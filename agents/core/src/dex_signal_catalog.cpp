@@ -68,6 +68,41 @@ std::uint32_t parse_hex_u32(const std::string& s) {
     }
 }
 
+// Canonicalize a Windows-Error-Reporting version field to the dotted numeric
+// quad slice-1's procperf collector emits (VS_FIXEDFILEINFO → "a.b.c.d"), so the
+// (app, version) identity JOINS across stability and perf. WER's AppName/
+// AppVersion is normally the fixed quad already (verified Win11 26100: clean
+// "6.15.101.7085"), but the version resource's StringFileInfo can carry suffixes
+// ("10.0.x (WinBuild…)") or fewer parts — keep ONLY the leading run of
+// dot-separated numeric groups. An all-zero quad ("0.0.0.0", WER's "no version
+// resource" sentinel) and an empty field both canonicalize to "" — the single
+// "unknown version" bucket the read model groups under (matching procperf's ""
+// for an unresolved/packaged app).
+std::string canon_version(std::string_view raw) {
+    std::string out;
+    std::size_t i = 0;
+    bool all_zero = true;
+    while (i < raw.size()) {
+        // one numeric group
+        std::size_t start = i;
+        while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9')
+            ++i;
+        if (i == start)
+            break; // not a digit where a group must start → stop (drops any suffix)
+        for (std::size_t k = start; k < i; ++k)
+            if (raw[k] != '0')
+                all_zero = false;
+        if (!out.empty())
+            out += '.';
+        out.append(raw, start, i - start);
+        if (i < raw.size() && raw[i] == '.')
+            ++i; // consume the separator and continue
+        else
+            break;
+    }
+    return all_zero ? std::string{} : out;
+}
+
 double parse_metric_ms(const std::string& s) {
     if (s.empty()) return 0.0;
     try {
@@ -112,6 +147,12 @@ SignalObservation x_app_crash(const EventFields& f, int) {
     SignalObservation o;
     o.subject = named(f, "AppName");
     o.component = named(f, "ModuleName");
+    // The crashed APP's file version (event-1000 manifested field). WER reports
+    // the fixed quad — canon_version drops any "0.0.0.0" sentinel / odd suffix so
+    // it joins to procperf's (name, version). Deliberately AppVersion, NOT
+    // ModuleVersion: we attribute the crash to the application build, matching the
+    // perf identity. Empty for store/packaged apps (Teams, new Outlook) → "".
+    o.version = canon_version(named(f, "AppVersion"));
     o.kind = "exception";
     const std::uint32_t code = parse_hex_u32(named(f, "ExceptionCode"));
     o.reason = std::format("0x{:08X}", code);
@@ -132,6 +173,7 @@ SignalObservation x_app_hang(const EventFields& f, int) {
     SignalObservation o;
     // 1002 is classic-style: positional Data ([0]=program, [1]=version, [2]=pid hex).
     o.subject = named_or_pos(f, "AppName", 0);
+    o.version = canon_version(named_or_pos(f, "AppVersion", 1)); // [1] = the hung app's version
     o.pid = parse_hex_u32(named_or_pos(f, "ProcessId", 2));
     o.kind = "hang";
     o.symbolic = "NOT_RESPONDING";

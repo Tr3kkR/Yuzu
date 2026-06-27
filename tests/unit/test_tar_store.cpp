@@ -622,6 +622,7 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
         r.ts = 2000 + i;
         r.snapshot_id = 7;
         r.name = "app" + std::to_string(i) + ".exe";
+        r.version = "1.2." + std::to_string(i) + ".0";
         r.instances = i + 1;
         r.cpu_pct = 10.0 * (i + 1);
         r.ws_bytes = (100 << 20) * (i + 1);
@@ -630,12 +631,13 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
     REQUIRE(t.db.insert_proc_perf_samples(rows));
     REQUIRE(t.db.insert_proc_perf_samples({})); // empty batch is a no-op success
 
-    auto q = t.db.execute_query("SELECT name, instances, cpu_pct, ws_bytes FROM procperf_live "
+    auto q = t.db.execute_query("SELECT name, version, instances, cpu_pct, ws_bytes FROM procperf_live "
                                 "ORDER BY name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 3);
     CHECK(q->rows[0][0] == "app0.exe");
-    CHECK(q->rows[2][1] == "3");
+    CHECK(q->rows[0][1] == "1.2.0.0"); // version round-trips
+    CHECK(q->rows[2][2] == "3");
 }
 
 TEST_CASE("TarDatabase: insert_netqual_samples batch round-trips", "[tar][store][netqual]") {
@@ -831,6 +833,67 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
         r.name = "x.exe";
         r.instances = 1;
         REQUIRE(db->insert_proc_perf_samples({r}));
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf tier (upgrade path)",
+          "[tar][store][lifecycle][procperf]") {
+    // The deployment-critical path the fresh-DB tests never exercise: an
+    // UPGRADING agent already has procperf_live/_hourly WITHOUT `version` at
+    // schema_version=3, so create_warehouse_tables' IF-NOT-EXISTS leaves them
+    // alone and the v4 block's ALTER TABLE ADD COLUMN must run. Seed that exact
+    // pre-v4 shape by hand, then open and prove the ALTER fired.
+    auto tmp = yuzu::test::unique_temp_path("tar_v4_");
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO tar_config (key, value) VALUES ('schema_version', '3');
+            CREATE TABLE procperf_live (
+                ts INTEGER, snapshot_id INTEGER, name TEXT,
+                instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
+            CREATE TABLE procperf_hourly (
+                hour_ts INTEGER, name TEXT, samples INTEGER, instances_max INTEGER,
+                cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER, ws_max_bytes INTEGER);
+        )";
+        REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 4); // the v3→v4 walk ran
+
+        // Both tiers now carry `version` (added by the ALTER, not the DDL).
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            auto info = db->execute_query(std::string{"PRAGMA table_info("} + tbl + ")");
+            REQUIRE(info.has_value());
+            bool has_version = false;
+            for (const auto& row : info->rows)
+                if (row.size() > 1 && row[1] == "version")
+                    has_version = true;
+            CHECK(has_version);
+        }
+
+        // And a real insert carrying a version round-trips through the migrated table.
+        ProcPerfRow r;
+        r.ts = 11;
+        r.snapshot_id = 1;
+        r.name = "chrome.exe";
+        r.version = "124.0.6367.91";
+        r.instances = 2;
+        REQUIRE(db->insert_proc_perf_samples({r}));
+        auto q = db->execute_query("SELECT version FROM procperf_live WHERE name = 'chrome.exe'");
+        REQUIRE(q.has_value());
+        REQUIRE(q->rows.size() == 1);
+        CHECK(q->rows[0][0] == "124.0.6367.91");
     }
 
     std::error_code ec;

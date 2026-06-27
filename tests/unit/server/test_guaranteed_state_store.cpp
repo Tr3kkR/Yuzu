@@ -23,6 +23,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -398,7 +401,7 @@ TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
     crash.detail_json =
         R"({"subject":"notepad.exe","pid":1234,"kind":"exception",)"
         R"("reason":"0xC0000005","symbolic":"ACCESS_VIOLATION",)"
-        R"("component":"ntdll.dll","platform":"windows"})";
+        R"("component":"ntdll.dll","version":"11.0.26100.1","platform":"windows"})";
     crash.timestamp = "2026-06-08T12:00:00Z";
     REQUIRE(store.insert_event(crash));
 
@@ -412,7 +415,60 @@ TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
     CHECK(obs[0].reason == "0xC0000005");
     CHECK(obs[0].symbolic == "ACCESS_VIOLATION");
     CHECK(obs[0].component == "ntdll.dll");
+    CHECK(obs[0].version == "11.0.26100.1"); // slice 2b: per-version stability projects
     CHECK(obs[0].platform == "windows");
+}
+
+TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by version",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // Slice 2b: the per-device app-reliability query groups by (subject, version)
+    // so "did THIS build crash more" is answerable. A missing version buckets
+    // under "". Crashes on a DIFFERENT device must not leak into the count.
+    GuaranteedStateStore store(":memory:");
+    auto crash = [&](const char* id, const char* agent, const char* subject, const char* version,
+                     const char* type, const char* ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = type;
+        e.severity = "info";
+        nlohmann::json j{{"subject", subject}, {"platform", "windows"}};
+        if (version[0])
+            j["version"] = version;
+        e.detail_json = j.dump();
+        e.timestamp = ts;
+        REQUIRE(store.insert_event(e));
+    };
+    // chrome on agent-A: 2 crashes on v125, 1 crash + 1 hang on v124.
+    crash("o1", "agent-A", "chrome.exe", "125.0.6422.61", "process.crashed", "2026-06-08T10:00:00Z");
+    crash("o2", "agent-A", "chrome.exe", "125.0.6422.61", "process.crashed", "2026-06-08T11:00:00Z");
+    crash("o3", "agent-A", "chrome.exe", "124.0.6367.91", "process.crashed", "2026-06-08T09:00:00Z");
+    crash("o4", "agent-A", "chrome.exe", "124.0.6367.91", "process.hung",    "2026-06-08T09:30:00Z");
+    // an unknown-version crash (packaged app) buckets under "".
+    crash("o5", "agent-A", "Teams.exe", "", "process.crashed", "2026-06-08T08:00:00Z");
+    // a crash on ANOTHER device must not appear in agent-A's per-device query.
+    crash("o6", "agent-B", "chrome.exe", "125.0.6422.61", "process.crashed", "2026-06-08T10:30:00Z");
+
+    auto rows = store.dex_device_top_apps("agent-A", "2026-06-01T00:00:00Z", 50);
+    // 3 (subject,version) buckets: chrome 125, chrome 124, Teams "".
+    REQUIRE(rows.size() == 3);
+    // Ranked by (crashes+hangs) desc → chrome 125 (2) and chrome 124 (2) lead.
+    auto find = [&](const std::string& s, const std::string& v) {
+        return std::find_if(rows.begin(), rows.end(),
+                            [&](const auto& r) { return r.subject == s && r.version == v; });
+    };
+    auto v125 = find("chrome.exe", "125.0.6422.61");
+    REQUIRE(v125 != rows.end());
+    CHECK(v125->crashes == 2);   // agent-B's crash excluded
+    CHECK(v125->hangs == 0);
+    auto v124 = find("chrome.exe", "124.0.6367.91");
+    REQUIRE(v124 != rows.end());
+    CHECK(v124->crashes == 1);
+    CHECK(v124->hangs == 1);
+    auto teams = find("Teams.exe", "");
+    REQUIRE(teams != rows.end()); // unknown version is its own honest bucket
+    CHECK(teams->crashes == 1);
 }
 
 TEST_CASE("GuaranteedStateStore: legacy slice-1 crash keys still project (fallback)",
