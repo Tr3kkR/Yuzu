@@ -51,27 +51,28 @@ namespace {
 
 using yuzu::installed_apps::reg_utf8::reg_sz_to_utf8;
 
-// Scratch key under the shared SOFTWARE\YuzuTest namespace (same convention as
-// test_guard_registry.cpp) so it never collides with real uninstall data. A
-// distinct leaf from that test's GuardEnforceTest, so the two never interfere.
-constexpr const wchar_t* kSubKeyW = L"SOFTWARE\\YuzuTest\\InstalledAppsUtf8";
-
-// RAII owner of the scratch key: delete it (and our values) on scope exit.
-// Non-copyable/non-movable so the single-owner contract is enforced, not assumed
-// (a copy would double-close/double-delete the same HKEY) -- matches the
-// HKeyCloser idiom in installed_apps_plugin.cpp.
+// RAII owner of a scratch key under the shared SOFTWARE\YuzuTest namespace (same
+// convention as test_guard_registry.cpp). The leaf is suffixed with the process
+// id so two concurrent test processes running as the same user never share a key
+// (the registry analog of unique_temp_path -- avoids the #473/#482 fixed-path
+// flake class). Non-copyable/non-movable so the single-HKEY-owner contract is
+// enforced, not assumed (a copy would double-close/double-delete the same HKEY)
+// -- matches the HKeyCloser idiom in installed_apps_plugin.cpp.
 struct ScratchKey {
+    std::wstring sub;
     HKEY key{};
     bool ok{false};
-    ScratchKey() {
-        ok = RegCreateKeyExW(HKEY_CURRENT_USER, kSubKeyW, 0, nullptr, 0, KEY_READ | KEY_WRITE,
+    ScratchKey()
+        : sub(L"SOFTWARE\\YuzuTest\\InstalledAppsUtf8_" +
+              std::to_wstring(GetCurrentProcessId())) {
+        ok = RegCreateKeyExW(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE,
                              nullptr, &key, nullptr) == ERROR_SUCCESS;
     }
     ~ScratchKey() {
         if (key) {
             RegCloseKey(key);
         }
-        RegDeleteKeyW(HKEY_CURRENT_USER, kSubKeyW);
+        RegDeleteKeyW(HKEY_CURRENT_USER, sub.c_str());
     }
     ScratchKey(const ScratchKey&) = delete;
     ScratchKey& operator=(const ScratchKey&) = delete;
