@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
+  single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
+  default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,
+  `f_bavail` on POSIX). Content definition `crossplatform.storage.free`.
+- **Device page — live Disk space card.** New card on the device "Get live info" lens dispatches
+  `disk_space/free` on demand; per-volume table with a colour-coded usage bar (>=90% used or <5 GiB
+  free = red, matching the `storage.low` DEX threshold). Audit verb `device.live.disk`.
 - **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
   pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
   with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at

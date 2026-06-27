@@ -70,9 +70,20 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 #ifdef _WIN32
     const std::wstring wpath = utf8_to_wide(path);
+    if (wpath.empty()) {
+        ctx.write_output(std::format("error|failed to query disk space for path: {}", path));
+        return 1;
+    }
     ULARGE_INTEGER avail_to_caller{}, total{}, total_free{};
-    if (wpath.empty() ||
-        !GetDiskFreeSpaceExW(wpath.c_str(), &avail_to_caller, &total, &total_free)) {
+    // Suppress the Windows session-0 hard-error dialog for a not-ready removable
+    // or BitLocker-locked volume — without this the call can block this worker
+    // thread awaiting a dialog dismissal that never comes, starving the agent's
+    // bounded dispatch pool. Thread-scoped + restored immediately after.
+    DWORD prev_err_mode = 0;
+    ::SetThreadErrorMode(SEM_FAILCRITICALERRORS, &prev_err_mode);
+    const BOOL ok = ::GetDiskFreeSpaceExW(wpath.c_str(), &avail_to_caller, &total, &total_free);
+    ::SetThreadErrorMode(prev_err_mode, nullptr);
+    if (!ok) {
         ctx.write_output(std::format("error|failed to query disk space for path: {}", path));
         return 1;
     }
@@ -85,8 +96,14 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
         ctx.write_output(std::format("error|failed to stat path: {}", path));
         return 1;
     }
-    total_bytes = static_cast<unsigned long long>(vfs.f_blocks) * vfs.f_frsize;
-    free_bytes = static_cast<unsigned long long>(vfs.f_bavail) * vfs.f_frsize;
+    // Some virtual / network filesystems report f_frsize == 0; fall back to
+    // f_bsize so the volume doesn't silently read as 0 total / 0 free (the
+    // dex_linux_collector idiom). free_bytes is the authoritative cross-OS
+    // figure; percent_used is approximate (f_bavail excludes root-reserved slack
+    // on Linux, so it reads a few points higher than Windows for the same fill).
+    const auto block_size = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+    total_bytes = static_cast<unsigned long long>(vfs.f_blocks) * block_size;
+    free_bytes = static_cast<unsigned long long>(vfs.f_bavail) * block_size;
 
 #else
     ctx.write_output("error|unsupported platform");

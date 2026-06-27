@@ -22,7 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -415,7 +415,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
-    h += card("disk", "Disk space", "", "free / used");
+    h += card("disk", "Disk space", "", "system volume only");
     h += "</div></div>";
     return h;
 }
@@ -814,10 +814,14 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
         double v = static_cast<double>(b);
         int i = 0;
         while (v >= 1024.0 && i < 5) { v /= 1024.0; ++i; }
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), i == 0 ? "%.0f %s" : "%.1f %s", v, unit[i]);
-        return std::string(buf);
+        // Two literal format strings — std::format needs a consteval format arg.
+        return i == 0 ? std::format("{:.0f} {}", v, unit[i])
+                      : std::format("{:.1f} {}", v, unit[i]);
     };
+    // < 5 GiB free latches red even below 90% used — mirroring BOTH halves of the
+    // storage.low DEX threshold (>= 90% used OR < 5 GiB free; dex_win_poll), so the
+    // bar and the DEX signal agree.
+    constexpr long long kLowFreeBytes = 5LL * 1024 * 1024 * 1024;
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Volume</th>"
                     "<th class=\"ls-num\">Size</th><th class=\"ls-num\">Free</th>"
                     "<th>Used</th></tr></thead><tbody>";
@@ -825,13 +829,21 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
         int pct = r.percent_used;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
-        // >= 90% used is the same threshold the storage.low DEX signal latches on.
-        const char* tone = pct >= 90 ? "bad" : pct >= 75 ? "warn" : "ok";
+        std::string used_cell;
+        if (r.total <= 0) {
+            // Unmeasured volume (f_frsize==0 / unreadable / forged) — never render
+            // a "0% used / 100% free" green bar off a row we couldn't measure.
+            used_cell = "<span class=\"gp-mute\">&mdash;</span>";
+        } else {
+            const char* tone =
+                (pct >= 90 || r.free < kLowFreeBytes) ? "bad" : pct >= 75 ? "warn" : "ok";
+            used_cell = "<div class=\"ls-bar ls-bar-" + std::string(tone) +
+                        "\"><span style=\"width:" + std::to_string(pct) +
+                        "%\"></span></div><span class=\"ls-barlbl\">" + std::to_string(pct) + "%</span>";
+        }
         h += "<tr><td class=\"name\"><code>" + esc(r.path) + "</code></td><td class=\"ls-num\">" +
-             esc(human(r.total)) + "</td><td class=\"ls-num\">" + esc(human(r.free)) +
-             "</td><td><div class=\"ls-bar ls-bar-" + tone + "\"><span style=\"width:" +
-             std::to_string(pct) + "%\"></span></div><span class=\"ls-barlbl\">" +
-             std::to_string(pct) + "%</span></td></tr>";
+             esc(human(r.total)) + "</td><td class=\"ls-num\">" + esc(human(r.free)) + "</td><td>" +
+             used_cell + "</td></tr>";
     }
     h += "</tbody></table>";
     return h;

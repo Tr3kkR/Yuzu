@@ -41,6 +41,11 @@ spec:
           maxLength: 4096
 
   result:
+    # The plugin emits a single pipe row `disk|<path>|<total>|<free>|<percent_used>`
+    # — field 0 is the literal `disk` discriminator and the columns below map to
+    # fields 1–4. As with os_info, result.columns is dashboard metadata, not an
+    # engine parser hint (the engine stores the raw pipe row); a visualization
+    # author binding a field index must account for the leading discriminator.
     columns:
       - name: path
         type: string

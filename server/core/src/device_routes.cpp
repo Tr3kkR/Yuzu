@@ -383,7 +383,13 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
             try { v.total = std::stoll(f[2]); } catch (...) {}
             try { v.free = std::stoll(f[3]); } catch (...) {}
             try { v.percent_used = std::stoi(f[4]); } catch (...) {}
-            if (v.percent_used > worst_used) worst_used = v.percent_used;
+            // Clamp the agent-supplied percent into range, and only let a
+            // MEASURED volume (total > 0) drive the worst-used KPI — a total of 0
+            // (f_frsize==0 / a volume the agent couldn't read) must not render as
+            // "100% free" off a forged or indeterminate row.
+            if (v.percent_used < 0) v.percent_used = 0;
+            if (v.percent_used > 100) v.percent_used = 100;
+            if (v.total > 0 && v.percent_used > worst_used) worst_used = v.percent_used;
             rows.push_back(std::move(v));
             if (rows.size() >= kMaxLiveRows) break;
         }
