@@ -209,6 +209,7 @@ tar_test_exe = executable(
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
+    include_directories('../agents/plugins/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
