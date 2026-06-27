@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
+  single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
+  default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,
+  `f_bavail` on POSIX). Content definition `crossplatform.storage.free`.
+- **Device page — live Disk space card.** New card on the device "Get live info" lens dispatches
+  `disk_space/free` on demand; per-volume table with a colour-coded usage bar (>=90% used or <5 GiB
+  free = red, matching the `storage.low` DEX threshold). Audit verb `device.live.disk`.
 - **REST endpoint for fleet-wide installed-software inventory (ADR-0016 follow-on).**
   `GET /api/v1/inventory/software` exposes the typed `SoftwareInventoryStore` over REST
   (gated on `Inventory:Read`), the agentic-first sibling of the `query_installed_software`
@@ -181,6 +188,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
+
+- **Sibling inventory plugins now read non-ASCII registry strings as UTF-8 (#1682), via a shared
+  helper (#1681).** Four plugins read the registry with the ANSI `Reg*A` APIs and carried the same
+  cp1252 mojibake as #1662 on any non-ASCII value: `vuln_scan` (the installed-apps enumerate path —
+  the same shape as the pre-#1662 `installed_apps`, including a `RegEnumKeyExA` key-name enumeration —
+  plus `config_checks.hpp`), `os_info` (the OS `ProductName` / edition strings), `sccm` (the SCCM
+  client version), and `windows_updates` (the WSUS `WUServer` URL). Every read whose value lands in a
+  stored or fleet-queryable surface now uses the wide `Reg*W` APIs + `WideCharToMultiByte(CP_UTF8)`;
+  presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
+  probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
+  picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
+  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
+  Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
+  **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
+  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
+  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
+  (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
+  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
+  delegating shims. This is a **partial** consolidation — **not** every conversion site: other plugins
+  (`processes`, `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, and the
+  `tar_dns_collector`/`tar_proc_etw`/`tar_proc_perf`/`tar_arp_collector` siblings) and several agent-**core**
+  files (`process_enum`, `dex_observer`, `guard_file`, `guard_registry`, `guard_service`, `temp_file`,
+  `trigger_engine`) still carry their own named or inline conversions; a comprehensive sweep is a tracked
+  follow-up, and `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
+  first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
+  `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
+  prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
+  four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
+  cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
+  trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
+  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows: unit tests + a
+  per-plugin MSVC compile, and an end-to-end smoke inside the Hyper-V agent VM that seeded a non-ASCII
+  `DisplayName` "Café Ñoño 日本語" under `HKCU\…\Uninstall` and confirmed it round-tripped byte-exact
+  UTF-8 through the real `RegEnumKeyExW` + `reg_sz_to_utf8` read path.)
 
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service

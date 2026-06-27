@@ -33,6 +33,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wlanapi.h>
 #pragma comment(lib, "wlanapi.lib")
 #endif
@@ -60,17 +61,9 @@ std::string run_command(const char* cmd) {
 #endif
 
 #ifdef _WIN32
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    std::string result(len > 0 ? len - 1 : 0, '\0');
-    if (len > 0) {
-        WideCharToMultiByte(CP_UTF8, 0, ws, -1, result.data(), len, nullptr, nullptr);
-    }
-    return result;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 // Convert DOT11_AUTH_ALGORITHM to human-readable string
 const char* auth_to_string(DOT11_AUTH_ALGORITHM auth) {
@@ -406,7 +399,7 @@ int do_connected(yuzu::CommandContext& ctx) {
         auto bssid_str = std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", bssid[0],
                                      bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 
-        auto iface_name = wide_to_utf8(iface.strInterfaceDescription);
+        auto iface_name = from_wide(iface.strInterfaceDescription);
 
         ctx.write_output(
             std::format("connected|{}|{}|{}|{}|{}", ssid, signal, security, bssid_str, iface_name));

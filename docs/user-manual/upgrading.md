@@ -250,6 +250,15 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
+  encoding fix was extended to four more Windows plugins: `vuln_scan` (app
+  DisplayName/Publisher/Version in vulnerability findings), `os_info` (OS
+  ProductName / edition), `sccm` (client version), and `windows_updates` (the WSUS
+  `WUServer` URL). Unlike `installed_apps`, these produce **transient** response
+  data — no stored names are rewritten; each call simply delivers correct UTF-8
+  immediately after the agent upgrade. Any operator automation that matched
+  previously-mangled non-ASCII strings in those plugins' responses (e.g. a vuln
+  finding filtered on `title == "Caf?"`) will need updating.
 
 ## Upgrading the Server
 

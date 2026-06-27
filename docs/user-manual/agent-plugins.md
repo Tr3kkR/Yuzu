@@ -531,6 +531,18 @@ Plugins for file and directory operations.
 | `get_signature` | Check the Authenticode digital signature of a file (Windows only). Returns signer, timestamp, and trust status. On Linux/macOS, returns unsigned status. Parameters: `path` (required). |
 | `find_by_hash` | Search a directory tree for files matching a SHA-256 hash. Useful for threat hunting and file integrity verification. Parameters: `hash` (required, SHA-256 hex string), `path` (required, directory to search). |
 
+### disk_space
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Reports free and total bytes (and percent used) for a single volume. The free figure is quota-aware caller headroom: FreeBytesAvailableToCaller on Windows (GetDiskFreeSpaceExW), f_bavail*f_frsize on POSIX (statvfs). One volume per call; query each volume separately. |
+
+| Action | Description |
+|---|---|
+| `free` | Report free and total bytes (and percent used) for the volume containing `path`. Parameter: `path` (string, optional -- volume root or any directory on the target volume; defaults to `C:\` on Windows / `/` on Linux/macOS). Returns `disk|<path>|<total_bytes>|<free_bytes>|<percent_used>` on success, `error|<msg>` with a non-zero exit on failure (same convention as os_info). |
+
 ---
 
 ## Execution
