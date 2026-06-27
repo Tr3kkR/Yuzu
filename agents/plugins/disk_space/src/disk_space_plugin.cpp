@@ -13,9 +13,9 @@
  *   error|<message>   (and a non-zero return)
  *
  * "free_bytes" is the space usable by an ordinary (unprivileged) caller —
- * GetDiskFreeSpaceExW's FreeBytesAvailableToCaller on Windows, statvfs
- * f_bavail*f_frsize on POSIX — which is the correct figure for an installer
- * headroom check (quota-aware), not the raw f_bfree.
+ * GetDiskFreeSpaceExW's FreeBytesAvailableToCaller on Windows, f_bavail on POSIX
+ * (statfs on macOS, statvfs on Linux) — which is the correct figure for an
+ * installer headroom check (quota-aware), not the raw f_bfree.
  */
 
 #include <yuzu/plugin.hpp>
@@ -24,8 +24,12 @@
 #include <string>
 #include <string_view>
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
 #include <sys/statvfs.h>
+#elif defined(__APPLE__)
+// statfs(2) carries 64-bit block counts; statvfs's __darwin_fsblkcnt_t is 32-bit.
+#include <sys/mount.h>
+#include <sys/param.h>
 #endif
 
 #ifdef _WIN32
@@ -106,7 +110,21 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
     total_bytes = total.QuadPart;
     free_bytes = avail_to_caller.QuadPart;
 
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(__APPLE__)
+    // macOS: statfs(2) — f_blocks/f_bavail are 64-bit (uint64_t), so a volume
+    // > ~16 TiB is reported correctly (statvfs's __darwin_fsblkcnt_t is 32-bit
+    // and would truncate). f_bavail is space usable by a non-superuser (the
+    // installer-headroom basis); f_bsize is the fundamental block size.
+    struct statfs vfs{};
+    if (statfs(std::string(path).c_str(), &vfs) != 0) {
+        ctx.write_output(std::format("error|failed to stat path: {}", path));
+        return 1;
+    }
+    const auto block_size = vfs.f_bsize;
+    total_bytes = static_cast<unsigned long long>(vfs.f_blocks) * block_size;
+    free_bytes = static_cast<unsigned long long>(vfs.f_bavail) * block_size;
+
+#elif defined(__linux__)
     struct statvfs vfs{};
     if (statvfs(std::string(path).c_str(), &vfs) != 0) {
         ctx.write_output(std::format("error|failed to stat path: {}", path));

@@ -818,9 +818,11 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
         return i == 0 ? std::format("{:.0f} {}", v, unit[i])
                       : std::format("{:.1f} {}", v, unit[i]);
     };
-    // < 5 GiB free latches red even below 90% used — mirroring BOTH halves of the
-    // storage.low DEX threshold (>= 90% used OR < 5 GiB free; dex_win_poll), so the
-    // bar and the DEX signal agree.
+    // < 5 GiB free latches red even below 90% used — the same threshold SHAPE the
+    // storage.low DEX signal uses (>= 90% used OR < 5 GiB free; dex_win_poll). Note
+    // this aligns the *thresholds*, not necessarily the *inputs*: the plugin's free
+    // is caller-quota (Windows FreeBytesAvailableToCaller / POSIX f_bavail), so under
+    // a per-user NTFS/FSRM quota it can read below storage.low's volume-wide basis.
     constexpr long long kLowFreeBytes = 5LL * 1024 * 1024 * 1024;
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Volume</th>"
                     "<th class=\"ls-num\">Size</th><th class=\"ls-num\">Free</th>"
