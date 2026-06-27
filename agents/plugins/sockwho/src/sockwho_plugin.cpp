@@ -47,6 +47,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #endif
 
@@ -471,17 +472,9 @@ std::string format_addr6(const void* addr) {
     return buf;
 }
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string s(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), len, nullptr, nullptr);
-    return s;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 ProcInfo get_proc_info(DWORD pid) {
     ProcInfo info;
@@ -492,7 +485,7 @@ ProcInfo get_proc_info(DWORD pid) {
     wchar_t path_buf[MAX_PATH];
     DWORD path_len = MAX_PATH;
     if (QueryFullProcessImageNameW(proc, 0, path_buf, &path_len)) {
-        info.path = wide_to_utf8(path_buf);
+        info.path = from_wide(path_buf);
         // Extract filename as process name
         auto slash = info.path.rfind('\\');
         if (slash != std::string::npos)

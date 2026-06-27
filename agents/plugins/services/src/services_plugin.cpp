@@ -42,9 +42,9 @@ namespace {
 
 #ifdef _WIN32
 
-// Wide<->UTF-8 conversion now comes from the shared win_str.hpp (#1681): the old
-// local wide_to_utf8 / utf8_to_wide map onto from_wide / to_wide (behaviour-identical
-// for valid input -- both were NUL-terminated forms).
+// Wide<->UTF-8 conversion now comes from the shared win_str.hpp (#1681): the old local
+// wide_to_utf8 (NUL-terminated) / utf8_to_wide (explicit length) map onto from_wide /
+// to_wide -- behaviour-identical for valid input.
 using yuzu::win::from_wide;
 using yuzu::win::to_wide;
 

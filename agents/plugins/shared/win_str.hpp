@@ -1,18 +1,21 @@
 // win_str.hpp -- shared Windows UTF-16 <-> UTF-8 string helpers.
 //
-// A single canonical home (#1681) for the wide<->UTF-8 conversion that several
-// agent plugins had each re-derived. The actual prior landscape (do NOT trust the
-// originating issue's "~6 byte-identical" shorthand): the full trio existed only in
-// installed_apps; `registry` carried to_wide + from_wide (no reg_sz_to_utf8 -- it
-// inlines that); `wmi`/`interaction`/`tar_module_etw`/`services` each carried a single,
-// sometimes-renamed wide converter; `processes` has none and no registry access.
-// Consumers now: vuln_scan/os_info/sccm/windows_updates (the previously-ANSI siblings,
-// #1682) PLUS registry/wmi/services/interaction/tar_module_etw (de-dup migration --
-// their local copies were removed in favour of this header; tar/services keep their
-// own signature shims that delegate here). The remaining inline converters live in
-// agent CORE (process_enum.cpp, dex_observer.cpp), which is outside agents/plugins/
-// and cannot reach this plugin-shared header -- consolidating those is a separate
-// follow-up. installed_apps keeps its own copy for now (its #1662 fix is on `dev`).
+// A single canonical home (#1681) for the wide<->UTF-8 conversion that many agent
+// plugins had each re-derived. (Do NOT trust the originating issue's "~6 byte-identical"
+// shorthand -- the real prior spread was wider and uneven.) As of the #1681/#1682 work,
+// EVERY Windows agent plugin that does wide<->UTF-8 conversion consumes this header:
+//   - vuln_scan / os_info / sccm / windows_updates -- the previously-ANSI Reg*A siblings (#1682);
+//   - registry / wmi / services / interaction / tar_module_etw -- de-dup of the trio /
+//     single-direction local copies;
+//   - network_config / procfetch / sockwho / users / wifi / tar_service_collector /
+//     tar_user_collector -- de-dup of the process_enum-style `wide_to_utf8`.
+// Most switch via `using yuzu::win::...;` (the local name coincided); wmi (`from_bstr`)
+// and tar_module_etw (`std::wstring`/`std::string` signatures) keep thin delegating shims.
+// The ONLY remaining inline wide<->UTF-8 copies are in agent CORE (process_enum.cpp,
+// dex_observer.cpp, guard_file.cpp, guard_registry.cpp, guard_service.cpp, temp_file.cpp),
+// which is outside agents/plugins/ and cannot reach this plugin-shared header --
+// consolidating those is a separate follow-up. installed_apps keeps its own copy for
+// now (its #1662 fix is already on `dev`; convergence deferred to avoid a merge clash).
 //
 // These depend only on WideCharToMultiByte / MultiByteToWideChar -- no other Win32
 // surface -- so a header-only home gives one source of truth while preserving build
@@ -69,11 +72,13 @@ inline std::wstring to_wide(std::string_view s) {
 
 // UTF-16 -> UTF-8. len == -1 treats ws as NUL-terminated and strips the single
 // trailing NUL the API includes in its count. An explicit len converts that many
-// wchar_t -- but the trailing-NUL pop still fires, so a single trailing NUL inside
-// an explicit-len buffer is also stripped (benign: the only explicit-len caller,
-// reg_sz_to_utf8, has already removed trailing NULs). Lone surrogates map to U+FFFD
-// (default WideCharToMultiByte behaviour -- no WC_ERR_INVALID_CHARS). Returns empty
-// for a null pointer.
+// wchar_t, and the trailing-NUL pop still applies: when the explicit length INCLUDES
+// a trailing NUL wchar (e.g. a RegQueryValueExW REG_SZ byte size, as the registry
+// plugin's value reads pass) the pop strips it -- it is load-bearing there; when the
+// length EXCLUDES the NUL (e.g. RegEnumKeyExW name_len, or reg_sz_to_utf8 after its
+// first-NUL scan) s.back() is not '\0' and no pop occurs. Lone surrogates map to
+// U+FFFD (default WideCharToMultiByte behaviour -- no WC_ERR_INVALID_CHARS). Returns
+// empty for a null pointer.
 inline std::string from_wide(const wchar_t* ws, int len = -1) {
     if (!ws)
         return {};

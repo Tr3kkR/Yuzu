@@ -155,13 +155,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
   `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
   Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
-  plugin still compiles its own copy and build isolation is preserved). Nine plugins now consume it:
-  the four siblings above, plus a **de-dup migration** of `registry`, `wmi`, `services`, `interaction`,
-  and `tar_module_etw`, whose hand-rolled converters (only `installed_apps` had the full trio;
-  `registry` had two; the rest one apiece) are removed in favour of the shared helper
-  (`tar_module_etw`/`services` keep thin signature shims that delegate to it). The remaining inline
-  converters live in agent **core** (`process_enum.cpp`, `dex_observer.cpp`), which is outside
-  `agents/plugins/` and cannot reach the plugin-shared header — consolidating those is a tracked
+  plugin still compiles its own copy and build isolation is preserved). **Every** Windows agent plugin
+  that does wide<->UTF-8 conversion now consumes it: the four siblings above, plus a **de-dup migration**
+  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
+  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
+  (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
+  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
+  delegating shims. The ONLY remaining inline converters are in agent **core** (`process_enum.cpp`,
+  `dex_observer.cpp`, `guard_file.cpp`, `guard_registry.cpp`, `guard_service.cpp`, `temp_file.cpp`), which
+  is outside `agents/plugins/` and cannot reach the plugin-shared header — consolidating those is a tracked
   follow-up; `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
   first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
   `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean

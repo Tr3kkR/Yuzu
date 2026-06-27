@@ -164,7 +164,11 @@ int run_command_status(const std::string& cmd) {
 int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
                     const std::string& message, const std::string& type) {
     // Convert strings to wide
-    // wide conversion via the shared win_str.hpp helper (#1681)
+    // wide conversion via the shared win_str.hpp helper (#1681). NOTE: to_wide uses an
+    // explicit length, so an embedded NUL in title/message is no longer truncated at
+    // conversion -- safe here only because wtitle/wmessage are consumed via c_str() by
+    // NUL-terminated Win32 APIs (MessageBoxW / Shell_NotifyIconW). A future length-aware
+    // consumer of operator-supplied text would need to strip/reject embedded NULs first.
     using yuzu::win::to_wide;
 
     std::wstring wtitle = to_wide(title);
@@ -267,7 +271,11 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& /*title*/,
 
 int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
                          const std::string& message, const std::string& buttons) {
-    // wide conversion via the shared win_str.hpp helper (#1681)
+    // wide conversion via the shared win_str.hpp helper (#1681). NOTE: to_wide uses an
+    // explicit length, so an embedded NUL in title/message is no longer truncated at
+    // conversion -- safe here only because wtitle/wmessage are consumed via c_str() by
+    // NUL-terminated Win32 APIs (MessageBoxW / Shell_NotifyIconW). A future length-aware
+    // consumer of operator-supplied text would need to strip/reject embedded NULs first.
     using yuzu::win::to_wide;
 
     UINT mb_type = MB_TOPMOST | MB_SETFOREGROUND;
