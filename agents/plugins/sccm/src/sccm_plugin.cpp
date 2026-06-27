@@ -28,6 +28,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "advapi32.lib")
 #endif
 
@@ -53,17 +54,20 @@ std::string run_command(const char* cmd) {
 
 std::string read_registry_string(HKEY root, const char* subkey, const char* value) {
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+    // Reg*W for UTF-8-correct values (#1662 / #1682); the SCCM version string is
+    // ASCII today, converted for consistency with the sibling inventory plugins.
+    if (RegOpenKeyExW(root, yuzu::win::to_wide(subkey).c_str(), 0, KEY_READ, &hkey) !=
+        ERROR_SUCCESS) {
         return {};
     }
-    char buf[256]{};
-    DWORD size = sizeof(buf);
+    wchar_t buf[512]{};
+    DWORD size = sizeof(buf); // size in BYTES
     DWORD type = 0;
     std::string result;
-    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
-        ERROR_SUCCESS) {
-        if (type == REG_SZ && size > 0) {
-            result.assign(buf, size - 1);
+    if (RegQueryValueExW(hkey, yuzu::win::to_wide(value).c_str(), nullptr, &type,
+                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+        if (type == REG_SZ && size >= sizeof(wchar_t)) {
+            result = yuzu::win::reg_sz_to_utf8(buf, size);
         }
     }
     RegCloseKey(hkey);

@@ -143,6 +143,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
 
+- **Sibling inventory plugins now read non-ASCII registry strings as UTF-8 (#1682), via a shared
+  helper (#1681).** Four plugins read the registry with the ANSI `Reg*A` APIs and carried the same
+  cp1252 mojibake as #1662 on any non-ASCII value: `vuln_scan` (the installed-apps enumerate path —
+  the same shape as the pre-#1662 `installed_apps`, including a `RegEnumKeyExA` key-name enumeration —
+  plus `config_checks.hpp`), `os_info` (the OS `ProductName` / edition strings), `sccm` (the SCCM
+  client version), and `windows_updates` (the WSUS `WUServer` URL). Every read whose value lands in a
+  stored or fleet-queryable surface now uses the wide `Reg*W` APIs + `WideCharToMultiByte(CP_UTF8)`;
+  presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
+  probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
+  picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
+  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters — previously duplicated byte-identically across
+  ~6 plugins — are extracted to a single Windows-only header `agents/plugins/shared/win_str.hpp`
+  (`namespace yuzu::win`, header-only so each plugin still compiles its own copy and build isolation is
+  preserved) and gain deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`: round-trip,
+  trailing-NUL strip, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator, lone-surrogate → U+FFFD,
+  null/empty). No proto/wire change.
+
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service
   previously short-circuited silently and never emitted `guard.compliant`, so the

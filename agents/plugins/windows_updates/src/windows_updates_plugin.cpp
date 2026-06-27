@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/types.h>
@@ -273,6 +274,9 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     std::vector<std::string> reasons;
 
 #ifdef _WIN32
+    // All three reboot probes below test key/value EXISTENCE only -- no value
+    // string is ever decoded -- so they carry no encoding and stay Reg*A (#1682
+    // stored-vs-transient audit).
     // Check 1: Windows Update RebootRequired registry key
     {
         HKEY hkey = nullptr;
@@ -305,7 +309,10 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
                                      found ? "Registry key exists" : ""));
     }
 
-    // Check 3: Pending file rename operations
+    // Check 3: Pending file rename operations.
+    // Presence-only: the value's bytes are never decoded into a string (only its
+    // size is read to detect a non-empty value), so this carries no encoding and
+    // stays Reg*A -- no cp1252 mojibake risk (#1682 stored-vs-transient audit).
     {
         HKEY hkey = nullptr;
         bool found = false;
@@ -551,16 +558,20 @@ std::vector<std::string> get_default_patch_targets() {
     targets.push_back("https://windowsupdate.microsoft.com");
     targets.push_back("https://update.microsoft.com");
     targets.push_back("https://download.windowsupdate.com");
-    // Check for WSUS URL in registry
+    // Check for a WSUS URL in the registry. Reg*W + reg_sz_to_utf8 so a non-ASCII
+    // WSUS hostname survives as UTF-8 rather than cp1252 mojibake (#1662 / #1682);
+    // wide literals are used directly since the subkey/value names are constants.
     HKEY hkey = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-            R"(SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate)",
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            LR"(SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate)",
             0, KEY_READ, &hkey) == ERROR_SUCCESS) {
-        char buf[512]{};
-        DWORD buf_size = sizeof(buf);
-        if (RegQueryValueExA(hkey, "WUServer", nullptr, nullptr,
-                              reinterpret_cast<LPBYTE>(buf), &buf_size) == ERROR_SUCCESS) {
-            std::string wsus(buf);
+        wchar_t buf[512]{};
+        DWORD buf_size = sizeof(buf); // size in BYTES
+        DWORD type = 0;
+        if (RegQueryValueExW(hkey, L"WUServer", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(buf), &buf_size) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ) && buf_size >= sizeof(wchar_t)) {
+            std::string wsus = yuzu::win::reg_sz_to_utf8(buf, buf_size);
             if (!wsus.empty()) targets.push_back(wsus);
         }
         RegCloseKey(hkey);

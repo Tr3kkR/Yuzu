@@ -21,6 +21,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace yuzu::vuln {
@@ -88,22 +89,26 @@ namespace detail {
 
 inline std::string read_registry_string(HKEY root, const char* subkey, const char* value_name) {
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS)
+    // Reg*W so a non-ASCII config value survives as UTF-8 rather than cp1252
+    // mojibake when it lands in a stored vuln finding (#1662 / #1682).
+    if (RegOpenKeyExW(root, yuzu::win::to_wide(subkey).c_str(), 0, KEY_READ, &hkey) != ERROR_SUCCESS)
         return {};
-    char buf[512]{};
-    DWORD size = sizeof(buf);
+    wchar_t buf[512]{};
+    DWORD size = sizeof(buf); // size in BYTES
     DWORD type = 0;
     std::string result;
-    if (RegQueryValueExA(hkey, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
-        ERROR_SUCCESS) {
-        if ((type == REG_SZ || type == REG_EXPAND_SZ) && size > 0) {
-            result.assign(buf, size - 1);
+    if (RegQueryValueExW(hkey, yuzu::win::to_wide(value_name).c_str(), nullptr, &type,
+                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+        if ((type == REG_SZ || type == REG_EXPAND_SZ) && size >= sizeof(wchar_t)) {
+            result = yuzu::win::reg_sz_to_utf8(buf, size);
         }
     }
     RegCloseKey(hkey);
     return result;
 }
 
+// Numeric read -- the value is a DWORD, never decoded into a string, so it carries
+// no encoding and stays Reg*A (no cp1252 mojibake risk; #1682 audit).
 inline DWORD read_registry_dword(HKEY root, const char* subkey, const char* value_name,
                                  DWORD default_val) {
     HKEY hkey{};
