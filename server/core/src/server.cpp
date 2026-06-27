@@ -308,6 +308,10 @@ public:
                           "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
                           "leading pool-saturation indicator",
                           "histogram");
+        // Birth the series with the extended 10-60s buckets ONCE here (#1686) so the
+        // hot per-acquire observe path uses the cheap name-only lookup and never
+        // allocates a throwaway bucket vector per acquire.
+        metrics_.histogram("yuzu_pg_acquire_wait_seconds", yuzu::Histogram::seconds_buckets_60s());
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
