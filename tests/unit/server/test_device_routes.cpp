@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,8 @@ struct LiveHarness {
     std::unordered_map<std::string, std::vector<DexAgentResponse>> rows_by_cmd; // per-command override
     std::string audited;                                      // "action|result|target_id"
     bool allow_execute = true;
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
+    bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
 
     LiveHarness() {
         auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -78,7 +81,11 @@ struct LiveHarness {
                             const std::string&, const std::string& tid,
                             const std::string&) -> bool {
             audited = a + "|" + r + "|" + tid;
-            return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
+            // #1647: the row is recorded before the throw so `audited` still proves the
+            // site was reached; the throw then exercises the shared helper's catch-arm.
+            if (audit_throws)
+                throw std::runtime_error("audit DB write blew up");
+            return audit_ok; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
         };
         // store is unused by the live routes — pass nullptr deliberately.
         routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
@@ -155,6 +162,36 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         REQUIRE(r);
         CHECK(r->body.find("Execute") != std::string::npos);
         CHECK(h.dispatched == 0);
+    }
+}
+
+// #1647 catch-arm parity: the device.live.* DISPATCH audit set Sec-Audit-Failed on a
+// returns-false but had NO try/catch — a throwing audit_fn escaped the handler (httplib
+// → 500). Routed through the shared rest_audit.hpp chokepoint, a throw is now caught and
+// flags the header, while the post-dispatch SET-AND-PROCEED posture is unchanged (the
+// dispatch already happened; the panel still polls for the result).
+TEST_CASE("device live run: audit-persist gap surfaces Sec-Audit-Failed, still polls",
+          "[device][routes][audit]") {
+    SECTION("a dropped audit row (audit_fn → false)") {
+        LiveHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime");
+        REQUIRE(r);
+        CHECK(r->status == 200); // set-and-proceed
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatched == 1); // the audit failure did not block the dispatch
+        CHECK(r->body.find("/fragments/device/live/result") != std::string::npos);
+    }
+    SECTION("a throwing audit_fn is caught, never escapes the handler") {
+        LiveHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatched == 1);
+        CHECK(r->body.find("/fragments/device/live/result") != std::string::npos);
     }
 }
 
