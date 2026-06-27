@@ -2,8 +2,8 @@
 //
 // A single canonical home (#1681) for the wide<->UTF-8 conversion that many agent
 // plugins had each re-derived. (Do NOT trust the originating issue's "~6 byte-identical"
-// shorthand -- the real prior spread was wider and uneven.) As of the #1681/#1682 work,
-// EVERY Windows agent plugin that does wide<->UTF-8 conversion consumes this header:
+// shorthand -- the real prior spread was wider and uneven.) #1681/#1682 migrated the
+// plugins that carried a NAMED wide<->UTF-8 helper to this header:
 //   - vuln_scan / os_info / sccm / windows_updates -- the previously-ANSI Reg*A siblings (#1682);
 //   - registry / wmi / services / interaction / tar_module_etw -- de-dup of the trio /
 //     single-direction local copies;
@@ -11,11 +11,17 @@
 //     tar_user_collector -- de-dup of the process_enum-style `wide_to_utf8`.
 // Most switch via `using yuzu::win::...;` (the local name coincided); wmi (`from_bstr`)
 // and tar_module_etw (`std::wstring`/`std::string` signatures) keep thin delegating shims.
-// The ONLY remaining inline wide<->UTF-8 copies are in agent CORE (process_enum.cpp,
-// dex_observer.cpp, guard_file.cpp, guard_registry.cpp, guard_service.cpp, temp_file.cpp),
-// which is outside agents/plugins/ and cannot reach this plugin-shared header --
-// consolidating those is a separate follow-up. installed_apps keeps its own copy for
-// now (its #1662 fix is already on `dev`; convergence deferred to avoid a merge clash).
+//
+// This is a PARTIAL consolidation -- NOT every conversion site is migrated. Other plugins
+// still carry their own named or inline wide<->UTF-8 conversions (as of this writing:
+// processes, device_identity, filesystem, hardware, ioc, content_dist, and the
+// tar_dns_collector / tar_proc_etw / tar_proc_perf / tar_arp_collector siblings), as do
+// several agent-CORE files (process_enum, dex_observer, guard_file, guard_registry,
+// guard_service, temp_file, trigger_engine) which sit outside agents/plugins/ and cannot
+// reach this plugin-shared header. installed_apps keeps its own copy too (its #1662 fix is
+// already on `dev`). A comprehensive sweep of the remaining sites is a tracked follow-up --
+// do NOT read this list as exhaustive; grep `WideCharToMultiByte`/`MultiByteToWideChar` for
+// the live set.
 //
 // These depend only on WideCharToMultiByte / MultiByteToWideChar -- no other Win32
 // surface -- so a header-only home gives one source of truth while preserving build
