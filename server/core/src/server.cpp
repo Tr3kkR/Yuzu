@@ -316,14 +316,13 @@ public:
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report — the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
-                          "(full = full-payload replace; hash_only = hash-skip compare) (#1664)",
+                          "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal "
-                          "(#1675)",
+                          "under pure pool saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -438,7 +437,7 @@ public:
                           "gauge this cycle (a subset of net_reporting{os}). Denominator for "
                           "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) — a "
                           "Windows device reports a retransmit fact but it is withheld from the "
-                          "gauge (#1465), so Windows is absent here", "gauge");
+                          "gauge, so Windows is absent here", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
                           "DORMANT (measurement-first), per `os`: absent unless an agent still emits "
                           "the retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
@@ -598,12 +597,12 @@ public:
         // distinguishes the accommodation that fired.
         metrics_.describe("yuzu_grpc_subscribe_peer_advisory_total",
                           "Subscribe RPC peer-IP mismatch tolerated under a NAT-aware "
-                          "accommodation instead of rejected (#1128). Labelled event=security "
+                          "accommodation instead of rejected. Labelled event=security "
                           "(SIEM-routing tag) and reason (mtls_identity_match|trusted_nat_cidr)",
                           "counter");
         metrics_.describe("yuzu_register_denied_total",
                           "Register/ProxyRegister rejected an admin-denied agent before "
-                          "consuming its enrollment token (#1067). Labelled source "
+                          "consuming its enrollment token. Labelled source "
                           "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
                           "persistently-denied identity hammering Register is a "
                           "credential-abuse signal",
@@ -980,7 +979,12 @@ public:
                     metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
                 };
                 opts.observer.on_acquire_wait_seconds = [this](double s) {
-                    metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
+                    // Extended buckets (#1686): acquire waits saturate into the
+                    // 10-60s range under pool contention; the default 10s ceiling
+                    // collapses that tail into +Inf.
+                    metrics_.histogram("yuzu_pg_acquire_wait_seconds",
+                                       yuzu::Histogram::seconds_buckets_60s())
+                        .observe(s);
                 };
                 pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
                 // Probe: a live checkout proves reachability and warms one

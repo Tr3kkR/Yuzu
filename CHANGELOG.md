@@ -99,7 +99,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
   the audit subsystem recovers."
 
+- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
+  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
+  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
+  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
+  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
+  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
+  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
+  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
+  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
+  was written into the future back down to now, so a previously-hidden dark endpoint re-enters the
+  freshness window. No schema change — the column had no other consumer.
+
 ### Changed
+
+- **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
+  governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
+  created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
+  `yuzu_pg_acquire_wait_seconds` now use a bucket set extended into the 10-60s range so the saturation
+  tail no longer collapses into `+Inf` (the slow-ingest alert reads a real bucket rather than the
+  `+Inf`-minus-`le=10` complement). (2) The per-site read-degrade WARN sampler is now episode-relative:
+  a new outage after a quiet gap re-logs its leading edge instead of staying silent until the next
+  hundredth occurrence because process-lifetime sampling already spent its "1st" on an earlier,
+  recovered outage (the `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only).
+  (3) Issue-ref tokens (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on
+  `/metrics` / Grafana. The deterministic stuck-`need_full` per-agent signal is deferred pending a
+  real-fleet IO baseline.
 
 - **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
   (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single

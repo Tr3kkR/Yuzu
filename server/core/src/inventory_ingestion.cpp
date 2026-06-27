@@ -234,7 +234,8 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();
             metrics->histogram("yuzu_inventory_ingest_duration_seconds",
-                               {{"source", source}, {"phase", phase}})
+                               {{"source", source}, {"phase", phase}},
+                               yuzu::Histogram::seconds_buckets_60s())
                 .observe(secs);
         }
         emit(source, outcome == InventoryIngestOutcome::kStored    ? "stored"
