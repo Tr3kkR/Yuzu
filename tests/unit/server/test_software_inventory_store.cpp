@@ -492,7 +492,8 @@ TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675
               .value() == 2.0);
 }
 
-TEST_CASE("count_stale_agents counts agents past the freshness cutoff (stale gauge feed)",
+TEST_CASE("count_stale_agents keys on server receipt time, immune to agent collected_at skew "
+          "(#1685)",
           "[pg][software_inventory]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -500,23 +501,52 @@ TEST_CASE("count_stale_agents counts agents past the freshness cutoff (stale gau
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
 
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
     std::vector<SoftwareEntry> rows = {{"Chrome", "1", "", ""}};
     const std::string h = SoftwareInventoryStore::canonical_hash(rows);
-    // last_seen is taken from collected_at: agent-old at 1000, agent-new at 5000.
-    REQUIRE(store.apply_installed_software("agent-old", h, rows, 1000) ==
+
+    // A future-skewed (or hostile) agent supplies collected_at far ahead of now.
+    // Pre-fix this stamped last_seen into the future, so the agent could go dark
+    // and never satisfy `last_seen < cutoff` — hidden from the freshness gauge
+    // forever (#1685). Post-fix last_seen is the SERVER receipt time (~now), so the
+    // skew is ignored. collected_at is otherwise unobservable from the store, so
+    // the gauge is the only lever to assert through.
+    const std::int64_t far_future = now + 100'000'000; // ~3 years ahead
+    REQUIRE(store.apply_installed_software("agent-skew", h, rows, far_future) ==
             InventoryIngestOutcome::kStored);
-    REQUIRE(store.apply_installed_software("agent-new", h, rows, 5000) ==
+    REQUIRE(store.apply_installed_software("agent-honest", h, rows, now) ==
             InventoryIngestOutcome::kStored);
 
-    auto none = store.count_stale_agents(1000); // last_seen < 1000 → neither
-    REQUIRE(none.has_value());
-    CHECK(*none == 0);
-    auto one = store.count_stale_agents(2000); // 1000 < 2000 stale, 5000 not
-    REQUIRE(one.has_value());
-    CHECK(*one == 1);
-    auto both = store.count_stale_agents(6000); // both < 6000
-    REQUIRE(both.has_value());
-    CHECK(*both == 2);
+    // Against a past cutoff neither is stale (both last_seen ≈ now).
+    auto fresh = store.count_stale_agents(now - 1'000);
+    REQUIRE(fresh.has_value());
+    CHECK(*fresh == 0);
+
+    // Against a future cutoff BOTH count — proving agent-skew's last_seen sits at
+    // ~now, NOT the far-future collected_at it supplied. Pre-fix this would be 1
+    // (the skewed agent hidden above the cutoff); the fix makes it 2.
+    auto all_stale = store.count_stale_agents(now + 50'000'000);
+    REQUIRE(all_stale.has_value());
+    CHECK(*all_stale == 2);
+
+    // Partial-count coverage (preserved from the prior collected_at-based test):
+    // backdate one agent's SERVER last_seen 10 days — there is no clock seam, so go
+    // direct — and confirm only it falls outside the real 2-day window.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto upd = pg::exec_params(
+            lease.get(),
+            "UPDATE software_inventory_store.inventory_state SET last_seen = $2::bigint "
+            "WHERE agent_id = $1",
+            std::vector<std::string>{"agent-honest", std::to_string(now - 10 * 86'400)});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    auto window = store.count_stale_agents(now - 2 * 86'400);
+    REQUIRE(window.has_value());
+    CHECK(*window == 1); // only the backdated agent-honest; agent-skew is fresh (~now)
 }
 
 TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phase (#1664)",
