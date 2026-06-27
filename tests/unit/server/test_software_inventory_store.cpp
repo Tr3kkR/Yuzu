@@ -21,6 +21,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::InventoryIngestOutcome;
@@ -492,7 +493,8 @@ TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675
               .value() == 2.0);
 }
 
-TEST_CASE("count_stale_agents counts agents past the freshness cutoff (stale gauge feed)",
+TEST_CASE("count_stale_agents keys on server receipt time, immune to agent collected_at skew "
+          "(#1685)",
           "[pg][software_inventory]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -500,23 +502,52 @@ TEST_CASE("count_stale_agents counts agents past the freshness cutoff (stale gau
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
 
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
     std::vector<SoftwareEntry> rows = {{"Chrome", "1", "", ""}};
     const std::string h = SoftwareInventoryStore::canonical_hash(rows);
-    // last_seen is taken from collected_at: agent-old at 1000, agent-new at 5000.
-    REQUIRE(store.apply_installed_software("agent-old", h, rows, 1000) ==
+
+    // A future-skewed (or hostile) agent supplies collected_at far ahead of now.
+    // Pre-fix this stamped last_seen into the future, so the agent could go dark
+    // and never satisfy `last_seen < cutoff` — hidden from the freshness gauge
+    // forever (#1685). Post-fix last_seen is the SERVER receipt time (~now), so the
+    // skew is ignored. collected_at is otherwise unobservable from the store, so
+    // the gauge is the only lever to assert through.
+    const std::int64_t far_future = now + 100'000'000; // ~3 years ahead
+    REQUIRE(store.apply_installed_software("agent-skew", h, rows, far_future) ==
             InventoryIngestOutcome::kStored);
-    REQUIRE(store.apply_installed_software("agent-new", h, rows, 5000) ==
+    REQUIRE(store.apply_installed_software("agent-honest", h, rows, now) ==
             InventoryIngestOutcome::kStored);
 
-    auto none = store.count_stale_agents(1000); // last_seen < 1000 → neither
-    REQUIRE(none.has_value());
-    CHECK(*none == 0);
-    auto one = store.count_stale_agents(2000); // 1000 < 2000 stale, 5000 not
-    REQUIRE(one.has_value());
-    CHECK(*one == 1);
-    auto both = store.count_stale_agents(6000); // both < 6000
-    REQUIRE(both.has_value());
-    CHECK(*both == 2);
+    // Against a past cutoff neither is stale (both last_seen ≈ now).
+    auto fresh = store.count_stale_agents(now - 1'000);
+    REQUIRE(fresh.has_value());
+    CHECK(*fresh == 0);
+
+    // Against a future cutoff BOTH count — proving agent-skew's last_seen sits at
+    // ~now, NOT the far-future collected_at it supplied. Pre-fix this would be 1
+    // (the skewed agent hidden above the cutoff); the fix makes it 2.
+    auto all_stale = store.count_stale_agents(now + 50'000'000);
+    REQUIRE(all_stale.has_value());
+    CHECK(*all_stale == 2);
+
+    // Partial-count coverage (preserved from the prior collected_at-based test):
+    // backdate one agent's SERVER last_seen 10 days — there is no clock seam, so go
+    // direct — and confirm only it falls outside the real 2-day window.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto upd = pg::exec_params(
+            lease.get(),
+            "UPDATE software_inventory_store.inventory_state SET last_seen = $2::bigint "
+            "WHERE agent_id = $1",
+            std::vector<std::string>{"agent-honest", std::to_string(now - 10 * 86'400)});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    auto window = store.count_stale_agents(now - 2 * 86'400);
+    REQUIRE(window.has_value());
+    CHECK(*window == 1); // only the backdated agent-honest; agent-skew is fresh (~now)
 }
 
 TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phase (#1664)",
@@ -595,6 +626,113 @@ TEST_CASE("read-degrade store_not_open reason fires when the store failed to ope
     CHECK_FALSE(store.get_agent_software("agent-a").has_value());
     CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "store_not_open"}})
               .value() == 2.0);
+}
+
+TEST_CASE("migration v3 backfill clamps pre-fix future last_seen/first_seen at re-open "
+          "(#1685 / governance UP-10)",
+          "[pg][software_inventory]") {
+    // The forward write fix can't re-stamp a dark agent, so v3 must clamp rows that
+    // were ALREADY persisted with a future-skewed timestamp. Reproduce a pre-fix
+    // row, roll the recorded schema version back to 2 so a fresh construction
+    // re-runs ONLY v3 (a DML, re-run-safe), and prove the clamp moved it back into
+    // the freshness window.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const std::int64_t far_future = now + 100'000'000;
+    { // first construction creates schema + tables + schema_meta @ v3 (v3 no-ops on empty)
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    { // seed a pre-fix future-skewed row, then roll the recorded version back to 2
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.inventory_state "
+            "(agent_id, source, content_hash, first_seen, last_seen) "
+            "VALUES ('agent-future', 'installed_software', 'deadbeef', $1::bigint, $1::bigint)",
+            std::vector<std::string>{std::to_string(far_future)});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        pg::PgResult back = pg::exec_params(
+            lease.get(),
+            "UPDATE public.schema_meta SET version = 2 WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(back.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore store{pool}; // re-runs v3 → clamps the future row
+    REQUIRE(store.is_open());
+
+    // Discriminator: against a cutoff between now and far_future, the CLAMPED row
+    // (last_seen ≈ now) counts stale; an un-clamped row (last_seen = far_future)
+    // would sit above the cutoff and count 0.
+    auto stale = store.count_stale_agents(now + 50'000'000);
+    REQUIRE(stale.has_value());
+    CHECK(*stale == 1);
+
+    // first_seen is clamped too (UP-10) — assert it is no longer in the future.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult sel = pg::exec_params(
+            lease.get(),
+            "SELECT first_seen FROM software_inventory_store.inventory_state "
+            "WHERE agent_id = 'agent-future'",
+            std::vector<std::string>{});
+        REQUIRE(sel.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(sel.get()) == 1);
+        const std::int64_t first_seen = std::stoll(PQgetvalue(sel.get(), 0, 0));
+        CHECK(first_seen <= now + 5); // clamped to ~now (small margin for a clock tick)
+    }
+}
+
+TEST_CASE("read-degrade sampler is data-race-free under concurrent degraded reads "
+          "(#1686 DegradeSampler — TSan guard)",
+          "[pg][software_inventory]") {
+    // The episode WARN sampler's DegradeSampler uses two std::atomics. A regression
+    // dropping the atomics would be a data race invisible to a single-threaded test
+    // but flagged by ThreadSanitizer here. Drop the schema so every read degrades via
+    // the query_error path, then hammer it from many threads. NB: no Catch2 assertion
+    // runs INSIDE the threads (Catch2's macros aren't thread-safe — that would flag
+    // Catch2, not our code); all assertions run after join on the exact counter.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP SCHEMA software_inventory_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 50;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < kPerThread; ++i) {
+                SoftwareFleetQuery q;
+                q.name = "Chrome";
+                (void)store.query_software(q);       // → query_error degrade
+                (void)store.get_agent_software("agent-x"); // → query_error degrade
+            }
+        });
+    }
+    for (auto& th : threads)
+        th.join();
+    // The counter is exact regardless of WARN sampling: every degraded read bumped it
+    // exactly once, two reads per iteration.
+    const double total =
+        metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}}).value();
+    CHECK(total == static_cast<double>(kThreads * kPerThread * 2));
 }
 
 TEST_CASE("count_stale_agents returns nullopt on a backend degrade (freeze-counter trigger)",

@@ -466,11 +466,12 @@ groups:
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
         # measures time-to-GET a connection — this measures total txn hold
         # (incl. statement execution), so it fires even when the pool hands out
-        # connections quickly but transactions run slow. The default histogram
-        # buckets cap at 10s, so the 10-30s saturation tail collapses into +Inf;
-        # the +Inf-minus-le=10 complement is the buildable signal today (extending
-        # the buckets into the 10-60s range is a tracked follow-up). Fires ahead of
-        # YuzuInventoryReadDegraded (sre).
+        # connections quickly but transactions run slow. The histogram buckets now
+        # extend into the 10-60s range (#1686), so the saturation tail is resolved
+        # into le=15/20/30/45/60 rather than collapsing into +Inf — the
+        # +Inf-minus-le=10 complement below is an honest count of full ingests over
+        # 10s, and histogram_quantile over the tail now yields a real p99. Fires
+        # ahead of YuzuInventoryReadDegraded (sre).
         expr: |
           sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
           - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
@@ -486,6 +487,24 @@ groups:
             need_full herd, ahead of read-path degradation. Correlate with
             yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      # Recording rule (#1686): now that yuzu_inventory_ingest_duration_seconds
+      # carries 10-60s buckets, histogram_quantile over the tail yields a REAL p99
+      # (previously everything >10s collapsed into +Inf, so a quantile pinned at
+      # +Inf). Precompute it per (source, phase) so dashboards — and any future
+      # tighter ">30s critical" alert — read a cheap series instead of a fan-out
+      # quantile at query time. `le` is kept in the by() set (required by
+      # histogram_quantile). The [10m] window matches the sibling
+      # YuzuInventoryIngestSlow over the same _bucket series: this metric is
+      # daily-cadence (ADR-0016 per-agent phase spread), so a shorter window would
+      # often see zero ingests on a quiet fleet → NaN gaps.
+      - record: yuzu:inventory_ingest_duration_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (source, phase, le) (
+              rate(yuzu_inventory_ingest_duration_seconds_bucket[10m])
+            )
+          )
       - alert: YuzuInventoryStaleCountUnavailable
         # The stale-agents freshness count could not be computed (pool saturation
         # or query timeout) on the metrics sweep, so yuzu_inventory_stale_agents is
