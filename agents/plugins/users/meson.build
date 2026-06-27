@@ -9,6 +9,7 @@ shared_library(
   'users',
   files('src/users_plugin.cpp'),
   name_prefix: '',
+  include_directories: include_directories('../shared'),  # win_str.hpp (#1681)
   dependencies: users_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

@@ -37,6 +37,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 #include "config_checks.hpp"
@@ -145,48 +146,78 @@ std::string escape_pipes(std::string_view s) {
 // ── Get installed apps (same approach as installed_apps plugin) ────────────
 
 #ifdef _WIN32
+
+// RAII closer for an HKEY -- releases the handle even if a value read throws
+// (std::string allocation in reg_sz_to_utf8/to_wide). vuln_scan reads HKLM/HKCU
+// directly, so unlike installed_apps it needs no hive load/unload guard.
+struct HKeyCloser {
+    HKEY h{};
+    explicit HKeyCloser(HKEY k) : h(k) {}
+    ~HKeyCloser() {
+        if (h)
+            RegCloseKey(h);
+    }
+    HKeyCloser(const HKeyCloser&) = delete;
+    HKeyCloser& operator=(const HKeyCloser&) = delete;
+};
+
 void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                              std::vector<AppInfo>& apps) {
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) !=
-        ERROR_SUCCESS) {
+    // Reg*W + WideCharToMultiByte(CP_UTF8) so non-ASCII names (e.g. "Café")
+    // survive intact -- the *A APIs return the system ANSI code page (cp1252),
+    // which then fails UTF-8 validation downstream and corrupts the stored /
+    // fleet-queryable software-inventory surface (#1662 / #1682).
+    if (RegOpenKeyExW(root, yuzu::win::to_wide(subkey).c_str(), 0,
+                      KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) != ERROR_SUCCESS) {
         return;
     }
+    HKeyCloser hkey_guard{hkey};
 
-    char name_buf[256]{};
+    // RegEnumKeyExW's lpcchName is a WCHAR COUNT, not a byte size. Bind the array
+    // size and every reset to one constant so the byte-vs-count unit cannot skew --
+    // the #1662 A->W conversion missed one reset site (gov Gate 3/4 BLOCKING).
+    constexpr DWORD kNameBufLen = 256;
+    wchar_t name_buf[kNameBufLen]{};
     DWORD idx = 0;
-    DWORD name_len = sizeof(name_buf);
+    DWORD name_len = kNameBufLen;
 
-    while (RegEnumKeyExA(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+    while (RegEnumKeyExW(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
            ERROR_SUCCESS) {
         HKEY app_key{};
-        if (RegOpenKeyExA(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
-            auto read_str = [&](const char* value_name) -> std::string {
-                char buf[512]{};
-                DWORD size = sizeof(buf);
+        if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
+            HKeyCloser app_guard{app_key};
+            // Value names are compile-time wide literals -> no per-iteration to_wide
+            // allocation in this hot loop (hundreds of apps x 3 reads), and the only
+            // throwing call left is the post-read reg_sz_to_utf8, on which app_guard
+            // still releases app_key (#1682 Gate-4 R4). buf is written as bytes and
+            // read back through its declared wchar_t lvalue (LPBYTE is alignment-1).
+            auto read_str = [&](const wchar_t* value_name) -> std::string {
+                wchar_t buf[512]{};
+                DWORD size = sizeof(buf); // size in BYTES
                 DWORD type = 0;
-                if (RegQueryValueExA(app_key, value_name, nullptr, &type,
+                if (RegQueryValueExW(app_key, value_name, nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if (type == REG_SZ && size > 0) {
-                        return std::string(buf, size - 1);
+                    if (type == REG_SZ && size >= sizeof(wchar_t)) {
+                        return yuzu::win::reg_sz_to_utf8(buf, size);
                     }
                 }
                 return {};
             };
 
-            auto display_name = read_str("DisplayName");
+            auto display_name = read_str(L"DisplayName");
             if (!display_name.empty()) {
-                auto sys_component = read_str("SystemComponent");
+                auto sys_component = read_str(L"SystemComponent");
                 if (sys_component != "1") {
-                    auto version = read_str("DisplayVersion");
+                    auto version = read_str(L"DisplayVersion");
                     apps.push_back({std::move(display_name), std::move(version)});
                 }
             }
-            RegCloseKey(app_key);
+            // app_guard closes app_key (also on the read_str throw path)
         }
-        name_len = sizeof(name_buf);
+        name_len = kNameBufLen;
     }
-    RegCloseKey(hkey);
+    // hkey_guard closes hkey
 }
 
 std::vector<AppInfo> get_installed_apps() {

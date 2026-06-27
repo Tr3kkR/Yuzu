@@ -30,6 +30,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace {
@@ -37,29 +38,19 @@ namespace {
 YuzuPluginContext* g_ctx = nullptr;
 
 #ifdef _WIN32
+// to_wide / from_wide now come from the shared agents/plugins/shared/win_str.hpp
+// (#1681) instead of a local copy; brought in unqualified so the existing call
+// sites are unchanged. The shared versions are behaviour-identical for valid input
+// (they add null / non-positive guards over the old local copies).
+using yuzu::win::from_wide;
+using yuzu::win::to_wide;
+
 HKEY parse_hive(std::string_view hive) {
     if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
     if (hive == "HKCU") return HKEY_CURRENT_USER;
     if (hive == "HKCR") return HKEY_CLASSES_ROOT;
     if (hive == "HKU")  return HKEY_USERS;
     return nullptr;
-}
-
-std::wstring to_wide(std::string_view s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring ws(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), ws.data(), len);
-    return ws;
-}
-
-std::string from_wide(const wchar_t* ws, int len = -1) {
-    if (!ws) return {};
-    int sz = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(sz), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, len, s.data(), sz, nullptr, nullptr);
-    if (!s.empty() && s.back() == '\0') s.pop_back();
-    return s;
 }
 
 std::string reg_type_name(DWORD type) {
