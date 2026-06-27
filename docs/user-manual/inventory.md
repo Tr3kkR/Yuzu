@@ -202,6 +202,15 @@ payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
 leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
 freshness gauge may be frozen).
 
+A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
+ships in the same group: it precomputes the 99th-percentile ingest duration per
+`(source, phase)` over a 10m window (matching `YuzuInventoryIngestSlow`) so
+dashboards and any future tighter latency alert read a cheap single series rather
+than a fan-out `histogram_quantile` at query time — meaningful only because the
+extended 10-60s buckets resolve the tail. Reference it directly in Grafana panels
+or custom alert expressions; it returns no data unless the shipped rules file is
+loaded.
+
 `YuzuInventoryStaleAgents` ships **disabled** (commented out) in the same group:
 the `yuzu_inventory_stale_agents` gauge has no fleet-size-independent absolute
 threshold (`>50` is day-one noise on a 100-device pilot and 0.1% ambient churn on a

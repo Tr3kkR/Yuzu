@@ -118,13 +118,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
   `yuzu_pg_acquire_wait_seconds` now use a bucket set extended into the 10-60s range so the saturation
   tail no longer collapses into `+Inf` (the slow-ingest alert reads a real bucket rather than the
-  `+Inf`-minus-`le=10` complement). (2) The per-site read-degrade WARN sampler is now episode-relative:
-  a new outage after a quiet gap re-logs its leading edge instead of staying silent until the next
-  hundredth occurrence because process-lifetime sampling already spent its "1st" on an earlier,
-  recovered outage (the `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only).
-  (3) Issue-ref tokens (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on
-  `/metrics` / Grafana. The deterministic stuck-`need_full` per-agent signal is deferred pending a
-  real-fleet IO baseline.
+  `+Inf`-minus-`le=10` complement). A `yuzu:inventory_ingest_duration_seconds:p99` Prometheus
+  **recording rule** (per `source`/`phase`, `[10m]` window matching the slow-ingest alert) ships
+  alongside, precomputing the now-resolvable tail quantile the extended buckets make meaningful.
+  (2) The per-site read-degrade WARN sampler is now episode-relative: a new outage after a quiet gap
+  re-logs its leading edge instead of staying silent until the next hundredth occurrence because
+  process-lifetime sampling already spent its "1st" on an earlier, recovered outage (the
+  `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only). (3) Issue-ref tokens
+  (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on `/metrics` / Grafana.
+  The deterministic stuck-`need_full` per-agent signal is deferred pending a real-fleet IO baseline.
 
 - **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
   (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single

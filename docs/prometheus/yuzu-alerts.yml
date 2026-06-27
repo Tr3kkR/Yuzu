@@ -487,6 +487,24 @@ groups:
             need_full herd, ahead of read-path degradation. Correlate with
             yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      # Recording rule (#1686): now that yuzu_inventory_ingest_duration_seconds
+      # carries 10-60s buckets, histogram_quantile over the tail yields a REAL p99
+      # (previously everything >10s collapsed into +Inf, so a quantile pinned at
+      # +Inf). Precompute it per (source, phase) so dashboards — and any future
+      # tighter ">30s critical" alert — read a cheap series instead of a fan-out
+      # quantile at query time. `le` is kept in the by() set (required by
+      # histogram_quantile). The [10m] window matches the sibling
+      # YuzuInventoryIngestSlow over the same _bucket series: this metric is
+      # daily-cadence (ADR-0016 per-agent phase spread), so a shorter window would
+      # often see zero ingests on a quiet fleet → NaN gaps.
+      - record: yuzu:inventory_ingest_duration_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (source, phase, le) (
+              rate(yuzu_inventory_ingest_duration_seconds_bucket[10m])
+            )
+          )
       - alert: YuzuInventoryStaleCountUnavailable
         # The stale-agents freshness count could not be computed (pool saturation
         # or query timeout) on the metrics sweep, so yuzu_inventory_stale_agents is
