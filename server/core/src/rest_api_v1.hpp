@@ -53,6 +53,9 @@ class ExecutionEventBus;
 // Forward-declared (used only as a pointer in register_routes); the .cpp includes
 // baseline_store.hpp for the definition.
 class BaselineStore;
+// ADR-0016: the typed daily-sync software store backs GET /api/v1/inventory/software.
+// Forward-declared (pointer-only in register_routes); the .cpp includes the header.
+class SoftwareInventoryStore;
 }
 
 #include <httplib.h>
@@ -101,6 +104,18 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
+    /// Per-device Inventory-scope predicate for the fleet-wide installed-software
+    /// read (GET /api/v1/inventory/software). Returns true iff `username` may see
+    /// `agent_id`'s rows via a management group. A FILTER, not a gate: unlike
+    /// ScopedPermFn it writes no response and is invoked per result row to drop
+    /// out-of-scope devices (the fleet query returns many agents). Mirrors the MCP
+    /// query_installed_software scope fn exactly (server.cpp wires the SAME
+    /// check_scoped_permission chokepoint). Empty/default `{}` = no filter
+    /// (legacy-open, matching the MCP default + require_scoped_permission) —
+    /// production MUST wire it from server.cpp or a fleet read leaks one operator's
+    /// devices' software to another (#1676 cross-operator IDOR class).
+    using InventoryScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -210,7 +225,12 @@ public:
         LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
+        // ADR-0016: typed installed-software store + its per-device Inventory-scope
+        // predicate for GET /api/v1/inventory/software (trailing optional deps;
+        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        SoftwareInventoryStore* software_inventory_store = nullptr,
+        InventoryScopeFn inventory_scope_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -241,7 +261,12 @@ public:
         LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
+        // ADR-0016: typed installed-software store + its per-device Inventory-scope
+        // predicate for GET /api/v1/inventory/software (trailing optional deps;
+        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        SoftwareInventoryStore* software_inventory_store = nullptr,
+        InventoryScopeFn inventory_scope_fn = {});
 };
 
 } // namespace yuzu::server

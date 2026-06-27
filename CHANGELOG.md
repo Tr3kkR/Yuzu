@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **REST endpoint for fleet-wide installed-software inventory (ADR-0016 follow-on).**
+  `GET /api/v1/inventory/software` exposes the typed `SoftwareInventoryStore` over REST
+  (gated on `Inventory:Read`), the agentic-first sibling of the `query_installed_software`
+  MCP tool. Filter by `name` / `agent_id` (omit both for a fleet scan); `limit` capped at
+  1000 with `result_truncated_by_cap` when more rows exist. Results are management-group
+  scoped — out-of-scope devices are dropped and counted in `devices_omitted` (a positive
+  value means matching software exists outside your scope, **not** "absent fleet-wide"),
+  with a distinct scope-denied audit row. On store degradation it returns `503` (an A4
+  error envelope), **never** an empty `200`, so a vulnerability query cannot read a
+  transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads). A
+  software dashboard / per-device drill-down remain planned follow-ons.
 - **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
   pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
   with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
@@ -26,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
   **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
   scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
-  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  tools, and via **`GET /api/v1/inventory/software`** (REST; see the separate entry above). A
+  software dashboard is a planned follow-on. A deploy-time opt-out
   (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
   privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
   (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and

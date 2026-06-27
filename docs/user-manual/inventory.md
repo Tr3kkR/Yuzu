@@ -118,8 +118,49 @@ workers (gated on `Inventory:Read`):
   genuinely empty result (no error, zero rows) means the query succeeded and
   matched nothing in your scope.
 
-A dedicated REST endpoint and a software dashboard / per-device drill-down view
-are planned follow-ons.
+### REST (for automation / scripts)
+
+The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
+`Inventory:Read`), the agentic-first sibling of the MCP tool:
+
+```bash
+# Which devices run Google Chrome (fleet-wide, within your scope)?
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=Google%20Chrome"
+
+# Everything on one device
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+```
+
+- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
+  `name` and `agent_id` for a fleet-wide scan.
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
+  "meta": {"api_version": "v1"}}`. Each row is
+  `{agent_id, name, version, publisher, install_date}`.
+- **Scoped to your management groups**, exactly like the MCP tool: out-of-scope
+  devices are dropped (and the omission audited), and `devices_omitted` reports the
+  count. A positive value means matching software exists outside your scope — an
+  empty or short result does **not** mean the software is absent fleet-wide.
+- `result_truncated_by_cap: true` (present only when set) means more rows exist past
+  `limit` (keyset pagination is a follow-up, #1634).
+- **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
+  `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
+  transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
+  Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
+  succeeded and matched nothing in your scope.
+
+**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
+endpoint).** The 1000-row cap is applied by the store *before* the management-group
+scope filter runs. So a narrow-scope operator querying a popular title across a large
+fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
+their own rows, because the cap was consumed by out-of-scope devices that sort ahead
+of yours. **That is "incomplete", not "absent in your scope."** Until keyset
+pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
+the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
+filter, so your in-scope rows fit under the cap.
+
+A software dashboard / per-device drill-down view are planned follow-ons.
 
 ## Access control
 
