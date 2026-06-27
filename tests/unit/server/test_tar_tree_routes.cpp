@@ -443,6 +443,10 @@ TEST_CASE("tar routes: dropped audit row flags Sec-Audit-Failed once; clean path
         CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A"));
         REQUIRE(r);
         CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        // BOTH verbs must have fired (the first throw was caught, the second still ran)
+        // — otherwise count==1 would prove single-emission, not de-duplication.
+        CHECK(h.find_audit("tar.dns.read", "dispatched") != nullptr);
+        CHECK(h.find_audit("tar.arp.read", "dispatched") != nullptr);
     }
     SECTION("/capture-sources/push two sources both drop — header exactly once over the loop") {
         TarHarness h;
@@ -454,6 +458,13 @@ TEST_CASE("tar routes: dropped audit row flags Sec-Audit-Failed once; clean path
         CHECK(r->status == 200);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        // BOTH loop iterations must have reached the audit chokepoint — otherwise
+        // count==1 could mean the loop skipped the second source, not de-duplication.
+        int cfg_rows = 0;
+        for (const auto& row : h.audit_log)
+            if (row.action == "tar.sources.configure")
+                ++cfg_rows;
+        CHECK(cfg_rows == 2);
     }
     SECTION("clean path sets NO Sec-Audit-Failed header") {
         TarHarness h; // audit_ok=true, audit_throws=false
