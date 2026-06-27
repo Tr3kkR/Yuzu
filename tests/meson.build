@@ -317,6 +317,7 @@ if build_server
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_rest_software_packages.cpp',
+      'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',

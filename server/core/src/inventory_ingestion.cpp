@@ -233,8 +233,16 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         if (metrics) {
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();
+            // SOLE creating site for yuzu_inventory_ingest_duration_seconds — the
+            // bucket boundaries are fixed by whichever call births a (source,phase)
+            // series first, and this is it (unlike pg_acquire there is no registration
+            // birth, because the {source,phase} label sets aren't known up front). Any
+            // NEW call site for this metric MUST pass seconds_buckets_60s() too, or it
+            // would silently birth a default-10s-ceiling series and collapse the tail
+            // (governance #1686 UP-6 / consistency N2).
             metrics->histogram("yuzu_inventory_ingest_duration_seconds",
-                               {{"source", source}, {"phase", phase}})
+                               {{"source", source}, {"phase", phase}},
+                               yuzu::Histogram::seconds_buckets_60s())
                 .observe(secs);
         }
         emit(source, outcome == InventoryIngestOutcome::kStored    ? "stored"
