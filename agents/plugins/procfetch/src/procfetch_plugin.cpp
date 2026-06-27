@@ -52,6 +52,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "bcrypt.lib")
 #include <charconv>
 #include <tlhelp32.h>
@@ -243,17 +244,9 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string s(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), len, nullptr, nullptr);
-    return s;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 std::string get_process_image_path(DWORD pid) {
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -267,7 +260,7 @@ std::string get_process_image_path(DWORD pid) {
 
     if (!ok)
         return {};
-    return wide_to_utf8(path_buf);
+    return from_wide(path_buf);
 }
 
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
@@ -332,7 +325,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
     do {
         int pid = static_cast<int>(pe.th32ProcessID);
-        std::string name = wide_to_utf8(pe.szExeFile);
+        std::string name = from_wide(pe.szExeFile);
         if (name.empty())
             continue;
 

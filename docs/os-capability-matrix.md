@@ -37,6 +37,7 @@ _Last hand-updated: 2026-06-27._
 | **Live device snapshot — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent (`/proc/net/tcp` exposes inode, not pid) | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Device page "Get live info" Processes card |
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
+| **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate
