@@ -32,6 +32,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+// UTF-16<->UTF-8 registry conversion (#1662). In a header so the #1662
+// regression test exercises the same code, not a re-implementation.
+#include "installed_apps_registry_utf8.hpp"
 #endif
 
 namespace {
@@ -134,40 +138,11 @@ std::string sanitize_utf8(const std::string& s) {
 
 #ifdef _WIN32
 
-// Registry strings are UTF-16. Read via the *W APIs and convert to UTF-8 so
-// non-ASCII names (e.g. "Café") survive intact — the *A APIs return the system
-// ANSI code page (cp1252), which then fails UTF-8 validation downstream and
-// corrupts the typed software-inventory store's WHERE name=$1 lookups (#1662).
-// to_wide/from_wide are duplicated from registry_plugin.cpp for build isolation
-// (each plugin is its own shared object with no shared internal code); reg_sz_to_utf8
-// is a local helper for the REG_SZ byte-size convention.
-std::wstring to_wide(std::string_view s) {
-    if (s.empty())
-        return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring ws(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), ws.data(), len);
-    return ws;
-}
-
-std::string from_wide(const wchar_t* ws, int len = -1) {
-    if (!ws)
-        return {};
-    int sz = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(sz), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, len, s.data(), sz, nullptr, nullptr);
-    if (!s.empty() && s.back() == '\0')
-        s.pop_back();
-    return s;
-}
-
-// Convert a REG_SZ payload (size is in BYTES, may include trailing NUL(s)) to UTF-8.
-std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
-    size_t nch = size_bytes / sizeof(wchar_t);
-    while (nch > 0 && buf[nch - 1] == L'\0')
-        --nch;
-    return from_wide(buf, static_cast<int>(nch));
-}
+// to_wide / from_wide / reg_sz_to_utf8 now live in
+// installed_apps_registry_utf8.hpp (included above) so the #1662 regression test
+// runs the same conversion the plugin does. Pull them into this anonymous
+// namespace so the existing unqualified call sites resolve unchanged.
+using namespace yuzu::installed_apps::reg_utf8;
 
 // RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
 // BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
