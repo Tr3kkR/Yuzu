@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Device page — live Disk space card.** New card on the device "Get live info" lens dispatches
   `disk_space/free` on demand; per-volume table with a colour-coded usage bar (>=90% used or <5 GiB
   free = red, matching the `storage.low` DEX threshold). Audit verb `device.live.disk`.
+- **REST endpoint for fleet-wide installed-software inventory (ADR-0016 follow-on).**
+  `GET /api/v1/inventory/software` exposes the typed `SoftwareInventoryStore` over REST
+  (gated on `Inventory:Read`), the agentic-first sibling of the `query_installed_software`
+  MCP tool. Filter by `name` / `agent_id` (omit both for a fleet scan); `limit` capped at
+  1000 with `result_truncated_by_cap` when more rows exist. Results are management-group
+  scoped — out-of-scope devices are dropped and counted in `devices_omitted` (a positive
+  value means matching software exists outside your scope, **not** "absent fleet-wide"),
+  with a distinct scope-denied audit row. On store degradation it returns `503` (an A4
+  error envelope), **never** an empty `200`, so a vulnerability query cannot read a
+  transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads). A
+  software dashboard / per-device drill-down remain planned follow-ons.
 - **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
   pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
   with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
@@ -33,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
   **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
   scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
-  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  tools, and via **`GET /api/v1/inventory/software`** (REST; see the separate entry above). A
+  software dashboard is a planned follow-on. A deploy-time opt-out
   (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
   privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
   (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and
@@ -49,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
 
 ### Security
+
+- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
+  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
+  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
+  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
+  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
+  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
+  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
+  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
+  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
+  or `first_seen` was written into the future back down to now, so a previously-hidden dark endpoint
+  re-enters the freshness window. No schema change — the column had no other consumer.
 
 - **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
   route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
@@ -108,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
+  governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
+  created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
+  `yuzu_pg_acquire_wait_seconds` now use a bucket set extended into the 10-60s range so the saturation
+  tail no longer collapses into `+Inf` (the slow-ingest alert reads a real bucket rather than the
+  `+Inf`-minus-`le=10` complement). A `yuzu:inventory_ingest_duration_seconds:p99` Prometheus
+  **recording rule** (per `source`/`phase`, `[10m]` window matching the slow-ingest alert) ships
+  alongside, precomputing the now-resolvable tail quantile the extended buckets make meaningful.
+  (2) The per-site read-degrade WARN sampler is now episode-relative: a new outage after a quiet gap
+  re-logs its leading edge instead of staying silent until the next hundredth occurrence because
+  process-lifetime sampling already spent its "1st" on an earlier, recovered outage (the
+  `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only). (3) Issue-ref tokens
+  (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on `/metrics` / Grafana.
+  The deterministic stuck-`need_full` per-agent signal is deferred pending a real-fleet IO baseline.
+
 - **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
   (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
   `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
@@ -149,6 +188,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
+
+- **Sibling inventory plugins now read non-ASCII registry strings as UTF-8 (#1682), via a shared
+  helper (#1681).** Four plugins read the registry with the ANSI `Reg*A` APIs and carried the same
+  cp1252 mojibake as #1662 on any non-ASCII value: `vuln_scan` (the installed-apps enumerate path —
+  the same shape as the pre-#1662 `installed_apps`, including a `RegEnumKeyExA` key-name enumeration —
+  plus `config_checks.hpp`), `os_info` (the OS `ProductName` / edition strings), `sccm` (the SCCM
+  client version), and `windows_updates` (the WSUS `WUServer` URL). Every read whose value lands in a
+  stored or fleet-queryable surface now uses the wide `Reg*W` APIs + `WideCharToMultiByte(CP_UTF8)`;
+  presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
+  probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
+  picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
+  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
+  Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
+  **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
+  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
+  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
+  (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
+  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
+  delegating shims. This is a **partial** consolidation — **not** every conversion site: other plugins
+  (`processes`, `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, and the
+  `tar_dns_collector`/`tar_proc_etw`/`tar_proc_perf`/`tar_arp_collector` siblings) and several agent-**core**
+  files (`process_enum`, `dex_observer`, `guard_file`, `guard_registry`, `guard_service`, `temp_file`,
+  `trigger_engine`) still carry their own named or inline conversions; a comprehensive sweep is a tracked
+  follow-up, and `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
+  first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
+  `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
+  prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
+  four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
+  cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
+  trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
+  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows: unit tests + a
+  per-plugin MSVC compile, and an end-to-end smoke inside the Hyper-V agent VM that seeded a non-ASCII
+  `DisplayName` "Café Ñoño 日本語" under `HKCU\…\Uninstall` and confirmed it round-tripped byte-exact
+  UTF-8 through the real `RegEnumKeyExW` + `reg_sz_to_utf8` read path.)
 
 - **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
   A `service-running` / `service-stopped` guard watching a steadily-compliant service

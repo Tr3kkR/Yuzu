@@ -41,6 +41,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace {
@@ -82,24 +83,33 @@ bool get_rtl_version(RTL_OSVERSIONINFOW& vi) {
 }
 
 std::string read_registry_string(HKEY root, const char* subkey, const char* value) {
+    // Reg*W so non-ASCII OS identity strings (e.g. a localized edition) survive as
+    // UTF-8 in the stored / fleet-queryable device surface rather than cp1252
+    // mojibake (#1662 / #1682). Widen the names BEFORE opening the key so the only
+    // operation between open and RegCloseKey is the non-allocating RegQueryValueExW;
+    // the allocating reg_sz_to_utf8 runs AFTER the handle is closed, so a
+    // std::bad_alloc cannot leak the HKEY (#1682 Gate-4 R1; vuln_scan's loop uses
+    // HKeyCloser RAII instead).
+    const std::wstring wsubkey = yuzu::win::to_wide(subkey);
+    const std::wstring wvalue = yuzu::win::to_wide(value);
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+    if (RegOpenKeyExW(root, wsubkey.c_str(), 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
         return {};
     }
-    char buf[256]{};
-    DWORD size = sizeof(buf);
-    DWORD type = 0;
-    std::string result;
-    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
-        ERROR_SUCCESS) {
-        if (type == REG_SZ && size > 0) {
-            result.assign(buf, size - 1); // exclude null terminator
-        }
+    wchar_t buf[512]{};
+    DWORD size = sizeof(buf); // size in BYTES; buf is written as bytes and read back
+    DWORD type = 0;           // through its declared wchar_t lvalue (LPBYTE is align-1)
+    const LONG rc = RegQueryValueExW(hkey, wvalue.c_str(), nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size);
+    RegCloseKey(hkey); // closed before the allocating convert -- no leak window
+    if (rc == ERROR_SUCCESS && type == REG_SZ && size >= sizeof(wchar_t)) {
+        return yuzu::win::reg_sz_to_utf8(buf, size);
     }
-    RegCloseKey(hkey);
-    return result;
+    return {};
 }
 
+// Numeric read -- the value is a DWORD, never decoded into a string, so it carries
+// no encoding and stays Reg*A (no cp1252 mojibake risk; #1682 audit).
 DWORD read_registry_dword(HKEY root, const char* subkey, const char* value) {
     HKEY hkey{};
     if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {

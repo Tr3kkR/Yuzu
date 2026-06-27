@@ -114,7 +114,11 @@ public:
     ///    hash from these rows and stores THAT (never trusts `claimed_hash`),
     ///    replacing all of this agent's rows + upserting the parent in one
     ///    transaction → kStored.
-    /// `collected_at` is epoch seconds (0 → server wall-clock now).
+    /// `collected_at` (epoch seconds, agent-supplied) is part of the ingest
+    /// contract but is **intentionally NOT used to stamp `last_seen`/`first_seen`**
+    /// — those are the SERVER receipt time so the staleness gauge is immune to
+    /// agent clock skew (#1685, ADR-0016 Update 2026-06-27). Retained on the wire
+    /// (proto-carried) for a future content-age signal.
     /// `rows` is taken BY VALUE so the full-payload path can `std::move` the
     /// entries into normalization instead of copying up to kMaxEntries structs on
     /// the ingest hot path (UP-8); pass `std::move` at the call site.

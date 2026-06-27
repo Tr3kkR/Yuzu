@@ -52,7 +52,10 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   `install_date` may be empty (`''`) — the `installed_apps` plugin does not
   guarantee them on every platform/package.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
-  device sync bookkeeping.
+  device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
+  (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
+  `collected_at` — so the recency filters and freshness gauge below are immune to
+  agent clock skew (#1685).
 
 Today it is queried with **direct SQL**, e.g.:
 
@@ -115,8 +118,49 @@ workers (gated on `Inventory:Read`):
   genuinely empty result (no error, zero rows) means the query succeeded and
   matched nothing in your scope.
 
-A dedicated REST endpoint and a software dashboard / per-device drill-down view
-are planned follow-ons.
+### REST (for automation / scripts)
+
+The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
+`Inventory:Read`), the agentic-first sibling of the MCP tool:
+
+```bash
+# Which devices run Google Chrome (fleet-wide, within your scope)?
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=Google%20Chrome"
+
+# Everything on one device
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+```
+
+- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
+  `name` and `agent_id` for a fleet-wide scan.
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
+  "meta": {"api_version": "v1"}}`. Each row is
+  `{agent_id, name, version, publisher, install_date}`.
+- **Scoped to your management groups**, exactly like the MCP tool: out-of-scope
+  devices are dropped (and the omission audited), and `devices_omitted` reports the
+  count. A positive value means matching software exists outside your scope — an
+  empty or short result does **not** mean the software is absent fleet-wide.
+- `result_truncated_by_cap: true` (present only when set) means more rows exist past
+  `limit` (keyset pagination is a follow-up, #1634).
+- **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
+  `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
+  transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
+  Distinct from a genuinely empty result (`200` with `count: 0`), which means the query
+  succeeded and matched nothing in your scope.
+
+**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
+endpoint).** The 1000-row cap is applied by the store *before* the management-group
+scope filter runs. So a narrow-scope operator querying a popular title across a large
+fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
+their own rows, because the cap was consumed by out-of-scope devices that sort ahead
+of yours. **That is "incomplete", not "absent in your scope."** Until keyset
+pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
+the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
+filter, so your in-scope rows fit under the cap.
+
+A software dashboard / per-device drill-down view are planned follow-ons.
 
 ## Access control
 
@@ -168,12 +212,17 @@ whose ingest is failing. Four further series sharpen the picture:
   `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
-  otherwise invisible. The per-degrade WARN is sampled (1st then every 100th per
-  site) so a fan-out outage can't flood the log; the counter is the continuous
+  otherwise invisible. The per-degrade WARN is sampled per site — the leading edge
+  of each outage *episode* (a degrade arriving after a quiet gap), then every 100th
+  within it — so a fan-out outage can't flood the log while a second, later outage
+  still logs its onset rather than staying silent; the counter is the continuous
   signal.
 - `yuzu_inventory_stale_agents{source}` (gauge) — agents that have not synced this
   source within the staleness window (two missed daily cycles), a freshness /
-  liveness signal sampled on the metrics sweep. On a degrade the gauge **holds its
+  liveness signal sampled on the metrics sweep. Staleness keys on the **server
+  receipt time** (`inventory_state.last_seen`), not the agent's `collected_at`, so a
+  future-skewed or hostile agent cannot pin itself "fresh" and hide a dark endpoint
+  (#1685). On a degrade the gauge **holds its
   prior value** (it is never set to a false `0`), so pair it with the counter below
   to know whether a low reading is current.
 - `yuzu_inventory_stale_count_unavailable_total` (counter) — the freshness count
@@ -193,6 +242,15 @@ payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
 `YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
 leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
 freshness gauge may be frozen).
+
+A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
+ships in the same group: it precomputes the 99th-percentile ingest duration per
+`(source, phase)` over a 10m window (matching `YuzuInventoryIngestSlow`) so
+dashboards and any future tighter latency alert read a cheap single series rather
+than a fan-out `histogram_quantile` at query time — meaningful only because the
+extended 10-60s buckets resolve the tail. Reference it directly in Grafana panels
+or custom alert expressions; it returns no data unless the shipped rules file is
+loaded.
 
 `YuzuInventoryStaleAgents` ships **disabled** (commented out) in the same group:
 the `yuzu_inventory_stale_agents` gauge has no fleet-size-independent absolute

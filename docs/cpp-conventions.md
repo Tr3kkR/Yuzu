@@ -19,6 +19,10 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 - `#pragma once` only — no include guards.
 - Include order: STL → third-party → project.
 
+## Windows string conversion
+
+- A Windows plugin needing wide↔UTF-8 conversion must use the shared header `agents/plugins/shared/win_str.hpp` (`yuzu::win::to_wide` / `from_wide` / `reg_sz_to_utf8`) rather than hand-rolling another `MultiByteToWideChar`/`WideCharToMultiByte` copy. It is header-only and `#ifdef _WIN32`-guarded, so build isolation is preserved (each plugin compiles its own inline copy). Add `include_directories('../shared')` to the plugin's `meson.build`. Registry **string** reads must go through the wide `Reg*W` APIs (#1662/#1682) — see the ADR-0016 routed-concern row in `CLAUDE.md`. (Agent-core code outside `agents/plugins/` cannot reach this header and keeps its own copies pending a separate consolidation.)
+
 ## Plugin ABI
 
 - The C API in `sdk/include/yuzu/plugin.h` must stay stable. No C++ types cross the boundary — only `const char*`, fixed-size arrays, and C enums.

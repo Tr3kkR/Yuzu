@@ -2622,6 +2622,53 @@ Each condition object:
 }
 ```
 
+#### `GET /api/v1/inventory/software`
+
+Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the legacy blob store. This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
+
+**Permission:** `Inventory:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Exact software-name filter |
+| `agent_id` | string | No | Exact agent filter |
+| `limit` | integer | No | Max rows (default 100, min 1, max 1000) |
+
+Omit both `name` and `agent_id` for a fleet-wide scan.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "software": [
+      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+    ],
+    "count": 1,
+    "devices_omitted": 0,
+    "result_truncated_by_cap": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+
+Results are **management-group scoped**: out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. **Tenant isolation:** an operator can never read a device outside their management groups.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 400 | `limit` is not a valid integer |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+On a `503` the store could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
 ---
 
 ### Execution Statistics
