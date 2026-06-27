@@ -611,6 +611,15 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
           std::string::npos);
     // Counts + uncatalogued render as plain integers (no unit, no sci).
     CHECK(render("hw.battery_error", 2.0).find("Metric</span><code>2</code>") != std::string::npos);
+    // A3 perf-breach family is reachable in this panel (projection stores any obs_type,
+    // history filters none) — render with the RIGHT unit, not a bare number (governance
+    // consistency S1). cpu/memory are %; disk latency is direct ms (NOT fmt_ms's "s").
+    CHECK(render("perf.cpu_sustained", 85.0).find("Metric</span><code>85%</code>") !=
+          std::string::npos);
+    CHECK(render("perf.memory_pressure", 92.0).find("Metric</span><code>92%</code>") !=
+          std::string::npos);
+    CHECK(render("perf.disk_latency_high", 25.0).find("Metric</span><code>25 ms</code>") !=
+          std::string::npos);
     // NaN / +inf / absurd are rejected defensively → em-dash, never "inf%" / "inf d"
     // / a 300-digit blob (UP-4/UP-5). The store range-guards on write; this keeps the
     // formatter robust independent of that.

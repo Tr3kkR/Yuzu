@@ -1645,8 +1645,17 @@ GuaranteedStateStore::dex_observation(const std::string& event_id) const {
         return std::nullopt;
     }
     sqlite3_bind_text(st.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st.get()) != SQLITE_ROW)
+    const int rc = sqlite3_step(st.get());
+    if (rc != SQLITE_ROW) {
+        // SQLITE_DONE is the genuine not-found (no row matched the PK); any other
+        // code (SQLITE_CORRUPT/IOERR/...) is a STORE FAULT that would otherwise be
+        // silently indistinguishable from not-found at the route — log it so a
+        // faulting store is diagnosable, mirroring the prepare-fail arm above.
+        if (rc != SQLITE_DONE)
+            spdlog::warn("GuaranteedStateStore::dex_observation: step failed: {}",
+                         sqlite3_errmsg(db_));
         return std::nullopt;
+    }
     GuardianObservationRow r;
     r.event_id = col_text(st.get(), 0);
     r.agent_id = col_text(st.get(), 1);

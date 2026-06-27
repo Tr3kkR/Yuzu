@@ -460,6 +460,17 @@ std::string dex_metric_display(const std::string& obs_type, double metric) {
             return fmt_ms(metric); // milliseconds → "12.3 s"
     if (obs_type == "os.uptime_report" || obs_type == "os.time_unsynced")
         return fmt_secs(metric); // seconds → humanized
+    // A3 Performance-breach family (metrics emitted by dex_perf_breach.cpp — a SECOND
+    // metric source besides the agent extractors): cpu/memory are sustained % over the
+    // window, disk latency is an average service time in the tens-of-ms range (so a
+    // direct "ms" suffix, NOT fmt_ms which humanizes thousands-of-ms durations to "s").
+    // These ARE reachable here: the projection stores any obs_type and the device
+    // history filters none, so a perf.* row is clickable into this panel (#1638 owns
+    // the durable carry-unit-in-catalogue fix; this stops the wrong DISPLAY).
+    if (obs_type == "perf.cpu_sustained" || obs_type == "perf.memory_pressure")
+        return std::format("{:.0f}%", metric);
+    if (obs_type == "perf.disk_latency_high")
+        return std::format("{:.0f} ms", metric);
     return std::format("{:.0f}", metric); // counts + any future type: plain, no sci
 }
 
