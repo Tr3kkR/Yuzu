@@ -132,6 +132,7 @@ agent_test_exe = executable(
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
+    'unit/test_inventory_sync.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -338,6 +339,8 @@ if build_server
       'unit/server/test_pg_hardening.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
+      'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_pg_array.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

@@ -31,6 +31,10 @@ namespace yuzu {
 class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 }
 
+namespace yuzu::server {
+class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+}
+
 namespace yuzu::server::mcp {
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
@@ -78,6 +82,17 @@ public:
     /// rows) holds regardless. NOTE: service-scoped tokens are scoped by the token
     /// creator's RBAC, not the service tag (pre-existing, tracked in #1634).
     using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
+
+    /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
+    /// bound to ("Inventory","Read"), so `query_installed_software` filters its
+    /// fleet rows to the caller's management groups (cross-operator isolation,
+    /// mirrors the #1550 query_responses fix). Same fail-open-when-unwired
+    /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
+    /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
+    /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,
+    /// mgmt_store). Do NOT add a new production registration without wiring it.
+    using InventoryScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
@@ -134,6 +149,8 @@ public:
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
                             DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                             ResponseScopeFn response_scope_fn = {},
+                            SoftwareInventoryStore* software_inventory_store = nullptr,
+                            InventoryScopeFn inventory_scope_fn = {},
                             yuzu::MetricsRegistry* metrics = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
@@ -151,6 +168,8 @@ public:
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
                          DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                          ResponseScopeFn response_scope_fn = {},
+                         SoftwareInventoryStore* software_inventory_store = nullptr,
+                         InventoryScopeFn inventory_scope_fn = {},
                          yuzu::MetricsRegistry* metrics = nullptr);
 };
 

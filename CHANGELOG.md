@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent daily-sync framework + installed-software inventory in Postgres (ADR-0016).** The agent now
+  pushes endpoint state to the server on a per-source daily cadence over `ReportInventory`, starting
+  with **installed software** (machine-wide scope; no per-user/PII). It is kind to the network at
+  fleet scale: each endpoint spreads its sync by a stable per-agent phase offset (no lockstep), and
+  when a source's content is unchanged since the last successful sync it sends only a **content hash**
+  instead of the full list (hash-skip); the server replies `need_full` to force a resend on a cold
+  cache, with a weekly full-floor as a backstop. Installed software lands in a new born-on-Postgres
+  **`SoftwareInventoryStore`** (normalized rows — portable SQL, no JSONB — so fleet-wide queries
+  like "which devices run X" are first-class), via a shared ingest seam wired identically on the
+  direct and gateway paths. Reads are gated on a new **`Inventory` RBAC securable** (`Inventory:Read`).
+  Reuses the existing `installed_apps` plugin (Windows/Linux/macOS) in-process — no new collector.
+  Hardened for fleet-scale resilience: a per-source blob cap sized below the gRPC message ceiling,
+  exponential agent-side backoff on consecutive `need_full` resends (so a server cold-cache or store
+  outage cannot drive a flat-cadence full-resend storm), a `yuzu_inventory_ingest_total{source,outcome}`
+  metric, and the store wired into both `/readyz` and `/healthz`. Readable now via the
+  **`query_installed_software` MCP tool** (`Inventory:Read`, filter by name/agent, management-group
+  scoped so an operator sees only their own devices) — distinct from the generic `query_inventory`
+  tools. A REST endpoint and software dashboard are planned follow-ons. A deploy-time opt-out
+  (**`--inventory-disable`** / `YUZU_AGENT_INVENTORY_DISABLE`) disables collection entirely for
+  privacy-sensitive / works-council jurisdictions. Inventory fields are sanitized to valid UTF-8
+  (invalid bytes → U+FFFD) and truncated on codepoint boundaries — byte-coordinated between agent and
+  server — so a non-UTF-8 registry string can never trigger a PostgreSQL TEXT-reject resend loop;
+  concurrent full-replaces for one agent are serialized with a transaction-scoped advisory lock (no
+  row/hash divergence); a transient empty collection is skipped rather than wiping stored inventory;
+  an over-cap blob raises a dedicated `dropped`-outcome alert (it never self-heals); and
+  `query_installed_software` reports `devices_omitted` so a scoped caller can distinguish "outside my
+  scope" from "not installed". **Reads are authoritative** (ADR-0016 §7): `query_installed_software`
+  returns a JSON-RPC error — never a silent `success` with empty rows — when the Postgres store is
+  degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
+  hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
+  wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
 ### Security
 
 - **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
@@ -20,10 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
     **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
   - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
-    `/api/v1/guaranteed-state/events?agent_id=`, and now
-    `/api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`) **fails closed** with
-    `503` + `Sec-Audit-Failed: true` and serves no PII. The baseline-device route previously
-    discarded the result and served regardless — it now matches its `dex.device.view` siblings.
+    `/api/v1/guaranteed-state/events?agent_id=`, and
+    `/api/v1/guaranteed-state/device-compliance`) **fails closed** with
+    `503` + `Sec-Audit-Failed: true` and serves no PII.
   - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
     `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
     matching the `query_responses` / `revoke_certificate` convention.
@@ -48,33 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
   token creator's RBAC, not the service tag.)*
 
-### Changed
-
-- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
-  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
-  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
-  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
-  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
-  release is the cut-over that makes the server *require* them. **Operator action:** provision a
-  reachable PostgreSQL (the bundled image, a managed instance, or
-  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
-  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
-
-### Fixed
-
-- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
-  A `service-running` / `service-stopped` guard watching a steadily-compliant service
-  previously short-circuited silently and never emitted `guard.compliant`, so the
-  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
-  compliant service could never show as compliant (on the dashboard or the per-device
-  REST read). The `registry` and `file` guards already emitted the compliant edge; the
-  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
-  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
-  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
-  service guard remains observe-only on the compliant edge (parity deferred).
-
-### Security
-
 - **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
   `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
   and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
@@ -93,8 +99,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
   the audit subsystem recovers."
 
+### Changed
+
+- **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
+  (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
+  `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
+  collapsing the per-agent connection-hold and `statement_timeout` exposure that, under a cold-cache
+  `need_full` herd, could saturate the shared Postgres pool and flip healthy agents touched→full.
+  New series make the path measurable: `yuzu_inventory_ingest_duration_seconds{source,phase}` (the
+  pooled-connection + transaction hold time, split `full` vs `hash_only`), `yuzu_inventory_read_degrade_total{reason}`
+  (an authoritative read that degraded rather than returning a silent empty — otherwise invisible
+  since `/readyz` stays green under pure saturation; the per-site WARN is now sampled to avoid
+  flooding the log at agentic fan-out), `yuzu_inventory_stale_agents{source}` (a freshness gauge,
+  fed by an execution-bounded count so it can never stall the revocation-teardown sweep it shares a
+  thread with), and `yuzu_inventory_stale_count_unavailable_total` (a freeze-detector so a held gauge
+  is distinguishable from a genuine low). New `YuzuInventoryReadDegraded`, `YuzuInventoryIngestSlow`,
+  and `YuzuInventoryStaleCountUnavailable` alert rules ship active in the `yuzu-inventory` group;
+  `YuzuInventoryStaleAgents` ships disabled (no fleet-size-independent threshold — enable after
+  baselining, see `docs/user-manual/inventory.md`).
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
+### Fixed
+
+- **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
+  `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
+  strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
+  UTF-8 scrub then replaced the resulting invalid bytes with `?` (`Café` → `Caf?`), so any app or
+  publisher with a non-ASCII name was corrupted in the output — and, now that the names land in the
+  typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
+  now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
+  (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
+  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
+  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
+  unknown). No proto/wire change.
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
 ### Added
 
+- **Guardian — name-anchored, device-applicable compliance REST.**
+  New `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
+  looks a Baseline up by **name** (a stable constant such as `ServiceNow Compliance`, not
+  a churning `baseline_id`) and returns the Guards **actually applicable to the device**
+  each with the device's last reported verdict (`compliant` | `drifted` | `errored` |
+  `pending`), plus counts and a `last_updated` freshness stamp. One Baseline carries a
+  **superset** of Guards, each scoped via `scope_expr`, so the push arms a different
+  subset per machine; the endpoint returns the `deployed_snapshot` intersected with the
+  Guards the device has reported, so an out-of-scope Guard is **absent** (not `pending`)
+  and two machines querying the same Baseline name legitimately see different Guards.
+  `total_guards` is that applicable count. A not-yet-deployed Baseline returns
+  `deployed:false` with empty guards (consumer renders "No Baseline Deployed"), and
+  member edits appear only after a re-deploy. A *deployed* Baseline returning
+  `total_guards:0` with `last_updated:null` is **not assessable** (the device is
+  offline / newly-enrolled, or every Guard is out of its scope), **not compliant** — a
+  CMDB consumer must cross-reference device liveness and never render `0/0` as green.
+  Designed for embedding Guardian compliance into an external CMDB / ITSM CI record
+  (e.g. ServiceNow).
+  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
+  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
+  device is in — a previously group-scoped token now gets `403` for out-of-scope
+  devices, where a flat global check would have passed them; global tokens are
+  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
+  layer as `auth.scoped_permission_required`). A behavioural-PII read, so it **fails
+  closed**: if the `guardian.device.view` audit row cannot persist it returns `503` +
+  `Sec-Audit-Failed: true` and **withholds** the compliance body (parity with
+  `GET /api/v1/dex/devices/{id}`, governance #1549) — the `503` is returned before the
+  `404`, so an audit outage never reveals baseline existence without durable evidence
+  (CC7.2). **Behaviour change for API consumers:** an audit-store outage now yields
+  `503` where this unreleased route previously returned `200`; on the fleet-polled
+  CMDB path a *sustained* outage 503s every poll fleet-wide (no degraded-serve
+  fallback). Both query params are required, length-capped (`256` /
+  `auth::kMaxAgentIdLength`), and rejected if they contain control characters
+  (bytes `< 0x20`) → `400`; the `400`/`404`/`503` bodies use the A4 envelope
+  (`correlation_id`), while the `403` is the auth/RBAC layer's denial body (not the A4
+  envelope; exact shape varies by denial reason — RBAC vs service-scope).
+  The response carries a machine-readable **`assessable`** flag (`false` for a draft
+  Baseline or a deployed Baseline this device has reported no applicable Guard against —
+  the consumer must not compute a `0/0` compliance %) and **`snapshot_total`** (the
+  Baseline's full deployed-member superset, an upper bound on coverage). **Caution:** the
+  report-driven denominator can *over-estimate* compliance on a partial report (an
+  in-scope-but-unreported Guard is absent, not `pending`), so consumers must not gate on
+  `compliant/total_guards` until the per-device `scope_expr` computed denominator lands
+  (deferred). `X-Correlation-Id` is set on every response (parity with the
+  `dex.device.view` siblings); a guard reported with an unrecognized verdict token keeps
+  its real `updated_at` (no longer suppressed); a baseline-store *fault* returns a
+  retryable `503` (not the `404` a CMDB would read as "delete this CI") on a transient
+  fault; and the guard-name lookup chunks its `IN`-list so a Baseline larger than
+  `SQLITE_MAX_VARIABLE_NUMBER` still resolves every name. A `YuzuAuditPersistFailures`
+  Prometheus alert (`docs/prometheus/yuzu-alerts.yml`) now fires when behavioural-data
+  routes 503 fleet-wide on an audit-store outage.
 - **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
   page's **Get live info** button now returns a full live system snapshot — a KPI strip
   (uptime, process / service / connection / user counts) over a grid of collapsible,
@@ -264,24 +376,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the device (device / comm / short reason) — the raw kernel `MESSAGE` is never
   shipped (`[dex][linux][kmsg][privacy]` pins). Linux server DEX coverage grows from
   7 to 13 reused signals, all in the same `/dex` display groups.
-- **Guardian — baseline-anchored per-device compliance REST.**
-  New `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
-  returns one Baseline's deployed Guards each with the device's last reported verdict
-  (`compliant` | `drifted` | `errored` | `pending`), plus counts and a `last_updated`
-  freshness stamp. The denominator is the Baseline's `deployed_snapshot` (the enforced
-  set, not the live member list); a not-yet-deployed Baseline returns `deployed:false`
-  with empty guards (consumer renders "No Baseline Deployed"), and member edits
-  appear only after a re-deploy. Designed for embedding Guardian compliance into an
-  external CMDB / ITSM CI record (e.g. ServiceNow).
-  Authorization is **per-device-scoped `GuaranteedState:Read`** (a global grant passes
-  fleet-wide; a management-group-scoped principal must hold `Read` via a group the
-  device is in — a previously group-scoped token now gets `403` for out-of-scope
-  devices, where a flat global check would have passed them; global tokens are
-  unaffected). Audited `guardian.device.view` on access (denials audited at the auth
-  layer as `auth.scoped_permission_required`). Path params are length-capped
-  (`256` / `auth::kMaxAgentIdLength`) → `400`; the `400`/`404`/`503` error bodies use
-  the A4 envelope (`correlation_id`), while the `403` is the auth/RBAC layer's denial
-  body (not the A4 envelope; exact shape varies by denial reason — RBAC vs service-scope).
 - **Live-query bundles — one instruction → several plugin actions on one device,
   collated (ADR-0011).** New `POST /api/v1/bundles` (dispatch, `Execution:Execute`,
   returns `202 {bundle_id, agent_id, expected}`) + `GET /api/v1/bundles/{id}`

@@ -3,6 +3,7 @@
 #include "mcp_policy.hpp"
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -222,7 +223,10 @@ static const ToolDef kTools[] = {
     {"aggregate_responses", "Aggregate response data (COUNT, SUM, AVG) grouped by a column.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
 
-    {"query_inventory", "Query inventory data across agents. Filter by agent or plugin.",
+    {"query_inventory",
+     "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
+     "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
+     "query_installed_software instead.",
      R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})"},
 
     {"list_inventory_tables", "List available inventory data types with agent counts.",
@@ -230,6 +234,16 @@ static const ToolDef kTools[] = {
 
     {"get_agent_inventory", "Get all inventory data for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+
+    {"query_installed_software",
+     "Query the typed installed-software inventory collected by the agent daily-sync framework "
+     "(ADR-0016) — machine-wide installed packages (name, version, publisher, install_date) per "
+     "device, fleet-wide. Filter by software `name` and/or `agent_id`. This is DISTINCT from "
+     "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
+     "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
+     "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
+     "follow-up). Results are scoped to your management groups — out-of-scope devices are omitted.",
+     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
@@ -468,6 +482,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
+    {"query_installed_software", {"Inventory", "Read"}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -567,6 +582,7 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
@@ -1343,6 +1359,131 @@ McpServer::HandlerFn McpServer::build_handler(
                 // shape — content[].text stays the bare rows array, unchanged).
                 if (hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
+                res.set_content(success_response(id, result_obj.str()), "application/json");
+                return;
+            }
+
+            // ── query_installed_software ──────────────────────────────────
+            // Typed daily-sync software store (ADR-0016), DISTINCT from the generic
+            // query_inventory above. Mirrors query_responses: tier → RBAC → store →
+            // cap → management-group scope filter → audit (success + distinct denied).
+            if (tool_name == "query_installed_software") {
+                if (!tier_allows(tier, "Inventory", "Read")) {
+                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
+                                             kTierRemediation),
+                                    "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Inventory", "Read"))
+                    return;
+                if (!software_inventory_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Software inventory store unavailable"),
+                        "application/json");
+                    return;
+                }
+                SoftwareFleetQuery q;
+                q.agent_id = param_str(args, "agent_id");
+                q.name = param_str(args, "name");
+                // Clamp in 64-bit BEFORE narrowing (same posture as query_responses):
+                // limit:0 reads as "done, no rows"; a negative/wrapped limit binds
+                // unbounded and defeats the cap. No offset — the scope filter runs AFTER
+                // the store LIMIT, so paging would yield unstable windows over a table
+                // that mutates on sync cadence; keyset is the #1634 follow-up.
+                q.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                const std::string audit_key = !q.name.empty() ? ("name=" + q.name)
+                                              : !q.agent_id.empty() ? ("agent=" + q.agent_id)
+                                                                    : std::string("fleet");
+                auto rows_opt = software_inventory_store->query_software(q);
+                if (!rows_opt) {
+                    // Store degraded (pool/query failure) — surface it, never return
+                    // success+[]. A silent empty here reads as "installed nowhere" for a
+                    // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
+                    // failure-vs-empty). Distinct message from the null-store case above.
+                    // Audit the degraded access (gov compliance CC7.2): a CVE-triage caller
+                    // under a sustained outage must still leave a behavioural trail
+                    // (who/when/what filter), mirroring the success/denied audits below.
+                    mcp_audit("failure", "store degraded; " + audit_key);
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Software inventory store degraded — query failed"),
+                                    "application/json");
+                    return;
+                }
+                auto& rows = *rows_opt;
+
+                // Cap hit BEFORE scope filtering → result incomplete (the store's hard
+                // ceiling kFleetQueryRowCap >> 1000, so the binding cap is q.limit).
+                // Captured pre-filter: the filter shrinks `rows`. NOTE: unlike the
+                // correlation-bounded query_responses (which requires execution_id/
+                // instruction_id), an empty-filter call here is an unbounded fleet-wide
+                // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
+                // filter — so a narrow-scope operator may see few of their own rows in one
+                // page, signalled by result_truncated_by_cap. Cross-operator ISOLATION
+                // (never another operator's rows) holds regardless; completeness for a
+                // narrow scope over a wide fleet is the keyset follow-up (#1634).
+                const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
+
+                // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat
+                // Inventory:Read gate above is not a per-device ownership check, so without
+                // this an operator could read other operators' devices' software fleet-wide
+                // by name. Filter per-agent through the injected Inventory-scoped predicate
+                // (production: check_scoped_permission), memoised per distinct agent_id,
+                // passing the already-resolved principal. Unwired/RBAC-off → no filter
+                // (legacy-open), matching require_scoped_permission.
+                bool scope_filtered = false;
+                std::size_t dropped_agents = 0;
+                if (inventory_scope_fn) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<SoftwareFleetRow> visible;
+                    visible.reserve(rows.size());
+                    for (auto& r : rows) {
+                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                        if (inserted)
+                            m->second = inventory_scope_fn(session->username, r.agent_id);
+                        if (m->second) {
+                            visible.push_back(std::move(r));
+                        } else {
+                            scope_filtered = true;
+                            if (inserted) // count each DISTINCT dropped device once
+                                ++dropped_agents;
+                        }
+                    }
+                    rows.swap(visible);
+                }
+
+                JArr arr;
+                for (const auto& r : rows) {
+                    arr.add(JObj()
+                                .add("agent_id", r.agent_id)
+                                .add("name", r.entry.name)
+                                .add("version", r.entry.version)
+                                .add("publisher", r.entry.publisher)
+                                .add("install_date", r.entry.install_date));
+                }
+                // A scope-dropped read is security-relevant — audit it distinctly (mirrors
+                // #1634) with the DISTINCT dropped-device count, and fold its persistence
+                // bool into audit_persisted (a dropped denial-evidence row is the MORE
+                // security-relevant gap).
+                bool denied_ok = true;
+                if (scope_filtered)
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group device(s) for " +
+                                                        audit_key);
+                const bool audit_ok = mcp_audit("success", audit_key) && denied_ok;
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                if (hit_cap)
+                    result_obj.raw("result_truncated_by_cap", "true");
+                // Surface the count of devices dropped by the management-group scope filter
+                // (0 when none) so an agentic caller can tell "out of my scope" from "not
+                // installed anywhere" — the partial- and all-out-of-scope false-negative
+                // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
+                result_obj.raw("devices_omitted", std::to_string(dropped_agents));
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -2994,7 +3135,10 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
                                 DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
-                                ResponseScopeFn response_scope_fn, yuzu::MetricsRegistry* metrics) {
+                                ResponseScopeFn response_scope_fn,
+                                SoftwareInventoryStore* software_inventory_store,
+                                InventoryScopeFn inventory_scope_fn,
+                                yuzu::MetricsRegistry* metrics) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -3003,7 +3147,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            mcp_disabled, std::move(dispatch_fn), ca_store,
                            std::move(publish_crl_fn), guaranteed_state_store,
                            std::move(dex_perf_fn), std::move(net_perf_fn),
-                           std::move(response_scope_fn), metrics));
+                           std::move(response_scope_fn), software_inventory_store,
+                           std::move(inventory_scope_fn), metrics));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

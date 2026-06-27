@@ -19,6 +19,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Scope Engine](scope-engine.md) | Expression-tree device targeting with AND/OR/NOT, tags, OS filters, and wildcards |
 | [Audit Log](audit-log.md) | Structured audit events -- who did what, when, on which devices |
 | [Response Store](response-store.md) | Persistent, filterable, aggregatable instruction response data |
+| [Installed-Software Inventory](inventory.md) | Daily machine-scope installed-software sync to central Postgres (hash-skip, fleet-wide queries); first source of the agent daily-sync framework |
 | [Agent Plugins](agent-plugins.md) | Plugin architecture, available plugins, and plugin development |
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
