@@ -19,6 +19,7 @@
 #include <ctime>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <string_view>
@@ -161,6 +162,11 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
+
+// Server-side length cap for free-text agentic params (question, scenario) that
+// are lowercased/echoed/searched. Bounds work + error-message echo (G-S11); the
+// matching input schemas also carry "maxLength": 2048.
+constexpr std::size_t kAgenticParamMaxLen = 2048;
 
 std::string json_quoted_string(std::string_view value) {
     std::string quoted;
@@ -549,14 +555,14 @@ static const ToolDef
                  "this "
                  "before planning incident work, especially for OpenShift, KVM, database, and SaaS "
                  "asks.",
-                 R"({"type":"object","properties":{"question":{"type":"string"},"mode":{"type":"string","enum":["live","curated"],"default":"live"}},"required":["question"]})",
+                 R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
                  kObjectOutputSchema,
-                 R"({"readOnlyHint":true,"title":"Classify operational question","safety":"classification only"})"},
+                 R"({"readOnlyHint":true,"title":"Classify operational question","safety":"advisory classification only; not a security gate"})"},
                 {"get_incident_playbook",
                  "Return the recommended Yuzu investigation workflow for a named incident "
                  "scenario, including "
                  "the first tool, safe tool path, connector gaps, and approval boundaries.",
-                 R"({"type":"object","properties":{"scenario":{"type":"string","description":"Scenario name or tag, e.g. openshift, teams, crowdstrike, postgres, buildx"}},"required":["scenario"]})",
+                 R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
                  kObjectOutputSchema,
                  R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
                 {"prepare_demo_scenario",
@@ -565,7 +571,7 @@ static const ToolDef
                  "findings and never executes endpoint actions; live mode summarizes current fleet "
                  "facts and "
                  "keeps the proposed sequence read-only unless remediation is explicitly approved.",
-                 R"({"type":"object","properties":{"scenario":{"type":"string","default":"executive_fleet_health"},"mode":{"type":"string","enum":["live","curated"],"default":"curated"}}})",
+                 R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"default":"executive_fleet_health"},"mode":{"type":"string","enum":["live","curated"],"default":"curated"}}})",
                  kObjectOutputSchema,
                  R"({"readOnlyHint":true,"title":"Prepare demo scenario","safety":"curated mode is synthetic; live mode is read-only"})"},
                 {"summarize_working_set",
@@ -785,10 +791,18 @@ McpServer::HandlerFn McpServer::build_handler(
             metrics, /*surface=*/"mcp");
     }
 
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
     struct PostureCache {
+        std::mutex mtx;
         std::chrono::steady_clock::time_point generated_at{};
-        std::string generated_at_iso;
-        std::string payload;
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
     };
     auto posture_cache = std::make_shared<PostureCache>();
 
@@ -940,7 +954,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     untrusted_prompt_argument("principal", principal) +
                     "\nUse query_audit_log with principal and since filters.";
             } else if (prompt_name == "ceo_demo_agentic_endpoint_management") {
-                const auto mode = param_str(params, "mode", "curated");
+                // G-S3: `mode` is a closed {live,curated} enum. Normalise to a
+                // known-safe constant so NO caller-supplied text is inlined into
+                // the prompt. Every other prompt arg reflects free-form input and
+                // is wrapped via untrusted_prompt_argument; `mode` is strictly
+                // safer because the raw value is discarded — an injected
+                // "curated\n\nIgnore previous instructions…" collapses to
+                // "curated", closing the prompt-injection vector at the source.
+                const auto raw_mode = param_str(params, "mode", "curated");
+                const std::string mode = (raw_mode == "live") ? "live" : "curated";
                 prompt_text = "Prepare a concise Yuzu CEO demo in " + mode +
                               " mode. Start with prepare_demo_scenario, then use "
                               "get_fleet_posture_fast. Clearly label curated findings as demo "
@@ -3232,15 +3254,27 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 const int ttl = std::clamp(param_int32(args, "ttl_seconds", 30), 5, 300);
                 const auto now = std::chrono::steady_clock::now();
-                if (!posture_cache->payload.empty()) {
-                    const auto age = std::chrono::duration_cast<std::chrono::seconds>(
-                                         now - posture_cache->generated_at)
-                                         .count();
-                    if (age <= ttl) {
-                        auto result = tool_result(posture_cache->payload, kObjectOutputSchema);
-                        mcp_audit("success", "cache_hit age_seconds=" + std::to_string(age));
-                        res.set_content(success_response(id, result), "application/json");
-                        return;
+
+                // Cache read — snapshot the body + age under the lock, release
+                // before any audit/response I/O. data_age_seconds is injected from
+                // the freshly computed age (never the cached 0) so a cache hit
+                // reports real freshness (G-S4).
+                {
+                    std::lock_guard<std::mutex> lk(posture_cache->mtx);
+                    if (!posture_cache->body.empty()) {
+                        const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                                             now - posture_cache->generated_at)
+                                             .count();
+                        if (age <= ttl) {
+                            std::string payload = "{\"data_age_seconds\":" +
+                                                  std::to_string(age) + "," +
+                                                  posture_cache->body.substr(1);
+                            auto result = tool_result(payload, kObjectOutputSchema);
+                            mcp_audit("success",
+                                      "cache_hit age_seconds=" + std::to_string(age));
+                            res.set_content(success_response(id, result), "application/json");
+                            return;
+                        }
                     }
                 }
 
@@ -3288,12 +3322,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     policy_obj.add("available", false);
                 }
 
-                posture_cache->generated_at = now;
-                posture_cache->generated_at_iso = utc_now_iso();
-                posture_cache->payload =
+                // Build the cached body WITHOUT data_age_seconds — that field is
+                // volatile and injected per-request (0 here on a fresh miss, the
+                // real age on a later hit). Compute happens outside the lock; only
+                // the store is serialised.
+                std::string body =
                     JObj()
-                        .add("generated_at", posture_cache->generated_at_iso)
-                        .add("data_age_seconds", 0)
+                        .add("generated_at", utc_now_iso())
                         .add("cache_ttl_seconds", ttl)
                         .add("partial", missing.size() > 0)
                         .raw("missing_sources", missing.str())
@@ -3311,7 +3346,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .str())
                         .raw("recommended_next_tools", next.str())
                         .str();
-                auto result = tool_result(posture_cache->payload, kObjectOutputSchema);
+                {
+                    std::lock_guard<std::mutex> lk(posture_cache->mtx);
+                    posture_cache->generated_at = now;
+                    posture_cache->body = body;
+                }
+                std::string payload = "{\"data_age_seconds\":0," + body.substr(1);
+                auto result = tool_result(payload, kObjectOutputSchema);
                 mcp_audit("success", "cache_miss");
                 res.set_content(success_response(id, result), "application/json");
                 return;
@@ -3322,10 +3363,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 const std::string question = param_str(args, "question");
                 if (question.empty()) {
+                    mcp_audit("error", "question_required");
                     res.set_content(error_response(id, kInvalidParams, "question is required"),
                                     "application/json");
                     return;
                 }
+                if (question.size() > kAgenticParamMaxLen) {
+                    mcp_audit("error", "question_too_long");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "question exceeds maximum length"),
+                                    "application/json");
+                    return;
+                }
+                // NOTE (G-S9): this keyword classifier is ADVISORY ONLY — a UX hint
+                // for the agentic worker, NOT a security gate. It is trivially
+                // evaded by rephrasing ("controlled power cycle" misses "reboot")
+                // or Unicode homoglyphs (ASCII std::tolower only). Real enforcement
+                // is the MCP tier + RBAC checks on each tool; never treat this
+                // classification as an authorization decision.
                 const std::string q = lower_copy(question);
                 std::string classification = "answerable_now";
                 std::string rationale = "Yuzu can answer from current endpoint inventory, "
@@ -3387,8 +3442,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 JArr next;
                 next.add("get_fleet_posture_fast").add("get_incident_playbook");
+                // G-S6: recommend a READ-ONLY next step for the live-dispatch case,
+                // never execute_bundle (a kWriteTools mutation needing
+                // Execution:Execute). Steering an agentic worker toward a mutation
+                // tool from an advisory classifier is inappropriate; tier/RBAC
+                // would gate the call, but the recommendation must not invite it.
                 if (classification == "answerable_with_live_dispatch")
-                    next.add("execute_bundle");
+                    next.add("get_agent_inventory");
                 auto payload = JObj()
                                    .add("classification", classification)
                                    .add("rationale", rationale)
@@ -3408,8 +3468,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 const std::string scenario = param_str(args, "scenario");
+                if (scenario.size() > kAgenticParamMaxLen) {
+                    mcp_audit("error", "scenario_too_long");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "scenario exceeds maximum length"),
+                                    "application/json");
+                    return;
+                }
                 const auto* pb = agentic::find_playbook(scenario);
                 if (!pb) {
+                    mcp_audit("error", "unknown_scenario");
                     res.set_content(error_response(id, kInvalidParams,
                                                    "unknown playbook scenario: " + scenario),
                                     "application/json");
@@ -3439,7 +3507,23 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 const std::string mode = lower_copy(param_str(args, "mode", "curated"));
+                // G-S12: enforce the {live,curated} enum server-side instead of
+                // silently coercing any non-"live" string to curated.
+                if (mode != "live" && mode != "curated") {
+                    mcp_audit("error", "invalid_mode");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "mode must be 'live' or 'curated'"),
+                                    "application/json");
+                    return;
+                }
                 const std::string scenario = param_str(args, "scenario", "executive_fleet_health");
+                if (scenario.size() > kAgenticParamMaxLen) {
+                    mcp_audit("error", "scenario_too_long");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "scenario exceeds maximum length"),
+                                    "application/json");
+                    return;
+                }
                 const bool curated = mode != "live";
                 JArr sequence;
                 sequence.add("resources/read yuzu://about")
@@ -3459,9 +3543,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("DEMO DATA: OpenShift/database internals are connector gaps; Yuzu "
                              "supplies host evidence only.");
                 } else {
+                    // G-S10: count only agents in the caller's scope — a scoped
+                    // operator must not learn the global fleet size from the demo
+                    // tool. Unwired scope fn → legacy-open (full count), matching
+                    // the rest of the MCP surface.
                     const auto& agents = get_agents();
+                    std::size_t visible = 0;
+                    for (const auto& a : agents) {
+                        if (!response_scope_fn ||
+                            response_scope_fn(session->username, a.value("agent_id", "")))
+                            ++visible;
+                    }
                     findings.add("LIVE DATA: connected agents visible to MCP now: " +
-                                 std::to_string(agents.size()));
+                                 std::to_string(visible));
                     findings.add(
                         "LIVE DATA: no endpoint actions have been executed by this demo tool.");
                 }
@@ -3493,16 +3587,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr next;
                 std::string narrative;
                 if (kind == "agent" && !target_id.empty()) {
-                    const auto& agents = get_agents();
+                    // Group-scope gate (G-S2): an operator scoped to one
+                    // management group must not be able to probe arbitrary
+                    // agent_ids in another group and recover hostname/os (which
+                    // often encode role/site). An out-of-scope agent is rendered
+                    // IDENTICALLY to not-found so existence itself does not leak.
+                    // Unwired scope fn → legacy-open, matching query_responses.
+                    const bool in_scope =
+                        !response_scope_fn || response_scope_fn(session->username, target_id);
                     bool found = false;
-                    for (const auto& a : agents) {
-                        if (a.value("agent_id", "") == target_id) {
-                            found = true;
-                            narrative = "Agent " + target_id + " (" +
-                                        a.value("hostname", "unknown") + ", " +
-                                        a.value("os", "unknown") +
-                                        ") is present in the current MCP agent registry.";
-                            break;
+                    if (in_scope) {
+                        const auto& agents = get_agents();
+                        for (const auto& a : agents) {
+                            if (a.value("agent_id", "") == target_id) {
+                                found = true;
+                                narrative = "Agent " + target_id + " (" +
+                                            a.value("hostname", "unknown") + ", " +
+                                            a.value("os", "unknown") +
+                                            ") is present in the current MCP agent registry.";
+                                break;
+                            }
                         }
                     }
                     if (!found)
@@ -3510,6 +3614,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     " is not present in the current MCP agent registry.";
                     next.add("get_agent_details").add("get_agent_inventory").add("get_tags");
                 } else if (kind == "execution" && !target_id.empty() && execution_tracker) {
+                    // Execution data is a distinct securable — gate on
+                    // Execution:Read (tier + RBAC), not just the tool's generic
+                    // Infrastructure:Read (G-S2).
+                    if (!tier_allows(tier, "Execution", "Read")) {
+                        res.set_content(a4_error(kTierDenied,
+                                                 "MCP tier does not allow this operation",
+                                                 kTierRemediation),
+                                        "application/json");
+                        return;
+                    }
+                    if (!perm_fn(req, res, "Execution", "Read"))
+                        return;
                     auto exec = execution_tracker->get_execution(target_id);
                     if (exec) {
                         narrative = "Execution " + target_id + " is " + exec->status +

@@ -92,14 +92,45 @@ inline constexpr IncidentPlaybook
                  R"(["Classify VM-internal state as connector-required unless host probes are available.","Use host inventory for libvirt service/socket, bridge config, storage pressure, and kernel/package state.","Use network and DEX performance tools for noisy-host or degraded-link evidence.","Keep VM-state claims scoped to observed host evidence."])"},
 };
 
+// Resolve a scenario name or friendly tag to a playbook. Matching is EXACT on
+// the playbook name, on its category, or on a curated tag alias (G-S8, #1653
+// review). The previous loose `title.find(key)` / `key.find(category)` substring
+// matching returned the WRONG playbook for short/generic queries — "a", "host",
+// or "operator" each matched the first playbook whose title happened to contain
+// the substring, sending an agentic worker the wrong first tool and connector
+// advice. Aliases keep the documented friendly tags (postgres, teams, buildx,
+// crowdstrike, …) working without reintroducing substring ambiguity.
 inline const IncidentPlaybook* find_playbook(std::string_view name_or_tag) {
     const auto key = lower_copy(std::string(name_or_tag));
+    if (key.empty())
+        return nullptr;
+    struct Alias {
+        std::string_view tag;
+        std::string_view category;
+    };
+    static constexpr Alias kAliases[] = {
+        {"openshift", "openshift"},        {"kubernetes", "openshift"},
+        {"k8s", "openshift"},              {"teams", "collaboration"},
+        {"zoom", "collaboration"},         {"collaboration", "collaboration"},
+        {"buildx", "containers"},          {"docker", "containers"},
+        {"chisel", "containers"},          {"container", "containers"},
+        {"crowdstrike", "security_client"},{"zscaler", "security_client"},
+        {"anyconnect", "security_client"}, {"vpn", "security_client"},
+        {"postgres", "database"},          {"oracle", "database"},
+        {"database", "database"},          {"java", "runtime"},
+        {"node", "runtime"},               {"spring", "runtime"},
+        {"kvm", "virtualization"},         {"libvirt", "virtualization"},
+        {"patch", "endpoint_ops"},         {"reboot", "endpoint_ops"},
+    };
+    std::string_view category_key = key;
+    for (const auto& a : kAliases) {
+        if (key == a.tag) {
+            category_key = a.category;
+            break;
+        }
+    }
     for (const auto& p : kIncidentPlaybooks) {
-        const std::string name = lower_copy(p.name);
-        const std::string title = lower_copy(p.title);
-        const std::string category = lower_copy(p.category);
-        if (key == name || key == category || title.find(key) != std::string::npos ||
-            key.find(category) != std::string::npos)
+        if (key == lower_copy(p.name) || category_key == p.category)
             return &p;
     }
     return nullptr;

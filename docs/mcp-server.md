@@ -65,15 +65,15 @@ Yuzu also exposes a v1 MCP-native demo and incident-orientation layer for LLM cl
 
 These tools are read-only and available to the `readonly` MCP tier, subject to normal RBAC checks. They advertise `outputSchema` and return both legacy MCP `content[]` text and `structuredContent`.
 
-- `get_fleet_posture_fast` — compact cached posture summary. The cache TTL defaults to 30 seconds and responses include `generated_at`, `data_age_seconds`, `partial`, and `missing_sources`.
-- `classify_operational_question` — classifies a question as `answerable_now`, `answerable_with_live_dispatch`, `requires_external_connector`, `unsafe_without_approval`, or `outside_yuzu_scope`.
-- `get_incident_playbook` — returns a scenario workflow, first tool, safe tool path, connector gaps, and approval boundaries.
-- `prepare_demo_scenario` — `mode=curated` returns deterministic synthetic findings labelled `DEMO DATA`; `mode=live` summarizes current fleet facts without executing endpoint actions.
-- `summarize_working_set` — summarizes a fleet, agent, execution, or result-set working set into a bounded model-ready narrative with resource links.
+- `get_fleet_posture_fast` — compact cached posture summary. The cache TTL defaults to 30 seconds and responses include `generated_at`, `data_age_seconds`, `partial`, and `missing_sources`. `data_age_seconds` reflects the **real age of the cached snapshot at read time** — it is recomputed per request, so a cache hit reports a non-zero age (it is not the value baked in at generation).
+- `classify_operational_question` — classifies a question as `answerable_now`, `answerable_with_live_dispatch`, `requires_external_connector`, `unsafe_without_approval`, or `outside_yuzu_scope`. **This classification is advisory only — a UX hint for the agentic worker, not a security control.** It uses ASCII keyword matching that can be evaded by rephrasing or Unicode homoglyphs; never treat it as an authorization decision. Real enforcement is the MCP tier + RBAC check on each tool, and its `recommended_next_tools` are always read-only.
+- `get_incident_playbook` — returns a scenario workflow, first tool, safe tool path, connector gaps, and approval boundaries. `scenario` is matched **exactly** against a playbook name, category, or curated tag (e.g. `openshift`, `teams`, `postgres`) — not by loose substring, so a short/generic query returns "unknown scenario" rather than the wrong playbook.
+- `prepare_demo_scenario` — `mode=curated` returns deterministic synthetic findings labelled `DEMO DATA`; `mode=live` summarizes current fleet facts without executing endpoint actions. `mode` is validated server-side against `{live,curated}`, and a live count reflects only the caller's in-scope agents.
+- `summarize_working_set` — summarizes a fleet, agent, execution, or result-set working set into a bounded model-ready narrative with resource links. The `agent` kind is management-group scoped (an out-of-scope agent is reported as not-present, never leaking its hostname/os); the `execution` kind additionally requires `Execution:Read`.
 
 ### Prompts
 
-Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_agentic_endpoint_management`, `fleet_health_briefing`, `investigate_collaboration_quality_issue`, `investigate_endpoint_security_client_outage`, `investigate_patch_or_reboot_risk`, `investigate_container_or_build_failure`, `investigate_java_gateway_or_node_service_degradation`, `investigate_database_client_or_host_bottleneck`, and `prepare_remediation_plan`. User-supplied prompt arguments are wrapped as untrusted data.
+Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_agentic_endpoint_management`, `fleet_health_briefing`, `investigate_collaboration_quality_issue`, `investigate_endpoint_security_client_outage`, `investigate_patch_or_reboot_risk`, `investigate_container_or_build_failure`, `investigate_java_gateway_or_node_service_degradation`, `investigate_database_client_or_host_bottleneck`, and `prepare_remediation_plan`. User-supplied prompt arguments are wrapped as untrusted data; closed-enum prompt arguments (e.g. the CEO demo's `mode`) are instead normalized server-side to a known-safe value, so caller text never reaches the model as task instructions.
 
 ### Golden Prompt Pack
 
