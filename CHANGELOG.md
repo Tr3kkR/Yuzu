@@ -134,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
   Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
-  leaf so agent-**core** can reach it without inverting the core←plugins dependency direction. The
+  leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
   agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
   `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
   `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
