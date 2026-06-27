@@ -92,6 +92,8 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
                         "device.live.connections"};
     if (kind == "capture_sources")
         return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
+    if (kind == "disk")
+        return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
     return std::nullopt;
 }
 
@@ -123,7 +125,7 @@ constexpr std::size_t kMaxLiveRows = 20000;
 // dataset (process_tree's connections). uptime/processes use the shared live_kinds.hpp
 // parsers (REST parity); the rest parse the dashboard-only wire shapes inline. All
 // agent fields are HTML-escaped at render.
-std::string render_live_result(const std::string& kind, const LiveKind& lk,
+std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
                                const std::string& output, const std::string& output2) {
     const auto lines = yuzu::server::live::split_lines(output);
 
@@ -366,6 +368,29 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         std::string body = render_device_live_capture_sources(rows);
         body += oob("ls-cnt-capture_sources", "ls-cnt",
                     std::to_string(on) + " of " + std::to_string(rows.size()) + " on");
+        return body;
+    }
+
+    if (kind == "disk") { // disk|<path>|<total_bytes>|<free_bytes>|<percent_used>
+        std::vector<LiveDiskVolume> rows;
+        int worst_used = -1; // highest %-used across reported volumes → drives the KPI
+        for (const auto& l : lines) {
+            if (!l.starts_with("disk|")) continue;
+            auto f = pipe_fields(l);
+            if (f.size() < 5) continue;
+            LiveDiskVolume v;
+            v.path = f[1];
+            try { v.total = std::stoll(f[2]); } catch (...) {}
+            try { v.free = std::stoll(f[3]); } catch (...) {}
+            try { v.percent_used = std::stoi(f[4]); } catch (...) {}
+            if (v.percent_used > worst_used) worst_used = v.percent_used;
+            rows.push_back(std::move(v));
+            if (rows.size() >= kMaxLiveRows) break;
+        }
+        std::string body = render_device_live_disk(rows);
+        body += oob("ls-cnt-disk", "ls-cnt", std::to_string(rows.size()));
+        body += oob("ls-kpi-disk", "n",
+                    worst_used < 0 ? "&mdash;" : std::to_string(100 - worst_used) + "%");
         return body;
     }
 
