@@ -151,7 +151,10 @@ TEST_CASE("MetricsRegistry: histogram bucket overload seeds custom buckets at cr
     // buckets must NOT re-bucket the existing series — the 60s-range boundary it
     // was born with survives (default_buckets() has no le="30").
     reg.histogram("acquire_seconds", Histogram::default_buckets()).observe(0.001);
-    CHECK(reg.serialize().find("acquire_seconds_bucket{le=\"30\"}") != std::string::npos);
+    // le="30" survives (the series kept its 60s boundaries) AND accumulates: the
+    // 30.0 and 0.001 observations are both ≤ 30, so the cumulative count is 2 — a
+    // default-bucket re-bind would have dropped the le="30" series entirely.
+    CHECK(reg.serialize().find("acquire_seconds_bucket{le=\"30\"} 2") != std::string::npos);
 }
 
 // ── MetricFamily ────────────────────────────────────────────────────────────

@@ -88,17 +88,28 @@ const std::vector<pg::PgMigration>& migrations() {
          "ON inventory_state (source, last_seen);"},
         {3,
          // #1685 data-backfill. The WRITE fix (apply_installed_software now stamps
-         // last_seen with the server receipt time, not the agent's collected_at) is
-         // forward-only: a dark agent can't re-stamp itself. Any PRE-FIX row whose
-         // last_seen was written from a future-skewed agent clock sits AHEAD of now
-         // and would never satisfy `last_seen < now − 2d`, so a disappeared endpoint
-         // stays hidden from the freshness gauge forever (the issue's exact worst
-         // case, persisting in live data). Clamp every future last_seen down to now
-         // so those rows re-enter the staleness window (a fresh 2d grace from
-         // deploy, after which a still-dark agent flags correctly). Honest past/now
-         // values are untouched. DML, not DDL — runs in the migration txn.
-         "UPDATE inventory_state SET last_seen = EXTRACT(EPOCH FROM now())::bigint "
-         "WHERE last_seen > EXTRACT(EPOCH FROM now())::bigint;"},
+         // last_seen/first_seen with the server receipt time, not the agent's
+         // collected_at) is forward-only: a dark agent can't re-stamp itself. Any
+         // PRE-FIX row whose last_seen was written from a future-skewed agent clock
+         // sits AHEAD of now and would never satisfy `last_seen < now − 2d`, so a
+         // disappeared endpoint stays hidden from the freshness gauge forever (the
+         // issue's exact worst case, persisting in live data). Clamp every future
+         // timestamp down to now with LEAST — honest past/now values are untouched —
+         // so those rows re-enter the staleness window (a fresh 2d grace from deploy,
+         // after which a still-dark agent flags correctly). first_seen is clamped too
+         // (governance UP-10): it was also seeded from collected_at pre-fix, so a
+         // future content-age consumer could otherwise read now − first_seen as
+         // negative; first_seen has no consumer today, this is forward defence.
+         // NOTE: this one-time backfill uses the Postgres server clock (now()), while
+         // the runtime write + the staleness cutoff (server.cpp) use the app-process
+         // system_clock. Co-located / NTP-synced they agree; any residual app↔PG skew
+         // is immaterial against the 2-day window (governance UP-1, NICE). DML, not
+         // DDL — runs in the migration txn.
+         "UPDATE inventory_state SET "
+         "  last_seen  = LEAST(last_seen,  EXTRACT(EPOCH FROM now())::bigint), "
+         "  first_seen = LEAST(first_seen, EXTRACT(EPOCH FROM now())::bigint) "
+         "WHERE last_seen  > EXTRACT(EPOCH FROM now())::bigint "
+         "   OR first_seen > EXTRACT(EPOCH FROM now())::bigint;"},
     };
     return kMigrations;
 }

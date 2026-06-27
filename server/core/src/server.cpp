@@ -517,7 +517,7 @@ public:
         //     — revoked token replay; investigate originating IP
         metrics_.describe("yuzu_device_token_binding_mismatch_total",
                           "Device-token presenter did not match the bound device_id "
-                          "(#826 stolen-token impersonation attempt)",
+                          "(stolen-token impersonation attempt)",
                           "counter");
         metrics_.describe("yuzu_device_token_unbound_legacy_total",
                           "Device-token validation refused because the stored row has "
@@ -540,7 +540,7 @@ public:
         // <agent_id>` accompanies each increment.
         metrics_.describe("yuzu_enrollment_token_race_lost_total",
                           "Enrollment-token consume lost the atomic-claim race "
-                          "(#827 — leaked token presented by a second agent)",
+                          "(leaked token presented by a second agent)",
                           "counter");
         // Low-signal enrollment-token rejection bucket. Variants are
         // `not_found`, `revoked`, `expired`, `invalid_input`,
@@ -983,12 +983,12 @@ public:
                     metrics_.counter("yuzu_pg_unhealthy_discard_total").increment();
                 };
                 opts.observer.on_acquire_wait_seconds = [this](double s) {
-                    // Extended buckets (#1686): acquire waits saturate into the
-                    // 10-60s range under pool contention; the default 10s ceiling
-                    // collapses that tail into +Inf.
-                    metrics_.histogram("yuzu_pg_acquire_wait_seconds",
-                                       yuzu::Histogram::seconds_buckets_60s())
-                        .observe(s);
+                    // The series is born with the extended 10-60s buckets at metric
+                    // registration (#1686), so this hot per-acquire path uses the
+                    // cheap name-only lookup — no throwaway bucket-vector alloc per
+                    // acquire. (Birth runs at startup, before the pool exists, so the
+                    // name-only lookup always resolves to the 60s-bucket series.)
+                    metrics_.histogram("yuzu_pg_acquire_wait_seconds").observe(s);
                 };
                 pg_pool_ = std::make_unique<pg::PgPool>(std::move(opts));
                 // Probe: a live checkout proves reachability and warms one

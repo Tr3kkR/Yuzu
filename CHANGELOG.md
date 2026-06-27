@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
+  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
+  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
+  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
+  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
+  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
+  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
+  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
+  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
+  or `first_seen` was written into the future back down to now, so a previously-hidden dark endpoint
+  re-enters the freshness window. No schema change — the column had no other consumer.
+
 - **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
   route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
   failed to persist (audit DB locked/full, or a `bad_alloc`-class throw) could previously look like
@@ -98,18 +110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Behavior change for API consumers:** an audit-store outage now yields `503` where it
   previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
   the audit subsystem recovers."
-
-- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
-  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
-  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
-  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
-  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
-  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
-  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
-  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
-  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
-  was written into the future back down to now, so a previously-hidden dark endpoint re-enters the
-  freshness window. No schema change — the column had no other consumer.
 
 ### Changed
 
