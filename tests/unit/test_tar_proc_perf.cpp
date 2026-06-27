@@ -17,6 +17,8 @@
 #include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
 
+#include <yuzu/version_string.hpp>
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
@@ -196,14 +198,51 @@ TEST_CASE("procperf derive: the representative is the largest-working-set instan
     CHECK(out[0].version.empty());               // unresolved until resolve_proc_versions
 }
 
-// ── format_file_version (pure) ───────────────────────────────────────────────
+// ── shared version normalization (pure, cross-platform) ──────────────────────
 
-TEST_CASE("procperf version: VS_FIXEDFILEINFO words format as a.b.c.d", "[tar][procperf]") {
+TEST_CASE("version_string: VS_FIXEDFILEINFO words format as a.b.c.d", "[tar][procperf][version]") {
+    using yuzu::util::format_file_version;
     // ms = HIWORD.LOWORD, ls = HIWORD.LOWORD — e.g. Chrome 124.0.6367.91.
     CHECK(format_file_version(0x007C0000u, 0x18DF005Bu) == "124.0.6367.91");
     CHECK(format_file_version(0u, 0u) == "0.0.0.0");
     CHECK(format_file_version(0xFFFFFFFFu, 0xFFFFFFFFu) == "65535.65535.65535.65535");
     CHECK(format_file_version(0x000A0001u, 0x00000000u) == "10.1.0.0");
+}
+
+TEST_CASE("version_string: normalize_ffi_version maps the all-zero fixed version to ''",
+          "[tar][procperf][version]") {
+    using yuzu::util::normalize_ffi_version;
+    // The contract the perf-side resolver relies on but never exercised in CI
+    // (the all-zero guard lived inline in the Windows-only impure shell, quality-1).
+    CHECK(normalize_ffi_version(0u, 0u).empty());          // "no real version" -> unknown bucket
+    CHECK(normalize_ffi_version(0x007C0000u, 0x18DF005Bu) == "124.0.6367.91");
+    CHECK(normalize_ffi_version(0x000A0001u, 0u) == "10.1.0.0");
+}
+
+TEST_CASE("version_string: canon_version normalizes to exactly 4 groups, joins perf",
+          "[tar][procperf][version]") {
+    using yuzu::util::canon_version;
+    using yuzu::util::format_file_version;
+    // Already a 4-group quad -> unchanged (the dominant WER case).
+    CHECK(canon_version("6.15.101.7085") == "6.15.101.7085");
+    // ARITY FIX (UP-2): short forms pad to 4 so they byte-match format_file_version,
+    // which is ALWAYS 4 groups. Before this, "3.2" stayed "3.2" and never joined
+    // the perf row "3.2.0.0".
+    CHECK(canon_version("3.2") == "3.2.0.0");
+    CHECK(canon_version("3.2") == format_file_version(0x00030002u, 0u)); // proves the join
+    CHECK(canon_version("10") == "10.0.0.0");
+    // Trailing non-numeric suffix dropped (live-observed explorer.exe form).
+    CHECK(canon_version("10.0.26100.8457 (WinBuild.160101.0800)") == "10.0.26100.8457");
+    // Leading zeros normalized through the integer parse (matches format_file_version).
+    CHECK(canon_version("01.02.03.04") == "1.2.3.4");
+    // > 4 groups capped at 4.
+    CHECK(canon_version("1.2.3.4.5.6") == "1.2.3.4");
+    // all-zero and empty and non-numeric all collapse to the unknown bucket.
+    CHECK(canon_version("0.0.0.0").empty());
+    CHECK(canon_version("").empty());
+    CHECK(canon_version("not.a.version").empty());
+    // UP-12 length guard: an absurd digit run is rejected, not echoed unbounded.
+    CHECK(canon_version(std::string(10000, '9')).empty());
 }
 
 TEST_CASE("procperf version: resolve_proc_versions is a no-op when there is no representative",

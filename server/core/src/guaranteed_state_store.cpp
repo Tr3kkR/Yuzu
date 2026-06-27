@@ -3,6 +3,8 @@
 #include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
+#include <yuzu/version_string.hpp> // shared canon_version — re-canon agent input at the boundary
+
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
@@ -151,6 +153,10 @@ constexpr const char* kGobsDdl = R"(
     --   symbolic  = human name for reason ("ACCESS_VIOLATION", …)
     --   component = secondary entity (faulting module, NIC, MAC…)
     --   metric    = numeric payload (boot duration ms); 0 = none
+    --   version   = the crashed/hung app's file version, canonicalized to the
+    --               4-group quad procperf emits ("" = unknown). Added by
+    --               migration {8}; re-canonicalized server-side at projection so
+    --               an untrusted agent can never persist a non-canonical value.
     -- Reaped in lockstep with the parent events via ttl_expires_at.
     CREATE TABLE IF NOT EXISTS guardian_observations (
         event_id        TEXT PRIMARY KEY,
@@ -893,9 +899,14 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     if (component.empty())
         component = field("faulting_module");
     const std::string platform = field("platform");
-    // Per-version stability (slice 2b): the agent already canonicalized this to the
-    // procperf quad and clipped it; field() re-clamps defensively. "" = unknown.
-    const std::string version = field("version");
+    // Per-version stability (slice 2b). RE-CANONICALIZE server-side (UP-4): never
+    // trust the agent's string — a hostile/buggy/non-Windows agent could ship a
+    // non-canonical or malicious value (e.g. "<script>…") within the 256-byte
+    // clamp. Re-running the shared canon_version guarantees guardian_observations
+    // .version is ALWAYS a clean 4-group quad or "" (the unknown bucket),
+    // preserving the (subject, version) join invariant and removing any latent
+    // stored-XSS surface for a future renderer regardless of agent behaviour.
+    const std::string version = yuzu::util::canon_version(field("version"));
     double metric = 0.0;
     if (j.is_object())
         if (auto it = j.find("metric"); it != j.end() && it->is_number()) {

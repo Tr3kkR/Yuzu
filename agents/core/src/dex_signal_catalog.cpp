@@ -1,5 +1,7 @@
 #include <yuzu/agent/dex_signal_catalog.hpp>
 
+#include <yuzu/version_string.hpp> // shared canon_version (perf/crash/server agree)
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -68,40 +70,12 @@ std::uint32_t parse_hex_u32(const std::string& s) {
     }
 }
 
-// Canonicalize a Windows-Error-Reporting version field to the dotted numeric
-// quad slice-1's procperf collector emits (VS_FIXEDFILEINFO → "a.b.c.d"), so the
-// (app, version) identity JOINS across stability and perf. WER's AppName/
-// AppVersion is normally the fixed quad already (verified Win11 26100: clean
-// "6.15.101.7085"), but the version resource's StringFileInfo can carry suffixes
-// ("10.0.x (WinBuild…)") or fewer parts — keep ONLY the leading run of
-// dot-separated numeric groups. An all-zero quad ("0.0.0.0", WER's "no version
-// resource" sentinel) and an empty field both canonicalize to "" — the single
-// "unknown version" bucket the read model groups under (matching procperf's ""
-// for an unresolved/packaged app).
-std::string canon_version(std::string_view raw) {
-    std::string out;
-    std::size_t i = 0;
-    bool all_zero = true;
-    while (i < raw.size()) {
-        // one numeric group
-        std::size_t start = i;
-        while (i < raw.size() && raw[i] >= '0' && raw[i] <= '9')
-            ++i;
-        if (i == start)
-            break; // not a digit where a group must start → stop (drops any suffix)
-        for (std::size_t k = start; k < i; ++k)
-            if (raw[k] != '0')
-                all_zero = false;
-        if (!out.empty())
-            out += '.';
-        out.append(raw, start, i - start);
-        if (i < raw.size() && raw[i] == '.')
-            ++i; // consume the separator and continue
-        else
-            break;
-    }
-    return all_zero ? std::string{} : out;
-}
+// canon_version (WER AppVersion -> the same 4-group quad procperf emits) is now
+// the shared yuzu::util::canon_version in <yuzu/version_string.hpp>, so the
+// agent crash/hang extractor, the agent perf collector, and the SERVER projection
+// boundary all normalize identically. Pulled into a header-only util to close the
+// arity mismatch (UP-2) and let the server re-canon untrusted agent input (UP-4).
+using yuzu::util::canon_version;
 
 double parse_metric_ms(const std::string& s) {
     if (s.empty()) return 0.0;

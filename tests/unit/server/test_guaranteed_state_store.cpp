@@ -471,6 +471,73 @@ TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by ver
     CHECK(teams->crashes == 1);
 }
 
+TEST_CASE("GuaranteedStateStore: dex_device_top_apps honors time-fence, ranking and limit",
+          "[guaranteed_state_store][events][crash][dex]") {
+    // quality SHOULD-2: the prior test shares one timestamp band, so the
+    // `observed_at >= ?` fence, the ORDER BY rank, and the LIMIT cap were all
+    // unexercised — a regression dropping any of the three would pass. Pin them.
+    GuaranteedStateStore store(":memory:");
+    int n = 0;
+    auto crash = [&](const char* subject, const char* ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = "o" + std::to_string(++n);
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = nlohmann::json{{"subject", subject}, {"version", "1.0.0.0"}}.dump();
+        e.timestamp = ts;
+        REQUIRE(store.insert_event(e));
+    };
+    // hot.exe: 3 crashes in-window; cold.exe: 1 in-window. Plus one hot.exe crash
+    // BEFORE the cutoff that must be fenced out.
+    crash("hot.exe", "2026-06-10T10:00:00Z");
+    crash("hot.exe", "2026-06-10T11:00:00Z");
+    crash("hot.exe", "2026-06-10T12:00:00Z");
+    crash("cold.exe", "2026-06-10T10:00:00Z");
+    crash("hot.exe", "2026-05-01T10:00:00Z"); // pre-cutoff — must NOT count
+
+    auto rows = store.dex_device_top_apps("agent-A", "2026-06-01T00:00:00Z", 50);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].subject == "hot.exe"); // ranking: highest (crashes+hangs) first
+    CHECK(rows[0].crashes == 3);         // time-fence: the May crash excluded (else 4)
+    CHECK(rows[1].subject == "cold.exe");
+
+    // LIMIT cap: top-1 returns only the hottest bucket.
+    auto capped = store.dex_device_top_apps("agent-A", "2026-06-01T00:00:00Z", 1);
+    REQUIRE(capped.size() == 1);
+    CHECK(capped[0].subject == "hot.exe");
+}
+
+TEST_CASE("GuaranteedStateStore: projection RE-CANONICALIZES the agent version (UP-4)",
+          "[guaranteed_state_store][events][crash][dex][security]") {
+    // UP-4: the server must never trust the agent's version string. Re-running
+    // canon_version at the projection boundary guarantees guardian_observations
+    // .version is always a clean 4-group quad or "" — closing the latent
+    // stored-XSS surface and the arity join, regardless of agent behaviour.
+    GuaranteedStateStore store(":memory:");
+    auto project_version = [&](const char* id, const std::string& sent) -> std::string {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = "agent-A";
+        e.event_type = "process.crashed";
+        e.severity = "info";
+        e.detail_json = nlohmann::json{{"subject", "a.exe"}, {"version", sent}}.dump();
+        e.timestamp = "2026-06-08T12:00:00Z";
+        REQUIRE(store.insert_event(e));
+        for (const auto& o : store.query_observations())
+            if (o.event_id == id)
+                return o.version;
+        return "<not-found>";
+    };
+    CHECK(project_version("rc1", "1.2") == "1.2.0.0");              // short -> padded (arity)
+    CHECK(project_version("rc2", "01.02.03.04") == "1.2.3.4");      // leading zeros normalized
+    CHECK(project_version("rc3", "<script>alert(1)</script>").empty()); // hostile -> "" (no XSS)
+    CHECK(project_version("rc4", std::string(5000, '9')).empty());  // garbage length -> ""
+    CHECK(project_version("rc5", "6.15.101.7085") == "6.15.101.7085"); // clean quad unchanged
+}
+
 TEST_CASE("GuaranteedStateStore: legacy slice-1 crash keys still project (fallback)",
           "[guaranteed_state_store][events][crash][dex]") {
     // PR #1311 transition compat: an agent still emitting the slice-1 crash keys

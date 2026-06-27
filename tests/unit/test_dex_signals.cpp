@@ -288,7 +288,7 @@ TEST_CASE("extract_signal: hang (1002, classic positional)", "[dex][parse]") {
     REQUIRE(o);
     CHECK(o->obs_type == "process.hung");
     CHECK(o->subject == "Teams.exe");
-    CHECK(o->version == "1.6.0"); // positional [1] = the hung app's version
+    CHECK(o->version == "1.6.0.0"); // positional [1] = hung app's version, padded to the 4-group quad
     CHECK(o->kind == "hang");
     CHECK(o->symbolic == "NOT_RESPONDING");
     CHECK(o->pid == 0x11c8u);
@@ -309,7 +309,9 @@ TEST_CASE("extract_signal: crash version canonicalizes to the procperf quad", "[
     CHECK(ver("").empty());
     // Store/packaged apps report no AppVersion in event 1000 → "" (honest blank).
     CHECK(ver("not.a.version").empty());     // non-numeric → no leading group → ""
-    CHECK(ver("3.2") == "3.2");              // short forms are kept as-is
+    // ARITY FIX (UP-2): a short WER version pads to the 4-group quad so it joins
+    // procperf (which always emits 4 groups). Was "3.2" — a silent join miss.
+    CHECK(ver("3.2") == "3.2.0.0");
 }
 
 TEST_CASE("extract_signal: service crash 7031/7034 + start failure 7000", "[dex][parse]") {

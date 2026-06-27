@@ -42,8 +42,9 @@
  * sampling stays on).
  *
  * The derivation + top-N selection is PURE (derive_proc_samples), as is the
- * version-string formatting (format_file_version) — both unit-tested on every
- * host; read_proc_counters() and resolve_proc_versions() are the impure
+ * shared version normalization (yuzu::util::format_file_version /
+ * normalize_ffi_version in <yuzu/version_string.hpp>) — both unit-tested on
+ * every host; read_proc_counters() and resolve_proc_versions() are the impure
  * Windows shells.
  */
 
@@ -113,9 +114,10 @@ ProcSnapshot read_proc_counters();
 /// Shared by the CPU-baseline lookup and the version cache so both agree.
 std::uint64_t proc_identity(std::uint32_t pid, std::int64_t create_time_100ns);
 
-/// PURE: format a Win32 VS_FIXEDFILEINFO version (dwFileVersionMS/LS) as the
-/// canonical "a.b.c.d" — HIWORD(ms).LOWORD(ms).HIWORD(ls).LOWORD(ls).
-std::string format_file_version(std::uint32_t ms, std::uint32_t ls);
+// Version formatting/normalization is shared with the crash-side extractor and
+// the server projection — see <yuzu/version_string.hpp> (format_file_version /
+// normalize_ffi_version / canon_version), so all three producers of the
+// (name, version) identity emit byte-identical canonical strings.
 
 /// Impure shell: annotate each sample's `version` from its representative
 /// process (Windows OpenProcess + file-version resource read). `cache` maps a

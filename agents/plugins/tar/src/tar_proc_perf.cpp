@@ -2,9 +2,10 @@
 
 #include "tar_collectors.hpp" // should_redact
 
+#include <yuzu/version_string.hpp> // shared format_file_version / normalize_ffi_version
+
 #include <algorithm>
 #include <cmath>
-#include <format>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,11 +33,6 @@ std::uint64_t proc_identity(std::uint32_t pid, std::int64_t create_time_100ns) {
     // mis-attribution for one app row.
     return (static_cast<std::uint64_t>(pid) << 32) ^
            static_cast<std::uint64_t>(create_time_100ns);
-}
-
-std::string format_file_version(std::uint32_t ms, std::uint32_t ls) {
-    return std::format("{}.{}.{}.{}", (ms >> 16) & 0xffffu, ms & 0xffffu,
-                       (ls >> 16) & 0xffffu, ls & 0xffffu);
 }
 
 std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
@@ -266,13 +262,10 @@ std::string resolve_one_version(std::uint32_t pid, std::int64_t create_time_100n
     if (!::VerQueryValueW(info.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffi_len) ||
         !ffi || ffi_len < sizeof(VS_FIXEDFILEINFO))
         return {};
-    // An all-zero fixed version is the "no real version" case — return "" so it
-    // shares the single unknown-version bucket with the crash side's canon_version
-    // ("0.0.0.0" → ""), keeping the (name, version) join consistent across perf
-    // and stability. (DEX app-perf-over-time slice 2b.)
-    if (ffi->dwFileVersionMS == 0 && ffi->dwFileVersionLS == 0)
-        return {};
-    return format_file_version(ffi->dwFileVersionMS, ffi->dwFileVersionLS);
+    // Shared normalization: an all-zero fixed version maps to "" so it shares the
+    // single unknown-version bucket with the crash side's canon_version, keeping
+    // the (name, version) join consistent across perf and stability.
+    return yuzu::util::normalize_ffi_version(ffi->dwFileVersionMS, ffi->dwFileVersionLS);
 }
 
 } // namespace

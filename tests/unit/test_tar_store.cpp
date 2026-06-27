@@ -473,23 +473,29 @@ TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays auth
     // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
     // the panel with no CI signal (governance G3 quality-engineer).
     auto t = make_test_db();
+    // Three rows for Teams.exe: TWO at hour 3600 (a version flip within the hour,
+    // the post-v4 (hour,name,version) granularity) and one at hour 7200. So
+    // COUNT(*) == 3 but COUNT(DISTINCT hour_ts) == 2 — they diverge, pinning the
+    // happy-path "Hours seen" regression fix (COUNT(*) over-counts across a version
+    // change; the correct answer is distinct hourly windows).
     REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max, "
+        "INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max, "
         "cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes) VALUES "
-        "(3600, 'Teams.exe', 120, 6, 8.4, 41.2, 2040109465, 3328599654), "
-        "(7200, 'Teams.exe', 120, 5, 4.0, 20.0, 1000000000, 2000000000)"));
+        "(3600, 'Teams.exe', '1.0.0.0', 120, 6, 8.4, 41.2, 2040109465, 3328599654), "
+        "(3600, 'Teams.exe', '2.0.0.0', 60,  4, 5.0, 22.0, 1500000000, 2500000000), "
+        "(7200, 'Teams.exe', '2.0.0.0', 120, 5, 4.0, 20.0, 1000000000, 2000000000)"));
     auto r = t.db.execute_user_query(
         "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
         "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
         "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
-        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(DISTINCT hour_ts) AS hours "
         "FROM procperf_hourly WHERE hour_ts >= 0 "
         "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][0] == "Teams.exe");
-    CHECK(r->rows[0][1] == "240");  // SUM(samples)
-    CHECK(r->rows[0][7] == "2");    // COUNT(*) hours
+    CHECK(r->rows[0][1] == "300");  // SUM(samples) across all three rows
+    CHECK(r->rows[0][7] == "2");    // COUNT(DISTINCT hour_ts) — NOT 3 (COUNT(*) would over-count)
     // Column names ride the schema line the server parser locates fields by.
     REQUIRE(r->columns.size() == 8);
     CHECK(r->columns[0] == "name");

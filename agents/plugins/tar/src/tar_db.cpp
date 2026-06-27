@@ -418,7 +418,16 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             const auto alter =
                 std::format("ALTER TABLE {} ADD COLUMN version TEXT NOT NULL DEFAULT ''", tbl);
             if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, &emsg) != SQLITE_OK) {
-                spdlog::warn("TarDatabase: v4 ALTER {} failed: {}", tbl, emsg ? emsg : "unknown");
+                // ERROR, not warn: a stranded v4 is NOT a degraded-version state —
+                // insert_proc_perf_samples and the hourly rollup both name the
+                // `version` column unconditionally, so on a schema-v3 DB they fail
+                // to prepare EVERY tick and ALL procperf collection stops. Give the
+                // on-call operator the exact recovery, since the schema stays at v3.
+                spdlog::error("TarDatabase: v4 ALTER {} failed: {} — schema remains at v3; ALL "
+                              "procperf collection will fail until the column is added. Recovery: "
+                              "stop the agent and run `ALTER TABLE {} ADD COLUMN version TEXT NOT "
+                              "NULL DEFAULT '';` on the tar.db, then restart.",
+                              tbl, emsg ? emsg : "unknown", tbl);
                 sqlite3_free(emsg);
                 emsg = nullptr;
                 ok = false;
