@@ -161,6 +161,7 @@ struct GuardianObservationRow {
     std::string reason;            // e.g. "0xC0000005", "0x80070643", "timeout"
     std::string symbolic;          // e.g. "ACCESS_VIOLATION", "WIFI_DISCONNECT"
     std::string component;         // e.g. "ntdll.dll" (faulting module)
+    std::string version;           // crashed/hung app's file version "a.b.c.d", "" if unknown
     double metric{0.0};            // numeric payload (boot duration ms); 0 = none
     std::string platform;          // "windows" | "linux" | "macos"
 };
@@ -180,6 +181,7 @@ struct DexCrashSummary {
 };
 struct DexAppCrashCount {          // top unreliable apps + blast radius
     std::string subject;           // process name
+    std::string version;           // app file version, "" = unknown/all (version-blind query)
     int64_t crashes{0};
     int64_t hangs{0};
     int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
@@ -314,6 +316,14 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "") const;
     // Spans process.crashed + process.hung (the app-reliability table).
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
+    // Per-DEVICE app reliability, split by VERSION (slice 2b) — the per-(app,
+    // version) crash/hang counts on ONE device, joinable to that device's
+    // procperf (name, version) for the perf+stability-by-version drill. Rows with
+    // an unknown version ("") bucket together. distinct_devices is always 1 here
+    // (single agent) — kept for struct reuse. blast radius lives in dex_top_apps.
+    std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
+                                                      const std::string& since = "",
+                                                      int limit = 50) const;
     std::vector<DexModuleCrashCount> dex_top_modules(const std::string& since = "", int limit = 20) const;
     std::vector<DexDeviceCrashCount> dex_top_devices(const std::string& since = "", int limit = 20) const;
     std::vector<DexOsCrashCount> dex_crashes_by_os(const std::string& since = "") const;

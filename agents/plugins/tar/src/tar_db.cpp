@@ -388,6 +388,62 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         }
     }
 
+    // Version 4: add the per-app `version` column to the procperf tiers (DEX
+    // app-perf-over-time, slice 1). A FRESH db already has the column from the
+    // registry DDL (create_warehouse_tables ran above), and the version walk
+    // 0→2→3→4 reaches here with it present — so each ALTER is guarded on a
+    // PRAGMA table_info existence check. The version is bumped only when both
+    // tiers carry the column (already-present counts as success).
+    if (db.schema_version() == 3) {
+        std::lock_guard lock(db.mu_);
+        auto has_version_col = [&](const char* tbl) -> bool {
+            const auto pragma = std::format("PRAGMA table_info({})", tbl);
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(raw_db, pragma.c_str(), -1, &raw, nullptr) != SQLITE_OK)
+                return false;
+            StmtPtr q(raw);
+            while (sqlite3_step(q.get()) == SQLITE_ROW) {
+                const auto* col = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 1));
+                if (col && std::string_view{col} == "version")
+                    return true;
+            }
+            return false;
+        };
+        char* emsg = nullptr;
+        sqlite3_exec(raw_db, "SAVEPOINT v4_migration", nullptr, nullptr, nullptr);
+        bool ok = true;
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            if (has_version_col(tbl))
+                continue;
+            const auto alter =
+                std::format("ALTER TABLE {} ADD COLUMN version TEXT NOT NULL DEFAULT ''", tbl);
+            if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, &emsg) != SQLITE_OK) {
+                // ERROR, not warn: a stranded v4 is NOT a degraded-version state —
+                // insert_proc_perf_samples and the hourly rollup both name the
+                // `version` column unconditionally, so on a schema-v3 DB they fail
+                // to prepare EVERY tick and ALL procperf collection stops. Give the
+                // on-call operator the exact recovery, since the schema stays at v3.
+                spdlog::error("TarDatabase: v4 ALTER {} failed: {} — schema remains at v3; ALL "
+                              "procperf collection will fail until the column is added. Recovery: "
+                              "stop the agent and run `ALTER TABLE {} ADD COLUMN version TEXT NOT "
+                              "NULL DEFAULT '';` on the tar.db, then restart.",
+                              tbl, emsg ? emsg : "unknown", tbl);
+                sqlite3_free(emsg);
+                emsg = nullptr;
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "4");
+            sqlite3_exec(raw_db, "RELEASE v4_migration", nullptr, nullptr, nullptr);
+            spdlog::info("TarDatabase: migrated to schema version 4 (procperf version column)");
+        } else {
+            sqlite3_exec(raw_db, "ROLLBACK TO v4_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v4_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
     // impossible and the authorizer restricts reads to registry-known warehouse
@@ -1133,8 +1189,8 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
     sqlite3_free(err_msg);
 
     const char* sql = R"(
-        INSERT INTO procperf_live (ts, snapshot_id, name, instances, cpu_pct, ws_bytes)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* raw_stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
@@ -1148,9 +1204,10 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
         sqlite3_bind_int64(stmt.get(), 1, r.ts);
         sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
         sqlite3_bind_text(stmt.get(), 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt.get(), 4, r.instances);
-        sqlite3_bind_double(stmt.get(), 5, r.cpu_pct);
-        sqlite3_bind_int64(stmt.get(), 6, r.ws_bytes);
+        sqlite3_bind_text(stmt.get(), 4, r.version.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt.get(), 5, r.instances);
+        sqlite3_bind_double(stmt.get(), 6, r.cpu_pct);
+        sqlite3_bind_int64(stmt.get(), 7, r.ws_bytes);
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_proc_perf_samples step: {}", sqlite3_errmsg(db_));
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);

@@ -2085,10 +2085,14 @@ std::string dex_procperf_sql() {
                             .count() -
                         86400;
     return std::format(
+        // COUNT(DISTINCT hour_ts), not COUNT(*): the rollup now keys on
+        // (hour, name, version), so one app can have >1 row per hour during an
+        // in-place version change. "Hours seen" must count distinct hourly windows,
+        // not (hour x version) tuples, or it over-counts across a version flip.
         "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
         "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
         "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
-        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(DISTINCT hour_ts) AS hours "
         "FROM $ProcPerf_Hourly WHERE hour_ts >= {} "
         "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25",
         cutoff);

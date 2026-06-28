@@ -10,6 +10,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('dnsapi')   # DnsQuery_W / DnsRecordListFree (tar_dns_collector)
   tar_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (tar_module_etw)
   tar_deps += cxx.find_library('crypt32')  # CryptQueryObject — signer extraction (tar_module_etw)
+  tar_deps += cxx.find_library('version')  # GetFileVersionInfoW / VerQueryValueW (tar_proc_perf)
 elif host_machine.system() == 'darwin'
   # Endpoint Security process stream (tar_proc_es). The ES framework ships only
   # with the FULL Xcode SDK, not the Command Line Tools SDK, so detect it: where
