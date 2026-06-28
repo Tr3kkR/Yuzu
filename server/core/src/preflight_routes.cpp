@@ -183,6 +183,23 @@ std::string gen_run_id() {
     return auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 }
 
+// The viewer's own recent runs as (run_id, rail-label). Owner-scoped (is_admin
+// false). Shared by the config fragment + the delete route's rail re-render.
+std::vector<std::pair<std::string, std::string>> recent_runs(PreflightRunStore* store,
+                                                             const std::string& viewer) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (!store)
+        return out;
+    for (const auto& r : store->list_runs(viewer, /*is_admin=*/false, 12)) {
+        std::string label = r.name.empty() ? std::string("Pre-flight") : r.name;
+        label += " \xC2\xB7 " + std::to_string(r.go) + "go/" + std::to_string(r.nogo) + "no-go";
+        if (r.status == "running")
+            label += " \xC2\xB7 running";
+        out.emplace_back(r.run_id, label);
+    }
+    return out;
+}
+
 } // namespace
 
 void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
@@ -224,18 +241,32 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
         std::vector<std::pair<std::string, std::string>> groups;
         if (groups_fn_)
             groups = groups_fn_();
-        // Owner-scoped recent runs for the rail (created_by = viewer).
-        std::vector<std::pair<std::string, std::string>> recent;
-        if (run_store_) {
-            for (const auto& r : run_store_->list_runs(session->username, /*is_admin=*/false, 12)) {
-                std::string label = r.name.empty() ? std::string("Pre-flight") : r.name;
-                label += " \xC2\xB7 " + std::to_string(r.go) + "go/" + std::to_string(r.nogo) + "no-go";
-                if (r.status == "running")
-                    label += " \xC2\xB7 running";
-                recent.emplace_back(r.run_id, label);
-            }
+        res.set_content(render_auto_config(groups, recent_runs(run_store_, session->username)),
+                        "text/html; charset=utf-8");
+    });
+
+    // ── Delete a run (owner-scoped, confirm-guarded on the client) ───────────
+    svr.Post("/fragments/auto/delete", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
         }
-        res.set_content(render_auto_config(groups, recent), "text/html; charset=utf-8");
+        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        if (!run_store_) {
+            res.set_content(render_auto_rail({}), "text/html; charset=utf-8");
+            return;
+        }
+        const std::string run_id = param(req, "run");
+        // Owner-scoped at the store seam (created_by must match) — a non-owner /
+        // unknown run is a silent no-op (the rail is the viewer's own anyway).
+        const bool deleted = run_store_->delete_run(run_id, session->username);
+        if (audit_fn_)
+            audit_fn_(req, "preflight.run.delete", deleted ? "success" : "noop", "Scope", run_id, "");
+        res.set_content(render_auto_rail(recent_runs(run_store_, session->username)),
+                        "text/html; charset=utf-8");
     });
 
     // ── Run — freeze cohort, create run, first dispatch, render live ─────────

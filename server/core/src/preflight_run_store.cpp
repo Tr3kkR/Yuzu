@@ -369,4 +369,19 @@ int PreflightRunStore::prune_older_than(std::int64_t cutoff_ms) {
     return PQntuples(res.get());
 }
 
+bool PreflightRunStore::delete_run(const std::string& run_id, const std::string& created_by) {
+    if (!open_ || run_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return false;
+    // Owner-scoped at the seam (defense in depth on top of the route's check);
+    // run_device cascades via the FK ON DELETE CASCADE.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM preflight_run_store.runs WHERE run_id=$1 AND created_by=$2 RETURNING run_id",
+        std::vector<std::string>{run_id, created_by});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+}
+
 } // namespace yuzu::server

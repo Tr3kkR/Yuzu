@@ -47,7 +47,7 @@ struct PreflightCheck {
 /// Slice 1 live checks (params come from the config; staged-artifact checks
 /// installer/rollback/backup arrive in a later slice).
 inline constexpr std::array<PreflightCheck, 5> kPreflightChecks = {{
-    {"app", "Target application", "installed_apps", "query", true},
+    {"app", "Target App", "installed_apps", "query", true},
     {"osver", "OS version", "os_info", "os_version", true},
     {"osarch", "Arch", "os_info", "os_arch", true},
     {"disk", "Free disk", "disk_space", "free", true},
@@ -242,7 +242,7 @@ inline std::optional<std::string> extract_cell(std::string_view key, std::string
     if (key == "reboot") {
         auto r = find_row(output, "reboot_required");
         if (r && r->size() >= 2)
-            return (*r)[1] == "true" ? std::string("Pending") : std::string("Clear");
+            return (*r)[1] == "true" ? std::string("yes") : std::string("no");
         return std::nullopt;
     }
     if (key == "disk") {

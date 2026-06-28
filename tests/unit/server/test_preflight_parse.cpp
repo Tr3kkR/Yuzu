@@ -41,8 +41,8 @@ TEST_CASE("cmp_version dotted-numeric semantics", "[preflight][parse]") {
 TEST_CASE("extract_cell display values", "[preflight][parse]") {
     CHECK(extract_cell("osver", "os_version|10.0.22631\nos_product_version|24H2") == "10.0.22631");
     CHECK(extract_cell("osarch", "os_arch|x86_64") == "x86_64");
-    CHECK(extract_cell("reboot", "cbs_reboot|true|CBS\nreboot_required|true|CBS") == "Pending");
-    CHECK(extract_cell("reboot", "reboot_required|false|") == "Clear");
+    CHECK(extract_cell("reboot", "cbs_reboot|true|CBS\nreboot_required|true|CBS") == "yes");
+    CHECK(extract_cell("reboot", "reboot_required|false|") == "no");
     CHECK(extract_cell("disk", "disk|C:\\|511056015360|61024096256|87") == "56.8 GiB free (87% used)");
     // app: found + version, or honest "(not installed)"
     CHECK(extract_cell("app", "found|true\napp|AcmeVPN|4.2.0|Acme") == "4.2.0");

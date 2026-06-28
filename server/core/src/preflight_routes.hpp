@@ -56,6 +56,12 @@ namespace yuzu::server {
 std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups,
                                const std::vector<std::pair<std::string, std::string>>& recent);
 
+/// PURE: the saved-runs rail as its own swap target (#auto-rail) — a clickable
+/// button per run + a confirm-guarded delete (hx-confirm, CSP-safe). The delete
+/// route re-renders this standalone after removing a run. `recent` = (run_id,
+/// label) of the viewer's own runs.
+std::string render_auto_rail(const std::vector<std::pair<std::string, std::string>>& recent);
+
 /// PURE: the result GROUPED BY DEVICE (Pass / Failed / Warn-only / Incomplete),
 /// with bucket + failure-type client-side filters (CSP-safe inline JS). Summary
 /// pills + "Failed by" chip counts are derived here from `devices`.

@@ -22,6 +22,7 @@ namespace {
 std::string esc(const std::string& s) { return html_escape(s); }
 
 const char* kAutoCss = R"CSS(<style>
+.gp-wrap{max-width:1320px}
 .af-cfg{border-top:1px solid #1a2c46;padding:.55rem 0;display:flex;gap:.6rem;align-items:end;flex-wrap:wrap}
 .af-cfg:first-of-type{border-top:none}
 .af-name{font-weight:600;color:#dce7f4;font-size:.82rem;min-width:150px}
@@ -35,8 +36,11 @@ const char* kAutoCss = R"CSS(<style>
 .af-rail{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem;padding-bottom:.55rem;border-bottom:1px solid #1a2c46}
 .af-rail-lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.04em;color:#7f93ad;margin-right:.2rem}
 .af-rail-keep{font-size:.62rem;color:#5d6f88;text-transform:none;letter-spacing:0}
-.af-run{background:#0c1626;border:1px solid #25395a;border-radius:.5rem;color:#cfe0f6;font-size:.72rem;padding:.22rem .55rem;cursor:pointer}
+.af-run-wrap{display:inline-flex;align-items:stretch}
+.af-run{background:#0c1626;border:1px solid #25395a;border-radius:.5rem 0 0 .5rem;border-right:none;color:#cfe0f6;font-size:.72rem;padding:.22rem .55rem;cursor:pointer}
 .af-run:hover{border-color:#3d7ad6;background:#0f1f37}
+.af-run-x{background:#0c1626;border:1px solid #25395a;border-radius:0 .5rem .5rem 0;color:#7f93ad;font-size:.74rem;line-height:1;padding:0 .42rem;cursor:pointer}
+.af-run-x:hover{border-color:#5a2323;background:#1f0e0e;color:#e57373}
 .af-cfg-hd{display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.78rem;font-weight:600;color:#9fb2cc;text-transform:uppercase;letter-spacing:.04em;padding:.2rem 0;user-select:none}
 .af-cfg-hd:hover{color:#cfe0f6}
 .af-cfg-hd .chev{font-size:.7rem;color:#7f93ad;transition:transform .12s}
@@ -103,6 +107,31 @@ const char* bucket_key(preflight::Bucket b) {
 }
 } // namespace
 
+std::string render_auto_rail(const std::vector<std::pair<std::string, std::string>>& recent) {
+    std::string h = "<div id=\"auto-rail\" class=\"af-rail\">";
+    h += "<span class=\"af-rail-lbl\">Recent runs<span class=\"af-rail-keep\"> &middot; kept 14 "
+         "days</span></span>";
+    if (recent.empty()) {
+        h += "<span class=\"gp-mute\" style=\"font-size:.7rem\">none yet</span>";
+    } else {
+        for (const auto& [run_id, label] : recent) {
+            h += "<span class=\"af-run-wrap\">";
+            h += "<button class=\"af-run\" hx-get=\"/fragments/auto/result?run=" + esc(run_id) +
+                 "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" + esc(label) +
+                 "</button>";
+            // Confirm-guarded delete (hx-confirm → native confirm(), CSP-safe).
+            h += "<button class=\"af-run-x\" title=\"Delete run\" "
+                 "hx-post=\"/fragments/auto/delete?run=" +
+                 esc(run_id) +
+                 "\" hx-confirm=\"Delete this pre-flight run? This cannot be undone.\" "
+                 "hx-target=\"#auto-rail\" hx-swap=\"outerHTML\">&times;</button>";
+            h += "</span>";
+        }
+    }
+    h += "</div>";
+    return h;
+}
+
 std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups,
                                const std::vector<std::pair<std::string, std::string>>& recent) {
     std::string h = kAutoCss;
@@ -110,16 +139,8 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
          "grouped by device. Runs persist \xE2\x80\x94 reopen one below to revisit it.</div>";
 
-    // Saved-runs rail (owner-scoped). Clicking loads that run into #auto-results.
-    if (!recent.empty()) {
-        h += "<div class=\"af-rail\"><span class=\"af-rail-lbl\">Recent runs"
-             "<span class=\"af-rail-keep\"> &middot; kept 14 days</span></span>";
-        for (const auto& [run_id, label] : recent)
-            h += "<button class=\"af-run\" hx-get=\"/fragments/auto/result?run=" + esc(run_id) +
-                 "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" + esc(label) +
-                 "</button>";
-        h += "</div>";
-    }
+    // Saved-runs rail (owner-scoped), its own swap target for the delete route.
+    h += render_auto_rail(recent);
 
     // Collapsible configuration. Inline onclick (CSP-safe; never hx-on) toggles
     // #auto-cfg's visibility — hidden inputs still submit via the Run button's
@@ -150,7 +171,7 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
          "re-dispatch on reconnect \xE2\x80\x94 lands with the saved-runs slice.)</div>";
 
     // Target application (A) — name + min/max version
-    h += "<div class=\"af-cfg\"><span class=\"af-name\">Target application</span>"
+    h += "<div class=\"af-cfg\"><span class=\"af-name\">Target App</span>"
          "<div class=\"af-fld\"><label>App name</label>"
          "<input name=\"app_name\" placeholder=\"e.g. AcmeVPN\"></div>"
          "<div class=\"af-fld\"><label class=\"thr\">Min version</label>"

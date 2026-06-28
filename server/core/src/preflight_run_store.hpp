@@ -115,6 +115,10 @@ public:
     /// Returns rows deleted, or -1 on error.
     int prune_older_than(std::int64_t cutoff_ms);
 
+    /// Delete one run, OWNER-SCOPED at the seam (`created_by` must match;
+    /// run_device cascades). Returns true if a row was deleted.
+    bool delete_run(const std::string& run_id, const std::string& created_by);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
