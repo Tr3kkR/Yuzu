@@ -53,6 +53,13 @@ automatically. Delete a run from the rail (you are asked to confirm first).
 Runs are **owner-scoped**: you only see and can delete your own runs, and opening
 another operator's run is indistinguishable from a run that does not exist.
 
+If the run store's schema cannot be initialized at boot (for example, after a
+conflicting manual schema alteration in Postgres), the server **refuses to start**
+and logs `[PG] Refusing to start`. Treat this like any other Postgres migration
+failure — restore the schema or redeploy from a clean database. (A *transient*
+store error while the server is already running just degrades `/auto` to an
+"unavailable" note; it does not take the server down.)
+
 ## Permissions
 
 | Action | Permission |

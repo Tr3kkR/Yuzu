@@ -1029,13 +1029,20 @@ public:
             }
         }
 
-        // PreflightRunStore — born-on-PG persistence for /auto runs. Fail-SOFT: a
-        // feature page, not core infra, so an open failure degrades /auto to an
-        // honest "run store unavailable" note rather than blocking startup.
+        // PreflightRunStore — born-on-PG persistence for /auto runs. CONSTRUCTION
+        // is fail-CLOSED per ADR-0012 §1 (a store that cannot migrate/open sets
+        // startup_failed_, same as OfflineEndpointStore above): a reachable
+        // database whose schema can't be created is a deploy error, not a
+        // serve-degraded state. The fail-soft posture is RUNTIME-only (a transient
+        // lease timeout degrades /auto to a note; see preflight_run_store.hpp).
         if (pg_pool_ && !startup_failed_) {
             preflight_run_store_ = std::make_unique<PreflightRunStore>(*pg_pool_);
-            if (!preflight_run_store_->is_open())
-                spdlog::warn("PreflightRunStore unavailable — /auto pre-flight runs will not persist");
+            if (!preflight_run_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: preflight-run store migration/open failed "
+                              "(database reachable but the preflight_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
         }
 
         // Initialize response store

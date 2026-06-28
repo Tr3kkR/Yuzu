@@ -7,9 +7,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "preflight_run_store.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <string>
@@ -17,7 +20,9 @@
 using yuzu::server::PreflightRunDeviceRow;
 using yuzu::server::PreflightRunRow;
 using yuzu::server::PreflightRunStore;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 using yuzu::server::preflight::PreflightTarget;
 
 namespace {
@@ -144,4 +149,25 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
         CHECK(store.get_devices("rOld").empty()); // cascaded
         CHECK(store.get_run("rL").has_value());    // newer run survives
     }
+}
+
+// #1720 review (ADR-0012 §1): construction must be fail-CLOSED — a reachable
+// database whose schema can't migrate leaves the store !is_open(), which
+// server.cpp wires to startup_failed_ (refuse to start, not serve-degraded).
+// Force the failure by pre-seeding the store's schema with a conflicting table
+// and no schema_meta row: the migration runner's drift guard refuses.
+TEST_CASE("PreflightRunStore reports !is_open on a migration failure", "[pg][preflight][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA preflight_run_store")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE preflight_run_store.runs (bogus int)")};
+        REQUIRE(t.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    PreflightRunStore store{pool};
+    CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
 }

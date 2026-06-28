@@ -4,9 +4,12 @@
 /// Born-on-Postgres store (ADR-0006, schema `preflight_run_store`) for `/auto`
 /// pre-flight RUNS — the persistence behind the saved-runs rail and the
 /// re-dispatch-on-reconnect runner. The store is the ONLY home for run state (no
-/// in-memory duplicate) yet is wired FAIL-SOFT — durability-on-top per ADR-0012,
-/// NOT fail-hard: it's a feature page, so a store outage degrades /auto to an
-/// honest note rather than failing the server (do not "fix" it to fail-closed).
+/// in-memory duplicate). Posture per ADR-0012: CONSTRUCTION is fail-CLOSED — a
+/// reachable database whose schema can't migrate/open sets `startup_failed_` in
+/// server.cpp (same as OfflineEndpointStore; a broken substrate is a deploy
+/// error, not a serve-degraded state). RUNTIME is durability-on-top / fail-soft —
+/// once open, a transient lease timeout or query error degrades /auto to an
+/// honest note rather than failing the request, never blocking the gRPC hot path.
 ///
 /// Two tables:
 ///   * runs       — metadata + frozen config + window + status + summary counts.
