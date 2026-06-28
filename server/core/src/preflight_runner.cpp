@@ -35,7 +35,11 @@ void PreflightRunner::tick() {
         const auto cfg = preflight::config_from_json(run.config_json);
         auto targets = d_.run_store->get_targets(run.run_id);
         if (targets.empty()) {
-            d_.run_store->complete_run(run.run_id, t); // nothing to do — don't linger
+            // A persisted run ALWAYS has ≥1 frozen target (create_run rejects an
+            // empty cohort), so empty here means a transient read failure — skip
+            // and retry next tick, NEVER complete (completing would lock in a
+            // zero-device run). Recovery is the normal tick: once the store reads
+            // again, an overdue run is processed + completed via the path below.
             continue;
         }
 
@@ -50,8 +54,14 @@ void PreflightRunner::tick() {
         const bool past_deadline = t >= run.deadline_at_ms;
 
         // Re-dispatch each applicable check to the not-yet-fully-answered targets
-        // while inside the window. send_to drops offline agents silently; checks
-        // are read-only so re-dispatch is idempotent.
+        // while inside the window. send_to drops offline agents silently.
+        // LOAD-BEARING INVARIANT (#governance security): this re-dispatch reaches a
+        // cohort FROZEN at creation, in the background, for up to the window, with
+        // NO re-authorization — it is safe ONLY because every check is a READ-ONLY
+        // plugin (idempotent). Any future check that MUTATES endpoint state must
+        // NOT reuse this frozen cohort; it must re-resolve devices_fn(creator)∩group
+        // authorization at each dispatch, or an operator who has since lost scope to
+        // a device would still command it.
         if (!past_deadline && d_.dispatch_fn) {
             std::vector<std::string> pending;
             for (const auto& dr : grid)
@@ -97,10 +107,16 @@ void PreflightRunner::tick() {
                 break;
             }
         }
-        d_.run_store->persist_grid(run.run_id, rows, static_cast<int>(grid.size()), go, warn, nogo,
-                                   inc);
+        const bool persisted = d_.run_store->persist_grid(run.run_id, rows,
+                                                          static_cast<int>(grid.size()), go, warn,
+                                                          nogo, inc);
 
-        if (past_deadline || !any_pending)
+        // Complete ONLY once the grid is durably persisted (#governance UP-1/CH-1).
+        // persist_grid and complete_run take independent leases — completing on a
+        // failed persist would flip the run to 'complete' with the stale/seed grid
+        // forever (it then leaves list_running, never retried). On a persist
+        // failure the run stays running and the next tick retries.
+        if (persisted && (past_deadline || !any_pending))
             d_.run_store->complete_run(run.run_id, t);
     }
 }

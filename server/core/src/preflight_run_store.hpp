@@ -3,8 +3,10 @@
 /// @file preflight_run_store.hpp
 /// Born-on-Postgres store (ADR-0006, schema `preflight_run_store`) for `/auto`
 /// pre-flight RUNS — the persistence behind the saved-runs rail and the
-/// re-dispatch-on-reconnect runner. A run is AUTHORITATIVE (no in-memory
-/// equivalent): the rail, revisit, and the runner's lifecycle all read it.
+/// re-dispatch-on-reconnect runner. The store is the ONLY home for run state (no
+/// in-memory duplicate) yet is wired FAIL-SOFT — durability-on-top per ADR-0012,
+/// NOT fail-hard: it's a feature page, so a store outage degrades /auto to an
+/// honest note rather than failing the server (do not "fix" it to fail-closed).
 ///
 /// Two tables:
 ///   * runs       — metadata + frozen config + window + status + summary counts.
@@ -13,7 +15,10 @@
 ///                  checks_json COMPUTED/upserted by the runner.
 ///
 /// Owner scoping: `created_by` is captured at creation; the rail lists a viewer's
-/// own runs (admin sees all) and the result route 403s on someone else's run.
+/// own runs and the result route reads via get_run(run_id, viewer), so another
+/// operator's run is indistinguishable from not-found (no existence oracle).
+/// Admin-sees-all (the `is_admin` list_runs path) is a tracked follow-up — not
+/// wired; callers pass is_admin=false today.
 ///
 /// Durability rationale: the computed grid is persisted (not recomputed from the
 /// ResponseStore at render) so a run revisited days later survives ResponseStore
@@ -84,9 +89,12 @@ public:
     /// bucket='inc'). Returns false on error.
     bool create_run(const PreflightRunRow& run, const std::vector<preflight::PreflightTarget>& targets);
 
-    /// Run metadata by id; nullopt if absent/error. Caller enforces owner-scope
-    /// against `created_by`.
-    [[nodiscard]] std::optional<PreflightRunRow> get_run(const std::string& run_id);
+    /// Run metadata by id; nullopt if absent/error. When `created_by` is non-empty
+    /// the read is OWNER-SCOPED at the seam: a not-yours run reads as nullopt, same
+    /// as not-found — closes the existence oracle on the result route. Empty
+    /// `created_by` = unscoped (internal callers).
+    [[nodiscard]] std::optional<PreflightRunRow> get_run(const std::string& run_id,
+                                                         const std::string& created_by = "");
 
     /// A viewer's recent runs (created_by = viewer, or all when `is_admin`),
     /// newest first, capped at `limit`.

@@ -178,15 +178,21 @@ bool PreflightRunStore::create_run(const PreflightRunRow& run,
     });
 }
 
-std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run_id) {
+std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run_id,
+                                                         const std::string& created_by) {
     if (!open_ || run_id.empty())
         return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::nullopt;
-    const std::string sql =
+    std::string sql =
         std::string("SELECT ") + kRunCols + " FROM preflight_run_store.runs WHERE run_id = $1";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{run_id});
+    std::vector<std::string> params{run_id};
+    if (!created_by.empty()) {
+        sql += " AND created_by = $2"; // owner-scope at the seam
+        params.push_back(created_by);
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
     return read_run(res.get(), 0);
@@ -305,25 +311,46 @@ bool PreflightRunStore::persist_grid(const std::string& run_id,
                                      int go, int warn, int nogo, int inc) {
     if (!open_ || run_id.empty())
         return false;
+    // ONE batched upsert via unnest of parallel arrays, instead of N per-row
+    // round-trips inside a single held lease (#governance perf-S1/UP-7 — matches
+    // create_run's batch). The string_views alias `devices`, valid for the
+    // synchronous with_txn_for below; to_text_array copies the bytes (and drops
+    // 0x00, which checks_json/ids never contain).
+    std::vector<std::string_view> aids, hosts, oses, buckets, jsons;
+    aids.reserve(devices.size());
+    hosts.reserve(devices.size());
+    oses.reserve(devices.size());
+    buckets.reserve(devices.size());
+    jsons.reserve(devices.size());
+    std::int64_t ts = 0;
+    for (const auto& d : devices) {
+        if (d.agent_id.empty())
+            continue;
+        aids.emplace_back(d.agent_id);
+        hosts.emplace_back(d.hostname);
+        oses.emplace_back(d.os);
+        buckets.emplace_back(d.bucket);
+        jsons.emplace_back(d.checks_json);
+        ts = d.updated_at_ms; // one tick-time stamps the whole grid
+    }
+    const std::string ts_s = std::to_string(ts);
     return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        for (const auto& d : devices) {
-            if (d.agent_id.empty())
-                continue;
-            // Rows were seeded at create_run → UPDATE in practice; ON CONFLICT
-            // keeps it idempotent if a target ever arrives late.
+        if (!aids.empty()) {
             pg::PgResult r = pg::exec_params(
                 conn,
                 "INSERT INTO preflight_run_store.run_device "
                 "(run_id, agent_id, hostname, os, bucket, checks_json, updated_at_ms) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7::bigint) "
+                "SELECT $1, a, h, o, b, j, $7::bigint "
+                "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) "
+                "  AS t(a, h, o, b, j) "
                 "ON CONFLICT (run_id, agent_id) DO UPDATE SET "
                 "  bucket = EXCLUDED.bucket, checks_json = EXCLUDED.checks_json, "
-                "  updated_at_ms = EXCLUDED.updated_at_ms "
-                "RETURNING agent_id",
-                std::vector<std::string>{run_id, d.agent_id, d.hostname, d.os, d.bucket,
-                                         d.checks_json, std::to_string(d.updated_at_ms)});
-            if (r.status() != PGRES_TUPLES_OK) {
-                spdlog::warn("PreflightRunStore: device upsert failed (run={}): {}", run_id,
+                "  updated_at_ms = EXCLUDED.updated_at_ms",
+                std::vector<std::string>{run_id, pg::to_text_array(aids), pg::to_text_array(hosts),
+                                         pg::to_text_array(oses), pg::to_text_array(buckets),
+                                         pg::to_text_array(jsons), ts_s});
+            if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
+                spdlog::warn("PreflightRunStore: grid upsert failed (run={}): {}", run_id,
                              PQerrorMessage(conn));
                 return false;
             }
@@ -335,14 +362,16 @@ bool PreflightRunStore::persist_grid(const std::string& run_id,
             std::vector<std::string>{run_id, std::to_string(total), std::to_string(go),
                                      std::to_string(warn), std::to_string(nogo),
                                      std::to_string(inc)});
-        return rs.status() == PGRES_TUPLES_OK;
+        // RETURNING 0 rows ⇒ the run was deleted mid-tick (UP-14): roll back, the
+        // runner won't complete it.
+        return rs.status() == PGRES_TUPLES_OK && PQntuples(rs.get()) > 0;
     });
 }
 
 bool PreflightRunStore::complete_run(const std::string& run_id, std::int64_t completed_at_ms) {
     if (!open_ || run_id.empty())
         return false;
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kWriteTimeout); // a write — match the other mutations
     if (!lease)
         return false;
     pg::PgResult res = pg::exec_params(
@@ -350,13 +379,15 @@ bool PreflightRunStore::complete_run(const std::string& run_id, std::int64_t com
         "UPDATE preflight_run_store.runs SET status='complete', completed_at_ms=$2::bigint "
         "WHERE run_id=$1 AND status='running' RETURNING run_id",
         std::vector<std::string>{run_id, std::to_string(completed_at_ms)});
-    return res.status() == PGRES_TUPLES_OK;
+    // Require an actually-updated row: an unknown or already-complete run yields 0
+    // rows → false (no silent "success" on a no-op; #governance quality/consistency).
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
 int PreflightRunStore::prune_older_than(std::int64_t cutoff_ms) {
     if (!open_)
         return -1;
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kWriteTimeout); // a DELETE — write budget
     if (!lease)
         return -1;
     pg::PgResult res =
@@ -372,10 +403,11 @@ int PreflightRunStore::prune_older_than(std::int64_t cutoff_ms) {
 bool PreflightRunStore::delete_run(const std::string& run_id, const std::string& created_by) {
     if (!open_ || run_id.empty())
         return false;
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kWriteTimeout); // a DELETE — write budget
     if (!lease)
         return false;
-    // Owner-scoped at the seam (defense in depth on top of the route's check);
+    // Owner-scope is enforced HERE at the seam (the sole chokepoint — the route
+    // does not pre-check ownership): a non-owner / unknown run_id deletes 0 rows.
     // run_device cascades via the FK ON DELETE CASCADE.
     pg::PgResult res = pg::exec_params(
         lease.get(),

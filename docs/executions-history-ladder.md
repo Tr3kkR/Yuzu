@@ -57,9 +57,9 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
-### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`)
+### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`)
 
-`notify_exec_tracker` skips two server-minted correlation-id prefixes that ride
+`notify_exec_tracker` skips three server-minted correlation-id prefixes that ride
 the `execution_id` column on `responses` (so their rows are retrievable via
 `ResponseStore::query_by_execution`) but are **NOT operator executions** —
 creating a tracker row for them would publish a phantom `agent-transition` SSE
@@ -72,6 +72,12 @@ event and leave an orphan `agent_exec_status` row that the executions drawer /
   agent, so the agent-counted tracker would mark it complete after the first
   step — collate (`received`/`succeeded` vs `expected`) is the bundle's sole
   completion authority, deliberately outside this ladder.
+- **`preflight-`** — minted by `PreflightRoutes` / `PreflightRunner` as
+  `preflight-<run_id>-<check_key>`; the `/auto` pre-flight checks. A run
+  re-dispatches each check under the same per-check id so `query_by_execution`
+  unions the re-dispatches per agent. There is no `ExecutionTracker` row —
+  `PreflightRunStore` is the run's completion authority, deliberately outside
+  this ladder.
 
 Both ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
 and their namespaces are disjoint from real tracker ids (32-hex, no prefix), so a

@@ -3,14 +3,20 @@
 #include "response_store.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace yuzu::server::preflight {
 
 namespace {
-// Generous per-check fetch: a run re-dispatches, so one agent may have several
-// command_ids under the same execution_id; latest_per_agent collapses them. The
-// cap bounds the materialised set (fleet-scale keyset paging is a follow-up).
-constexpr int kResponseFetchCap = 10000;
+// Per-check fetch cap. MUST exceed the run's cohort cap (PreflightRunStore
+// kRowCap=20000) with headroom for the multiple rows/agent that re-dispatch
+// accrues — `query_by_execution` is `ORDER BY ts DESC LIMIT`, a sliding window,
+// so an undersized cap evicts already-answered agents' terminal rows and the run
+// can never complete (#governance perf-S2/architect). 50000 covers realistic
+// re-dispatch depth at the 20k cohort ceiling; the true fix (per-agent keyset
+// paging so size is independent of row count) is a tracked follow-up — a
+// truncation hit is logged below as the signal that we've reached it.
+constexpr int kResponseFetchCap = 50000;
 
 int score_response(const StoredResponse& r) {
     int s = 0;
@@ -61,6 +67,10 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         cr.key = key;
         cr.label = label;
         auto rows = store.query_by_execution(check_execution_id(run_id, key), q);
+        if (static_cast<int>(rows.size()) >= kResponseFetchCap)
+            spdlog::warn("preflight: check '{}' response fetch hit the {}-row cap for run {} — "
+                         "some agents' latest may be evicted (keyset-paging follow-up)",
+                         key, kResponseFetchCap, run_id);
         // latest_per_agent: terminal beats running, then non-empty output, then
         // the later arrival (mirrors policy_evaluator.cpp).
         std::unordered_map<std::string, const StoredResponse*> best;
@@ -101,15 +111,22 @@ std::vector<PreflightDeviceCheck> checks_from_json(const std::string& json) {
     for (const auto& e : j) {
         if (!e.is_object())
             continue;
-        PreflightDeviceCheck c;
-        c.key = e.value("key", std::string{});
-        c.label = e.value("label", std::string{});
-        int v = e.value("v", static_cast<int>(Verdict::kUnknown));
-        if (v < 0 || v > static_cast<int>(Verdict::kUnknown))
-            v = static_cast<int>(Verdict::kUnknown);
-        c.verdict = static_cast<Verdict>(v);
-        c.value = e.value("val", std::string{});
-        out.push_back(std::move(c));
+        // .value() throws type_error on a wrong-typed key even with
+        // allow_exceptions=false on parse — guard so a corrupt stored row drops
+        // the bad element instead of 500-ing the render (#governance cpp-expert).
+        try {
+            PreflightDeviceCheck c;
+            c.key = e.value("key", std::string{});
+            c.label = e.value("label", std::string{});
+            int v = e.value("v", static_cast<int>(Verdict::kUnknown));
+            if (v < 0 || v > static_cast<int>(Verdict::kUnknown))
+                v = static_cast<int>(Verdict::kUnknown);
+            c.verdict = static_cast<Verdict>(v);
+            c.value = e.value("val", std::string{});
+            out.push_back(std::move(c));
+        } catch (const nlohmann::json::exception&) {
+            // skip malformed element
+        }
     }
     return out;
 }
@@ -131,14 +148,19 @@ PreflightConfig config_from_json(const std::string& json) {
     auto j = nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object())
         return c;
-    c.app_name = j.value("app_name", std::string{});
-    c.app_min_version = j.value("app_min", std::string{});
-    c.app_max_version = j.value("app_max", std::string{});
-    c.os_min_version = j.value("os_min", std::string{});
-    c.req_arch = j.value("arch", std::string{});
-    c.min_free_gib = j.value("min_gib", static_cast<std::int64_t>(0));
-    c.volume = j.value("volume", std::string{});
-    c.reboot_block = j.value("reboot_block", true);
+    // Guard .value() type_error on a wrong-typed key (see checks_from_json).
+    try {
+        c.app_name = j.value("app_name", std::string{});
+        c.app_min_version = j.value("app_min", std::string{});
+        c.app_max_version = j.value("app_max", std::string{});
+        c.os_min_version = j.value("os_min", std::string{});
+        c.req_arch = j.value("arch", std::string{});
+        c.min_free_gib = j.value("min_gib", static_cast<std::int64_t>(0));
+        c.volume = j.value("volume", std::string{});
+        c.reboot_block = j.value("reboot_block", true);
+    } catch (const nlohmann::json::exception&) {
+        return PreflightConfig{}; // degrade to defaults on a corrupt row
+    }
     return c;
 }
 

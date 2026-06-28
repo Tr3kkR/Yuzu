@@ -134,3 +134,16 @@ TEST_CASE("format_gib / parse_i64 edges", "[preflight][parse]") {
     CHECK(parse_i64("12abc") == 12);
     CHECK(parse_i64("") == 0);
 }
+
+TEST_CASE("parse_i64 / format_gib saturate, not overflow (operator input, UP-2)", "[preflight][parse]") {
+    constexpr std::int64_t kMax = 9223372036854775807LL; // INT64_MAX
+    // A long numeric (operator's min_gib/window/version string) must saturate, not
+    // wrap via signed-overflow UB.
+    CHECK(parse_i64("99999999999999999999999999") == kMax);
+    CHECK(parse_i64("-99999999999999999999999999") == -kMax);
+    CHECK(parse_i64("9223372036854775807") == kMax);     // exactly INT64_MAX
+    CHECK(parse_i64("9223372036854775808") == kMax);     // one past → clamp
+    // format_gib on a huge byte count must not overflow the *10 multiply.
+    REQUIRE_NOTHROW(format_gib(kMax));
+    CHECK(format_gib(kMax).find(" GiB") != std::string::npos);
+}

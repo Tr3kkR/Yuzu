@@ -82,6 +82,28 @@ TEST_CASE("checks_from_json tolerates garbage", "[preflight][eval]") {
     CHECK(checks_from_json("{}").empty()); // object, not array
 }
 
+TEST_CASE("checks_from_json clamps out-of-range verdict + survives wrong types", "[preflight][eval]") {
+    // out-of-range verdict ints clamp to kUnknown (#governance quality S-1).
+    auto over = checks_from_json(R"([{"key":"app","label":"App","v":99,"val":""}])");
+    REQUIRE(over.size() == 1);
+    CHECK(over[0].verdict == Verdict::kUnknown);
+    auto under = checks_from_json(R"([{"key":"app","label":"App","v":-1,"val":""}])");
+    REQUIRE(under.size() == 1);
+    CHECK(under[0].verdict == Verdict::kUnknown);
+    // a wrong-typed key (v as a string) must NOT throw — the element is dropped, not
+    // a 500 (#governance cpp-expert: nlohmann .value() type_error guard).
+    std::vector<PreflightDeviceCheck> bad;
+    REQUIRE_NOTHROW(bad = checks_from_json(R"([{"key":"app","v":"notanint","val":""}])"));
+    CHECK(bad.empty());
+}
+
+TEST_CASE("config_from_json survives wrong-typed key", "[preflight][eval]") {
+    // min_gib as a string must not throw — degrade to defaults.
+    PreflightConfig c;
+    REQUIRE_NOTHROW(c = config_from_json(R"({"app_name":"X","min_gib":"oops"})"));
+    CHECK(c.reboot_block == true); // default-shaped (degraded)
+}
+
 TEST_CASE("check_execution_id format", "[preflight][eval]") {
     CHECK(check_execution_id("abc123", "disk") == "preflight-abc123-disk");
     CHECK(check_execution_id("abc123", "osver") == "preflight-abc123-osver");

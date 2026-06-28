@@ -2,32 +2,37 @@
 
 /// @file preflight_routes.hpp
 /// The `/auto` PRE-FLIGHT page: a config section (per-check parameters +
-/// thresholds) → run across a cohort → a go/no-go result AGGREGATED BY CHECK
-/// (pass/fail per check, expandable to the failing devices). Interim manual
-/// surface for the agentic upgrade-lifecycle; the orchestrator drives the same
-/// checks + thresholds headless later. Reached at /auto by URL — deliberately NOT
-/// a nav tab yet.
+/// thresholds) → run across a cohort → a go/no-go result GROUPED BY DEVICE
+/// (Pass / Failed / Warn-only / Incomplete, with summary pills + "Failed by"
+/// chips). Interim manual surface for the agentic upgrade-lifecycle; the
+/// orchestrator drives the same checks + thresholds headless later. Reached at
+/// /auto by URL — deliberately NOT a nav tab yet.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only, htmx CORE attrs only (the
 /// dashboard CSP blocks hx-on / unsafe-eval). Reuses the shared full-page shell
 /// (guardian_page_ui.cpp kGuardianDetailPageHtml) + its `.gp-*` component CSS.
 ///
-/// SLICE 1: live checks app(version) / os_version / arch / free-disk / reboot, with
-/// ad-hoc config (entered per run, not persisted). Staged-artifact checks
-/// (installer integrity / rollback / config backup) + Save-as-manifest persistence
-/// arrive in later slices. Thresholds → verdict are applied server-side
-/// (preflight_parse.hpp `evaluate`) as raw facts land.
+/// Live checks: app(version min/max) / os_version / arch / free-disk / reboot.
+/// Runs are PERSISTED (PreflightRunStore) + revisitable from a saved-runs rail; a
+/// background runner re-dispatches to reconnecting stragglers until the window
+/// closes. Staged-artifact checks (installer integrity / rollback / config backup)
+/// arrive in a later slice. Thresholds → verdict are applied server-side
+/// (preflight_parse.hpp) — the SAME pure compute_device_results path for the live
+/// render and the runner's persist.
 ///
 /// AUTH / scope (IDOR-safe by construction):
-///   * `/auto` shell is auth-only chrome.
-///   * the config fragment gates on global Infrastructure:Read.
-///   * RUN gates on global Execution:Execute (a fleet-wide dispatch). Targets =
-///     `devices_fn(username) ∩ group members` (operator-visible set), so dispatch
-///     only reaches in-scope devices and the aggregate only counts them.
-///   * RESULT poll re-resolves the SAME visible∩group set (rows pinned → an offline
-///     device stays "incomplete", never silently drops from the denominator).
+///   * `/auto` shell is auth-only chrome; the config/result fragments gate on
+///     global Infrastructure:Read.
+///   * RUN gates on Infrastructure:Read + Execution:Execute. The cohort is FROZEN
+///     at creation = `devices_fn(username) ∩ group members ∩ os filter`
+///     (operator-visible set), so dispatch only reaches in-scope devices.
+///   * RESULT poll / revisit reads the FROZEN cohort (NOT re-resolved) via
+///     `get_run(run_id, viewer)` — OWNER-SCOPED at the store seam, so another
+///     operator's run is indistinguishable from not-found (no existence oracle).
+///     An offline frozen target stays "incomplete", never drops from the
+///     denominator. DELETE is owner-scoped at the seam + gates Execution:Execute.
 /// Machine-health facts (OS/arch/reboot/disk/app-version), NOT behavioural PII →
-/// the dispatch audit (`preflight.run`) is operational set-and-proceed.
+/// the dispatch audit (`preflight.run` / `preflight.run.delete`) is set-and-proceed.
 
 #include <yuzu/server/auth.hpp>
 

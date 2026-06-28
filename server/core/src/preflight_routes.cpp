@@ -253,18 +253,27 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             res.set_content("auth required", "text/plain");
             return;
         }
-        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
+        // A destructive mutation → the Execute tier (you needed Execute to create
+        // the run), not a read tier (#governance least-privilege).
+        if (!perm_fn_ || !perm_fn_(req, res, "Execution", "Execute"))
             return;
         if (!run_store_) {
             res.set_content(render_auto_rail({}), "text/html; charset=utf-8");
             return;
         }
         const std::string run_id = param(req, "run");
+        // Read the run's scope (owner-scoped, so no cross-operator leak) for the
+        // audit detail BEFORE the row is gone — keeps the delete event
+        // self-contained for review (#governance compliance).
+        std::string scope;
+        if (auto r = run_store_->get_run(run_id, session->username))
+            scope = r->scope_label;
         // Owner-scoped at the store seam (created_by must match) — a non-owner /
         // unknown run is a silent no-op (the rail is the viewer's own anyway).
         const bool deleted = run_store_->delete_run(run_id, session->username);
         if (audit_fn_)
-            audit_fn_(req, "preflight.run.delete", deleted ? "success" : "noop", "Scope", run_id, "");
+            audit_fn_(req, "preflight.run.delete", deleted ? "success" : "noop", "Scope", run_id,
+                      "run=" + run_id + (scope.empty() ? "" : (" scope=" + scope)));
         res.set_content(render_auto_rail(recent_runs(run_store_, session->username)),
                         "text/html; charset=utf-8");
     });
@@ -277,7 +286,12 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             res.set_content("auth required", "text/plain");
             return;
         }
-        if (!perm_fn_ || !perm_fn_(req, res, "Execution", "Execute"))
+        // Run dispatches AND renders the (Infrastructure:Read) result grid +
+        // self-polls — require both tiers so an Execute-only principal isn't left
+        // 403-ing on every repoll (#governance consistency).
+        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        if (!perm_fn_(req, res, "Execution", "Execute"))
             return;
         if (!run_store_ || !run_store_->is_open()) {
             res.set_content(render_auto_note("Pre-flight run store is unavailable on this server."),
@@ -300,6 +314,11 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
         auto targets =
             resolve_targets(devices_fn_, group_members_fn_, session->username, group_id, os_filter);
         if (targets.empty()) {
+            // Audit the no-op attempt too (matches the dex no_agents pattern), so
+            // an empty-scope run isn't an unrecorded gap (#governance consistency).
+            if (audit_fn_)
+                audit_fn_(req, "preflight.run", "no_devices", "Scope",
+                          group_id.empty() ? std::string("all-visible") : group_id, "");
             res.set_content(render_auto_note("No visible devices in that scope."),
                             "text/html; charset=utf-8");
             return;
@@ -368,17 +387,14 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             return;
         }
         const std::string run_id = param(req, "run");
-        auto run = run_store_->get_run(run_id);
+        // OWNER-SCOPED read at the seam: a frozen-cohort run is the creator's, so we
+        // pass the viewer's username — a not-yours run reads as nullopt, identical
+        // to not-found, so the response can't distinguish "exists but not yours"
+        // from "doesn't exist" (closes the existence oracle, Pattern D). Admin-
+        // sees-all is a tracked follow-up.
+        auto run = run_store_->get_run(run_id, session->username);
         if (!run) {
             res.set_content(render_auto_note("Run not found (it may have aged out of retention)."),
-                            "text/html; charset=utf-8");
-            return;
-        }
-        // OWNER SCOPE: a frozen-cohort run is the creator's; do not expose another
-        // operator's device list. (Admin-sees-all is a deliberate follow-up.)
-        if (run->created_by != session->username) {
-            res.status = 403;
-            res.set_content(render_auto_note("You are not authorized to view this run."),
                             "text/html; charset=utf-8");
             return;
         }

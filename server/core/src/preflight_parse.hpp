@@ -156,10 +156,15 @@ inline std::optional<std::vector<std::string>> find_row(std::string_view output,
     return std::nullopt;
 }
 
-/// Best-effort signed-int parse (0 on garbage — agent-emitted, never operator input).
+/// Best-effort signed-int parse. SATURATES at INT64_MAX magnitude rather than
+/// overflowing — this is reached with OPERATOR-controlled values (the /auto form's
+/// `min_gib`/`window`, and the version threshold strings via cmp_version), so an
+/// unguarded `v*10+digit` would be signed-overflow UB on a long numeric input
+/// (#governance UP-2). 0 on non-numeric.
 inline std::int64_t parse_i64(std::string_view s) {
+    constexpr std::int64_t kMax = 9223372036854775807LL; // INT64_MAX
     std::int64_t v = 0;
-    bool neg = false, any = false;
+    bool neg = false, any = false, sat = false;
     std::size_t i = 0;
     if (i < s.size() && (s[i] == '-' || s[i] == '+')) {
         neg = s[i] == '-';
@@ -168,23 +173,34 @@ inline std::int64_t parse_i64(std::string_view s) {
     for (; i < s.size(); ++i) {
         if (s[i] < '0' || s[i] > '9')
             break;
-        v = v * 10 + (s[i] - '0');
         any = true;
+        if (sat)
+            continue; // already clamped; keep consuming digits
+        const int digit = s[i] - '0';
+        if (v > (kMax - digit) / 10) {
+            v = kMax;
+            sat = true;
+            continue;
+        }
+        v = v * 10 + digit;
     }
     if (!any)
         return 0;
     return neg ? -v : v;
 }
 
-/// Format a byte count as 1-decimal GiB ("123.4 GiB"); negative → "?".
+/// Format a byte count as 1-decimal GiB ("123.4 GiB"); negative → "?". Computes
+/// the fractional digit from `bytes % kGiB` (< ~1e9) rather than `bytes*10`, so a
+/// large byte count can't overflow the multiply (#governance UP-2).
 inline std::string format_gib(std::int64_t bytes) {
     if (bytes < 0)
         return "?";
     constexpr std::int64_t kGiB = 1024LL * 1024 * 1024;
-    std::int64_t tenths = (bytes * 10) / kGiB;
-    std::string out = std::to_string(tenths / 10);
+    const std::int64_t whole = bytes / kGiB;
+    const std::int64_t frac_tenths = ((bytes % kGiB) * 10) / kGiB; // remainder<kGiB → *10 safe
+    std::string out = std::to_string(whole);
     out += '.';
-    out += std::to_string(tenths % 10);
+    out += std::to_string(frac_tenths);
     out += " GiB";
     return out;
 }

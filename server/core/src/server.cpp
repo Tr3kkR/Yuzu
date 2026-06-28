@@ -8045,6 +8045,9 @@ private:
         // PreflightRunner — /auto re-dispatch-on-reconnect + window lifecycle.
         // Same dispatch lambda as operator commands; per-check execution_ids union
         // re-dispatches via query_by_execution. Joined BEFORE the stores in stop().
+        metrics_.describe("yuzu_preflight_tick_errors_total",
+                          "Pre-flight runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
         preflight_runner_ = std::make_unique<PreflightRunner>(PreflightRunner::Deps{
             .run_store = preflight_run_store_.get(),
             .response_store = response_store_.get(),
@@ -8066,9 +8069,11 @@ private:
                     try {
                         preflight_runner_->tick();
                     } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
                         spdlog::error("preflight_runner: tick threw ({}) — thread continuing",
                                       e.what());
                     } catch (...) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
                         spdlog::error("preflight_runner: tick threw unknown exception — continuing");
                     }
                 }

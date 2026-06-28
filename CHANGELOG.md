@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pre-flight readiness page (`/auto`).** New dashboard page for operator-initiated go/no-go checks
+  across a scoped device cohort before a fleet change. Checks: application version (min/max), OS version
+  floor, OS architecture, minimum free disk, and pending-reboot status — grouped per device
+  (Pass / Failed / Warn-only / Incomplete) with a run-level summary. Runs persist in a new born-on-Postgres
+  `PreflightRunStore` (schema `preflight_run_store`) for 14 days and are owner-scoped (an operator sees only
+  their own runs; the result read is owner-scoped at the store seam, so another operator's run is
+  indistinguishable from not-found). A background runner re-dispatches the read-only checks to devices that
+  reconnect within the run window. Audit verbs: `preflight.run` (gates `Infrastructure:Read` + `Execution:Execute`)
+  and `preflight.run.delete` (gates `Execution:Execute`). Reached by URL — not a nav tab.
 - **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
   single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
   default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,

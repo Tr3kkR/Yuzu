@@ -93,18 +93,9 @@ const char* badge_class(preflight::Verdict v) {
     }
 }
 
-const char* bucket_key(preflight::Bucket b) {
-    switch (b) {
-    case preflight::Bucket::kPass:
-        return "go";
-    case preflight::Bucket::kFailed:
-        return "nogo";
-    case preflight::Bucket::kWarnOnly:
-        return "warn";
-    default:
-        return "inc";
-    }
-}
+// Delegate to the canonical token map (preflight_parse.hpp) so the client-filter
+// data-b attribute can never desync from the stored/wire token (#governance).
+const char* bucket_key(preflight::Bucket b) { return preflight::bucket_token(b); }
 } // namespace
 
 std::string render_auto_rail(const std::vector<std::pair<std::string, std::string>>& recent) {
@@ -167,9 +158,9 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     h += "<div class=\"af-fld\"><label>Run window \xE2\x80\x94 catch offline (min)</label>"
          "<input name=\"window\" type=\"number\" value=\"30\" style=\"width:6rem\"></div>";
     h += "</div>";
-    h += "<div class=\"af-note\">Run keeps polling for the window so slow devices still report; devices "
-         "that never answer stay <b>incomplete</b>. (Catching devices that were offline at dispatch \xE2\x80\x94 "
-         "re-dispatch on reconnect \xE2\x80\x94 lands with the saved-runs slice.)</div>";
+    h += "<div class=\"af-note\">The run keeps re-trying for the window, so a device that is offline at "
+         "dispatch still reports if it reconnects in time; a device that never answers stays "
+         "<b>incomplete</b>.</div>";
 
     // Target application (A) — name + min/max version
     h += "<div class=\"af-cfg\"><span class=\"af-name\">Target App</span>"
@@ -291,8 +282,9 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
     if (warn > 0)
         h += "<span class=\"af-pill warn\" data-b=\"warn\" onclick=\"pfSetBucket('warn')\">" +
              std::to_string(warn) + " warn-only</span>";
-    h += "<span class=\"af-pill nogo\" data-b=\"nogo\" onclick=\"pfSetBucket('nogo')\">" +
-         std::to_string(nogo) + " no-go</span>";
+    if (nogo > 0) // gate like warn/incomplete — no alarming red "0 no-go" on a clean run
+        h += "<span class=\"af-pill nogo\" data-b=\"nogo\" onclick=\"pfSetBucket('nogo')\">" +
+             std::to_string(nogo) + " no-go</span>";
     if (inc > 0)
         h += "<span class=\"af-pill inc\" data-b=\"inc\" onclick=\"pfSetBucket('inc')\">" +
              std::to_string(inc) + " incomplete</span>";
