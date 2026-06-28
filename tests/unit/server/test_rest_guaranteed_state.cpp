@@ -123,6 +123,10 @@ struct RestGsHarness {
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
     yuzu::server::AppPerfProviders app_perf_providers_;
+    // Rows the wired fleet provider returns (default empty). A test sets this before
+    // calling /perf/app to drive the suppression-serialization path (the wired fleet
+    // lambda reads it lazily at request time).
+    std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
 
     // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
@@ -221,9 +225,9 @@ struct RestGsHarness {
         // can hit the provider-absent → 503 branch.
         if (wire_app_perf) {
             app_perf_providers_.fleet =
-                [](std::string_view, std::string_view)
+                [this](std::string_view, std::string_view)
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
-                return std::vector<yuzu::server::AppPerfFleetRow>{};
+                return fleet_rows_; // settable by a test (default empty)
             };
             app_perf_providers_.apps =
                 [](bool& truncated) -> std::optional<std::vector<yuzu::server::AppPerfAppSummary>> {
@@ -1275,6 +1279,34 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["app"].get<std::string>() == "chrome.exe");
         CHECK(j["data"]["points"].is_array());
+    }
+    SECTION("sub-floor fleet point serializes suppressed, stats omitted") {
+        // The fleet path floors too now — a sub-floor (version,day) point must carry
+        // suppressed=true with device_count only, never zeroed stats that read as
+        // "3 devices @ 0% CPU" (security re-review of the suppressed-flag fix).
+        RestGsHarness h;
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor (10)
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        h.fleet_rows_ = {r};
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=niche.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j["data"]["points"].size() == 1);
+        const auto& pt = j["data"]["points"][0];
+        CHECK(pt["suppressed"] == true);
+        CHECK(pt["device_count"] == 3);
+        CHECK_FALSE(pt.contains("cpu_mean")); // stats omitted when suppressed
     }
 }
 

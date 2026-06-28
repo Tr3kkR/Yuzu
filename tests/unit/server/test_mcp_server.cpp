@@ -1366,6 +1366,40 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     CHECK(group["points"][0]["device_count"] == 20);
 }
 
+TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",
+          "[mcp][integration][dex][app_perf]") {
+    // The fleet path floors too now — a sub-floor (version,day) point must serialize
+    // suppressed=true with device_count only, NOT zeroed stats that read as
+    // "3 devices @ 0% CPU" (security re-review of 5ebde07f).
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.fleet =
+        [](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        return std::vector<yuzu::server::AppPerfFleetRow>{r};
+    };
+    ts.start("readonly");
+    auto p = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_app_perf","arguments":{"app":"niche.exe"}}})")
+            ->body);
+    REQUIRE(p["points"].size() == 1);
+    CHECK(p["points"][0]["suppressed"] == true);
+    CHECK(p["points"][0]["device_count"] == 3);
+    CHECK_FALSE(p["points"][0].contains("cpu_mean")); // stats omitted when suppressed
+}
+
 TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
           "[mcp][integration][dex][app_perf]") {
     {
