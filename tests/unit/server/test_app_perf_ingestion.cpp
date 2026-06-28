@@ -107,3 +107,25 @@ TEST_CASE("ingest_app_perf_report end-to-end", "[pg][app_perf]") {
         CHECK(ack.need_full_size() == 0);
     }
 }
+
+// CROSS-PIN (server half). Byte-identical to the agent render cross-pin
+// (test_sync_source_app_perf.cpp, "app_perf wire cross-pin — render matches the
+// pinned blob"). If parse_app_perf_blob's field order drifts from the agent's
+// render, this breaks. Field order: name|version|day|samples|instances_max|
+// cpu_avg|cpu_max|ws_avg_bytes|ws_max_bytes.
+TEST_CASE("app_perf wire cross-pin — parse recovers the pinned blob", "[app_perf][parse]") {
+    const std::string blob = std::string("chrome.exe") + '\x1f' + "119.0.0.0" + '\x1f' +
+                             "1700000000" + '\x1f' + "120" + '\x1f' + "3" + '\x1f' + "12.5" +
+                             '\x1f' + "95.5" + '\x1f' + "1048576" + '\x1f' + "2097152" + '\x1e';
+    auto rows = parse_app_perf_blob(blob);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].app_name == "chrome.exe");
+    CHECK(rows[0].version == "119.0.0.0");
+    CHECK(rows[0].day == 1700000000);
+    CHECK(rows[0].samples == 120);
+    CHECK(rows[0].instances_max == 3);
+    CHECK(std::abs(rows[0].cpu_avg - 12.5) < 1e-9);
+    CHECK(std::abs(rows[0].cpu_max - 95.5) < 1e-9);
+    CHECK(rows[0].ws_avg_bytes == 1048576);
+    CHECK(rows[0].ws_max_bytes == 2097152);
+}

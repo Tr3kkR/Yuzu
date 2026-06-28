@@ -38,6 +38,8 @@
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
+#include "app_perf_fleet_store.hpp"
+#include "app_perf_rollup.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_inventory_store.hpp"
@@ -2000,6 +2002,25 @@ public:
             }
         }
 
+        // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
+        // long-retention trend substrate, built from B1 by a daily background job.
+        // AppPerfFleetStore owns the schema (fail-closed like every PG store);
+        // AppPerfRollup is the ADR-0012 cross-store query owner (reads the B1
+        // schema, writes the B2 schema, on ONE lease — neither store grows a
+        // cross-schema method).
+        if (pg_pool_ && !startup_failed_) {
+            app_perf_fleet_store_ = std::make_unique<AppPerfFleetStore>(*pg_pool_);
+            if (!app_perf_fleet_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_perf fleet store migration/open failed "
+                              "(database reachable but the app_perf_fleet_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_perf_fleet_store_->set_metrics(&metrics_);
+                app_perf_rollup_ = std::make_unique<AppPerfRollup>(*pg_pool_);
+            }
+        }
+
         // Phase 7: Directory Sync (AD/Entra integration)
         {
             auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
@@ -2795,6 +2816,12 @@ public:
             policy_eval_thread_.join();
         }
 
+        // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
+        // app_perf_fleet_store_ — must stop before they / the pool are torn down).
+        if (app_perf_rollup_thread_.joinable()) {
+            app_perf_rollup_thread_.join();
+        }
+
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
@@ -2933,6 +2960,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
         app_perf_daily_store_.reset();
+        // B2: roll-up (query owner) then the fleet store; both before the pool.
+        app_perf_rollup_.reset();
+        app_perf_fleet_store_.reset();
         pg_pool_.reset();
     }
 
@@ -4410,11 +4440,13 @@ private:
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
+            bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok;
+                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
+                                 app_perf_fleet_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4432,7 +4464,8 @@ private:
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
-                  {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"}}},
+                  {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
+                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4595,6 +4628,8 @@ private:
                  software_inventory_store_ && software_inventory_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
+                {"app_perf_fleet_store",
+                 app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8046,6 +8081,47 @@ private:
             }
         });
 
+        // App-perf B1->B2 roll-up thread (DEX app-perf-over-time). Re-rolls the
+        // trailing window into B2 (idempotent) + prunes B2 beyond 180d, hourly.
+        // Borrows app_perf_rollup_ + app_perf_fleet_store_, so it MUST be joined
+        // before they / the pool are torn down (join sits with the policy-eval join
+        // in stop()). Rolls once at start so B2 populates from existing B1 at boot.
+        if (app_perf_rollup_ && app_perf_fleet_store_ && app_perf_fleet_store_->is_open()) {
+            app_perf_rollup_thread_ = std::thread([this]() {
+                spdlog::info("App-perf roll-up thread started (cadence=1h, B2 retention=180d)");
+                bool first = true;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    if (!first) {
+                        // ~1h in 5s steps so shutdown stays responsive.
+                        for (int i = 0;
+                             i < 720 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                            std::this_thread::sleep_for(std::chrono::seconds{5});
+                        if (stop_requested_.load(std::memory_order_acquire))
+                            break;
+                    }
+                    first = false;
+                    // roll_window/prune touch PG; an exception escaping a std::thread
+                    // entry calls std::terminate — catch, log, keep ticking.
+                    try {
+                        const std::int64_t now =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+                        app_perf_rollup_->roll_window(now);
+                        const std::int64_t today = (now / 86400) * 86400;
+                        app_perf_fleet_store_->prune(
+                            today -
+                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400);
+                    } catch (const std::exception& e) {
+                        spdlog::error("app_perf_rollup: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("app_perf_rollup: tick threw unknown exception — continuing");
+                    }
+                }
+            });
+        }
+
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
         // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
@@ -9649,6 +9725,10 @@ private:
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
+    // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
+    // Declared after pg_pool_ so they destruct before the pool.
+    std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
+    std::unique_ptr<AppPerfRollup> app_perf_rollup_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
@@ -9662,6 +9742,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread app_perf_rollup_thread_;
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

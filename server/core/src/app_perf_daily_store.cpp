@@ -70,6 +70,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "  ws_max_bytes  BIGINT NOT NULL DEFAULT 0,"
          "  updated_at    BIGINT NOT NULL,"
          "  PRIMARY KEY (agent_id, app_name, version, day));"},
+        {2,
+         // Rollup-scan index (DEX app-perf-over-time B2): the daily fleet rollup
+         // (AppPerfRollup) reads `WHERE day = $1 GROUP BY app_name, version`. Leading
+         // `day` serves the equality + per-(app,version) grouping. Plain CREATE INDEX
+         // is safe here — this table is born-on-Pg alongside B2, so it is empty at
+         // first migration (no ACCESS EXCLUSIVE stall, no CONCURRENTLY needed).
+         "CREATE INDEX app_perf_daily_day_idx ON app_perf_daily (day, app_name, version);"},
     };
     return kMigrations;
 }

@@ -101,3 +101,22 @@ TEST_CASE("render_app_perf_blob emits 9 0x1F-separated fields per 0x1E record",
     CHECK(blob.find("a.exe") != std::string::npos);
     CHECK(blob.find("1.0.0.0") != std::string::npos);
 }
+
+// CROSS-PIN. B1 is hash-less, so a field-order drift between the agent's
+// render_app_perf_blob and the server's parse_app_perf_blob would corrupt data
+// with nothing to catch it. This literal blob is the wire contract; the SERVER
+// side asserts the byte-identical blob parses back to these values
+// (test_app_perf_ingestion.cpp, "app_perf wire cross-pin"). Keep the two literals
+// identical. Field order: name|version|day|samples|instances_max|cpu_avg|cpu_max|
+// ws_avg_bytes|ws_max_bytes.
+TEST_CASE("app_perf wire cross-pin — render matches the pinned blob",
+          "[app_perf][agent][crosspin]") {
+    const std::string expected = std::string("chrome.exe") + '\x1f' + "119.0.0.0" + '\x1f' +
+                                 "1700000000" + '\x1f' + "120" + '\x1f' + "3" + '\x1f' + "12.5" +
+                                 '\x1f' + "95.5" + '\x1f' + "1048576" + '\x1f' + "2097152" + '\x1e';
+    std::vector<AppPerfRow> rows = {{.name = "chrome.exe", .version = "119.0.0.0",
+                                     .day = 1700000000, .samples = 120, .instances_max = 3,
+                                     .cpu_avg = 12.5, .cpu_max = 95.5, .ws_avg_bytes = 1048576,
+                                     .ws_max_bytes = 2097152}};
+    CHECK(render_app_perf_blob(std::move(rows)) == expected);
+}

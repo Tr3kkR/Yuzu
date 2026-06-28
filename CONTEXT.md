@@ -85,6 +85,10 @@ The denominator that travels with every fleet-aggregate performance statistic: h
 
 The centralized per-device daily summary of a device's **resource-significant app-versions**: one record per `(device, app, version, UTC day)` carrying sample-weighted CPU and working-set averages, their peaks, and a sample count, derived on the agent from the on-device `procperf_hourly` warehouse and shipped daily. It is the fleet-queryable layer ("which devices ran v124, and how did it perform") that complements the on-device, federated-on-demand drill — distinct from **installed software** inventory (a complete app-presence census; B1 is performance over the top-N consumers only).
 
+## App-perf fleet roll-up (B2)
+
+The fleet-aggregate trend layer over [[App-perf daily roll-up (B1)]]: one record per `(app, version, UTC day)` summarising how that app-version performed **across all devices** that ran it that day — device count, fleet CPU/working-set means and maxima, and a fixed-bucket histogram of the per-device daily values from which fleet percentiles are derived. It deliberately drops the device dimension (no `agent_id`) — it answers "did v125 run hotter than v124 across the fleet", not "on which device". Distinct from B1 (per-device, 31-day, the drill-down source) by retention (180 days) and grain (fleet, not device).
+
 ## Resource-significant app-version
 
 An `(application, version)` pair that appeared among a device's top-N CPU- or working-set-consuming processes during sampling, and therefore the unit B1 measures. The qualifier is load-bearing: B1 deliberately does **not** record every app that ran — only those significant enough to surface in `procperf` — so "ran on this device" in a B1 context always means "ran among its top resource consumers."

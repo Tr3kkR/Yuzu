@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows-only); gated by `procperf_enabled` + the `--inventory-disable` daily-sync master switch.
   No operator read surface yet — the per-device + fleet dashboard/REST/MCP views are a follow-on
   slice and will ship REST + MCP in lockstep (agentic-first A1–A4).
+- **DEX app-performance over time (B2) — fleet-aggregate trend substrate.** New born-on-Postgres
+  `AppPerfFleetStore` (schema `app_perf_fleet_store`, 180-day retention) holds one row per
+  `(app, version, UTC day)`: fleet device-count, exact CPU/working-set sums + maxima, and a
+  fixed-bucket histogram of per-device daily values (CPU low-end-weighted, working-set log-scale)
+  so true fleet percentiles (p50/p95) are computable over the long window without storing
+  per-device rows. Built from B1 by `AppPerfRollup` — the ADR-0012 cross-store query owner — as one
+  server-side `INSERT … SELECT … ON CONFLICT` per day (histogram via `COUNT(*) FILTER` over
+  half-open buckets; no per-device data crosses the wire), driven by an hourly background thread
+  that re-rolls a 4-day trailing window (idempotent; absorbs late-arriving B1) and prunes beyond
+  180 days. Full version grain (coarsen to major.minor on read). Histogram boundaries are frozen
+  (`hist_version` stamps the scheme); derived percentiles are bucket-resolution approximations.
+  No operator read surface yet (slice 2). The aggregate carries no `agent_id` — no per-device
+  attribution.
 - **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
   single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
   default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,
