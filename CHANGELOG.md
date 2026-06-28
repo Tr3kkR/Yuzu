@@ -140,13 +140,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warehouse source records application **installed / removed / upgraded** events over
   time by diffing the installed-software inventory on a dedicated hourly trigger
   (`tar.software`; tune or disable via `software_interval`, `0`–86400 s). On Windows it
-  captures both **machine-wide** (HKLM Uninstall 64-bit + WOW6432Node) and **per-user**
-  installs (each profile's `HKU\<SID>` Uninstall key); the `scope` column distinguishes
-  them and `user` carries the profile name. Tiers: `$Software_Live` (5000 rows) →
+  captures **machine-wide** (HKLM Uninstall 64-bit + WOW6432Node) installs by default, and
+  **per-user** installs (each profile's `HKU\<SID>` Uninstall key) only when
+  `software_user_scope_enabled` is set; the `scope` column distinguishes them and `user`
+  carries the profile name. Tiers: `$Software_Live` (5000 rows) →
   `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`(name, scope)`
-  install/remove/upgrade counts. **On by default** (asset-management / vulnerability-relevance
-  data, like Services and User sessions; toggle with `software_enabled`); names, versions,
-  and publisher only — no command lines or usage data. Per-user capture is efficient:
+  install/remove/upgrade counts. **Machine scope is on by default** (device
+  asset-management / vulnerability-relevance data with no user identity, like Services and
+  User sessions; toggle with `software_enabled`). **Per-user scope is off by default**
+  (`software_user_scope_enabled`) because a Windows profile name is personal data under the
+  works-council posture — changing the toggle re-baselines the source so neither enabling
+  nor disabling emits a spurious install/remove storm. Names, versions, and publisher only
+  — no command lines or usage data. Per-user capture (when enabled) is efficient:
   **steady-state scans read only the machine scope and logged-on hives and carry
   logged-off users forward** (no per-tick `NTUSER.DAT` mounting — the RDS/Citrix I/O
   cost — and no logon/logoff churn); logged-off hives are mounted only once at the
@@ -154,8 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan on a host **seeds the baseline silently** so an `installed` event always means
   "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
   `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
-  `software_max_hive_mounts` / `software_last_run_ts` lines — update any field-count
-  parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
+  `software_max_hive_mounts` / `software_last_run_ts` / `software_user_scope_enabled` lines
+  — update any field-count parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
   `$Software_*` tables are queryable but empty there until then. Disabling the source
   (`software_enabled=false`) is **atomic with the collector** — it holds the same
   `software_collect_mu_` the collector takes and the collector re-checks the flag under
@@ -164,7 +169,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same #538 contract as the other snapshot-diff sources). `SystemComponent` entries are
   read as `REG_DWORD` (their canonical type) so system components/patches are correctly
   excluded, and `software` rows are reachable from the legacy `tar.query`/`tar.export`
-  typed paths as well as `tar.sql`. See `docs/user-manual/tar.md` and the data-handling
+  typed paths as well as `tar.sql`. Enumeration is bounded by a per-cycle entry cap
+  (`kSoftwareEntryCap`, warns once on truncation) so a bloated/corrupt registry cannot grow
+  the tick unbounded, and same-name dedup compares versions **numerically** (so `10.0`
+  outranks `9.0` — a lexicographic compare previously suppressed real upgrades). `tar.snapshot`
+  now collects the source too. See `docs/user-manual/tar.md` and the data-handling
   classification in `docs/enterprise-readiness-soc2-first-customer.md`.
 - **Guardian — name-anchored, device-applicable compliance REST.**
   New `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`

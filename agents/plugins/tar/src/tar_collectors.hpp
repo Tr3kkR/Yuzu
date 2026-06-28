@@ -179,10 +179,17 @@ std::vector<ArpEntry> enumerate_arp();
  */
 std::vector<DnsEntry> enumerate_dns();
 
-/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector resizes to
-/// the cap and logs a truncation warning rather than growing unbounded.
+/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector stops
+/// enumerating at the cap and logs a truncation warning rather than growing
+/// unbounded.
 inline constexpr std::size_t kArpEntryCap = 2048;
 inline constexpr std::size_t kDnsEntryCap = 4096;
+/// Per-cycle cap on installed-software entries (machine + all per-user hives in
+/// one tick). Sized to hold a bloated many-profile RDS/Citrix host's full
+/// inventory while bounding memory + tick duration on a corrupt/huge registry
+/// (#1620). A truncated tick warns once (rate-limited) — see
+/// tar_software_collector.cpp.
+inline constexpr std::size_t kSoftwareEntryCap = 8192;
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 

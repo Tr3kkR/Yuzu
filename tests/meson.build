@@ -180,6 +180,7 @@ tar_test_exe = executable(
   'yuzu_tar_tests',
   files(
     'unit/test_tar_diff.cpp',
+    'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
@@ -194,6 +195,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
+    '../agents/plugins/tar/src/tar_software_core.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
     '../agents/plugins/tar/src/tar_perf.cpp',

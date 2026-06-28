@@ -26,8 +26,12 @@
  */
 
 #include "tar_collectors.hpp"
+#include "tar_version.hpp"
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -127,15 +131,31 @@ std::string sanitize_utf8(const std::string& s) {
     return out;
 }
 
+// Warn once (per process) when the per-cycle software entry cap is hit. Unlike
+// the ARP/DNS auto-clearing rate-limit, a host that genuinely owns >8192
+// installed entries would truncate on EVERY tick, so the flag latches and never
+// resets — one warning, not a per-tick spam. The append loop bounds memory + tick
+// duration regardless of whether the warn fires (#1620).
+void note_software_truncation() {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        spdlog::warn("TAR software: per-cycle entry cap {} reached — truncating installed-software "
+                     "inventory (further truncation warnings suppressed)",
+                     kSoftwareEntryCap);
+    }
+}
+
 // One-entry-per-(scope,user,name): sort then keep the highest-versioned of any
 // same-identity duplicates (e.g. two products sharing a DisplayName), so the
-// diff key (scope,user,name) is unambiguous.
+// diff key (scope,user,name) is unambiguous. Versions compare numerically
+// (compare_versions), not lexicographically — "10.0" outranks "9.0" so the diff
+// keeps the real-latest build (#1620).
 void dedup(std::vector<SoftwareInfo>& apps) {
     std::sort(apps.begin(), apps.end(), [](const SoftwareInfo& a, const SoftwareInfo& b) {
         if (a.scope != b.scope) return a.scope < b.scope;
         if (a.user != b.user) return a.user < b.user;
         if (a.name != b.name) return a.name < b.name;
-        return a.version > b.version; // descending → std::unique keeps the highest
+        return compare_versions(a.version, b.version) > 0; // descending → unique keeps the highest
     });
     apps.erase(std::unique(apps.begin(), apps.end(),
                            [](const SoftwareInfo& a, const SoftwareInfo& b) {
@@ -149,6 +169,13 @@ void dedup(std::vector<SoftwareInfo>& apps) {
 void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                              const std::string& scope, const std::string& user,
                              std::vector<SoftwareInfo>& apps) {
+    // Per-cycle cap (#1620): `apps` is the shared accumulator across machine +
+    // every per-user hive in one tick, so a prior key may already have filled it.
+    if (apps.size() >= kSoftwareEntryCap) {
+        note_software_truncation();
+        return;
+    }
+
     RegKey hkey;
     if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, hkey.put()) !=
         ERROR_SUCCESS) {
@@ -161,6 +188,10 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
 
     while (RegEnumKeyExA(hkey.get(), idx++, name_buf, &name_len, nullptr, nullptr, nullptr,
                          nullptr) == ERROR_SUCCESS) {
+        if (apps.size() >= kSoftwareEntryCap) {
+            note_software_truncation();
+            break;
+        }
         RegKey app_key;
         if (RegOpenKeyExA(hkey.get(), name_buf, 0, KEY_READ | extra_sam, app_key.put()) ==
             ERROR_SUCCESS) {
@@ -353,6 +384,12 @@ std::vector<SoftwareInfo> enumerate_software(int max_hive_mounts) {
 
     int mounts_used = 0;
     for (const auto& p : list_profiles()) {
+        // Stop once the per-cycle cap is full so we don't keep mounting (the
+        // expensive part) hives whose entries would be dropped anyway (#1620).
+        if (apps.size() >= kSoftwareEntryCap) {
+            note_software_truncation();
+            break;
+        }
         if (p.loaded) {
             read_loaded_user(p, apps);
         } else if (mounts_used < max_hive_mounts) {

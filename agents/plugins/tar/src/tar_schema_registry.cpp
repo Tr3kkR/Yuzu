@@ -562,28 +562,33 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // Diffs the installed-software inventory on the `tar.software` tick
         // (hourly default) and records install/remove/upgrade events over time —
         // the historical "what was installed/removed on this box, when" the
-        // point-in-time installed_apps inventory cannot answer. Default-ON
-        // (asset-management + vuln-relevance, like `service`/`user`), not the
-        // opt-in posture used for the app-usage-class sources.
+        // point-in-time installed_apps inventory cannot answer. The SOURCE is
+        // default-ON, but it collects only MACHINE-WIDE inventory by default (HKLM
+        // Uninstall) — device asset-management + vuln-relevance data with no user
+        // identity, like `service`/`user`. PER-USER inventory (which carries a
+        // Windows profile name = personal data) is opt-in behind
+        // software_user_scope_enabled, matching the works-council posture used for
+        // the app-usage-class sources (#1620).
         //
-        // Windows captures BOTH machine-wide (HKLM Uninstall 64-bit + WOW6432Node)
-        // AND per-user (HKU\<SID> for loaded hives, mounting NTUSER.DAT for
-        // logged-off profiles) — the `scope` column distinguishes them and `user`
-        // carries the profile name for per-user rows. Linux (dpkg/rpm) and macOS
-        // (pkgutil) are kPlanned (queryable-empty) until a fast-follow wires the
-        // installed_apps enumeration into a collector.
+        // Windows captures machine-wide (HKLM Uninstall 64-bit + WOW6432Node)
+        // always, and per-user (HKU\<SID> for loaded hives, mounting NTUSER.DAT for
+        // logged-off profiles) ONLY when the per-user scope is enabled — the `scope`
+        // column distinguishes them and `user` carries the profile name for per-user
+        // rows. Linux (dpkg/rpm) and macOS (pkgutil) are kPlanned (queryable-empty)
+        // until a fast-follow wires the installed_apps enumeration into a collector.
         {
             .name = "software",
             .dollar_name = "Software",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "registry",
                  "Registry Uninstall keys, polled-and-diffed on the tar.software "
-                 "tick: HKLM 64-bit + WOW6432Node 32-bit (machine scope) plus each "
-                 "user profile's HKU\\<SID>\\...\\Uninstall (per-user scope; "
-                 "NTUSER.DAT is mounted for logged-off profiles so the per-user "
-                 "inventory is complete regardless of logon state). SystemComponent "
-                 "entries are skipped. No command line / no usage data — names, "
-                 "versions, publisher only."},
+                 "tick: HKLM 64-bit + WOW6432Node 32-bit (machine scope, default-on) "
+                 "plus, when software_user_scope_enabled is set, each user profile's "
+                 "HKU\\<SID>\\...\\Uninstall (per-user scope, opt-in; NTUSER.DAT is "
+                 "mounted for logged-off profiles so the per-user inventory is "
+                 "complete regardless of logon state). SystemComponent entries are "
+                 "skipped. No command line / no usage data — names, versions, "
+                 "publisher only."},
                 {"linux",   OsSupportStatus::kPlanned, "dpkg_rpm",
                  "dpkg-query / rpm -qa / pacman -Q diff (reuse of the installed_apps "
                  "enumeration). Wired in a fast-follow."},

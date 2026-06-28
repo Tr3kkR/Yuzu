@@ -437,13 +437,28 @@ spec:
         displayName: Software Inventory Collector Enabled
         description: >
           Enable or disable the software install/uninstall source (software →
-          $Software_*) on this agent. **On by default** — installed-software
-          inventory is asset-management and vulnerability-relevance data. On
-          Windows it covers machine-wide and per-user installs (the scope column
-          distinguishes them); names, versions, and publisher only. See
-          process_enabled for the disable semantics (atomic, existing rows remain
-          queryable, clean re-baseline on re-enable). Requires agent v0.12.0+;
-          older agents silently ignore. Valid: "true" | "false".
+          $Software_*) on this agent. **On by default** — machine-wide
+          installed-software inventory (HKLM Uninstall) is device asset-management
+          and vulnerability-relevance data and carries no user identity. Per-user
+          installs (which carry a profile name) are NOT collected unless
+          software_user_scope_enabled is also turned on. Names, versions, and
+          publisher only. See process_enabled for the disable semantics (atomic,
+          existing rows remain queryable, clean re-baseline on re-enable). Requires
+          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      software_user_scope_enabled:
+        type: string
+        displayName: Software Per-User Scope Enabled
+        description: >
+          Additionally collect PER-USER installed software (Windows HKU\<SID>,
+          mounting NTUSER.DAT for logged-off profiles) under the software source.
+          **Off by default** — per-user inventory is attributed to a Windows
+          profile name, which is personal data under the works-council posture
+          (like procperf / netqual / dns); machine-wide inventory above stays on
+          regardless. Has no effect unless software_enabled is also on. Changing
+          this re-baselines the source on the next tick (no spurious install/remove
+          storm). Requires agent v0.12.0+. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       software_interval:
