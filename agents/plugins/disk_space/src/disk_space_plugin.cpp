@@ -40,6 +40,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace {
@@ -48,16 +49,9 @@ namespace {
 // Convert a UTF-8 path to UTF-16 for the wide Win32 API. The narrow Reg*A /
 // *A variants apply the system code page and silently corrupt non-ASCII paths
 // (#1662) — the established idiom is the wide API + an explicit CP_UTF8 decode.
-std::wstring utf8_to_wide(std::string_view s) {
-    if (s.empty())
-        return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (n <= 0)
-        return {};
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-    return w;
-}
+// Delegates to the shared agents/shared/win_str.hpp helper (#1681); the removed
+// local copy was the same size-based (NUL-excluded) convert as yuzu::win::to_wide.
+std::wstring utf8_to_wide(std::string_view s) { return yuzu::win::to_wide(s); }
 
 // RAII guard: set the thread error mode on construction, restore on scope exit.
 // Suppresses the Windows session-0 hard-error dialog around a disk query on a

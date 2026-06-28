@@ -220,7 +220,9 @@ namespace {
 
 struct TempDb {
     std::filesystem::path path;
-    TempDb() : path(std::filesystem::temp_directory_path() / "test_mcp_tokens.db") {
+    // #473: per-instance unique path (was a shared `test_mcp_tokens.db` in the system
+    // temp dir, which collided across concurrent CI shards / a crash-without-cleanup).
+    TempDb() : path(yuzu::test::unique_temp_path("mcp-tokens-")) {
         std::filesystem::remove(path);
     }
     ~TempDb() { std::filesystem::remove(path); }
@@ -3170,4 +3172,112 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──
+//
+// aggregate_responses folds rows into COUNT/SUM/AVG totals, so an out-of-scope
+// row cannot be post-filtered out — it must be excluded from the WHERE clause
+// before aggregation. These prove an operator's totals never include another
+// operator's agents' rows.
+
+TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + denied audit (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    // instr-1: two SUCCESS (status 0), one FAILURE (status 1). Only agent-1 is
+    // in the caller's management group.
+    store.store(mk_resp("exec-1", "instr-1", "agent-1", 0, "ok", 500)); // in scope
+    store.store(mk_resp("exec-1", "instr-1", "agent-2", 0, "ok", 501)); // OUT of scope
+    store.store(mk_resp("exec-1", "instr-1", "agent-3", 1, "err", 502)); // OUT of scope
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.response_scope_fn_for_test = [](const std::string&, const std::string& agent_id) -> bool {
+        return agent_id == "agent-1";
+    };
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-1","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    // Only agent-1's SUCCESS survives: status "0" count 1, and NO status "1"
+    // group (agent-3's failure belonged to an out-of-scope agent).
+    std::int64_t count0 = 0, count1 = 0;
+    for (const auto& g : groups) {
+        if (g["group_value"] == "0")
+            count0 = g["count"].get<std::int64_t>();
+        if (g["group_value"] == "1")
+            count1 = g["count"].get<std::int64_t>();
+    }
+    CHECK(count0 == 1); // NOT 2 — agent-2 excluded from the total
+    CHECK(count1 == 0); // agent-3's failure never folded in
+    // The drop is a security-relevant event → distinct denied audit + success.
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.aggregate_responses|denied")
+            saw_denied = true;
+        if (a == "mcp.aggregate_responses|success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-2", "instr-2", "agent-1", 0, "ok", 510));
+    store.store(mk_resp("exec-2", "instr-2", "agent-2", 0, "ok", 511));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store; // response_scope_fn_for_test left empty
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-2","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    std::int64_t count0 = 0;
+    for (const auto& g : groups)
+        if (g["group_value"] == "0")
+            count0 = g["count"].get<std::int64_t>();
+    CHECK(count0 == 2); // both agents counted — RBAC-off legacy posture
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.aggregate_responses|denied");
+    CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-3", "instr-3", "agent-1", 0, "ok", 520));
+    store.store(mk_resp("exec-3", "instr-3", "agent-2", 1, "err", 521));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.response_scope_fn_for_test = [](const std::string&, const std::string&) -> bool {
+        return false; // caller can see NONE of this instruction's agents
+    };
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-3","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    CHECK(groups.empty()); // zero rows — not a silent unfiltered read
+    // No row leaked into the body at all.
+    CHECK(res->body.find("\"count\"") == std::string::npos);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.aggregate_responses|denied")
+            saw_denied = true;
+    CHECK(saw_denied);
 }

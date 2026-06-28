@@ -43,6 +43,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <windns.h> // DnsQuery_W / DNS_RECORD / DnsRecordListFree / DnsFree
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace yuzu::tar {
@@ -62,16 +63,9 @@ struct DnsCacheEntryW {
 };
 using DnsGetCacheDataTable_t = int(WINAPI*)(DnsCacheEntryW**);
 
-std::string wstr_to_utf8(PCWSTR w) {
-    if (!w)
-        return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1)
-        return {};
-    std::string s(static_cast<size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
-    return s;
-}
+// Delegates to the shared helper (#1681); identical -1 convert that drops the
+// trailing NUL (null -> {}).
+std::string wstr_to_utf8(PCWSTR w) { return yuzu::win::from_wide(w); }
 
 std::string record_type_str(unsigned short t) {
     switch (t) {

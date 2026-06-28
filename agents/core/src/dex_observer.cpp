@@ -111,6 +111,7 @@ EventSystemFields extract_system_fields(const std::string& xml) {
 #include "dex_win_poll.hpp" // IStatePoller (storage.low / battery state poll)
 
 #include <winevt.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <chrono>
 #include <condition_variable>
@@ -133,26 +134,12 @@ using EvtSubHandle = ScopedWinHandle<&evt_close_>;
 namespace yuzu::agent {
 namespace {
 
-std::string wide_to_utf8(const wchar_t* w) {
-    if (!w) return {};
-    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1) return {}; // n counts the NUL; <=1 means empty
-    std::string out(static_cast<std::size_t>(n - 1), '\0');
-    // Pass the full size `n` (content + NUL): out.data()[n-1] is the std::string's
-    // own writable NUL slot. The house pattern everywhere else (process_enum,
-    // hardware_plugin, …) is allocate len-1, pass len — match it.
-    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring utf8_to_wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 1) return {};
-    std::wstring out(static_cast<std::size_t>(n - 1), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), n);
-    return out;
-}
+// wide_to_utf8 / utf8_to_wide now delegate to the shared agents/shared/win_str.hpp
+// helpers (#1681). The removed local copies used the same allocate-(n-1)/pass-n
+// idiom (trailing NUL dropped), matching yuzu::win::from_wide / yuzu::win::to_wide
+// (both total on null/empty -> {}).
+std::string wide_to_utf8(const wchar_t* w) { return yuzu::win::from_wide(w); }
+std::wstring utf8_to_wide(const std::string& s) { return yuzu::win::to_wide(s); }
 
 // Render the event to XML once; the pure helpers split out the <System> facts
 // and <EventData> fields (both tested off Windows against real records).
