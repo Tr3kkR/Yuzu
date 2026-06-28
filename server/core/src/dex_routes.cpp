@@ -2004,7 +2004,8 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "hx-get=\"/fragments/dex/device/perf?agent_id=" +
         url_encode(agent_id) +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load performance</button> "
-        "<span class=\"gp-mute\">runs a live read-only query on the device</span></div>";
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; needs Execute "
+        "permission</span></div>";
 
     // PR2: vs-fleet/cohort percentile strips — render-time registry state, no
     // dispatch, no extra permission, so they render directly (no click).
@@ -2023,8 +2024,8 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "hx-get=\"/fragments/dex/device/procperf?agent_id=" +
         url_encode(agent_id) + "&amp;window=" + window +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load applications</button> "
-        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; audited "
-        "separately &mdash; per-app is usage-class telemetry</span></div>";
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; needs Execute "
+        "permission &middot; audited separately &mdash; per-app is usage-class telemetry</span></div>";
 
     // B1 retained app-perf-over-time: reads the CENTRAL store (no dispatch, no
     // Execute probe), so it loads for a read-only operator too — the "over time, on
@@ -2704,7 +2705,10 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  bool truncated = false;
                  const auto apps = app_perf_providers_.apps(truncated);
                  if (!apps) { // nullopt = a real read error → honest degrade, not empty
-                     res.status = 503;
+                     // Render the note at 200, not 503: the dashboard htmx drops
+                     // 4xx/5xx bodies (responseHandling swap:false), so a 503 would
+                     // swap nothing. The store already counted the degrade
+                     // (yuzu_app_perf_read_degrade_total) before returning nullopt.
                      res.set_content(placeholder("Application performance unavailable",
                                                  "The app-perf store could not be read right now."),
                                      "text/html; charset=utf-8");
@@ -2751,7 +2755,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             rows = app_perf_providers_.fleet(app, "");
             if (!rows) {
-                res.status = 503;
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
+                // already counted the degrade. (REST twin stays fail-closed.)
                 res.set_content(placeholder("Application performance unavailable",
                                             "The app-perf store could not be read right now."),
                                 "text/html; charset=utf-8");
@@ -2767,7 +2772,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             rows = app_perf_providers_.group(group, app, "");
             if (!rows) {
-                res.status = 503;
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
+                // reader already counted the degrade. (REST twin stays fail-closed.)
                 res.set_content(placeholder("Group performance unavailable",
                                             "The app-perf store could not be read right now."),
                                 "text/html; charset=utf-8");
@@ -3055,6 +3061,16 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
                                      : !perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
+                 // Missing agent_id (direct URL / misconfigured hx-get; the rendered
+                 // button always includes it). Reject BEFORE the audit so we never log
+                 // a blank-target PII-access row, and BEFORE the read so we never serve
+                 // a misleading empty-state for a malformed request. Status stays 200 so
+                 // the dashboard htmx swaps the note in (it drops 4xx/5xx bodies).
+                 if (id.empty()) {
+                     res.set_content("<div class=\"gp-note\">Missing agent_id.</div>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
                  if (!app_perf_providers_.device) {
                      res.set_content(
                          "<div class=\"gp-note\">Application performance history is unavailable on "
@@ -3064,13 +3080,22 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  }
                  // Audit the behavioural-PII access before serving (provider-null
                  // checked first, so a no-store server does not log a read that
-                 // returns nothing — matches the REST twin's ordering).
+                 // returns nothing — matches the REST twin's ordering). result=success
+                 // records that access was GRANTED + attempted (the established
+                 // pre-read convention, same as the REST twin); a subsequent store
+                 // degrade still carries this row — it over-audits, never under-audits.
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
                      "device app-perf-over-time drill (B1 retained)");
                  const auto rows = app_perf_providers_.device(id);
-                 if (!rows) { // nullopt = a real read degrade → honest 503, never a fake empty
-                     res.status = 503;
+                 if (!rows) {
+                     // nullopt = a real read degrade. Render the honest note at status
+                     // 200, NOT 503: the dashboard htmx config drops 4xx/5xx bodies
+                     // (responseHandling swap:false), so a 503 here would render
+                     // nothing — the exact "fake empty" we mean to avoid. The store
+                     // already counted the degrade (yuzu_app_perf_read_degrade_total)
+                     // before returning nullopt, so monitoring is unaffected. The REST
+                     // twin keeps its fail-closed 503 (its JSON consumer reads status).
                      res.set_content(
                          "<div class=\"gp-note\">Application performance history could not be read "
                          "right now &mdash; the store degraded. Retry shortly.</div>",

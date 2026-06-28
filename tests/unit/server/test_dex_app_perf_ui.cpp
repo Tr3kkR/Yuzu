@@ -139,7 +139,38 @@ TEST_CASE("render_dex_device_app_perf: multi-version app shows header + latest t
     CHECK(has(h, "per-version below"));
     CHECK(has(h, "125.0"));
     CHECK(has(h, "124.0"));
-    CHECK(has(h, "latest")); // newest version (versions[0]) tagged
+    CHECK(has(h, "latest")); // tagged by max-latest_day equality, not row position
     CHECK(has(h, "12.4%"));
     CHECK(has(h, "4.1%"));
+}
+
+TEST_CASE("render_dex_device_app_perf: a day-tie tags both newest versions",
+          "[dex][app_perf][ui]") {
+    // The "latest" cue is by day-EQUALITY (max latest_day), not row position — so two
+    // versions seen on the same most-recent day are both tagged honestly. This is the
+    // property the day-equality fix protects (a position-based tag would tag only one).
+    AppPerfDeviceVersion a;
+    a.version = "2.0";
+    a.latest_day = 300;
+    a.cpu_avg = 5.0;
+    a.cpu_series = {5.0, 5.0};
+    AppPerfDeviceVersion b;
+    b.version = "1.0";
+    b.latest_day = 300; // same day as a
+    b.cpu_avg = 4.0;
+    b.cpu_series = {4.0, 4.0};
+    AppPerfDeviceApp app;
+    app.app_name = "tie.exe";
+    app.latest_day = 300;
+    app.peak_cpu_avg = 5.0;
+    app.versions = {a, b};
+
+    const auto h = render_dex_device_app_perf({app});
+    // Two "latest" tags — one per version on the tied newest day.
+    std::size_t n = 0, pos = 0;
+    while ((pos = h.find("latest", pos)) != std::string::npos) {
+        ++n;
+        pos += 6;
+    }
+    CHECK(n == 2);
 }

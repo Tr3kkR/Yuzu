@@ -1084,12 +1084,12 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->body.find("chrome.exe") != std::string::npos);
-        CHECK(r->body.find("125") != std::string::npos);
+        CHECK(r->body.find(">125</span>") != std::string::npos); // the version, in its mono span
         // Same usage-class verb as the REST drill, PascalCase target_type.
         CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
-    SECTION("store degrade (nullopt) -> 503 + honest note, never a fake empty") {
+    SECTION("store degrade (nullopt) -> 200 honest note (htmx drops 4xx/5xx), audit still fired") {
         degrade = true;
         test::TestRouteSink sink;
         DexRoutes routes;
@@ -1097,17 +1097,51 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
                                providers, {});
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
-        CHECK(r->status == 503);
+        // 200, NOT 503: the dashboard htmx config (swap:false for [45]..) would drop a
+        // 503 body, rendering nothing — the exact "fake empty" the note avoids.
+        CHECK(r->status == 200);
         CHECK(r->body.find("could not be read") != std::string::npos);
+        // The access audit fires BEFORE the read, so a degrade still carries the row.
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
-    SECTION("no provider wired -> graceful unavailable note (no crash)") {
+    SECTION("no provider wired -> graceful note, audit suppressed (no read served)") {
         test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit); // app_perf_providers={}
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(r->body.find("no app-perf store wired") != std::string::npos);
+        CHECK(audited.empty()); // provider-null checked before the audit — no PII-access row
+    }
+
+    SECTION("missing agent_id -> note at 200, no audit (guarded before the PII audit)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf"); // no agent_id query param
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing agent_id") != std::string::npos);
+        CHECK(audited.empty()); // rejected before the behavioural-PII audit
+    }
+
+    SECTION("scoped_perm_fn receives the device agent_id, not a constant (UP-6)") {
+        std::string scoped_seen;
+        auto scoped = [&](const httplib::Request&, httplib::Response&, const std::string& type,
+                          const std::string& op, const std::string& id) {
+            scoped_seen = type + ":" + op + ":" + id;
+            return true;
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scoped, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(scoped_seen == "GuaranteedState:Read:WS-1"); // the scope gate got the device id
     }
 
     SECTION("perm-denied -> gate runs BEFORE audit + read (no audit row, no PII)") {

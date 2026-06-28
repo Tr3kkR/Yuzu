@@ -157,10 +157,12 @@ app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows, std::int64_t floo
 // differences from the fleet/group reductions: a single device has NO histogram
 // (its daily averages ARE the series, so no bucket-resolution percentiles) and NO
 // cohort floor (the per-device read is behind the `dex.device.app_perf.view` audit
-// gate — there is no aggregate that could single an operator out). REST stays raw
-// rows; this reduction is the dashboard consumer (no MCP twin — the device drill is
-// REST-only by design), but it lives here, pure + testable, so a future aggregated
-// device surface reuses it rather than re-deriving the numbers.
+// gate — there is no aggregate that could single an operator out). REST serves the
+// raw rows; this reduction backs the dashboard "Application performance over time"
+// panel. There is no MCP twin (the per-device drill's fail-closed audit contract
+// cannot be expressed on MCP's set-and-proceed posture). It lives here, pure +
+// testable, so a future aggregated device surface reuses it rather than re-deriving
+// the numbers.
 
 /// One application VERSION on a single device, reduced across the retained window.
 /// The window aggregates are sample-weighted (so days with more 30 s samples weigh
@@ -196,6 +198,15 @@ struct AppPerfDeviceApp {
 /// row still shows an honest number rather than 0. Apps are ordered by peak window
 /// `cpu_avg` desc (tiebreak `app_name` asc); versions within an app are newest-day
 /// first. Robust to unsorted input (groups by key, sorts the series chronologically).
+///
+/// Precondition: `rows` are canon-merged as `AppPerfDailyStore::get_agent_app_perf`
+/// returns them — every numeric finite, non-negative, and bounded (`samples` ≤
+/// `kMaxSamples`, so the `int64` sample-weight sum cannot overflow), and unique on
+/// `(app_name, version, day)`. Finiteness is load-bearing: the resource-ranking sort
+/// compares `double cpu_avg`, which is a valid strict-weak order only for finite
+/// values (a NaN would be `std::sort` UB); key-uniqueness keeps `day_count` an honest
+/// distinct-day count. The store is the sole writer and enforces all of this on the
+/// apply path; this pure fn does not re-validate.
 [[nodiscard]] std::vector<AppPerfDeviceApp>
 app_perf_device_summaries(const std::vector<AppPerfDailyRow>& rows);
 

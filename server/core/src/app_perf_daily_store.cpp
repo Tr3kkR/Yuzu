@@ -47,6 +47,24 @@ constexpr std::size_t kMaxRowsPerApply = 5000;
 // Sane ceiling for the per-day instance count (defense-in-depth; procperf
 // instance counts are tiny). Keeps a forged value from poisoning aggregates.
 constexpr std::int64_t kMaxInstances = 1'000'000;
+// Upper ceiling for the per-day sample count. `samples` is the ONE agent-supplied
+// numeric the canon previously only lower-clamped — yet it is the weight in the
+// reductions' sample-weighted means (dex_app_perf_model), so a forged near-INT64_MAX
+// value (or a sum of several) overflows the int64 `sample_sum` accumulator (signed
+// overflow = UB) and makes the downstream `llround(ws_sum/sample_sum)` UB too
+// (sec-M1). 1e9 is >> any legitimate daily count (≤2880 30 s ticks/day × instances)
+// and kMaxSamples × kQueryRowCap (1e5) = 1e14 ≪ INT64_MAX, so the read-side sum is
+// safe even at the row cap.
+constexpr std::int64_t kMaxSamples = 1'000'000'000;
+// Future-dating slack: rows whose agent-supplied `day` is more than this many days
+// ahead of the server's current UTC day are dropped on apply. `day` is agent
+// time and was never upper-bounded; the retention prune is `WHERE day < cutoff`, so
+// a far-future `day` would survive forever (retention bypass → unbounded per-agent
+// storage) and could spread one (app,version) across ~kQueryRowCap distinct days
+// (a multi-MB sparkline). The agent only ever sends the last 2 *completed* UTC days,
+// so 2 days of slack absorbs any benign clock skew / TZ boundary without rejecting a
+// legitimate payload (UP-2; the #1685 agent-clock lesson, applied to `day`).
+constexpr int kFutureSlackDays = 2;
 // Upper ceilings for the per-device daily perf values (defense-in-depth against a
 // forged/hostile agent). cpu is share-of-total-capacity percent (documented 0..100).
 // ws caps at 1 PiB — far above any real working set; combined with the rollup's
@@ -157,6 +175,8 @@ std::vector<AppPerfDailyRow> canon_merge_daily(std::vector<AppPerfDailyRow> rows
         r.cpu_max = (std::min)(clamp_finite_nonneg(r.cpu_max), kMaxCpuPct);
         if (r.samples < 0)
             r.samples = 0;
+        else if (r.samples > kMaxSamples)
+            r.samples = kMaxSamples; // weight in the reductions' sample-weighted means — cap to bound the int64 sum (sec-M1)
         if (r.instances_max < 0)
             r.instances_max = 0;
         else if (r.instances_max > kMaxInstances)
@@ -233,16 +253,26 @@ bool AppPerfDailyStore::apply_daily(std::string_view agent_id, std::vector<AppPe
     if (!open_ || agent_id.empty())
         return false;
 
-    // Re-canon + merge server-side (authoritative writer, defense-in-depth) so the
-    // batch is key-unique — otherwise ON CONFLICT would "affect a row a second time".
-    std::vector<AppPerfDailyRow> merged = canon_merge_daily(std::move(rows));
-    if (merged.size() > kMaxRowsPerApply)
-        merged.resize(kMaxRowsPerApply);
-
     const std::int64_t ts = now_secs();
     const std::int64_t today_start = (ts / 86400) * 86400;
     const std::int64_t cutoff = today_start - static_cast<std::int64_t>(kRetentionDays) * 86400;
+    const std::int64_t day_upper = today_start + static_cast<std::int64_t>(kFutureSlackDays) * 86400;
     const std::string agent_id_s{agent_id};
+
+    // Re-canon + merge server-side (authoritative writer, defense-in-depth) so the
+    // batch is key-unique — otherwise ON CONFLICT would "affect a row a second time".
+    std::vector<AppPerfDailyRow> merged = canon_merge_daily(std::move(rows));
+    // Drop rows whose agent-supplied `day` is outside the retention window — in
+    // particular far-FUTURE days, which the `WHERE day < cutoff` prune below would
+    // never reclaim (retention bypass / sparkline amplification, UP-2). Filtered
+    // BEFORE the per-apply cap so a flood of forged future rows can't crowd out the
+    // agent's legitimate recent days. A day < cutoff is already stale (the prune
+    // would delete it this same txn) — dropping it here is equivalent and cheaper.
+    std::erase_if(merged, [&](const AppPerfDailyRow& r) {
+        return r.day < cutoff || r.day > day_upper;
+    });
+    if (merged.size() > kMaxRowsPerApply)
+        merged.resize(kMaxRowsPerApply);
 
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         if (!merged.empty()) {

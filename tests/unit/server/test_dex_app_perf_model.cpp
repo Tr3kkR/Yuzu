@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace yuzu::server;
@@ -446,4 +447,74 @@ TEST_CASE("app_perf_device_summaries: reversed input still groups + sorts the se
 
 TEST_CASE("app_perf_device_summaries: empty input → empty", "[dex][app_perf]") {
     CHECK(app_perf_device_summaries({}).empty());
+}
+
+TEST_CASE("app_perf_device_summaries: equal peak CPU → apps ordered alphabetically",
+          "[dex][app_perf]") {
+    // Both apps share peak window cpu_avg = 5.0, so the tiebreak (app_name asc) decides.
+    std::vector<AppPerfDailyRow> rows = {
+        daily("zebra.exe", "1", 100, 10, 5.0, 5.0, 100, 100, 1),
+        daily("alpha.exe", "1", 100, 10, 5.0, 5.0, 100, 100, 1),
+    };
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 2);
+    CHECK(apps[0].app_name == "alpha.exe"); // equal peak_cpu_avg → app_name asc
+    CHECK(apps[1].app_name == "zebra.exe");
+}
+
+TEST_CASE("app_perf_device_summaries: negative samples treated as zero weight",
+          "[dex][app_perf]") {
+    // Defense-in-depth: the store clamps samples>=0, but the pure reduction must not
+    // assume that — a negative `samples` contributes 0 weight (never a negative
+    // denominator). With all weights non-positive, the unweighted fallback applies.
+    std::vector<AppPerfDailyRow> rows = {
+        daily("a.exe", "1", 100, -5, 4.0, 4.0, 1000, 1000, 1),
+        daily("a.exe", "1", 200, -3, 6.0, 6.0, 3000, 3000, 1),
+    };
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 1);
+    REQUIRE(apps[0].versions.size() == 1);
+    CHECK(apps[0].versions[0].cpu_avg == 5.0); // (4+6)/2 unweighted (both weights ≤ 0)
+    CHECK(apps[0].versions[0].ws_avg == 2000);
+}
+
+TEST_CASE("app_perf_device_summaries: many distinct keys group correctly (UP-1)",
+          "[dex][app_perf]") {
+    // Grouping is O(n log n) via std::map (was O(distinct²) linear-find — a DoS at
+    // the kQueryRowCap). Build many distinct (app,version) rows and assert each
+    // becomes its own version under its own app: correctness at adversarial scale.
+    std::vector<AppPerfDailyRow> rows;
+    for (int i = 0; i < 2000; ++i)
+        rows.push_back(
+            daily("app" + std::to_string(i) + ".exe", "1.0", 100, 10, 1.0, 1.0, 100, 100, 1));
+    auto apps = app_perf_device_summaries(rows);
+    CHECK(apps.size() == 2000); // every distinct app present exactly once
+    for (const auto& a : apps)
+        CHECK(a.versions.size() == 1);
+}
+
+TEST_CASE("app_perf_device_summaries: cpu_series capped to bound the sparkline (UP-2)",
+          "[dex][app_perf]") {
+    // A degenerate input (one version across > kMaxSeriesPoints distinct days, e.g. a
+    // future-dating attack the store's day-bound also blocks) must not yield an
+    // unbounded series → multi-MB SVG. The series keeps the MOST-RECENT points.
+    std::vector<AppPerfDailyRow> rows;
+    for (int d = 0; d < 1000; ++d)
+        rows.push_back(daily("a.exe", "1", 100 + static_cast<std::int64_t>(d) * 86400, 10,
+                             static_cast<double>(d), 5.0, 100, 100, 1));
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 1);
+    REQUIRE(apps[0].versions.size() == 1);
+    CHECK(apps[0].versions[0].cpu_series.size() == 400); // capped at kMaxSeriesPoints
+    CHECK(apps[0].versions[0].cpu_series.back() == 999.0); // kept the most-recent day
+}
+
+TEST_CASE("app_perf_param_valid: rejects oversize + control/NUL, accepts empty + normal",
+          "[dex][app_perf]") {
+    CHECK(app_perf_param_valid(""));                            // all-versions sentinel
+    CHECK(app_perf_param_valid("chrome.exe"));                  // normal
+    CHECK(app_perf_param_valid(std::string(512, 'a')));         // at the cap
+    CHECK_FALSE(app_perf_param_valid(std::string(513, 'a')));   // over the cap
+    CHECK_FALSE(app_perf_param_valid(std::string("a\0b", 3)));  // embedded NUL (libpq truncation)
+    CHECK_FALSE(app_perf_param_valid("a\tb"));                  // C0 control char
 }

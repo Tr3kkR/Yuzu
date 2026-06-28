@@ -63,6 +63,20 @@ TEST_CASE("canon_merge_daily clamps cpu>100% and ws>1PiB (UP-1 per-row defense)"
     CHECK(m[0].ws_max_bytes == kPiB);
 }
 
+TEST_CASE("canon_merge_daily upper-clamps samples (sec-M1)", "[app_perf][merge]") {
+    // `samples` is the weight in the reductions' sample-weighted means; an uncapped
+    // near-INT64_MAX value would overflow the int64 sample_sum accumulator (UB) and
+    // make the downstream llround UB. canon upper-caps it at 1e9 (>> any legit daily
+    // count: ≤2880 30 s ticks/day × instances).
+    std::vector<AppPerfDailyRow> rows = {
+        {.app_name = "x", .version = "1.0", .day = 86400, .samples = 9223372036854775807LL,
+         .instances_max = 1, .cpu_avg = 50.0, .cpu_max = 50.0, .ws_avg_bytes = 100,
+         .ws_max_bytes = 100}};
+    auto m = canon_merge_daily(std::move(rows));
+    REQUIRE(m.size() == 1);
+    CHECK(m[0].samples == 1'000'000'000LL); // capped — bounds the reductions' int64 weight sum
+}
+
 TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -141,6 +155,26 @@ TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
         REQUIRE(got.has_value());
         REQUIRE(got->size() == 1);
         CHECK((*got)[0].app_name == "new"); // the 40-day-old row was pruned
+    }
+
+    SECTION("drops far-future-dated rows (retention-bypass guard, UP-2)") {
+        // `day` is agent-supplied; an unbounded far-future day would survive the
+        // `WHERE day < cutoff` prune forever (retention bypass → unbounded storage)
+        // and could amplify one version's sparkline. apply_daily drops rows beyond
+        // today + 2 days of slack BEFORE the upsert.
+        const std::int64_t future = today_utc() + 30 * 86400; // well past the 2-day slack
+        std::vector<AppPerfDailyRow> rows = {
+            {.app_name = "future", .version = "1.0.0.0", .day = future, .samples = 1,
+             .instances_max = 1, .cpu_avg = 1.0, .cpu_max = 1.0, .ws_avg_bytes = 1,
+             .ws_max_bytes = 1},
+            {.app_name = "now", .version = "1.0.0.0", .day = day, .samples = 1, .instances_max = 1,
+             .cpu_avg = 1.0, .cpu_max = 1.0, .ws_avg_bytes = 1, .ws_max_bytes = 1},
+        };
+        CHECK(store.apply_daily("agent-f", rows));
+        auto got = store.get_agent_app_perf("agent-f");
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        CHECK((*got)[0].app_name == "now"); // the far-future row never reached the table
     }
 
     SECTION("delete_agent removes all rows") {

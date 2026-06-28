@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <map>
 #include <utility>
 
 namespace yuzu::server {
@@ -150,29 +152,25 @@ app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points) {
     // order. Index access (not a held pointer-into-vector) sidesteps any
     // use-after-realloc on push_back.
     std::vector<std::vector<std::pair<std::int64_t, double>>> series;
+    // version -> index into `out`. A std::map (tree, O(log n) per lookup → O(n log n)
+    // total) replaces the prior linear scan so an app carrying many agent-supplied
+    // version strings cannot drive this to O(versions²) (UP-1, sibling of
+    // app_perf_device_summaries). Ordered, not hashed: the keys are agent-controlled,
+    // so a tree is immune to the hash-flooding an unordered_map would suffer. `out`
+    // is still built in first-seen order (push_back on miss), the map only indexes.
+    std::map<std::string, std::size_t> version_index;
     for (const AppPerfTrendPoint& pt : points) {
-        // Points are grouped by version (SQL ORDER BY version, day); the common path
-        // extends the last summary. Fall back to a search so out-of-order input still
-        // groups correctly (defence-in-depth, never a duplicate row).
-        std::size_t idx = 0;
-        bool found = false;
-        if (!out.empty() && out.back().version == pt.version) {
-            idx = out.size() - 1;
-            found = true;
+        auto it = version_index.find(pt.version);
+        std::size_t idx;
+        if (it != version_index.end()) {
+            idx = it->second;
         } else {
-            for (std::size_t k = 0; k < out.size(); ++k)
-                if (out[k].version == pt.version) {
-                    idx = k;
-                    found = true;
-                    break;
-                }
-        }
-        if (!found) {
+            idx = out.size();
             AppPerfVersionSummary fresh;
             fresh.version = pt.version;
             out.push_back(std::move(fresh));
             series.emplace_back();
-            idx = out.size() - 1;
+            version_index.emplace(pt.version, idx);
         }
         AppPerfVersionSummary& s = out[idx];
         ++s.day_count;
@@ -235,35 +233,40 @@ struct DeviceAcc {
     std::int64_t row_count{0};    ///< days seen (fallback denominator)
 };
 
+// Defensive cap on the per-version sparkline length. With the store's day-bound
+// (apply_daily drops rows outside the retention window) a legitimate series is
+// ≤ retention (~31 days), so this never truncates real data — it is belt-and-
+// suspenders against a degenerate/oversized input reaching this pure fn (e.g. a
+// future caller, or if the day-bound were ever weakened), keeping spark() from
+// emitting a multi-MB SVG polyline (UP-2). We keep the MOST RECENT points.
+constexpr std::size_t kMaxSeriesPoints = 400;
+
 } // namespace
 
 std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPerfDailyRow>& rows) {
     std::vector<DeviceAcc> accs;
     std::vector<std::vector<std::pair<std::int64_t, double>>> series;
-
-    auto same_key = [](const DeviceAcc& a, const AppPerfDailyRow& r) {
-        return a.app == r.app_name && a.version == r.version;
-    };
+    // (app, version) -> index into accs. A std::map (tree, O(log n) per lookup →
+    // O(n log n) total) replaces the prior linear scan: the agent controls these
+    // keys and can push up to kQueryRowCap (1e5) distinct ones, so the old
+    // back()+scan was O(distinct²) ≈ 1e10 compares on one web thread = a dashboard
+    // DoS (UP-1). Ordered, not hashed — a tree is immune to the hash-flooding an
+    // unordered_map would suffer on adversarial keys.
+    std::map<std::pair<std::string, std::string>, std::size_t> acc_index;
 
     for (const AppPerfDailyRow& r : rows) {
-        // Rows arrive grouped by (app, version) — the back() fast path hits; the
-        // linear scan is the order-robust fallback (defence-in-depth, never a dup).
-        std::size_t idx = accs.size();
-        if (!accs.empty() && same_key(accs.back(), r)) {
-            idx = accs.size() - 1;
+        const auto it = acc_index.find({r.app_name, r.version});
+        std::size_t idx;
+        if (it != acc_index.end()) {
+            idx = it->second;
         } else {
-            for (std::size_t k = 0; k < accs.size(); ++k)
-                if (same_key(accs[k], r)) {
-                    idx = k;
-                    break;
-                }
-        }
-        if (idx == accs.size()) {
+            idx = accs.size();
             DeviceAcc fresh;
             fresh.app = r.app_name;
             fresh.version = r.version;
             accs.push_back(std::move(fresh));
             series.emplace_back();
+            acc_index.emplace(std::pair{r.app_name, r.version}, idx);
         }
         DeviceAcc& a = accs[idx];
         ++a.day_count;
@@ -284,6 +287,7 @@ std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPer
     // Reduce each accumulator to a version summary, group under its app (first-seen
     // app order preserved here; the final sort re-orders by resource).
     std::vector<AppPerfDeviceApp> apps;
+    std::map<std::string, std::size_t> app_index; // app_name -> index into apps (UP-1)
     for (std::size_t k = 0; k < accs.size(); ++k) {
         const DeviceAcc& a = accs[k];
         AppPerfDeviceVersion v;
@@ -303,27 +307,25 @@ std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPer
             v.ws_avg = static_cast<std::int64_t>(
                 std::llround(a.ws_plain_sum / static_cast<double>(a.row_count)));
         }
-        auto pairs = series[k];
+        auto& pairs = series[k]; // sort in place — series[k] is dead afterwards
         std::sort(pairs.begin(), pairs.end(),
                   [](const auto& x, const auto& y) { return x.first < y.first; });
-        v.cpu_series.reserve(pairs.size());
-        for (const auto& [day, cpu] : pairs)
-            v.cpu_series.push_back(cpu);
+        // Keep the most-recent kMaxSeriesPoints (UP-2 belt: bound the sparkline).
+        const std::size_t start = pairs.size() > kMaxSeriesPoints ? pairs.size() - kMaxSeriesPoints : 0;
+        v.cpu_series.reserve(pairs.size() - start);
+        for (std::size_t i = start; i < pairs.size(); ++i)
+            v.cpu_series.push_back(pairs[i].second);
 
-        std::size_t ai = apps.size();
-        if (!apps.empty() && apps.back().app_name == a.app) {
-            ai = apps.size() - 1;
+        const auto ait = app_index.find(a.app);
+        std::size_t ai;
+        if (ait != app_index.end()) {
+            ai = ait->second;
         } else {
-            for (std::size_t j = 0; j < apps.size(); ++j)
-                if (apps[j].app_name == a.app) {
-                    ai = j;
-                    break;
-                }
-        }
-        if (ai == apps.size()) {
+            ai = apps.size();
             AppPerfDeviceApp na;
             na.app_name = a.app;
             apps.push_back(std::move(na));
+            app_index.emplace(a.app, ai);
         }
         AppPerfDeviceApp& app = apps[ai];
         app.latest_day = (std::max)(app.latest_day, v.latest_day);
