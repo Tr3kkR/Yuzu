@@ -437,3 +437,148 @@ TEST_CASE("ResponseStore PR2: migration v2 idempotency — re-open the same DB",
     std::filesystem::remove(path.string() + "-wal");
     std::filesystem::remove(path.string() + "-shm");
 }
+
+// ── #1634 management-group scope on aggregate (filter-BEFORE-aggregate) ───────
+
+namespace {
+StoredResponse mk_agg_resp(const std::string& instr, const std::string& agent, int status) {
+    StoredResponse r;
+    r.instruction_id = instr;
+    r.agent_id = agent;
+    r.status = status;
+    r.output = "out";
+    return r;
+}
+} // namespace
+
+TEST_CASE("ResponseStore: distinct_agent_ids returns sorted distinct agents", "[response_store]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_agg_resp("instr-1", "agent-c", 0));
+    store.store(mk_agg_resp("instr-1", "agent-a", 0));
+    store.store(mk_agg_resp("instr-1", "agent-a", 1)); // duplicate agent
+    store.store(mk_agg_resp("instr-1", "agent-b", 0));
+    store.store(mk_agg_resp("instr-2", "agent-z", 0)); // other instruction
+
+    auto ids = store.distinct_agent_ids("instr-1");
+    REQUIRE(ids.has_value());
+    REQUIRE(ids->size() == 3);
+    CHECK((*ids)[0] == "agent-a");
+    CHECK((*ids)[1] == "agent-b");
+    CHECK((*ids)[2] == "agent-c");
+    // Genuinely-empty (instruction has no rows) is an ENGAGED empty vector, NOT
+    // nullopt — nullopt is reserved for a store-read error so the caller can fail
+    // closed on error without conflating it with "no agents" (#1634 UP-2).
+    auto none = store.distinct_agent_ids("nope");
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+}
+
+TEST_CASE("ResponseStore: aggregate scope excludes out-of-scope rows from totals (#1634)",
+          "[response_store][scope]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    // Two agents reported SUCCESS (status 0), one reported FAILURE (status 1).
+    store.store(mk_agg_resp("instr-1", "agent-1", 0)); // in scope
+    store.store(mk_agg_resp("instr-1", "agent-2", 0)); // OUT of scope
+    store.store(mk_agg_resp("instr-1", "agent-3", 1)); // OUT of scope
+
+    AggregationQuery aq;
+    aq.group_by = "status";
+    aq.op = AggregateOp::Count;
+
+    auto count_for = [](const std::vector<AggregationResult>& rs, const std::string& status) {
+        for (const auto& r : rs)
+            if (r.group_value == status)
+                return r.count;
+        return std::int64_t{0};
+    };
+
+    SECTION("nullopt scope = legacy-open: all rows counted") {
+        auto rs = store.aggregate("instr-1", aq, {}, std::nullopt);
+        CHECK(count_for(rs, "0") == 2);
+        CHECK(count_for(rs, "1") == 1);
+    }
+
+    SECTION("subset scope: only in-scope agents fold into the totals") {
+        auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{{"agent-1"}});
+        // agent-1 is the only in-scope agent → status 0 count is 1, not 2.
+        CHECK(count_for(rs, "0") == 1);
+        // agent-3's FAILURE belongs to an out-of-scope agent → excluded entirely.
+        CHECK(count_for(rs, "1") == 0);
+    }
+
+    SECTION("empty scope set = visible to no one: zero rows, never silently unfiltered") {
+        auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{std::vector<std::string>{}});
+        CHECK(rs.empty());
+    }
+}
+
+TEST_CASE("ResponseStore: aggregate scope applies to SUM, not just COUNT (#1634)",
+          "[response_store][scope]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    // group_by agent_id, SUM over the `status` column so each agent's contribution
+    // is its own value — proves the WHERE-level scope filter applies to non-COUNT ops.
+    store.store(mk_agg_resp("instr-1", "agent-1", 2)); // in scope, status=2
+    store.store(mk_agg_resp("instr-1", "agent-2", 3)); // OUT of scope, status=3
+
+    AggregationQuery aq;
+    aq.group_by = "agent_id";
+    aq.op = AggregateOp::Sum;
+    aq.op_column = "status";
+
+    auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{{"agent-1"}});
+    // Only agent-1's group survives; agent-2's status=3 never folds into any total.
+    REQUIRE(rs.size() == 1);
+    CHECK(rs[0].group_value == "agent-1");
+    CHECK(rs[0].aggregate_value == 2.0);
+}
+
+TEST_CASE("ResponseStore: aggregate scope AND filter.agent_id compose — out-of-scope explicit "
+          "agent yields zero (#1634)",
+          "[response_store][scope]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_agg_resp("instr-1", "agent-1", 0)); // in scope
+    store.store(mk_agg_resp("instr-1", "agent-2", 0)); // OUT of scope
+
+    AggregationQuery aq;
+    aq.group_by = "status";
+    aq.op = AggregateOp::Count;
+
+    // Explicitly request agent-2 (which is OUTSIDE the scope set): the conjunction
+    // `agent_id = 'agent-2' AND agent_id IN ('agent-1')` matches nothing — an operator
+    // cannot escape scope by naming an out-of-scope agent_id (the residual IDOR case).
+    ResponseQuery filter;
+    filter.agent_id = "agent-2";
+    auto rs = store.aggregate("instr-1", aq, filter, AggregateScope{{"agent-1"}});
+    CHECK(rs.empty());
+
+    // In-scope explicit agent_id still works.
+    ResponseQuery filter_ok;
+    filter_ok.agent_id = "agent-1";
+    auto rs_ok = store.aggregate("instr-1", aq, filter_ok, AggregateScope{{"agent-1"}});
+    int64_t total = 0;
+    for (const auto& r : rs_ok)
+        total += r.count;
+    CHECK(total == 1);
+}
+
+TEST_CASE("ResponseStore: distinct_agent_ids returns nullopt on an unopenable store (#1634 UP-2)",
+          "[response_store][scope]") {
+    // An unopenable store (parent dir absent) → db_ null → is_open() false. distinct_agent_ids
+    // MUST return nullopt (store-read error), NOT an engaged-empty vector — so the aggregate
+    // caller fails CLOSED (empty AggregateScope → AND 1=0 → zero rows; REST 503 / MCP JSON-RPC
+    // error) instead of reading "couldn't read" as "no agents to drop" → unrestricted (the UP-2
+    // fail-open this contract closes). This is the store-seam half of the corrupt-store posture.
+    ResponseStore store(std::filesystem::path("/yuzu-nonexistent-uat-dir-zz/sub/responses.db"));
+    REQUIRE_FALSE(store.is_open());
+    auto ids = store.distinct_agent_ids("instr-1");
+    CHECK_FALSE(ids.has_value()); // nullopt = error, distinct from an engaged-empty vector
+    // aggregate on a closed store returns empty (no crash, no rows).
+    AggregationQuery aq;
+    aq.group_by = "status";
+    aq.op = AggregateOp::Count;
+    CHECK(store.aggregate("instr-1", aq).empty());
+}
