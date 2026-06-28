@@ -72,6 +72,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "preflight_routes.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -8600,6 +8601,53 @@ private:
             },
             audit_fn);
 
+        // PreflightRoutes — /auto pre-flight page. A config section (per-check
+        // params + thresholds) runs the live checks (app version / os_version /
+        // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
+        // in a chosen management group (optionally narrowed by OS family), applies
+        // the thresholds server-side, and groups the result BY DEVICE (Pass / Failed
+        // / Warn-only / Incomplete). Reuses DeviceRoutes' scoped device provider
+        // (devices_fn) + the SAME untracked dispatch (execution_id="" → not in the
+        // executions drawer, like device live-info / DEX-perf reads) + a narrow
+        // all-agents ResponseStore seam (query by command_id, no agent filter — the
+        // grid only counts the pinned visible∩group devices, so an extra agent
+        // in the result is ignored). Machine-health facts, not behavioural PII →
+        // operational `preflight.run` audit (set-and-proceed).
+        preflight_routes_ = std::make_unique<PreflightRoutes>();
+        preflight_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            [this](const std::string& group_id) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                if (mgmt_group_store_)
+                    for (const auto& m : mgmt_group_store_->get_members(group_id))
+                        out.push_back(m.agent_id);
+                return out;
+            },
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope_expr,
+                                  const std::unordered_map<std::string, std::string>& parameters)
+                -> std::pair<std::string, int> {
+                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
+                                           /*execution_id=*/"");
+            },
+            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
+                std::vector<DexAgentResponse> out;
+                if (!response_store_)
+                    return out;
+                for (const auto& r : response_store_->query(command_id, {}))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                return out;
+            },
+            audit_fn);
+
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
@@ -9546,6 +9594,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
