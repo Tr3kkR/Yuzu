@@ -133,6 +133,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
   ),
@@ -347,6 +348,8 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_app_perf_daily_store.cpp',
+      'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_pg_array.cpp',
     ),
     include_directories: [

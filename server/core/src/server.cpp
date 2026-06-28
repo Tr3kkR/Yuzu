@@ -37,6 +37,7 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "app_perf_daily_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_inventory_store.hpp"
@@ -1980,6 +1981,25 @@ public:
             }
         }
 
+        // Typed per-device app-perf daily projection — born-on-Postgres (DEX
+        // app-perf-over-time B1). Independent of the software store above (its own
+        // schema, its own fail-closed). Wires BOTH server entry points (direct
+        // ReportInventory + gateway ProxyInventory) to the typed app_perf seam.
+        if (pg_pool_ && !startup_failed_) {
+            app_perf_daily_store_ = std::make_unique<AppPerfDailyStore>(*pg_pool_);
+            if (!app_perf_daily_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_perf daily store migration/open failed "
+                              "(database reachable but the app_perf_daily_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_perf_daily_store_->set_metrics(&metrics_);
+                agent_service_.set_app_perf_daily_store(app_perf_daily_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_app_perf_daily_store(app_perf_daily_store_.get());
+            }
+        }
+
         // Phase 7: Directory Sync (AD/Entra integration)
         {
             auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
@@ -2909,6 +2929,10 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        agent_service_.set_app_perf_daily_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_app_perf_daily_store(nullptr);
+        app_perf_daily_store_.reset();
         pg_pool_.reset();
     }
 
@@ -4385,11 +4409,12 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok;
+                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4406,7 +4431,8 @@ private:
                   {"offload_target", offload_target_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
-                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"}}},
+                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4567,6 +4593,8 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                {"app_perf_daily_store",
+                 app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -9618,6 +9646,9 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    // Typed per-device app-perf daily projection — born-on-Postgres (DEX
+    // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;

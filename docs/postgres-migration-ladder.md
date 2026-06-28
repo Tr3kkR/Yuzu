@@ -18,6 +18,7 @@ Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Upd
 |---|---|---|
 | `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). durability-on-top. |
 | `SoftwareInventoryStore` | `software_inventory_store` | Born-on-Pg (ADR-0016). Typed projection for the daily-sync `installed_software` source (normalized rows, no JSONB). authoritative reads; ingest fail-soft (next sync + weekly floor self-heal). **Coexists with the generic `InventoryStore` (Wave 1 below) — it is NOT that store's migration.** |
+| `AppPerfDailyStore` | `app_perf_daily_store` | Born-on-Pg (DEX app-perf-over-time B1). Typed per-device daily app-version perf projection for the daily-sync `app_perf` source (plain table, PK `(agent_id, app_name, version, day)`, 31-day per-agent prune, no JSONB). authoritative reads; ingest fail-soft. **Hash-less** (perf changes daily → no hash-skip), so unlike `SoftwareInventoryStore` it stores no content hash and a hash-only report is answered `need_full`. No backfill (greenfield). |
 
 ## Wave 1 — cross-store-join / durable / high-write
 

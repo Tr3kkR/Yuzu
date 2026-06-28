@@ -81,6 +81,14 @@ The comparison population for fleet-relative performance benchmarking: the set o
 
 The denominator that travels with every fleet-aggregate performance statistic: how many devices actually contributed values in the current cycle. A fleet average over 12 devices is never presented as fleet-wide truth without its population; a metric nobody reported is absent, never a fabricated zero.
 
+## App-perf daily roll-up (B1)
+
+The centralized per-device daily summary of a device's **resource-significant app-versions**: one record per `(device, app, version, UTC day)` carrying sample-weighted CPU and working-set averages, their peaks, and a sample count, derived on the agent from the on-device `procperf_hourly` warehouse and shipped daily. It is the fleet-queryable layer ("which devices ran v124, and how did it perform") that complements the on-device, federated-on-demand drill — distinct from **installed software** inventory (a complete app-presence census; B1 is performance over the top-N consumers only).
+
+## Resource-significant app-version
+
+An `(application, version)` pair that appeared among a device's top-N CPU- or working-set-consuming processes during sampling, and therefore the unit B1 measures. The qualifier is load-bearing: B1 deliberately does **not** record every app that ran — only those significant enough to surface in `procperf` — so "ran on this device" in a B1 context always means "ran among its top resource consumers."
+
 ## Asset value (Crown jewel)
 
 A risk-weighting of how much a node matters to defend — a *value* axis, **orthogonal** to tags, management groups, and scope (which are *targeting* axes). **Operator-declared**: the defender knows what matters and Yuzu does not guess it, though optional inference *hints* may suggest a value (never auto-apply it). Value is carried by the **service** — the process/listening unit where a vulnerability and an exposed port actually live — and may also be declared on an addressable instance (container, VM, bare-metal host). A host's **effective value is the maximum** of the values of the services/instances it carries: a box is as valuable a target as its most valuable tenant. A **crown jewel** is the high end of that axis — the service whose compromise is the attacker's objective and the defender's nightmare. New term; does not collide with any existing Yuzu concept.

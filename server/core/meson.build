@@ -363,6 +363,8 @@ yuzu_server_core_lib = static_library(
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
     'src/product_pack_store.cpp',
+    'src/app_perf_daily_store.cpp',
+    'src/app_perf_ingestion.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/software_inventory_store.cpp',

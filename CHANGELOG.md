@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX app-performance over time (B1) — per-device daily app-version perf, centralized.**
+  New daily-sync source `app_perf` (agent) rolls the on-device `procperf_hourly` warehouse up to
+  per-`(app, version, day)` daily summaries — sample-weighted CPU/working-set, max-of-max peaks,
+  the last 2 completed UTC days per cycle — and ships them over the existing `ReportInventory`
+  transport as a new `plugin_data` key (no proto change, no gateway regen). New born-on-Postgres
+  `AppPerfDailyStore` (schema `app_perf_daily_store`, 31-day retention, plain table + per-agent
+  prune) persists them via a shared ingest seam wired identically on the direct `ReportInventory`
+  and gateway `ProxyInventory` paths, so fleet questions like "which devices ran v124 and how did
+  it perform" become answerable without federating to every endpoint. Version is canonicalized at
+  ingest (the same `canon_version` the stability side uses) so perf joins app stability by
+  `(app, version)`. Hash-less (perf changes daily → always full); scope is resource-significant
+  (procperf top-N) app-versions, not a full app census. Windows-fed today (procperf is
+  Windows-only); gated by `procperf_enabled` + the `--inventory-disable` daily-sync master switch.
+  No operator read surface yet — the per-device + fleet dashboard/REST/MCP views are a follow-on
+  slice and will ship REST + MCP in lockstep (agentic-first A1–A4).
 - **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
   single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
   default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,
