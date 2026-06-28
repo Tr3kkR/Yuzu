@@ -23,6 +23,7 @@
 ///     carried alongside the bucket-resolution percentiles for callers that need
 ///     a precise number.
 
+#include "app_perf_daily_store.hpp" // AppPerfDailyRow (per-device drill)
 #include "app_perf_fleet_store.hpp" // AppPerfFleetRow, AppPerfAppSummary
 #include "app_perf_hist.hpp"        // bucket scheme + kAppPerfHistVersion
 
@@ -74,6 +75,12 @@ struct AppPerfTrendPoint {
     std::optional<HistPctile> ws_p50;
     std::optional<HistPctile> ws_p95;
     bool hist_stale{false};
+    /// Set ONLY by the GROUP path (`app_perf_group_trend`): this (version, day)
+    /// point covered fewer than the statistical floor of devices, so its stats are
+    /// suppressed (means/percentiles cleared) and only `device_count` is honest.
+    /// The fleet path never sets this — a low-N fleet point is a rollout ramp
+    /// (count shown, no identity), not a small named-group slice.
+    bool suppressed{false};
 };
 
 /// PURE: reduce retained B2 rows (as returned by `get_app_fleet_perf`, ordered
@@ -82,6 +89,17 @@ struct AppPerfTrendPoint {
 /// drift. Rows with `device_count <= 0` yield zero means (never a divide).
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows);
+
+/// PURE: the GROUP variant — `app_perf_fleet_trend` over a management group's
+/// on-the-fly aggregate rows, THEN the statistical-floor suppression a named
+/// group needs that the fleet does not. A management group is a set of SPECIFIC
+/// devices, so a small-N group aggregate is de-facto individual behaviour
+/// (works-council); any point with `device_count < floor` is marked
+/// `suppressed` with its means/percentiles cleared (only the honest
+/// `device_count` survives). Reusing `app_perf_fleet_trend` keeps the group and
+/// fleet percentile convention IDENTICAL (one helper, one histogram reading).
+[[nodiscard]] std::vector<AppPerfTrendPoint>
+app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows, std::int64_t floor);
 
 // ── Provider seams (wired in server.cpp over the B1/B2 stores) ────────────────
 //
@@ -101,9 +119,27 @@ using AppPerfFleetFn = std::function<std::optional<std::vector<AppPerfFleetRow>>
 using AppPerfAppListFn =
     std::function<std::optional<std::vector<AppPerfAppSummary>>(bool& truncated)>;
 
+/// B1 per-device drill: one device's retained daily rows across all its
+/// resource-significant app-versions. Mirrors `AppPerfDailyStore::get_agent_app_perf`:
+/// nullopt = degrade, empty = no rows. This carries PER-DEVICE behavioural PII —
+/// its read surface is audited fail-closed, unlike the fleet/picker seams above.
+using AppPerfDeviceFn =
+    std::function<std::optional<std::vector<AppPerfDailyRow>>(std::string_view agent_id)>;
+
+/// Management-group trend: the on-the-fly B1 aggregate (same `AppPerfFleetRow`
+/// shape as B2, computed over the group's members for one app) for `group_id`.
+/// `version` empty = all versions. nullopt = degrade (member resolution OR the
+/// aggregate read failed); empty = the group has no members / no rows. The
+/// provider resolves members then aggregates B1 — two bounded single-store reads
+/// composed, never a held cross-store lease.
+using AppPerfGroupFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
+    std::string_view group_id, std::string_view app_name, std::string_view version)>;
+
 struct AppPerfProviders {
     AppPerfFleetFn fleet;
     AppPerfAppListFn apps;
+    AppPerfDeviceFn device;
+    AppPerfGroupFn group;
 };
 
 } // namespace yuzu::server

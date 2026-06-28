@@ -127,6 +127,52 @@ TEST_CASE("app_perf_fleet_trend: exact mean, no divide-by-zero", "[dex][app_perf
     CHECK_FALSE(t2[0].cpu_p50.has_value()); // empty population → nullopt
 }
 
+TEST_CASE("app_perf_group_trend: sub-floor points suppress stats, keep device_count",
+          "[dex][app_perf]") {
+    // Two points: one above the floor, one below. Same app, two days.
+    AppPerfFleetRow big;
+    big.app_name = "chrome.exe";
+    big.version = "124";
+    big.day = 1'700'000'000;
+    big.device_count = 25; // >= floor
+    big.cpu_sum = 125.0;   // mean 5.0
+    big.cpu_max = 9.0;
+    big.ws_sum = 2500;
+    big.ws_max = 200;
+    big.hist_version = kAppPerfHistVersion;
+    big.cpu_hist = cpu_hist({0, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0});
+    big.ws_hist.assign(app_perf_ws_buckets().size() + 1, 0);
+    big.ws_hist[3] = 25;
+
+    AppPerfFleetRow small = big;
+    small.day = 1'700'086'400;
+    small.device_count = 3; // < floor (10)
+    small.cpu_sum = 15.0;   // would be mean 5.0 — but must be suppressed
+    small.cpu_hist = cpu_hist({0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0});
+    small.ws_hist.assign(app_perf_ws_buckets().size() + 1, 0);
+    small.ws_hist[3] = 3;
+
+    auto pts = app_perf_group_trend({big, small}, /*floor=*/10);
+    REQUIRE(pts.size() == 2);
+
+    // Above floor: full stats, not suppressed.
+    CHECK_FALSE(pts[0].suppressed);
+    CHECK(pts[0].device_count == 25);
+    CHECK(pts[0].cpu_mean == 5.0);
+    CHECK(pts[0].cpu_p50.has_value());
+
+    // Below floor: suppressed, device_count honest, ALL stats cleared.
+    CHECK(pts[1].suppressed);
+    CHECK(pts[1].device_count == 3); // the only honest field
+    CHECK(pts[1].cpu_mean == 0.0);
+    CHECK(pts[1].cpu_max == 0.0);
+    CHECK(pts[1].ws_mean == 0);
+    CHECK_FALSE(pts[1].cpu_p50.has_value());
+    CHECK_FALSE(pts[1].cpu_p95.has_value());
+    CHECK_FALSE(pts[1].ws_p50.has_value());
+    CHECK_FALSE(pts[1].ws_p95.has_value());
+}
+
 TEST_CASE("app_perf_fleet_trend: a wrong-scheme row withholds percentiles", "[dex][app_perf]") {
     AppPerfFleetRow row;
     row.device_count = 2;

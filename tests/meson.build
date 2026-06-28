@@ -354,6 +354,7 @@ if build_server
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_app_perf_rollup.cpp',
+      'unit/server/test_app_perf_group_reader.cpp',
       'unit/server/test_pg_array.cpp',
     ),
     include_directories: [

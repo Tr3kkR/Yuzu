@@ -366,6 +366,7 @@ yuzu_server_core_lib = static_library(
     'src/product_pack_store.cpp',
     'src/app_perf_daily_store.cpp',
     'src/app_perf_fleet_store.cpp',
+    'src/app_perf_group_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
     'src/inventory_ingestion.cpp',

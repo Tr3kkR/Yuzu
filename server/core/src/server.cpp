@@ -39,6 +39,7 @@
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
+#include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
@@ -2019,6 +2020,11 @@ public:
             } else {
                 app_perf_fleet_store_->set_metrics(&metrics_);
                 app_perf_rollup_ = std::make_unique<AppPerfRollup>(*pg_pool_);
+                // Group-trend reader (slice 2): on-the-fly B1 aggregate over a
+                // management group's members. Borrows the pool, no schema of its
+                // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
+                app_perf_group_reader_ = std::make_unique<AppPerfGroupReader>(*pg_pool_);
+                app_perf_group_reader_->set_metrics(&metrics_);
             }
         }
 
@@ -2960,6 +2966,7 @@ public:
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
+        app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_daily_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -8962,6 +8969,27 @@ private:
                 return std::nullopt;
             return app_perf_fleet_store_->list_apps(truncated);
         };
+        app_perf_providers.device =
+            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+            if (!app_perf_daily_store_)
+                return std::nullopt;
+            return app_perf_daily_store_->get_agent_app_perf(agent_id);
+        };
+        app_perf_providers.group =
+            [this](std::string_view group_id, std::string_view app,
+                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_group_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN aggregate B1
+            // (a second bounded read) — never a lease held across the other (ADR-0012
+            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
+        };
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -9756,6 +9784,8 @@ private:
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
     std::unique_ptr<AppPerfRollup> app_perf_rollup_;
+    // Slice-2 group-trend reader (reads B1 by member list; borrows the pool).
+    std::unique_ptr<AppPerfGroupReader> app_perf_group_reader_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;

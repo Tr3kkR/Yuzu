@@ -720,6 +720,9 @@ const std::string& openapi_spec() {
     "/dex/devices/{id}/live": {
       "post": {"summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The request is audited per kind (device.live.uptime / device.live.processes) with result=requested BEFORE the command is dispatched; if the audit row cannot persist the request is rejected with 503 + Sec-Audit-Failed: true and NO command is dispatched (audit-on-open, fail-closed). Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])"}, "400": {"description": "unknown kind"}, "403": {"description": "outside the caller's management scope, or missing Execute"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
     },
+    "/dex/devices/{id}/app-perf": {
+      "get": {"summary": "Per-device app performance over time (B1 drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. This device's retained daily per-app-version performance series from the Postgres B1 store — the 'over time, on THIS box' companion to the fleet trend GET /dex/perf/app. One row per (app, version, UTC day) over the B1 retention (up to 31 days): cpu_avg/cpu_max are share-of-capacity %, ws_avg_bytes/ws_max_bytes are working-set bytes, samples is the hourly-bucket count, instances_max the peak concurrent process count. No percentiles — a single device's daily averages ARE the series. Optional app query parameter narrows to one app name. Individual-identifying behavioral data, so every call emits a dex.device.app_perf.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist. Covers only resource-significant app-versions (procperf top-N), NOT every installed app.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "app", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Exact app-name filter (optional)."}], "responses": {"200": {"description": "{data:{agent_id, app, rows[].{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}}}"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.device.app_perf.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    },
     "/dex/perf/fleet": {
       "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
     },
@@ -740,6 +743,9 @@ const std::string& openapi_spec() {
     },
     "/dex/perf/app": {
       "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 256}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing app, or app/version too long"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
+    },
+    "/dex/perf/group": {
+      "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id) — NOT audited. Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped principal does not pass the global check and cannot use this endpoint, so the only callers who reach it already have unscoped fleet-wide read — no cross-operator exposure. Scoped operators are excluded by design, not by an unfinished control.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 256}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 256}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
     },
     "/network/fleet": {
       "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
@@ -5679,6 +5685,85 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(data), "application/json");
         });
 
+    // GET /dex/devices/{id}/app-perf?app=<name> — the per-device B1 drill: this
+    // device's retained daily app-version perf series (the "over time, on THIS
+    // box" companion to the fleet trend /dex/perf/app). Per-device behavioural PII,
+    // so it lives on the audited per-device family (NOT /dex/perf/*): SCOPED
+    // Read + audit-on-open FAIL-CLOSED, the same posture as the read model above
+    // (dex.device.view). Optional ?app= narrows to one app. No percentiles — a
+    // single device's daily averages ARE the series; percentiles are a fleet/group
+    // concept.
+    sink.Get(
+        R"(/api/v1/dex/devices/([^/]+)/app-perf)",
+        [scoped_perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            const std::string agent_id = req.matches[1].str();
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!scoped_perm_fn) { // fail CLOSED if the scope gate is unwired
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return; // the gate wrote its own 401/403
+            if (!app_perf_providers.device) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            // Audit-on-open, FAIL-CLOSED (per-device PII) — refuse to serve when the
+            // evidence row is known-lost (#1647 shared helper; dex.device.view posture).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.device.app_perf.view",
+                                               "success", "Agent", agent_id,
+                                               "REST per-device app-perf drill cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("dex.device.app_perf.view audit fail-closed (503) cid={} agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            auto rows = app_perf_providers.device(agent_id);
+            if (!rows) { // AUTHORITATIVE read degrade
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf store read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
+            JArr arr;
+            for (const auto& r : *rows) {
+                if (!app_filter.empty() && r.app_name != app_filter)
+                    continue;
+                arr.add(JObj()
+                            .add("app_name", r.app_name)
+                            .add("version", r.version)
+                            .add("day", r.day)
+                            .add("samples", r.samples)
+                            .add("instances_max", r.instances_max)
+                            .add("cpu_avg", r.cpu_avg)
+                            .add("cpu_max", r.cpu_max)
+                            .add("ws_avg_bytes", r.ws_avg_bytes)
+                            .add("ws_max_bytes", r.ws_max_bytes));
+            }
+            res.set_content(
+                ok_json(JObj().add("agent_id", agent_id).add("app", app_filter).raw("rows",
+                                                                                    arr.str()).str()),
+                "application/json");
+        });
+
     if (metrics_registry) {
         metrics_registry->describe(
             "yuzu_server_live_requests_total",
@@ -6451,6 +6536,120 @@ void RestApiV1::register_routes(
                                              .str()),
                                  "application/json");
              });
+
+    // GET /dex/perf/group?group_id=<id>&app=<name>&version=<v> — the management-
+    // group trend: the same fleet-trend shape, aggregated on-the-fly over ONE
+    // group's members (B1, NOT the fleet B2), with the statistical-floor
+    // suppression a NAMED group needs (a small group of specific devices ⇒
+    // de-facto individual behaviour). Aggregate → GuaranteedState:Read, NOT
+    // audited (cohort posture). Sub-floor points carry suppressed=true with
+    // device_count only.
+    //
+    // Authz: gated on the GLOBAL perm_fn (check_permission), exactly like the
+    // cohort surface — NOT scoped_perm_fn. check_permission reads only global role
+    // grants; management-group-scoped grants live in a separate table consulted
+    // only by check_scoped_permission. So a scoped-only principal returns false
+    // here and never reaches this endpoint; the only callers who pass already hold
+    // unscoped fleet-wide Read and can compute every cohort/fleet aggregate AND
+    // pull any single device anyway. The group roll-up is a strict subset of that
+    // — no cross-operator exposure. Scoped operators are excluded by design (the
+    // cohort posture), not by an unfinished control.
+    sink.Get(
+        "/api/v1/dex/perf/group",
+        [perm_fn, app_perf_providers, app_pct_json](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!app_perf_providers.group) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            const std::string group_id =
+                req.has_param("group_id") ? req.get_param_value("group_id") : "";
+            if (group_id.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'group_id'", cid,
+                                          "supply ?group_id=<management group id>"),
+                    "application/json");
+                return;
+            }
+            if (group_id.size() > 256) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "parameter 'group_id' too long", cid),
+                                "application/json");
+                return;
+            }
+            const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+            if (app.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'app'", cid,
+                                          "supply ?app=<name>; discover names via GET "
+                                          "/api/v1/dex/perf/apps"),
+                    "application/json");
+                return;
+            }
+            if (app.size() > 512) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "parameter 'app' too long", cid),
+                                "application/json");
+                return;
+            }
+            const std::string version =
+                req.has_param("version") ? req.get_param_value("version") : "";
+            if (version.size() > 256) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "parameter 'version' too long", cid),
+                                "application/json");
+                return;
+            }
+            auto rows = app_perf_providers.group(group_id, app, version);
+            if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf group read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            JArr points;
+            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                JObj o;
+                o.add("version", pt.version)
+                    .add("day", pt.day)
+                    .add("device_count", pt.device_count)
+                    .add("suppressed", pt.suppressed);
+                if (!pt.suppressed) {
+                    o.add("cpu_mean", pt.cpu_mean)
+                        .add("cpu_max", pt.cpu_max)
+                        .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                        .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                        .add("ws_mean", pt.ws_mean)
+                        .add("ws_max", pt.ws_max)
+                        .raw("ws_p50", app_pct_json(pt.ws_p50))
+                        .raw("ws_p95", app_pct_json(pt.ws_p95))
+                        .add("hist_stale", pt.hist_stale);
+                }
+                points.add(std::move(o));
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("group_id", group_id)
+                                        .add("app", app)
+                                        .add("version", version)
+                                        .add("floor", static_cast<int64_t>(kDexCohortFloor))
+                                        .raw("points", points.str())
+                                        .str()),
+                            "application/json");
+        });
 
     // ── N1: network quality read model (/api/v1/network/*) ───────────────────
     //

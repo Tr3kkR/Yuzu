@@ -95,4 +95,25 @@ std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFle
     return out;
 }
 
+std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows,
+                                                    std::int64_t floor) {
+    std::vector<AppPerfTrendPoint> points = app_perf_fleet_trend(rows);
+    for (AppPerfTrendPoint& pt : points) {
+        if (pt.device_count < floor) {
+            // Sub-floor named-group slice → suppress stats, keep only the honest
+            // device_count (the cohort-floor rule, applied to the group axis).
+            pt.suppressed = true;
+            pt.cpu_mean = 0.0;
+            pt.cpu_max = 0.0;
+            pt.ws_mean = 0;
+            pt.ws_max = 0;
+            pt.cpu_p50.reset();
+            pt.cpu_p95.reset();
+            pt.ws_p50.reset();
+            pt.ws_p95.reset();
+        }
+    }
+    return points;
+}
+
 } // namespace yuzu::server

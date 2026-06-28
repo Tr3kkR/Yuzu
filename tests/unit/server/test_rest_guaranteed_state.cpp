@@ -20,6 +20,7 @@
  */
 
 #include "baseline_store.hpp"
+#include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
 #include "guaranteed_state_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
@@ -118,11 +119,17 @@ struct RestGsHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
+    // Slice-2 DEX app-perf read seams. Wired with present-but-empty doubles by
+    // default (so the audit/scope/render paths are reachable); left empty when
+    // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
+    yuzu::server::AppPerfProviders app_perf_providers_;
+
     // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
     // device-compliance route with an EMPTY ScopedPermFn, exercising its fail-closed-503
     // path. Both default true so every existing test is unchanged.
-    explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true)
+    explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
+                           bool wire_app_perf = true)
         : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")),
           wire_live_deps(live_deps) {
         fs::remove(db_path);
@@ -209,6 +216,32 @@ struct RestGsHarness {
             return audit_succeeds;
         };
 
+        // Present-but-empty app-perf doubles (reach the audit/scope/render paths
+        // without seeding rows). Left empty when wire_app_perf is false so a test
+        // can hit the provider-absent → 503 branch.
+        if (wire_app_perf) {
+            app_perf_providers_.fleet =
+                [](std::string_view, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+                return std::vector<yuzu::server::AppPerfFleetRow>{};
+            };
+            app_perf_providers_.apps =
+                [](bool& truncated) -> std::optional<std::vector<yuzu::server::AppPerfAppSummary>> {
+                truncated = false;
+                return std::vector<yuzu::server::AppPerfAppSummary>{};
+            };
+            app_perf_providers_.device =
+                [](std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfDailyRow>> {
+                return std::vector<yuzu::server::AppPerfDailyRow>{};
+            };
+            app_perf_providers_.group =
+                [](std::string_view, std::string_view, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+                return std::vector<yuzu::server::AppPerfFleetRow>{};
+            };
+        }
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/nullptr,
@@ -240,7 +273,9 @@ struct RestGsHarness {
                             /*lockout_clear_fn=*/{},
                             baseline_store.get(),
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
-                                             : RestApiV1::ScopedPermFn{});
+                                             : RestApiV1::ScopedPermFn{},
+                            /*software_inventory_store=*/nullptr,
+                            /*inventory_scope_fn=*/{}, app_perf_providers_);
     }
 
     ~RestGsHarness() {
@@ -1198,6 +1233,116 @@ TEST_CASE("REST dex/devices/{id}: success echoes X-Correlation-Id header",
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+}
+
+// ── Slice-2 DEX app-perf read surface: route-level control flow ──────────────
+// Model math (test_dex_app_perf_model.cpp) + the group SQL (test_app_perf_group_
+// reader.cpp) are covered separately; these pin the HANDLER control flow the
+// dex-perf family already tests — the gate, the provider-absent degrade, the
+// required-param 400s, and the security-relevant device audit-fail-closed.
+
+TEST_CASE("REST dex/perf/apps: provider absent → 503 + A4 correlation id",
+          "[rest][dex][app_perf][route]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/false);
+    auto res = h.sink.Get("/api/v1/dex/perf/apps");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+}
+
+TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; present → 200",
+          "[rest][dex][app_perf][route]") {
+    SECTION("missing required app → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/app");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, false);
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("present provider, valid app → 200 with the app echoed") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["app"].get<std::string>() == "chrome.exe");
+        CHECK(j["data"]["points"].is_array());
+    }
+}
+
+TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503; floor echoed",
+          "[rest][dex][app_perf][route]") {
+    SECTION("missing group_id → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/group?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("missing app → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, false);
+        auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("present provider → 200 with the floor echoed") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+    }
+}
+
+TEST_CASE("REST dex/devices/{id}/app-perf: audit failure → 503 + Sec-Audit-Failed, no rows",
+          "[rest][dex][device][app_perf][audit]") {
+    RestGsHarness h;
+    h.audit_succeeds = false; // the evidence row cannot persist
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/app-perf");
+    REQUIRE(res);
+    // FAIL-CLOSED: per-device behavioural data is not served without durable evidence.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    CHECK(res->body.find("\"rows\"") == std::string::npos); // no behavioural data leaked
+    bool saw_verb = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.app_perf.view" && a.target_id == "WS-1")
+            saw_verb = true;
+    CHECK(saw_verb); // the right verb was attempted (cross-surface SIEM parity)
+}
+
+TEST_CASE("REST dex/devices/{id}/app-perf: out-of-scope device → 403, scoped by the path id",
+          "[rest][dex][device][app_perf][scope]") {
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-9/app-perf");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_scoped_agent_id == "WS-9"); // scoped by the path device, not a default
+}
+
+TEST_CASE("REST dex/devices/{id}/app-perf: provider absent → 503 BEFORE audit",
+          "[rest][dex][device][app_perf][route]") {
+    RestGsHarness h(true, true, false); // app-perf seam unwired
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/app-perf");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // provider check precedes audit
 }
 
 TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dispatch, "

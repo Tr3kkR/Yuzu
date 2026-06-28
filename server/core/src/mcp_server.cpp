@@ -383,6 +383,22 @@ static const ToolDef kTools[] = {
      R"j("version":{"type":"string","maxLength":256,"description":"Canonicalized + matched exactly; omit for all versions"})j"
      R"j(},"required":["app"]})j"},
 
+    {"get_dex_group_app_perf",
+     "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
+     "trend aggregated over a single group's members (computed on-the-fly from the "
+     "per-device B1 store). One point per (version, UTC day) with exact group mean+max "
+     "+ bucket-resolution p50/p95 (same histogram scheme as the fleet trend). Because "
+     "a group is a set of specific devices, any point covering fewer than the floor "
+     "(10) devices is returned suppressed=true with device_count only "
+     "(means/percentiles withheld — a small named-group aggregate is de-facto "
+     "individual behaviour). Aggregate (no agent_id) — not audited. Mirrors GET "
+     "/api/v1/dex/perf/group. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","maxLength":256,"description":"Management group id"},)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":256,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j(},"required":["group_id","app"]})j"},
+
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
     {"get_network_fleet",
      "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
@@ -530,6 +546,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
     {"get_dex_app_perf", {"GuaranteedState", "Read"}},
+    {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
@@ -2588,7 +2605,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // above. Fleet aggregates (no agent_id) — generic mcp.<tool> audit only.
             // The shared app_perf_fleet_trend transform is reused so the MCP payload
             // matches the REST body field-for-field.
-            if (tool_name == "list_dex_perf_apps" || tool_name == "get_dex_app_perf") {
+            if (tool_name == "list_dex_perf_apps" || tool_name == "get_dex_app_perf" ||
+                tool_name == "get_dex_group_app_perf") {
                 const auto cid = yuzu::server::detail::make_correlation_id();
                 auto a4_data = [&](std::int64_t retry_ms, std::string_view remediation) {
                     JObj o;
@@ -2645,7 +2663,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     .add("versions", a.versions)
                                     .add("last_day", a.last_day));
                     payload = JObj().raw("apps", arr.str()).add("truncated", truncated).str();
-                } else { // get_dex_app_perf
+                } else if (tool_name == "get_dex_app_perf") {
                     if (!app_perf_providers.fleet) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
@@ -2707,6 +2725,92 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload = JObj()
                                   .add("app", app)
                                   .add("version", version)
+                                  .raw("points", points.str())
+                                  .str();
+                } else { // get_dex_group_app_perf
+                    if (!app_perf_providers.group) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("group_id") || !args["group_id"].is_string() ||
+                        args["group_id"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "missing required parameter 'group_id'",
+                                           a4_data(0, "supply group_id=<management group id>")),
+                            "application/json");
+                        return;
+                    }
+                    const auto group_id = args["group_id"].get<std::string>();
+                    if (group_id.size() > 256) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "parameter 'group_id' too long",
+                                           a4_data(0, "group_id must be <= 256 bytes")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("app") || !args["app"].is_string() ||
+                        args["app"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "missing required parameter 'app'",
+                                           a4_data(0, "supply app=<name>; discover names via "
+                                                      "list_dex_perf_apps")),
+                            "application/json");
+                        return;
+                    }
+                    const auto app = args["app"].get<std::string>();
+                    if (app.size() > 512) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "parameter 'app' too long",
+                                           a4_data(0, "app must be <= 512 bytes")),
+                            "application/json");
+                        return;
+                    }
+                    const auto version = param_str(args, "version");
+                    if (version.size() > 256) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "parameter 'version' too long",
+                                           a4_data(0, "version must be <= 256 bytes")),
+                            "application/json");
+                        return;
+                    }
+                    auto rows = app_perf_providers.group(group_id, app, version);
+                    if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf group read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr points;
+                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(o);
+                    }
+                    payload = JObj()
+                                  .add("group_id", group_id)
+                                  .add("app", app)
+                                  .add("version", version)
+                                  .add("floor", static_cast<int64_t>(kDexCohortFloor))
                                   .raw("points", points.str())
                                   .str();
                 }
