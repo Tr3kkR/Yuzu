@@ -34,8 +34,17 @@ const char* kAutoCss = R"CSS(<style>
 .af-note{color:#7f93ad;font-size:.72rem;margin:.2rem 0 .3rem}
 .af-rail{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem;padding-bottom:.55rem;border-bottom:1px solid #1a2c46}
 .af-rail-lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.04em;color:#7f93ad;margin-right:.2rem}
+.af-rail-keep{font-size:.62rem;color:#5d6f88;text-transform:none;letter-spacing:0}
 .af-run{background:#0c1626;border:1px solid #25395a;border-radius:.5rem;color:#cfe0f6;font-size:.72rem;padding:.22rem .55rem;cursor:pointer}
 .af-run:hover{border-color:#3d7ad6;background:#0f1f37}
+.af-cfg-hd{display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.78rem;font-weight:600;color:#9fb2cc;text-transform:uppercase;letter-spacing:.04em;padding:.2rem 0;user-select:none}
+.af-cfg-hd:hover{color:#cfe0f6}
+.af-cfg-hd .chev{font-size:.7rem;color:#7f93ad;transition:transform .12s}
+.af-cfg-hd.af-collapsed .chev{transform:rotate(-90deg)}
+#auto-cfg.af-hide{display:none}
+.af-bdg.p{color:#7fcf9a;border-color:#235a3a;background:#0e1f16}
+.af-dev .hn a{color:#dce7f4;text-decoration:none;border-bottom:1px dotted #3d7ad6}
+.af-dev .hn a:hover{color:#fff;border-bottom-color:#fff}
 /* results */
 .af-rhd{font-size:.74rem;color:#7f93ad;margin-bottom:.5rem}
 .af-rhd b{color:#dce7f4}
@@ -63,13 +72,14 @@ const char* kAutoCss = R"CSS(<style>
 .af-bdg.w{color:#e0b85a;border-color:#5a4a23;background:#1f1a0e}
 .af-bdg.u{color:#7f93ad;border-color:#33476b;background:#101f34}
 .af-bdg .v{opacity:.85;margin-left:.25rem}
-.af-allok{font-size:.7rem;color:#4ed27e}
 .af-empty{font-size:.74rem;color:#7f93ad;padding:.3rem .1rem;display:none}
 </style>)CSS";
 
-// Verdict → badge css class (passing checks are not rendered as badges).
+// Verdict → badge css class.
 const char* badge_class(preflight::Verdict v) {
     switch (v) {
+    case preflight::Verdict::kPass:
+        return "p";
     case preflight::Verdict::kFail:
         return "f";
     case preflight::Verdict::kWarn:
@@ -102,13 +112,21 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
 
     // Saved-runs rail (owner-scoped). Clicking loads that run into #auto-results.
     if (!recent.empty()) {
-        h += "<div class=\"af-rail\"><span class=\"af-rail-lbl\">Recent runs</span>";
+        h += "<div class=\"af-rail\"><span class=\"af-rail-lbl\">Recent runs"
+             "<span class=\"af-rail-keep\"> &middot; kept 14 days</span></span>";
         for (const auto& [run_id, label] : recent)
             h += "<button class=\"af-run\" hx-get=\"/fragments/auto/result?run=" + esc(run_id) +
                  "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" + esc(label) +
                  "</button>";
         h += "</div>";
     }
+
+    // Collapsible configuration. Inline onclick (CSP-safe; never hx-on) toggles
+    // #auto-cfg's visibility — hidden inputs still submit via the Run button's
+    // hx-include, so collapsing never drops the config.
+    h += "<div class=\"af-cfg-hd\" onclick=\"document.getElementById('auto-cfg')"
+         ".classList.toggle('af-hide');this.classList.toggle('af-collapsed')\">"
+         "<span class=\"chev\">&#9660;</span> Pre-flight configuration</div>";
 
     h += "<div id=\"auto-cfg\">";
     // Scope: name + group + OS filter + run window
@@ -296,19 +314,20 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
                 }
             h += "<div class=\"af-dev\" data-bucket=\"" + std::string(bucket_key(bk)) +
                  "\" data-fails=\"" + esc(fails) + "\">";
-            h += "<span class=\"hn\">" + esc(host) + "</span>";
+            // Device name links into the per-device view (/device?id=).
+            h += "<span class=\"hn\"><a href=\"/device?id=" + esc(d.agent_id) + "\">" + esc(host) +
+                 "</a></span>";
             h += "<span class=\"os\">" + esc(osline) + "</span><span class=\"badges\">";
-            if (d.bucket == Bucket::kPass) {
-                h += "<span class=\"af-allok\">\xE2\x9C\x93 all checks pass</span>";
-            } else {
-                for (const auto& ck : d.checks) {
-                    if (ck.verdict == Verdict::kPass)
-                        continue; // hide passing checks → signal only
-                    const std::string show =
-                        (ck.verdict == Verdict::kUnknown && ck.value.empty()) ? "\xE2\x80\x94" : ck.value;
-                    h += "<span class=\"af-bdg " + std::string(badge_class(ck.verdict)) + "\">" +
-                         esc(ck.label) + "<span class=\"v\">" + esc(show) + "</span></span>";
-                }
+            // Every check's status (pass = green), so the full per-device picture
+            // is visible, not just the problems.
+            for (const auto& ck : d.checks) {
+                const std::string show =
+                    (ck.verdict == Verdict::kUnknown && ck.value.empty()) ? "\xE2\x80\x94" : ck.value;
+                h += "<span class=\"af-bdg " + std::string(badge_class(ck.verdict)) + "\">" +
+                     esc(ck.label);
+                if (!show.empty())
+                    h += "<span class=\"v\">" + esc(show) + "</span>";
+                h += "</span>";
             }
             h += "</span></div>";
         }
