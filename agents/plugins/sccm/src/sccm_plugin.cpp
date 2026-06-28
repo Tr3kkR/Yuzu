@@ -28,6 +28,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "advapi32.lib")
 #endif
 
@@ -52,22 +53,28 @@ std::string run_command(const char* cmd) {
 }
 
 std::string read_registry_string(HKEY root, const char* subkey, const char* value) {
+    // Reg*W for UTF-8-correct values (#1662 / #1682); the SCCM version string is
+    // ASCII today, converted for consistency with the sibling inventory plugins.
+    // Widen the names BEFORE opening so the only operation between open and
+    // RegCloseKey is the non-allocating RegQueryValueExW; the allocating
+    // reg_sz_to_utf8 runs AFTER the handle is closed, so a std::bad_alloc cannot
+    // leak the HKEY (#1682 Gate-4 R1).
+    const std::wstring wsubkey = yuzu::win::to_wide(subkey);
+    const std::wstring wvalue = yuzu::win::to_wide(value);
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+    if (RegOpenKeyExW(root, wsubkey.c_str(), 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
         return {};
     }
-    char buf[256]{};
-    DWORD size = sizeof(buf);
-    DWORD type = 0;
-    std::string result;
-    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
-        ERROR_SUCCESS) {
-        if (type == REG_SZ && size > 0) {
-            result.assign(buf, size - 1);
-        }
+    wchar_t buf[512]{};
+    DWORD size = sizeof(buf); // size in BYTES; buf written as bytes, read back through
+    DWORD type = 0;           // its declared wchar_t lvalue (LPBYTE is alignment-1)
+    const LONG rc = RegQueryValueExW(hkey, wvalue.c_str(), nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size);
+    RegCloseKey(hkey); // closed before the allocating convert -- no leak window
+    if (rc == ERROR_SUCCESS && type == REG_SZ && size >= sizeof(wchar_t)) {
+        return yuzu::win::reg_sz_to_utf8(buf, size);
     }
-    RegCloseKey(hkey);
-    return result;
+    return {};
 }
 #endif
 

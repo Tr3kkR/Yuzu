@@ -55,6 +55,7 @@ struct SignalObservation {
     std::string reason;         ///< failure code, or "" when the type has none
     std::string symbolic;       ///< human name for reason, "" if not mapped
     std::string component;      ///< secondary entity (module/NIC/MAC), or ""
+    std::string version;        ///< the subject's file version "a.b.c.d" (crash/hang), "" if unknown
     double metric{0.0};         ///< numeric payload (boot ms); 0 = none
     std::uint32_t pid{0};       ///< process id where meaningful (crash/hang), else 0
     std::string kind;           ///< "exception" | "hang" | "signal" | "unit" | "" — crash/failure-family detail

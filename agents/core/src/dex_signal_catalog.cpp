@@ -1,5 +1,7 @@
 #include <yuzu/agent/dex_signal_catalog.hpp>
 
+#include <yuzu/version_string.hpp> // shared canon_version (perf/crash/server agree)
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -85,6 +87,13 @@ int parse_int(const std::string& s) {
     }
 }
 
+// canon_version (WER AppVersion -> the same 4-group quad procperf emits) is now
+// the shared yuzu::util::canon_version in <yuzu/version_string.hpp>, so the
+// agent crash/hang extractor, the agent perf collector, and the SERVER projection
+// boundary all normalize identically. Pulled into a header-only util to close the
+// arity mismatch (UP-2) and let the server re-canon untrusted agent input (UP-4).
+using yuzu::util::canon_version;
+
 double parse_metric_ms(const std::string& s) {
     if (s.empty()) return 0.0;
     try {
@@ -141,6 +150,12 @@ SignalObservation x_app_crash(const EventFields& f, int) {
     SignalObservation o;
     o.subject = named(f, "AppName");
     o.component = named(f, "ModuleName");
+    // The crashed APP's file version (event-1000 manifested field). WER reports
+    // the fixed quad — canon_version drops any "0.0.0.0" sentinel / odd suffix so
+    // it joins to procperf's (name, version). Deliberately AppVersion, NOT
+    // ModuleVersion: we attribute the crash to the application build, matching the
+    // perf identity. Empty for store/packaged apps (Teams, new Outlook) → "".
+    o.version = canon_version(named(f, "AppVersion"));
     o.kind = "exception";
     const std::uint32_t code = parse_hex_u32(named(f, "ExceptionCode"));
     o.reason = std::format("0x{:08X}", code);
@@ -161,6 +176,7 @@ SignalObservation x_app_hang(const EventFields& f, int) {
     SignalObservation o;
     // 1002 is classic-style: positional Data ([0]=program, [1]=version, [2]=pid hex).
     o.subject = named_or_pos(f, "AppName", 0);
+    o.version = canon_version(named_or_pos(f, "AppVersion", 1)); // [1] = the hung app's version
     o.pid = parse_hex_u32(named_or_pos(f, "ProcessId", 2));
     o.kind = "hang";
     o.symbolic = "NOT_RESPONDING";

@@ -327,6 +327,7 @@ DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear"
 DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
 DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
+DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)

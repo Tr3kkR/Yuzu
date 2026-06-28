@@ -133,6 +133,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
   ),
   include_directories: [
@@ -140,6 +141,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
+    include_directories('../agents/plugins/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
@@ -163,6 +165,7 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
+  tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -209,6 +212,7 @@ tar_test_exe = executable(
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
+    include_directories('../agents/plugins/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,

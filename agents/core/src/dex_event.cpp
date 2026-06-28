@@ -24,6 +24,8 @@ std::string signal_detail_json(const SignalObservation& o) {
         j["symbolic"] = o.symbolic;
     if (!o.component.empty())
         j["component"] = o.component;
+    if (!o.version.empty())
+        j["version"] = o.version; // the subject's file version → joins to procperf (name, version)
     if (o.metric > 0.0)
         j["metric"] = o.metric;
     if (o.pid != 0)
