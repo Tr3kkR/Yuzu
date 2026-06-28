@@ -47,8 +47,8 @@ const char* kAutoCss = R"CSS(<style>
 .af-cfg-hd.af-collapsed .chev{transform:rotate(-90deg)}
 #auto-cfg.af-hide{display:none}
 .af-bdg.p{color:#7fcf9a;border-color:#235a3a;background:#0e1f16}
-.af-dev .hn a{color:#dce7f4;text-decoration:none;border-bottom:1px dotted #3d7ad6}
-.af-dev .hn a:hover{color:#fff;border-bottom-color:#fff}
+.af-dev .hn a{color:#6ea8e6;text-decoration:none;border-bottom:1px solid rgba(110,168,230,.35)}
+.af-dev .hn a:hover{color:#9fc4f0;border-bottom-color:#9fc4f0}
 /* results */
 .af-rhd{font-size:.74rem;color:#7f93ad;margin-bottom:.5rem}
 .af-rhd b{color:#dce7f4}
@@ -60,6 +60,12 @@ const char* kAutoCss = R"CSS(<style>
 .af-pill.nogo{color:#e57373;border-color:#5a2323;background:#241010}
 .af-pill.inc{color:#8fb4ec;border-color:#33476b;background:#11243d}
 .af-pill.sel{outline:2px solid currentColor;outline-offset:1px}
+.af-verdict{display:inline-block;font-size:1.35rem;font-weight:800;letter-spacing:.07em;padding:.32rem 1.15rem;border-radius:.55rem;border:1px solid;margin-bottom:.75rem}
+.af-verdict .vsub{font-size:.74rem;font-weight:600;letter-spacing:.03em;opacity:.85;margin-left:.5rem}
+.af-v-go{color:#4ed27e;border-color:#235a3a;background:#10241a}
+.af-v-nogo{color:#e57373;border-color:#5a2323;background:#241010}
+.af-v-warn{color:#e0b85a;border-color:#5a4a23;background:#231d10}
+.af-v-wait{color:#8fb4ec;border-color:#33476b;background:#11243d}
 .af-chips{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem}
 .af-chips .lbl{font-size:.68rem;color:#7f93ad;margin-right:.1rem}
 .af-chip{font-size:.7rem;padding:.12rem .5rem;border-radius:.5rem;border:1px solid #5a2323;background:#1c0f0f;color:#e9a6a6;cursor:pointer;user-select:none}
@@ -116,9 +122,10 @@ std::string render_auto_rail(const std::vector<std::pair<std::string, std::strin
     } else {
         for (const auto& [run_id, label] : recent) {
             h += "<span class=\"af-run-wrap\">";
-            h += "<button class=\"af-run\" hx-get=\"/fragments/auto/result?run=" + esc(run_id) +
-                 "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" + esc(label) +
-                 "</button>";
+            h += "<button class=\"af-run\" onclick=\"pfCollapseCfg()\" "
+                 "hx-get=\"/fragments/auto/result?run=" +
+                 esc(run_id) + "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" +
+                 esc(label) + "</button>";
             // Confirm-guarded delete (hx-confirm → native confirm(), CSP-safe).
             h += "<button class=\"af-run-x\" title=\"Delete run\" "
                  "hx-post=\"/fragments/auto/delete?run=" +
@@ -211,13 +218,20 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
 
     h += "<div style=\"margin-top:.7rem\">"
          "<button class=\"gp-chip\" style=\"background:#3d7ad6;border-color:#3d7ad6;color:#fff;"
-         "font-weight:600;cursor:pointer\" "
+         "font-weight:600;cursor:pointer\" onclick=\"pfCollapseCfg()\" "
          "hx-post=\"/fragments/auto/run\" hx-include=\"#auto-cfg input, #auto-cfg select\" "
          "hx-target=\"#auto-results\" hx-swap=\"innerHTML\">Run pre-flight</button></div>";
 
     h += "<div id=\"auto-results\" style=\"margin-top:.9rem\">"
          "<div class=\"gp-placeholder\"><b>Configure and run</b>"
          "Results group by device as each one answers.</div></div>";
+
+    // CSP-safe helper: collapse the config so the results (verdict + pills) rise
+    // to the top. Called by Run and by each saved-run in the rail. Defined once
+    // with the page; persists on window for the standalone rail re-render.
+    h += "<script>window.pfCollapseCfg=function(){var c=document.getElementById('auto-cfg');"
+         "if(c)c.classList.add('af-hide');var t=document.querySelector('.af-cfg-hd');"
+         "if(t)t.classList.add('af-collapsed');};</script>";
     return h;
 }
 
@@ -269,6 +283,28 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
              "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\"";
     h += ">";
 
+    // Verdict hero — the go/no-go thesis. NO-GO is definitive the moment any
+    // device fails; while devices are still answering it reads CHECKING; only an
+    // all-answered, zero-fail cohort earns GO (amber GO when warnings remain).
+    const char* vcls = "af-v-go";
+    std::string vtxt = "GO";
+    std::string vsub = "all clear";
+    if (nogo > 0) {
+        vcls = "af-v-nogo";
+        vtxt = "NO-GO";
+        vsub = std::to_string(nogo) + (nogo == 1 ? " device failed" : " devices failed");
+    } else if (inc > 0) {
+        vcls = "af-v-wait";
+        vtxt = "CHECKING\xE2\x80\xA6";
+        vsub = std::to_string(go + warn) + " of " + std::to_string(total) + " answered";
+    } else if (warn > 0) {
+        vcls = "af-v-warn";
+        vtxt = "GO";
+        vsub = "with " + std::to_string(warn) + (warn == 1 ? " warning" : " warnings");
+    }
+    h += "<div class=\"af-verdict " + std::string(vcls) + "\">" + vtxt + "<span class=\"vsub\">" +
+         vsub + "</span></div>";
+
     h += "<div class=\"af-rhd\">Pre-flight &mdash; <b>" + esc(scope_label) + "</b>";
     if (!config_summary.empty())
         h += " &middot; " + esc(config_summary);
@@ -277,7 +313,7 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
     // Summary pills (clickable bucket filters; derived from `devices`).
     h += "<div class=\"af-pills\">";
     h += "<span class=\"af-pill tot\" data-b=\"all\" onclick=\"pfSetBucket('all')\">" +
-         std::to_string(total) + " devices</span>";
+         std::to_string(total) + (total == 1 ? " device" : " devices") + "</span>";
     h += "<span class=\"af-pill go\" data-b=\"go\" onclick=\"pfSetBucket('go')\">" +
          std::to_string(go) + " go-clean</span>";
     if (warn > 0)
