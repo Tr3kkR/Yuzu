@@ -149,6 +149,56 @@ app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows, std::int64_t floor);
 
+// ── Per-device drill (B1, audited PII) ────────────────────────────────────────
+//
+// The single-device companion to the fleet/group trend. Reads the SAME B1 daily
+// rows (`AppPerfDailyStore::get_agent_app_perf`) the audited per-device REST drill
+// serializes raw, but reduces them for the dashboard table. Two deliberate
+// differences from the fleet/group reductions: a single device has NO histogram
+// (its daily averages ARE the series, so no bucket-resolution percentiles) and NO
+// cohort floor (the per-device read is behind the `dex.device.app_perf.view` audit
+// gate — there is no aggregate that could single an operator out). REST stays raw
+// rows; this reduction is the dashboard consumer (no MCP twin — the device drill is
+// REST-only by design), but it lives here, pure + testable, so a future aggregated
+// device surface reuses it rather than re-deriving the numbers.
+
+/// One application VERSION on a single device, reduced across the retained window.
+/// The window aggregates are sample-weighted (so days with more 30 s samples weigh
+/// more); the maxima are plain maxima; `cpu_series` is the chronological daily
+/// `cpu_avg` — the "over time" sparkline.
+struct AppPerfDeviceVersion {
+    std::string version;            ///< canon version ("" = unknown)
+    std::int64_t latest_day{0};     ///< most recent day present for this version
+    std::int64_t day_count{0};      ///< distinct days this version appears in the window
+    std::int64_t instances_max{0};  ///< peak concurrent process count over the window
+    double cpu_avg{0.0};            ///< sample-weighted mean of daily cpu_avg over the window
+    double cpu_max{0.0};            ///< max daily cpu_max over the window
+    std::int64_t ws_avg{0};         ///< sample-weighted mean of daily ws_avg over the window
+    std::int64_t ws_max{0};         ///< max daily ws_max over the window
+    std::vector<double> cpu_series; ///< chronological daily cpu_avg — the sparkline
+};
+
+/// One application on a single device, grouping its versions. `peak_cpu_avg` is the
+/// max window `cpu_avg` across the app's versions — it ranks the app in the table
+/// (resource-significant first). `latest_day` is the most recent day across versions.
+struct AppPerfDeviceApp {
+    std::string app_name;
+    std::int64_t latest_day{0};
+    double peak_cpu_avg{0.0};
+    std::vector<AppPerfDeviceVersion> versions; ///< newest-day first
+};
+
+/// PURE: reduce ONE device's retained B1 daily rows (as returned by
+/// `AppPerfDailyStore::get_agent_app_perf`, ordered `(app_name, version, day)`) into
+/// per-app/per-version window summaries for the device drill. Window means are
+/// sample-weighted (`cpu_avg`/`ws_avg` weighted by `samples`); a window whose total
+/// sample count is zero falls back to an unweighted mean so a malformed-but-present
+/// row still shows an honest number rather than 0. Apps are ordered by peak window
+/// `cpu_avg` desc (tiebreak `app_name` asc); versions within an app are newest-day
+/// first. Robust to unsorted input (groups by key, sorts the series chronologically).
+[[nodiscard]] std::vector<AppPerfDeviceApp>
+app_perf_device_summaries(const std::vector<AppPerfDailyRow>& rows);
+
 // ── Provider seams (wired in server.cpp over the B1/B2 stores) ────────────────
 //
 // One bundle threaded once through the REST + MCP registrars covers the whole

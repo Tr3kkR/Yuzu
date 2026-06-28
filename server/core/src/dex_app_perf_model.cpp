@@ -213,4 +213,138 @@ std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFle
     return points;
 }
 
+namespace {
+
+// Per-(app, version) accumulator over a single device's daily rows. The parallel
+// `series` vector (index-aligned with the accumulator vector) collects (day,
+// cpu_avg) so the sparkline is sorted chronologically regardless of input order —
+// the same index-not-pointer discipline as app_perf_version_summaries.
+struct DeviceAcc {
+    std::string app;
+    std::string version;
+    std::int64_t latest_day{0};
+    std::int64_t day_count{0};
+    std::int64_t instances_max{0};
+    double cpu_max{0.0};
+    std::int64_t ws_max{0};
+    double cpu_weighted_sum{0.0}; ///< Σ cpu_avg·samples
+    double ws_weighted_sum{0.0};  ///< Σ ws_avg·samples
+    std::int64_t sample_sum{0};   ///< Σ samples (the weight denominator)
+    double cpu_plain_sum{0.0};    ///< Σ cpu_avg (zero-weight fallback numerator)
+    double ws_plain_sum{0.0};     ///< Σ ws_avg (zero-weight fallback numerator)
+    std::int64_t row_count{0};    ///< days seen (fallback denominator)
+};
+
+} // namespace
+
+std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPerfDailyRow>& rows) {
+    std::vector<DeviceAcc> accs;
+    std::vector<std::vector<std::pair<std::int64_t, double>>> series;
+
+    auto same_key = [](const DeviceAcc& a, const AppPerfDailyRow& r) {
+        return a.app == r.app_name && a.version == r.version;
+    };
+
+    for (const AppPerfDailyRow& r : rows) {
+        // Rows arrive grouped by (app, version) — the back() fast path hits; the
+        // linear scan is the order-robust fallback (defence-in-depth, never a dup).
+        std::size_t idx = accs.size();
+        if (!accs.empty() && same_key(accs.back(), r)) {
+            idx = accs.size() - 1;
+        } else {
+            for (std::size_t k = 0; k < accs.size(); ++k)
+                if (same_key(accs[k], r)) {
+                    idx = k;
+                    break;
+                }
+        }
+        if (idx == accs.size()) {
+            DeviceAcc fresh;
+            fresh.app = r.app_name;
+            fresh.version = r.version;
+            accs.push_back(std::move(fresh));
+            series.emplace_back();
+        }
+        DeviceAcc& a = accs[idx];
+        ++a.day_count;
+        ++a.row_count;
+        a.latest_day = (std::max)(a.latest_day, r.day);
+        a.instances_max = (std::max)(a.instances_max, r.instances_max);
+        a.cpu_max = (std::max)(a.cpu_max, r.cpu_max);
+        a.ws_max = (std::max)(a.ws_max, r.ws_max_bytes);
+        const std::int64_t w = r.samples > 0 ? r.samples : 0;
+        a.cpu_weighted_sum += r.cpu_avg * static_cast<double>(w);
+        a.ws_weighted_sum += static_cast<double>(r.ws_avg_bytes) * static_cast<double>(w);
+        a.sample_sum += w;
+        a.cpu_plain_sum += r.cpu_avg;
+        a.ws_plain_sum += static_cast<double>(r.ws_avg_bytes);
+        series[idx].emplace_back(r.day, r.cpu_avg);
+    }
+
+    // Reduce each accumulator to a version summary, group under its app (first-seen
+    // app order preserved here; the final sort re-orders by resource).
+    std::vector<AppPerfDeviceApp> apps;
+    for (std::size_t k = 0; k < accs.size(); ++k) {
+        const DeviceAcc& a = accs[k];
+        AppPerfDeviceVersion v;
+        v.version = a.version;
+        v.latest_day = a.latest_day;
+        v.day_count = a.day_count;
+        v.instances_max = a.instances_max;
+        v.cpu_max = a.cpu_max;
+        v.ws_max = a.ws_max;
+        if (a.sample_sum > 0) {
+            v.cpu_avg = a.cpu_weighted_sum / static_cast<double>(a.sample_sum);
+            v.ws_avg = static_cast<std::int64_t>(
+                std::llround(a.ws_weighted_sum / static_cast<double>(a.sample_sum)));
+        } else if (a.row_count > 0) {
+            // Zero total samples (malformed rows) — unweighted mean, never a divide.
+            v.cpu_avg = a.cpu_plain_sum / static_cast<double>(a.row_count);
+            v.ws_avg = static_cast<std::int64_t>(
+                std::llround(a.ws_plain_sum / static_cast<double>(a.row_count)));
+        }
+        auto pairs = series[k];
+        std::sort(pairs.begin(), pairs.end(),
+                  [](const auto& x, const auto& y) { return x.first < y.first; });
+        v.cpu_series.reserve(pairs.size());
+        for (const auto& [day, cpu] : pairs)
+            v.cpu_series.push_back(cpu);
+
+        std::size_t ai = apps.size();
+        if (!apps.empty() && apps.back().app_name == a.app) {
+            ai = apps.size() - 1;
+        } else {
+            for (std::size_t j = 0; j < apps.size(); ++j)
+                if (apps[j].app_name == a.app) {
+                    ai = j;
+                    break;
+                }
+        }
+        if (ai == apps.size()) {
+            AppPerfDeviceApp na;
+            na.app_name = a.app;
+            apps.push_back(std::move(na));
+        }
+        AppPerfDeviceApp& app = apps[ai];
+        app.latest_day = (std::max)(app.latest_day, v.latest_day);
+        app.peak_cpu_avg = (std::max)(app.peak_cpu_avg, v.cpu_avg);
+        app.versions.push_back(std::move(v));
+    }
+
+    for (auto& app : apps)
+        std::sort(app.versions.begin(), app.versions.end(),
+                  [](const AppPerfDeviceVersion& x, const AppPerfDeviceVersion& y) {
+                      if (x.latest_day != y.latest_day)
+                          return x.latest_day > y.latest_day; // newest day first
+                      return x.version < y.version;
+                  });
+    std::sort(apps.begin(), apps.end(),
+              [](const AppPerfDeviceApp& x, const AppPerfDeviceApp& y) {
+                  if (x.peak_cpu_avg != y.peak_cpu_avg)
+                      return x.peak_cpu_avg > y.peak_cpu_avg; // resource-significant first
+                  return x.app_name < y.app_name;
+              });
+    return apps;
+}
+
 } // namespace yuzu::server

@@ -12,6 +12,7 @@
  *    device_count==0); percentiles withheld + hist_stale on a wrong-scheme row;
  *    populated on a current-scheme row.
  */
+#include "app_perf_daily_store.hpp" // AppPerfDailyRow (device drill)
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_hist.hpp"
 #include "dex_app_perf_model.hpp"
@@ -351,4 +352,98 @@ TEST_CASE("app_perf_fleet_trend: a wrong-scheme row withholds percentiles", "[de
     CHECK_FALSE(trend[0].cpu_p50.has_value()); // percentiles withheld, not reinterpreted
     CHECK_FALSE(trend[0].cpu_p95.has_value());
     CHECK_FALSE(trend[0].ws_p50.has_value());
+}
+
+// ── Per-device drill: app_perf_device_summaries ───────────────────────────────
+
+namespace {
+AppPerfDailyRow daily(std::string app, std::string ver, std::int64_t day, std::int64_t samples,
+                      double cpu_avg, double cpu_max, std::int64_t ws_avg, std::int64_t ws_max,
+                      std::int64_t inst) {
+    AppPerfDailyRow r;
+    r.app_name = std::move(app);
+    r.version = std::move(ver);
+    r.day = day;
+    r.samples = samples;
+    r.instances_max = inst;
+    r.cpu_avg = cpu_avg;
+    r.cpu_max = cpu_max;
+    r.ws_avg_bytes = ws_avg;
+    r.ws_max_bytes = ws_max;
+    return r;
+}
+} // namespace
+
+TEST_CASE("app_perf_device_summaries: sample-weighted window means, maxima, chronological series",
+          "[dex][app_perf]") {
+    // chrome has two versions; 124 spans two days with DIFFERENT sample counts so
+    // the window mean must be sample-weighted, not a flat average of daily means.
+    std::vector<AppPerfDailyRow> rows = {
+        daily("chrome.exe", "124", 100, 10, 4.0, 9.0, 1000, 1400, 3),
+        daily("chrome.exe", "124", 200, 30, 6.0, 12.0, 1200, 1600, 4),
+        daily("chrome.exe", "125", 300, 5, 12.0, 31.0, 1800, 2400, 8),
+        daily("explorer.exe", "6.2", 300, 24, 1.2, 5.0, 240, 310, 1),
+    };
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 2);
+
+    // Ordered by peak window cpu_avg desc: chrome (peak 12.0) before explorer (1.2).
+    CHECK(apps[0].app_name == "chrome.exe");
+    CHECK(apps[1].app_name == "explorer.exe");
+
+    const auto& chrome = apps[0];
+    REQUIRE(chrome.versions.size() == 2);
+    // Versions newest-day first: 125 (day 300) before 124 (day 200).
+    CHECK(chrome.versions[0].version == "125");
+    CHECK(chrome.versions[1].version == "124");
+
+    const auto& v124 = chrome.versions[1];
+    CHECK(v124.day_count == 2);
+    CHECK(v124.latest_day == 200);
+    CHECK(v124.cpu_avg == 5.5);  // (4·10 + 6·30)/40 — sample-weighted, NOT (4+6)/2=5
+    CHECK(v124.cpu_max == 12.0); // window max of daily maxima
+    CHECK(v124.ws_avg == 1150);  // (1000·10 + 1200·30)/40
+    CHECK(v124.ws_max == 1600);
+    CHECK(v124.instances_max == 4);
+    REQUIRE(v124.cpu_series.size() == 2);
+    CHECK(v124.cpu_series[0] == 4.0); // chronological (older day first)
+    CHECK(v124.cpu_series[1] == 6.0);
+
+    CHECK(chrome.peak_cpu_avg == 12.0); // ranks the app
+}
+
+TEST_CASE("app_perf_device_summaries: zero total samples falls back to an unweighted mean",
+          "[dex][app_perf]") {
+    // Malformed rows (samples=0) must still show an honest number, never 0 from a
+    // divide-by-zero guard that drops the data.
+    std::vector<AppPerfDailyRow> rows = {
+        daily("app.exe", "1", 100, 0, 4.0, 8.0, 1000, 2000, 1),
+        daily("app.exe", "1", 200, 0, 6.0, 9.0, 3000, 4000, 1),
+    };
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 1);
+    REQUIRE(apps[0].versions.size() == 1);
+    CHECK(apps[0].versions[0].cpu_avg == 5.0); // (4+6)/2 unweighted fallback
+    CHECK(apps[0].versions[0].ws_avg == 2000); // (1000+3000)/2
+}
+
+TEST_CASE("app_perf_device_summaries: reversed input still groups + sorts the series",
+          "[dex][app_perf]") {
+    // Feed the newer day first (out of order): the reducer must still group by
+    // version and emit the sparkline ascending.
+    std::vector<AppPerfDailyRow> rows = {
+        daily("a.exe", "1", 200, 1, 6.0, 6.0, 0, 0, 1),
+        daily("a.exe", "1", 100, 1, 4.0, 4.0, 0, 0, 1),
+    };
+    auto apps = app_perf_device_summaries(rows);
+    REQUIRE(apps.size() == 1);
+    REQUIRE(apps[0].versions.size() == 1);
+    CHECK(apps[0].versions[0].latest_day == 200);
+    REQUIRE(apps[0].versions[0].cpu_series.size() == 2);
+    CHECK(apps[0].versions[0].cpu_series[0] == 4.0); // chronological despite reversed input
+    CHECK(apps[0].versions[0].cpu_series[1] == 6.0);
+}
+
+TEST_CASE("app_perf_device_summaries: empty input → empty", "[dex][app_perf]") {
+    CHECK(app_perf_device_summaries({}).empty());
 }
