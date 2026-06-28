@@ -192,6 +192,7 @@ tar_test_exe = executable(
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
+    'unit/test_app_perf_rollup_query.cpp',
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
@@ -214,6 +215,7 @@ tar_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
     include_directories('../agents/plugins/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
+    include_directories('../agents/core/src'),        # sync_source_app_perf.hpp — app_perf rollup-query integration test
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
