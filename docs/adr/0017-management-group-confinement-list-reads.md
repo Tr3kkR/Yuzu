@@ -186,9 +186,15 @@ a wiring PR that violates one is a blocking defect.
 - **INV-10 (SHOULD) — batched, not N+1.** Resolve the visible set in one query, not a per-row
   ancestor walk; the many-groups × deep-hierarchy case is a latency/DoS surface otherwise. Cap and
   measure group count.
-- **INV-11 (SHOULD) — hierarchy depth.** `get_ancestor_ids` is depth-capped (10). Document the
-  max-supported depth and warn when hit (a deeper agent is denied in-scope rows — fail-closed but
-  wrong), or make the walk unbounded with the visited-set cycle guard.
+- **INV-11 (SHOULD) — hierarchy depth.** `get_ancestor_ids` is depth-capped (10). Prefer
+  **cap-and-warn**: document the max-supported depth and surface a warning when hit (a deeper agent is
+  denied in-scope rows — fail-closed but wrong). Removing the cap is the weaker option (it trades the
+  bounded-recursion posture for an unbounded walk guarded only by the visited-set).
+- **INV-12 (SHOULD) — the visible set constrains every per-agent source.** Apply the visible set to
+  *every* per-agent data source feeding the response — secondary fetches, enrichment JOINs, and
+  counts — not just the primary table. A read that filters the primary `WHERE agent_id IN (set)` but
+  enriches via an unfiltered join or a secondary dispatch (cf. the process-tree dual-dispatch
+  `network_diag` join) leaks out-of-scope data through the side channel.
 
 ### In scope (per-agent list/fan-out reads)
 
@@ -230,15 +236,24 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   shipped: `docs/user-manual/tar.md:302` ("scoped to your management-group visibility"), the
   inventory/MCP "out-of-scope devices omitted" strings (`mcp_server.cpp:255/1436`,
   `mcp_server.hpp:96`, `rest_api_v1.cpp:3235`, `rest_api_v1.hpp:116/129`, `docs/user-manual/inventory.md:106/141`,
-  `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). ADR-0016 (`:175/181`) makes the same claim and,
+  `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). **Highest priority:**
+  `docs/enterprise-readiness-soc2-first-customer.md:170` makes an affirmative **CC6.1 / CAIQ**
+  tenant-isolation claim ("one operator cannot read another's device software… the affirmative answer
+  to the CAIQ confidentiality question for this surface") — the most compliance-load-bearing instance,
+  because it feeds a customer-facing CAIQ answer; revise to "designed for, not yet verified effective;
+  confirmed via #1713/#1676 UAT before reliance." ADR-0016 (`:175/181`) makes the same claim and,
   being immutable, receives an **Update note pointing here** rather than an in-place edit. Until the
   gate lands, these read as "global read; per-device confinement only" (PR #1711 already corrected
-  the response-reader strings).
+  the response-reader strings). **Timing:** these corrections are customer-facing and ship as the
+  ADR-0017 **companion PR** — before any customer is directed to those docs or a CAIQ is (re-)issued —
+  not deferred to the gate ladder. If the CAIQ containing the line-170 claim has already gone to a
+  prospect/customer, treat that as a BLOCKING retraction/caveat, not a routine doc fix.
 - **Fail-closed list-read gate (HIGH).** The dashboard `/fragments/results` table
   (`dashboard_routes.cpp:1317`) and the workflow executions-drawer reader (`workflow_routes.cpp:548/550`)
   gate on flat `perm_fn` with **no per-agent filter at all**, and the gate **fails OPEN** on a
-  corrupt/load-failed `rbac.db`: `require_permission` keys on `is_rbac_enabled()`
-  (`rbac_store.cpp:493`), which returns `rbac_enabled_` — defaulted `false` (`rbac_store.hpp:118`),
+  corrupt/load-failed `rbac.db`: `require_permission` (call site `auth_routes.cpp:301`) keys on
+  `is_rbac_enabled()` (def `rbac_store.cpp:493`), which returns `rbac_enabled_` — defaulted `false`
+  (`rbac_store.hpp:118`),
   set true only on a *successful* config load (`rbac_store.cpp:485`). A failed open leaves it `false`
   → the legacy fallback returns **true for any `Read`** (`auth_routes.cpp:329`) → full-fleet response
   disclosure to any authenticated principal. The root cause is the **gate primitive**, not these two
@@ -247,7 +262,11 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   scoped sibling) consult `rbac_enforcement_in_effect()` — closing the **entire** Read class at once,
   **behavior-neutral** for fresh installs (open db + enabled=false → `rbac_enforcement_in_effect` →
   false → legacy-allow preserved). This is independent of the gate-model decision and should ship at
-  HIGH severity.
+  HIGH severity, tracked as a numbered risk-register entry with a mitigating control (the
+  `rbac_enforcement_in_effect()` gate fix) and a target date. **Boundary:** the "nothing is leaking
+  today" safe-harbour above covers ONLY the inert-confinement class (no confined operators exist to be
+  under-restricted). It does **not** cover this fail-open, which discloses to *any* authenticated
+  principal the moment `rbac.db` fails to load — independent of whether confined operators exist.
 
 ## Consequences
 
@@ -301,13 +320,25 @@ ahead of PR-A.)
 
 Gate-independent, shippable now (not on this ladder): the doc corrections + the ADR-0016 Update note,
 and the fail-closed list-read gate (HIGH). Tracked separately: the global↔group combining-algorithm
-(deny-precedence) decision — its own issue, a prerequisite for PR-A.
+(deny-precedence) decision — a prerequisite for PR-A.
+
+**Change-management traceability (Workstream F):** each spawned item below needs a filed GitHub issue,
+cross-referenced here, before they are relied on as closed-loop evidence — in-prose deferral is not
+sufficient SOC 2 change-management evidence:
+
+- the global↔group combining-algorithm (deny-precedence) decision — PR-A prerequisite;
+- the doc-honesty companion PR (incl. `soc2-first-customer.md:170` / the CAIQ claim and the ADR-0016
+  Update note);
+- the fail-closed list-read gate (HIGH) with its target date.
 
 ## Governance
 
-Reviewed by the full Yuzu pipeline (Gate 2 security-guardian + docs-writer; Gate 3 architect; Gate 4
-consistency-auditor + unhappy-path) on commit `25a7f6d3`. No finding overturned World A. The original
-"deny-overrides preserved" / "not the RBAC model" framing (Gate-2 BLOCKING) was corrected here; the
-single-chokepoint shape, descendant-ward set-equivalence, the design invariants (INV-1..11), the
-audit-log classification, the data-shape out-of-scope caveat, and the reframed fail-closed list-read
-gate were all folded in from that round.
+Reviewed by the full Yuzu pipeline on commit `25a7f6d3` (Gate 2 security-guardian + docs-writer;
+Gate 3 architect; Gate 4 consistency-auditor + unhappy-path), with a Gate 8 re-review on the hardening
+round (`704fc77c`): security-guardian **PASS** (sec-H1/H2/M1 resolved, no Pattern-C regression),
+compliance-officer **PASS** with tracked conditions (the CAIQ-claim reconciliation, doc-honesty
+timing, the fail-open risk-register entry, and spawned-issue numbers above). No finding overturned
+World A. The original "deny-overrides preserved" / "not the RBAC model" framing (Gate-2 BLOCKING) was
+corrected; the single-chokepoint shape, descendant-ward set-equivalence, the design invariants
+(INV-1..12), the audit-log classification, the data-shape out-of-scope caveat, and the reframed
+fail-closed list-read gate were folded in.
