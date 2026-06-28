@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <sddl.h>   // ConvertSidToStringSidW (fallback)
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "advapi32.lib")
 #elif defined(__linux__)
 #include <dirent.h>
@@ -46,17 +47,10 @@ namespace {
 
 #ifdef _WIN32
 
-// Canonical wide_to_utf8 implementation — duplicated in other plugins for build isolation
-std::string wide_to_utf8(const wchar_t* wstr) {
-    if (!wstr || !*wstr)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string result(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, result.data(), len, nullptr, nullptr);
-    return result;
-}
+// wide_to_utf8 now delegates to the shared agents/shared/win_str.hpp helper
+// (#1681). The removed local copy used the same allocate-(len-1)/pass-len idiom
+// that drops the trailing NUL, matching yuzu::win::from_wide (null/empty -> {}).
+std::string wide_to_utf8(const wchar_t* wstr) { return yuzu::win::from_wide(wstr); }
 
 /// Try to get the full image path for a process. Falls back to empty string.
 std::string get_process_image_path(DWORD pid) {

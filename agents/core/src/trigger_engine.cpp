@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #else
 #include <cstdio>
 #endif
@@ -480,14 +481,10 @@ void TriggerEngine::registry_watch_loop() {
                 continue;
             }
 
-            // Convert key path to wide string
-            std::wstring wkey;
-            {
-                int len =
-                    MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(), -1, nullptr, 0);
-                wkey.resize(static_cast<size_t>(len));
-                MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(), -1, wkey.data(), len);
-            }
+            // Convert key path to wide via the shared helper (#1681). Only wkey.c_str()
+            // is consumed below, so the size difference vs the old -1 convert (which kept
+            // the trailing NUL in .size()) is immaterial here.
+            const std::wstring wkey = yuzu::win::to_wide(trigger.registry_key);
 
             HKEY opened = nullptr;
             if (RegOpenKeyExW(root, wkey.c_str(), 0, KEY_NOTIFY | KEY_READ, &opened) !=

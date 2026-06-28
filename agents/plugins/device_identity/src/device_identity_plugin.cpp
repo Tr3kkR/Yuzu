@@ -33,6 +33,7 @@
 #define SECURITY_WIN32
 #include <windows.h>
 #include <lm.h>       // NetGetJoinInformation, NetApiBufferFree
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <security.h> // GetComputerObjectNameA
 #endif
 
@@ -190,11 +191,7 @@ int do_domain(yuzu::CommandContext& ctx) {
     auto status = NetGetJoinInformation(nullptr, &name_buf, &join_status);
     if (status == NERR_Success && name_buf) {
         // Convert wide string to narrow
-        int len = WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, nullptr, 0, nullptr, nullptr);
-        std::string domain(len > 0 ? len - 1 : 0, '\0');
-        if (len > 0) {
-            WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, domain.data(), len, nullptr, nullptr);
-        }
+        std::string domain = yuzu::win::from_wide(name_buf); // (#1681) -1 convert, NUL dropped
         NetApiBufferFree(name_buf);
 
         ctx.write_output(std::format("domain|{}", domain.empty() ? "N/A" : domain));

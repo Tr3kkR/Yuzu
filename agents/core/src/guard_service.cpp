@@ -98,6 +98,8 @@ ServiceEmit service_classify_edge(ServiceGuard::Desired want, ServiceState got,
 #include <string>
 #include <utility> // std::pair (remediate() return)
 
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
+
 namespace yuzu::agent {
 namespace {
 
@@ -117,18 +119,10 @@ bool valid_service_name(const std::string& name) {
     return true;
 }
 
-std::wstring to_wide(const std::string& s) {
-    if (s.empty())
-        return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (len <= 0)
-        return {};
-    std::wstring w(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), len);
-    if (!w.empty() && w.back() == L'\0')
-        w.pop_back(); // drop the NUL the API appends
-    return w;
-}
+// to_wide now delegates to the shared agents/shared/win_str.hpp helper (#1681);
+// the removed local copy popped the trailing NUL the -1 convert appends, exactly
+// matching yuzu::win::to_wide's size-based (NUL-excluded) result.
+using yuzu::win::to_wide;
 
 // RAII owner for an SC_HANDLE (OpenSCManager / OpenService). Closes via
 // CloseServiceHandle — NOT CloseHandle, so guard_win_handle.hpp's ScopedWinHandle
