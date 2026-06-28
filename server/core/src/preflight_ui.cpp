@@ -60,12 +60,6 @@ const char* kAutoCss = R"CSS(<style>
 .af-pill.nogo{color:#e57373;border-color:#5a2323;background:#241010}
 .af-pill.inc{color:#8fb4ec;border-color:#33476b;background:#11243d}
 .af-pill.sel{outline:2px solid currentColor;outline-offset:1px}
-.af-verdict{display:inline-block;font-size:1.35rem;font-weight:800;letter-spacing:.07em;padding:.32rem 1.15rem;border-radius:.55rem;border:1px solid;margin-bottom:.75rem}
-.af-verdict .vsub{font-size:.74rem;font-weight:600;letter-spacing:.03em;opacity:.85;margin-left:.5rem}
-.af-v-go{color:#4ed27e;border-color:#235a3a;background:#10241a}
-.af-v-nogo{color:#e57373;border-color:#5a2323;background:#241010}
-.af-v-warn{color:#e0b85a;border-color:#5a4a23;background:#231d10}
-.af-v-wait{color:#8fb4ec;border-color:#33476b;background:#11243d}
 .af-chips{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem}
 .af-chips .lbl{font-size:.68rem;color:#7f93ad;margin-right:.1rem}
 .af-chip{font-size:.7rem;padding:.12rem .5rem;border-radius:.5rem;border:1px solid #5a2323;background:#1c0f0f;color:#e9a6a6;cursor:pointer;user-select:none}
@@ -282,28 +276,6 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
         h += " hx-get=\"" + esc(repoll_url) +
              "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\"";
     h += ">";
-
-    // Verdict hero — the go/no-go thesis. NO-GO is definitive the moment any
-    // device fails; while devices are still answering it reads CHECKING; only an
-    // all-answered, zero-fail cohort earns GO (amber GO when warnings remain).
-    const char* vcls = "af-v-go";
-    std::string vtxt = "GO";
-    std::string vsub = "all clear";
-    if (nogo > 0) {
-        vcls = "af-v-nogo";
-        vtxt = "NO-GO";
-        vsub = std::to_string(nogo) + (nogo == 1 ? " device failed" : " devices failed");
-    } else if (inc > 0) {
-        vcls = "af-v-wait";
-        vtxt = "CHECKING\xE2\x80\xA6";
-        vsub = std::to_string(go + warn) + " of " + std::to_string(total) + " answered";
-    } else if (warn > 0) {
-        vcls = "af-v-warn";
-        vtxt = "GO";
-        vsub = "with " + std::to_string(warn) + (warn == 1 ? " warning" : " warnings");
-    }
-    h += "<div class=\"af-verdict " + std::string(vcls) + "\">" + vtxt + "<span class=\"vsub\">" +
-         vsub + "</span></div>";
 
     h += "<div class=\"af-rhd\">Pre-flight &mdash; <b>" + esc(scope_label) + "</b>";
     if (!config_summary.empty())
