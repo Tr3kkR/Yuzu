@@ -3856,7 +3856,7 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 
 #### `GET /api/v1/dex/devices/{id}/app-perf`
 
-One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. REST-only — there is deliberately **no** MCP twin (MCP's set-and-proceed audit posture cannot express this fail-closed contract).
+One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. This endpoint also backs the `/device` dashboard DEX drill's *Application performance over time* panel (same `dex.device.app_perf.view` verb, dashboard set-and-proceed posture); there is deliberately **no** MCP twin (MCP's set-and-proceed audit posture cannot express this REST fail-closed contract).
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
@@ -5098,7 +5098,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
 | `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices) |
 
-All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is REST-only — there is deliberately no MCP twin (its fail-closed audit contract cannot be expressed on MCP). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
+All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

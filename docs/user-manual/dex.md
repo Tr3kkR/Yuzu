@@ -183,10 +183,13 @@ numbers match.
 
 > **Per-device history is behavioral data.** A device's signal history reveals
 > which applications a person runs. Access is gated on `GuaranteedState:Read`
-> and **every open is audit-logged** (`dex.device.view`). The same audit applies
-> to the agent-scoped REST query `GET /api/v1/guaranteed-state/events?agent_id=…`.
-> See the works-council / co-determination posture in
-> `docs/enterprise-readiness-soc2-first-customer.md`.
+> and **every open is audit-logged** (`dex.device.view` for the signal-history
+> view; the *Application performance over time* panel emits the distinct verb
+> `dex.device.app_perf.view`, and the live per-app query emits
+> `dex.device.procperf.query` — kept separate so usage-class reads stay
+> separately countable). The same audit applies to the agent-scoped REST query
+> `GET /api/v1/guaranteed-state/events?agent_id=…`. See the works-council /
+> co-determination posture in `docs/enterprise-readiness-soc2-first-customer.md`.
 
 ## Agentic access (REST)
 
