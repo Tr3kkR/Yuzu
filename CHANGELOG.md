@@ -185,7 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a global operator's filter is a no-op). Docs, the SOC 2 / CAIQ CC6.1 evidence, the capability map,
   and the relevant code comments are corrected to "designed, not yet verified — per-device
   confinement only"; ADR-0016 gains an appended Update note (immutable original preserved). The
-  responses surface (#1634 / #1718) is a separate ladder and is unchanged here. No behavior change.
+  responses surface logic fix is a separate ladder (#1634 / #1718 PR-B); its docs and code comments
+  are annotated here with the same caveat. No behavior change.
 - **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
   `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
   strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
