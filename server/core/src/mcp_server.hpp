@@ -79,7 +79,9 @@ public:
     /// view; the result then carries `result_truncated_by_cap:true` so the caller
     /// can detect it. Completeness for >cap collection is the keyset follow-up
     /// (#1634); the cross-operator ISOLATION guarantee (never another operator's
-    /// rows) holds regardless. NOTE: service-scoped tokens are scoped by the token
+    /// rows) holds regardless. NOTE (ADR-0017): this filter is INERT under the
+    /// global Response:Read gate (does not narrow by management group today); the
+    /// list-view correction is tracked #1718 PR-B. NOTE: service-scoped tokens are scoped by the token
     /// creator's RBAC, not the service tag (pre-existing, tracked in #1634).
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
@@ -87,7 +89,8 @@ public:
     /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
     /// bound to ("Inventory","Read"), so `query_installed_software` filters its
     /// fleet rows to the caller's management groups (INTENDED cross-operator
-    /// isolation, mirrors the #1550 query_responses fix). NOTE (ADR-0017): this
+    /// isolation, mirrors the #1550 query_responses filter — same inert-under-the-
+    /// global-gate class, NOT achieved isolation). NOTE (ADR-0017): this
     /// filter is INERT under the global Inventory:Read gate — a confined operator
     /// is denied at the gate before it runs, a global operator's filter is a no-op —
     /// so it does not yet narrow list reads; it is the foundation the ADR-0017

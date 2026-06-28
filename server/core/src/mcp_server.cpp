@@ -1299,6 +1299,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // out-of-scope agents may truncate the in-scope view (keyset follow-up
                 // #1634); the isolation guarantee — never another operator's rows —
                 // holds regardless, and result_truncated_by_cap signals the gap.
+                // NOTE (ADR-0017): like the inventory sibling, this responses filter is
+                // INERT under the global Response:Read gate (it does not narrow by
+                // management group today); the list-view correction is tracked #1718 PR-B.
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
                 if (response_scope_fn) {
@@ -1421,9 +1424,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // instruction_id), an empty-filter call here is an unbounded fleet-wide
                 // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                 // filter — so a narrow-scope operator may see few of their own rows in one
-                // page, signalled by result_truncated_by_cap. Cross-operator ISOLATION
-                // (never another operator's rows) holds regardless; completeness for a
-                // narrow scope over a wide fleet is the keyset follow-up (#1634).
+                // page, signalled by result_truncated_by_cap. NOTE (ADR-0017): the
+                // per-agent filter here is INERT under the global Inventory:Read gate, so
+                // it does not actually narrow by management group today — do not read
+                // "ISOLATION holds" as effective list-view confinement (that is the
+                // ADR-0017 admit-then-filter gate, #1716). Completeness for a narrow scope
+                // over a wide fleet is the keyset follow-up (#1634).
                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
                 // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat

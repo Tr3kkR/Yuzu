@@ -4832,7 +4832,7 @@ Render the TAR dashboard page. Requires an authenticated session (302 redirect t
 
 #### `GET /fragments/tar/retention-paused`
 
-Render an HTML table fragment of the calling operator's most-recent TAR retention scan, scoped to the operator's visible-agent set. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources."
+Render an HTML table fragment of the calling operator's most-recent TAR retention scan. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources." **Scope caveat (ADR-0017):** this list gates on the *global* `Infrastructure:Read` permission — management-group confinement of this list/fan-out view is **not yet effective** (a confined operator is denied at the global gate rather than shown a narrowed list); when RBAC is disabled the list is the full enrolled fleet. Per-device confinement remains genuine only on the per-device `reenable` endpoint below.
 
 **Permission:** `Infrastructure:Read`.
 
@@ -4846,9 +4846,9 @@ Dispatch a `tar.status` command to the operator's visible-agent set and record t
 
 **Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
 
-**Request:** no parameters. Scope is implicitly the operator's visible-agent set; the operator cannot widen scope through this endpoint.
+**Request:** no parameters. The dispatch gates on the *global* `Execution:Execute` permission; management-group confinement of the dispatch target is **not yet effective** (ADR-0017 — a confined operator is denied at the global gate, not narrowed). When RBAC is disabled, the target is the full enrolled fleet.
 
-**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder if the operator has zero visible agents in scope.
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder.
 
 **Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
 

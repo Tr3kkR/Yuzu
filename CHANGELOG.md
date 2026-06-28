@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET /api/v1/inventory/software` exposes the typed `SoftwareInventoryStore` over REST
   (gated on `Inventory:Read`), the agentic-first sibling of the `query_installed_software`
   MCP tool. Filter by `name` / `agent_id` (omit both for a fleet scan); `limit` capped at
-  1000 with `result_truncated_by_cap` when more rows exist. Results are management-group
-  scoped — out-of-scope devices are dropped and counted in `devices_omitted` (a positive
-  value means matching software exists outside your scope, **not** "absent fleet-wide"),
+  1000 with `result_truncated_by_cap` when more rows exist. A per-agent management-group
+  drop filter is applied — out-of-scope devices are dropped and counted in `devices_omitted`
+  (a positive value means matching software exists outside your scope, **not** "absent
+  fleet-wide") — but this confinement is **not yet verified effective** under the global
+  `Inventory:Read` gate (ADR-0017; see `docs/user-manual/inventory.md` §Scope),
   with a distinct scope-denied audit row. On store degradation it returns `503` (an A4
   error envelope), **never** an empty `200`, so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads). A
@@ -176,6 +178,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
+  `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
+  list carry a per-agent management-group drop filter that is **not yet effective** under the
+  *global* `Inventory:Read` / `Infrastructure:Read` gate (a confined operator is denied at the gate;
+  a global operator's filter is a no-op). Docs, the SOC 2 / CAIQ CC6.1 evidence, the capability map,
+  and the relevant code comments are corrected to "designed, not yet verified — per-device
+  confinement only"; ADR-0016 gains an appended Update note (immutable original preserved). The
+  responses surface (#1634 / #1718) is a separate ladder and is unchanged here. No behavior change.
 - **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
   `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
   strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
