@@ -5,7 +5,7 @@ owner: Nathan Dornbrook (platform)
 deciders: Nathan Dornbrook; issue #1714 (intent question)
 scope: server — authorization shape for list/fan-out reads of per-agent data under management-group confinement
 resolves: #1714
-builds-on: #1634 (response-reader ruling), PR #1711 (per-row filter foundation), #1550 (query_responses scoping), #1713/#1676 (inventory)
+context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundation), #1550 (query_responses scoping), #1713/#1676 (inventory)
 ---
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
@@ -16,15 +16,16 @@ Management groups confine an operator to a subset of the fleet. For **per-device
 works today: the route's admission check *is* `scoped_perm_fn_(req, res, "<securable>", "<op>", id)`
 (`device_routes.cpp:535`), which calls `RbacStore::check_scoped_permission`. That function admits a
 caller who holds the permission either **globally** (step 1, the global `check_permission`,
-`rbac_store.cpp:1115`) **or** via a management group containing `agent_id` (steps 3-5, consulting
-`ManagementGroupStore::get_group_roles` / the `management_group_roles` table, `rbac_store.cpp:1153-1180`).
-A single `agent_id` is available, so the scoped check can serve as the gate.
+`rbac_store.cpp:1115`) **or** via a management group containing `agent_id` (steps 3-5,
+`rbac_store.cpp:1122-1180`, consulting `ManagementGroupStore::get_group_roles` / the
+`management_group_roles` table). A single `agent_id` is available, so the scoped check can serve as
+the gate.
 
-For **list / fan-out** reads (responses, the device list, inventory, DEX/TAR list surfaces) there is
-no single `agent_id` to gate on. These routes instead gate on the **global** `require_permission` /
-`perm_fn` (e.g. `dashboard_routes.cpp:203`, `rest_api_v1.cpp:3479`, `mcp_server.cpp:1217`,
-`server.cpp:5307`) and then — where a filter exists at all — drop out-of-scope rows per-row with
-`check_scoped_permission(user, sec, op, agent_id)`.
+For **list / fan-out** reads (responses, the device list, inventory, audit-log, DEX/TAR list
+surfaces) there is no single `agent_id` to gate on. These routes instead gate on the **global**
+`require_permission` / `perm_fn` (e.g. `dashboard_routes.cpp:203`, `rest_api_v1.cpp:3479`,
+`mcp_server.cpp:1217`, `server.cpp:5307`) and then — where a filter exists at all — drop out-of-scope
+rows per-row with `check_scoped_permission(user, sec, op, agent_id)`.
 
 That shape is **inert**. UAT-proven (Windows, real server, `Operator@G1`-confined user `opA`,
 agent-1 ∈ G1; full reproduction in #1634 / `streamB-maintainer-finding`), grilled with 5 disproof
@@ -34,7 +35,7 @@ attempts, all failed:
   step 1 returns true for **every** agent → the per-row filter is a no-op → sees the whole fleet.
   *(UAT: admin saw agent-1 + agent-2.)*
 - **Confined operator** (`Operator@G1`): the global gate is `check_permission`, which consults only
-  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-944`)
+  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`)
   — **never** the management-group `GroupRoleAssignment`s. So the confined operator is **403'd at the
   gate** and never reaches the filter. *(UAT: opA → 403 on `/api/responses/*`, `/api/agents`,
   `/fragments/devices/list`.)*
@@ -43,15 +44,16 @@ There is **no** RBAC configuration where an operator passes the global list gate
 narrows. The per-row filters shipped for responses (#1634 / PR #1711) and `query_responses` (#1550)
 are correct-but-unreachable. The same applies to `ManagementGroupStore::get_visible_agents`
 (`management_group_store.cpp:628`): it narrows by **role-existence** (any role in the group,
-`principal_type='user'` only) rather than by the *specific* permission, and is itself unreachable for
-a confined operator / short-circuited for a global holder.
+`principal_type='user'` only, same-group join with **no hierarchy walk** — already inconsistent with
+`check_scoped_permission`'s ancestor-aware admit) rather than by the *specific* permission, and is
+itself unreachable for a confined operator / short-circuited for a global holder.
 
 This issue (#1714) is the intent question that gates that whole class of work: **is list-view
 management-group confinement actually intended?**
 
 - **World A — yes (latent gap):** a confined operator who holds `Response:Read` (or
-  `Infrastructure:Read`, `Execution:Execute`, `Inventory:Read`) via a management group should see, in
-  list/fan-out reads, only the agents inside those groups.
+  `Infrastructure:Read`, `Execution:Execute`, `Inventory:Read`, `AuditLog:Read`) via a management
+  group should see, in list/fan-out reads, only the agents inside those groups.
 - **World B — no:** operators hold **global** read; management groups confine **only per-device
   routes** and organize the fleet. The per-row filters are unnecessary.
 
@@ -72,62 +74,155 @@ response's `agent_id`"); the scoped-grant machinery (`Operator@G1` delegation, `
 `management_group_roles`) already exists and was built for confinement that cannot currently take
 effect; and the per-device `scoped_perm_fn` precedent *is* World A for the single-id case.
 
-### The blocker is the gate shape, not the RBAC model
+### What is missing: mostly the gate shape — plus one undecided model question
 
-`check_scoped_permission` (steps 3-5) **already expresses** per-agent management-group authorization.
-Two pieces are missing, and World A adds exactly these — it does **not** rewrite the RBAC model:
+`check_scoped_permission` (steps 3-5) **already expresses** per-agent management-group authorization
+at the single-`agent_id` granularity. World A is therefore *largely* a gate-shape change, not an RBAC
+rewrite. Two mechanical pieces are missing, and one semantic question is genuinely undecided:
 
 1. **A list-admit primitive.** "Does this user hold `<securable>:<op>` via *any* management group?"
    — because a list gate has no single `agent_id` to pass to `check_scoped_permission`. New
-   `RbacStore` method, e.g. `holds_permission_via_any_group(user, securable, op, mgmt_store)`,
-   mirroring steps 3-5 over the union of the user's reachable management groups (deny-overrides
-   preserved). Admit if global `check_permission` **or** this returns true.
-2. **A permission-specific visible set.** The per-row filter must narrow by the *specific*
-   permission, not by `get_visible_agents`' role-existence. PR #1711 already built the per-row
-   predicate (`check_scoped_permission(user, sec, op, agent_id)`); the list path reuses it, or a
-   batched `visible_agents_for_permission(user, sec, op)` equivalent.
+   `RbacStore` computation, e.g. `holds_permission_via_any_group(user, securable, op, mgmt_store)`,
+   mirroring steps 3-5 over the union of the user's reachable management groups.
+2. **A permission-specific visible set.** The per-row filter / batched narrowing must key on the
+   *specific* permission, not `get_visible_agents`' role-existence. **Direction is load-bearing:**
+   `check_scoped_permission` admits an agent via its group **or any ancestor** (downward
+   inheritance), so the inverted visible set must start from {groups where the user holds the
+   perm-role} and walk **descendant-ward** to members. Collect direct members only → under-disclose
+   vs the per-device gate; include ancestors' agents → over-disclose. PR-A must freeze the
+   set-equivalence invariant:
 
-### The admit-then-filter list gate
+   > `visible_agents_for_permission(u, s, o) == { a : check_scoped_permission(u, s, o, a) }`
 
-Every in-scope list/fan-out route adopts one shape:
+   asserted by a property test over a fixture group tree (stronger than re-running the UAT).
+3. **The combining algorithm across the global↔group boundary is UNDECIDED** (see next section). This
+   *is* a model-level question, so the "only the gate shape" framing is qualified: the gate shape
+   covers (1)+(2); the precedence lattice in (3) is a real model decision PR-A must freeze.
 
-1. **Admit** if the caller holds the permission globally **or** via any management group
-   (the new primitive). 403 only if neither.
-2. **Carry an `is_global` flag.** A global holder skips the per-row filter (correct full-fleet
-   read; no wasted work). A non-global (group-confined) caller runs the filter.
-3. **Filter** per row by the permission-specific scoped check, ancestor-aware, fail-closed on a
-   corrupt/unavailable `rbac.db` (the PR #1711 `rbac_enforcement_in_effect` posture).
-4. For **aggregates** (`aggregate_responses`), filter **before** aggregating — never aggregate the
-   full fleet and trim after.
+### Combining algorithm across the global↔group boundary (undecided — own issue)
 
-This is the product's first admit-then-filter list pattern; it is introduced **once** as a shared
-helper and applied **consistently**, never re-invented per route.
+Today a **global explicit-deny + a group allow ADMITS**: `check_permission` returns false on a global
+deny (`rbac_store.cpp:1014-1017`); `check_scoped_permission` step 1 short-circuits only on an *allow*
+(`:1115`), then falls through to steps 3-5, which read **only** `management_group_roles` — so the
+global deny is not consulted. The proposed `holds_permission_via_any_group` OR-gate inherits this
+exactly.
+
+This is **not self-evidently a bug.** A global-deny-made-absolute forecloses the "deny globally,
+re-grant per group" delegation idiom — a plausible *intended* use of `GroupRoleAssignment`, and the
+#1634 ruling reads **additive** (readability comes *from* the group grant). So the cross-boundary
+behavior may be a feature. The ADR does **not** prescribe deny-overrides; it records that the
+precedence lattice (does a global deny override a group allow? does a global allow — an `is_global`
+holder — override a group deny?) is **undecided and must be decided in its own issue**, then frozen
+in **one** shared implementation used by `holds_permission_via_any_group`, the batched visible-set,
+and `check_scoped_permission`, so list and per-device authz can never diverge. (Earlier drafts that
+said "deny-overrides preserved" were wrong: deny-overrides holds only *within* a group's assignments,
+not across the boundary.)
+
+### The admit-then-filter list gate — one chokepoint, three transports
+
+Rather than each route orchestrating two calls (admit + `is_global`) plus a filter — three things a
+route can wire wrong, exactly the per-route drift this pattern exists to avoid — the decision is a
+**single chokepoint returning a discriminated result**:
+
+```
+RbacStore::authorize_list_read(user, securable, op) -> DenyAll | AdmitAll | AdmitScoped(visible_set)
+```
+
+- **Placement is load-bearing.** The *computation* lives in `RbacStore` (it owns
+  `check_permission` / `check_scoped_permission` / the new primitives) because list surfaces span
+  **three transports** — REST (`AuthRoutes`), MCP (`mcp_server.cpp`), and dashboard fragments — and
+  only an `RbacStore`-level chokepoint is shared by all three. Each transport wraps it with its own
+  403 / audit envelope: `AuthRoutes::require_list_read` (REST, sibling to `require_scoped_permission`
+  and to the `rest_audit.hpp` #1647 chokepoint precedent), the MCP equivalent, the dashboard
+  equivalent.
+- `DenyAll` → 403 (REST) / empty (dashboard). `AdmitAll` → unfiltered read (global holder).
+  `AdmitScoped(set)` → the route reads **only** `set` (preferably pushed into SQL `WHERE agent_id IN
+  (...)`).
+- For **aggregates** (`aggregate_responses`) and **paginated** reads (#1550), the visible set MUST be
+  applied **in SQL before** the aggregate / `LIMIT` (see invariants). Post-fetch per-row filtering is
+  permitted **only** for bounded, unpaginated, unaggregated lists.
+- Honest caveat: a single chokepoint *reduces* but does not *eliminate* "forgot to apply" — the route
+  still applies the returned predicate to its own rows. The confined-operator UAT + the invariant
+  tests below are the regression guard.
+
+### Design invariants the implementation must satisfy
+
+Folded from the Gate-4 unhappy-path register. CRITICAL invariants are confidentiality-load-bearing;
+a wiring PR that violates one is a blocking defect.
+
+- **INV-1 (CRITICAL) — fail-closed is total.** `authorize_list_read` returns `DenyAll` (not
+  `AdmitAll`) on any `rbac.db` / mgmt-store error or `!is_open()`. The `AdmitAll` discriminant must
+  never be the error default. Key on `rbac_enforcement_in_effect()` (`rbac_store.cpp:511`), which
+  already fails closed on `!is_open()`.
+- **INV-2 (CRITICAL) — empty visible set ⇒ empty result.** `AdmitScoped({})` returns zero rows. A
+  query builder that omits the `WHERE agent_id IN ()` clause on an empty list (degrading to
+  unfiltered) is the canonical fail-open; tests must cover it.
+- **INV-3 (CRITICAL) — batched, before LIMIT/aggregate.** Any paginated or aggregated read applies
+  the visible set as `WHERE agent_id IN (...)` **before** the aggregate or `LIMIT`. COUNT/SUM/AVG and
+  GROUP BY values must be computed over the in-scope set only; LIMIT-before-filter (the #1550 known
+  issue) yields short/empty pages and silently drops in-scope rows for confined operators.
+- **INV-4 (CRITICAL) — descendant-ward expansion.** The batched visible set expands each
+  perm-holding group **to its descendants** (mirror of `check_scoped_permission`'s ancestor-ward
+  admit), so admit / batched / per-row agree. Pin the direction in code + test.
+- **INV-5 (CRITICAL) — partial failure drops, never includes.** A per-row or batch resolution error
+  (mgmt-store unavailable mid-read, ancestor lookup throws) drops the row or 503s the whole read —
+  never includes the row. Recommended posture: whole-read 503 for confidentiality.
+- **INV-6 (CRITICAL) — do not port the #1453 full-fleet fallback.** `get_visible_agents` returns
+  `all_member_agents()` (the whole fleet) when the RBAC probe reports disabled
+  (`management_group_store.cpp:638-639`). The new `visible_agents_for_permission` must NOT copy this;
+  it keys on `rbac_enforcement_in_effect()` and fails closed. PR-C deletes the role-existence narrower
+  and its full-fleet fallback rather than extending them.
+- **INV-7 (CRITICAL) — one resolver.** Admit, batched-set, and per-row are one shared resolver (the
+  discriminated chokepoint), guarded by a cross-check unit test (precedent: the H2/G9 schema↔handler
+  cross-check) so a later edit can't make admit say yes while the filter shows nothing.
+- **INV-8 (SHOULD) — cache invalidation tracks the graph.** Any visible-set / `is_global` cache
+  (the many-groups case will demand one) MUST invalidate on `management_group_members` /
+  `management_group_roles` / hierarchy mutations, not only RBAC writes (the existing `perm_cache_`
+  hook). Stale visibility = over-disclosure after a regrouping.
+- **INV-9 (SHOULD) — filter path is exercised and observable.** Most test principals are global, so
+  the `AdmitScoped` path can ship broken behind green tests. Mandate the `opA`-confined UAT *plus* a
+  unit assertion that `AdmitScoped` is returned for a confined caller, and emit a metric/log
+  distinguishing filtered vs unfiltered list reads.
+- **INV-10 (SHOULD) — batched, not N+1.** Resolve the visible set in one query, not a per-row
+  ancestor walk; the many-groups × deep-hierarchy case is a latency/DoS surface otherwise. Cap and
+  measure group count.
+- **INV-11 (SHOULD) — hierarchy depth.** `get_ancestor_ids` is depth-capped (10). Document the
+  max-supported depth and warn when hit (a deeper agent is denied in-scope rows — fail-closed but
+  wrong), or make the walk unbounded with the visited-set cycle guard.
 
 ### In scope (per-agent list/fan-out reads)
 
 The surface list below is **indicative**, sourced from the #1634 / `streamB-maintainer-finding`
-sweep — it is the decision's coverage map, not the authoritative wiring checklist. Each wiring PR
+sweep — it is the decision's coverage map, not the authoritative wiring checklist. The test for
+in-scope is **data-shape, not route-family**: *does a returned row carry `agent_id`?* Each wiring PR
 **re-enumerates exhaustively** within its surface (grep every `perm_fn` / `require_permission`
-list-read site) so a missed route does not silently inherit the old global gate.
+list-read site, apply the `agent_id` test) so a missed route does not silently inherit the old global
+gate.
 
 - **Responses** — `query_responses` (#1550), `aggregate_responses` (filter-before-aggregate),
   REST `/executions/{id}/visualization`, `/api/responses/{id}` (GET list) + `/export`, dashboard
   `/fragments/results` + the scan fragment, workflow execution-detail.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
-  `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892/8543`),
-  `get_visible_agents_json` (`server.cpp:3784`).
+  `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
+  `get_visible_agents_json` (`server.cpp:3784/8543`).
 - **Inventory** — `query_installed_software` (MCP, `mcp_server.cpp:1377`),
   `GET /api/v1/inventory/software` (`rest_api_v1.cpp:3026+`) — #1713 / #1676 (needs its own UAT to
   settle effective-vs-inert; the born-on-PG `SoftwareInventoryStore` path may differ).
-- **DEX / TAR list surfaces** — the `VisibleSetFn` seam (`server.cpp:8516`).
+- **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
+  confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
+  also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
+- **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
+  `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
 
 ### Out of scope (global by design)
 
 Config / settings / CA / auth / discovery-write / offload / notification routes operate on
-fleet-global or non-per-agent data and remain global-gated. They are not per-agent reads and World A
-does not touch them.
+fleet-global or non-per-agent data and remain global-gated. This list is itself subject to the same
+**data-shape re-enumeration**: a wiring PR must confirm each "out-of-scope" route really returns no
+`agent_id`-bearing rows before leaving it global — the asymmetry (indicative-in-scope but
+definitive-out-of-scope) is exactly how a per-agent reader hides forever (audit-log was such a case).
 
-### True in **either** world (do not block on this decision)
+### Ship-now, decision-independent fixes (either world)
 
 Two corrections are needed whether A or B is chosen and should ship independently of the gate work:
 
@@ -135,27 +230,39 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   shipped: `docs/user-manual/tar.md:302` ("scoped to your management-group visibility"), the
   inventory/MCP "out-of-scope devices omitted" strings (`mcp_server.cpp:255/1436`,
   `mcp_server.hpp:96`, `rest_api_v1.cpp:3235`, `rest_api_v1.hpp:116/129`, `docs/user-manual/inventory.md:106/141`,
-  `docs/adr/0016-…:175/181`, `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). Until the gate
-  lands, these must read as "global read; per-device confinement only" (PR #1711 already corrected
+  `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). ADR-0016 (`:175/181`) makes the same claim and,
+  being immutable, receives an **Update note pointing here** rather than an in-place edit. Until the
+  gate lands, these read as "global read; per-device confinement only" (PR #1711 already corrected
   the response-reader strings).
-- **UP-E fail-open fix (HIGH).** The deferred dashboard `/fragments/results` table
+- **Fail-closed list-read gate (HIGH).** The dashboard `/fragments/results` table
   (`dashboard_routes.cpp:1317`) and the workflow executions-drawer reader (`workflow_routes.cpp:548/550`)
-  gate on flat `perm_fn` with **no per-agent filter at all** → on a corrupt/load-failed `rbac.db`
-  they **fail OPEN** (full-fleet response disclosure to any authenticated principal). A focused
-  `rbac_enforcement_in_effect` fail-closed filter on those two readers is independent of the gate-
-  model decision and should ship at UP-1 severity.
+  gate on flat `perm_fn` with **no per-agent filter at all**, and the gate **fails OPEN** on a
+  corrupt/load-failed `rbac.db`: `require_permission` keys on `is_rbac_enabled()`
+  (`rbac_store.cpp:493`), which returns `rbac_enabled_` — defaulted `false` (`rbac_store.hpp:118`),
+  set true only on a *successful* config load (`rbac_store.cpp:485`). A failed open leaves it `false`
+  → the legacy fallback returns **true for any `Read`** (`auth_routes.cpp:329`) → full-fleet response
+  disclosure to any authenticated principal. The root cause is the **gate primitive**, not these two
+  readers: `require_permission` keys on `is_rbac_enabled()` while the per-row filter keys on
+  `rbac_enforcement_in_effect()` (fails closed). The fix is to make `require_permission` (and its
+  scoped sibling) consult `rbac_enforcement_in_effect()` — closing the **entire** Read class at once,
+  **behavior-neutral** for fresh installs (open db + enabled=false → `rbac_enforcement_in_effect` →
+  false → legacy-allow preserved). This is independent of the gate-model decision and should ship at
+  HIGH severity.
 
 ## Consequences
 
-- A new, named authorization pattern (admit-then-filter list gate) enters the codebase. Every
-  future list/fan-out read of per-agent data must use it, not a bare global `require_permission`.
-  This ADR is the contract those PRs build to.
+- A new, named authorization pattern (the admit-then-filter list gate, expressed as the
+  `authorize_list_read` discriminated chokepoint) enters the codebase. Every future list/fan-out read
+  of per-agent data must use it, not a bare global `require_permission`. This ADR is the contract
+  those PRs build to, and the design invariants above are its acceptance criteria.
 - The per-row filter foundation (PR #1711) and `query_responses` scoping (#1550) become **live**
-  rather than inert once the admit primitive is wired in; #1550's gate must be swapped to the
+  rather than inert once the chokepoint is wired in; #1550's gate must be swapped to the
   admit-then-filter shape (it has the filter, the wrong gate).
+- One shared deny-precedence implementation (once the combining-algorithm issue is decided) backs
+  list and per-device authz; a cross-check test pins admit/batched/per-row agreement (INV-7).
 - Each surface re-runs the `opA`-confined UAT reproduction to *prove* narrowing (a confined operator
   is admitted and sees only in-scope rows; a global holder still sees all; both fail closed on a
-  corrupt `rbac.db`).
+  corrupt `rbac.db`), plus the INV-9 filtered-path assertion.
 - Cross-operator authorization → every wiring PR runs the full governance pipeline with
   security-guardian + consistency-auditor + unhappy-path + chaos as load-bearing reviewers.
 
@@ -166,23 +273,41 @@ fleet." Rejected because it contradicts the #1634 ruling, strands the `GroupRole
 `Operator@G1` delegation machinery (built specifically for confinement), and is inconsistent with the
 per-device precedent. If World B were chosen the per-row filters would be deleted as dead weight and
 the scoped-grant UI removed — a larger product reduction than building the gate. The doc corrections
-above would still be required.
+and the fail-closed list-read gate above would still be required.
 
 ## Implementation ladder (separate governed PRs)
 
-Sequenced; each its own governance round + `opA`-confined UAT re-run.
+Sequenced; each its own governance round + `opA`-confined UAT re-run. (This ADR lands standalone,
+ahead of PR-A.)
 
-1. **PR-A — foundation.** This ADR + the list-admit primitive
-   (`holds_permission_via_any_group`) + the shared admit-then-filter helper (`{admit, is_global}`)
-   + the permission-specific visible-set fn + unit tests. **No route behavior change** (no call site
-   switched yet), so it lands safely ahead of the wiring.
+1. **PR-A — foundation.** The `authorize_list_read` chokepoint + `holds_permission_via_any_group`
+   admit computation + the permission-specific `visible_agents_for_permission` (descendant-ward) +
+   the transport wrappers (`require_list_read` etc.) + unit tests, including the **set-equivalence
+   property test** and the **INV-7 cross-check**. Freezes the combining-algorithm decision (see the
+   undecided-precedence issue) in one shared deny implementation. **No call site switched yet**, so
+   it lands ahead of the wiring — but it is *not* semantically empty: it commits the precedence
+   lattice and the visible-set semantics.
 2. **PR-B — responses.** Builds on PR #1711's per-row filter; swaps the global gate for the
-   admit-then-filter gate across the ~8 response readers; `aggregate_responses` filters before
-   aggregating; #1550's `query_responses` gate swapped.
+   chokepoint across the ~8 response readers; `aggregate_responses` filters **in SQL before**
+   aggregating (INV-3); #1550's `query_responses` gate swapped.
 3. **PR-C — device list.** `/api/agents`, `/fragments/devices/list`, the `get_visible_agents`
-   callers, `get_visible_agents_json`; replace role-existence narrowing with permission-specific.
+   callers, `get_visible_agents_json`; **delete** the role-existence narrower + its #1453 full-fleet
+   fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
+   + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` (#1713 /
    #1676), after the dedicated inventory UAT settles effective-vs-inert.
-5. **PR-E — DEX / TAR.** The `VisibleSetFn` seam + remaining dashboard fragments.
+5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
+   the `AuditLog:Read` surface.
 
-Gate-independent, shippable now (not on this ladder): the doc corrections and the UP-E fail-open fix.
+Gate-independent, shippable now (not on this ladder): the doc corrections + the ADR-0016 Update note,
+and the fail-closed list-read gate (HIGH). Tracked separately: the global↔group combining-algorithm
+(deny-precedence) decision — its own issue, a prerequisite for PR-A.
+
+## Governance
+
+Reviewed by the full Yuzu pipeline (Gate 2 security-guardian + docs-writer; Gate 3 architect; Gate 4
+consistency-auditor + unhappy-path) on commit `25a7f6d3`. No finding overturned World A. The original
+"deny-overrides preserved" / "not the RBAC model" framing (Gate-2 BLOCKING) was corrected here; the
+single-chokepoint shape, descendant-ward set-equivalence, the design invariants (INV-1..11), the
+audit-log classification, the data-shape out-of-scope caveat, and the reframed fail-closed list-read
+gate were all folded in from that round.
