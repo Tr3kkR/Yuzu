@@ -1,9 +1,9 @@
 # DEX Signal Catalogue
 
-The Guardian DEX observer collects **103 reliability / employee-experience
-signals** (wave 1: 20, wave 2: +50, wave 3: +33) from Windows endpoints as
-ruleless observations (`rule_id = "__observation__"`, `event_type` = the
-obs_type below). One catalogue-driven engine (`agents/core/src/dex_observer.cpp`)
+The Guardian DEX observer collects **110 reliability / employee-experience
+signals** (wave 1: 20, wave 2: +50, wave 3: +33, wave 4: +7) from Windows
+endpoints as ruleless observations (`rule_id = "__observation__"`, `event_type` =
+the obs_type below). One catalogue-driven engine (`agents/core/src/dex_observer.cpp`)
 arms one kernel-filtered `EvtSubscribe` per channel (22 channels); the signal
 set, field extraction, privacy minimisations, and per-type rate caps all live
 in `agents/core/src/dex_signal_catalog.cpp`. **Adding a signal is one catalogue
@@ -13,7 +13,7 @@ whatever types exist, and unknown types render with a raw-label fallback under
 "Other"). The dashboard groups the catalogue into 13 display groups; the
 server-side mirror is `dex_signal_groups()` in `dex_routes.cpp` — keep it in
 sync (the paired drift-net tests fail loudly if not). The server display
-catalogue totals **107** entries: the 103 Windows event-catalogue types **+
+catalogue totals **114** entries: the 110 Windows event-catalogue types **+
 `storage.low`** (one display entry, now emitted by all three platforms from
 separate sources — the macOS IOKit poll, the Windows state poll, and the Linux
 `/proc`+`statvfs` collector, see those sections below; it began macOS-only) **+
@@ -21,7 +21,7 @@ the three A3 `perf.*` sustained-breach types** (`perf.cpu_sustained`,
 `perf.memory_pressure`, `perf.disk_latency_high` — the "Performance" display
 family, Windows state poll + the Linux `/proc` poll for cpu_sustained &
 memory_pressure; disk_latency_high stays Windows-only, see below).
-The Windows *event* catalogue stays 103; the state-poll signals (`storage.low`,
+The Windows *event* catalogue is 110; the state-poll signals (`storage.low`,
 battery via `hw.error`, the `perf.*` breaches) ride alongside it without
 catalogue entries, exactly like the macOS and Linux poll mechanisms.
 
@@ -183,6 +183,37 @@ Task Scheduler (channel disabled by default), DCOM 10016 + WMI-Activity 5858
 (noise), app start-times / audio glitches / NCSI (need ETW collectors, not
 event IDs — collector-gated future work).
 
+## Wave 4 — +7 signals (2026-06-22), power-management + driver reliability
+
+Real-record-pinned from a live HP ZBook Firefly 14 G8 (Win11 26100). The driving
+case: a Wi-Fi adapter cycling D3 low-power thousands of times in a fortnight, a
+hundreds-per-month Modern-standby exit count, and unclean reboots the user
+recovered by holding the power button. DEX now **captures and surfaces** each of
+these as FACTS — it does not infer the root cause (that is the operator's job).
+
+| obs_type / change | Source | Extract | Notes / privacy |
+|---|---|---|---|
+| `os.power_loss` (enhanced, NOT new) | Kernel-Power 41 `PowerButtonTimestamp` | reason `power button` when the timestamp is non-zero (the button was pressed before the unclean reboot — the classic hold-to-recover-from-a-hard-hang), `power loss` when zero (sudden supply loss); `LongPowerButtonPressDetected=true` ⇒ the 4-second forced hold. bugcheck path unchanged. | **real** — pins the live record's `PowerButtonTimestamp=134266075744470540`, `BugcheckCode=0`. A factual discriminator, no inference. |
+| `os.modern_standby_exit` | Kernel-Power 507 | `metric` = **deep-idle (DRIPS) residency %** (`DripsResidencyInUs/DurationInUs`); `reason` = the provider's numeric exit Reason; sentence carries the standby duration. 0% means the platform never reached deep idle while "asleep". | **real** — `DripsResidencyInUs=0` of a 17.4 s standby ⇒ 0%. Fires every resume; the near-empty `os.standby`(300) path often doesn't fire on Modern-Standby boxes, so 507 fills a real gap rather than duplicating it. No PII. |
+| `network.adapter_driver_dump` | Netwtw10 **7025 only** (classic, positional) | `subject` = adapter (Data[1]), `component` = NDIS device (Data[0]), `reason` = `d3-dump`. | **real** — `Intel(R) Wi-Fi 6 AX201 160MHz` / `\Device\NDMP5`. **Vendor-coupled**: `Netwtw*` is the Intel Wi-Fi driver; the provider name tracks driver generation and the IDs are Intel-specific — there is no vendor-neutral event-log signal for D3 thrash (the generic version needs an ETW D-state collector, which the catalogue defers). 7026 is the paired completion record and co-fires, so only 7025 is catalogued (cataloguing both would double-count each incident, cf. the 6008/41 exclusion). A thrashing adapter storms past the cap; the overflow is dropped with the one-warn-per-hour log line (a count-preserving summary is deferred — see Rate caps). No PII. |
+| `hw.driver_load_failed` | Kernel-PnP 219 | `subject` = the driver basename (`FailureName`, e.g. `WUDFRd`), `component` = the device instance id (`DriverName`, kept — hardware identity, no user content), `reason` = decimal `Status` → hex NTSTATUS. | **real** — `\Driver\WUDFRd` / `0xC0000365`. **Distinct from `hw.device_start_failed` (PnP 411)** — a driver failing to *load* vs a device failing to *start*. |
+| `hw.battery_error` | Kernel-Power 521 | Emits ONLY when `ErrorBatteryCount` or `AbandonedBatteryCount` > 0; a benign battery-count change (all-zero) **self-suppresses** in the extractor (`SignalObservation::suppress` → `extract_signal` returns nullopt) so the type carries only real faults. `metric` = count of faulted batteries; `reason` = `error`/`abandoned`. | **real** (suppress path pinned from the healthy live record). Complements the state-poll wear signal (`hw.error` subject=`battery`, full-charge < 80% of design) — wear vs an error/abandoned state. |
+
+**Batch 2 — cheap additions on already-armed channels** (no new `EvtSubscribe`):
+
+| obs_type | Source | Extract | Notes / privacy |
+|---|---|---|---|
+| `service.unresponsive` | SCM 7011 | `subject` = service (`param2` — **params REVERSED** vs 7022, exactly like 7009), `reason` = the timeout ms. Runtime unresponsiveness (a service stopped answering a control), distinct from `service.hung` (7022 = hung on *starting*). | **real** — `param2="HPAudioAnalytics"`. NOT folded into `service.hung`: that extractor reads `param1` (which here is the timeout `30000`), so a fold would mis-extract the subject. |
+| `service.shutdown_failed` | SCM 7043 | `subject` = service (`param1`, normal SCM layout); a trailing `Binary` is skipped. | **real** — `param1="Windows Biometric Service"`. |
+| `network.adapter_reset` | Microsoft-Windows-NDIS 10317 | `subject` = `AdapterName`, `reason` = `MiniportEventEnum` (the provider's numeric event code, surfaced verbatim — no public text map). | **real** — `AdapterName="Microsoft Wi-Fi Direct Virtual Adapter #2"`. **Vendor-NEUTRAL**: NDIS is the generic networking layer, so it fires for **any** NIC — the generic complement to the Intel-specific `network.adapter_driver_dump`. *Caveat:* virtual adapters (Wi-Fi Direct / Hyper-V / VPN) also raise 10317 and can be noisier than physical NICs — `AdapterName` makes that visible and the rate cap bounds volume. No PII. |
+
+**The `suppress` primitive (new).** `SignalObservation::suppress` lets an extractor
+veto a matched event that empty/benign fields cannot confirm as a real signal —
+`extract_signal` returns `nullopt`, so it never emits. `hw.battery_error` is the
+first user (Kernel-Power 521 fires on every battery-count change, mostly benign);
+the catalogue's graceful-degradation test allows the listed suppressing types to
+return `nullopt` on empty fields rather than counting a non-event.
+
 ## Windows state poll (shipped 2026-06-12 — `dex_win_poll.cpp`)
 
 The event engine is blind to bad *states* the OS never logs: a volume filling
@@ -234,11 +265,24 @@ solved here.
 
 ## Rate caps
 
-Each obs_type carries `max_per_hour`; the engine counts per fixed hour-bucket
-and drops the overflow with ONE warn per (type, bucket). Storm-prone providers
-(WHEA corrected-error loops, failing disks issuing retry storms, Wi-Fi flaps)
-cannot flood the wire or the Guardian event store. Caps are deliberately
-generous for genuine incident rates.
+Each obs_type carries `max_per_hour`; the engine counts per fixed hour-bucket and
+emits at most `cap` events per (type, hour), dropping the overflow with ONE warn
+per (type, bucket). Storm-prone providers (WHEA corrected-error loops, failing
+disks issuing retry storms, Wi-Fi flaps, the wave-4 D3-dump thrash) cannot flood
+the wire or the Guardian event store. Caps are deliberately generous for genuine
+incident rates.
+
+Both the Windows observer and the Linux collector share the pure, every-CI-leg-
+tested `DexRateLimiter` (`dex_rate_limiter.{hpp,cpp}`) — the Windows observer no
+longer carries its own inline bucket. (The macOS collector's bespoke cap table is
+a tracked follow-up.)
+
+> A storm *summary* — surfacing the suppressed overflow count as one observation
+> rather than dropping it silently — was scoped and deliberately **deferred**: as
+> a same-obs_type row it aliased every obs_type-keyed consumer (blast-radius,
+> alert routing, the app/health aggregations). A correct re-design (a dedicated
+> reserved obs_type + a `yuzu_fleet_dex_rate_cap_*` metric) is tracked as its own
+> slice. Today the cap drops the overflow with the one-warn-per-hour log line.
 
 ## macOS collector (shipped — `dex_macos_collector.cpp`)
 

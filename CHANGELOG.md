@@ -291,6 +291,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX: wave-4 reliability signals — power, driver, and service health (Windows).**
+  Seven new signal types (Windows event catalogue 103→110, server display catalogue
+  107→114), all real-record-pinned from a live HP ZBook Firefly 14 G8:
+  `os.modern_standby_exit` (Kernel-Power 507 — deep-idle/DRIPS residency %; fires on
+  every resume, scores as benign by default), `network.adapter_driver_dump`
+  (Netwtw10 7025 — Intel Wi-Fi D3 dump; **vendor-coupled to Intel Wi-Fi**),
+  `hw.driver_load_failed` (Kernel-PnP 219 — driver failed to load; distinct from
+  device-start-fail 411), `hw.battery_error` (Kernel-Power 521 — faulted/abandoned
+  batteries only; benign battery-count changes self-suppress), `service.unresponsive`
+  (SCM 7011 — runtime control-timeout; params reversed vs 7022, so it is its own
+  type), `service.shutdown_failed` (SCM 7043 — unclean service shutdown), and
+  `network.adapter_reset` (NDIS 10317 — **vendor-neutral** NIC fatal/reset, the
+  generic complement to the Intel-specific dump). `os.power_loss` (Kernel-Power 41)
+  is **enhanced** (not new): `PowerButtonTimestamp` now discriminates a held power
+  button (hard-hang recovery / manual power-off) from a sudden supply loss. Adds a
+  `SignalObservation::suppress` primitive (an extractor can veto a matched benign
+  event). Full signal table in `docs/dex-signal-catalog.md` Wave 4.
+
+- **DEX: per-event observation detail panel.** Clicking any row in a device's DEX
+  signal history loads a detail panel showing every captured projection field for
+  that one event (subject, reason, symbolic name, component, metric, platform,
+  exact timestamp, event ID). Fields already in the store — no agent or wire change.
+  Per-device-scoped (`GuaranteedState:Read`), bound to the event's own device (a
+  foreign event ID returns an opaque 200 placeholder, indistinguishable from a
+  missing event), and audit-logged (`dex.observation.view`,
+  recording the obs_type for works-council countability).
+
+- **DEX: Applications lens (Apps tab).** A new top-level DEX tab ranks fleet
+  applications by reliability signals (crashes and hangs, keyed on the process
+  image), each row drilling to the existing per-app blast-radius view. Built on the
+  existing `dex_top_apps` aggregation — no new agent collection. The DEX sub-nav is
+  now **Overview · Apps · Catalogue · Health score · Trends · Performance · Network**.
+
 - **Guardian — name-anchored, device-applicable compliance REST.**
   New `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
   looks a Baseline up by **name** (a stable constant such as `ServiceNow Compliance`, not
