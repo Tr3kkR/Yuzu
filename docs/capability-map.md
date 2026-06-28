@@ -755,7 +755,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.4 Management-Group-Scoped Roles :white_check_mark: `T2`
 
-`ManagementGroupStore` supports group-scoped role assignments. `assign_role()` / `unassign_role()` bind principals to roles within a specific group. `get_visible_agents()` resolves which agents a user can see based on their group-scoped roles. REST endpoints at `/api/v1/management-groups/{id}/roles` (GET/POST/DELETE). RBAC integration filters agent lists to respect group-scoped visibility.
+`ManagementGroupStore` supports group-scoped role assignments. `assign_role()` / `unassign_role()` bind principals to roles within a specific group. `get_visible_agents()` resolves which agents a user can see based on their group-scoped roles. REST endpoints at `/api/v1/management-groups/{id}/roles` (GET/POST/DELETE). RBAC integration enforces group-scoped visibility on **per-device** routes today; confinement of **list/fan-out** reads (agent lists, responses, inventory) is **not yet effective** — see ADR-0017 (the admit-then-filter list gate).
 
 ### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 

@@ -3130,11 +3130,13 @@ void RestApiV1::register_routes(
     // two-segment /api/v1/inventory/{agent}/{plugin} regex.
     //
     // CONSISTENCY NOTE: the sibling generic routes share this securable (Inventory:Read)
-    // but are NOT management-group scoped (the #1676 cross-operator gap). This endpoint
-    // is the SCOPED reference shape they should converge to under #1676 — the fix
-    // direction is "scope the generics up to this bar", not "move this endpoint to a
-    // separate prefix". Until #1676 lands, mixed scoping under /inventory is a known,
-    // ticketed gap, not an oversight.
+    // but apply no per-agent filter at all. This endpoint carries the per-agent drop
+    // filter as a FOUNDATION — but per ADR-0017 the filter is INERT under the global
+    // Inventory:Read gate (a confined operator is denied at the gate before it runs; a
+    // global operator's filter is a no-op), so this endpoint is NOT yet a working
+    // scoped reference. The convergence target is the ADR-0017 admit-then-filter list
+    // gate (#1716), not this endpoint as-is. Until then, list-view management-group
+    // confinement under /inventory is not effective — a known, ticketed gap.
     // Agentic-first A1: a fleet software dashboard + a /device drill-down section
     // (planned follow-ons) sit on this same data + scope contract.
     //
@@ -3230,9 +3232,11 @@ void RestApiV1::register_routes(
                  // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
                  // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                  // filter, so a narrow-scope operator may see few of their own rows in one page
-                 // (signalled by result_truncated_by_cap); cross-operator ISOLATION holds
-                 // regardless. Narrow-scope completeness over a wide fleet is the keyset
-                 // follow-up (#1634).
+                 // (signalled by result_truncated_by_cap). NOTE (ADR-0017): the per-agent filter
+                 // here is INERT under the global Inventory:Read gate, so it does not actually
+                 // narrow by management group today — do not read "ISOLATION holds" as effective
+                 // list-view confinement (that is the ADR-0017 gate, #1716). Narrow-scope
+                 // completeness over a wide fleet is the keyset follow-up (#1634).
                  const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
                  // Management-group scope filter (mirrors the MCP tool / query_responses #1550).

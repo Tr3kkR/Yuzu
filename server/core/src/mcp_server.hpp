@@ -86,8 +86,12 @@ public:
 
     /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
     /// bound to ("Inventory","Read"), so `query_installed_software` filters its
-    /// fleet rows to the caller's management groups (cross-operator isolation,
-    /// mirrors the #1550 query_responses fix). Same fail-open-when-unwired
+    /// fleet rows to the caller's management groups (INTENDED cross-operator
+    /// isolation, mirrors the #1550 query_responses fix). NOTE (ADR-0017): this
+    /// filter is INERT under the global Inventory:Read gate — a confined operator
+    /// is denied at the gate before it runs, a global operator's filter is a no-op —
+    /// so it does not yet narrow list reads; it is the foundation the ADR-0017
+    /// admit-then-filter list gate builds on (#1716). Same fail-open-when-unwired
     /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
     /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
     /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,

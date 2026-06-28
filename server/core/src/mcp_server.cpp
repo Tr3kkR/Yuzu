@@ -242,7 +242,9 @@ static const ToolDef kTools[] = {
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
      "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
      "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
-     "follow-up). Results are scoped to your management groups — out-of-scope devices are omitted.",
+     "follow-up). A per-agent management-group drop filter is applied (devices_omitted reports the "
+     "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
+     "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
      R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j"},
 
     {"get_tags", "Get all tags for a specific agent.",

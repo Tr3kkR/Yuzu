@@ -111,9 +111,11 @@ public:
     /// out-of-scope devices (the fleet query returns many agents). Mirrors the MCP
     /// query_installed_software scope fn exactly (server.cpp wires the SAME
     /// check_scoped_permission chokepoint). Empty/default `{}` = no filter
-    /// (legacy-open, matching the MCP default + require_scoped_permission) —
-    /// production MUST wire it from server.cpp or a fleet read leaks one operator's
-    /// devices' software to another (#1676 cross-operator IDOR class).
+    /// (legacy-open, matching the MCP default + require_scoped_permission).
+    /// NOTE (ADR-0017): wiring this does NOT close the #1676 cross-operator gap —
+    /// the filter is INERT under the global Inventory:Read gate (a confined operator
+    /// is denied at the gate before it runs; a global operator's filter is a no-op).
+    /// It is the foundation the ADR-0017 admit-then-filter list gate builds on (#1716).
     using InventoryScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
