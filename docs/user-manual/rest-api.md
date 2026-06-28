@@ -3833,7 +3833,7 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
-- **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale}` (see the percentile/suppression note above; a suppressed point carries `device_count` only with stats cleared). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
+- **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
 
 #### `GET /api/v1/dex/perf/group`
 
@@ -3860,8 +3860,8 @@ One device's retained per-`(app, version, day)` performance history (B1) — the
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
-- **Query parameter:** `app` — optional filter; ≤ 512 bytes, no control characters. Omitted = every resource-significant app-version on the device.
-- **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `400` on an invalid `app`; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
+- **Query parameter:** `app` — optional display filter applied **in memory** to the device's returned rows (not a bound query parameter — the device's retained rows are fetched by `agent_id`, then narrowed by `app`), so there is no length/charset gate or `400` on it. Omitted = every resource-significant app-version on the device.
+- **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
 - **Headers:** `X-Correlation-Id` echoed on every response path.
 - **Audit:** emits `dex.device.app_perf.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the PII is served — kept a separate verb from `dex.device.view` / `dex.device.procperf.query` so usage-class reads stay separately countable for works-council evidence. Fail-closed as above.
 

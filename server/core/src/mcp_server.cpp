@@ -380,7 +380,7 @@ static const ToolDef kTools[] = {
      "not audited. Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
-     R"j("version":{"type":"string","maxLength":256,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
      R"j(},"required":["app"]})j"},
 
     {"get_dex_group_app_perf",
@@ -394,9 +394,9 @@ static const ToolDef kTools[] = {
      "individual behaviour). Aggregate (no agent_id) — not audited. Mirrors GET "
      "/api/v1/dex/perf/group. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","maxLength":256,"description":"Management group id"},)j"
+     R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
-     R"j("version":{"type":"string","maxLength":256,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
      R"j(},"required":["group_id","app"]})j"},
 
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
@@ -2708,19 +2708,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     JArr points;
                     for (const auto& pt : app_perf_fleet_trend(*rows)) {
-                        points.add(JObj()
-                                       .add("version", pt.version)
-                                       .add("day", pt.day)
-                                       .add("device_count", pt.device_count)
-                                       .add("cpu_mean", pt.cpu_mean)
-                                       .add("cpu_max", pt.cpu_max)
-                                       .raw("cpu_p50", app_pct_json(pt.cpu_p50))
-                                       .raw("cpu_p95", app_pct_json(pt.cpu_p95))
-                                       .add("ws_mean", pt.ws_mean)
-                                       .add("ws_max", pt.ws_max)
-                                       .raw("ws_p50", app_pct_json(pt.ws_p50))
-                                       .raw("ws_p95", app_pct_json(pt.ws_p95))
-                                       .add("hist_stale", pt.hist_stale));
+                        // Fleet floors now too — emit suppressed + gate stats, same
+                        // shape as get_dex_group_app_perf (a suppressed point must not
+                        // read as "N devices @ 0% CPU").
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(std::move(o));
                     }
                     payload = JObj()
                                   .add("app", app)

@@ -89,7 +89,11 @@ AppPerfGroupReader::AppPerfGroupReader(pg::PgPool& pool) : pool_(pool) {
         AppPerfRollup::build_hist_array_sql("ws_avg_bytes", fmt_literals(app_perf_ws_buckets()));
     select_prefix_ =
         "SELECT $2::text AS app_name, version, day, COUNT(*), SUM(cpu_avg), MAX(cpu_avg), "
-        "SUM(ws_avg_bytes)::bigint, MAX(ws_avg_bytes), " +
+        // Saturating SUM, mirroring AppPerfRollup (sibling parity): a forged
+        // near-INT64_MAX ws across a huge group would otherwise overflow the
+        // ::bigint cast and degrade the whole group read to nullopt. cpu_sum is
+        // DOUBLE (saturates to Inf, isfinite-guarded on read), so no LEAST there.
+        "LEAST(SUM(ws_avg_bytes), 9223372036854775807)::bigint, MAX(ws_avg_bytes), " +
         cpu_hist + ", " + ws_hist + ", " + std::to_string(kAppPerfHistVersion) +
         " FROM app_perf_daily_store.app_perf_daily "
         "WHERE agent_id = ANY($1::text[]) AND app_name = $2";

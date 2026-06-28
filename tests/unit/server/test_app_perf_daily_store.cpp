@@ -48,6 +48,21 @@ TEST_CASE("canon_merge_daily merges canon-collisions sample-weighted", "[app_per
     CHECK(m[0].ws_max_bytes == 400);
 }
 
+TEST_CASE("canon_merge_daily clamps cpu>100% and ws>1PiB (UP-1 per-row defense)",
+          "[app_perf][merge]") {
+    constexpr std::int64_t kPiB = std::int64_t{1} << 50; // the ws ceiling
+    std::vector<AppPerfDailyRow> rows = {
+        {.app_name = "x", .version = "1.0", .day = 86400, .samples = 1, .instances_max = 1,
+         .cpu_avg = 1.0e9, .cpu_max = 1.0e9,
+         .ws_avg_bytes = 9223372036854775807LL, .ws_max_bytes = 9223372036854775807LL}};
+    auto m = canon_merge_daily(std::move(rows));
+    REQUIRE(m.size() == 1);
+    CHECK(m[0].cpu_avg == 100.0); // share-of-capacity percent ceiling
+    CHECK(m[0].cpu_max == 100.0);
+    CHECK(m[0].ws_avg_bytes == kPiB); // 1 PiB — keeps the rollup SUM(ws) from overflowing
+    CHECK(m[0].ws_max_bytes == kPiB);
+}
+
 TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

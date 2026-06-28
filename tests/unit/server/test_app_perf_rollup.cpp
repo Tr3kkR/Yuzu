@@ -11,9 +11,13 @@
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_rollup.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <cmath>
@@ -123,6 +127,37 @@ TEST_CASE("AppPerfRollup B1->B2 roll-up", "[pg][app_perf]") {
         auto empty = b2.get_app_fleet_perf("", "");
         REQUIRE(empty.has_value());
         CHECK(empty->empty());
+    }
+
+    SECTION("rollup saturates a >INT64_MAX ws sum instead of aborting the day (UP-1)") {
+        // Two devices with near-INT64_MAX working set on the same (app,version,day):
+        // their SUM(ws) exceeds INT64_MAX. Inserted RAW (bypassing the per-row clamp)
+        // to exercise the rollup's LEAST(SUM, INT64_MAX) backstop — the day must still
+        // roll (COMMAND_OK, not a 22003 abort) and ws_sum saturates to INT64_MAX
+        // rather than poisoning the WHOLE fleet-day.
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            const char* ins = "INSERT INTO app_perf_daily_store.app_perf_daily "
+                              "(agent_id, app_name, version, day, samples, instances_max, "
+                              " cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes, updated_at) "
+                              "VALUES ($1,'big.exe','1.0',$2,1,1,1.0,1.0,$3,$3,0)";
+            for (const char* ag : {"d1", "d2"}) {
+                auto r = yuzu::server::pg::exec_params(
+                    lease.get(), ins,
+                    std::vector<std::string>{ag, std::to_string(day),
+                                             std::string("5000000000000000000")}); // 5e18
+                REQUIRE(r.status() == PGRES_COMMAND_OK);
+            }
+        }
+        REQUIRE(rollup.roll_day(day)); // must NOT abort on the bigint-overflow cast
+        // Query all-versions ("") — the raw-inserted version "1.0" is stored verbatim,
+        // and the all-versions read applies no canon filter.
+        auto rows = b2.get_app_fleet_perf("big.exe", "");
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].device_count == 2);
+        CHECK((*rows)[0].ws_sum == std::int64_t{9223372036854775807}); // saturated, not aborted
     }
 
     SECTION("prune deletes day < before_day, keeps day == before_day") {
