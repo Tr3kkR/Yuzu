@@ -1,33 +1,48 @@
 /// @file preflight_routes.cpp
-/// `/auto` page shell + config / run / result-poll fragments. See
-/// preflight_routes.hpp for the auth/scope contract. Run dispatches the configured
-/// checks to the operator-visible devices in the chosen group; the result poll
-/// applies the operator's thresholds (preflight_parse.hpp `evaluate`) to the raw
-/// facts and aggregates pass/fail BY CHECK (self-repolling until terminal).
+/// `/auto` page shell + config/rail fragment + run creation + result poll. See
+/// preflight_routes.hpp for the auth/scope contract.
+///
+/// Slice 2: a run is PERSISTED (PreflightRunStore). POST /run freezes the cohort
+/// (devices_fn(user) ∩ group ∩ os), creates the run, does the FIRST dispatch
+/// (per-check execution_id `preflight-<run>-<key>`), and renders live. The
+/// background PreflightRunner re-dispatches to reconnecting stragglers + persists
+/// the grid until the window closes. The result route renders a RUNNING run live
+/// (collect + compute) and a COMPLETE run from the stored grid; reads are
+/// OWNER-SCOPED (created_by) so one operator can't open another's run.
 
 #include "preflight_routes.hpp"
 
-#include "preflight_parse.hpp" // kPreflightChecks, extract_cell, evaluate, PreflightConfig
-#include "web_utils.hpp"       // html_escape
+#include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
+#include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token
+#include "preflight_run_store.hpp"  // PreflightRunStore + rows
+#include "web_utils.hpp"            // html_escape
+
+#include <yuzu/server/auth.hpp> // auth::AuthManager (run-id bytes)
 
 #include <algorithm>
-#include <array>
 #include <cctype>
+#include <chrono>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-// Defined in guardian_page_ui.cpp — the shared dark-theme full-page shell. Declared
-// at GLOBAL scope (not inside yuzu::server) to match the definition's linkage, the
-// same way device_routes.cpp does it.
+// Defined in guardian_page_ui.cpp — the shared dark-theme full-page shell.
+// Declared at GLOBAL scope (not inside yuzu::server) to match the definition.
 extern const char* const kGuardianDetailPageHtml;
 
 namespace yuzu::server {
 
 namespace {
+
+// Page-poll cap: ~5 min at the 700ms cadence. After this the page stops polling
+// but the run continues SERVER-SIDE (the runner owns the window) — reopen from
+// the rail to refresh. Bounds an open tab; doesn't bound the run.
+constexpr int kPollCap = 430;
+// Window bounds (minutes): 1 minute … 2 days.
+constexpr int kMinWindowMin = 1;
+constexpr int kMaxWindowMin = 2880;
 
 std::string url_encode(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
@@ -62,8 +77,12 @@ std::string param(const httplib::Request& req, const char* key) {
     return req.has_param(key) ? req.get_param_value(key) : std::string{};
 }
 
-// Read the operator's config from the request (POST form on run, query on poll —
-// httplib merges both into get_param_value).
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 preflight::PreflightConfig config_from_req(const httplib::Request& req) {
     preflight::PreflightConfig c;
     c.app_name = param(req, "app_name");
@@ -77,24 +96,8 @@ preflight::PreflightConfig config_from_req(const httplib::Request& req) {
     return c;
 }
 
-// A check runs only when configured: `app` needs a target name; the rest always.
-bool check_applicable(std::string_view key, const preflight::PreflightConfig& cfg) {
-    if (key == "app")
-        return !cfg.app_name.empty();
-    return true;
-}
-
-std::unordered_map<std::string, std::string> dispatch_params(std::string_view key,
-                                                             const preflight::PreflightConfig& cfg) {
-    if (key == "app")
-        return {{"name", cfg.app_name}};
-    if (key == "disk" && !cfg.volume.empty())
-        return {{"path", cfg.volume}};
-    return {};
-}
-
-// One-check threshold phrase; prefixed so it reads standalone in the config-summary
-// line ("AcmeVPN ≥ 4.2.0 ≤ 4.9.99 · OS ≥ 10.0.19045 · arch x86_64 · …").
+// One-check threshold phrase; prefixed so it reads standalone in the
+// config-summary line ("AcmeVPN ≥ 4.2.0 ≤ 4.9.99 · OS ≥ 10.0.19045 · …").
 std::string threshold_text(std::string_view key, const preflight::PreflightConfig& cfg) {
     if (key == "app") {
         std::string s = cfg.app_name;
@@ -118,11 +121,10 @@ std::string threshold_text(std::string_view key, const preflight::PreflightConfi
     return {};
 }
 
-// The one-line threshold recap shown above the result grid (applicable checks only).
 std::string config_summary(const preflight::PreflightConfig& cfg) {
     std::string s;
     for (const auto& c : preflight::kPreflightChecks) {
-        if (!check_applicable(c.key, cfg))
+        if (!preflight::check_applicable(c.key, cfg))
             continue;
         if (!s.empty())
             s += " \xC2\xB7 ";
@@ -131,70 +133,9 @@ std::string config_summary(const preflight::PreflightConfig& cfg) {
     return s;
 }
 
-// One in-flight check + its per-agent (status,output). Empty byAgent (initial
-// render) → every device reads Unknown.
-struct ActiveCheck {
-    std::string key;
-    std::string label;
-    std::unordered_map<std::string, std::pair<int, std::string>> byAgent;
-};
-
-// Build the canonical per-device result set. Sets `any_pending` if any
-// device×check still lacks a terminal response (drives the self-repoll). The
-// bucket is preflight::classify_device over the device's verdicts.
-std::vector<PreflightDeviceResult> build_results(const std::vector<DeviceRow>& targets,
-                                                 const std::vector<ActiveCheck>& active,
-                                                 const preflight::PreflightConfig& cfg,
-                                                 bool& any_pending) {
-    std::vector<PreflightDeviceResult> out;
-    out.reserve(targets.size());
-    for (const auto& d : targets) {
-        PreflightDeviceResult dr;
-        dr.agent_id = d.agent_id;
-        dr.hostname = d.hostname;
-        dr.os = d.os;
-        std::vector<preflight::Verdict> verdicts;
-        verdicts.reserve(active.size());
-        for (const auto& ac : active) {
-            PreflightDeviceCheck ck;
-            ck.key = ac.key;
-            ck.label = ac.label;
-            bool terminal = false;
-            auto it = ac.byAgent.find(d.agent_id);
-            if (it != ac.byAgent.end()) {
-                const int status = it->second.first;
-                const std::string& outp = it->second.second;
-                if (!outp.empty()) {
-                    terminal = true;
-                    if (outp.rfind("error|", 0) == 0) {
-                        ck.value = "error";
-                    } else {
-                        ck.verdict = preflight::evaluate(ac.key, outp, cfg);
-                        if (auto disp = preflight::extract_cell(ac.key, outp))
-                            ck.value = *disp;
-                    }
-                } else if (status >= 2) {
-                    terminal = true;
-                    ck.value = "error";
-                } else if (status == 1) {
-                    terminal = true; // success, no output → no fact
-                    ck.value = "\xE2\x80\x94";
-                }
-            }
-            if (!terminal)
-                any_pending = true;
-            verdicts.push_back(ck.verdict);
-            dr.checks.push_back(std::move(ck));
-        }
-        dr.bucket = preflight::classify_device(verdicts);
-        out.push_back(std::move(dr));
-    }
-    return out;
-}
-
-// Operator-visible devices in `group_id` (empty → all visible), then narrowed by
-// OS family (`os_filter` empty/"any" → no OS narrowing). IDOR-safe: the visible
-// set is always devices_fn(username) ∩ group, never a raw fleet read.
+// Operator-visible devices in `group_id` (empty → all visible), narrowed by OS
+// family (empty/"any" → no OS narrowing). IDOR-safe: always devices_fn(user) ∩
+// group, never a raw fleet read.
 std::vector<DeviceRow> resolve_targets(const PreflightRoutes::DevicesFn& devices_fn,
                                        const PreflightRoutes::GroupMembersFn& members_fn,
                                        const std::string& username, const std::string& group_id,
@@ -221,36 +162,25 @@ std::vector<DeviceRow> resolve_targets(const PreflightRoutes::DevicesFn& devices
     return out;
 }
 
-std::string scope_label(const PreflightRoutes::GroupsFn& groups_fn, const std::string& group_id) {
-    if (group_id.empty())
-        return "all visible devices";
-    if (groups_fn)
-        for (const auto& [id, name] : groups_fn())
-            if (id == group_id)
-                return name;
-    return group_id;
-}
-
-// Append the operator's config (thresholds + params) to a result-poll URL. The
-// result handler re-reads these to evaluate verdicts, so EVERY poll URL — the
-// initial one and every repoll — must carry them, or the first poll would score
-// against an empty config.
-void append_config_params(std::string& url, const httplib::Request& req) {
-    static const char* kCfg[] = {"app_name", "app_min", "app_max", "os_min",    "arch",
-                                 "min_gib",  "volume",  "reboot",  "os_filter", "window"};
-    for (const char* k : kCfg)
-        url += "&" + std::string(k) + "=" + url_encode(param(req, k));
-}
-
-// Append config + the cmd_<key> command ids (for repoll, where both come off the
-// previous poll's query string).
-void append_run_params(std::string& url, const httplib::Request& req) {
-    append_config_params(url, req);
-    for (const auto& c : preflight::kPreflightChecks) {
-        const std::string p = std::string("cmd_") + c.key;
-        if (req.has_param(p))
-            url += "&" + p + "=" + url_encode(req.get_param_value(p));
+std::string scope_label(const PreflightRoutes::GroupsFn& groups_fn, const std::string& group_id,
+                        const std::string& os_filter) {
+    std::string base;
+    if (group_id.empty()) {
+        base = "all visible devices";
+    } else {
+        base = group_id;
+        if (groups_fn)
+            for (const auto& [id, name] : groups_fn())
+                if (id == group_id)
+                    base = name;
     }
+    if (!os_filter.empty() && os_filter != "any")
+        base += " \xC2\xB7 " + os_filter;
+    return base;
+}
+
+std::string gen_run_id() {
+    return auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 }
 
 } // namespace
@@ -258,15 +188,17 @@ void append_run_params(std::string& url, const httplib::Request& req) {
 void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                       DevicesFn devices_fn, GroupsFn groups_fn,
                                       GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
-                                      ResponsesAllFn responses_all_fn, AuditFn audit_fn) {
+                                      CollectFn collect_fn, AuditFn audit_fn,
+                                      PreflightRunStore* run_store) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
     groups_fn_ = std::move(groups_fn);
     group_members_fn_ = std::move(group_members_fn);
     dispatch_fn_ = std::move(dispatch_fn);
-    responses_all_fn_ = std::move(responses_all_fn);
+    collect_fn_ = std::move(collect_fn);
     audit_fn_ = std::move(audit_fn);
+    run_store_ = run_store;
 
     // ── Page shell — auth-only chrome ────────────────────────────────────────
     svr.Get("/auto", [this](const httplib::Request& req, httplib::Response& res) {
@@ -279,7 +211,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                         "text/html; charset=utf-8");
     });
 
-    // ── Config fragment ──────────────────────────────────────────────────────
+    // ── Config + saved-runs rail ─────────────────────────────────────────────
     svr.Get("/fragments/auto", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
@@ -292,10 +224,21 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
         std::vector<std::pair<std::string, std::string>> groups;
         if (groups_fn_)
             groups = groups_fn_();
-        res.set_content(render_auto_config(groups), "text/html; charset=utf-8");
+        // Owner-scoped recent runs for the rail (created_by = viewer).
+        std::vector<std::pair<std::string, std::string>> recent;
+        if (run_store_) {
+            for (const auto& r : run_store_->list_runs(session->username, /*is_admin=*/false, 12)) {
+                std::string label = r.name.empty() ? std::string("Pre-flight") : r.name;
+                label += " \xC2\xB7 " + std::to_string(r.go) + "go/" + std::to_string(r.nogo) + "no-go";
+                if (r.status == "running")
+                    label += " \xC2\xB7 running";
+                recent.emplace_back(r.run_id, label);
+            }
+        }
+        res.set_content(render_auto_config(groups, recent), "text/html; charset=utf-8");
     });
 
-    // ── Run — dispatch the configured checks to the visible cohort ────────────
+    // ── Run — freeze cohort, create run, first dispatch, render live ─────────
     svr.Post("/fragments/auto/run", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
@@ -305,70 +248,13 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
         }
         if (!perm_fn_ || !perm_fn_(req, res, "Execution", "Execute"))
             return;
+        if (!run_store_ || !run_store_->is_open()) {
+            res.set_content(render_auto_note("Pre-flight run store is unavailable on this server."),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (!dispatch_fn_) {
             res.set_content(render_auto_note("Live dispatch is unavailable on this server."),
-                            "text/html; charset=utf-8");
-            return;
-        }
-        const auto cfg = config_from_req(req);
-        const std::string group_id = param(req, "group");
-        const std::string os_filter = param(req, "os_filter");
-        auto targets =
-            resolve_targets(devices_fn_, group_members_fn_, session->username, group_id, os_filter);
-        if (targets.empty()) {
-            res.set_content(render_auto_note("No visible devices in that scope."),
-                            "text/html; charset=utf-8");
-            return;
-        }
-        std::vector<std::string> agent_ids;
-        agent_ids.reserve(targets.size());
-        for (const auto& d : targets)
-            agent_ids.push_back(d.agent_id);
-
-        // Dispatch each APPLICABLE check (explicit agent_ids, no scope_expr, untracked
-        // exec) and thread the command_ids + the config into the result-poll URL.
-        std::string poll = "/fragments/auto/result?group=" + url_encode(group_id) + "&n=1";
-        int dispatched = 0;
-        for (const auto& c : preflight::kPreflightChecks) {
-            if (!check_applicable(c.key, cfg))
-                continue;
-            auto [cmd, reached] = dispatch_fn_(c.plugin, c.action, agent_ids, "", dispatch_params(c.key, cfg));
-            (void)reached;
-            poll += "&cmd_" + std::string(c.key) + "=" + url_encode(cmd);
-            ++dispatched;
-        }
-        append_config_params(poll, req); // first poll must carry the thresholds too
-        if (audit_fn_)
-            audit_fn_(req, "preflight.run", "success", "Scope",
-                      group_id.empty() ? std::string("all-visible") : group_id,
-                      "checks=" + std::to_string(dispatched) +
-                          " devices=" + std::to_string(agent_ids.size()));
-
-        // Initial render: every applicable check pending → every device incomplete;
-        // the wrapper repolls immediately.
-        std::vector<ActiveCheck> active;
-        for (const auto& c : preflight::kPreflightChecks)
-            if (check_applicable(c.key, cfg))
-                active.push_back({c.key, c.label, {}});
-        bool any_pending = false;
-        auto devices = build_results(targets, active, cfg, any_pending);
-        res.set_content(render_auto_results(devices, config_summary(cfg),
-                                            scope_label(groups_fn_, group_id), poll),
-                        "text/html; charset=utf-8");
-    });
-
-    // ── Result poll — apply thresholds + aggregate by check ──────────────────
-    svr.Get("/fragments/auto/result", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
-        if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
-            return;
-        }
-        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
-            return;
-        if (!responses_all_fn_) {
-            res.set_content(render_auto_note("Result store is unavailable on this server."),
                             "text/html; charset=utf-8");
             return;
         }
@@ -378,54 +264,138 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
         int window_min = static_cast<int>(preflight::parse_i64(param(req, "window")));
         if (window_min <= 0)
             window_min = 30;
-        // 700ms cadence; Slice-1 caps page-polling at ~10 min. (Slice 2 makes the
-        // window a true server-side run that survives page close + re-dispatches.)
-        const int max_attempts = std::clamp(window_min * 86, 40, 860);
+        window_min = std::clamp(window_min, kMinWindowMin, kMaxWindowMin);
+
+        auto targets =
+            resolve_targets(devices_fn_, group_members_fn_, session->username, group_id, os_filter);
+        if (targets.empty()) {
+            res.set_content(render_auto_note("No visible devices in that scope."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        PreflightRunRow run;
+        run.run_id = gen_run_id();
+        run.execution_id = "preflight-" + run.run_id;
+        run.created_by = session->username;
+        run.name = param(req, "name");
+        run.scope_label = scope_label(groups_fn_, group_id, os_filter);
+        run.group_id = group_id;
+        run.os_filter = os_filter;
+        run.config_json = preflight::config_to_json(cfg);
+        run.window_seconds = window_min * 60;
+        run.created_at_ms = now_ms();
+        run.deadline_at_ms = run.created_at_ms + static_cast<std::int64_t>(run.window_seconds) * 1000;
+        run.status = "running";
+
+        std::vector<preflight::PreflightTarget> ptargets;
+        ptargets.reserve(targets.size());
+        std::vector<std::string> agent_ids;
+        agent_ids.reserve(targets.size());
+        for (const auto& d : targets) {
+            ptargets.push_back({d.agent_id, d.hostname, d.os});
+            agent_ids.push_back(d.agent_id);
+        }
+
+        if (!run_store_->create_run(run, ptargets)) {
+            res.set_content(render_auto_note("Could not persist the pre-flight run."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // First dispatch — per-check execution_id so re-dispatches union.
+        int dispatched = 0;
+        for (const auto& c : preflight::kPreflightChecks) {
+            if (!preflight::check_applicable(c.key, cfg))
+                continue;
+            dispatch_fn_(c.plugin, c.action, agent_ids, "", preflight::dispatch_params(c.key, cfg),
+                         preflight::check_execution_id(run.run_id, c.key));
+            ++dispatched;
+        }
+        if (audit_fn_)
+            audit_fn_(req, "preflight.run", "success", "Scope",
+                      group_id.empty() ? std::string("all-visible") : group_id,
+                      "run=" + run.run_id + " checks=" + std::to_string(dispatched) +
+                          " devices=" + std::to_string(agent_ids.size()));
+
+        res.set_content(render_run(run, /*attempt=*/0), "text/html; charset=utf-8");
+    });
+
+    // ── Result poll / revisit ── ?run=<id> (owner-scoped) ────────────────────
+    svr.Get("/fragments/auto/result", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        if (!run_store_) {
+            res.set_content(render_auto_note("Pre-flight run store is unavailable on this server."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::string run_id = param(req, "run");
+        auto run = run_store_->get_run(run_id);
+        if (!run) {
+            res.set_content(render_auto_note("Run not found (it may have aged out of retention)."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // OWNER SCOPE: a frozen-cohort run is the creator's; do not expose another
+        // operator's device list. (Admin-sees-all is a deliberate follow-up.)
+        if (run->created_by != session->username) {
+            res.status = 403;
+            res.set_content(render_auto_note("You are not authorized to view this run."),
+                            "text/html; charset=utf-8");
+            return;
+        }
         int attempt = 1;
         if (req.has_param("n")) {
             try {
-                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 2000);
+                attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 100000);
             } catch (...) {
             }
         }
-        auto targets =
-            resolve_targets(devices_fn_, group_members_fn_, session->username, group_id, os_filter);
-
-        // Which checks are in this run (a cmd_<key> param present) + each agent's
-        // best response so far (terminal output / highest status wins).
-        std::vector<ActiveCheck> active;
-        for (const auto& c : preflight::kPreflightChecks) {
-            const std::string p = std::string("cmd_") + c.key;
-            if (!req.has_param(p) || req.get_param_value(p).empty())
-                continue;
-            ActiveCheck ac;
-            ac.key = c.key;
-            ac.label = c.label;
-            for (const auto& r : responses_all_fn_(req.get_param_value(p))) {
-                auto& slot = ac.byAgent[r.agent_id];
-                const bool better = (!r.output.empty() && slot.second.empty()) || (r.status > slot.first);
-                if (better) {
-                    slot.first = r.status;
-                    slot.second = r.output;
-                }
-            }
-            active.push_back(std::move(ac));
-        }
-
-        bool any_pending = false;
-        auto devices = build_results(targets, active, cfg, any_pending);
-
-        const bool done = !any_pending || attempt >= max_attempts;
-        std::string repoll;
-        if (!done) {
-            repoll = "/fragments/auto/result?group=" + url_encode(group_id) + "&n=" +
-                     std::to_string(attempt + 1);
-            append_run_params(repoll, req);
-        }
-        res.set_content(render_auto_results(devices, config_summary(cfg),
-                                            scope_label(groups_fn_, group_id), repoll),
-                        "text/html; charset=utf-8");
+        res.set_content(render_run(*run, attempt), "text/html; charset=utf-8");
     });
+}
+
+// Shared render: a RUNNING run computes live (collect + compute); a COMPLETE run
+// reads the stored grid. Repoll while running + pending + under the page-poll cap.
+std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt) {
+    const bool running = (run.status == "running");
+    const auto cfg = preflight::config_from_json(run.config_json);
+
+    std::vector<preflight::PreflightDeviceResult> grid;
+    bool any_pending = false;
+    if (running) {
+        const auto applicable = preflight::applicable_checks(cfg);
+        const auto targets = run_store_ ? run_store_->get_targets(run.run_id)
+                                        : std::vector<preflight::PreflightTarget>{};
+        auto checks = collect_fn_ ? collect_fn_(run.run_id, applicable)
+                                  : std::vector<preflight::PreflightCheckResponses>{};
+        grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);
+    } else {
+        // Stored grid (durable revisit, survives ResponseStore pruning).
+        for (const auto& r : run_store_->get_devices(run.run_id)) {
+            preflight::PreflightDeviceResult dr;
+            dr.agent_id = r.agent_id;
+            dr.hostname = r.hostname;
+            dr.os = r.os;
+            dr.bucket = preflight::bucket_from_token(r.bucket);
+            dr.checks = preflight::checks_from_json(r.checks_json);
+            grid.push_back(std::move(dr));
+        }
+    }
+
+    std::string repoll;
+    if (running && any_pending && attempt < kPollCap)
+        repoll = "/fragments/auto/result?run=" + url_encode(run.run_id) + "&n=" +
+                 std::to_string(attempt + 1);
+
+    return render_auto_results(grid, config_summary(cfg), run.scope_label, repoll, /*run_complete=*/!running);
 }
 
 } // namespace yuzu::server

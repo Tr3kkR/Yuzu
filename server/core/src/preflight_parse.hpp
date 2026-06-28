@@ -27,6 +27,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::preflight {
@@ -72,6 +74,29 @@ enum class Verdict { kPass, kFail, kWarn, kUnknown };
 /// kWarn, not kFail, in warn-only mode), so a single kFail always means no-go —
 /// the roll-up needs the verdicts alone, not a separate blocking flag.
 enum class Bucket { kPass, kFailed, kWarnOnly, kIncomplete };
+
+/// Stable wire/storage token for a bucket (persisted in run_device.bucket).
+inline const char* bucket_token(Bucket b) {
+    switch (b) {
+    case Bucket::kPass:
+        return "go";
+    case Bucket::kFailed:
+        return "nogo";
+    case Bucket::kWarnOnly:
+        return "warn";
+    default:
+        return "inc";
+    }
+}
+inline Bucket bucket_from_token(std::string_view t) {
+    if (t == "go")
+        return Bucket::kPass;
+    if (t == "nogo")
+        return Bucket::kFailed;
+    if (t == "warn")
+        return Bucket::kWarnOnly;
+    return Bucket::kIncomplete;
+}
 
 inline Bucket classify_device(const std::vector<Verdict>& verdicts) {
     bool any_unknown = false, any_warn = false;
@@ -229,6 +254,48 @@ inline std::optional<std::string> extract_cell(std::string_view key, std::string
     return std::nullopt;
 }
 
+// ── Device-result model (pure; shared by routes/runner/store) ────────────────
+// Moved here from preflight_routes.hpp so the routes layer (live render), the
+// background runner (persist), and the run store (serialize) all share ONE
+// verdict path — pills/chips/grid can never disagree. The roll-up function
+// compute_device_results is defined at the end (it calls evaluate, below).
+
+/// One target in a run's FROZEN cohort (captured at creation = denominator +
+/// authz boundary).
+struct PreflightTarget {
+    std::string agent_id;
+    std::string hostname;
+    std::string os; ///< family: "windows" | "linux" | "darwin" | "?"
+};
+
+/// One check's outcome on one device (verdict + the device's actual value).
+struct PreflightDeviceCheck {
+    std::string key;
+    std::string label;
+    Verdict verdict = Verdict::kUnknown;
+    std::string value; ///< display: "4.1.0", "9.4 GiB free…", "error", "" → "—"
+};
+
+/// One device's full result. `bucket` is the canonical roll-up
+/// (classify_device); summary pills + "Failed by" chips derive from the device
+/// set so they cannot disagree.
+struct PreflightDeviceResult {
+    std::string agent_id;
+    std::string hostname;
+    std::string os;
+    Bucket bucket = Bucket::kIncomplete;
+    std::vector<PreflightDeviceCheck> checks; ///< applicable checks, in catalogue order
+};
+
+/// One applicable check + each agent's best (status, output) so far. The caller
+/// builds `by_agent` from whatever response seam it has (routes: per-command
+/// poll; runner: query_by_execution + latest_per_agent).
+struct PreflightCheckResponses {
+    std::string key;
+    std::string label;
+    std::unordered_map<std::string, std::pair<int, std::string>> by_agent; ///< agent → (status, output)
+};
+
 // ── Verdict (threshold applied to the parsed fact) ───────────────────────────
 
 /// Evaluate one check's raw output against the config threshold. kUnknown when the
@@ -283,6 +350,61 @@ inline Verdict evaluate(std::string_view key, std::string_view output, const Pre
         return cfg.reboot_block ? Verdict::kFail : Verdict::kWarn;
     }
     return Verdict::kUnknown;
+}
+
+/// THE shared grid: roll the per-check responses up to a per-device result for
+/// every frozen target. `any_pending` (optional out) is set when any
+/// device×check still lacks a terminal response — drives the self-repoll and the
+/// run's running/complete transition. A check with no by_agent entry for a
+/// device reads Unknown (pending). Mirrors the parse contract exactly.
+inline std::vector<PreflightDeviceResult>
+compute_device_results(const std::vector<PreflightTarget>& targets,
+                       const std::vector<PreflightCheckResponses>& checks,
+                       const PreflightConfig& cfg, bool* any_pending = nullptr) {
+    std::vector<PreflightDeviceResult> out;
+    out.reserve(targets.size());
+    for (const auto& t : targets) {
+        PreflightDeviceResult dr;
+        dr.agent_id = t.agent_id;
+        dr.hostname = t.hostname;
+        dr.os = t.os;
+        std::vector<Verdict> verdicts;
+        verdicts.reserve(checks.size());
+        for (const auto& c : checks) {
+            PreflightDeviceCheck ck;
+            ck.key = c.key;
+            ck.label = c.label;
+            bool terminal = false;
+            auto it = c.by_agent.find(t.agent_id);
+            if (it != c.by_agent.end()) {
+                const int status = it->second.first;
+                const std::string& outp = it->second.second;
+                if (!outp.empty()) {
+                    terminal = true;
+                    if (outp.rfind("error|", 0) == 0) {
+                        ck.value = "error";
+                    } else {
+                        ck.verdict = evaluate(c.key, outp, cfg);
+                        if (auto disp = extract_cell(c.key, outp))
+                            ck.value = *disp;
+                    }
+                } else if (status >= 2) {
+                    terminal = true;
+                    ck.value = "error";
+                } else if (status == 1) {
+                    terminal = true; // success, no output → no fact
+                    ck.value = "\xE2\x80\x94";
+                }
+            }
+            if (!terminal && any_pending)
+                *any_pending = true;
+            verdicts.push_back(ck.verdict);
+            dr.checks.push_back(std::move(ck));
+        }
+        dr.bucket = classify_device(verdicts);
+        out.push_back(std::move(dr));
+    }
+    return out;
 }
 
 } // namespace yuzu::server::preflight

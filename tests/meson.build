@@ -240,6 +240,7 @@ if build_server
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
       'unit/server/test_preflight_parse.cpp',
+      'unit/server/test_preflight_eval.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',

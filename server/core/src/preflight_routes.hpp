@@ -32,54 +32,50 @@
 #include <yuzu/server/auth.hpp>
 
 #include "device_routes.hpp"   // DeviceRow
-#include "dex_routes.hpp"      // DexRoutes::DispatchFn/AuditFn + DexAgentResponse
-#include "preflight_parse.hpp" // Verdict, Bucket
+#include "dex_routes.hpp"      // DexRoutes::AuditFn
+#include "preflight_parse.hpp" // Verdict, Bucket, PreflightCheckResponses, PreflightDeviceResult
 
 #include <httplib.h>
 
 #include <functional>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace yuzu::server {
 
-/// One check's outcome on one device (verdict + the device's actual value).
-struct PreflightDeviceCheck {
-    std::string key;
-    std::string label;
-    preflight::Verdict verdict = preflight::Verdict::kUnknown;
-    std::string value; ///< display: "4.1.0", "9.4 GiB free…", "error", "" → "—"
-};
-
-/// One device's full result. `bucket` is the canonical roll-up
-/// (preflight::classify_device); the summary pills + "Failed by" chips are derived
-/// from the device set so they cannot disagree.
-struct PreflightDeviceResult {
-    std::string agent_id;
-    std::string hostname;
-    std::string os; ///< family: "windows" | "linux" | "darwin" | "?"
-    preflight::Bucket bucket = preflight::Bucket::kIncomplete;
-    std::vector<PreflightDeviceCheck> checks; ///< applicable checks, in catalogue order
-};
+// PreflightTarget / PreflightDeviceCheck / PreflightDeviceResult now live in the
+// pure layer (preflight_parse.hpp, namespace `preflight`) so routes, the runner,
+// and the store share ONE verdict model.
 
 /// PURE: the config section (scope + per-check params/thresholds + Run) and an
 /// empty results container. `groups` = (id, name) for the scope dropdown.
-std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups);
+/// `recent` = (run_id, label) of the viewer's recent runs for the saved-runs rail.
+std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups,
+                               const std::vector<std::pair<std::string, std::string>>& recent);
 
 /// PURE: the result GROUPED BY DEVICE (Pass / Failed / Warn-only / Incomplete),
 /// with bucket + failure-type client-side filters (CSP-safe inline JS). Summary
 /// pills + "Failed by" chip counts are derived here from `devices`.
 /// `config_summary` is the one-line threshold recap; `repoll_url` non-empty → the
-/// wrapper self-polls (≥1 device still answering), empty → final.
-std::string render_auto_results(const std::vector<PreflightDeviceResult>& devices,
+/// wrapper self-polls. When `repoll_url` is empty: `run_complete` true → "Complete",
+/// false → "still running in the background" (page-poll capped; the run continues
+/// server-side, reopen from the rail to refresh).
+std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
-                                const std::string& repoll_url);
+                                const std::string& repoll_url, bool run_complete);
 
 /// PURE: an honest note body (no devices in scope, missing seam, etc.).
 std::string render_auto_note(const std::string& message);
 
-/// `/auto` routes — page shell + config fragment + run dispatch + result poll.
+class PreflightRunStore; // server/core/src/preflight_run_store.hpp
+struct PreflightRunRow;  //   "
+
+/// `/auto` routes — page shell + config/rail fragment + run creation + result
+/// poll. Runs persist (PreflightRunStore); a running run renders live, a complete
+/// run renders the stored grid; reads are owner-scoped (created_by).
 class PreflightRoutes {
 public:
     using AuthFn =
@@ -89,16 +85,24 @@ public:
     using DevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
     using GroupsFn = std::function<std::vector<std::pair<std::string, std::string>>()>;
     using GroupMembersFn = std::function<std::vector<std::string>(const std::string& group_id)>;
-    using DispatchFn = DexRoutes::DispatchFn;
-    /// Read ALL agents' stored responses for a command_id (fleet poll). The grid
-    /// only counts the pinned visible∩group devices, so an extra agent is ignored.
-    using ResponsesAllFn =
-        std::function<std::vector<DexAgentResponse>(const std::string& command_id)>;
+    /// 6-param shared command_dispatch_fn — execution_id carried so responses
+    /// correlate via query_by_execution (the runner reuses the SAME ids).
+    using DispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
+    /// Collect each applicable check's per-agent best response for a run (wraps
+    /// preflight::collect_check_responses over the ResponseStore). Used for the
+    /// LIVE render of a running run.
+    using CollectFn = std::function<std::vector<preflight::PreflightCheckResponses>(
+        const std::string& run_id,
+        const std::vector<std::pair<std::string, std::string>>& applicable)>;
     using AuditFn = DexRoutes::AuditFn;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
                          GroupsFn groups_fn, GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
-                         ResponsesAllFn responses_all_fn, AuditFn audit_fn);
+                         CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
 
 private:
     AuthFn auth_fn_;
@@ -107,8 +111,13 @@ private:
     GroupsFn groups_fn_;
     GroupMembersFn group_members_fn_;
     DispatchFn dispatch_fn_;
-    ResponsesAllFn responses_all_fn_;
+    CollectFn collect_fn_;
     AuditFn audit_fn_;
+    PreflightRunStore* run_store_{nullptr};
+
+    /// Render a run's result block: RUNNING → live (collect + compute), COMPLETE
+    /// → stored grid. Self-repolls while running + pending + under the poll cap.
+    std::string render_run(const PreflightRunRow& run, int attempt);
 };
 
 } // namespace yuzu::server

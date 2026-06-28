@@ -72,7 +72,10 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "preflight_eval.hpp"
 #include "preflight_routes.hpp"
+#include "preflight_run_store.hpp"
+#include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -1024,6 +1027,15 @@ public:
                               "not be created/opened)");
                 startup_failed_ = true;
             }
+        }
+
+        // PreflightRunStore — born-on-PG persistence for /auto runs. Fail-SOFT: a
+        // feature page, not core infra, so an open failure degrades /auto to an
+        // honest "run store unavailable" note rather than blocking startup.
+        if (pg_pool_ && !startup_failed_) {
+            preflight_run_store_ = std::make_unique<PreflightRunStore>(*pg_pool_);
+            if (!preflight_run_store_->is_open())
+                spdlog::warn("PreflightRunStore unavailable — /auto pre-flight runs will not persist");
         }
 
         // Initialize response store
@@ -2776,6 +2788,14 @@ public:
             policy_eval_thread_.join();
         }
 
+        // Join the pre-flight runner thread (uses preflight_run_store_ +
+        // response_store_ + the dispatch path — stop before teardown), then drop
+        // the runner so its borrowed pointers can't be ticked again.
+        if (preflight_runner_thread_.joinable()) {
+            preflight_runner_thread_.join();
+        }
+        preflight_runner_.reset();
+
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
@@ -2900,6 +2920,9 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
+        // thread that leased it is already joined above).
+        preflight_run_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -8019,6 +8042,39 @@ private:
             }
         });
 
+        // PreflightRunner — /auto re-dispatch-on-reconnect + window lifecycle.
+        // Same dispatch lambda as operator commands; per-check execution_ids union
+        // re-dispatches via query_by_execution. Joined BEFORE the stores in stop().
+        preflight_runner_ = std::make_unique<PreflightRunner>(PreflightRunner::Deps{
+            .run_store = preflight_run_store_.get(),
+            .response_store = response_store_.get(),
+            .dispatch_fn = command_dispatch_fn,
+            .now_ms_fn = {},
+            .retention_days = 14,
+        });
+        preflight_runner_thread_ = std::thread([this]() {
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (preflight_runner_) {
+                    // tick() touches JSON, PG and gRPC dispatch — any can throw; an
+                    // escaping exception would std::terminate the process, so a bad
+                    // run must not take it down. Catch, log, keep ticking.
+                    try {
+                        preflight_runner_->tick();
+                    } catch (const std::exception& e) {
+                        spdlog::error("preflight_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("preflight_runner: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
         // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
@@ -8630,23 +8686,19 @@ private:
                         out.push_back(m.agent_id);
                 return out;
             },
-            [command_dispatch_fn](const std::string& plugin, const std::string& action,
-                                  const std::vector<std::string>& agent_ids,
-                                  const std::string& scope_expr,
-                                  const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
-                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
-                                           /*execution_id=*/"");
-            },
-            [this](const std::string& command_id) -> std::vector<DexAgentResponse> {
-                std::vector<DexAgentResponse> out;
+            // 6-param dispatch: execution_id carried so re-dispatched checks union
+            // via query_by_execution (the runner reuses the same per-check ids).
+            command_dispatch_fn,
+            // Collect: per-check query_by_execution + latest_per_agent (LIVE render
+            // of a running run). NOT under any PreflightRunStore lease.
+            [this](const std::string& run_id,
+                   const std::vector<std::pair<std::string, std::string>>& applicable)
+                -> std::vector<preflight::PreflightCheckResponses> {
                 if (!response_store_)
-                    return out;
-                for (const auto& r : response_store_->query(command_id, {}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
-                return out;
+                    return {};
+                return preflight::collect_check_responses(*response_store_, run_id, applicable);
             },
-            audit_fn);
+            audit_fn, preflight_run_store_.get());
 
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
@@ -9503,6 +9555,9 @@ private:
     /// ingest path; declared here among the stores so it destructs AFTER the
     /// ingest services + BEFORE the pool.
     std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
+    /// Born-on-PG persistence for /auto pre-flight runs. Borrows pg_pool_ →
+    /// declared after it so it destructs before the pool; reset in stop().
+    std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -9548,6 +9603,7 @@ private:
     std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
+    std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -9680,6 +9736,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

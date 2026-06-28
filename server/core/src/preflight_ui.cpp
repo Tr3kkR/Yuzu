@@ -32,6 +32,10 @@ const char* kAutoCss = R"CSS(<style>
 .af-cfg input[type=number]{width:6.5rem}
 .af-tag{font-size:.58rem;color:#7f93ad;border:1px solid #25395a;border-radius:.5rem;padding:.02rem .35rem;margin-left:.4rem}
 .af-note{color:#7f93ad;font-size:.72rem;margin:.2rem 0 .3rem}
+.af-rail{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem;padding-bottom:.55rem;border-bottom:1px solid #1a2c46}
+.af-rail-lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.04em;color:#7f93ad;margin-right:.2rem}
+.af-run{background:#0c1626;border:1px solid #25395a;border-radius:.5rem;color:#cfe0f6;font-size:.72rem;padding:.22rem .55rem;cursor:pointer}
+.af-run:hover{border-color:#3d7ad6;background:#0f1f37}
 /* results */
 .af-rhd{font-size:.74rem;color:#7f93ad;margin-bottom:.5rem}
 .af-rhd b{color:#dce7f4}
@@ -89,16 +93,29 @@ const char* bucket_key(preflight::Bucket b) {
 }
 } // namespace
 
-std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups) {
+std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups,
+                               const std::vector<std::pair<std::string, std::string>>& recent) {
     std::string h = kAutoCss;
     h += "<div class=\"gp-mute\" style=\"font-size:.76rem;margin-bottom:.6rem\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
-         "grouped by device.</div>";
+         "grouped by device. Runs persist \xE2\x80\x94 reopen one below to revisit it.</div>";
+
+    // Saved-runs rail (owner-scoped). Clicking loads that run into #auto-results.
+    if (!recent.empty()) {
+        h += "<div class=\"af-rail\"><span class=\"af-rail-lbl\">Recent runs</span>";
+        for (const auto& [run_id, label] : recent)
+            h += "<button class=\"af-run\" hx-get=\"/fragments/auto/result?run=" + esc(run_id) +
+                 "&amp;n=1\" hx-target=\"#auto-results\" hx-swap=\"innerHTML\">" + esc(label) +
+                 "</button>";
+        h += "</div>";
+    }
 
     h += "<div id=\"auto-cfg\">";
-    // Scope: group + OS filter + run window
+    // Scope: name + group + OS filter + run window
     h += "<div class=\"af-cfg\">";
     h += "<span class=\"af-name\">Scope (cohort)</span>";
+    h += "<div class=\"af-fld\"><label>Run name</label>"
+         "<input name=\"name\" placeholder=\"e.g. AcmeVPN 4.2.0 rollout\" style=\"min-width:170px\"></div>";
     h += "<div class=\"af-fld\"><label>Management group</label><select name=\"group\">";
     h += "<option value=\"\">(all visible devices)</option>";
     for (const auto& [id, name] : groups)
@@ -165,9 +182,9 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     return h;
 }
 
-std::string render_auto_results(const std::vector<PreflightDeviceResult>& devices,
+std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
-                                const std::string& repoll_url) {
+                                const std::string& repoll_url, bool run_complete) {
     using preflight::Bucket;
     using preflight::Verdict;
 
@@ -302,11 +319,15 @@ std::string render_auto_results(const std::vector<PreflightDeviceResult>& device
 
     if (!repoll_url.empty())
         h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.3rem\">Polling devices&hellip;</div>";
-    else
+    else if (run_complete)
         h += "<div class=\"gp-note\">Complete. A device is <b>no-go</b> if any blocking check fails, "
              "<b>warn-only</b> if it has warnings but no blocking fail, <b>incomplete</b> until every "
              "check answers. Click a pill to filter buckets; click a failure-type chip to narrow the "
              "failed group.</div>";
+    else
+        h += "<div class=\"gp-note\">Still running in the background \xE2\x80\x94 the run keeps catching "
+             "devices that reconnect within its window. This page paused polling; reopen the run from "
+             "<b>Recent runs</b> to refresh.</div>";
 
     // CSP-safe inline filter JS — re-runs on every poll swap, re-applies window.__pf.
     h += "<script>(function(){window.__pf=window.__pf||{b:'all',t:null};var P=window.__pf;"
