@@ -222,7 +222,15 @@ std::vector<AppPerfDailyRow> canon_merge_daily(std::vector<AppPerfDailyRow> rows
                                          static_cast<long double>(total);
                 m.ws_avg_bytes = static_cast<std::int64_t>(wavg);
             }
-            m.samples = total;
+            // Re-clamp the MERGED count: the per-row cap bounds each raw row, but a
+            // batch of duplicate-key rows sums here, so the stored value must be
+            // re-capped to keep `samples` ≤ kMaxSamples by construction (so the
+            // read-side int64 weight sum stays ≤ kMaxSamples × kQueryRowCap = 1e14 ≪
+            // INT64_MAX regardless of the wire message size — sec-M1 LOW). The
+            // weighted means above already used the true `total`; 1e9 samples/day is
+            // physically impossible, so the clamp only engages on hostile input where
+            // the mean is already meaningless.
+            m.samples = (std::min)(total, kMaxSamples);
             m.cpu_max = std::max(m.cpu_max, r.cpu_max);
             m.ws_max_bytes = std::max(m.ws_max_bytes, r.ws_max_bytes);
             m.instances_max = std::max(m.instances_max, r.instances_max);

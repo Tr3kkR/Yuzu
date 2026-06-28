@@ -77,6 +77,25 @@ TEST_CASE("canon_merge_daily upper-clamps samples (sec-M1)", "[app_perf][merge]"
     CHECK(m[0].samples == 1'000'000'000LL); // capped — bounds the reductions' int64 weight sum
 }
 
+TEST_CASE("canon_merge_daily re-clamps the MERGED sample sum (sec-M1 LOW)", "[app_perf][merge]") {
+    // The per-row cap bounds each raw row, but a batch of duplicate-key rows sums in
+    // the merge; the merged value must be re-clamped so `samples` ≤ kMaxSamples holds
+    // by construction (the read-side int64 weight sum then stays ≪ INT64_MAX
+    // regardless of how many duplicates arrived in one apply).
+    std::vector<AppPerfDailyRow> rows = {
+        {.app_name = "x", .version = "1.0", .day = 86400, .samples = 1'000'000'000LL,
+         .instances_max = 1, .cpu_avg = 50.0, .cpu_max = 50.0, .ws_avg_bytes = 100,
+         .ws_max_bytes = 100},
+        {.app_name = "x", .version = "1.0", .day = 86400, .samples = 1'000'000'000LL,
+         .instances_max = 1, .cpu_avg = 50.0, .cpu_max = 50.0, .ws_avg_bytes = 100,
+         .ws_max_bytes = 100},
+    };
+    auto m = canon_merge_daily(std::move(rows));
+    REQUIRE(m.size() == 1);
+    CHECK(m[0].samples == 1'000'000'000LL); // 2e9 merged → re-clamped to 1e9
+    CHECK(m[0].cpu_avg == 50.0);            // weighted mean used the true total first
+}
+
 TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

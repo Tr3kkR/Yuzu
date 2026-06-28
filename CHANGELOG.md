@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(version, day)`), `GET /api/v1/dex/perf/group?group_id=&app=&version=` (one management group's
   on-the-fly trend), and the per-device `GET /api/v1/dex/devices/{id}/app-perf`. MCP twins
   (read-only): `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf` (the per-device
-  drill is REST-only — no MCP twin). Dashboard: a picker + per-version trend on the DEX
+  drill has no MCP twin; its dashboard panel is in the entry above). Dashboard: a picker + per-version trend on the DEX
   Performance tab, fleet-wide or scoped to a group via a selector. One shared pure transform
   (`app_perf_fleet_trend`/`app_perf_group_trend`/`app_perf_version_summaries`) feeds REST, MCP and
   the dashboard so they cannot disagree. **Privacy:** both the fleet AND group aggregates suppress
