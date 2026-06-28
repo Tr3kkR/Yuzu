@@ -95,6 +95,48 @@ std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFle
     return out;
 }
 
+std::vector<AppPerfVersionSummary>
+app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points) {
+    std::vector<AppPerfVersionSummary> out;
+    for (const AppPerfTrendPoint& pt : points) {
+        // Points are grouped by version (SQL ORDER BY version, day); the common
+        // path extends the last summary. Fall back to a search so an out-of-order
+        // input still groups correctly (defence-in-depth, never a duplicate row).
+        AppPerfVersionSummary* s = nullptr;
+        if (!out.empty() && out.back().version == pt.version) {
+            s = &out.back();
+        } else {
+            for (auto& e : out)
+                if (e.version == pt.version) {
+                    s = &e;
+                    break;
+                }
+            if (s == nullptr) {
+                AppPerfVersionSummary fresh;
+                fresh.version = pt.version;
+                out.push_back(std::move(fresh));
+                s = &out.back();
+            }
+        }
+        ++s->day_count;
+        if (!pt.suppressed)
+            s->cpu_series.push_back(pt.cpu_mean); // real means only; cleared days skipped
+        // Headline = the latest day seen for this version (days ascend, so the
+        // last wins; `>=` keeps a single-day version honest too).
+        if (pt.day >= s->latest_day) {
+            s->latest_day = pt.day;
+            s->device_count = pt.device_count;
+            s->suppressed = pt.suppressed;
+            s->hist_stale = pt.hist_stale;
+            s->cpu_mean = pt.cpu_mean;
+            s->cpu_max = pt.cpu_max;
+            s->cpu_p95 = pt.cpu_p95;
+            s->ws_mean = pt.ws_mean;
+        }
+    }
+    return out;
+}
+
 std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows,
                                                     std::int64_t floor) {
     std::vector<AppPerfTrendPoint> points = app_perf_fleet_trend(rows);

@@ -8414,6 +8414,60 @@ private:
             dex_perf_fn_ = dex_perf_fn;
         }
 
+        // App-perf-over-time providers (F2b) — ONE bundle threaded through the
+        // dashboard (DexRoutes), the REST surface (RestApiV1) and the MCP tools, so
+        // all three read the SAME stores. nullopt from any seam = an honest degrade
+        // (the read surfaces map it to a 503 / "unavailable" note, never a silent
+        // empty). The fleet + picker seams read B2; the per-device drill reads B1
+        // (audited at the route); the group roll-up resolves members then aggregates
+        // B1 — two bounded single-store reads composed, never a held cross-store
+        // lease (ADR-0012 §1).
+        AppPerfProviders app_perf_providers;
+        app_perf_providers.fleet =
+            [this](std::string_view app, std::string_view version)
+            -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
+        };
+        app_perf_providers.apps =
+            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->list_apps(truncated);
+        };
+        app_perf_providers.device =
+            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+            if (!app_perf_daily_store_)
+                return std::nullopt;
+            return app_perf_daily_store_->get_agent_app_perf(agent_id);
+        };
+        app_perf_providers.group =
+            [this](std::string_view group_id, std::string_view app,
+                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_group_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN aggregate B1
+            // (a second bounded read) — never a lease held across the other (ADR-0012
+            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
+        };
+        // The dashboard scope-selector's group list (id + name + member count).
+        DexRoutes::GroupListFn dex_group_list_fn = [this]() -> std::vector<DexGroupOption> {
+            std::vector<DexGroupOption> out;
+            if (!mgmt_group_store_)
+                return out;
+            for (const auto& g : mgmt_group_store_->list_groups())
+                out.push_back({g.id, g.name,
+                               static_cast<std::int64_t>(mgmt_group_store_->get_members(g.id).size())});
+            return out;
+        };
+
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
         // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
@@ -8495,7 +8549,9 @@ private:
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
-            scoped_perm_fn, visible_set_fn);
+            scoped_perm_fn, visible_set_fn,
+            // F2b app-perf-over-time providers + the scope-selector group list.
+            app_perf_providers, dex_group_list_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -8953,43 +9009,9 @@ private:
         // store seams shared by the REST endpoints and the MCP twins so both read
         // the SAME substrate. Each lambda null-checks the store at call time and
         // returns std::nullopt on an unwired/closed store (the read surfaces map a
-        // nullopt to a 503 degrade, never a silent empty). The fleet+picker seams
-        // ship now; the per-device drill (audited) and group roll-up land later.
-        AppPerfProviders app_perf_providers;
-        app_perf_providers.fleet =
-            [this](std::string_view app, std::string_view version)
-            -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
-        };
-        app_perf_providers.apps =
-            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->list_apps(truncated);
-        };
-        app_perf_providers.device =
-            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->get_agent_app_perf(agent_id);
-        };
-        app_perf_providers.group =
-            [this](std::string_view group_id, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN aggregate B1
-            // (a second bounded read) — never a lease held across the other (ADR-0012
-            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
-        };
+        // nullopt to a 503 degrade, never a silent empty). The `app_perf_providers`
+        // bundle is built once ABOVE (before the DexRoutes registration) so the
+        // dashboard, REST and MCP surfaces all share the same store seams.
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 

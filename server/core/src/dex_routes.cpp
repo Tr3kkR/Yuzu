@@ -2359,19 +2359,22 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
-                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn));
+                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
+                    std::move(app_perf_providers), std::move(group_list_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
-                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2382,6 +2385,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
     perf_fn_ = std::move(perf_fn);
+    app_perf_providers_ = std::move(app_perf_providers);
+    group_list_fn_ = std::move(group_list_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
     // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
@@ -2658,6 +2663,109 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
                                                          not_reporting, cohort_filter, limit,
                                                          window_days, vis ? &*vis : nullptr),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- F2b: application performance over time (per version) ------------------
+    //
+    // The retained per-(app,version) trend the fleet-now Performance tab deferred
+    // until the Postgres store landed (dex_perf_model.hpp). Two fragments share
+    // ONE renderer family + the ONE reduction (app_perf_version_summaries over
+    // app_perf_fleet_trend/app_perf_group_trend) the REST/MCP twins use — so the
+    // dashboard, /api/v1/dex/perf/* and the MCP tools cannot disagree. Aggregate
+    // surface → GuaranteedState:Read, NOT audited (cohort posture; the per-device
+    // drill is the audited surface and ships separately).
+    sink.Get("/fragments/dex/perf/apps",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const int window_days = window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d");
+                 if (!app_perf_providers_.apps) {
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "This server has no app-perf store wired."),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 bool truncated = false;
+                 const auto apps = app_perf_providers_.apps(truncated);
+                 if (!apps) { // nullopt = a real read error → honest degrade, not empty
+                     res.status = 503;
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "The app-perf store could not be read right now."),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days),
+                                 "text/html; charset=utf-8");
+             });
+
+    sink.Get("/fragments/dex/perf/app", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+        const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
+        // The store binds `app` as a parameter, but keep control bytes + oversize
+        // garbage out of the markup and the provider (mirrors the REST route's
+        // control-char re-floor). NUL would also truncate a bound text param.
+        const bool bad_app =
+            app.empty() || app.size() > 260 ||
+            std::any_of(app.begin(), app.end(),
+                        [](unsigned char c) { return c < 0x20; });
+        if (bad_app) {
+            res.status = 400;
+            res.set_content(placeholder("Pick an application",
+                                        "Choose an application from the list to see its "
+                                        "per-version trend."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::vector<DexGroupOption> groups =
+            group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
+
+        // group empty → fleet B2 (app_perf_fleet_trend); group set → the named-
+        // group on-the-fly B1 aggregate (app_perf_group_trend, sub-floor
+        // suppression at the SAME kDexCohortFloor the REST group endpoint uses).
+        std::optional<std::vector<AppPerfFleetRow>> rows;
+        std::vector<AppPerfVersionSummary> versions;
+        if (group.empty()) {
+            if (!app_perf_providers_.fleet) {
+                res.set_content(placeholder("Application performance unavailable",
+                                            "This server has no fleet app-perf store wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.fleet(app, "");
+            if (!rows) {
+                res.status = 503;
+                res.set_content(placeholder("Application performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
+        } else {
+            if (!app_perf_providers_.group) {
+                res.set_content(placeholder("Group performance unavailable",
+                                            "This server has no group app-perf reader wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.group(group, app, "");
+            if (!rows) {
+                res.status = 503;
+                res.set_content(placeholder("Group performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        }
+        res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
+                                                  window_days),
                         "text/html; charset=utf-8");
     });
 

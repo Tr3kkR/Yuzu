@@ -90,6 +90,36 @@ struct AppPerfTrendPoint {
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows);
 
+/// One application VERSION reduced across the window — the row the dashboard
+/// per-version table renders. Built by `app_perf_version_summaries` from the
+/// `(version, day)` trend points: the HEADLINE stats are the LATEST day present
+/// (current state), and `cpu_series` is the chronological daily mean over the
+/// window (the "over time" sparkline). Keeping the reduction pure + here (not in
+/// the route) means the dashboard and any future summary surface agree.
+struct AppPerfVersionSummary {
+    std::string version;
+    std::int64_t latest_day{0};   ///< most recent day present for this version
+    std::int64_t device_count{0}; ///< latest day's distinct-device count (honest even when suppressed)
+    std::int64_t day_count{0};    ///< days this version appears in the window
+    bool suppressed{false};       ///< latest day sub-floor (group path) → stats withheld
+    bool hist_stale{false};       ///< latest day stamped under a different histogram scheme
+    double cpu_mean{0.0};         ///< latest day exact fleet/group mean CPU%
+    double cpu_max{0.0};
+    std::optional<HistPctile> cpu_p95;
+    std::int64_t ws_mean{0};
+    /// Chronological daily cpu_mean over NON-suppressed days — the sparkline.
+    /// A cleared (suppressed) day is skipped, never plotted as a real 0.
+    std::vector<double> cpu_series;
+};
+
+/// PURE: reduce `(version, day)` trend points (the output of
+/// `app_perf_fleet_trend`/`app_perf_group_trend`, ordered `(version, day)`) to one
+/// summary per version. The headline is the latest day; the sparkline series skips
+/// suppressed days (a cleared mean is not a real 0). Versions are returned in
+/// first-seen order. Robust to an unsorted input (it groups by version key).
+[[nodiscard]] std::vector<AppPerfVersionSummary>
+app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
+
 /// PURE: the GROUP variant — `app_perf_fleet_trend` over a management group's
 /// on-the-fly aggregate rows, THEN the statistical-floor suppression a named
 /// group needs that the fleet does not. A management group is a set of SPECIFIC

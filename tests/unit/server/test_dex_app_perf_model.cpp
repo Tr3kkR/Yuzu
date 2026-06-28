@@ -173,6 +173,88 @@ TEST_CASE("app_perf_group_trend: sub-floor points suppress stats, keep device_co
     CHECK_FALSE(pts[1].ws_p95.has_value());
 }
 
+TEST_CASE("app_perf_version_summaries: groups by version, latest-day headline + chronological series",
+          "[dex][app_perf]") {
+    // version "124": two days (older then newer); version "125": one day. The
+    // reducer keeps first-seen order, takes the LATEST day for the headline, and
+    // collects the daily means chronologically for the sparkline.
+    AppPerfTrendPoint a1;
+    a1.version = "124";
+    a1.day = 100;
+    a1.device_count = 10;
+    a1.cpu_mean = 4.0;
+    a1.ws_mean = 1000;
+    AppPerfTrendPoint a2;
+    a2.version = "124";
+    a2.day = 200; // newer
+    a2.device_count = 12;
+    a2.cpu_mean = 6.0;
+    a2.cpu_max = 9.0;
+    a2.ws_mean = 1200;
+    a2.cpu_p95 = HistPctile{20.0, false};
+    AppPerfTrendPoint b1;
+    b1.version = "125";
+    b1.day = 200;
+    b1.device_count = 5;
+    b1.cpu_mean = 11.0;
+    b1.ws_mean = 2000;
+
+    auto s = app_perf_version_summaries({a1, a2, b1});
+    REQUIRE(s.size() == 2);
+    CHECK(s[0].version == "124"); // first-seen order
+    CHECK(s[0].day_count == 2);
+    CHECK(s[0].latest_day == 200);
+    CHECK(s[0].device_count == 12); // latest day's count
+    CHECK(s[0].cpu_mean == 6.0);    // latest day's mean
+    CHECK(s[0].ws_mean == 1200);
+    REQUIRE(s[0].cpu_p95.has_value());
+    CHECK(s[0].cpu_p95->value == 20.0);
+    REQUIRE(s[0].cpu_series.size() == 2);
+    CHECK(s[0].cpu_series[0] == 4.0); // chronological (older first)
+    CHECK(s[0].cpu_series[1] == 6.0);
+    CHECK(s[1].version == "125");
+    CHECK(s[1].day_count == 1);
+    CHECK(s[1].device_count == 5);
+}
+
+TEST_CASE("app_perf_version_summaries: suppressed latest day → count only, series skips it",
+          "[dex][app_perf]") {
+    AppPerfTrendPoint d1;
+    d1.version = "124";
+    d1.day = 100;
+    d1.device_count = 10;
+    d1.cpu_mean = 5.0; // a real day
+    AppPerfTrendPoint d2;
+    d2.version = "124";
+    d2.day = 200;
+    d2.device_count = 3;
+    d2.suppressed = true; // cleared by the group path (mean already 0)
+
+    auto s = app_perf_version_summaries({d1, d2});
+    REQUIRE(s.size() == 1);
+    CHECK(s[0].suppressed);           // latest day was suppressed
+    CHECK(s[0].device_count == 3);    // honest count survives
+    CHECK(s[0].cpu_mean == 0.0);      // mirrors the cleared trend point
+    CHECK(s[0].day_count == 2);       // both days counted
+    REQUIRE(s[0].cpu_series.size() == 1); // sparkline plots only the real day
+    CHECK(s[0].cpu_series[0] == 5.0);
+}
+
+TEST_CASE("app_perf_version_summaries: hist_stale latest day withholds p95", "[dex][app_perf]") {
+    AppPerfTrendPoint d;
+    d.version = "x";
+    d.day = 10;
+    d.device_count = 2;
+    d.cpu_mean = 5.0;
+    d.hist_stale = true; // trend point left cpu_p95 unset
+
+    auto s = app_perf_version_summaries({d});
+    REQUIRE(s.size() == 1);
+    CHECK(s[0].hist_stale);
+    CHECK(s[0].cpu_mean == 5.0); // exact mean survives
+    CHECK_FALSE(s[0].cpu_p95.has_value());
+}
+
 TEST_CASE("app_perf_fleet_trend: a wrong-scheme row withholds percentiles", "[dex][app_perf]") {
     AppPerfFleetRow row;
     row.device_count = 2;
