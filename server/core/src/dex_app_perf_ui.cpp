@@ -299,14 +299,19 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         }
         // Multi-version: an app header row (the version count) then per-version
         // sub-rows, each carrying its OWN perf — "v125 vs v124 on this box" reads
-        // straight off adjacent rows. The newest day is tagged "latest".
+        // straight off adjacent rows. The version(s) on the newest day are tagged
+        // "latest" by day-equality (NOT by row position) — same idiom as the fleet
+        // renderer, so a day-tie tags both honestly and the cue does not silently
+        // depend on the reducer's sort order.
+        std::int64_t newest = 0;
+        for (const auto& v : app.versions)
+            newest = (std::max)(newest, v.latest_day);
         h += "<tr style=\"background:var(--surface)\"><td style=\"font-weight:700;color:var(--white)\">" +
              esc(app.app_name) + " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.7rem\">&middot; " +
              std::to_string(app.versions.size()) +
              " versions</span></td><td colspan=\"7\" class=\"gp-mute\">per-version below</td></tr>";
-        for (std::size_t i = 0; i < app.versions.size(); ++i) {
-            const auto& v = app.versions[i];
-            const std::string tag = (i == 0) ? kLatestTag : ""; // versions are newest-first
+        for (const auto& v : app.versions) {
+            const std::string tag = (v.latest_day == newest) ? kLatestTag : "";
             h += "<tr><td style=\"padding-left:1.5rem\">" + version_label(v) + tag + "</td>" +
                  device_metric_cells(v) + "</tr>";
         }
