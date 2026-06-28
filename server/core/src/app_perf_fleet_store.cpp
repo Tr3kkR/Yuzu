@@ -6,6 +6,7 @@
 #include "pg/pg_raii.hpp"
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/version_string.hpp> // canon_version — read path must match ingest
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -28,6 +29,9 @@ constexpr std::chrono::milliseconds kPruneAcquireTimeout{2000};
 // Hard ceiling on rows a single app read materialises (an app over the full 180d
 // retention × its versions is small; this is unbounded-growth defence).
 constexpr int kQueryRowCap = 100000;
+// Picker cap — a bounded slice of the fleet's distinct app set (unbounded in
+// principle). Clipping is reported via the out-param, never silent.
+constexpr int kAppListCap = 5000;
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -165,15 +169,22 @@ AppPerfFleetStore::get_app_fleet_perf(std::string_view app_name, std::string_vie
         return std::nullopt;
     }
 
+    // Canonicalize the version FILTER exactly as ingest canonicalized the stored
+    // key (yuzu::util::canon_version, the same fn AppPerfDailyStore applies). A raw
+    // "1.2.3.4" must match a canon-collapsed stored row, or the filter silently
+    // misses every row — a bug invisible to any test that queries the already-canon
+    // form. "" stays "" (the all-versions sentinel).
+    const std::string cversion = yuzu::util::canon_version(version);
+
     std::string sql =
         "SELECT app_name, version, day, device_count, cpu_sum, cpu_max, ws_sum, ws_max, "
         "       cpu_hist, ws_hist, hist_version "
         "FROM app_perf_fleet_store.app_perf_fleet WHERE app_name = $1";
     std::vector<std::string> params;
     params.emplace_back(app_name);
-    if (!version.empty()) {
+    if (!cversion.empty()) {
         sql += " AND version = $2";
-        params.emplace_back(version);
+        params.emplace_back(cversion);
     }
     sql += " ORDER BY version, day LIMIT $" + std::to_string(params.size() + 1) + "::bigint";
     params.push_back(std::to_string(kQueryRowCap));
@@ -203,6 +214,56 @@ AppPerfFleetStore::get_app_fleet_perf(std::string_view app_name, std::string_vie
         r.ws_hist = parse_bigint_array(PQgetvalue(res.get(), i, 9));
         r.hist_version = static_cast<int>(to_i64(PQgetvalue(res.get(), i, 10)));
         out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<AppPerfAppSummary>> AppPerfFleetStore::list_apps(bool& truncated) {
+    truncated = false;
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("AppPerfFleetStore: list_apps degraded — store not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("AppPerfFleetStore: list_apps degraded — no connection ({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    // One extra row over the cap distinguishes "exactly cap" from "more than cap"
+    // so truncation is reported, never silent (the fleet's distinct-app count is
+    // unbounded in principle; the picker only needs a bounded slice).
+    const std::string sql =
+        "SELECT app_name, COUNT(DISTINCT version), MAX(day) "
+        "FROM app_perf_fleet_store.app_perf_fleet "
+        "GROUP BY app_name ORDER BY app_name LIMIT $1::bigint";
+    std::vector<std::string> params{std::to_string(kAppListCap + 1)};
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("AppPerfFleetStore: list_apps degraded — query failed: {} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<AppPerfAppSummary> out;
+    int n = PQntuples(res.get());
+    if (n > kAppListCap) {
+        truncated = true;
+        n = kAppListCap; // drop the probe row
+    }
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        AppPerfAppSummary s;
+        s.app_name = PQgetvalue(res.get(), i, 0);
+        s.versions = to_i64(PQgetvalue(res.get(), i, 1));
+        s.last_day = to_i64(PQgetvalue(res.get(), i, 2));
+        out.push_back(std::move(s));
     }
     return out;
 }

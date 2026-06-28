@@ -40,6 +40,7 @@
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_rollup.hpp"
+#include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_inventory_store.hpp"
@@ -8941,6 +8942,27 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
+        // store seams shared by the REST endpoints and the MCP twins so both read
+        // the SAME substrate. Each lambda null-checks the store at call time and
+        // returns std::nullopt on an unwired/closed store (the read surfaces map a
+        // nullopt to a 503 degrade, never a silent empty). The fleet+picker seams
+        // ship now; the per-device drill (audited) and group roll-up land later.
+        AppPerfProviders app_perf_providers;
+        app_perf_providers.fleet =
+            [this](std::string_view app, std::string_view version)
+            -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
+        };
+        app_perf_providers.apps =
+            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->list_apps(truncated);
+        };
+
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
         rest_api_v1_ = std::make_unique<RestApiV1>();
@@ -9177,7 +9199,9 @@ private:
                     return true;
                 return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
                                                             mgmt_group_store_.get());
-            });
+            },
+            // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
+            app_perf_providers);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -9326,7 +9350,10 @@ private:
                 },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
-                &metrics_);
+                &metrics_,
+                // DEX app-perf-over-time read providers (slice 2) — same bundle the
+                // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
+                app_perf_providers);
         }
 
         // -- Listen -----------------------------------------------------------

@@ -77,6 +77,14 @@ struct AppPerfFleetRow {
     int hist_version{0};
 };
 
+/// One row of the app picker: an app with retained fleet data, plus how many
+/// distinct versions it carries and the most recent UTC day it was seen.
+struct AppPerfAppSummary {
+    std::string app_name;
+    std::int64_t versions{0}; ///< distinct retained versions
+    std::int64_t last_day{0}; ///< most recent UTC-midnight epoch day with data
+};
+
 class AppPerfFleetStore {
 public:
     /// Borrows the shared pool and runs the `app_perf_fleet_store` schema migration
@@ -95,11 +103,20 @@ public:
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     /// All retained fleet rows for one app, ordered `(version, day)`. `version`
-    /// empty = all versions of the app. AUTHORITATIVE read: `std::nullopt` on a
-    /// store/pool/query degrade (distinct from an empty value = genuinely no rows).
-    /// An empty `app_name` is a precondition miss → empty value. Capped.
+    /// empty = all versions of the app; a non-empty `version` is canonicalized
+    /// (`yuzu::util::canon_version`) to match the stored key exactly. AUTHORITATIVE
+    /// read: `std::nullopt` on a store/pool/query degrade (distinct from an empty
+    /// value = genuinely no rows). An empty `app_name` is a precondition miss →
+    /// empty value. Capped.
     [[nodiscard]] std::optional<std::vector<AppPerfFleetRow>>
     get_app_fleet_perf(std::string_view app_name, std::string_view version);
+
+    /// Distinct apps that currently have any retained fleet data — the app picker
+    /// for the fleet-trend read surface (agentic-first A2: a worker discovers what
+    /// is measurable instead of guessing `app=`). Ordered by `app_name`.
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade; an empty value = no app-perf
+    /// data yet. Capped (`truncated` set when the cap clipped the list).
+    [[nodiscard]] std::optional<std::vector<AppPerfAppSummary>> list_apps(bool& truncated);
 
     /// Delete rows with `day` strictly older than `before_day` (epoch seconds).
     /// Best-effort (called by the roll-up background thread). Uses the `(day)` index.

@@ -17,6 +17,8 @@
 /// re-rolling a day overwrites its B2 row, so a trailing window safely absorbs
 /// late-arriving B1.
 
+#include "app_perf_hist.hpp" // THE shared bucket scheme + kAppPerfHistVersion
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,9 +36,11 @@ public:
     /// silently mixes schemes — bump `kHistVersion` and have readers filter if ever
     /// changed). CPU = share-of-total-capacity percent, low-end weighted (most apps
     /// idle). WS = working-set bytes, log-scale. N boundaries → N+1 buckets.
+    /// These forward to the shared scheme in `app_perf_hist.hpp` — the ONE
+    /// definition the reader (`dex_app_perf_model`) interprets against.
     static const std::vector<double>& cpu_buckets();
     static const std::vector<std::int64_t>& ws_buckets();
-    static constexpr int kHistVersion = 1;
+    static constexpr int kHistVersion = kAppPerfHistVersion;
 
     /// Trailing completed UTC days re-aggregated each run, to absorb late-arriving
     /// B1 (the agent's 2-day window + missed syncs). MUST stay below B1's retention

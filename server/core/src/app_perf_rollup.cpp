@@ -1,6 +1,7 @@
 #include "app_perf_rollup.hpp"
 
 #include "app_perf_daily_store.hpp" // kRetentionDays (window bound static_assert)
+#include "app_perf_hist.hpp"        // THE shared bucket scheme (writer + reader)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -47,19 +48,12 @@ template <typename T> std::vector<std::string> fmt_literals(const std::vector<T>
 
 } // namespace
 
-const std::vector<double>& AppPerfRollup::cpu_buckets() {
-    // share-of-capacity %, low-end weighted (11 boundaries → 12 buckets).
-    static const std::vector<double> kCpu = {0.5, 1, 2, 3, 5, 8, 12, 20, 30, 50, 75};
-    return kCpu;
-}
+// Thin forwarders to the shared scheme (app_perf_hist.hpp) — the writer and the
+// reader (dex_app_perf_model) interpret ONE definition. Kept public so the
+// rollup tests can reference AppPerfRollup::cpu_buckets()/kHistVersion unchanged.
+const std::vector<double>& AppPerfRollup::cpu_buckets() { return app_perf_cpu_buckets(); }
 
-const std::vector<std::int64_t>& AppPerfRollup::ws_buckets() {
-    // working-set bytes, log-scale 32 MiB … 8 GiB (9 boundaries → 10 buckets).
-    static const std::vector<std::int64_t> kWs = {
-        33554432,   67108864,   134217728,  268435456, 536870912,
-        1073741824, 2147483648, 4294967296, 8589934592};
-    return kWs;
-}
+const std::vector<std::int64_t>& AppPerfRollup::ws_buckets() { return app_perf_ws_buckets(); }
 
 std::string AppPerfRollup::build_hist_array_sql(const std::string& column,
                                                 const std::vector<std::string>& b) {

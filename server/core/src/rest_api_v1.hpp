@@ -7,6 +7,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -230,7 +231,10 @@ public:
         // predicate for GET /api/v1/inventory/software (trailing optional deps;
         // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {});
+        InventoryScopeFn inventory_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -266,7 +270,10 @@ public:
         // predicate for GET /api/v1/inventory/software (trailing optional deps;
         // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {});
+        InventoryScopeFn inventory_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 };
 
 } // namespace yuzu::server
