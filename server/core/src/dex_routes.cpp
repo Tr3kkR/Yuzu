@@ -2026,6 +2026,20 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "<span class=\"gp-mute\">runs a live read-only query on the device &middot; audited "
         "separately &mdash; per-app is usage-class telemetry</span></div>";
 
+    // B1 retained app-perf-over-time: reads the CENTRAL store (no dispatch, no
+    // Execute probe), so it loads for a read-only operator too — the "over time, on
+    // this box" companion to the live top-applications query above. Same usage-class
+    // audit verb as the REST drill (dex.device.app_perf.view), set-and-proceed.
+    perf_panel +=
+        "<div class=\"gp-sech\">Application performance over time "
+        "<span class=\"gp-mute\">(retained daily, central store)</span></div>"
+        "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
+        "hx-get=\"/fragments/dex/device/app-perf?agent_id=" +
+        url_encode(agent_id) +
+        "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load history</button> "
+        "<span class=\"gp-mute\">retained daily summary &middot; no live query &middot; per-app "
+        "usage-class, audited</span></div>";
+
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(agent_id) +
@@ -3022,6 +3036,48 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  }
                  res.set_content(procperf_pending(command_id, id, attempt + 1, w),
+                                 "text/html; charset=utf-8");
+             });
+
+    // B1 per-device app-perf-over-time drill — the retained-daily companion to the
+    // live procperf query above. Reads the CENTRAL Postgres B1 store
+    // (app_perf_providers_.device → AppPerfDailyStore::get_agent_app_perf): NO
+    // dispatch, NO Execute probe (it does not touch the device). Per-device
+    // behavioural PII, so it is scoped-Read gated AND audited per access; the HTML
+    // fragment posture is set-and-proceed (flag via Sec-Audit-Failed, still render)
+    // — the REST twin GET /dex/devices/{id}/app-perf is the fail-closed 503 surface.
+    sink.Get("/fragments/dex/device/app-perf",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 // Per-device scoped Read floor (tier + management group). Mirrors the
+                 // sibling fallback so a deployment without scoped_perm_fn still gates.
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!app_perf_providers_.device) {
+                     res.set_content(
+                         "<div class=\"gp-note\">Application performance history is unavailable on "
+                         "this server (no app-perf store wired).</div>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 // Audit the behavioural-PII access before serving (provider-null
+                 // checked first, so a no-store server does not log a read that
+                 // returns nothing — matches the REST twin's ordering).
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
+                     "device app-perf-over-time drill (B1 retained)");
+                 const auto rows = app_perf_providers_.device(id);
+                 if (!rows) { // nullopt = a real read degrade → honest 503, never a fake empty
+                     res.status = 503;
+                     res.set_content(
+                         "<div class=\"gp-note\">Application performance history could not be read "
+                         "right now &mdash; the store degraded. Retry shortly.</div>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 res.set_content(render_dex_device_app_perf(app_perf_device_summaries(*rows)),
                                  "text/html; charset=utf-8");
              });
 }
