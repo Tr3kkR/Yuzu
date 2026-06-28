@@ -142,7 +142,7 @@ namespace {
 // projection rows, never events).
 constexpr const char* kGobsDdl = R"(
     -- DEX read-model PROJECTION of ruleless signal observations (the
-    -- 103-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
+    -- 110-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
     -- guaranteed_state_events (the single source of truth): written in the
     -- SAME transaction as the event, so a redelivered event_id fails the
     -- event PK and rolls back both → the projection inherits the dedup and
@@ -1688,6 +1688,55 @@ GuaranteedStateStore::dex_device_history(const std::string& agent_id, const std:
         out.push_back(std::move(r));
     }
     return out;
+}
+
+std::optional<GuardianObservationRow>
+GuaranteedStateStore::dex_observation(const std::string& event_id) const {
+    std::shared_lock lock(mtx_);
+    if (!db_ || event_id.empty())
+        return std::nullopt;
+    // Single-row read of the SAME projection columns the device history lists —
+    // the per-event detail drill. event_id is the projection PK (it shares the
+    // event journal dedup key), so this is an indexed point lookup.
+    const char* sql = R"(
+        SELECT event_id, agent_id, observed_at, obs_type, subject,
+               reason, symbolic, component, metric, platform
+        FROM guardian_observations
+        WHERE event_id = ?1
+        LIMIT 1
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK) {
+        // A store fault here would otherwise be indistinguishable from "not found"
+        // at the route — log it so it's diagnosable.
+        spdlog::warn("GuaranteedStateStore::dex_observation: prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    sqlite3_bind_text(st.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(st.get());
+    if (rc != SQLITE_ROW) {
+        // SQLITE_DONE is the genuine not-found (no row matched the PK); any other
+        // code (SQLITE_CORRUPT/IOERR/...) is a STORE FAULT that would otherwise be
+        // silently indistinguishable from not-found at the route — log it so a
+        // faulting store is diagnosable, mirroring the prepare-fail arm above.
+        if (rc != SQLITE_DONE)
+            spdlog::warn("GuaranteedStateStore::dex_observation: step failed: {}",
+                         sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    GuardianObservationRow r;
+    r.event_id = col_text(st.get(), 0);
+    r.agent_id = col_text(st.get(), 1);
+    r.observed_at = col_text(st.get(), 2);
+    r.obs_type = col_text(st.get(), 3);
+    r.subject = col_text(st.get(), 4);
+    r.reason = col_text(st.get(), 5);
+    r.symbolic = col_text(st.get(), 6);
+    r.component = col_text(st.get(), 7);
+    r.metric = sqlite3_column_double(st.get(), 8);
+    r.platform = col_text(st.get(), 9);
+    return r;
 }
 
 std::vector<GuaranteedStateEventRow>
