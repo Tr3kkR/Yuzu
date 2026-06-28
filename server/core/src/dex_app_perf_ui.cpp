@@ -253,4 +253,73 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     return h;
 }
 
+namespace {
+
+// The "newest version" cue — a factual tag (most recent day on this device), not a
+// verdict. Same idiom as the fleet trend's latest tag.
+const char* const kLatestTag =
+    " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);border-radius:.3rem;"
+    "padding:.03rem .35rem;font-weight:700\">latest</span>";
+
+// One version's metric cells (Avg CPU · Peak CPU · CPU trend · Avg WS · Peak WS ·
+// Instances · Days) — shared by the single-version combined row and the multi-
+// version sub-row so the two layouts cannot drift.
+std::string device_metric_cells(const AppPerfDeviceVersion& v) {
+    return "<td>" + fmt_pct(v.cpu_avg) + "</td><td>" + fmt_pct(v.cpu_max) + "</td><td>" +
+           spark(v.cpu_series) + "</td><td>" + fmt_bytes(static_cast<double>(v.ws_avg)) +
+           "</td><td>" + fmt_bytes(static_cast<double>(v.ws_max)) + "</td><td>" +
+           std::to_string(v.instances_max) + "</td><td>" + std::to_string(v.day_count) + "</td>";
+}
+
+std::string version_label(const AppPerfDeviceVersion& v) {
+    return v.version.empty() ? "<span class=\"gp-mute\">(no version)</span>"
+                             : "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
+}
+
+} // namespace
+
+std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps) {
+    if (apps.empty())
+        return placeholder("No application performance history for this device",
+                           "This device has reported no retained daily application performance "
+                           "yet. Per-application sampling is opt-in (procperf_enabled, off by "
+                           "default) and a daily summary appears only after the first completed "
+                           "UTC day — enable it on this device to populate this view.");
+
+    std::string h = "<table class=\"gp-table\"><thead><tr><th>Application / version</th>"
+                    "<th>Avg CPU</th><th>Peak CPU</th><th>CPU trend</th><th>Avg working set</th>"
+                    "<th>Peak working set</th><th>Instances</th><th>Days</th></tr></thead><tbody>";
+    for (const auto& app : apps) {
+        if (app.versions.size() == 1) {
+            // Common case: collapse the app + its one version into a single row.
+            const auto& v = app.versions.front();
+            h += "<tr><td><span style=\"font-weight:600;color:var(--white)\">" + esc(app.app_name) +
+                 "</span> " + version_label(v) + "</td>" + device_metric_cells(v) + "</tr>";
+            continue;
+        }
+        // Multi-version: an app header row (the version count) then per-version
+        // sub-rows, each carrying its OWN perf — "v125 vs v124 on this box" reads
+        // straight off adjacent rows. The newest day is tagged "latest".
+        h += "<tr style=\"background:var(--surface)\"><td style=\"font-weight:700;color:var(--white)\">" +
+             esc(app.app_name) + " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.7rem\">&middot; " +
+             std::to_string(app.versions.size()) +
+             " versions</span></td><td colspan=\"7\" class=\"gp-mute\">per-version below</td></tr>";
+        for (std::size_t i = 0; i < app.versions.size(); ++i) {
+            const auto& v = app.versions[i];
+            const std::string tag = (i == 0) ? kLatestTag : ""; // versions are newest-first
+            h += "<tr><td style=\"padding-left:1.5rem\">" + version_label(v) + tag + "</td>" +
+                 device_metric_cells(v) + "</tr>";
+        }
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">Retained <b>daily</b> per-application summaries from the central "
+         "store (up to <b>31 days</b>) &mdash; the &ldquo;over time, on this box&rdquo; companion "
+         "to the fleet trend. <b>Avg</b> CPU / working set are the sample-weighted window mean; "
+         "<b>Peak</b> is the window maximum; <b>CPU trend</b> is the daily mean over the window. "
+         "Top resource-significant app-versions only (procperf top-N), names + version only "
+         "&mdash; command lines and image paths are never collected. Per-version crashes/hangs are "
+         "deferred (a separate central crash-store join on the shared (name, version) identity).</div>";
+    return h;
+}
+
 } // namespace yuzu::server

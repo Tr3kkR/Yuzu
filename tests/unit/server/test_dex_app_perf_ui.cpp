@@ -79,3 +79,67 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     // No versions → honest placeholder, never an empty table.
     CHECK(has(render_dex_app_perf_trend("x", {}, "", groups, 10, 30), "No performance history"));
 }
+
+TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
+    const auto h = render_dex_device_app_perf({});
+    CHECK(has(h, "No application performance history for this device"));
+    CHECK(has(h, "procperf_enabled")); // names the opt-in so the empty state isn't read as a bug
+}
+
+TEST_CASE("render_dex_device_app_perf: single-version app collapses to one row",
+          "[dex][app_perf][ui]") {
+    AppPerfDeviceVersion v;
+    v.version = "3.2.1";
+    v.latest_day = 300;
+    v.day_count = 5;
+    v.instances_max = 2;
+    v.cpu_avg = 2.1;
+    v.cpu_max = 7.0;
+    v.ws_avg = 1024LL * 1024 * 1024; // 1 GB
+    v.ws_max = 2LL * 1024 * 1024 * 1024;
+    v.cpu_series = {2.0, 2.2, 2.1};
+    AppPerfDeviceApp app;
+    app.app_name = "AcmeCRM.exe";
+    app.latest_day = 300;
+    app.peak_cpu_avg = 2.1;
+    app.versions = {v};
+
+    const auto h = render_dex_device_app_perf({app});
+    CHECK(has(h, "AcmeCRM.exe"));
+    CHECK(has(h, "3.2.1"));      // version inline on the combined row
+    CHECK(has(h, "2.1%"));       // avg CPU
+    CHECK(has(h, "1.0 GB"));     // avg working set formatted
+    CHECK(has(h, "<svg"));       // CSP-safe server-rendered sparkline
+    CHECK(has(h, "central store")); // foot explains the retained-daily source
+    CHECK(has(h, "crashes/hangs are deferred")); // deferred join is noted, not greyed
+    CHECK_FALSE(has(h, "per-version below")); // single version → no app header row
+    CHECK_FALSE(has(h, "hx-on"));             // CSP: no eval-compiled handlers
+}
+
+TEST_CASE("render_dex_device_app_perf: multi-version app shows header + latest tag",
+          "[dex][app_perf][ui]") {
+    AppPerfDeviceVersion newer;
+    newer.version = "125.0";
+    newer.latest_day = 300;
+    newer.cpu_avg = 12.4;
+    newer.cpu_series = {9.0, 12.4};
+    AppPerfDeviceVersion older;
+    older.version = "124.0";
+    older.latest_day = 200;
+    older.cpu_avg = 4.1;
+    older.cpu_series = {4.0, 4.1};
+    AppPerfDeviceApp app;
+    app.app_name = "chrome.exe";
+    app.latest_day = 300;
+    app.peak_cpu_avg = 12.4;
+    app.versions = {newer, older}; // already newest-first (as the reducer emits)
+
+    const auto h = render_dex_device_app_perf({app});
+    CHECK(has(h, "2 versions"));   // app header row for a multi-version app
+    CHECK(has(h, "per-version below"));
+    CHECK(has(h, "125.0"));
+    CHECK(has(h, "124.0"));
+    CHECK(has(h, "latest")); // newest version (versions[0]) tagged
+    CHECK(has(h, "12.4%"));
+    CHECK(has(h, "4.1%"));
+}

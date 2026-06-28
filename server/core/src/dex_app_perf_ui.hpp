@@ -42,4 +42,15 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       const std::vector<DexGroupOption>& groups,
                                       std::int64_t group_floor, int window_days);
 
+/// PURE: the per-DEVICE app-perf drill (B1) — one application per group, its
+/// versions as sub-rows, with a CPU-over-time sparkline and window aggregates.
+/// Sits inline inside the device drill's perf panel (in-place swap, no back-link —
+/// peer of the live procperf table, NOT the full-pane fleet picker). `apps` is the
+/// reduced model (`app_perf_device_summaries`); an empty `apps` renders the honest
+/// empty state (the caller already mapped a store degrade to a 503 + note). Single
+/// device → exact daily values (no percentiles, no cohort floor — it is behind the
+/// `dex.device.app_perf.view` audit gate). Per-version crashes/hangs are deferred
+/// (a separate central crash-store join), noted in the foot.
+std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps);
+
 } // namespace yuzu::server
