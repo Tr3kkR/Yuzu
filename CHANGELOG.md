@@ -62,6 +62,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Response/execution reads fail closed on a corrupt/load-failed `rbac.db`; per-agent
+  management-group scope-filter foundation added (#1634, PARTIAL — the gate change that makes
+  management-group scoping effective for normal operators is NOT in this change and remains open
+  under #1634).** The response readers (MCP `query_responses` + `aggregate_responses`, REST
+  `GET /executions/{id}/visualization`, and the legacy `GET /api/responses/{id}` / `/aggregate` /
+  `/export`) gained a per-agent management-group filter, routed through ONE predicate
+  (`response_agent_in_scope` → `check_scoped_permission`) gated on `rbac_enforcement_in_effect`.
+
+  **What this fixes today (the real, observable change):** under a **corrupt or load-failed
+  `rbac.db`**, `require_permission`'s legacy fallback opens READ to any authenticated principal, so
+  these readers previously returned the **whole fleet's** responses to anyone. They now fail
+  **closed** (zero rows), matching the #1498 device-visibility posture. A transient response-store
+  read error while resolving scope likewise fails closed — surfaced as `503` (REST aggregate) / a
+  JSON-RPC internal error (`aggregate_responses`), never success-with-empty-totals (agentic-first A4
+  failure-vs-empty).
+
+  **What this does NOT yet do (important — no false sense of security):** under **normal RBAC
+  operation the filter is inert.** A holder of global `Response:Read` passes the gate and
+  `check_scoped_permission`'s global step then admits every agent (filter is a no-op → sees all);
+  a management-group-confined operator is `403`'d by the global `require_permission` gate **before**
+  the filter runs. So this does **not** bound a normal operator's responses to their management
+  groups and does **not** close the cross-operator read #1634 describes. Achieving that requires a
+  new admit-then-filter **gate** for fan-out/list reads (admit an operator holding the permission via
+  *any* management group, then filter) — a systemic change that also affects `/api/agents`,
+  `/devices`, the dashboard `/fragments/results/…` family, and the shipped #1550, and is tracked as
+  the remaining work under **#1634**. This change is the filter foundation that gate will build on.
+
+  Also included: each scope-drop is auditable (`aggregate_responses` → distinct `result=denied` +
+  `audit_persisted:false` on a gap; visualization → `scope_dropped=N` on its
+  `execution.visualization.fetch` success audit; legacy `/api/responses/*` → a `response.read`
+  `result=denied` audit, `detail=scope_dropped=<N> surface=<…>`); `ResponseStore::aggregate` takes a
+  dedicated scope parameter (off the shared `ResponseQuery`, so the row-path readers can't be handed
+  a silently-ignored scope); `distinct_agent_ids` returns `optional` (a store-read error is distinct
+  from a genuinely-empty result); and `aggregate`/`distinct_agent_ids` own their statements via
+  `SqliteStmt` RAII.
+
 - **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
   `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
   within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
@@ -95,22 +131,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
   evidence-gap signal.
 
-- **MCP `query_responses` is now management-group scoped (cross-operator isolation).** The tool
+- **MCP `query_responses` gained a per-agent management-group filter (#1550) — but it is INERT
+  under the global gate and does NOT yet isolate operators; see the #1634 entry above.** The tool
   previously gated only flat `Response:Read` and then returned **any** execution's response rows
-  (`dispatched_by` was display-only, never an access check), so an operator could collect another
-  operator's rows by id. Results are now filtered per-agent through the same
-  `check_scoped_permission` management-group chokepoint the per-device REST/dashboard routes use —
-  a caller sees only rows for agents inside their groups; out-of-scope rows are dropped and audited
-  `result=denied` (with the distinct dropped-agent count). The `denied` row's persistence failure,
-  like the success row's, surfaces `audit_persisted:false` on the result. RBAC-off → legacy-open
-  (no filter), matching `require_scoped_permission`. **Behavior change for agentic-worker
-  integrators:** results may now be a subset of an execution's total rows. The filter runs after
+  (`dispatched_by` was display-only, never an access check). A per-agent filter through the
+  `check_scoped_permission` chokepoint was added — HOWEVER, as the #1634 entry documents, the reader
+  still gates on the **global** `Response:Read`, and `check_scoped_permission`'s global step then
+  admits every agent for a global holder, so under normal RBAC operation **no rows are dropped** and
+  a caller does **not** see only their groups' rows. It does **not** close the cross-operator read;
+  its only active effect today is failing **closed** (zero rows) on a corrupt `rbac.db`. Effective
+  isolation needs the admit-then-filter gate change tracked under #1634. Out-of-scope rows, when
+  dropped (the corrupt-store path), are audited `result=denied` (with the distinct dropped-agent
+  count); the `denied` row's persistence failure surfaces `audit_persisted:false`. RBAC-off →
+  legacy-open (no filter), matching `require_scoped_permission`. The filter runs after
   the 1000-row cap, so a result that hit the cap before filtering carries
   `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
-  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(Partial: the
-  REST/dashboard/workflow siblings that read the same response store and the `aggregate_responses`
-  MCP tool remain flat-`Response:Read` — tracked in #1634; service-scoped tokens are scoped by the
-  token creator's RBAC, not the service tag.)*
+  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(The same
+  per-agent filter is now also on `aggregate_responses`, the REST visualization reader, and the
+  legacy `/api/responses/*` readers — but see the #1634 entry above for the important caveat that
+  this filter, INCLUDING `query_responses`', is currently **inert under the global `Response:Read`
+  gate** (a normal holder sees all agents) and its only active effect is failing **closed** on a
+  corrupt `rbac.db`; effective management-group scoping needs the #1634 gate change. Still flat —
+  and **fail-OPEN on a corrupt `rbac.db`** (no filter at all) — are the dashboard `/fragments/results/…`
+  family and the workflow executions-drawer reader (tracked under #1634, same UP-1 class). Service-scoped
+  tokens are scoped by the token creator's RBAC, not the service tag.)*
 
 - **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
   `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
@@ -132,6 +176,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
+  Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
+  leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
+  agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
+  `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
+  `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
+  `tar_dns_collector`, `tar_proc_etw`, `tar_proc_perf`, `tar_arp_collector`) now delegate to
+  `yuzu::win::{to_wide,from_wide,reg_sz_to_utf8}`. `temp_file` (caller-buffer contract) and
+  `installed_apps` (interior-NUL semantic divergence) deliberately retain their own copies.
+  Behaviour-preserving; no user-facing change.
 - **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
   governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
   created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
@@ -200,7 +254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
   picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
   `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
-  Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  Windows-only header `agents/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
   plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
   **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
   of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and

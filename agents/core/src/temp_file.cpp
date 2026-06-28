@@ -90,7 +90,12 @@ static std::wstring build_temp_path_w(const wchar_t* dir, const char* prefix, co
     return result;
 }
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
+// NOT migrated to the shared agents/shared/win_str.hpp (#1681): that helper
+// allocates and returns a std::string, whereas this writes UTF-8 directly into a
+// caller-provided fixed buffer (out/out_size) and returns a status code — a
+// different contract (same for get_temp_dir_w above, which fills a caller
+// wchar_t*). Keeping the local convert avoids an extra allocation + copy on the
+// temp-path path; it is a thin WideCharToMultiByte wrapper, not a re-derived helper.
 static int wide_to_utf8(const wchar_t* wide, char* out, size_t out_size) {
     int written = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<int>(out_size),
                                       nullptr, nullptr);
