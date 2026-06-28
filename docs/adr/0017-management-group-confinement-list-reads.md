@@ -322,14 +322,13 @@ Gate-independent, shippable now (not on this ladder): the doc corrections + the 
 and the fail-closed list-read gate (HIGH). Tracked separately: the global↔group combining-algorithm
 (deny-precedence) decision — a prerequisite for PR-A.
 
-**Change-management traceability (Workstream F):** each spawned item below needs a filed GitHub issue,
-cross-referenced here, before they are relied on as closed-loop evidence — in-prose deferral is not
-sufficient SOC 2 change-management evidence:
+**Change-management traceability (Workstream F):** the spawned items are filed for closed-loop
+evidence:
 
-- the global↔group combining-algorithm (deny-precedence) decision — PR-A prerequisite;
-- the doc-honesty companion PR (incl. `soc2-first-customer.md:170` / the CAIQ claim and the ADR-0016
-  Update note);
-- the fail-closed list-read gate (HIGH) with its target date.
+- **#1715** — the global↔group combining-algorithm (deny-precedence) decision — PR-A prerequisite;
+- **#1716** — the doc-honesty companion PR (incl. `soc2-first-customer.md:170` / the CAIQ claim and
+  the ADR-0016 Update note);
+- **#1717** — the fail-closed list-read gate (HIGH) with its target date.
 
 ## Governance
 
