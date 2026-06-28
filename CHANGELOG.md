@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
+  history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
+  surface: an "Application performance over time" panel on the `/device` DEX drill, beside the
+  live Top-applications query. It reads the **central** B1 store (no live device query, no
+  `Execute` permission — a read-only operator can open it), groups each application with its
+  **versions** as sub-rows, and renders a per-`(app, version)` CPU-over-time sparkline plus the
+  window's sample-weighted avg / peak CPU and working set, so a per-version regression on one
+  device reads straight off adjacent rows. Behavioural PII: per-device-scoped
+  `GuaranteedState:Read` + the **same `dex.device.app_perf.view`** audit verb as the REST drill,
+  under the dashboard set-and-proceed posture (sets `Sec-Audit-Failed` but still renders, distinct
+  from the REST fail-closed surface). A new pure reduction `app_perf_device_summaries` (in the
+  shared `dex_app_perf_model`) feeds the renderer; REST stays raw daily rows; still **no MCP twin**
+  (the fail-closed contract can't be expressed on MCP). Deferred: the per-version crashes/hangs
+  join (a separate central crash-store join on `(name, version)`).
 - **DEX app-performance over time (slice 2) — the operator read surface.** The B1/B2 stores
   below are now readable. REST (all `GuaranteedState:Read`): `GET /api/v1/dex/perf/apps` (the
   picker — apps with retained data), `GET /api/v1/dex/perf/app?app=&version=` (fleet trend, per
@@ -27,8 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Sec-Audit-Failed` if the audit row can't persist). Aggregate reads are not individually audited
   (cohort posture). Group trend reads B1 (≤31 days); fleet trend reads B2 (≤180 days); per-app
   sampling stays opt-in (`procperf_enabled`, off by default), so data appears only after the first
-  completed UTC midnight on an opted-in device. Deferred: per-version crashes/hangs join, the
-  per-device drill's dashboard UI, and a device-drill MCP tool.
+  completed UTC midnight on an opted-in device. Deferred: per-version crashes/hangs join and a
+  device-drill MCP tool. (The per-device drill's dashboard UI shipped — see the entry above.)
 - **DEX app-performance over time (B1) — per-device daily app-version perf, centralized.**
   New daily-sync source `app_perf` (agent) rolls the on-device `procperf_hourly` warehouse up to
   per-`(app, version, day)` daily summaries — sample-weighted CPU/working-set, max-of-max peaks,

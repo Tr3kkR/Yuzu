@@ -166,6 +166,18 @@ numbers match.
   read-only query surface deliberately hides plugin config, so the server
   does not guess which. App rows cross-link to the per-application
   reliability drill.
+
+  A third **Application performance over time** panel (behind its own "Load
+  history" click) is the *retained* companion to the live Top-applications query:
+  it reads the **central** Postgres B1 store (the daily per-app-version summaries
+  the device ships on the daily sync, ≤31 days), so it runs **no live query** and
+  needs **no Execute permission** — a read-only operator can open it. Each
+  application is grouped with its **versions** as sub-rows, each carrying its own
+  CPU-over-time sparkline and the window's sample-weighted avg / peak CPU and
+  working set, so a per-version regression on this device reads straight off
+  adjacent rows. It is the same behavioral-PII access class as the REST drill and
+  carries the **same audit action (`dex.device.app_perf.view`)**; per-version
+  crashes/hangs are a planned enrichment (a separate central crash-store join).
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 
@@ -224,7 +236,10 @@ fail-closed). The aggregate reads are exposed as MCP tools (`list_dex_signals`,
 `get_dex_signal_scope`, `get_dex_signal_detail`, `get_dex_perf_fleet`,
 `get_dex_perf_cohorts`, `get_dex_perf_cohort_diff`, `list_dex_perf_devices`,
 `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`); the
-per-device app-perf drill is **REST-only** (no MCP twin). Full request/response
+per-device app-perf drill is exposed via REST **and** the dashboard device drill
+(the "Application performance over time" panel, same `dex.device.app_perf.view`
+audit) but has **no MCP twin** (MCP's set-and-proceed posture can't express the
+REST fail-closed contract). Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 
