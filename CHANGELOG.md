@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DEX app-performance over time (slice 2) — the operator read surface.** The B1/B2 stores
+  below are now readable. REST (all `GuaranteedState:Read`): `GET /api/v1/dex/perf/apps` (the
+  picker — apps with retained data), `GET /api/v1/dex/perf/app?app=&version=` (fleet trend, per
+  `(version, day)`), `GET /api/v1/dex/perf/group?group_id=&app=&version=` (one management group's
+  on-the-fly trend), and the per-device `GET /api/v1/dex/devices/{id}/app-perf`. MCP twins
+  (read-only): `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf` (the per-device
+  drill is REST-only — no MCP twin). Dashboard: a picker + per-version trend on the DEX
+  Performance tab, fleet-wide or scoped to a group via a selector. One shared pure transform
+  (`app_perf_fleet_trend`/`app_perf_group_trend`/`app_perf_version_summaries`) feeds REST, MCP and
+  the dashboard so they cannot disagree. **Privacy:** both the fleet AND group aggregates suppress
+  any `(version, day)` point below `kDexCohortFloor` (10) devices to a count only — a sub-floor
+  aggregate singles out an individual even without an `agent_id`; percentiles are
+  bucket-resolution (`lower_bound`/"≥" when in the open top bucket) and withheld (`hist_stale`)
+  for a row under a superseded histogram scheme. The per-device drill is behavioural PII — scoped
+  to the caller's management group and audited fail-closed (`dex.device.app_perf.view`; 503 +
+  `Sec-Audit-Failed` if the audit row can't persist). Aggregate reads are not individually audited
+  (cohort posture). Group trend reads B1 (≤31 days); fleet trend reads B2 (≤180 days); per-app
+  sampling stays opt-in (`procperf_enabled`, off by default), so data appears only after the first
+  completed UTC midnight on an opted-in device. Deferred: per-version crashes/hangs join, the
+  per-device drill's dashboard UI, and a device-drill MCP tool.
 - **DEX app-performance over time (B1) — per-device daily app-version perf, centralized.**
   New daily-sync source `app_perf` (agent) rolls the on-device `procperf_hourly` warehouse up to
   per-`(app, version, day)` daily summaries — sample-weighted CPU/working-set, max-of-max peaks,
@@ -22,8 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(app, version)`. Hash-less (perf changes daily → always full); scope is resource-significant
   (procperf top-N) app-versions, not a full app census. Windows-fed today (procperf is
   Windows-only); gated by `procperf_enabled` + the `--inventory-disable` daily-sync master switch.
-  No operator read surface yet — the per-device + fleet dashboard/REST/MCP views are a follow-on
-  slice and will ship REST + MCP in lockstep (agentic-first A1–A4).
+  Its read surface (per-device drill + group trend) shipped in slice 2 — see the entry above.
 - **DEX app-performance over time (B2) — fleet-aggregate trend substrate.** New born-on-Postgres
   `AppPerfFleetStore` (schema `app_perf_fleet_store`, 180-day retention) holds one row per
   `(app, version, UTC day)`: fleet device-count, exact CPU/working-set sums + maxima, and a
@@ -35,8 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that re-rolls a 4-day trailing window (idempotent; absorbs late-arriving B1) and prunes beyond
   180 days. Full version grain (coarsen to major.minor on read). Histogram boundaries are frozen
   (`hist_version` stamps the scheme); derived percentiles are bucket-resolution approximations.
-  No operator read surface yet (slice 2). The aggregate carries no `agent_id` — no per-device
-  attribution.
+  Its read surface (fleet trend + picker, REST/MCP/dashboard) shipped in slice 2 — see the entry
+  above. The aggregate carries no `agent_id`, and sub-floor `(version, day)` points are suppressed
+  to a count only on read — no per-device attribution, no singling-out.
 - **`disk_space` agent plugin — cross-platform free-space probe.** New plugin (Windows/Linux/macOS),
   single `free` action: returns total bytes, free bytes, and percent used for a volume (`path` param;
   default `C:\` / `/`). Free is quota-aware caller headroom (`FreeBytesAvailableToCaller` on Windows,
@@ -620,9 +640,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
   `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
   rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
-  perf across the fleet) is **not** included — per-app data is device-drill-only
-  (federated), not fleet render-time; it remains deferred. See
-  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+  perf across the fleet) was deferred at the time of this entry — it has since
+  **shipped** as DEX app-performance-over-time (B1/B2 + the slice-2 read surface;
+  see the `[Unreleased]` entries), reading the retained Postgres aggregate rather
+  than the federated device drill. See `docs/user-manual/dex.md` and
+  `docs/user-manual/rest-api.md`.
 
 - **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
   under DEX (the Network tab in the DEX sub-nav, also reachable directly at

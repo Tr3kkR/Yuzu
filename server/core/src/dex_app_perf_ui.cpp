@@ -174,8 +174,8 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
          " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.85rem\">&mdash; by version, "
          "over time</span></h1></div><div class=\"gp-sub\">CPU &amp; memory per version across <b>" +
-         scope_name + "</b>. Each row's trend is the daily mean over the window; the headline is "
-         "the most recent day.</div></div></div>";
+         scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
+         "headline is the most recent day.</div></div></div>";
 
     // -- Scope selector (CSP-safe: htmx hx-get on change sends the select's
     // name=value, appended to the URL query — the proven cohort-picker idiom).
@@ -191,7 +191,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         for (const auto& g : groups) {
             const bool on = (g.id == scope_group_id);
             h += "<option value=\"" + esc(g.id) + "\"" + (on ? " selected" : "") + ">" +
-                 esc(g.name) + " (" + std::to_string(g.members) + ")</option>";
+                 esc(g.name) + "</option>";
         }
         h += "</select></div>";
     }
@@ -240,13 +240,15 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         "stream never leaves the device. <b>Avg CPU</b> / <b>Avg working set</b> are the latest "
         "day's exact mean across the reporting devices; <b>p95</b> is read from the fixed-bucket "
         "histogram (device p95s can't be averaged), shown as &ldquo;&ge; value&rdquo; when it "
-        "lands in the open top bucket. <b>CPU trend</b> is the daily mean over the window. "
-        "Per-version crashes/hangs are deferred (a separate crash store).";
+        "lands in the open top bucket. <b>CPU trend</b> is the daily mean over the retained "
+        "history. Per-version crashes/hangs are deferred (a separate crash store).";
     if (is_group)
         foot += " This is a <b>named group of specific devices</b>, so any version whose latest "
                 "day covers fewer than " +
                 std::to_string(group_floor) +
-                " devices shows its count only (works-council co-determination).";
+                " devices shows its count only (works-council co-determination). Group scope reads "
+                "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
+                "<b>180-day</b> aggregate, so a group series is shorter for the same app.";
     h += "<div class=\"gp-note\">" + foot + "</div>";
     return h;
 }

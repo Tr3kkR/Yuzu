@@ -2682,18 +2682,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const auto app = args["app"].get<std::string>();
-                    if (app.size() > 512) {
+                    if (!app_perf_param_valid(app)) { // shared cap + control-char/NUL re-floor
                         res.set_content(
-                            error_response(id, kInvalidParams, "parameter 'app' too long",
-                                           a4_data(0, "app must be <= 512 bytes")),
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
                             "application/json");
                         return;
                     }
                     const auto version = param_str(args, "version");
-                    if (version.size() > 256) {
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
                         res.set_content(
-                            error_response(id, kInvalidParams, "parameter 'version' too long",
-                                           a4_data(0, "version must be <= 256 bytes")),
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
                             "application/json");
                         return;
                     }
@@ -2746,10 +2746,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const auto group_id = args["group_id"].get<std::string>();
-                    if (group_id.size() > 256) {
+                    if (!app_perf_param_valid(group_id)) { // shared cap + control-char/NUL re-floor
                         res.set_content(
-                            error_response(id, kInvalidParams, "parameter 'group_id' too long",
-                                           a4_data(0, "group_id must be <= 256 bytes")),
+                            error_response(id, kInvalidParams, "invalid parameter 'group_id'",
+                                           a4_data(0, "group_id must be <= 512 bytes, no control chars")),
                             "application/json");
                         return;
                     }
@@ -2763,18 +2763,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const auto app = args["app"].get<std::string>();
-                    if (app.size() > 512) {
+                    if (!app_perf_param_valid(app)) {
                         res.set_content(
-                            error_response(id, kInvalidParams, "parameter 'app' too long",
-                                           a4_data(0, "app must be <= 512 bytes")),
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
                             "application/json");
                         return;
                     }
                     const auto version = param_str(args, "version");
-                    if (version.size() > 256) {
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
                         res.set_content(
-                            error_response(id, kInvalidParams, "parameter 'version' too long",
-                                           a4_data(0, "version must be <= 256 bytes")),
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
                             "application/json");
                         return;
                     }

@@ -1,9 +1,21 @@
 #include "dex_app_perf_model.hpp"
 
+#include "dex_perf_model.hpp" // kDexCohortFloor — the ONE cohort floor constant
+
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace yuzu::server {
+
+bool app_perf_param_valid(std::string_view s) {
+    if (s.size() > kAppPerfParamCap)
+        return false;
+    for (const unsigned char c : s)
+        if (c < 0x20) // C0 control incl. NUL (NUL truncates a bound libpq text param)
+            return false;
+    return true;
+}
 
 std::optional<HistPctile> percentile_from_hist(const std::vector<std::int64_t>& hist,
                                                const std::vector<double>& boundaries, double p) {
@@ -61,9 +73,11 @@ const std::vector<double>& ws_boundaries_d() {
     return kWs;
 }
 
-} // namespace
-
-std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows) {
+// PURE: reduce B2 rows to trend points WITHOUT the floor — the exact mean +
+// percentile + hist_version gate, one row in → one point out. The cohort floor is
+// applied on top by the public fleet/group entry points so they share one
+// histogram reading and one suppression rule.
+std::vector<AppPerfTrendPoint> build_trend(const std::vector<AppPerfFleetRow>& rows) {
     std::vector<AppPerfTrendPoint> out;
     out.reserve(rows.size());
     for (const AppPerfFleetRow& row : rows) {
@@ -95,55 +109,14 @@ std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFle
     return out;
 }
 
-std::vector<AppPerfVersionSummary>
-app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points) {
-    std::vector<AppPerfVersionSummary> out;
-    for (const AppPerfTrendPoint& pt : points) {
-        // Points are grouped by version (SQL ORDER BY version, day); the common
-        // path extends the last summary. Fall back to a search so an out-of-order
-        // input still groups correctly (defence-in-depth, never a duplicate row).
-        AppPerfVersionSummary* s = nullptr;
-        if (!out.empty() && out.back().version == pt.version) {
-            s = &out.back();
-        } else {
-            for (auto& e : out)
-                if (e.version == pt.version) {
-                    s = &e;
-                    break;
-                }
-            if (s == nullptr) {
-                AppPerfVersionSummary fresh;
-                fresh.version = pt.version;
-                out.push_back(std::move(fresh));
-                s = &out.back();
-            }
-        }
-        ++s->day_count;
-        if (!pt.suppressed)
-            s->cpu_series.push_back(pt.cpu_mean); // real means only; cleared days skipped
-        // Headline = the latest day seen for this version (days ascend, so the
-        // last wins; `>=` keeps a single-day version honest too).
-        if (pt.day >= s->latest_day) {
-            s->latest_day = pt.day;
-            s->device_count = pt.device_count;
-            s->suppressed = pt.suppressed;
-            s->hist_stale = pt.hist_stale;
-            s->cpu_mean = pt.cpu_mean;
-            s->cpu_max = pt.cpu_max;
-            s->cpu_p95 = pt.cpu_p95;
-            s->ws_mean = pt.ws_mean;
-        }
-    }
-    return out;
-}
-
-std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows,
-                                                    std::int64_t floor) {
-    std::vector<AppPerfTrendPoint> points = app_perf_fleet_trend(rows);
+// Sub-floor suppression: a (version, day) point covering fewer than `floor`
+// devices is de-facto individual behaviour (singling-out — works-council / GDPR
+// needs no name), so its stats are withheld and only the honest device_count
+// survives. Applied to BOTH the fleet and group paths (a niche app on N<floor
+// devices is just as identifying fleet-wide as inside a named group).
+void apply_cohort_floor(std::vector<AppPerfTrendPoint>& points, std::int64_t floor) {
     for (AppPerfTrendPoint& pt : points) {
         if (pt.device_count < floor) {
-            // Sub-floor named-group slice → suppress stats, keep only the honest
-            // device_count (the cohort-floor rule, applied to the group axis).
             pt.suppressed = true;
             pt.cpu_mean = 0.0;
             pt.cpu_max = 0.0;
@@ -155,6 +128,88 @@ std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFle
             pt.ws_p95.reset();
         }
     }
+}
+
+} // namespace
+
+std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows) {
+    // The fleet trend floors at kDexCohortFloor too: a sub-floor (version, day) point
+    // singles out one operator's exact CPU/mem even without an agent_id, so it is
+    // withheld (count only) — the same protection the named-group path applies, NOT
+    // a fleet-only exemption (governance compliance-HIGH / sec-MED).
+    std::vector<AppPerfTrendPoint> points = build_trend(rows);
+    apply_cohort_floor(points, kDexCohortFloor);
+    return points;
+}
+
+std::vector<AppPerfVersionSummary>
+app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points) {
+    std::vector<AppPerfVersionSummary> out;
+    // Per-version (day, cpu_mean) pairs, aligned with `out` by index — collected
+    // here so the sparkline series can be sorted chronologically regardless of input
+    // order. Index access (not a held pointer-into-vector) sidesteps any
+    // use-after-realloc on push_back.
+    std::vector<std::vector<std::pair<std::int64_t, double>>> series;
+    for (const AppPerfTrendPoint& pt : points) {
+        // Points are grouped by version (SQL ORDER BY version, day); the common path
+        // extends the last summary. Fall back to a search so out-of-order input still
+        // groups correctly (defence-in-depth, never a duplicate row).
+        std::size_t idx = 0;
+        bool found = false;
+        if (!out.empty() && out.back().version == pt.version) {
+            idx = out.size() - 1;
+            found = true;
+        } else {
+            for (std::size_t k = 0; k < out.size(); ++k)
+                if (out[k].version == pt.version) {
+                    idx = k;
+                    found = true;
+                    break;
+                }
+        }
+        if (!found) {
+            AppPerfVersionSummary fresh;
+            fresh.version = pt.version;
+            out.push_back(std::move(fresh));
+            series.emplace_back();
+            idx = out.size() - 1;
+        }
+        AppPerfVersionSummary& s = out[idx];
+        ++s.day_count;
+        if (!pt.suppressed)
+            series[idx].emplace_back(pt.day, pt.cpu_mean); // real means only; cleared days skipped
+        // Headline = the latest day seen for this version (`>=` makes it order-robust
+        // and keeps a single-day version honest).
+        if (pt.day >= s.latest_day) {
+            s.latest_day = pt.day;
+            s.device_count = pt.device_count;
+            s.suppressed = pt.suppressed;
+            s.hist_stale = pt.hist_stale;
+            s.cpu_mean = pt.cpu_mean;
+            s.cpu_max = pt.cpu_max;
+            s.cpu_p95 = pt.cpu_p95;
+            s.ws_mean = pt.ws_mean;
+        }
+    }
+    // Sort each version's series by day, then project to the chronological sparkline.
+    for (std::size_t k = 0; k < out.size(); ++k) {
+        auto& pairs = series[k];
+        std::sort(pairs.begin(), pairs.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        out[k].cpu_series.reserve(pairs.size());
+        for (const auto& [day, mean] : pairs)
+            out[k].cpu_series.push_back(mean);
+    }
+    return out;
+}
+
+std::vector<AppPerfTrendPoint> app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows,
+                                                    std::int64_t floor) {
+    // Same build + suppression as the fleet path; the group passes its own floor
+    // (kDexCohortFloor from the REST/MCP/dashboard callers). Shares one histogram
+    // reading + one floor rule with the fleet path so the surfaces cannot disagree.
+    std::vector<AppPerfTrendPoint> points = build_trend(rows);
+    apply_cohort_floor(points, floor);
     return points;
 }
 

@@ -46,6 +46,13 @@ std::int64_t now_secs() {
 // (B1 is hash-less), so this need NOT byte-match the agent — it only protects PG.
 std::string clamp_field(std::string_view raw) {
     std::string f = sanitize_utf8_strict(raw);
+    // Strip C0 control bytes incl. NUL. sanitize_utf8_strict keeps them (valid
+    // UTF-8), but a NUL survives canon dedup yet is DROPPED by pg::to_text_array, so
+    // "foo\0" and "foo" collapse to one PK in the batched upsert → "ON CONFLICT
+    // cannot affect row a second time" → the agent's app_perf goes permanently
+    // need_full (UP-8). Mirror the agent's append_clean; control bytes never occur in
+    // a real app name/version.
+    std::erase_if(f, [](unsigned char c) { return c < 0x20; });
     if (f.size() > kMaxFieldLen) {
         std::size_t end = kMaxFieldLen;
         while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
@@ -65,12 +72,20 @@ std::int64_t parse_i64(std::string_view s) {
 }
 
 double parse_double(std::string_view s) {
-    double v = 0.0;
-    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    (void)p;
-    if (ec != std::errc{} || !std::isfinite(v))
+    // libc++ on Apple Clang 15 has no floating-point std::from_chars
+    // (docs/ci-cpp23-troubleshooting.md); std::stod is the portable form used across
+    // the codebase (cell_double / parse_perf_tag). Integer from_chars is fine.
+    if (s.empty() || s.size() > 64)
         return 0.0;
-    return v;
+    try {
+        const std::string tmp(s);
+        std::size_t pos = 0;
+        const double v = std::stod(tmp, &pos);
+        if (pos == tmp.size() && std::isfinite(v))
+            return v;
+    } catch (...) {
+    }
+    return 0.0;
 }
 
 } // namespace

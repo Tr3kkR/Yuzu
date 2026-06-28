@@ -35,12 +35,20 @@ std::int64_t parse_i64(std::string_view s) {
 }
 
 double parse_double(std::string_view s) {
-    double v = 0.0;
-    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    (void)p;
-    if (ec != std::errc{} || !std::isfinite(v))
+    // libc++ on Apple Clang 15 (the macOS agent rig) has no floating-point
+    // std::from_chars (docs/ci-cpp23-troubleshooting.md); std::stod is the portable
+    // form used across the codebase. Integer from_chars (parse_i64) is fine.
+    if (s.empty() || s.size() > 64)
         return 0.0;
-    return v;
+    try {
+        const std::string tmp(s);
+        std::size_t pos = 0;
+        const double v = std::stod(tmp, &pos);
+        if (pos == tmp.size() && std::isfinite(v))
+            return v;
+    } catch (...) {
+    }
+    return 0.0;
 }
 
 double clamp_finite_nonneg(double v) {

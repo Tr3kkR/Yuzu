@@ -47,6 +47,13 @@ constexpr std::size_t kMaxRowsPerApply = 5000;
 // Sane ceiling for the per-day instance count (defense-in-depth; procperf
 // instance counts are tiny). Keeps a forged value from poisoning aggregates.
 constexpr std::int64_t kMaxInstances = 1'000'000;
+// Upper ceilings for the per-device daily perf values (defense-in-depth against a
+// forged/hostile agent). cpu is share-of-total-capacity percent (documented 0..100).
+// ws caps at 1 PiB — far above any real working set; combined with the rollup's
+// saturating SUM it stops a forged value from aborting the fleet-day aggregate
+// (overflow of SUM(ws)::bigint, UP-1) or skewing MAX/mean.
+constexpr double kMaxCpuPct = 100.0;
+constexpr std::int64_t kMaxWsBytes = std::int64_t{1} << 50; // 1 PiB
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -146,18 +153,25 @@ std::vector<AppPerfDailyRow> canon_merge_daily(std::vector<AppPerfDailyRow> rows
     //    function the stability side uses, so B1 rows join `(app, version)` later.
     for (auto& r : rows) {
         r.version = yuzu::util::canon_version(r.version);
-        r.cpu_avg = clamp_finite_nonneg(r.cpu_avg);
-        r.cpu_max = clamp_finite_nonneg(r.cpu_max);
+        r.cpu_avg = (std::min)(clamp_finite_nonneg(r.cpu_avg), kMaxCpuPct);
+        r.cpu_max = (std::min)(clamp_finite_nonneg(r.cpu_max), kMaxCpuPct);
         if (r.samples < 0)
             r.samples = 0;
         if (r.instances_max < 0)
             r.instances_max = 0;
         else if (r.instances_max > kMaxInstances)
             r.instances_max = kMaxInstances;
+        // Working set: upper-clamp too (was lower-only). A forged near-INT64_MAX ws
+        // on a popular app would otherwise overflow the rollup's SUM(ws)::bigint and
+        // abort the entire fleet-day roll-up (UP-1).
         if (r.ws_avg_bytes < 0)
             r.ws_avg_bytes = 0;
+        else if (r.ws_avg_bytes > kMaxWsBytes)
+            r.ws_avg_bytes = kMaxWsBytes;
         if (r.ws_max_bytes < 0)
             r.ws_max_bytes = 0;
+        else if (r.ws_max_bytes > kMaxWsBytes)
+            r.ws_max_bytes = kMaxWsBytes;
     }
     // 2. Sort by the merge key so collisions (two raw versions that canon to the
     //    same string) become adjacent.

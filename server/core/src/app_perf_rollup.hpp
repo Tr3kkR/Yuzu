@@ -23,6 +23,9 @@
 #include <string>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
 namespace yuzu::server::pg {
 class PgPool;
 }
@@ -50,6 +53,13 @@ public:
 
     explicit AppPerfRollup(pg::PgPool& pool);
 
+    /// Wire the metrics registry so each `roll_day` emits
+    /// `yuzu_app_perf_rollup_total{outcome}` + `_duration_seconds` and, on success,
+    /// `yuzu_app_perf_rollup_last_success_timestamp` (the alertable liveness signal
+    /// for the sole writer of the 180-day B2 store). Borrowed, non-owning; must
+    /// outlive this rollup. Optional — null = no instrumentation.
+    void set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
+
     /// Re-aggregate one completed UTC day (`day_start` = UTC midnight epoch) from
     /// B1 into B2, idempotent via ON CONFLICT. One lease, schema-qualified across
     /// both schemas, bounded `statement_timeout`. Returns false on lease/SQL error.
@@ -69,6 +79,7 @@ public:
 private:
     pg::PgPool& pool_;
     std::string roll_sql_; ///< the day roll-up INSERT, built once from the bucket constants ($1=day, $2=now)
+    yuzu::MetricsRegistry* metrics_{}; ///< borrowed; set_metrics; null = no instrumentation
 };
 
 } // namespace yuzu::server

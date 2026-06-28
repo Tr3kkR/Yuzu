@@ -16,13 +16,14 @@
 
 namespace yuzu::server {
 
-/// One management group offered in the app-perf scope selector (id + display name
-/// + member count). Sourced from `ManagementGroupStore::list_groups` via the
-/// DexRoutes `GroupListFn` — a plain struct so the renderer stays pure/testable.
+/// One management group offered in the app-perf scope selector (id + display
+/// name). Sourced from `ManagementGroupStore::list_groups` via the DexRoutes
+/// `GroupListFn` — a plain struct so the renderer stays pure/testable. Deliberately
+/// NO member count: counting per group would be an N+1 over the store on every
+/// render (`list_groups` carries no count); the selector shows names only.
 struct DexGroupOption {
     std::string id;
     std::string name;
-    std::int64_t members{0};
 };
 
 /// PURE: the app picker — every application with retained fleet perf history, each

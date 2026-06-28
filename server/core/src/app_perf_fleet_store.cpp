@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -73,7 +74,8 @@ std::int64_t to_i64(const char* s) {
 double to_double(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0.0;
-    return std::strtod(s, nullptr);
+    const double v = std::strtod(s, nullptr);
+    return std::isfinite(v) ? v : 0.0; // a stored Inf never propagates to model/JSON/UI (UP-2)
 }
 
 // Parse a PostgreSQL bigint[] text rendering ("{1,2,3}" / "{}") into a vector.

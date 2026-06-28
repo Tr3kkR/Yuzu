@@ -6489,17 +6489,20 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 if (app.size() > 512) { // defence — app names are short
+                 if (!app_perf_param_valid(app)) { // shared cap + control-char/NUL re-floor
                      res.status = 400;
-                     res.set_content(detail::error_json_a4(400, "parameter 'app' too long", cid),
-                                     "application/json");
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid parameter 'app'", cid,
+                                               "'app' must be <= 512 bytes with no control "
+                                               "characters"),
+                         "application/json");
                      return;
                  }
                  const std::string version =
                      req.has_param("version") ? req.get_param_value("version") : "";
-                 if (version.size() > 256) {
+                 if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
                      res.status = 400;
-                     res.set_content(detail::error_json_a4(400, "parameter 'version' too long", cid),
+                     res.set_content(detail::error_json_a4(400, "invalid parameter 'version'", cid),
                                      "application/json");
                      return;
                  }
@@ -6581,9 +6584,9 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            if (group_id.size() > 256) {
+            if (!app_perf_param_valid(group_id)) { // shared cap + control-char/NUL re-floor
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, "parameter 'group_id' too long", cid),
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'group_id'", cid),
                                 "application/json");
                 return;
             }
@@ -6597,17 +6600,19 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            if (app.size() > 512) {
+            if (!app_perf_param_valid(app)) {
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, "parameter 'app' too long", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(400, "invalid parameter 'app'", cid,
+                                          "'app' must be <= 512 bytes with no control characters"),
+                    "application/json");
                 return;
             }
             const std::string version =
                 req.has_param("version") ? req.get_param_value("version") : "";
-            if (version.size() > 256) {
+            if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
                 res.status = 400;
-                res.set_content(detail::error_json_a4(400, "parameter 'version' too long", cid),
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'version'", cid),
                                 "application/json");
                 return;
             }

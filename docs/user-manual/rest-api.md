@@ -38,7 +38,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
 
 #### `Sec-Audit-Failed` and the behavioural-PII audit posture
 
-Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
+Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `dex.device.app_perf.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
 
 - **REST JSON endpoints fail closed:** they return `503` + `Sec-Audit-Failed: true` and serve **no** data, so a machine integration (CMDB / ServiceNow / agentic worker) never records evidence-less PII as audited. Distinguish this transient, retryable `503` from a non-transient misconfiguration `503` by the presence of the `Sec-Audit-Failed` header.
 - **Dashboard HTMX fragments set-and-proceed:** they set `Sec-Audit-Failed: true` but **still render**, so a transient audit hiccup never blanks a human operator's lens.
@@ -3800,7 +3800,7 @@ Fleet-relative performance percentiles per **cohort** — the distinct values of
 
 #### `GET /api/v1/dex/perf/cohort-diff`
 
-The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf across the fleet — is not here: per-app data is device-drill-only, not fleet render-time.)*
+The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf over time across the fleet — is the separate **app-performance-over-time** surface below: `GET /api/v1/dex/perf/apps` / `app` / `group`, reading the retained Postgres aggregate.)*
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`); `a`, `b` — the two cohort values to compare (**both required**; an empty value is the untagged residual).
@@ -3814,6 +3814,35 @@ The one device list behind every Performance drill: worst devices by a metric (d
 - **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
+### Application performance over time
+
+Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling is opt-in (`procperf_enabled`, off by default); a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
+
+> **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** any `(version, day)` point covering fewer than **10** devices (`kDexCohortFloor`) is suppressed — its stats are withheld and only `device_count` is honest (a sub-floor aggregate would single out an individual). This applies to **both** the fleet and the group endpoints.
+
+#### `GET /api/v1/dex/perf/apps`
+
+The picker: applications that currently have retained fleet data, so a worker discovers which `app=` values are answerable (A2 discoverability).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `{apps[], truncated}` where each app is `{app_name, versions, last_day}` (`versions` = distinct retained versions; `last_day` = most recent UTC-midnight epoch day with data). `truncated: true` when the distinct-app set exceeded the picker cap. `503` (with `retry_after_ms`) when the store provider is unwired or the read degrades. Not audited.
+
+#### `GET /api/v1/dex/perf/app`
+
+The fleet trend for one application — one point per `(version, UTC day)` over the B2 window (**up to 180 days**).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
+- **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale}` (see the percentile/suppression note above; a suppressed point carries `device_count` only with stats cleared). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
+
+#### `GET /api/v1/dex/perf/group`
+
+The same trend shape, aggregated **on-the-fly over one management group's member devices** (B1, **up to 31 days** — shorter than the fleet's 180-day B2 window, so a group series is shorter for the same app).
+
+- **Permission:** `GuaranteedState:Read`. Gated on the **global** permission (like the cohort surface), not the per-device scope gate: the global check excludes management-group-scoped-only principals, so only a fleet-wide-Read caller — who can already compute every fleet/cohort aggregate — reaches it. No cross-operator exposure.
+- **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
+- **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade. Not audited.
+
 #### `GET /api/v1/dex/devices/{id}`
 
 Per-device DEX read model — the machine-readable equivalent of the **DEX** lens on the `/device?id=` dashboard page.
@@ -3824,6 +3853,17 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 - **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, **or** `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
 - **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the behavioral PII is served (audit-on-open). **Fail-closed:** if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves **no** device data — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council).
+
+#### `GET /api/v1/dex/devices/{id}/app-perf`
+
+One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. REST-only — there is deliberately **no** MCP twin (MCP's set-and-proceed audit posture cannot express this fail-closed contract).
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameter:** `app` — optional filter; ≤ 512 bytes, no control characters. Omitted = every resource-significant app-version on the device.
+- **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `400` on an invalid `app`; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
+- **Headers:** `X-Correlation-Id` echoed on every response path.
+- **Audit:** emits `dex.device.app_perf.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the PII is served — kept a separate verb from `dex.device.view` / `dex.device.procperf.query` so usage-class reads stay separately countable for works-council evidence. Fail-closed as above.
 
 #### `POST /api/v1/dex/devices/{id}/live`
 
@@ -5049,6 +5089,16 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+
+**Additional read-only tools (post-Phase-1).** Beyond the Phase 1 set the server also exposes the DEX signal/perf, network, and inventory read tools. The **application-performance-over-time** tools (this release) are:
+
+| Tool | Description |
+|---|---|
+| `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
+| `get_dex_app_perf` | Fleet trend for one application, by version, over time |
+| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices) |
+
+All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is REST-only — there is deliberately no MCP twin (its fail-closed audit contract cannot be expressed on MCP). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

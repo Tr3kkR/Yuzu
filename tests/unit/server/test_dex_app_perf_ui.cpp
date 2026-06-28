@@ -54,7 +54,7 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     v2.device_count = 3;
     v2.suppressed = true;
 
-    std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng", .members = 42}};
+    std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
 
     // Fleet scope (group empty): selector present with "Whole fleet" selected.
     const auto fleet = render_dex_app_perf_trend("chrome.exe", {v1, v2}, "", groups, 10, 30);
@@ -66,13 +66,15 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     CHECK(has(fleet, "n too small")); // v2 suppressed → count only
     CHECK(has(fleet, "name=\"group\""));
     CHECK(has(fleet, ">Whole fleet</option>"));
-    CHECK(has(fleet, "Eng (42)"));
-    CHECK_FALSE(has(fleet, "hx-on")); // CSP: no eval-compiled handlers
+    CHECK(has(fleet, ">Eng</option>")); // group option (names only — no N+1 count)
+    CHECK_FALSE(has(fleet, "hx-on"));   // CSP: no eval-compiled handlers
 
-    // Group scope: subtitle names the group, the works-council floor is captioned.
+    // Group scope: subtitle names the group, the works-council floor + the shorter
+    // (B1, 31-day) window are both captioned.
     const auto grp = render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 30);
     CHECK(has(grp, "Eng"));
     CHECK(has(grp, "works-council"));
+    CHECK(has(grp, "31 days")); // window-divergence disambiguator
 
     // No versions → honest placeholder, never an empty table.
     CHECK(has(render_dex_app_perf_trend("x", {}, "", groups, 10, 30), "No performance history"));

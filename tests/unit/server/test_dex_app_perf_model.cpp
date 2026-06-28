@@ -15,6 +15,7 @@
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_hist.hpp"
 #include "dex_app_perf_model.hpp"
+#include "dex_perf_model.hpp" // kDexCohortFloor
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -92,15 +93,15 @@ TEST_CASE("app_perf_fleet_trend: exact mean, no divide-by-zero", "[dex][app_perf
     row.app_name = "chrome.exe";
     row.version = "124.0.0.1";
     row.day = 1'700'000'000;
-    row.device_count = 4;
-    row.cpu_sum = 20.0; // mean 5.0
+    row.device_count = 20; // >= kDexCohortFloor so the row is NOT floor-suppressed
+    row.cpu_sum = 100.0;   // mean 5.0
     row.cpu_max = 9.0;
-    row.ws_sum = 400;   // mean 100
+    row.ws_sum = 2000;     // mean 100
     row.ws_max = 250;
     row.hist_version = kAppPerfHistVersion;
-    row.cpu_hist = cpu_hist({0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0}); // bucket 4
+    row.cpu_hist = cpu_hist({0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0}); // bucket 4
     row.ws_hist.assign(app_perf_ws_buckets().size() + 1, 0);
-    row.ws_hist[3] = 4;
+    row.ws_hist[3] = 20;
 
     auto trend = app_perf_fleet_trend({row});
     REQUIRE(trend.size() == 1);
@@ -173,6 +174,42 @@ TEST_CASE("app_perf_group_trend: sub-floor points suppress stats, keep device_co
     CHECK_FALSE(pts[1].ws_p95.has_value());
 }
 
+TEST_CASE("app_perf_fleet_trend: sub-floor points are suppressed (singling-out)",
+          "[dex][app_perf]") {
+    // A niche app on FEWER than kDexCohortFloor devices fleet-wide must not emit
+    // exact stats — only the honest count survives (works-council / GDPR
+    // singling-out). The fleet path floors exactly like the group path.
+    AppPerfFleetRow row;
+    row.app_name = "niche.exe";
+    row.version = "1.0";
+    row.day = 1'700'000'000;
+    row.device_count = kDexCohortFloor - 1; // below the floor
+    row.cpu_sum = 50.0;
+    row.cpu_max = 40.0;
+    row.ws_sum = 1000;
+    row.ws_max = 800;
+    row.hist_version = kAppPerfHistVersion;
+    row.cpu_hist = cpu_hist({});
+    row.ws_hist.assign(app_perf_ws_buckets().size() + 1, 0);
+
+    auto trend = app_perf_fleet_trend({row});
+    REQUIRE(trend.size() == 1);
+    CHECK(trend[0].suppressed);
+    CHECK(trend[0].device_count == kDexCohortFloor - 1); // the only honest field
+    CHECK(trend[0].cpu_mean == 0.0);
+    CHECK(trend[0].cpu_max == 0.0);
+    CHECK(trend[0].ws_mean == 0);
+    CHECK_FALSE(trend[0].cpu_p95.has_value());
+
+    // At the floor → full stats, not suppressed.
+    row.device_count = kDexCohortFloor;
+    row.cpu_sum = static_cast<double>(kDexCohortFloor) * 5.0; // mean 5.0
+    auto ok = app_perf_fleet_trend({row});
+    REQUIRE(ok.size() == 1);
+    CHECK_FALSE(ok[0].suppressed);
+    CHECK(ok[0].cpu_mean == 5.0);
+}
+
 TEST_CASE("app_perf_version_summaries: groups by version, latest-day headline + chronological series",
           "[dex][app_perf]") {
     // version "124": two days (older then newer); version "125": one day. The
@@ -240,6 +277,50 @@ TEST_CASE("app_perf_version_summaries: suppressed latest day → count only, ser
     CHECK(s[0].cpu_series[0] == 5.0);
 }
 
+TEST_CASE("app_perf_version_summaries: reversed input still picks latest day + sorts series",
+          "[dex][app_perf]") {
+    AppPerfTrendPoint newer;
+    newer.version = "1";
+    newer.day = 200;
+    newer.device_count = 12;
+    newer.cpu_mean = 6.0;
+    AppPerfTrendPoint older;
+    older.version = "1";
+    older.day = 100;
+    older.device_count = 10;
+    older.cpu_mean = 4.0;
+    // Feed NEWER first (out of order): the reducer must still headline day 200 and
+    // emit the sparkline ascending {4.0, 6.0}.
+    auto s = app_perf_version_summaries({newer, older});
+    REQUIRE(s.size() == 1);
+    CHECK(s[0].latest_day == 200);
+    CHECK(s[0].device_count == 12);
+    CHECK(s[0].cpu_mean == 6.0);
+    REQUIRE(s[0].cpu_series.size() == 2);
+    CHECK(s[0].cpu_series[0] == 4.0); // chronological despite reversed input
+    CHECK(s[0].cpu_series[1] == 6.0);
+}
+
+TEST_CASE("app_perf_version_summaries: all-suppressed version has empty series, honest count",
+          "[dex][app_perf]") {
+    AppPerfTrendPoint d1;
+    d1.version = "1";
+    d1.day = 100;
+    d1.device_count = 2;
+    d1.suppressed = true;
+    AppPerfTrendPoint d2;
+    d2.version = "1";
+    d2.day = 200;
+    d2.device_count = 3;
+    d2.suppressed = true;
+    auto s = app_perf_version_summaries({d1, d2});
+    REQUIRE(s.size() == 1);
+    CHECK(s[0].suppressed);
+    CHECK(s[0].device_count == 3); // latest day's honest count survives
+    CHECK(s[0].day_count == 2);
+    CHECK(s[0].cpu_series.empty()); // every day suppressed → nothing to plot
+}
+
 TEST_CASE("app_perf_version_summaries: hist_stale latest day withholds p95", "[dex][app_perf]") {
     AppPerfTrendPoint d;
     d.version = "x";
@@ -257,8 +338,8 @@ TEST_CASE("app_perf_version_summaries: hist_stale latest day withholds p95", "[d
 
 TEST_CASE("app_perf_fleet_trend: a wrong-scheme row withholds percentiles", "[dex][app_perf]") {
     AppPerfFleetRow row;
-    row.device_count = 2;
-    row.cpu_sum = 10.0; // mean still exact
+    row.device_count = 14;                      // >= kDexCohortFloor (not floor-suppressed)
+    row.cpu_sum = 70.0;                         // mean 5.0 — still exact
     row.hist_version = kAppPerfHistVersion + 1; // a DIFFERENT scheme
     row.cpu_hist = cpu_hist({0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0});
     row.ws_hist.assign(app_perf_ws_buckets().size() + 1, 0);

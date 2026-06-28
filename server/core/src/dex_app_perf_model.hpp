@@ -36,6 +36,20 @@
 
 namespace yuzu::server {
 
+/// Max length of an operator-supplied app/version/group identifier across every
+/// app-perf surface (REST, MCP, dashboard) — one cap so the surfaces agree.
+inline constexpr std::size_t kAppPerfParamCap = 512;
+
+/// PURE: validate an operator-supplied app/version/group identifier before it
+/// reaches a store binding. Rejects oversize (> `kAppPerfParamCap`) or any C0
+/// control byte INCLUDING NUL — a NUL truncates a libpq text parameter, so the
+/// store would silently query a DIFFERENT key than supplied (a cross-surface
+/// semantic divergence, not injection — everything is bound). Does NOT reject
+/// empty: `version=""` is the all-versions sentinel; callers reject an empty
+/// `app`/`group_id` themselves. The ONE validator the three surfaces share so they
+/// cannot drift on the accepted charset/cap.
+[[nodiscard]] bool app_perf_param_valid(std::string_view s);
+
 /// A percentile read off a fixed-bucket histogram. `value` is the LOWER EDGE of
 /// the bucket the percentile falls in (bucket-resolution approximation, not an
 /// exact quantile). `lower_bound` is true iff that bucket is the OPEN top bucket
@@ -75,18 +89,21 @@ struct AppPerfTrendPoint {
     std::optional<HistPctile> ws_p50;
     std::optional<HistPctile> ws_p95;
     bool hist_stale{false};
-    /// Set ONLY by the GROUP path (`app_perf_group_trend`): this (version, day)
-    /// point covered fewer than the statistical floor of devices, so its stats are
-    /// suppressed (means/percentiles cleared) and only `device_count` is honest.
-    /// The fleet path never sets this — a low-N fleet point is a rollout ramp
-    /// (count shown, no identity), not a small named-group slice.
+    /// Set by BOTH the fleet and group paths: this (version, day) point covered
+    /// fewer than the statistical floor (`kDexCohortFloor`) of devices, so its stats
+    /// are suppressed (means/percentiles cleared) and only `device_count` is honest.
+    /// A sub-floor aggregate singles out one operator's behaviour even without an
+    /// agent_id (works-council / GDPR singling-out), whether it is fleet-wide or a
+    /// named-group slice — so the fleet path floors too, not just the group path.
     bool suppressed{false};
 };
 
 /// PURE: reduce retained B2 rows (as returned by `get_app_fleet_perf`, ordered
 /// `(version, day)`) to trend points, one per row. The single place the fleet
-/// mean + percentile + `hist_version` gate is applied, so REST/MCP/UI cannot
-/// drift. Rows with `device_count <= 0` yield zero means (never a divide).
+/// mean + percentile + `hist_version` gate AND the `kDexCohortFloor` suppression
+/// are applied, so REST/MCP/UI cannot drift. Rows with `device_count <= 0` yield
+/// zero means (never a divide); rows with `device_count < kDexCohortFloor` are
+/// suppressed (count only) — a sub-floor fleet aggregate singles out an operator.
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows);
 
@@ -116,18 +133,19 @@ struct AppPerfVersionSummary {
 /// `app_perf_fleet_trend`/`app_perf_group_trend`, ordered `(version, day)`) to one
 /// summary per version. The headline is the latest day; the sparkline series skips
 /// suppressed days (a cleared mean is not a real 0). Versions are returned in
-/// first-seen order. Robust to an unsorted input (it groups by version key).
+/// first-seen order. Robust to unsorted input: it groups by version key, the
+/// headline picks the max day, and the sparkline series is sorted chronologically.
 [[nodiscard]] std::vector<AppPerfVersionSummary>
 app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
 
-/// PURE: the GROUP variant — `app_perf_fleet_trend` over a management group's
-/// on-the-fly aggregate rows, THEN the statistical-floor suppression a named
-/// group needs that the fleet does not. A management group is a set of SPECIFIC
-/// devices, so a small-N group aggregate is de-facto individual behaviour
-/// (works-council); any point with `device_count < floor` is marked
-/// `suppressed` with its means/percentiles cleared (only the honest
-/// `device_count` survives). Reusing `app_perf_fleet_trend` keeps the group and
-/// fleet percentile convention IDENTICAL (one helper, one histogram reading).
+/// PURE: the GROUP variant — the same build + percentile + `hist_version` gate as
+/// the fleet path, with the statistical-floor suppression applied at the caller's
+/// `floor` (the dashboard/REST/MCP pass `kDexCohortFloor`). A management group is a
+/// set of SPECIFIC devices, so a small-N group aggregate is de-facto individual
+/// behaviour (works-council); any point with `device_count < floor` is marked
+/// `suppressed` with its means/percentiles cleared (only the honest `device_count`
+/// survives). Shares the build + floor helpers with `app_perf_fleet_trend`, so the
+/// group and fleet percentile + suppression conventions are IDENTICAL.
 [[nodiscard]] std::vector<AppPerfTrendPoint>
 app_perf_group_trend(const std::vector<AppPerfFleetRow>& rows, std::int64_t floor);
 

@@ -2708,14 +2708,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
         const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
-        // The store binds `app` as a parameter, but keep control bytes + oversize
-        // garbage out of the markup and the provider (mirrors the REST route's
-        // control-char re-floor). NUL would also truncate a bound text param.
-        const bool bad_app =
-            app.empty() || app.size() > 260 ||
-            std::any_of(app.begin(), app.end(),
-                        [](unsigned char c) { return c < 0x20; });
-        if (bad_app) {
+        // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
+        // re-floor the REST and MCP app-perf surfaces apply, so the three agree (a
+        // NUL would truncate the bound libpq text param). `app` must be non-empty.
+        if (app.empty() || !app_perf_param_valid(app) ||
+            (!group.empty() && !app_perf_param_valid(group))) {
             res.status = 400;
             res.set_content(placeholder("Pick an application",
                                         "Choose an application from the list to see its "

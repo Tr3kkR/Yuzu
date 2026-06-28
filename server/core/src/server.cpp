@@ -344,6 +344,44 @@ public:
                           "was held at its prior value — a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
+        // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
+        // Described up front so the HELP/TYPE lines exist on an idle server (a
+        // low-traffic deployment otherwise ships these series invisible until the
+        // first event).
+        metrics_.describe("yuzu_app_perf_ingest_total",
+                          "DEX app-perf daily-sync ingest outcomes by outcome "
+                          "(stored/need_full/dropped/error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_ingest_duration_seconds",
+                          "Time to apply one agent's app-perf daily report (pooled-connection + "
+                          "upsert hold time)",
+                          "histogram");
+        metrics_.describe("yuzu_app_perf_rollup_total",
+                          "B1->B2 app-perf roll-up outcomes per day rolled, by outcome "
+                          "(success/fail)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_rollup_duration_seconds",
+                          "Time to roll one completed UTC day from B1 (per-device daily) into B2 "
+                          "(fleet aggregate + histogram)",
+                          "histogram");
+        metrics_.describe("yuzu_app_perf_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful B1->B2 roll-up. The sole writer of "
+                          "the 180-day B2 trend store; alert when now - this exceeds the roll-up "
+                          "cadence (a stuck/failing rollup thread leaves B2 silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_app_perf_read_degrade_total",
+                          "Authoritative B1 (per-device app-perf) reads that returned a degrade "
+                          "rather than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_fleet_read_degrade_total",
+                          "Authoritative B2 (fleet app-perf) reads that returned a degrade rather "
+                          "than a result, by reason",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_group_read_degrade_total",
+                          "Management-group app-perf trend reads that returned a degrade rather than "
+                          "a result, by reason",
+                          "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -2020,6 +2058,8 @@ public:
             } else {
                 app_perf_fleet_store_->set_metrics(&metrics_);
                 app_perf_rollup_ = std::make_unique<AppPerfRollup>(*pg_pool_);
+                app_perf_rollup_->set_metrics(&metrics_); // rollup-thread liveness signal
+
                 // Group-trend reader (slice 2): on-the-fly B1 aggregate over a
                 // management group's members. Borrows the pool, no schema of its
                 // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
@@ -8457,14 +8497,15 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
-        // The dashboard scope-selector's group list (id + name + member count).
+        // The dashboard scope-selector's group list (id + name only). NO per-group
+        // member count: that would be an N+1 get_members() over the store on every
+        // render (UP-7); the selector needs names, not counts.
         DexRoutes::GroupListFn dex_group_list_fn = [this]() -> std::vector<DexGroupOption> {
             std::vector<DexGroupOption> out;
             if (!mgmt_group_store_)
                 return out;
             for (const auto& g : mgmt_group_store_->list_groups())
-                out.push_back({g.id, g.name,
-                               static_cast<std::int64_t>(mgmt_group_store_->get_members(g.id).size())});
+                out.push_back({g.id, g.name});
             return out;
         };
 

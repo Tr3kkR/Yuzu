@@ -6,6 +6,8 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
@@ -89,7 +91,11 @@ AppPerfRollup::AppPerfRollup(pg::PgPool& pool) : pool_(pool) {
         "(app_name, version, day, device_count, cpu_sum, cpu_max, ws_sum, ws_max, "
         " cpu_hist, ws_hist, hist_version, updated_at) "
         "SELECT app_name, version, day, COUNT(*), SUM(cpu_avg), MAX(cpu_avg), "
-        "       SUM(ws_avg_bytes)::bigint, MAX(ws_avg_bytes), " +
+        // Saturate the working-set SUM at INT64_MAX before the ::bigint cast: even with
+        // the per-row clamp, an extreme fleet-day could overflow bigint and abort the
+        // WHOLE day's roll-up (UP-1). LEAST keeps the statement COMMAND_OK; a saturated
+        // (wrong-but-bounded) sum under attack beats a permanent B2 gap.
+        "       LEAST(SUM(ws_avg_bytes), 9223372036854775807)::bigint, MAX(ws_avg_bytes), " +
         cpu_hist + ", " + ws_hist + ", " + std::to_string(kHistVersion) +
         ", $2::bigint "
         "FROM app_perf_daily_store.app_perf_daily WHERE day = $1::bigint "
@@ -105,6 +111,7 @@ bool AppPerfRollup::roll_day(std::int64_t day_start) {
     if (day_start <= 0)
         return false;
     const std::int64_t now = now_secs();
+    const auto t0 = std::chrono::steady_clock::now();
     const bool ok = pool_.with_txn_for(kRollAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult t = pg::exec_params(
             c, std::string("SET LOCAL statement_timeout = '").append(kRollStatementTimeout).append("'").c_str(),
@@ -116,6 +123,22 @@ bool AppPerfRollup::roll_day(std::int64_t day_start) {
             std::vector<std::string>{std::to_string(day_start), std::to_string(now)});
         return r.status() == PGRES_COMMAND_OK; // INSERT … SELECT → COMMAND_OK
     });
+    // Liveness/health of the SOLE writer of the 180-day B2 trend store: without
+    // this a stuck/failing rollup thread leaves B2 silently stale (sre BLOCKING).
+    // A stale `yuzu_app_perf_rollup_last_success_timestamp` is the alertable signal.
+    if (metrics_ != nullptr) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        metrics_->counter("yuzu_app_perf_rollup_total", {{"outcome", ok ? "success" : "fail"}})
+            .increment();
+        metrics_
+            ->histogram("yuzu_app_perf_rollup_duration_seconds", {},
+                        yuzu::Histogram::seconds_buckets_60s())
+            .observe(secs);
+        if (ok)
+            metrics_->gauge("yuzu_app_perf_rollup_last_success_timestamp", {})
+                .set(static_cast<double>(now));
+    }
     if (!ok)
         spdlog::warn("AppPerfRollup: roll_day failed for day={}", day_start);
     return ok;
