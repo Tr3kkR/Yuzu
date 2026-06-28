@@ -61,6 +61,7 @@
 #include <softpub.h>
 #include <wintrust.h>
 #include <winver.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wintrust.lib")
@@ -377,19 +378,10 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
     std::error_code ec;
 #ifdef _WIN32
     // On Windows, fs::rename may fail if target is open; try ReplaceFile first
-    std::wstring wold, wnew;
-    {
-        auto s = tmp.string();
-        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-        wold.resize(static_cast<size_t>(len));
-        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, wold.data(), len);
-    }
-    {
-        auto s = target.string();
-        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-        wnew.resize(static_cast<size_t>(len));
-        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, wnew.data(), len);
-    }
+    // (#1681) only .c_str() is consumed by ReplaceFileW below, so the shared
+    // NUL-excluded convert is equivalent to the prior -1 convert.
+    const std::wstring wold = yuzu::win::to_wide(tmp.string());
+    const std::wstring wnew = yuzu::win::to_wide(target.string());
     if (fs::exists(target, ec)) {
         if (ReplaceFileW(wnew.c_str(), wold.c_str(), nullptr, 0, nullptr, nullptr))
             return true;
@@ -853,13 +845,7 @@ private:
         // Windows: Use GetNamedSecurityInfo to retrieve the DACL
         PSECURITY_DESCRIPTOR sd = nullptr;
         PACL dacl = nullptr;
-        std::wstring wpath;
-        {
-            std::string p = validated;
-            int len = MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0);
-            wpath.resize(static_cast<size_t>(len));
-            MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, wpath.data(), len);
-        }
+        const std::wstring wpath = yuzu::win::to_wide(validated); // (#1681) .c_str() consumer
 
         DWORD result = GetNamedSecurityInfoW(
             wpath.c_str(), SE_FILE_OBJECT,
@@ -981,12 +967,7 @@ private:
 
 #ifdef _WIN32
         // Convert path to wide string
-        std::wstring wpath;
-        {
-            int len = MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, nullptr, 0);
-            wpath.resize(static_cast<size_t>(len));
-            MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, wpath.data(), len);
-        }
+        const std::wstring wpath = yuzu::win::to_wide(validated); // (#1681) .c_str() consumer
 
         // Set up WINTRUST_FILE_INFO
         WINTRUST_FILE_INFO file_info{};
@@ -1165,12 +1146,7 @@ private:
 
 #ifdef _WIN32
         // Convert to wide string
-        std::wstring wpath;
-        {
-            int len = MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, nullptr, 0);
-            wpath.resize(static_cast<size_t>(len));
-            MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, wpath.data(), len);
-        }
+        const std::wstring wpath = yuzu::win::to_wide(validated); // (#1681) .c_str() consumer
 
         DWORD dummy = 0;
         DWORD size = GetFileVersionInfoSizeW(wpath.c_str(), &dummy);
@@ -1212,11 +1188,9 @@ private:
                 UINT val_len = 0;
                 if (VerQueryValueW(buf.data(), sub_block.c_str(),
                                    reinterpret_cast<LPVOID*>(&val), &val_len) && val && val_len > 0) {
-                    int mb_len = WideCharToMultiByte(CP_UTF8, 0, val, -1, nullptr, 0, nullptr, nullptr);
-                    std::string result(static_cast<size_t>(mb_len), '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, val, -1, result.data(), mb_len, nullptr, nullptr);
-                    while (!result.empty() && result.back() == '\0') result.pop_back();
-                    return result;
+                    // (#1681) a -1 convert yields exactly one trailing NUL, which
+                    // from_wide drops — equivalent to the old strip-all-trailing loop.
+                    return yuzu::win::from_wide(val);
                 }
                 return {};
             };

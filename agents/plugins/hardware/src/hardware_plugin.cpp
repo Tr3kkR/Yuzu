@@ -42,6 +42,7 @@
 #include <windows.h>
 #include <comdef.h>
 #include <wbemidl.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -158,12 +159,7 @@ public:
         VARIANT vt;
         VariantInit(&vt);
         if (SUCCEEDED(obj->Get(prop, 0, &vt, nullptr, nullptr)) && vt.vt == VT_BSTR && vt.bstrVal) {
-            int len = WideCharToMultiByte(CP_UTF8, 0, vt.bstrVal, -1, nullptr, 0, nullptr, nullptr);
-            std::string result(len > 0 ? len - 1 : 0, '\0');
-            if (len > 0) {
-                WideCharToMultiByte(CP_UTF8, 0, vt.bstrVal, -1, result.data(), len, nullptr,
-                                    nullptr);
-            }
+            std::string result = yuzu::win::from_wide(vt.bstrVal); // (#1681) -1 convert, NUL dropped
             VariantClear(&vt);
             return result;
         }

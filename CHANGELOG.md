@@ -132,6 +132,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
+  Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
+  leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
+  agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
+  `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
+  `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
+  `tar_dns_collector`, `tar_proc_etw`, `tar_proc_perf`, `tar_arp_collector`) now delegate to
+  `yuzu::win::{to_wide,from_wide,reg_sz_to_utf8}`. `temp_file` (caller-buffer contract) and
+  `installed_apps` (interior-NUL semantic divergence) deliberately retain their own copies.
+  Behaviour-preserving; no user-facing change.
 - **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
   governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
   created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
@@ -200,7 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
   picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
   `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
-  Windows-only header `agents/plugins/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  Windows-only header `agents/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
   plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
   **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
   of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
