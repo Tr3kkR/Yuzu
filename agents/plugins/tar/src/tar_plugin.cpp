@@ -527,12 +527,12 @@ public:
         if (db_->get_config("module_enabled", "").empty()) {
             db_->set_config("module_enabled", "false");
         }
-        // #1620: seed the opt-in per-user software scope to "false" so tar.status /
-        // configure read a concrete value (the `software` SOURCE stays default-on for
-        // machine-scope inventory; only the profile-name-bearing per-user scope is
-        // off until an operator opts in).
-        if (db_->get_config("software_user_scope_enabled", "").empty()) {
-            db_->set_config("software_user_scope_enabled", "false");
+        // #1620: seed the opt-in software_enabled key (the `software` source is
+        // default-off, like module) so the configure / retention /
+        // retention-paused-list machinery (which default a MISSING key to ENABLED
+        // via source_enabled) agrees with the collector's explicit default-off.
+        if (db_->get_config("software_enabled", "").empty()) {
+            db_->set_config("software_enabled", "false");
         }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
@@ -1252,16 +1252,15 @@ private:
     // Diffs the installed-software inventory and records install/remove/upgrade
     // events. Runs on the dedicated tar.software trigger (hourly default).
     //
-    // Scope: machine-wide inventory (HKLM Uninstall) is collected whenever the
-    // source is enabled (default on). Per-user inventory (HKU\<SID>, mounting
-    // NTUSER.DAT for logged-off profiles) is gathered only when
-    // software_user_scope_enabled is on — it carries profile names (PII) and is
-    // opt-in under the works-council posture (#1620).
+    // Scope: MACHINE-WIDE inventory only (HKLM Uninstall). The source carries no
+    // user identity — an event is the host's software, never a Windows profile's —
+    // so there is no per-user / NTUSER.DAT / hive-mount path (#1620). The source is
+    // opt-in (default off): an operator turns it on per host.
     //
-    // The enumeration — which on Windows walks the registry and may mount NTUSER.DAT
-    // hives for logged-off profiles — runs OUTSIDE collect_mu_ so a slow registry
-    // pass cannot stall collect_fast/slow/fleet_snapshot under that shared lock
-    // (gov UP-6, mirrors collect_perf). Only the state read-diff-write is locked.
+    // The enumeration — which on Windows walks the registry — runs OUTSIDE
+    // collect_mu_ so a slow registry pass cannot stall collect_fast/slow/
+    // fleet_snapshot under that shared lock (gov UP-6, mirrors collect_perf). Only
+    // the state read-diff-write is locked.
     //
     // Cold start: the FIRST run on a host (no prior "software" state) seeds the
     // baseline WITHOUT emitting events — an 'installed' event must mean "installed
@@ -1280,15 +1279,6 @@ private:
             return 0;
         }
 
-        // Cap on logged-off NTUSER.DAT mounts during the one-time baseline (steady
-        // state never mounts). Bounds the cold-start I/O on many-profile hosts.
-        int max_mounts = 100;
-        try {
-            max_mounts = std::stoi(db_->get_config("software_max_hive_mounts", "100"));
-        } catch (...) {}
-        if (max_mounts < 0)
-            max_mounts = 0;
-
         std::lock_guard lock(software_collect_mu_); // serialises concurrent collect_software only
         // #538/#1620: the source_enabled gate above ran WITHOUT this lock; a
         // `tar.configure software_enabled=false` (do_configure) takes this SAME
@@ -1300,48 +1290,20 @@ private:
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
-        // Per-user (HKU\<SID> / NTUSER.DAT, profile-name-bearing) collection is
-        // OPT-IN (#1620): machine-scope inventory is device asset data and ships on
-        // by default, but the per-user scope is personal data under the works-council
-        // posture, so it is gated behind software_user_scope_enabled (default false).
-        // do_configure clears the baseline under THIS lock whenever the toggle flips,
-        // so a scope change cold-starts cleanly rather than emitting an install/remove
-        // storm.
-        const bool user_scope =
-            db_->get_config("software_user_scope_enabled", "false") == "true";
 
         auto prev_json = db_->get_state("software");
 
-        // Enumerate THIS tick's inventory. The cold-start baseline (no prior state)
-        // is the ONLY path that mounts logged-off hives (enumerate_software, capped at
-        // max_mounts); steady-state ticks read machine + currently-loaded user hives
-        // only and carry logged-off users forward inside the core. With per-user scope
-        // OFF every leg is machine-only — no hive is read, no profile name is touched.
-        // The enumeration runs OUTSIDE collect_mu_ (we hold only software_collect_mu_),
-        // so a slow registry pass cannot stall collect_fast/slow/fleet_snapshot.
+        // Enumerate THIS tick's machine-scope inventory (HKLM Uninstall, 64-bit +
+        // WOW6432Node). The enumeration runs OUTSIDE collect_mu_ (we hold only
+        // software_collect_mu_), so a slow registry pass cannot stall
+        // collect_fast/slow/fleet_snapshot.
         std::vector<yuzu::tar::SoftwareInfo> enumerated;
-        std::vector<std::string> scanned_users;
-        if (prev_json.empty()) {
-            if (user_scope) {
-                enumerated = yuzu::tar::enumerate_software(max_mounts);
-            } else {
-                yuzu::tar::enumerate_machine_software(enumerated);
-            }
-        } else {
-            yuzu::tar::enumerate_machine_software(enumerated);
-            if (user_scope) {
-                auto loaded = yuzu::tar::enumerate_loaded_user_software();
-                for (auto& e : loaded.entries)
-                    enumerated.push_back(std::move(e));
-                scanned_users = std::move(loaded.scanned_users);
-            }
-        }
+        yuzu::tar::enumerate_machine_software(enumerated);
 
-        // Pure classify + diff (cold-start seed / corrupt-skip / steady carry-forward),
-        // unit-tested off-Windows in test_tar_software.cpp.
+        // Pure classify + diff (cold-start seed / corrupt-skip / steady), unit-tested
+        // off-Windows in test_tar_software.cpp.
         const auto snap_id = next_snapshot_id();
-        auto result = yuzu::tar::software_collect_core(prev_json, std::move(enumerated),
-                                                       scanned_users, user_scope, ts, snap_id);
+        auto result = yuzu::tar::software_collect_core(prev_json, std::move(enumerated), ts, snap_id);
         using Kind = yuzu::tar::SoftwareCollectResult::Kind;
         switch (result.kind) {
         case Kind::kCorruptSkip:
@@ -1432,19 +1394,11 @@ private:
         // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
         // of the last collect_software tick (0 if it has never run) — the operator's
         // signal that the hourly trigger is alive even on a host with no software
-        // changes (where software_live_rows stays 0). software_max_hive_mounts caps
-        // the one-time cold-start NTUSER.DAT mounts; steady-state ticks never mount.
+        // changes (where software_live_rows stays 0).
         ctx.write_output(std::format("config|software_interval_seconds|{}",
                                      db_->get_config("software_interval_seconds", "3600")));
-        ctx.write_output(std::format("config|software_max_hive_mounts|{}",
-                                     db_->get_config("software_max_hive_mounts", "100")));
         ctx.write_output(std::format("config|software_last_run_ts|{}",
                                      db_->get_config("software_last_run_ts", "0")));
-        // Per-user scope opt-in (#1620): machine-scope inventory is always collected
-        // when the source is enabled; this gates the profile-name-bearing per-user
-        // scope. Default false (works-council posture).
-        ctx.write_output(std::format("config|software_user_scope_enabled|{}",
-                                     db_->get_config("software_user_scope_enabled", "false")));
 
         // Mechanism actually in force. Only polling is wired today regardless of
         // the configured method (kPlanned methods like etw / endpoint_security are
@@ -1869,8 +1823,6 @@ private:
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
-        auto software_max_mounts = params.get("software_max_hive_mounts");
-        auto software_user_scope = params.get("software_user_scope_enabled");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -1881,11 +1833,6 @@ private:
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
         bool software_provided = false;
-        int software_mounts = 0;
-        bool software_mounts_provided = false;
-        // Per-user software scope opt-in (#1620) — a tri-state-validated bool.
-        bool software_user_scope_provided = false;
-        std::string software_user_scope_val;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -1940,30 +1887,6 @@ private:
             if (!parsed || software_secs < 0 ||
                 (software_secs > 0 && (software_secs < 300 || software_secs > 86400))) {
                 ctx.write_output("error|software_interval must be 0 (disable) or 300-86400 seconds");
-                return 1;
-            }
-        }
-
-        if (!software_max_mounts.empty()) {
-            software_mounts_provided = true;
-            bool parsed = false;
-            try {
-                software_mounts = std::stoi(std::string{software_max_mounts});
-                parsed = true;
-            } catch (...) {}
-            // 0 = never mount logged-off hives at cold-start (loaded hives only);
-            // upper bound guards against a typo causing a huge one-time I/O storm.
-            if (!parsed || software_mounts < 0 || software_mounts > 100000) {
-                ctx.write_output("error|software_max_hive_mounts must be 0-100000");
-                return 1;
-            }
-        }
-
-        if (!software_user_scope.empty()) {
-            software_user_scope_provided = true;
-            software_user_scope_val = std::string{software_user_scope};
-            if (software_user_scope_val != "true" && software_user_scope_val != "false") {
-                ctx.write_output("error|software_user_scope_enabled must be 'true' or 'false'");
                 return 1;
             }
         }
@@ -2122,36 +2045,6 @@ private:
         if (software_provided) {
             db_->set_config("software_interval_seconds", std::to_string(software_secs));
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
-            changed = true;
-        }
-        if (software_mounts_provided) {
-            db_->set_config("software_max_hive_mounts", std::to_string(software_mounts));
-            ctx.write_output(std::format("config|software_max_hive_mounts|{}", software_mounts));
-            changed = true;
-        }
-        if (software_user_scope_provided) {
-            // #1620: a per-user scope CHANGE must cold-start the software baseline so
-            // neither enabling (pre-existing per-user apps) nor disabling (the user
-            // rows we stop collecting) emits a spurious install/remove storm. Clear
-            // the baseline FIRST and flip the flag only if the clear persisted —
-            // fail-safe ordering mirroring apply_source_enabled_transition (#538): a
-            // failed clear leaves the scope unchanged with a valid baseline rather
-            // than a new scope diffing against a stale one. Same software_collect_mu_
-            // the collector takes for its read-diff-write (see do_collect_software);
-            // taking only the inner lock respects the collect_mu_ ≺ software_collect_mu_
-            // order. An idempotent set (same value) skips the clear entirely.
-            auto prev_scope = db_->get_config("software_user_scope_enabled", "false");
-            if (prev_scope != software_user_scope_val) {
-                std::lock_guard sw_lock(software_collect_mu_);
-                if (!db_->set_state(std::string{yuzu::tar::diff_state_key("software")}, "")) {
-                    ctx.write_output("error|software_user_scope_enabled change failed: could not "
-                                     "clear collection baseline (database busy); scope unchanged");
-                    return 1;
-                }
-                db_->set_config("software_user_scope_enabled", software_user_scope_val);
-            }
-            ctx.write_output(
-                std::format("config|software_user_scope_enabled|{}", software_user_scope_val));
             changed = true;
         }
         if (have_redaction) {

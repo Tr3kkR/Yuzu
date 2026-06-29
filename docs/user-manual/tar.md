@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors these categories of system activity. Processes, network connections, services, user sessions, software, and device performance are **always-on**; **ARP** and **DNS** are opt-in (off by default), Windows-only today (ADR-0015). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
+TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, and **DNS** are opt-in (off by default), Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality — are covered under Configuration and the OS compatibility matrix below.
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -21,9 +21,9 @@ TAR monitors these categories of system activity. Processes, network connections
 
 Every source except **Performance** takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
-The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures **machine-wide** installs (the HKLM Uninstall keys, 64-bit and 32-bit) by default, and **per-user** installs (each profile's `HKU\<SID>` Uninstall key) only when `software_user_scope_enabled` is turned on; the `scope` column distinguishes the two and `user` carries the profile name for per-user rows. It runs on its own slower trigger (hourly by default — installs are infrequent) and is **on by default** for machine-wide inventory (asset-management and vulnerability-relevance data with no user identity, like Services and User sessions). Per-user inventory is **off by default** because a profile name is personal data under the works-council posture (see `software_user_scope_enabled` below). It records names, versions, and publisher only — no command lines, no usage data.
+The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures **machine-wide** installs only (the HKLM Uninstall keys, 64-bit and 32-bit) — **machine scope only, no user identity / no PII**. It runs on its own slower trigger (hourly by default — installs are infrequent) and is **off by default** (opt-in): enable it per host with `software_enabled=true` (see `software_enabled` below). The cautious default reflects the posture for a new capture source; the inventory it gathers is asset-management and vulnerability-relevance data with no user identity, like Services and User sessions. It records names, versions, and publisher only — no command lines, no usage data.
 
-Per-user capture (when enabled) is efficient by design: a logged-off user cannot install software, so **steady-state scans read only the machine scope and currently-logged-on profiles' hives and carry each logged-off user's last-known inventory forward** — no `NTUSER.DAT` mounting per tick (which would be a real I/O cost on multi-profile RDS/Citrix hosts) and no spurious churn when users log on and off. Logged-off profiles are mounted **only once, at the cold-start baseline**, bounded by `software_max_hive_mounts` (default 100); a profile beyond that cap is not mounted — instead its software is first captured the next time that user logs on, at which point its then-installed apps are recorded as `installed` events (so on a host with more than `software_max_hive_mounts` never-recently-logged-on profiles, raise the cap if you need their inventory dated to the baseline rather than to first logon). The **first run on a host seeds the baseline silently** (it records no events) so an `installed` event always means "installed now", not "was already present when the agent started watching". Linux (dpkg/rpm) and macOS (pkgutil) collectors are planned; the `$Software_*` tables are queryable but stay empty on those platforms until then.
+The **first run on a host seeds the baseline silently** (it records no events) so an `installed` event always means "installed now", not "was already present when the agent started watching". Linux (dpkg/rpm) and macOS (pkgutil) collectors are planned; the `$Software_*` tables are queryable but stay empty on those platforms until then.
 
 The **Performance** source is different: it is a fixed-cadence *scalar sample*, not an event diff. Each 30-second tick records one row of derived device metrics — CPU busy %, memory used % and commit-charge %, per-IO disk service time (µs) and read/write throughput, and non-loopback network rx/tx throughput. It is collected from raw kernel counters (no PDH, no WMI, no shell-out) and, like all TAR data, **stays on the device** — only aggregates leave the edge. On Windows it is fully supported; Linux and macOS collectors are planned. The first sample after the agent starts is a baseline (it establishes the counter reference and records no row); every subsequent tick records one sample.
 
@@ -100,15 +100,13 @@ Use the `configure` action to adjust TAR behavior.
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
 | `software_interval` | `0` or 300-86400 | 3600 | Seconds between software install/uninstall scans. `0` disables the scan trigger entirely (no collection until re-set or agent restart). |
-| `software_max_hive_mounts` | 0-100000 | 100 | Max logged-off-user `NTUSER.DAT` hives mounted during the **one-time cold-start baseline** (steady-state scans never mount; mounting happens only when `software_user_scope_enabled` is on). `0` = baseline only the machine scope and logged-on users; logged-off users are picked up when they next log on. Raise on a host where many never-recently-logged-on profiles must be baselined immediately. |
 | `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive). **Merged with** the built-in defaults — added to, never replacing them; the defaults cannot be disabled. |
 | `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
 | `user_enabled` | `true` / `false` | `true` | Toggle the user-session collector on this host |
 | `perf_enabled` | `true` / `false` | `true` | Toggle the device performance sampler on this host |
-| `software_enabled` | `true` / `false` | `true` | Toggle the software install/uninstall source (`software` → `$Software_*`) on this host. **On by default** — machine-wide software inventory is device asset-management and vulnerability-relevance data with no user identity. On Windows it covers machine-wide installs (HKLM); per-user installs are added only when `software_user_scope_enabled` is also on. Disabling leaves existing rows queryable. |
-| `software_user_scope_enabled` | `true` / `false` | **`false`** | Additionally collect **per-user** installed software (Windows `HKU\<SID>`, mounting `NTUSER.DAT` for logged-off profiles). **Off by default** — per-user inventory is attributed to a Windows profile name, which is personal data under the works-council posture (like `procperf` / `netqual` / `dns`); machine-wide inventory stays on regardless. No effect unless `software_enabled` is on. Changing it re-baselines the source on the next tick (no spurious install/remove storm). |
+| `software_enabled` | `true` / `false` | **`false`** | Toggle the software install/uninstall source (`software` → `$Software_*`) on this host. **Off by default** (opt-in) — a cautious posture for a new capture source. On Windows it covers **machine-wide** installs (HKLM) only: **machine scope only, no user identity / no PII** — asset-management and vulnerability-relevance data like Services and User sessions. Set to `true` to opt in. Disabling leaves existing rows queryable. |
 | `procperf_enabled` | `true` / `false` | **`false`** | Toggle the per-application top-N sampler on this host. **Off by default** — per-application CPU/working-set reveals which applications run on a device, which is usage-class telemetry under the works-council posture (device-level `perf` carries no per-app identity and stays on by default). Set to `true` to opt in; independent of `perf_enabled`. |
 | `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`) on this host. **Off by default** — per-connection quality is usage-class telemetry under the works-council posture. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux only. Set to `true` to opt in; independent of `tcp_enabled`. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
@@ -156,7 +154,7 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | planned (`procfs`) — `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`. Records nothing until wired. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
 | **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | planned (`procfs`) — `/proc/<pid>/stat` utime+stime + VmRSS. Records nothing until wired. | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 | **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
-| **software** | supported (`registry`), **machine scope on by default** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (machine `scope`). Per-user installs (each profile's `HKU\<SID>` Uninstall key, mounting `NTUSER.DAT` for logged-off users — per-user `scope`, profile name in `user`) are collected **only when `software_user_scope_enabled` is on** (opt-in; profile name is personal data). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
+| **software** | supported (`registry`), **opt-in (off by default)** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (**machine scope only, no user identity / no PII**). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
 | **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
 | **dns** | supported (`dnsapi`), **opt-in (off by default)** — `DnsGetCacheDataTable` + cache-only `DnsQuery_W`: name/record_type/data/TTL (ADR-0015). Device-level resolver-cache state; **no per-process attribution**. | planned (`systemd-resolved`) — resolve1 D-Bus / `/etc/hosts` fallback (constrained). Records nothing until wired. | planned (`dscacheutil`) — subprocess; TTL unavailable (`ttl_remaining_s = -1`, constrained). Records nothing until wired. |
 
@@ -236,10 +234,10 @@ config|module_enabled|false
 config|module_paused_at|0
 config|module_live_rows|0
 config|module_oldest_ts|0
-config|software_enabled|true
+config|software_enabled|false
 config|software_paused_at|0
-config|software_live_rows|36
-config|software_oldest_ts|1710950000
+config|software_live_rows|0
+config|software_oldest_ts|0
 config|arp_enabled|false
 config|arp_paused_at|0
 config|arp_live_rows|0
@@ -251,16 +249,14 @@ config|dns_oldest_ts|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
-config|software_max_hive_mounts|100
 config|software_last_run_ts|1711050000
-config|software_user_scope_enabled|false
 ```
 
 A block is emitted for every capture source. The opt-in sources report
-`<source>_enabled|false` on a fresh agent — `module` (shown above),
-`procperf`, `netqual`, `arp`, and `dns` are off by default and must be enabled
-explicitly via `configure` (see the configuration table above). The default-ON
-sources — `process`, `tcp`, `service`, `user`, `perf`, and `software` — report
+`<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
+above), `procperf`, `netqual`, `arp`, and `dns` are off by default and must be
+enabled explicitly via `configure` (see the configuration table above). The
+default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on
 Linux/macOS), so on a Linux or macOS agent `arp_enabled|true` / `dns_enabled|true`
@@ -403,19 +399,19 @@ TAR is designed for minimal performance overhead:
 > `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
 > is expected, not a fault.
 
-> **Upgrade note (new `software` source — machine scope ON by default).** This
-> release adds the `software` install/uninstall source, which ships **on by
-> default** on Windows for **machine-wide** inventory (HKLM Uninstall —
-> asset-management / vulnerability-relevance data with no user identity, like
-> Services and User sessions). On upgrade, `tar.status` gains a `config|software_*`
+> **Upgrade note (new `software` source — OFF by default).** This
+> release adds the `software` install/uninstall source, which ships **off by
+> default** (opt-in) — a cautious posture for a new capture source. On Windows it
+> captures **machine-wide** inventory (HKLM Uninstall —
+> asset-management / vulnerability-relevance data, **machine scope only, with no
+> user identity / no PII**, like Services and User sessions). On upgrade,
+> `tar.status` gains a `config|software_*`
 > block per agent (Windows: live values; Linux/macOS: zero rows, collector planned)
-> **plus** the global `software_interval_seconds`, `software_max_hive_mounts`,
-> `software_last_run_ts`, and `software_user_scope_enabled` lines. **Automation
+> **plus** the global `software_interval_seconds` and `software_last_run_ts`
+> lines. **Automation
 > that parses `tar.status` by field count or terminal-field detection must be
-> updated** to tolerate these additional lines. **Per-user software (the
-> `scope=user` rows, which include the Windows profile name) is OFF by default** —
-> it is personal data under the works-council posture, so opt in per host with
-> `software_user_scope_enabled=true`. See
+> updated** to tolerate these additional lines. The source is **off by default**,
+> so opt in per host with `software_enabled=true`. See
 > `docs/enterprise-readiness-soc2-first-customer.md` for the data-handling
 > classification.
 
@@ -504,7 +500,7 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 
 The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 
-The `$Software_*` tables are populated on **Windows** (on by default); on **Linux/macOS** they are registered and queryable but empty until those collectors ship.
+The `$Software_*` tables are populated on **Windows** when the source is enabled (off by default — opt in with `software_enabled=true`); on **Linux/macOS** they are registered and queryable but empty until those collectors ship.
 
 - **Live** tables hold the most recent raw events with a row cap (oldest rows are evicted): **5000 rows** for TCP / Service / User, and **100000 rows for `$Process_Live`** — raised because the Windows ETW feeder is event-driven (every start/stop, including short-lived processes) and fills a 5000-row window far faster than the old 60-second poll did, so a larger raw window keeps a meaningful history before rows roll up into the hourly/daily/monthly count tiers. **Exception: `$Perf_Live` and `$ProcPerf_Live` are time-based (7 days), not row-capped** — a fixed-cadence sampler keeps a *time window*, so raising `perf_interval_seconds` must not shrink the history it covers.
 - **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours (perf/procperf hourly: 31 days).
@@ -531,10 +527,10 @@ SELECT name, MAX(cpu_max) AS peak, AVG(cpu_avg) AS typical
 FROM $ProcPerf_Hourly GROUP BY name ORDER BY peak DESC LIMIT 10
 ```
 
-**Software tables:** `ts`, `name`, `version`, `prev_version` (populated only for `upgraded`), `publisher`, `scope` (`machine`/`user`), `user` (profile name for per-user rows; empty for machine scope), `install_date`, `action` (installed/removed/upgraded). The daily/monthly tiers aggregate per `(name, scope)` with `install_count`, `remove_count`, `upgrade_count`. Example — everything installed or removed on a device in the last 30 days:
+**Software tables:** `$Software_Live` carries `ts`, `snapshot_id`, `action` (installed/removed/upgraded), `name`, `version`, `prev_version` (populated only for `upgraded`), `publisher`, `install_date` — **machine scope only, no user identity / no PII**. The daily/monthly tiers carry `day_ts` (or `month_ts`), `name`, `install_count`, `remove_count`, `upgrade_count`. Example — everything installed or removed on a device in the last 30 days:
 
 ```sql
-SELECT ts, action, name, version, prev_version, scope, user
+SELECT ts, action, name, version, prev_version, publisher
 FROM $Software_Live
 WHERE action IN ('installed','removed','upgraded')
 ORDER BY ts DESC

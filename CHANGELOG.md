@@ -201,10 +201,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **TAR `tar.configure` now advertises every per-source enable toggle and the software
   tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
-  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`
-  and `software_max_hive_mounts`) were already accepted by the agent but missing from the
+  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
+  were already accepted by the agent but missing from the
   build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
-  discover or tune them (notably the privacy-relevant disable toggles for the default-on
+  discover or tune them (notably the enable toggle for the opt-in, off-by-default
   `software` source). No runtime behaviour change — the params were always honoured; they
   are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
   trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
@@ -280,8 +280,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
   now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
   (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
-  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
-  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  round-trip intact. Affects both machine-scope registry read paths (`list`, `query`). The ingest seam's UTF-8 scrub remains as
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
 
@@ -336,27 +335,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TAR — software install/uninstall capture source (`$Software`).** A new TAR
   warehouse source records application **installed / removed / upgraded** events over
   time by diffing the installed-software inventory on a dedicated hourly trigger
-  (`tar.software`; tune or disable via `software_interval`, `0`–86400 s). On Windows it
-  captures **machine-wide** (HKLM Uninstall 64-bit + WOW6432Node) installs by default, and
-  **per-user** installs (each profile's `HKU\<SID>` Uninstall key) only when
-  `software_user_scope_enabled` is set; the `scope` column distinguishes them and `user`
-  carries the profile name. Tiers: `$Software_Live` (5000 rows) →
-  `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`(name, scope)`
-  install/remove/upgrade counts. **Machine scope is on by default** (device
-  asset-management / vulnerability-relevance data with no user identity, like Services and
-  User sessions; toggle with `software_enabled`). **Per-user scope is off by default**
-  (`software_user_scope_enabled`) because a Windows profile name is personal data under the
-  works-council posture — changing the toggle re-baselines the source so neither enabling
-  nor disabling emits a spurious install/remove storm. Names, versions, and publisher only
-  — no command lines or usage data. Per-user capture (when enabled) is efficient:
-  **steady-state scans read only the machine scope and logged-on hives and carry
-  logged-off users forward** (no per-tick `NTUSER.DAT` mounting — the RDS/Citrix I/O
-  cost — and no logon/logoff churn); logged-off hives are mounted only once at the
-  cold-start baseline, bounded by `software_max_hive_mounts` (default 100). The first
+  (`tar.software`; tune the cadence via `software_interval`, `0`–86400 s). On Windows it
+  captures **machine-scope only** (HKLM Uninstall 64-bit + WOW6432Node) installs — no
+  per-user enumeration, no Windows profile names, and **no user identity / no PII**.
+  Tiers: `$Software_Live` (5000 rows) →
+  `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`name`
+  install/remove/upgrade counts. **The source is off by default** (opt-in) — an operator
+  enables it per host with `tar.configure software_enabled=true`. Even though the
+  machine-scope data carries no user identity (device asset-management /
+  vulnerability-relevance data, like Services and User sessions), a brand-new capture
+  source ships disabled out of caution so a host only collects it once the operator has
+  decided to; enabling or disabling re-baselines the source so neither emits a spurious
+  install/remove storm. Names, versions, and publisher only
+  — no command lines or usage data. The first
   scan on a host **seeds the baseline silently** so an `installed` event always means
   "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
   `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
-  `software_max_hive_mounts` / `software_last_run_ts` / `software_user_scope_enabled` lines
+  `software_last_run_ts` lines
   — update any field-count parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
   `$Software_*` tables are queryable but empty there until then. Disabling the source
   (`software_enabled=false`) is **atomic with the collector** — it holds the same

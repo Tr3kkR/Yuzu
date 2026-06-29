@@ -113,11 +113,11 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user, software, arp, dns. software is part of the default
-          feed; arp/dns are opt-in device-state sources (ADR-0015) reached only
-          by an explicit filter — they are excluded from the default
-          (empty-filter) feed. Leave empty to return the core
-          process/network/service/user/software types.
+          service, user, software, arp, dns. software joins the default feed once
+          enabled (its collection is off by default — see software_enabled); arp/dns
+          are opt-in device-state sources (ADR-0015) reached only by an explicit
+          filter — they are excluded from the default (empty-filter) feed. Leave
+          empty to return the core process/network/service/user/software types.
         validation:
           enum: [process, network, service, user, software, arp, dns, ""]
       limit:
@@ -437,28 +437,14 @@ spec:
         displayName: Software Inventory Collector Enabled
         description: >
           Enable or disable the software install/uninstall source (software →
-          $Software_*) on this agent. **On by default** — machine-wide
-          installed-software inventory (HKLM Uninstall) is device asset-management
-          and vulnerability-relevance data and carries no user identity. Per-user
-          installs (which carry a profile name) are NOT collected unless
-          software_user_scope_enabled is also turned on. Names, versions, and
-          publisher only. See process_enabled for the disable semantics (atomic,
-          existing rows remain queryable, clean re-baseline on re-enable). Requires
-          agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
-        validation:
-          pattern: "^(true|false)$"
-      software_user_scope_enabled:
-        type: string
-        displayName: Software Per-User Scope Enabled
-        description: >
-          Additionally collect PER-USER installed software (Windows HKU\<SID>,
-          mounting NTUSER.DAT for logged-off profiles) under the software source.
-          **Off by default** — per-user inventory is attributed to a Windows
-          profile name, which is personal data under the works-council posture
-          (like procperf / netqual / dns); machine-wide inventory above stays on
-          regardless. Has no effect unless software_enabled is also on. Changing
-          this re-baselines the source on the next tick (no spurious install/remove
-          storm). Requires agent v0.12.0+. Valid: "true" | "false".
+          $Software_*) on this agent. **Off by default** — turn it on per host to
+          record machine-wide installed-software inventory (HKLM Uninstall), which
+          is device asset-management and vulnerability-relevance data and carries
+          NO user identity (machine scope only — no per-user / profile-name data).
+          Names, versions, and publisher only. See process_enabled for the disable
+          semantics (atomic, existing rows remain queryable, clean re-baseline on
+          re-enable). Requires agent v0.12.0+; older agents silently ignore. Valid:
+          "true" | "false".
         validation:
           pattern: "^(true|false)$"
       software_interval:
@@ -468,20 +454,8 @@ spec:
           Interval in seconds for the software install/uninstall sampler
           (tar.software trigger). "0" disables the trigger entirely; any other
           value must be 300-86400 (5 minutes - 1 day). Default: 3600 (hourly).
-          Installs are rare and the per-user path mounts NTUSER.DAT hives, so this
-          runs on its own slower trigger. Requires agent v0.12.0+.
-        validation:
-          pattern: "^[0-9]+$"
-      software_max_hive_mounts:
-        type: string
-        displayName: Software Cold-Start Hive Mount Cap
-        description: >
-          Maximum number of logged-off user NTUSER.DAT hives to mount during the
-          one-time cold-start software baseline on this host (steady-state ticks
-          never mount). Bounds the cold-start I/O on many-profile RDS/Citrix
-          hosts; profiles beyond the cap are baselined lazily when their user next
-          logs on. "0" never mounts logged-off hives (loaded hives only). Valid
-          range: 0-100000. Default: 100. Requires agent v0.12.0+.
+          Installs are rare, so this runs on its own slower trigger. Requires
+          agent v0.12.0+.
         validation:
           pattern: "^[0-9]+$"
       arp_enabled:

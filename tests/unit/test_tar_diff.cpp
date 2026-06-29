@@ -452,14 +452,11 @@ TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhe
 // =============================================================================
 
 namespace {
-SoftwareInfo sw(std::string name, std::string version, std::string scope = "machine",
-                std::string user = "") {
+SoftwareInfo sw(std::string name, std::string version) {
     SoftwareInfo s;
     s.name = std::move(name);
     s.version = std::move(version);
     s.publisher = "Acme";
-    s.scope = std::move(scope);
-    s.user = std::move(user);
     s.install_date = "20260101";
     return s;
 }
@@ -476,7 +473,6 @@ TEST_CASE("TAR software diff: install detected", "[tar][diff][software]") {
     CHECK(events[0].name == "7-Zip");
     CHECK(events[0].version == "23.01");
     CHECK(events[0].prev_version.empty());
-    CHECK(events[0].scope == "machine");
     CHECK(events[0].ts == 1000);
     CHECK(events[0].snapshot_id == 1);
 }
@@ -514,35 +510,6 @@ TEST_CASE("TAR software diff: same version produces no event", "[tar][diff][soft
     CHECK(events.empty());
 }
 
-TEST_CASE("TAR software diff: same name in machine vs user scope is independent",
-          "[tar][diff][software]") {
-    // A machine-scope and a per-user copy of the same product must not collapse:
-    // removing the user copy is one 'removed' event, the machine copy is untouched.
-    std::vector<SoftwareInfo> prev = {sw("VSCode", "1.90", "machine"),
-                                      sw("VSCode", "1.90", "user", "alice")};
-    std::vector<SoftwareInfo> curr = {sw("VSCode", "1.90", "machine")};
-
-    auto events = compute_software_events(prev, curr, 5000, 5);
-
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].action == "removed");
-    CHECK(events[0].scope == "user");
-    CHECK(events[0].user == "alice");
-}
-
-TEST_CASE("TAR software diff: two users' same app tracked separately",
-          "[tar][diff][software]") {
-    std::vector<SoftwareInfo> prev = {sw("Slack", "4.0", "user", "alice")};
-    std::vector<SoftwareInfo> curr = {sw("Slack", "4.0", "user", "alice"),
-                                      sw("Slack", "4.0", "user", "bob")};
-
-    auto events = compute_software_events(prev, curr, 6000, 6);
-
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].action == "installed");
-    CHECK(events[0].user == "bob");
-}
-
 TEST_CASE("TAR software diff: empty snapshots produce no events (cold-start contract)",
           "[tar][diff][software]") {
     // The plugin seeds the baseline silently on first run; at the diff level an
@@ -555,164 +522,20 @@ TEST_CASE("TAR software diff: empty snapshots produce no events (cold-start cont
     CHECK(events.empty());
 }
 
-TEST_CASE("TAR software diff: carried-forward entries are inert while a sibling changes",
+TEST_CASE("TAR software diff: an unchanged entry is inert while a sibling changes",
           "[tar][diff][software]") {
-    // This is the load-bearing invariant behind the plugin's carry-forward of
-    // logged-off users: an entry that is byte-identical in previous and current
-    // (a carried offline user) must emit NO event, even when another entry in the
-    // same snapshot genuinely changes. A spurious event here would be the
-    // logon/logoff "flapping" the carry-forward design exists to prevent.
-    std::vector<SoftwareInfo> prev = {sw("OfflineApp", "1.0", "user", "bob"),  // logged-off → carried
-                                      sw("7-Zip", "23.01", "machine")};
-    std::vector<SoftwareInfo> curr = {sw("OfflineApp", "1.0", "user", "bob"),  // carried unchanged
-                                      sw("7-Zip", "24.00", "machine")};        // real upgrade
+    // An entry byte-identical in previous and current must emit NO event even when
+    // another entry in the same snapshot genuinely changes — only the real change
+    // is reported.
+    std::vector<SoftwareInfo> prev = {sw("Notepad++", "8.6"), sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("Notepad++", "8.6"),  // unchanged
+                                      sw("7-Zip", "24.00")};    // real upgrade
 
     auto events = compute_software_events(prev, curr, 8000, 8);
 
-    REQUIRE(events.size() == 1); // only the machine upgrade — the carried user is inert
+    REQUIRE(events.size() == 1); // only the upgrade — the unchanged entry is inert
     CHECK(events[0].action == "upgraded");
-    CHECK(events[0].scope == "machine");
     CHECK(events[0].name == "7-Zip");
-}
-
-// =============================================================================
-// Steady-state snapshot assembly tests (assemble_steady_state_snapshot)
-//
-// These exercise the plugin's carry-forward ORCHESTRATION directly (the layer
-// do_collect_software runs) rather than just the diff: a logged-off user's
-// inventory is carried forward (no per-tick hive mount, no ghost events), a
-// logged-on user's uninstall is NOT masked, and machine scope always comes from
-// the fresh scan (never resurrected from the previous snapshot).
-// =============================================================================
-
-namespace {
-bool snapshot_has(const std::vector<SoftwareInfo>& snap, const std::string& scope,
-                  const std::string& user, const std::string& name) {
-    return std::any_of(snap.begin(), snap.end(), [&](const SoftwareInfo& s) {
-        return s.scope == scope && s.user == user && s.name == name;
-    });
-}
-} // namespace
-
-TEST_CASE("TAR software assembly: logged-off user carried forward, diff inert",
-          "[tar][software][assembly]") {
-    // bob is logged off this tick → his hive is not scanned, so his last-known
-    // inventory is carried forward and must diff to nothing (the design's reason
-    // for not re-mounting NTUSER.DAT every tick).
-    std::vector<SoftwareInfo> previous = {sw("Slack", "4.0", "user", "bob"),
-                                          sw("7-Zip", "23.01", "machine")};
-    std::vector<SoftwareInfo> machine_and_loaded = {sw("7-Zip", "23.01", "machine")};
-    std::vector<std::string> scanned; // bob NOT scanned (logged off)
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    CHECK(snapshot_has(current, "user", "bob", "Slack")); // carried forward
-    auto events = compute_software_events(previous, current, 1000, 1);
-    CHECK(events.empty()); // no ghost remove for the logged-off user
-}
-
-TEST_CASE("TAR software assembly: logged-on user's uninstall is not masked",
-          "[tar][software][assembly]") {
-    // alice is logged on (scanned) and has uninstalled Slack — her hive WAS read
-    // and returned nothing, so the prior entry must NOT be carried forward and the
-    // diff must report a real 'removed'.
-    std::vector<SoftwareInfo> previous = {sw("Slack", "4.0", "user", "alice")};
-    std::vector<SoftwareInfo> machine_and_loaded; // alice scanned, no apps now
-    std::vector<std::string> scanned = {"alice"};
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    CHECK(current.empty()); // alice's stale entry is dropped, not carried
-    auto events = compute_software_events(previous, current, 2000, 2);
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].action == "removed");
-    CHECK(events[0].user == "alice");
-}
-
-TEST_CASE("TAR software assembly: machine + loaded-user software pass through",
-          "[tar][software][assembly]") {
-    std::vector<SoftwareInfo> previous;
-    std::vector<SoftwareInfo> machine_and_loaded = {sw("7-Zip", "23.01", "machine"),
-                                                    sw("Slack", "4.0", "user", "alice")};
-    std::vector<std::string> scanned = {"alice"};
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    CHECK(current.size() == 2);
-    CHECK(snapshot_has(current, "machine", "", "7-Zip"));
-    CHECK(snapshot_has(current, "user", "alice", "Slack"));
-}
-
-TEST_CASE("TAR software assembly: empty scanned set carries all logged-off users forward",
-          "[tar][software][assembly]") {
-    // No hives loaded this tick (every user logged off): all prior user entries are
-    // carried forward; machine scope still comes from the fresh scan.
-    std::vector<SoftwareInfo> previous = {sw("Slack", "4.0", "user", "alice"),
-                                          sw("Zoom", "5.0", "user", "bob")};
-    std::vector<SoftwareInfo> machine_and_loaded = {sw("7-Zip", "23.01", "machine")};
-    std::vector<std::string> scanned;
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    CHECK(current.size() == 3); // 1 machine + 2 carried users
-    auto events = compute_software_events(previous, current, 3000, 3);
-    REQUIRE(events.size() == 1); // only the newly seen machine app
-    CHECK(events[0].name == "7-Zip");
-    CHECK(events[0].action == "installed");
-}
-
-TEST_CASE("TAR software assembly: stale machine entries are never resurrected",
-          "[tar][software][assembly]") {
-    // Carry-forward is user-scope ONLY. A machine app in `previous` but absent from
-    // the fresh machine scan is a real uninstall → 'removed', not carried.
-    std::vector<SoftwareInfo> previous = {sw("OldTool", "1.0", "machine")};
-    std::vector<SoftwareInfo> machine_and_loaded; // fresh scan: OldTool gone
-    std::vector<std::string> scanned;
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    CHECK(current.empty());
-    auto events = compute_software_events(previous, current, 4000, 4);
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].action == "removed");
-    CHECK(events[0].scope == "machine");
-}
-
-TEST_CASE("TAR software assembly: logged-on user's upgrade flows through (not masked)",
-          "[tar][software][assembly]") {
-    // alice is logged on (scanned) and bumped Slack 4.0 -> 4.1 — the fresh loaded
-    // scan supplies the new version, the prior entry is NOT carried forward, so the
-    // diff is a single 'upgraded', not a remove+install.
-    std::vector<SoftwareInfo> previous = {sw("Slack", "4.0", "user", "alice")};
-    std::vector<SoftwareInfo> machine_and_loaded = {sw("Slack", "4.1", "user", "alice")};
-    std::vector<std::string> scanned = {"alice"};
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    REQUIRE(current.size() == 1);
-    CHECK(current[0].version == "4.1"); // fresh scan wins; no carried 4.0 duplicate
-    auto events = compute_software_events(previous, current, 5000, 5);
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].action == "upgraded");
-    CHECK(events[0].version == "4.1");
-    CHECK(events[0].prev_version == "4.0");
-}
-
-TEST_CASE("TAR software assembly: a scanned user is not double-carried",
-          "[tar][software][assembly]") {
-    // A user present in BOTH the fresh loaded scan AND `previous`, whose SID IS in
-    // scanned_users, must appear exactly once in the assembled snapshot — the
-    // carry-forward guard (`!scanned.contains`) excludes them, so no duplicate
-    // (scope,user,name) entry is produced for the diff to fold.
-    std::vector<SoftwareInfo> previous = {sw("Zoom", "5.0", "user", "alice")};
-    std::vector<SoftwareInfo> machine_and_loaded = {sw("Zoom", "5.0", "user", "alice")};
-    std::vector<std::string> scanned = {"alice"};
-
-    auto current = assemble_steady_state_snapshot(previous, machine_and_loaded, scanned);
-
-    REQUIRE(current.size() == 1); // single entry, not carried a second time
-    auto events = compute_software_events(previous, current, 6000, 6);
-    CHECK(events.empty()); // unchanged -> no event
 }
 
 // =============================================================================

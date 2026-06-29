@@ -102,8 +102,8 @@ TEST_CASE("TarDatabase: insert and query process events", "[tar][store][crud]") 
 
 TEST_CASE("TarDatabase: insert and query software events", "[tar][store][crud][software]") {
     // Direct round-trip through insert_software_events — the only exerciser of the
-    // 10-parameter prepared statement, so a column-binding transposition (e.g.
-    // install_date <-> scope/user) is caught here rather than slipping past the
+    // 8-parameter prepared statement, so a column-binding transposition (e.g.
+    // publisher <-> install_date) is caught here rather than slipping past the
     // aggregator test (which seeds software_live with raw SQL).
     auto t = make_test_db();
 
@@ -115,7 +115,6 @@ TEST_CASE("TarDatabase: insert and query software events", "[tar][store][crud][s
     inst.name = "7-Zip";
     inst.version = "23.01";
     inst.publisher = "Igor Pavlov";
-    inst.scope = "machine";
     inst.install_date = "20260101";
     events.push_back(inst);
 
@@ -127,32 +126,29 @@ TEST_CASE("TarDatabase: insert and query software events", "[tar][store][crud][s
     upg.version = "1.91";
     upg.prev_version = "1.90";
     upg.publisher = "Microsoft";
-    upg.scope = "user";
-    upg.user = "alice";
     upg.install_date = "20260102";
     events.push_back(upg);
 
     REQUIRE(t.db.insert_software_events(events));
 
     auto r = t.db.execute_query(
-        "SELECT action, name, version, prev_version, publisher, scope, user, install_date "
+        "SELECT action, name, version, prev_version, publisher, install_date "
         "FROM software_live ORDER BY ts");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 2);
-    // Row 0: machine install — every column in declared order.
+    // Row 0: install — every column in declared order (machine scope only, no
+    // scope/user columns).
     CHECK(r->rows[0][0] == "installed");
     CHECK(r->rows[0][1] == "7-Zip");
     CHECK(r->rows[0][2] == "23.01");
     CHECK(r->rows[0][3] == ""); // prev_version empty for install
     CHECK(r->rows[0][4] == "Igor Pavlov");
-    CHECK(r->rows[0][5] == "machine");
-    CHECK(r->rows[0][6] == ""); // user empty for machine scope
-    CHECK(r->rows[0][7] == "20260101");
-    // Row 1: per-user upgrade — prev_version + user populated, not transposed.
+    CHECK(r->rows[0][5] == "20260101");
+    // Row 1: upgrade — prev_version + publisher + install_date populated, not transposed.
     CHECK(r->rows[1][0] == "upgraded");
     CHECK(r->rows[1][3] == "1.90");
-    CHECK(r->rows[1][5] == "user");
-    CHECK(r->rows[1][6] == "alice");
+    CHECK(r->rows[1][4] == "Microsoft");
+    CHECK(r->rows[1][5] == "20260102");
 
     // Empty-vector contract matches the sibling inserts (returns true, no-op).
     CHECK(t.db.insert_software_events({}));
@@ -171,11 +167,10 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     ev.action = "installed";
     ev.name = "7-Zip";
     ev.version = "23.01";
-    ev.scope = "machine";
     REQUIRE(t.db.insert_software_events({ev}));
     REQUIRE(t.db.execute_sql(
-        "INSERT INTO software_daily (day_ts, name, scope, install_count, remove_count, "
-        "upgrade_count) VALUES (86400, '7-Zip', 'machine', 3, 1, 2)"));
+        "INSERT INTO software_daily (day_ts, name, install_count, remove_count, "
+        "upgrade_count) VALUES (86400, '7-Zip', 3, 1, 2)"));
 
     auto live = t.db.execute_user_query("SELECT action, name FROM software_live");
     REQUIRE(live.has_value());

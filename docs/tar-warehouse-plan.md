@@ -210,7 +210,7 @@ Add `parameters` map to the existing signature so the SQL can be forwarded to th
 ## Phase 8: Additional Capture Sources
 
 ### Wave 1: Cross-platform
-1. **Software installations** ✅ (Windows) -- diffs the registry Uninstall keys (HKLM 64/32-bit machine scope by default; per-user `HKU\<SID>`/`NTUSER.DAT` only when `software_user_scope_enabled` is on — it carries a profile name, so it is opt-in) on the `tar.software` tick. Tables: `software_live`, `software_daily`, `software_monthly`. Linux (dpkg/rpm) + macOS (pkgutil) collectors are a fast-follow (schema is queryable-empty there). Machine scope on by default. See `docs/user-manual/tar.md`.
+1. **Software installations** ✅ (Windows) -- diffs the machine-wide registry Uninstall keys (HKLM 64/32-bit; machine scope only — no per-user `HKU\<SID>`/`NTUSER.DAT`, so no profile-name PII) on the `tar.software` tick. Tables: `software_live`, `software_daily`, `software_monthly`. Linux (dpkg/rpm) + macOS (pkgutil) collectors are a fast-follow (schema is queryable-empty there). Off by default (opt-in via `software_enabled`). See `docs/user-manual/tar.md`.
 2. **Device performance** ✅ -- CPU %, memory, disk I/O. Tables: `perf_live`, `perf_hourly` (shipped as the `perf`/`procperf` sources).
 
 ### Wave 2: Windows + partial macOS

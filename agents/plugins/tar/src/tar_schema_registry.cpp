@@ -566,33 +566,28 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // Diffs the installed-software inventory on the `tar.software` tick
         // (hourly default) and records install/remove/upgrade events over time —
         // the historical "what was installed/removed on this box, when" the
-        // point-in-time installed_apps inventory cannot answer. The SOURCE is
-        // default-ON, but it collects only MACHINE-WIDE inventory by default (HKLM
-        // Uninstall) — device asset-management + vuln-relevance data with no user
-        // identity, like `service`/`user`. PER-USER inventory (which carries a
-        // Windows profile name = personal data) is opt-in behind
-        // software_user_scope_enabled, matching the works-council posture used for
-        // the app-usage-class sources (#1620).
+        // point-in-time installed_apps inventory cannot answer. MACHINE SCOPE ONLY
+        // (HKLM Uninstall): an event is the host's software, never attributed to a
+        // Windows profile, so the capture carries no user identity / personal data
+        // (#1620). Opt-in (default_enabled=false): shipped disabled as the cautious
+        // posture for a new capture source — an operator turns it on per host via
+        // tar.configure software_enabled=true.
         //
-        // Windows captures machine-wide (HKLM Uninstall 64-bit + WOW6432Node)
-        // always, and per-user (HKU\<SID> for loaded hives, mounting NTUSER.DAT for
-        // logged-off profiles) ONLY when the per-user scope is enabled — the `scope`
-        // column distinguishes them and `user` carries the profile name for per-user
-        // rows. Linux (dpkg/rpm) and macOS (pkgutil) are kPlanned (queryable-empty)
-        // until a fast-follow wires the installed_apps enumeration into a collector.
+        // Windows captures machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit).
+        // Linux (dpkg/rpm) and macOS (pkgutil) are kPlanned (queryable-empty) until a
+        // fast-follow wires the installed_apps enumeration into a collector.
         {
             .name = "software",
             .dollar_name = "Software",
+            // Opt-in (cautious new-source posture): a fresh agent reports it disabled
+            // on tar.status, matching the explicit "false" collection gate.
+            .default_enabled = false,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "registry",
                  "Registry Uninstall keys, polled-and-diffed on the tar.software "
-                 "tick: HKLM 64-bit + WOW6432Node 32-bit (machine scope, default-on) "
-                 "plus, when software_user_scope_enabled is set, each user profile's "
-                 "HKU\\<SID>\\...\\Uninstall (per-user scope, opt-in; NTUSER.DAT is "
-                 "mounted for logged-off profiles so the per-user inventory is "
-                 "complete regardless of logon state). SystemComponent entries are "
-                 "skipped. No command line / no usage data — names, versions, "
-                 "publisher only."},
+                 "tick: HKLM 64-bit + WOW6432Node 32-bit (machine scope only). "
+                 "SystemComponent entries are skipped. No command line / no usage "
+                 "data — names, versions, publisher only."},
                 {"linux",   OsSupportStatus::kPlanned, "dpkg_rpm",
                  "dpkg-query / rpm -qa / pacman -Q diff (reuse of the installed_apps "
                  "enumeration). Wired in a fast-follow."},
@@ -615,8 +610,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"version",      "TEXT"},
                         {"prev_version", "TEXT"}, // populated only for 'upgraded'
                         {"publisher",    "TEXT"},
-                        {"scope",        "TEXT"}, // machine, user
-                        {"user",         "TEXT"}, // profile name for per-user rows; '' for machine
                         {"install_date", "TEXT"}, // registry InstallDate (YYYYMMDD) where present
                     },
                 },
@@ -627,7 +620,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
                     .columns = {
                         {"day_ts",        "INTEGER"},
                         {"name",          "TEXT"},
-                        {"scope",         "TEXT"},
                         {"install_count", "INTEGER"},
                         {"remove_count",  "INTEGER"},
                         {"upgrade_count", "INTEGER"},
@@ -640,7 +632,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
                     .columns = {
                         {"month_ts",      "INTEGER"},
                         {"name",          "TEXT"},
-                        {"scope",         "TEXT"},
                         {"install_count", "INTEGER"},
                         {"remove_count",  "INTEGER"},
                         {"upgrade_count", "INTEGER"},
@@ -1154,30 +1145,29 @@ GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_sta
         }
     }
 
-    // ── Software rollups (Phase 8 Wave 1) — per (name, scope) ─────────────────
-    // Counts install/remove/upgrade events. Per-user rows from different
-    // profiles fold together under the same (name, scope='user') bucket — the
-    // count tier is "how many install events", not "by which user" (that detail
-    // stays at full fidelity in software_live).
+    // ── Software rollups (Phase 8 Wave 1) — per name ─────────────────────────
+    // Counts install/remove/upgrade events per application name (machine scope
+    // only). The count tier is "how many install events", not "by which build"
+    // (that detail stays at full fidelity in software_live).
     if (source_name == "software") {
         if (target_suffix == "daily") {
-            return R"(INSERT INTO software_daily (day_ts, name, scope, install_count, remove_count, upgrade_count)
-SELECT (ts / 86400) * 86400, name, scope,
+            return R"(INSERT INTO software_daily (day_ts, name, install_count, remove_count, upgrade_count)
+SELECT (ts / 86400) * 86400, name,
        SUM(CASE WHEN action = 'installed' THEN 1 ELSE 0 END),
        SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END),
        SUM(CASE WHEN action = 'upgraded' THEN 1 ELSE 0 END)
 FROM software_live
 WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 86400) * 86400, name, scope)";
+GROUP BY (ts / 86400) * 86400, name)";
         }
         if (target_suffix == "monthly") {
-            return R"(INSERT INTO software_monthly (month_ts, name, scope, install_count, remove_count, upgrade_count)
+            return R"(INSERT INTO software_monthly (month_ts, name, install_count, remove_count, upgrade_count)
 SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
-       name, scope,
+       name,
        SUM(install_count), SUM(remove_count), SUM(upgrade_count)
 FROM software_daily
 WHERE day_ts >= ? AND day_ts < ?
-GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), name, scope)";
+GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), name)";
         }
     }
 

@@ -64,27 +64,15 @@ struct UserSession {
 };
 
 /// One installed-software entry, as enumerated for the `software` source diff.
-/// `scope` is "machine" or "user"; `user` is the profile name for per-user
-/// entries and empty for machine scope. The diff key is (scope, user, name);
-/// a change in `version` for the same key is an 'upgraded' event.
+/// Machine scope only: an entry is the host's installed software (HKLM
+/// Uninstall), never attributed to a Windows profile, so the capture carries no
+/// per-user identity (#1620). The diff key is `name`; a change in `version` for
+/// the same name is an 'upgraded' event.
 struct SoftwareInfo {
     std::string name;
     std::string version;
     std::string publisher;
-    std::string scope; // machine, user
-    std::string user;  // profile name for per-user entries; '' for machine scope
     std::string install_date;
-};
-
-/// Result of a steady-state per-user scan (loaded hives only — no NTUSER.DAT
-/// mounting). `entries` are the apps found; `scanned_users` is EVERY logged-on
-/// profile that was read, even those with zero per-user apps — the caller needs
-/// the full scanned set (not just users that happen to have entries) to decide
-/// which logged-off users to carry forward, so an uninstall of a logged-on
-/// user's last app is not masked by carry-forward.
-struct LoadedUserScan {
-    std::vector<SoftwareInfo> entries;
-    std::vector<std::string> scanned_users;
 };
 
 // One host ARP / neighbour-table entry (ADR-0015). Snapshot type for the `arp`
@@ -143,27 +131,13 @@ std::vector<ServiceInfo> enumerate_services();
 std::vector<UserSession> enumerate_users();
 
 /**
- * Full installed-software enumeration for the `software` source COLD-START
- * baseline only: machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit) plus
- * EVERY user profile (HKU\<SID> for loaded hives; mounting NTUSER.DAT for
- * logged-off profiles, capped at `max_hive_mounts` to bound the one-time I/O on
- * many-profile hosts — profiles beyond the cap are baselined lazily when their
- * user next logs on). Returns empty on Linux/macOS (kPlanned).
- *
- * Steady-state ticks must NOT call this — they use enumerate_machine_software +
- * enumerate_loaded_user_software and carry forward logged-off users, so no hive
- * is mounted after the baseline (a logged-off user cannot install software).
+ * Installed-software enumeration for the `software` source: machine-wide only
+ * (HKLM Uninstall 64-bit + WOW6432Node 32-bit). Cheap — no hive mounts, no
+ * per-user identity. This is the sole enumeration entry point (cold-start and
+ * steady-state alike read the same machine scope). Empty off Windows (kPlanned;
+ * a fast-follow will reuse the installed_apps dpkg/rpm/pkgutil enumeration).
  */
-std::vector<SoftwareInfo> enumerate_software(int max_hive_mounts);
-
-/** Machine-scope installed software only (HKLM 64-bit + WOW6432Node). Cheap,
- *  no hive mounts. Empty off Windows. */
 void enumerate_machine_software(std::vector<SoftwareInfo>& out);
-
-/** Per-user installed software for CURRENTLY-LOADED hives only (HKU\<SID>) — no
- *  NTUSER.DAT mounting. Returns the entries plus the full set of logged-on
- *  profiles scanned. Empty off Windows. */
-LoadedUserScan enumerate_loaded_user_software();
 
 /**
  * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
@@ -306,39 +280,15 @@ std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previ
 
 /**
  * Compute software install/uninstall diff.
- * Key: scope + user + name.
+ * Key: name (machine scope only — no per-user identity).
  * Detects installs (present in current, not previous), removals (present in
- * previous, not current), and upgrades (same key, different version — carries
+ * previous, not current), and upgrades (same name, different version — carries
  * prev_version). The diff is name-keyed, so a version bump is one 'upgraded'
  * event rather than a remove+install pair.
  */
 std::vector<SoftwareEvent> compute_software_events(const std::vector<SoftwareInfo>& previous,
                                                    const std::vector<SoftwareInfo>& current,
                                                    int64_t timestamp, int64_t snapshot_id);
-
-/**
- * Assemble the current installed-software snapshot for a STEADY-STATE tick.
- *
- * `machine_and_loaded` is machine-scope software plus the apps found in
- * currently-loaded user hives (from enumerate_machine_software +
- * enumerate_loaded_user_software, no NTUSER.DAT mounting). `scanned_users` is
- * EVERY logged-on profile that was read this tick (even those with zero apps).
- * `previous` is the last persisted snapshot.
- *
- * Logged-off users (scope=="user" and NOT in `scanned_users`) are carried
- * forward unchanged from `previous` — a logged-off user cannot install software,
- * so re-mounting their hive every tick is pure I/O. Because their entries are
- * then identical in `previous` and the returned snapshot, they yield no diff
- * events. Crucially, an uninstall by a *logged-on* user is NOT masked: their SID
- * is in `scanned_users`, so their (now-removed) entry is not carried forward.
- *
- * Pure (no registry I/O) so the carry-forward contract is unit-testable
- * off-Windows. Returns by value (the assembled `current` snapshot).
- */
-std::vector<SoftwareInfo> assemble_steady_state_snapshot(
-    const std::vector<SoftwareInfo>& previous,
-    std::vector<SoftwareInfo> machine_and_loaded,
-    const std::vector<std::string>& scanned_users);
 
 /**
  * Compute ARP diff. Key: interface + ip_address + mac_address.

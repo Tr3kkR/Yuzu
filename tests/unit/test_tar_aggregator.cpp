@@ -673,8 +673,8 @@ TEST_CASE("TAR rollup: $Software live→daily→monthly counts by action",
                          std::string_view prev_version) {
         REQUIRE(db.execute_sql(std::format(
             "INSERT INTO software_live "
-            "(ts,snapshot_id,action,name,version,prev_version,publisher,scope,user,install_date) "
-            "VALUES ({}, 1, '{}', '7-Zip', '{}', '{}', 'Acme', 'machine', '', '20250101')",
+            "(ts,snapshot_id,action,name,version,prev_version,publisher,install_date) "
+            "VALUES ({}, 1, '{}', '7-Zip', '{}', '{}', 'Acme', '20250101')",
             t0, action, version, prev_version)));
     };
     insert_sw("installed", "23.01", "");

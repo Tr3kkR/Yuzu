@@ -6,9 +6,9 @@
  * The platform shell (tar_software_collector.cpp) does the registry I/O and the
  * plugin (tar_plugin.cpp do_collect_software) does the lock / source-enabled gate
  * / DB read+write. Everything in between — classifying the prior state
- * (cold-start vs corrupt vs steady), gating machine-only vs per-user assembly, and
- * computing the diff — is the PURE logic here, so it is unit-testable off-Windows
- * where the registry collectors return empty (#1620).
+ * (cold-start vs corrupt vs steady) and computing the diff — is the PURE logic
+ * here, so it is unit-testable off-Windows where the registry collector returns
+ * empty (#1620). Machine scope only: there is no per-user assembly.
  */
 
 #include "tar_collectors.hpp" // SoftwareInfo, SoftwareEvent, compute/assemble
@@ -44,17 +44,13 @@ struct SoftwareCollectResult {
  * Pure core of do_collect_software (#1620).
  *
  * @param prev_json      The prior `software` KV state ("" ⇒ cold start).
- * @param enumerated     What the caller read THIS tick: machine-only when
- *                       per-user scope is off; machine + currently-loaded user
- *                       hives when on; the full cold-start baseline on a first run.
- * @param scanned_users  Loaded-profile set for the steady-state carry-forward
- *                       (empty when per-user scope is off).
- * @param user_scope     Selects machine-only vs. per-user carry-forward assembly.
+ * @param enumerated     The machine-scope installed software read THIS tick
+ *                       (also the full baseline on a first run). It IS the
+ *                       current snapshot — machine scope has nothing to carry
+ *                       forward.
  */
 SoftwareCollectResult software_collect_core(const std::string& prev_json,
                                             std::vector<SoftwareInfo> enumerated,
-                                            const std::vector<std::string>& scanned_users,
-                                            bool user_scope, int64_t timestamp,
-                                            int64_t snapshot_id);
+                                            int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar

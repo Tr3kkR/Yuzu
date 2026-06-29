@@ -234,12 +234,14 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // do_status(), apply_source_enabled_transition(), and run_retention() all
     // read. The high-volume usage-class sources (module ~100× process volume,
     // procperf per-app, netqual per-connection) are opt-in and must report
-    // disabled on a fresh agent; everything else is always-on.
-    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns"}) {
+    // disabled on a fresh agent; software is opt-in too (off by default — the
+    // cautious posture for a new capture source, #1620); everything else is
+    // always-on.
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }
-    for (const auto* name : {"process", "tcp", "service", "user", "perf", "software"}) {
+    for (const auto* name : {"process", "tcp", "service", "user", "perf"}) {
         INFO("always-on source=" << name);
         CHECK(source_default_enabled(name));
     }
@@ -260,7 +262,7 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
                            [](const CaptureSourceDef& s) { return s.name == "software"; });
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "Software");
-    CHECK(it->default_enabled); // asset/security data — on by default
+    CHECK_FALSE(it->default_enabled); // opt-in (off by default) — cautious new-source posture (#1620)
 
     // live + daily + monthly, in that declaration order (so run_aggregation rolls
     // daily-from-live before monthly-from-daily within one tick).
@@ -292,14 +294,19 @@ TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns"
     const auto ddl = generate_warehouse_ddl();
     CHECK(ddl.find("CREATE TABLE IF NOT EXISTS software_live") != std::string::npos);
     CHECK(ddl.find("prev_version") != std::string::npos);
-    CHECK(ddl.find("scope") != std::string::npos);
 
-    // live carries the full event columns; daily/monthly carry the count rollup.
+    // live carries the full event columns (machine scope only — no scope/user);
+    // daily/monthly carry the count rollup.
     auto live_cols = columns_for_table("software_live");
-    for (const auto* c : {"action", "name", "version", "prev_version", "publisher", "scope",
-                          "user", "install_date"}) {
+    for (const auto* c : {"action", "name", "version", "prev_version", "publisher",
+                          "install_date"}) {
         INFO("software_live column=" << c);
         CHECK(std::find(live_cols.begin(), live_cols.end(), c) != live_cols.end());
+    }
+    // scope/user were dropped with per-user scope (#1620) — they must NOT exist.
+    for (const auto* c : {"scope", "user"}) {
+        INFO("software_live must NOT have column=" << c);
+        CHECK(std::find(live_cols.begin(), live_cols.end(), c) == live_cols.end());
     }
     auto daily_cols = columns_for_table("software_daily");
     for (const auto* c : {"install_count", "remove_count", "upgrade_count"}) {

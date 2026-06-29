@@ -578,13 +578,10 @@ std::vector<SoftwareEvent> compute_software_events(
 
     std::vector<SoftwareEvent> events;
 
-    // Key on (scope, user, name) so a machine-scope and a per-user entry of the
-    // same name are tracked independently, and two users' copies of the same app
-    // don't collapse. \x1f (unit separator) cannot appear in a registry display
-    // name / username, so it is a collision-free joiner.
-    auto make_key = [](const SoftwareInfo& s) -> std::string {
-        return s.scope + "\x1f" + s.user + "\x1f" + s.name;
-    };
+    // Machine scope only: key on the application name. (An earlier design keyed on
+    // (scope, user, name) to track per-user installs independently; per-user scope
+    // was dropped, so name alone is the identity — #1620.)
+    auto make_key = [](const SoftwareInfo& s) -> std::string { return s.name; };
 
     std::unordered_map<std::string, const SoftwareInfo*> prev_map;
     for (const auto& s : previous) prev_map[make_key(s)] = &s;
@@ -595,19 +592,19 @@ std::vector<SoftwareEvent> compute_software_events(
         auto it = prev_map.find(make_key(s));
         if (it == prev_map.end()) {
             events.push_back({timestamp, snapshot_id, "installed", s.name, s.version, "",
-                              s.publisher, s.scope, s.user, s.install_date});
+                              s.publisher, s.install_date});
         } else if (it->second->version != s.version) {
             // Same identity, version changed → upgrade (or downgrade); carry the
             // previous version. A bare reinstall at the same version emits nothing.
             events.push_back({timestamp, snapshot_id, "upgraded", s.name, s.version,
-                              it->second->version, s.publisher, s.scope, s.user, s.install_date});
+                              it->second->version, s.publisher, s.install_date});
         }
     }
 
     for (const auto& s : previous) {
         if (!curr_map.contains(make_key(s))) {
             events.push_back({timestamp, snapshot_id, "removed", s.name, s.version, "",
-                              s.publisher, s.scope, s.user, s.install_date});
+                              s.publisher, s.install_date});
         }
     }
 
@@ -646,27 +643,6 @@ std::vector<ArpEvent> compute_arp_events(
     }
 
     return events;
-}
-
-std::vector<SoftwareInfo> assemble_steady_state_snapshot(
-    const std::vector<SoftwareInfo>& previous,
-    std::vector<SoftwareInfo> machine_and_loaded,
-    const std::vector<std::string>& scanned_users) {
-
-    // machine scope + currently-loaded user hives are already enumerated this
-    // tick; start from them and append carried-forward logged-off users.
-    std::vector<SoftwareInfo> current = std::move(machine_and_loaded);
-
-    std::unordered_set<std::string> scanned(scanned_users.begin(), scanned_users.end());
-    for (const auto& e : previous) {
-        // Carry forward a user whose hive was NOT scanned this tick (logged off):
-        // a logged-off user cannot install software, so their last-known inventory
-        // is still current. A scanned user's missing entry is a real uninstall and
-        // is deliberately NOT carried forward, so it diffs as 'removed'.
-        if (e.scope == "user" && !scanned.contains(e.user))
-            current.push_back(e);
-    }
-    return current;
 }
 
 std::vector<DnsEvent> compute_dns_events(

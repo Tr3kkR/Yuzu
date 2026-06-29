@@ -87,9 +87,10 @@ struct UserEvent {
 };
 
 /// One software_live row — an install / uninstall / upgrade event derived by
-/// diffing the installed-software inventory (Phase 8 Wave 1). `scope` is
-/// "machine" or "user"; `user` carries the profile name for per-user rows and
-/// is empty for machine scope. `prev_version` is populated only for 'upgraded'.
+/// diffing the installed-software inventory (Phase 8 Wave 1). Machine scope only
+/// (HKLM Uninstall): a row is the host's software, never attributed to a Windows
+/// profile, so it carries no per-user identity (#1620). `prev_version` is
+/// populated only for 'upgraded'.
 struct SoftwareEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
@@ -98,8 +99,6 @@ struct SoftwareEvent {
     std::string version;
     std::string prev_version;
     std::string publisher;
-    std::string scope; // machine, user
-    std::string user;  // profile name for per-user rows; '' for machine scope
     std::string install_date;
 };
 

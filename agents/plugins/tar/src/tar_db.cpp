@@ -1035,8 +1035,8 @@ bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& event
 
     const char* sql = R"(
         INSERT INTO software_live (ts, snapshot_id, action, name, version, prev_version,
-                                   publisher, scope, user, install_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   publisher, install_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     )";
 
     sqlite3_stmt* raw_stmt = nullptr;
@@ -1058,9 +1058,7 @@ bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& event
         sqlite3_bind_text(stmt.get(), 5, ev.version.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 6, ev.prev_version.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 7, ev.publisher.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.scope.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 9, ev.user.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 10, ev.install_date.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 8, ev.install_date.c_str(), -1, SQLITE_STATIC);
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_software_events step: {}", sqlite3_errmsg(db_));

@@ -20,8 +20,6 @@ std::string software_state_to_json(const std::vector<SoftwareInfo>& apps) {
         arr.push_back({{"name", a.name},
                        {"version", a.version},
                        {"publisher", a.publisher},
-                       {"scope", a.scope},
-                       {"user", a.user},
                        {"install_date", a.install_date}});
     }
     return arr.dump();
@@ -44,8 +42,6 @@ std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
         a.name = j.value("name", "");
         a.version = j.value("version", "");
         a.publisher = j.value("publisher", "");
-        a.scope = j.value("scope", "");
-        a.user = j.value("user", "");
         a.install_date = j.value("install_date", "");
         result.push_back(std::move(a));
     }
@@ -54,9 +50,7 @@ std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
 
 SoftwareCollectResult software_collect_core(const std::string& prev_json,
                                             std::vector<SoftwareInfo> enumerated,
-                                            const std::vector<std::string>& scanned_users,
-                                            bool user_scope, int64_t timestamp,
-                                            int64_t snapshot_id) {
+                                            int64_t timestamp, int64_t snapshot_id) {
     SoftwareCollectResult r;
 
     // Cold start: no prior state row. Seed the baseline silently — an 'installed'
@@ -81,15 +75,9 @@ SoftwareCollectResult software_collect_core(const std::string& prev_json,
 
     auto previous = software_state_from_json(prev_json);
 
-    // Steady state. With per-user scope ON, carry logged-off users forward from the
-    // baseline (assemble_steady_state_snapshot) so a frozen profile yields no diff;
-    // with it OFF the baseline holds only machine rows and `enumerated` IS the
-    // snapshot. (When the operator flips per-user scope, do_configure clears this
-    // baseline under software_collect_mu_, so the next tick cold-starts cleanly
-    // rather than diffing machine-only `enumerated` against user-bearing state.)
-    std::vector<SoftwareInfo> current =
-        user_scope ? assemble_steady_state_snapshot(previous, std::move(enumerated), scanned_users)
-                   : std::move(enumerated);
+    // Steady state. Machine scope only: there are no logged-off users to carry
+    // forward, so the freshly enumerated machine inventory IS the current snapshot.
+    std::vector<SoftwareInfo> current = std::move(enumerated);
 
     r.kind = SoftwareCollectResult::Kind::kSteady;
     r.events = compute_software_events(previous, current, timestamp, snapshot_id);
