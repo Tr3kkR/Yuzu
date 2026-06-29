@@ -588,6 +588,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
 
+        // The configured break-glass account is EXEMPT from failed-login lockout
+        // while in hardened mode (governance Hermes-F / UP-13 / security-LOW): the
+        // lockout pre-check runs first, so without this an attacker who learns the
+        // break-glass username could spray wrong passwords to keep `locked_until`
+        // armed and render the escape hatch unreachable during the exact IdP
+        // outage it exists for — a denial of *availability* of the recovery path.
+        // The exemption is safe because (a) the account still requires a second
+        // factor (MFA is mandatory, enforced fail-closed at boot + login), so a
+        // guessed password alone grants nothing; (b) while UN-armed the password
+        // is never even evaluated (the sso-only gate rejects before
+        // verify_password), so brute-force is only possible inside the operator's
+        // own armed window; and (c) per-IP `login_rate_limit` still throttles.
+        // Every wrong-password attempt is still audited as `auth.login_failed`,
+        // so brute-force activity remains visible — we drop the *lock*, not the
+        // evidence. Scoped to sso-only so the account keeps normal lockout in
+        // standard mode.
+        const bool break_glass_lockout_exempt = cfg_.auth_mode == "sso-only" &&
+                                                !cfg_.break_glass_user.empty() &&
+                                                username == cfg_.break_glass_user;
+
         // Serialize concurrent attempts for THIS username across the whole
         // lockout-critical section below (pre-check → verify_password →
         // record/clear), so a synchronized burst cannot all pass the stale
@@ -621,7 +641,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // counter that could lock a legitimate user on their very next slip
         // (Hermes cyber-review F4).
         bool lockout_read_failed = false;
-        if (cfg_.auth_lockout_threshold > 0) {
+        if (cfg_.auth_lockout_threshold > 0 && !break_glass_lockout_exempt) {
             if (auto* db = auth_mgr_.auth_db_ptr()) {
                 if (auto st = db->lockout_status(username)) {
                     prior_failed_count = st->failed_count;
@@ -673,10 +693,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // enumeration/mode/arm-state oracle, and verify_password (PBKDF2) is
         // skipped. The one residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
-        // so timing can reveal that the break-glass account is currently armed —
+        // so timing can reveal that the break-glass account is currently armed
+        // (and, separately, that the deployment is in sso-only mode) —
         // identical in kind to the lockout pre-check's accepted timing residue,
-        // and it discloses at most "armed", never a credential (the attacker
-        // still needs the password AND a second factor).
+        // and it discloses at most "armed"/"mode", never a credential (the
+        // attacker still needs the password AND a second factor). A constant-time
+        // floor (dummy PBKDF2 / sleep on the reject path) was DELIBERATELY NOT
+        // added: it would re-introduce exactly the PBKDF2-cost amplification DoS
+        // the skip exists to avoid — every sprayed sso-only reject would burn
+        // ~100 ms of server CPU — for a residue that leaks only operational
+        // state, never a secret. Same trade-off the shipped lockout pre-check
+        // already makes (see docs/auth-architecture.md "Account lockout").
         bool break_glass_login = false;
         if (cfg_.auth_mode == "sso-only") {
             if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
@@ -739,8 +766,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // blocked attempts are counted via the metric above, NOT audited.
             // record_failed_login is a no-op for unknown / malformed
             // usernames, so it never creates a row for a non-existent account
-            // (anti-enumeration + no storage growth).
-            if (cfg_.auth_lockout_threshold > 0) {
+            // (anti-enumeration + no storage growth). Skipped for the
+            // lockout-exempt break-glass account (the wrong attempt is still
+            // audited as auth.login_failed above — evidence kept, lock dropped).
+            if (cfg_.auth_lockout_threshold > 0 && !break_glass_lockout_exempt) {
                 if (auto* db = auth_mgr_.auth_db_ptr()) {
                     auto rec = db->record_failed_login(username, cfg_.auth_lockout_threshold,
                                                        cfg_.auth_lockout_window_secs);

@@ -179,6 +179,14 @@ account policy)"* — this ships **both** halves.
   `kCritical` — `result=ok` means the *password* was accepted; the row's `detail`
   is explicit that the mandatory TOTP challenge still runs before a session is
   minted) + the metric `yuzu_auth_break_glass_login_total` + a `warn` log.
+- **Lockout-exempt under sso-only (availability).** The break-glass account is
+  exempt from failed-login lockout while `--auth-mode=sso-only`, so an attacker
+  who learns its username cannot spray wrong passwords to keep it locked and
+  render the escape hatch unreachable during an IdP outage (governance Hermes-F /
+  UP-13). Safe because the second factor is still mandatory and, while un-armed,
+  the password is never evaluated; wrong attempts are still audited
+  (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
+  standard mode.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--data-dir`)

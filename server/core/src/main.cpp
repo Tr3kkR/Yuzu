@@ -314,9 +314,14 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_BREAK_GLASS_USER");
     app.add_option("--break-glass-window-secs", cfg.break_glass_window_secs,
                    "Seconds the break-glass account stays armed after --break-glass-arm "
-                   "(default: 86400 = 24h). The arm auto-expires — it is never permanent.")
+                   "(default: 86400 = 24h, max 2592000 = 30d). The arm auto-expires — it is "
+                   "never permanent.")
         ->default_val(86400)
-        ->check(CLI::PositiveNumber)
+        // Bounded 1s..30d: rejects a fat-finger like INT_MAX (~68y) that would
+        // make the "auto-expiring" exemption effectively permanent, and (with the
+        // arm one-shot's overflow guard) keeps datetime('now','+N seconds') well
+        // clear of SQLite's overflow-to-NULL range (Hermes INFO).
+        ->check(CLI::Range(1, 2592000))
         ->envname("YUZU_BREAK_GLASS_WINDOW_SECS");
 
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
@@ -1009,6 +1014,17 @@ int main(int argc, char* argv[]) {
             std::cerr << "error: window too large; account not armed\n";
             return EXIT_FAILURE;
         }
+        // Non-atomic across two databases: the arm mutated auth.db; the audit
+        // row goes to audit.db, so they cannot share a transaction (Hermes D).
+        // The order is deliberate — arm-then-audit, matching the --mfa-reset
+        // contract (#1226): we prefer "armed but maybe no evidence" over
+        // "evidence but maybe not armed" (a false audit row for an arm that
+        // didn't happen is worse). The is_open() pre-check above caught the
+        // common audit-unwritable case before mutating; the only residual window
+        // is a SIGKILL / power loss in the ~microseconds between the UPDATE and
+        // this INSERT, after which the next break-glass login still emits
+        // auth.breakglass.login. An audit-write FAILURE (not a crash) is surfaced
+        // loudly below with a non-zero exit so the operator records it manually.
         const std::string os_user = resolve_os_principal();
         yuzu::server::AuditEvent ev;
         ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(

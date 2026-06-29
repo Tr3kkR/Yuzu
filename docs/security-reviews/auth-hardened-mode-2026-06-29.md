@@ -76,12 +76,28 @@ Closes `/auth-and-authz` gap-matrix **P0 #3** (both halves of Workstream B line
 
 ## Residual risks (accepted / tracked)
 
-- **Break-glass lockout DoS (LOW).** The break-glass account is subject to the
-  normal failed-login lockout; an attacker who knows its username could lock it
-  *while armed* during an outage. Bounded by the auto-expiring window; documented
-  in `docs/ops-runbooks/auth-db-recovery.md` with operator mitigations (admin
-  unlock, short window, non-guessable username). While un-armed the password is
-  never evaluated, so it cannot be brute-forced then.
+- **Break-glass lockout DoS — FIXED.** Flagged by Hermes (MEDIUM, finding F),
+  security-guardian (LOW), and unhappy-path (UP-13): an attacker who learns the
+  break-glass username could spray wrong passwords to keep the account locked and
+  the escape hatch unreachable during an IdP outage. **Closed in the second
+  hardening round:** the break-glass account is now exempt from failed-login
+  lockout while `--auth-mode=sso-only` (the second factor remains mandatory, the
+  un-armed password is never evaluated, wrong attempts are still audited +
+  per-IP rate-limited). Regression test:
+  `test_auth_routes_hardened.cpp` "the break-glass account is exempt from
+  failed-login lockout".
+- **Login timing residue (MEDIUM, accepted).** An armed break-glass username
+  runs PBKDF2 while other sso-only rejects short-circuit, so response timing
+  leaks "armed"/"sso-only mode" (never a credential). A constant-time floor was
+  **deliberately rejected** — it would re-introduce the PBKDF2-cost amplification
+  DoS the skip exists to avoid. Same accepted trade-off as the shipped lockout
+  pre-check.
+- **Arm + audit non-atomic across two DBs (Hermes D, accepted).** A SIGKILL in
+  the microsecond window between the `auth.db` arm and the `audit.db` row leaves
+  the account armed with no audit row. Cross-DB atomicity is impossible; the
+  arm-then-audit order fails safe (matches the `--mfa-reset` #1226 contract), the
+  `is_open()` pre-check catches the common audit-unwritable case, and the next
+  break-glass login still emits `auth.breakglass.login`.
 - **No `--break-glass-disarm` / arm-expiry audit event (compliance SHOULD).**
   The window auto-expires silently; an explicit early-disarm command + an
   expiry/disarm audit row are tracked follow-ups.

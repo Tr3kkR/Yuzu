@@ -271,6 +271,37 @@ TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offe
     CHECK(h.count_audits("auth.breakglass.login", "alice") == 0);
 }
 
+TEST_CASE("sso-only: the break-glass account is exempt from failed-login lockout",
+          "[auth][hardened][routes]") {
+    // Governance Hermes-F / UP-13: without the exemption an attacker who learns
+    // the break-glass username could spray wrong passwords to keep it locked and
+    // render the escape hatch unreachable during the very IdP outage it exists
+    // for. The harness runs with the default lockout threshold (5), so spraying
+    // > 5 wrong passwords would lock a normal account; the break-glass account
+    // must remain reachable.
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    for (int i = 0; i < 8; ++i) {
+        auto bad = h.sink.Post(
+            "/login", form({{"username", "admin"}, {"password", "WRONGpassword1"}}), kFormCt);
+        REQUIRE(bad);
+        CHECK(bad->status == 401); // normal login failure, not a "locked" 401 (same body anyway)
+    }
+    // A correct-password break-glass login still reaches the MFA challenge — the
+    // account was NOT locked out by the spray.
+    auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                           kFormCt);
+    REQUIRE(res);
+    CHECK(res->status == 202); // MFA challenge, NOT a lockout 401
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.value("status", "") == "mfa_required");
+    CHECK(h.count_audits("auth.breakglass.login", "admin") == 1);
+    // The wrong attempts are still audited (evidence kept, lock dropped).
+    CHECK(h.count_audits("auth.login_failed") >= 8);
+}
+
 TEST_CASE("sso-only: wrong password against an armed break-glass user is a normal login failure",
           "[auth][hardened][routes]") {
     // The break-glass success row (auth.breakglass.login) must fire only AFTER

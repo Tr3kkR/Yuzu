@@ -427,17 +427,19 @@ Contract / safeguards:
   `--break-glass-disarm` yet — tracked follow-up). To close it early, you can
   reduce exposure by restoring SSO; the exemption lapses on its own.
 
-> **DoS caveat (security-guardian LOW):** the break-glass account is subject to
-> the normal failed-login lockout. An attacker who knows the break-glass
-> username could, by submitting wrong passwords *while it is armed*, lock it via
-> `--auth-lockout-threshold` during the very outage it exists for. The lock
-> **auto-expires** (`--auth-lockout-window-secs`, default 15 min), and while the
-> account is *un-armed* the password is never evaluated (so it cannot be
-> brute-forced or locked then). If you need to clear a lock immediately during an
-> incident, use the admin unlock `POST /api/v1/users/<name>/unlock` (requires an
-> authenticated admin — i.e. another operator who can still reach the system) or
-> wait out the window. Consider a longer break-glass username that is not
-> guessable, and keep the lockout window short.
+> **Availability — the break-glass account is exempt from lockout under
+> sso-only.** To stop an attacker who learns the break-glass username from
+> spraying wrong passwords to keep the account locked (and the escape hatch
+> unreachable) during the very outage it exists for, the configured
+> `--break-glass-user` is **not** subject to failed-login lockout while
+> `--auth-mode=sso-only` (governance Hermes-F / UP-13). This is safe because the
+> account still requires its **second factor** (a guessed password alone grants
+> nothing), and while *un-armed* the password is never even evaluated. Every
+> wrong attempt is still audited as `auth.login_failed` and per-IP rate-limited,
+> so brute-force activity stays visible. In **standard** mode the same account
+> keeps normal lockout. (Pick a non-guessable break-glass username regardless,
+> and alert on `yuzu_auth_local_disabled_total{target=break_glass}` +
+> `auth.login_failed` for it.)
 
 ## Locked out by MFA enforcement misconfiguration (PR 3)
 

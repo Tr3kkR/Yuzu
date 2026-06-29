@@ -1346,14 +1346,19 @@ std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::st
     if (!*exists) {
         return "account does not exist";
     }
-    // mfa_status filters is_active=1, so a soft-deleted user reads as
-    // not-enrolled here and is rejected fail-closed (governance UP-10).
+    // mfa_status filters is_active=1, so a soft-deleted (inactive) user reads as
+    // not-enrolled here and is rejected fail-closed (governance UP-10). The
+    // message names both causes because `user_exists` does not filter is_active,
+    // so an inactive account passes the existence check above and surfaces here
+    // rather than as "does not exist" (Hermes LOW — operator clarity during
+    // recovery; the fail-closed behaviour itself is correct either way).
     auto mfa = db.mfa_status(username);
     if (!mfa) {
         return "auth store error while checking MFA enrollment";
     }
     if (!mfa->enrolled) {
-        return "account has no MFA enrolled (a break-glass account must carry a second factor)";
+        return "account has no MFA enrolled, or the account is deactivated (a break-glass account "
+               "must be active and carry a second factor)";
     }
     return std::nullopt;
 }
