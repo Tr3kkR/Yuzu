@@ -16,6 +16,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include "../../../server/core/src/totp.hpp"
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -53,6 +54,18 @@ struct BreakGlassFixture {
         db.reset();
         std::error_code ec;
         std::filesystem::remove_all(data_dir, ec);
+    }
+
+    // Complete a real MFA enrollment for `name` so break_glass_account_problem
+    // sees an enrolled second factor.
+    void enroll_mfa(const std::string& name) {
+        auto init = db->mfa_init_enrollment(name, "Yuzu");
+        REQUIRE(init.has_value());
+        auto bytes = mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(db->mfa_verify_enrollment(name, code).has_value());
     }
 };
 
@@ -125,4 +138,35 @@ TEST_CASE_METHOD(BreakGlassFixture, "malformed username is rejected", "[auth][br
     const std::string bad = "alice:admin";
     CHECK_FALSE(db->break_glass_status(bad).has_value());
     CHECK_FALSE(db->arm_break_glass(bad, 3600).has_value());
+}
+
+// ── break_glass_account_problem (boot guard + --break-glass-arm validator) ────
+
+TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: enrolled user is usable",
+                 "[auth][breakglass]") {
+    enroll_mfa("alice");
+    CHECK_FALSE(break_glass_account_problem(*db, "alice").has_value()); // nullopt = usable
+}
+
+TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: no-MFA user is rejected",
+                 "[auth][breakglass]") {
+    // alice exists but has no MFA — a break-glass account MUST carry a second
+    // factor, so this is fail-closed (SOC 2 CC6.6).
+    auto problem = break_glass_account_problem(*db, "alice");
+    REQUIRE(problem.has_value());
+    CHECK(problem->find("MFA") != std::string::npos);
+}
+
+TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: missing user is rejected",
+                 "[auth][breakglass]") {
+    auto problem = break_glass_account_problem(*db, "ghost");
+    REQUIRE(problem.has_value());
+    CHECK(problem->find("does not exist") != std::string::npos);
+}
+
+TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: malformed username is rejected",
+                 "[auth][breakglass]") {
+    auto problem = break_glass_account_problem(*db, "alice:admin");
+    REQUIRE(problem.has_value());
+    CHECK(problem->find("valid username") != std::string::npos);
 }

@@ -1335,6 +1335,29 @@ AuthDB::arm_break_glass(const std::string& username, int window_secs) {
     return std::unexpected(AuthDBError::UserNotFound);
 }
 
+std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::string& username) {
+    if (!is_valid_username(username)) {
+        return "not a valid username";
+    }
+    auto exists = db.user_exists(username);
+    if (!exists) {
+        return "auth store error while checking the account";
+    }
+    if (!*exists) {
+        return "account does not exist";
+    }
+    // mfa_status filters is_active=1, so a soft-deleted user reads as
+    // not-enrolled here and is rejected fail-closed (governance UP-10).
+    auto mfa = db.mfa_status(username);
+    if (!mfa) {
+        return "auth store error while checking MFA enrollment";
+    }
+    if (!mfa->enrolled) {
+        return "account has no MFA enrolled (a break-glass account must carry a second factor)";
+    }
+    return std::nullopt;
+}
+
 // ── MFA / TOTP Operations ────────────────────────────────────────────────────
 //
 // See docs/auth-mfa-design.md for the full design. v1 surface:

@@ -13,13 +13,15 @@
  *
  * Wire contract under test:
  *   - standard mode: local login unaffected (regression guard)
- *   - sso-only, non-break-glass user: generic 401 (no mode/enumeration oracle)
- *     + `auth.local_disabled` denied audit, no session cookie
- *   - sso-only, break-glass user but NOT armed: same generic 401 + audit
+ *   - sso-only, non-break-glass user: generic 401 (no mode/enumeration oracle),
+ *     no session cookie, and NO per-attempt audit row (UP-2: metric-only)
+ *   - sso-only, break-glass user but NOT armed: same generic 401
  *   - sso-only, break-glass user ARMED + MFA enrolled: proceeds to the MFA
  *     challenge (202) + `auth.breakglass.login` audit — never a bare session
- *   - sso-only, break-glass user ARMED but NOT enrolled: forced through MFA
- *     enrollment (202), never a 200 bare-password session
+ *   - sso-only, break-glass user ARMED but NOT enrolled: HARD-DENIED 403 +
+ *     `auth.breakglass.denied` — enrollment is never offered (UP-1)
+ *   - sso-only, wrong password vs armed break-glass: normal auth.login_failed,
+ *     never a spurious break-glass "ok" row
  */
 
 #include "auth_routes.hpp"
@@ -181,7 +183,9 @@ TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401"
     CHECK(res->body.find("sso") == std::string::npos);
     CHECK(res->body.find("disabled") == std::string::npos);
     CHECK(res->get_header_value("Set-Cookie").empty());
-    CHECK(h.count_audits("auth.local_disabled") == 1);
+    // UP-2: the sso-only denial is metric-only (yuzu_auth_local_disabled_total),
+    // NEVER a per-attempt audit row — assert no audit row is written.
+    CHECK(h.count_audits("auth.local_disabled") == 0);
 }
 
 TEST_CASE("sso-only: a valid password is still rejected when local login is disabled",
@@ -194,7 +198,9 @@ TEST_CASE("sso-only: a valid password is still rejected when local login is disa
     REQUIRE(res);
     CHECK(res->status == 401);
     CHECK(res->get_header_value("Set-Cookie").empty());
-    CHECK(h.count_audits("auth.local_disabled") == 1);
+    // UP-2: the sso-only denial is metric-only (yuzu_auth_local_disabled_total),
+    // NEVER a per-attempt audit row — assert no audit row is written.
+    CHECK(h.count_audits("auth.local_disabled") == 0);
 }
 
 TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
@@ -206,7 +212,9 @@ TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
     REQUIRE(res);
     CHECK(res->status == 401);
     CHECK(res->get_header_value("Set-Cookie").empty());
-    CHECK(h.count_audits("auth.local_disabled") == 1);
+    // UP-2: the sso-only denial is metric-only (yuzu_auth_local_disabled_total),
+    // NEVER a per-attempt audit row — assert no audit row is written.
+    CHECK(h.count_audits("auth.local_disabled") == 0);
     CHECK(h.count_audits("auth.breakglass.login", "admin") == 0);
 }
 
@@ -237,23 +245,45 @@ TEST_CASE("sso-only: a non-break-glass user is rejected even while another is ar
                            kFormCt);
     REQUIRE(res);
     CHECK(res->status == 401);
-    CHECK(h.count_audits("auth.local_disabled") == 1);
+    // UP-2: the sso-only denial is metric-only (yuzu_auth_local_disabled_total),
+    // NEVER a per-attempt audit row — assert no audit row is written.
+    CHECK(h.count_audits("auth.local_disabled") == 0);
 }
 
-TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is forced through enrollment",
+TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offered enrollment",
           "[auth][hardened][routes]") {
-    // Defense-in-depth: the boot guard normally refuses to start with an
-    // MFA-less break-glass user, but if one slips through, the login handler
-    // must still force a second factor rather than mint a bare-password session.
+    // Governance UP-1 (BLOCKING fix). The boot guard normally refuses to start
+    // with an MFA-less break-glass user; if one slips through (MFA cleared
+    // out-of-band after boot), the login handler must HARD-DENY — never offer
+    // enrollment, which would hand a fresh TOTP secret to whoever proved the
+    // password and let a password-only adversary break the glass with no real
+    // second factor.
     HardenedHarness h("sso-only", "alice");
     h.arm("alice"); // alice has no MFA enrolled
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            kFormCt);
     REQUIRE(res);
-    CHECK(res->status == 202); // enrollment redirect, never 200
-    auto body = nlohmann::json::parse(res->body, nullptr, false);
-    REQUIRE_FALSE(body.is_discarded());
-    CHECK(body.value("status", "") == "mfa_enrollment_required");
+    CHECK(res->status == 403); // hard deny — NOT 202 enrollment, NOT 200 session
+    CHECK(res->body.find("second factor") != std::string::npos);
+    CHECK(res->body.find("mfa_enrollment_required") == std::string::npos);
     CHECK(res->get_header_value("Set-Cookie").empty());
-    CHECK(h.count_audits("auth.breakglass.login", "alice") == 1);
+    CHECK(h.count_audits("auth.breakglass.denied", "alice") == 1);
+    CHECK(h.count_audits("auth.breakglass.login", "alice") == 0);
+}
+
+TEST_CASE("sso-only: wrong password against an armed break-glass user is a normal login failure",
+          "[auth][hardened][routes]") {
+    // The break-glass success row (auth.breakglass.login) must fire only AFTER
+    // verify_password succeeds — a wrong password takes the standard
+    // auth.login_failed path and never produces a spurious "ok" break-glass row.
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "WRONGpassword1"}}),
+                           kFormCt);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("auth.breakglass.login", "admin") == 0);
+    CHECK(h.count_audits("auth.login_failed") >= 1);
 }

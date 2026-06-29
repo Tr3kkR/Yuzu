@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hardened authentication mode (`--auth-mode=sso-only`) + break-glass account (SOC 2 CC6.3/CC6.6).**
+  Local-password login can be disabled fleet-wide so only OIDC SSO mints a session
+  (`--auth-mode=sso-only` / `YUZU_AUTH_MODE`). A rejected local login returns the same generic 401 as a
+  bad password (no enumeration/mode oracle) and is counted via `yuzu_auth_local_disabled_total` (metric,
+  not a per-attempt audit row). A single `--break-glass-user` is exempt **only while armed**, armed
+  out-of-band via the host CLI `yuzu-server --break-glass-arm` (auto-expiring, default 24h via
+  `--break-glass-window-secs`; audited `auth.breakglass.armed`, attributed to the kernel OS identity).
+  Mandatory MFA is enforced fail-closed at boot and at login (an un-enrolled break-glass login is
+  hard-denied `403`, never offered enrollment). Use is audited at `Severity::kCritical`
+  (`auth.breakglass.login` / `auth.breakglass.denied`) + metric `yuzu_auth_break_glass_login_total`.
+  AuthDB migration v4 adds a nullable `users.break_glass_armed_until` column (additive, data-safe).
+  **Opt-in: existing deployments default to `standard` and are unaffected.** Enabling `sso-only`
+  **refuses to start** without `--oidc-issuer` configured and (if set) a `--break-glass-user` that
+  exists and has MFA enrolled — configure OIDC and pre-enroll the break-glass account before
+  restarting. See `docs/auth-architecture.md` "Hardened mode", `docs/user-manual/upgrading.md`, and the
+  `docs/ops-runbooks/auth-db-recovery.md` break-glass arm runbook. Closes `/auth-and-authz` P0 #3.
 - **Pre-flight readiness page (`/auto`).** New dashboard page for operator-initiated go/no-go checks
   across a scoped device cohort before a fleet change. Checks: application version (min/max), OS version
   floor, OS architecture, minimum free disk, and pending-reboot status — grouped per device

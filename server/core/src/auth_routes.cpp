@@ -669,9 +669,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After) so the response is not an enumeration / mode
-        // / arm-state oracle, and verify_password (PBKDF2) is skipped — mirroring
-        // the lockout pre-check's posture and its accepted timing residue.
+        // wording, no Retry-After), so the response BODY/STATUS/HEADERS carry no
+        // enumeration/mode/arm-state oracle, and verify_password (PBKDF2) is
+        // skipped. The one residue is response TIMING: an armed break-glass user
+        // runs PBKDF2 (slow) while every other username short-circuits (fast),
+        // so timing can reveal that the break-glass account is currently armed —
+        // identical in kind to the lockout pre-check's accepted timing residue,
+        // and it discloses at most "armed", never a credential (the attacker
+        // still needs the password AND a second factor).
         bool break_glass_login = false;
         if (cfg_.auth_mode == "sso-only") {
             if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
@@ -690,8 +695,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 res.set_content(
                     R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
                     "application/json");
-                audit_log(req, "auth.local_disabled", "denied", "User", username,
-                          "local-password login disabled (auth-mode=sso-only)");
+                // Governance UP-2: metric + rate-limited log, NOT a per-attempt
+                // audit row. sso-only rejects EVERY local login and this path
+                // never feeds lockout, so a per-attempt `audit_log` would let a
+                // credential-stuffing spray grow audit.db without bound — the
+                // exact amplification the lockout *blocked* path deliberately
+                // avoids (metric-only there too). CC6.3 evidence is the boot
+                // posture banner + this counter. The bounded {target} label
+                // (break_glass|other — cardinality 2) flags probing of the
+                // break-glass account itself for SIEM alerting without a row per
+                // attempt. The per-IP login_rate_limit bounds the log rate.
+                const bool probed_break_glass =
+                    !cfg_.break_glass_user.empty() && username == cfg_.break_glass_user;
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_local_disabled_total",
+                               {{"target", probed_break_glass ? "break_glass" : "other"}})
+                        .increment();
+                }
+                spdlog::warn("Local-password login blocked (auth-mode=sso-only){} from source {}",
+                             probed_break_glass ? " [break-glass account, not armed]" : "",
+                             req.remote_addr);
                 return;
             }
             // break_glass_login stays true → the success audit + metric + warn
@@ -754,25 +777,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Password verified for an armed break-glass account under sso-only.
-        // Loud + audited evidence (SOC 2 CC6.6): the OPENED escape-hatch path
-        // gets its own row + metric + warn so an auditor sees every break-glass
-        // use. Emitted here (post-verify) so it reflects an accepted credential,
-        // not merely an attempt; the session is still forced through MFA below.
-        if (break_glass_login) {
-            audit_log_for_principal(req, "auth.breakglass.login", "ok", username,
-                                    auth::role_to_string(*role_opt), "User", username,
-                                    "armed break-glass login under auth-mode=sso-only");
-            emit_event("auth.breakglass.login", req,
-                       {{"source_ip", req.remote_addr}, {"username", username}}, {},
-                       Severity::kWarn);
-            if (auto* m = auth_mgr_.metrics_registry()) {
-                m->counter("yuzu_auth_break_glass_login_total").increment();
-            }
-            spdlog::warn("BREAK-GLASS login proceeding for '{}' (source {}) under "
-                         "auth-mode=sso-only — a second factor is still required",
-                         username, req.remote_addr);
-        }
+        // (Break-glass success evidence is emitted further down, AFTER the UP-1
+        // hard-deny — so an un-enrolled armed break-glass user that proved its
+        // password gets ONLY the `auth.breakglass.denied` row, never a
+        // contradictory `login`-then-`denied` pair.)
 
         // Password verified — reset the lockout counter (the brute-force
         // window is per-consecutive-failure, so any success clears it). Done
@@ -821,22 +829,70 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         }
 
+        // Governance UP-1 (BLOCKING fix). A break-glass login requires an
+        // EXISTING enrolled second factor. The boot guard refuses to start
+        // sso-only with an MFA-less break-glass user, so this only trips in the
+        // narrow race where MFA was cleared out-of-band (e.g. --mfa-reset) after
+        // boot. HARD-DENY here rather than fall through to the enrollment branch
+        // below: enrollment would reveal a fresh provisional TOTP secret to
+        // whoever proved the password and let them self-enrol and complete the
+        // login — i.e. a password-only adversary would break the glass with no
+        // real second factor, defeating CC6.6. Fail closed; re-enrolment of the
+        // break-glass account is a deliberate out-of-band operation.
+        if (break_glass_login && !mfa_enrolled) {
+            res.status = 403;
+            res.set_content(
+                R"({"error":{"code":403,"message":"break-glass account requires an enrolled second factor"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            audit_log_for_principal(
+                req, "auth.breakglass.denied", "denied", username,
+                auth::role_to_string(*role_opt), "User", username,
+                "break-glass login refused: no MFA enrolled (enrollment not offered — re-enroll "
+                "out of band)");
+            emit_event("auth.breakglass.denied", req,
+                       {{"source_ip", req.remote_addr}, {"username", username}}, {},
+                       Severity::kCritical);
+            spdlog::error("BREAK-GLASS login DENIED for '{}' (source {}): no MFA enrolled — "
+                          "refusing to offer enrollment (would defeat the second factor). "
+                          "Re-enroll the break-glass account out of band.",
+                          username, req.remote_addr);
+            return;
+        }
+
+        // Break-glass password accepted AND an enrolled second factor exists
+        // (the UP-1 hard-deny above returned otherwise). Loud + audited evidence
+        // (SOC 2 CC6.6): a CRITICAL row + metric + log so an auditor/SIEM sees
+        // every break-glass use. `result=ok` here means "password accepted" —
+        // the `detail` is explicit that no session is minted yet (the mandatory
+        // TOTP challenge below still runs); correlate with the subsequent
+        // `auth.login` mint by principal + time.
+        if (break_glass_login) {
+            audit_log_for_principal(req, "auth.breakglass.login", "ok", username,
+                                    auth::role_to_string(*role_opt), "User", username,
+                                    "break-glass password accepted under auth-mode=sso-only; "
+                                    "second factor still required before a session is minted");
+            emit_event("auth.breakglass.login", req,
+                       {{"source_ip", req.remote_addr}, {"username", username}}, {},
+                       Severity::kCritical);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_break_glass_login_total").increment();
+            }
+            spdlog::warn("BREAK-GLASS login proceeding for '{}' (source {}) under "
+                         "auth-mode=sso-only — a second factor is still required",
+                         username, req.remote_addr);
+        }
+
         // PR3 enforcement (SOC 2 CC6.6). Under `required` (every role) or
         // `admin-only` (admins only), a user without MFA must enrol before
         // a session is minted. Reuse PR1's pending-token machinery: issue
         // a provisional TOTP secret + an enrollment-pending token and let
         // POST /login/mfa/enroll confirm the first code and complete the
         // login. No new session concept; an un-enrolled enforced user
-        // never holds a cookie until they finish enrolling.
-        // A break-glass login ALWAYS requires a second factor, irrespective of
-        // the global mfa_enforcement mode: the boot-time guard already refused
-        // to start sso-only with a break-glass user lacking MFA, so the common
-        // path is the enrolled MFA challenge below. Forcing enforcement here is
-        // belt-and-suspenders for the narrow race where MFA was disabled between
-        // boot and this login — it routes through enrollment rather than minting
-        // a bare-password break-glass session.
-        const bool mfa_enforced =
-            break_glass_login || mfa_enforcement_protects(cfg_.mfa_enforcement, *role_opt);
+        // never holds a cookie until they finish enrolling. (A break-glass
+        // user reaching here is necessarily already enrolled — the hard-deny
+        // above handled the un-enrolled case — so it falls through to the
+        // enrolled TOTP challenge, never this enrollment branch.)
+        const bool mfa_enforced = mfa_enforcement_protects(cfg_.mfa_enforcement, *role_opt);
         if (!mfa_enrolled && mfa_enforced) {
             auto* db = auth_mgr_.auth_db_ptr();
             if (!db) {

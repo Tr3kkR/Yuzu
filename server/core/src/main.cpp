@@ -103,34 +103,15 @@ static std::string json_escape(std::string_view s) {
     return out;
 }
 
-// Validate that the configured break-glass principal exists and carries a
-// second factor. Mandatory-MFA is enforced FAIL-CLOSED: the sso-only escape
-// hatch must never be a bare-password account (SOC 2 CC6.6). Shared by the
-// server-start guard and the --break-glass-arm one-shot so both apply the same
-// contract. Returns true on success; on failure returns false and sets `err`
-// to an operator-facing reason.
+// Thin main-side wrapper over the testable `break_glass_account_problem` free
+// function in auth_db (which carries the FAIL-CLOSED mandatory-MFA contract —
+// SOC 2 CC6.6 — so the sso-only escape hatch is never a bare-password account).
+// Shared by the server-start guard and the --break-glass-arm one-shot. Returns
+// true on success; on failure returns false and sets `err` to the reason.
 static bool break_glass_user_valid(yuzu::server::AuthDB& db, const std::string& user,
                                    std::string& err) {
-    if (!yuzu::server::is_valid_username(user)) {
-        err = "not a valid username";
-        return false;
-    }
-    auto exists = db.user_exists(user);
-    if (!exists) {
-        err = "auth store error while checking the account";
-        return false;
-    }
-    if (!*exists) {
-        err = "account does not exist";
-        return false;
-    }
-    auto mfa = db.mfa_status(user);
-    if (!mfa) {
-        err = "auth store error while checking MFA enrollment";
-        return false;
-    }
-    if (!mfa->enrolled) {
-        err = "account has no MFA enrolled (a break-glass account must carry a second factor)";
+    if (auto problem = yuzu::server::break_glass_account_problem(db, user)) {
+        err = *problem;
         return false;
     }
     return true;
@@ -558,33 +539,12 @@ int main(int argc, char* argv[]) {
                      cfg.mfa_enforcement,
                      cfg.mfa_enforcement == "required" ? "users" : "admins");
     }
-    // ── Hardened auth mode guard + posture (SOC 2 CC6.3/CC6.6) ──
-    // sso-only disables the local-password path, so OIDC must be configured or
-    // every operator is locked out (the break-glass account is for an IdP
-    // OUTAGE, not for never wiring SSO at all). Fail closed at boot with a clear
-    // message rather than booting an unreachable server.
-    if (cfg.auth_mode == "sso-only") {
-        if (cfg.oidc_issuer.empty()) {
-            spdlog::error("--auth-mode=sso-only disables local-password login but no OIDC "
-                          "provider is configured (--oidc-issuer is empty). This would lock "
-                          "every operator out. Configure OIDC SSO, or use --auth-mode=standard.");
-            return EXIT_FAILURE;
-        }
-        spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
-                     "DISABLED fleet-wide; only OIDC SSO can mint a session.{}",
-                     cfg.break_glass_user.empty()
-                         ? std::string(" No break-glass account is configured.")
-                         : std::format(" Break-glass account '{}' is exempt only while armed "
-                                       "(--break-glass-arm).",
-                                       cfg.break_glass_user));
-    } else if (!cfg.break_glass_user.empty()) {
-        // A break-glass user only means something under sso-only. Warn rather
-        // than fail so a standard-mode deployment that pre-seeds the env var
-        // (e.g. ahead of a planned hardening) still boots.
-        spdlog::warn("--break-glass-user='{}' is set but --auth-mode is 'standard' — the "
-                     "break-glass exemption only applies under --auth-mode=sso-only; ignoring.",
-                     cfg.break_glass_user);
-    }
+    // NOTE: the --auth-mode=sso-only fail-closed guard + posture log live just
+    // before the server starts to SERVE (below), NOT here — so the host-CLI
+    // one-shots (--break-glass-arm, --mfa-reset) can run on an sso-only
+    // deployment even when OIDC is unreachable, which is the exact situation
+    // break-glass exists for (governance happy-path finding). Standard-mode
+    // deployments that pre-seed --break-glass-user are warned there too.
     // Account lockout posture (SOC 2 CC6.3 evidence). Surfaced once at boot
     // so an operator/auditor can confirm the deployment's brute-force
     // protection from journald without scraping per-event logs. The posture
@@ -1037,6 +997,18 @@ int main(int argc, char* argv[]) {
             std::cerr << "error: failed to arm break-glass account\n";
             return EXIT_FAILURE;
         }
+        // Governance UP-4: a window so large that datetime('now','+N seconds')
+        // overflows to NULL leaves the row dormant (armed=false, armed_until="")
+        // — the UPDATE "succeeds" but the account is NOT armed. Detect that and
+        // fail loudly rather than print "ARMED until " (empty) and exit 0, which
+        // would leave the operator believing the glass is open when it is not.
+        if (!armed->armed || armed->armed_until.empty()) {
+            spdlog::error("--break-glass-arm: window {}s produced no valid expiry (too large?) — "
+                          "the account is NOT armed. Choose a smaller --break-glass-window-secs.",
+                          cfg.break_glass_window_secs);
+            std::cerr << "error: window too large; account not armed\n";
+            return EXIT_FAILURE;
+        }
         const std::string os_user = resolve_os_principal();
         yuzu::server::AuditEvent ev;
         ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1092,26 +1064,53 @@ int main(int argc, char* argv[]) {
 
     // -------------------------------------------------------------------------
 
-    // ── Hardened-mode break-glass boot validation (SOC 2 CC6.6) ──
-    // Under sso-only the break-glass account is the ONLY local-login path, so it
-    // must exist and carry a second factor. Enforce fail-closed at boot rather
-    // than discovering the misconfiguration during an IdP outage when an
-    // operator is trying to break the glass. (Standard mode ignores the field;
-    // it was already warned about above.)
-    if (cfg.auth_mode == "sso-only" && !cfg.break_glass_user.empty()) {
-        if (!auth_db) {
-            spdlog::error("--auth-mode=sso-only with --break-glass-user requires the persistent "
-                          "auth store (auth.db); set --data-dir.");
+    // ── Hardened auth mode guard + posture (SOC 2 CC6.3/CC6.6) ──
+    // Runs HERE (just before serving), after every host-CLI one-shot has already
+    // early-returned, so --break-glass-arm / --mfa-reset are never blocked by it.
+    if (cfg.auth_mode == "sso-only") {
+        // sso-only disables the local-password path, so OIDC must be configured
+        // or every operator is locked out (the break-glass account is for an IdP
+        // OUTAGE, not for never wiring SSO at all). Fail closed rather than
+        // booting an unreachable server.
+        if (cfg.oidc_issuer.empty()) {
+            spdlog::error("--auth-mode=sso-only disables local-password login but no OIDC "
+                          "provider is configured (--oidc-issuer is empty). This would lock "
+                          "every operator out. Configure OIDC SSO, or use --auth-mode=standard.");
             return EXIT_FAILURE;
         }
-        std::string why;
-        if (!break_glass_user_valid(*auth_db, cfg.break_glass_user, why)) {
-            spdlog::error("--break-glass-user='{}' is invalid under --auth-mode=sso-only: {}. "
-                          "Fix the account (create it / enroll MFA) or correct the flag — "
-                          "refusing to start with an unusable break-glass account.",
-                          cfg.break_glass_user, why);
-            return EXIT_FAILURE;
+        // The break-glass account is the ONLY local-login path under sso-only, so
+        // it must exist and carry a second factor. Enforce fail-closed at boot
+        // rather than discovering the misconfiguration during an IdP outage when
+        // an operator is trying to break the glass.
+        if (!cfg.break_glass_user.empty()) {
+            if (!auth_db) {
+                spdlog::error("--auth-mode=sso-only with --break-glass-user requires the "
+                              "persistent auth store (auth.db); set --data-dir.");
+                return EXIT_FAILURE;
+            }
+            std::string why;
+            if (!break_glass_user_valid(*auth_db, cfg.break_glass_user, why)) {
+                spdlog::error("--break-glass-user='{}' is invalid under --auth-mode=sso-only: {}. "
+                              "Fix the account (create it / enroll MFA) or correct the flag — "
+                              "refusing to start with an unusable break-glass account.",
+                              cfg.break_glass_user, why);
+                return EXIT_FAILURE;
+            }
         }
+        spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
+                     "DISABLED fleet-wide; only OIDC SSO can mint a session.{}",
+                     cfg.break_glass_user.empty()
+                         ? std::string(" No break-glass account is configured.")
+                         : std::format(" Break-glass account '{}' is exempt only while armed "
+                                       "(--break-glass-arm).",
+                                       cfg.break_glass_user));
+    } else if (!cfg.break_glass_user.empty()) {
+        // A break-glass user only means something under sso-only. Warn rather
+        // than fail so a standard-mode deployment that pre-seeds the env var
+        // (e.g. ahead of a planned hardening) still boots.
+        spdlog::warn("--break-glass-user='{}' is set but --auth-mode is 'standard' — the "
+                     "break-glass exemption only applies under --auth-mode=sso-only; ignoring.",
+                     cfg.break_glass_user);
     }
 
     std::signal(SIGINT, on_signal);

@@ -404,4 +404,15 @@ private:
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
 
+/// Validate that `username` is usable as the hardened-mode break-glass account:
+/// a syntactically valid username naming an existing ACTIVE user that has MFA
+/// enrolled. Returns std::nullopt when usable, otherwise an operator-facing
+/// reason string. Mandatory-MFA is enforced here, fail-closed (SOC 2 CC6.6) so
+/// the sso-only escape hatch can never be a bare-password account; a store read
+/// error is also a problem (never report a broken account as usable). Because
+/// `mfa_status` filters `is_active = 1`, a soft-deleted user reads as
+/// not-enrolled and is correctly rejected. Shared by the server boot guard and
+/// the `--break-glass-arm` one-shot so both apply one contract.
+std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::string& username);
+
 } // namespace yuzu::server
