@@ -565,15 +565,6 @@ static const ToolDef
                  R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
                  kObjectOutputSchema,
                  R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
-                {"prepare_demo_scenario",
-                 "Prepare a live or curated CEO-demo scenario. curated mode returns clearly "
-                 "labelled synthetic "
-                 "findings and never executes endpoint actions; live mode summarizes current fleet "
-                 "facts and "
-                 "keeps the proposed sequence read-only unless remediation is explicitly approved.",
-                 R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"default":"executive_fleet_health"},"mode":{"type":"string","enum":["live","curated"],"default":"curated"}}})",
-                 kObjectOutputSchema,
-                 R"({"readOnlyHint":true,"title":"Prepare demo scenario","safety":"curated mode is synthetic; live mode is read-only"})"},
                 {"summarize_working_set",
                  "Summarize an agent/result-set/execution scope into a model-ready narrative with "
                  "resource "
@@ -658,7 +649,6 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
     {"get_incident_playbook", {"Infrastructure", "Read"}},
-    {"prepare_demo_scenario", {"Infrastructure", "Read"}},
     {"summarize_working_set", {"Infrastructure", "Read"}},
 };
 
@@ -713,8 +703,9 @@ static const PromptDef kPrompts[] = {
     {"audit_investigation", "Show all actions by a principal in a given timeframe.",
      R"j([{"name":"principal","description":"Username to investigate","required":true},{"name":"hours","description":"Lookback hours (default 24)","required":false}])j"},
     {"ceo_demo_agentic_endpoint_management",
-     "Run a concise executive demo of Yuzu as an agentic endpoint-management control plane.",
-     R"([{"name":"mode","description":"curated or live","required":false}])"},
+     "Run a concise executive demo of Yuzu as an agentic endpoint-management control plane, "
+     "live against the real fleet (never canned data).",
+     "[]"},
     {"fleet_health_briefing",
      "Prepare a model-ready fleet health briefing using fast posture and follow-up resources.",
      "[]"},
@@ -954,19 +945,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     untrusted_prompt_argument("principal", principal) +
                     "\nUse query_audit_log with principal and since filters.";
             } else if (prompt_name == "ceo_demo_agentic_endpoint_management") {
-                // G-S3: `mode` is a closed {live,curated} enum. Normalise to a
-                // known-safe constant so NO caller-supplied text is inlined into
-                // the prompt. Every other prompt arg reflects free-form input and
-                // is wrapped via untrusted_prompt_argument; `mode` is strictly
-                // safer because the raw value is discarded — an injected
-                // "curated\n\nIgnore previous instructions…" collapses to
-                // "curated", closing the prompt-injection vector at the source.
-                const auto raw_mode = param_str(params, "mode", "curated");
-                const std::string mode = (raw_mode == "live") ? "live" : "curated";
-                prompt_text = "Prepare a concise Yuzu CEO demo in " + mode +
-                              " mode. Start with prepare_demo_scenario, then use "
-                              "get_fleet_posture_fast. Clearly label curated findings as demo "
-                              "data, and do not execute endpoint actions.";
+                // Live-only demo (ADR-0016): no curated/fabricated mode. The flow
+                // runs against the real fleet and remediates live, but only AFTER
+                // explicit operator approval through the normal tier/RBAC + approval
+                // path — there is no demo bypass and no canned data.
+                prompt_text =
+                    "Run a live Yuzu executive demo against the REAL fleet — never present "
+                    "fabricated or canned findings. Start with get_fleet_posture_fast, then "
+                    "classify_operational_question for the staged incident, get_incident_playbook "
+                    "for the matching scenario, and summarize_working_set before presenting. "
+                    "Investigate the staged condition with real read-only evidence and label any "
+                    "external-connector gaps honestly. If remediation is warranted, propose it and "
+                    "execute it live ONLY AFTER explicit operator approval through the normal "
+                    "tier/RBAC and approval path (execute_instruction / execute_bundle). Never "
+                    "bypass approval.";
             } else if (prompt_name == "fleet_health_briefing") {
                 prompt_text =
                     "Create a fleet health briefing. Use get_fleet_posture_fast first, then "
@@ -3499,80 +3491,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 auto result = tool_result(payload, kObjectOutputSchema);
                 mcp_audit("success", pb->name);
-                res.set_content(success_response(id, result), "application/json");
-                return;
-            }
-
-            if (tool_name == "prepare_demo_scenario") {
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                const std::string mode = lower_copy(param_str(args, "mode", "curated"));
-                // G-S12: enforce the {live,curated} enum server-side instead of
-                // silently coercing any non-"live" string to curated.
-                if (mode != "live" && mode != "curated") {
-                    mcp_audit("error", "invalid_mode");
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "mode must be 'live' or 'curated'"),
-                                    "application/json");
-                    return;
-                }
-                const std::string scenario = param_str(args, "scenario", "executive_fleet_health");
-                if (scenario.size() > kAgenticParamMaxLen) {
-                    mcp_audit("error", "scenario_too_long");
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "scenario exceeds maximum length"),
-                                    "application/json");
-                    return;
-                }
-                const bool curated = mode != "live";
-                JArr sequence;
-                sequence.add("resources/read yuzu://about")
-                    .add("tools/call get_fleet_posture_fast")
-                    .add("tools/call classify_operational_question")
-                    .add("tools/call get_incident_playbook")
-                    .add("tools/call summarize_working_set");
-                JArr findings;
-                if (curated) {
-                    findings
-                        .add("DEMO DATA: 18% of Windows laptops show pending reboot risk after a "
-                             "failed update wave.")
-                        .add("DEMO DATA: Teams/Zoom quality degradation clusters by one VPN-routed "
-                             "site with elevated RTT/retransmits.")
-                        .add("DEMO DATA: Security-client outage is scoped to one package version; "
-                             "remediation remains approval-gated.")
-                        .add("DEMO DATA: OpenShift/database internals are connector gaps; Yuzu "
-                             "supplies host evidence only.");
-                } else {
-                    // G-S10: count only agents in the caller's scope — a scoped
-                    // operator must not learn the global fleet size from the demo
-                    // tool. Unwired scope fn → legacy-open (full count), matching
-                    // the rest of the MCP surface.
-                    const auto& agents = get_agents();
-                    std::size_t visible = 0;
-                    for (const auto& a : agents) {
-                        if (!response_scope_fn ||
-                            response_scope_fn(session->username, a.value("agent_id", "")))
-                            ++visible;
-                    }
-                    findings.add("LIVE DATA: connected agents visible to MCP now: " +
-                                 std::to_string(visible));
-                    findings.add(
-                        "LIVE DATA: no endpoint actions have been executed by this demo tool.");
-                }
-                auto payload =
-                    JObj()
-                        .add("scenario", scenario)
-                        .add("mode", curated ? "curated" : "live")
-                        .add("curated_data", curated)
-                        .add("data_label", curated ? "DEMO DATA" : "LIVE DATA")
-                        .raw("tool_sequence", sequence.str())
-                        .raw("expected_findings", findings.str())
-                        .raw(
-                            "safety_notes",
-                            R"(["curated mode is synthetic","live mode is read-only in this tool","mutating remediation remains behind existing tier, RBAC, and approval controls"])")
-                        .str();
-                auto result = tool_result(payload, kObjectOutputSchema);
-                mcp_audit("success", curated ? "curated" : "live");
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }
