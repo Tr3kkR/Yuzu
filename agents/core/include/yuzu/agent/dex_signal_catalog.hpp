@@ -62,6 +62,10 @@ struct SignalObservation {
     std::string sentence;       ///< human-readable detected_value line
     std::int64_t timestamp_unix{0}; ///< epoch seconds, 0 = unknown (server stamps)
     std::string platform;       ///< "windows" | "linux" | "macos"
+    bool suppress{false};       ///< extractor verdict: a matched event that is NOT
+                                ///< actually a signal (e.g. a benign battery-count
+                                ///< change) — extract_signal returns nullopt, so it
+                                ///< never emits. Default false = emit (the norm).
 };
 
 /// One catalogue entry. `event_ids` empty = any id from this provider (WHEA);
@@ -80,7 +84,7 @@ struct SignalSpec {
     SignalObservation (*extract)(const EventFields& fields, int event_id);
 };
 
-/// The catalogue — 103 obs_types (some backed by two provider spellings, so the
+/// The catalogue — 110 obs_types (some backed by two provider spellings, so the
 /// spec count is slightly higher). Static, immutable, no registration API:
 /// signals are code, reviewed like code.
 YUZU_EXPORT const std::vector<SignalSpec>& dex_signal_catalog();

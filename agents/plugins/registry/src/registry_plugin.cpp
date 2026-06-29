@@ -38,7 +38,7 @@ namespace {
 YuzuPluginContext* g_ctx = nullptr;
 
 #ifdef _WIN32
-// to_wide / from_wide now come from the shared agents/plugins/shared/win_str.hpp
+// to_wide / from_wide now come from the shared agents/shared/win_str.hpp
 // (#1681) instead of a local copy; brought in unqualified so the existing call
 // sites are unchanged. The shared versions are behaviour-identical for valid input
 // (they add null / non-positive guards over the old local copies).

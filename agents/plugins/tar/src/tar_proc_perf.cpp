@@ -138,6 +138,7 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <winternl.h> // SYSTEM_PROCESS_INFORMATION (public/partial), NTSTATUS
 #include <winver.h>   // GetFileVersionInfoW / VerQueryValueW / VS_FIXEDFILEINFO
 
@@ -197,17 +198,11 @@ using NtQsiFn = NTSTATUS(WINAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG
 constexpr NTSTATUS kStatusInfoLengthMismatch = static_cast<NTSTATUS>(0xC0000004L);
 
 // UTF-16 → UTF-8 for a counted (possibly unterminated) UNICODE_STRING.
+// Delegates to the shared helper (#1681). UNICODE_STRING is COUNTED and not
+// NUL-terminated, so yuzu::win::from_wide's trailing-NUL pop never fires here (a
+// real image name carries no trailing NUL); null buffer / zero length -> {}.
 std::string ucs_to_utf8(const UNICODE_STRING& u) {
-    if (!u.Buffer || u.Length == 0)
-        return {};
-    const int wlen = static_cast<int>(u.Length / sizeof(WCHAR));
-    const int need =
-        ::WideCharToMultiByte(CP_UTF8, 0, u.Buffer, wlen, nullptr, 0, nullptr, nullptr);
-    if (need <= 0)
-        return {};
-    std::string out(static_cast<std::size_t>(need), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, u.Buffer, wlen, out.data(), need, nullptr, nullptr);
-    return out;
+    return yuzu::win::from_wide(u.Buffer, static_cast<int>(u.Length / sizeof(WCHAR)));
 }
 
 // RAII for a process HANDLE — CloseHandle on every exit path (the OpenProcess

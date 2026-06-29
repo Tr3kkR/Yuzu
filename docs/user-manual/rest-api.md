@@ -2770,6 +2770,8 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 **Permission:** `Response:Read`
 
+**Hardening (#1634, partial).** Under a **corrupt or unavailable RBAC store** this endpoint now fails **closed** (returns no rows) rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of this endpoint for normal operators is **not yet effective** — a holder of global `Response:Read` currently sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). `rows_capped` (below) is computed on the raw pre-filter result. When rows are dropped (today, the fail-closed path), the success audit detail carries ` scope_dropped=<N>`.
+
 **Path parameters:**
 
 | Param | Description |
@@ -2817,7 +2819,7 @@ When the underlying response set exceeds the per-request row cap (10000), the re
 | `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
 | `503` | Response store or instruction store unavailable. |
 
-**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id>`.
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id> index=<N>` on success (with ` scope_dropped=<N>` appended when out-of-scope agents' rows were dropped), or `<definition_id> reason=<r>` on the failure path.
 
 **Example:**
 
@@ -4511,6 +4513,8 @@ Aggregate response data for a command (counts, summaries).
 #### `GET /api/responses/{id}/export`
 
 Export response data in CSV format.
+
+**Hardening (#1634, partial).** On a **corrupt or unavailable RBAC store**, these three readers fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of these readers for normal operators is **not yet effective**: a holder of global `Response:Read` sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
 ---
 

@@ -3811,6 +3811,28 @@ private:
                                                        agent_id);
     }
 
+    /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
+    /// fan-out reader routes through this (legacy `/api/responses/*`, the REST
+    /// visualization ResponseScopeFn, and the MCP query_responses/aggregate_responses
+    /// response_scope_fn) so the posture can never drift between surfaces. Returns
+    /// true iff `username` may see `agent_id`'s rows via a management group. A FILTER,
+    /// not a gate (writes no response).
+    ///
+    /// FAILS CLOSED on a corrupt/load-failed rbac.db (#1634 UP-1): gates on
+    /// `rbac_enforcement_in_effect`, not raw `!is_rbac_enabled()`. The latter is
+    /// fail-OPEN — a corrupt store leaves `db_` null so `is_rbac_enabled()` defaults
+    /// false, which would read as "RBAC off → no filter" and re-open the cross-operator
+    /// IDOR. `rbac_enforcement_in_effect` returns false (→ legacy-open) ONLY for a
+    /// store that is loaded AND explicitly disabled; a null/!is_open() store returns
+    /// true (enforce), and `check_scoped_permission` then denies on the dead handle —
+    /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
+    bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true; // loaded & explicitly disabled → legacy-open
+        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                   agent_id, mgmt_group_store_.get());
+    }
+
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
@@ -5720,7 +5742,56 @@ private:
                 return;
             }
 
-            auto results = response_store_->aggregate(instruction_id, aq, filter);
+            // #1634 management-group scope (filter-BEFORE-aggregate; same as MCP
+            // aggregate_responses). The flat Response:Read gate is not a per-agent
+            // ownership check, so resolve the in-scope agent set and push it into the
+            // aggregate WHERE clause. Uses an EXPLICIT positive check, never the
+            // "dropped==0 → unrestricted" inference (#1634 UP-1/2/3):
+            //   * RBAC loaded & explicitly disabled → leave scope nullopt (open).
+            //   * Global Response:Read holder → leave scope nullopt (correct totals at
+            //     any scale; also the perf hoist — skips the distinct scan + per-agent
+            //     loop). check_permission (not is_rbac_enabled) gates this, so a corrupt
+            //     store can't take this branch.
+            //   * Otherwise (group-scoped operator) → resolve and ALWAYS set scope,
+            //     even to the empty set (`AND 1=0` → zero rows), never an unrestricted
+            //     read. A distinct_agent_ids() read error returns 503 (store-availability
+            //     failure is NOT "operator sees no agents" — it must not look like empty
+            //     data; observability-conventions + agentic-first A4 + ADR-0016
+            //     authoritative-reads, #1634 sre review).
+            AggregateScope agg_scope; // nullopt = no restriction
+            std::size_t agg_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                if (rbac_enforcement_in_effect(rbac_store_.get()) &&
+                    !(rbac_store_ &&
+                      rbac_store_->check_permission(session->username, "Response", "Read"))) {
+                    auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                    if (!distinct) {
+                        res.status = 503;
+                        res.set_content(
+                            R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct)
+                        if (response_agent_in_scope(session->username, aid))
+                            in_scope.push_back(std::move(aid));
+                    agg_dropped = distinct->size() - in_scope.size();
+                    agg_scope = std::move(in_scope); // ALWAYS engaged in this branch
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
+            // it so a cross-operator access attempt that was suppressed is auditable on this
+            // surface too (#1634 compliance review; parity with the MCP denied row / the
+            // visualization scope_dropped detail).
+            if (agg_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
+
+            auto results = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
 
             int64_t total_rows = 0;
             nlohmann::json groups = nlohmann::json::array();
@@ -5777,6 +5848,38 @@ private:
             }
 
             auto results = response_store_->query(instruction_id, q);
+
+            // #1634 management-group scope: drop out-of-scope agents' rows before
+            // export (mirrors MCP query_responses / the visualization reader). The
+            // flat Response:Read gate is not a per-agent ownership check.
+            std::size_t export_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
+                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
+                // response_agent_in_scope, rather than skipping it and serving the fleet.
+                if (rbac_enforcement_in_effect(rbac_store_.get())) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(results.size());
+                    for (auto& r : results) {
+                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
+                        if (ins)
+                            m->second = response_agent_in_scope(session->username, r.agent_id);
+                        if (m->second)
+                            visible.push_back(std::move(r));
+                        else if (ins) // count each DISTINCT dropped agent once
+                            ++export_dropped;
+                    }
+                    results.swap(visible);
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
+            if (export_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(export_dropped) + " surface=export");
+
             auto format = req.get_param_value("format");
 
             if (format == "csv") {
@@ -5859,6 +5962,37 @@ private:
             }
 
             auto results = response_store_->query(instruction_id, q);
+
+            // #1634 management-group scope: drop out-of-scope agents' rows before
+            // serving (mirrors the export sibling above + MCP query_responses). The
+            // flat Response:Read gate is not a per-agent ownership check.
+            std::size_t get_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
+                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
+                // response_agent_in_scope, rather than skipping it and serving the fleet.
+                if (rbac_enforcement_in_effect(rbac_store_.get())) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(results.size());
+                    for (auto& r : results) {
+                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
+                        if (ins)
+                            m->second = response_agent_in_scope(session->username, r.agent_id);
+                        if (m->second)
+                            visible.push_back(std::move(r));
+                        else if (ins) // count each DISTINCT dropped agent once
+                            ++get_dropped;
+                    }
+                    results.swap(visible);
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
+            if (get_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(get_dropped) + " surface=get");
 
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& r : results) {
@@ -9185,6 +9319,15 @@ private:
                     return true;
                 return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
                                                             mgmt_group_store_.get());
+            },
+            // #1634: per-agent Response-scope predicate for the fan-out response
+            // readers (GET /api/v1/executions/{id}/visualization). Routes through the
+            // single response_agent_in_scope helper so the REST, MCP and legacy
+            // surfaces share ONE fail-closed implementation (UP-1: a corrupt rbac.db
+            // can't re-open the IDOR via a drifted copy). MUST be wired here; the param
+            // defaults to {} = no filter.
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                return response_agent_in_scope(username, agent_id);
             });
 
         // -- Register MCP server routes ----------------------------------------
@@ -9302,22 +9445,20 @@ private:
                 // N1: the shared network-quality provider (fragments + REST + MCP).
                 net_perf_fn,
                 // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
-                // query_responses{execution_id}. Wired to check_scoped_permission —
-                // the SAME management-group chokepoint the per-device REST/dashboard
-                // routes use — so an operator collects only the agents inside their
-                // groups, not any execution's rows by id. The MCP handler resolves the
-                // principal ONCE (it already authed) and passes `username` in, so this
-                // does NOT re-resolve the session per agent. RBAC off / no store →
-                // legacy-open (no filter), matching require_scoped_permission.
+                // query_responses{execution_id} AND aggregate_responses. Routes through
+                // the single response_agent_in_scope helper — the SAME fail-closed
+                // implementation the REST + legacy surfaces use — so an operator
+                // collects only the agents inside their groups, not any execution's rows
+                // by id, and a corrupt rbac.db fails closed identically on every surface
+                // (#1634 UP-1: was raw is_rbac_enabled, fail-open on store corruption).
+                // The MCP handler resolves the principal ONCE (it already authed) and
+                // passes `username` in, so this does NOT re-resolve the session per agent.
                 // CAVEAT (#1634): for a service-scoped token this checks the token
                 // CREATOR's RBAC scope, not the service-tag confinement that
                 // require_scoped_permission's service branch applies — a pre-existing
                 // MCP confinement limitation this does not fully close.
                 [this](const std::string& username, const std::string& agent_id) -> bool {
-                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                        return true;
-                    return rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                agent_id, mgmt_group_store_.get());
+                    return response_agent_in_scope(username, agent_id);
                 },
                 // ADR-0016: the typed daily-sync software store + its per-device
                 // Inventory-scope predicate for query_installed_software. SAME

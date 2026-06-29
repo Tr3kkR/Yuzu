@@ -12,16 +12,22 @@
 // Most switch via `using yuzu::win::...;` (the local name coincided); wmi (`from_bstr`)
 // and tar_module_etw (`std::wstring`/`std::string` signatures) keep thin delegating shims.
 //
-// This is a PARTIAL consolidation -- NOT every conversion site is migrated. Other plugins
-// still carry their own named or inline wide<->UTF-8 conversions (as of this writing:
-// processes, device_identity, filesystem, hardware, ioc, content_dist, and the
-// tar_dns_collector / tar_proc_etw / tar_proc_perf / tar_arp_collector siblings), as do
-// several agent-CORE files (process_enum, dex_observer, guard_file, guard_registry,
-// guard_service, temp_file, trigger_engine) which sit outside agents/plugins/ and cannot
-// reach this plugin-shared header. installed_apps keeps its own copy too (its #1662 fix is
-// already on `dev`). A comprehensive sweep of the remaining sites is a tracked follow-up --
-// do NOT read this list as exhaustive; grep `WideCharToMultiByte`/`MultiByteToWideChar` for
-// the live set.
+// This header was relocated from agents/plugins/shared/ to agents/shared/ (#1681) so BOTH
+// agents/core/ and agents/plugins/ can reach it -- core could not include a plugin-shared
+// header without inverting the dependency direction. With that move, the agent-core files
+// (process_enum, dex_observer, guard_registry, guard_service, trigger_engine; guard_file's
+// dead, uncalled copy was deleted) and the remaining plugins (processes, device_identity,
+// filesystem, hardware, ioc, content_dist, disk_space, and the tar_dns_collector /
+// tar_proc_etw / tar_proc_perf / tar_arp_collector siblings) all delegate here.
+//
+// Two sites deliberately remain on their own conversion -- by design, NOT pending work:
+//   - temp_file.cpp: writes UTF-8 into a CALLER-provided char* buffer and returns a status
+//     code (a different contract from these std::string-allocating helpers);
+//   - installed_apps (installed_apps_registry_utf8.hpp): its #1662 copy on `dev` strips ALL
+//     trailing NULs in reg_sz_to_utf8, vs this header's first-NUL stop -- aligning would
+//     change output bytes on an interior-NUL value, so it is a separately-reviewed step.
+// Do NOT read any in-comment list as exhaustive; grep
+// `WideCharToMultiByte`/`MultiByteToWideChar` for the live set.
 //
 // These depend only on WideCharToMultiByte / MultiByteToWideChar -- no other Win32
 // surface -- so a header-only home gives one source of truth while preserving build
@@ -44,8 +50,8 @@
 // would yield an empty wstring -- opening the ROOT key / reading the DEFAULT value --
 // so validate any runtime-derived name before use.
 
-#ifndef YUZU_PLUGINS_SHARED_WIN_STR_HPP
-#define YUZU_PLUGINS_SHARED_WIN_STR_HPP
+#ifndef YUZU_SHARED_WIN_STR_HPP
+#define YUZU_SHARED_WIN_STR_HPP
 
 #ifdef _WIN32
 
@@ -125,4 +131,4 @@ inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
 
 #endif // _WIN32
 
-#endif // YUZU_PLUGINS_SHARED_WIN_STR_HPP
+#endif // YUZU_SHARED_WIN_STR_HPP

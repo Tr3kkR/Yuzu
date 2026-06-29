@@ -1,6 +1,7 @@
 #include "response_store.hpp"
 #include "migration_runner.hpp"
 #include "result_parsing.hpp"
+#include "sqlite_raii.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -542,11 +543,17 @@ ResponseStore::get_by_instruction(const std::string& instruction_id) const {
 
 std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instruction_id,
                                                         const AggregationQuery& aq,
-                                                        const ResponseQuery& filter) const {
+                                                        const ResponseQuery& filter,
+                                                        const AggregateScope& scope) const {
     std::shared_lock lock(mtx_);
     std::vector<AggregationResult> results;
     if (!db_)
         return results;
+
+    // Upper bound on the management-group IN-list (#1634). Well under SQLite's
+    // SQLITE_MAX_VARIABLE_NUMBER (32766 on modern builds, incl. the vcpkg
+    // amalgamation), leaving ample headroom for the handful of fixed binds.
+    static constexpr std::size_t kScopeAgentBindCap = 10000;
 
     // Whitelist group_by columns to prevent SQL injection
     static const std::vector<std::string> allowed_group = {"status", "agent_id"};
@@ -598,6 +605,43 @@ std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instr
         bind_texts.push_back(filter.agent_id);
         bind_idx++;
     }
+    // #1634 management-group scope (filter-BEFORE-aggregate). A folded
+    // aggregate cannot be post-filtered, so the caller's in-scope agent set is
+    // pushed into the WHERE clause here. See AggregateScope: nullopt = legacy-open
+    // (no restriction); an EMPTY set = the operator sees none → zero rows; a
+    // non-empty set = `agent_id IN (…)`. Emitted BEFORE the int filters so every
+    // text bind stays contiguous at positions 1..k (the text-bind loop below binds
+    // positionally by vector order, the int binds use the explicit bind_idx that
+    // this block advances).
+    if (scope.has_value()) {
+        const auto& allowed = *scope;
+        if (allowed.empty()) {
+            sql += " AND 1=0"; // visible to no one → exclude every row from the totals
+        } else {
+            // Cap the IN-list defensively so a very wide fan-out cannot exceed the
+            // prepared-statement variable limit (a failed prepare would silently
+            // zero the totals — fail-closed but wrong). The set is materialised
+            // from distinct_agent_ids() (ORDER BY agent_id), so the first N are
+            // deterministic; beyond the cap the totals cover the first N in-scope
+            // agents and a warning is logged. The chunked/keyset aggregate is the
+            // #1634 follow-up. The common case never trips this: the caller leaves
+            // the scope nullopt when the operator can see EVERY responding agent
+            // (admin / RBAC-off), so only a genuinely restricted operator's bounded
+            // group set reaches here.
+            const std::size_t n = std::min<std::size_t>(allowed.size(), kScopeAgentBindCap);
+            if (n < allowed.size())
+                spdlog::warn("ResponseStore::aggregate: in-scope agent set ({}) exceeds bind "
+                             "cap ({}); totals computed over the first {} agents (#1634)",
+                             allowed.size(), kScopeAgentBindCap, n);
+            sql += " AND agent_id IN (";
+            for (std::size_t i = 0; i < n; ++i) {
+                sql += (i == 0) ? "?" : ",?";
+                bind_texts.push_back(allowed[i]);
+                bind_idx++;
+            }
+            sql += ")";
+        }
+    }
     if (filter.status >= 0) {
         sql += " AND status = ?";
         int_binds.emplace_back(bind_idx++, static_cast<int64_t>(filter.status));
@@ -613,28 +657,58 @@ std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instr
 
     sql += " GROUP BY " + aq.group_by + " ORDER BY COUNT(*) DESC";
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    // SqliteStmt RAII: finalize on every path incl. a throwing push_back (bad_alloc)
+    // in the step loop — no manual finalize to leak (#1634 review; the IN-clause
+    // above made this function build a longer dynamic SQL string, but all throw
+    // points stay covered by the owner).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
         return results;
 
     for (int i = 0; i < static_cast<int>(bind_texts.size()); ++i) {
-        sqlite3_bind_text(stmt, i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
     }
     for (const auto& [idx, val] : int_binds) {
-        sqlite3_bind_int64(stmt, idx, val);
+        sqlite3_bind_int64(stmt.get(), idx, val);
     }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         AggregationResult r;
-        auto gv = sqlite3_column_text(stmt, 0);
+        auto gv = sqlite3_column_text(stmt.get(), 0);
         if (gv)
             r.group_value = reinterpret_cast<const char*>(gv);
-        r.count = sqlite3_column_int64(stmt, 1);
-        r.aggregate_value = sqlite3_column_double(stmt, 2);
+        r.count = sqlite3_column_int64(stmt.get(), 1);
+        r.aggregate_value = sqlite3_column_double(stmt.get(), 2);
         results.push_back(std::move(r));
     }
-    sqlite3_finalize(stmt);
     return results;
+}
+
+std::optional<std::vector<std::string>>
+ResponseStore::distinct_agent_ids(const std::string& instruction_id) const {
+    std::shared_lock lock(mtx_);
+    // nullopt = store-read error (caller must fail closed); empty vector = the
+    // instruction genuinely has no rows. Conflating the two re-opened the scoped
+    // aggregate to all agents on a transient SQLITE_BUSY (#1634 UP-2).
+    if (!db_)
+        return std::nullopt;
+    // SqliteStmt RAII: finalize on every path incl. a throwing emplace_back
+    // (bad_alloc) in the step loop — no manual finalize to leak (#1634 review).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(
+            db_, "SELECT DISTINCT agent_id FROM responses WHERE instruction_id = ? ORDER BY agent_id",
+            -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(stmt.get(), 1, instruction_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<std::string> ids;
+    int rc;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        if (auto t = sqlite3_column_text(stmt.get(), 0))
+            ids.emplace_back(reinterpret_cast<const char*>(t));
+    }
+    if (rc != SQLITE_DONE)
+        return std::nullopt; // step failed mid-iteration (e.g. SQLITE_BUSY) → fail closed
+    return ids;
 }
 
 std::size_t ResponseStore::total_count() const {
