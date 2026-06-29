@@ -32,6 +32,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
@@ -261,12 +262,7 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
     std::wstring cmdline = L"\"" + wpath + L"\"";
 
     if (!args_str.empty()) {
-        int len = MultiByteToWideChar(CP_UTF8, 0, args_str.data(),
-                                      static_cast<int>(args_str.size()), nullptr, 0);
-        std::wstring wargs(static_cast<size_t>(len), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, args_str.data(), static_cast<int>(args_str.size()),
-                            wargs.data(), len);
-        cmdline += L" " + wargs;
+        cmdline += L" " + yuzu::win::to_wide(args_str); // (#1681) size-based convert, no NUL
     }
 
     // Create pipes for stdout capture

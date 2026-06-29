@@ -51,6 +51,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <windns.h>
 #elif defined(__linux__)
@@ -477,13 +478,11 @@ bool check_dns_cache(std::string_view domain) {
         return false;
 
     // Convert search domain to wide string for comparison
-    int wide_len =
-        MultiByteToWideChar(CP_UTF8, 0, domain.data(), static_cast<int>(domain.size()), nullptr, 0);
-    if (wide_len <= 0)
+    // (#1681) shared size-based convert (NUL-excluded), identical to the prior inline;
+    // empty/untranslatable -> {} preserves the old wide_len<=0 early-return.
+    std::wstring wide_domain = yuzu::win::to_wide(domain);
+    if (wide_domain.empty())
         return false;
-    std::wstring wide_domain(static_cast<size_t>(wide_len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, domain.data(), static_cast<int>(domain.size()),
-                        wide_domain.data(), wide_len);
 
     bool found = false;
     for (auto* entry = head; entry != nullptr; entry = entry->pNext) {

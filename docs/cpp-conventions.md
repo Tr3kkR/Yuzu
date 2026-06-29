@@ -21,7 +21,7 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 
 ## Windows string conversion
 
-- A Windows plugin needing wide↔UTF-8 conversion must use the shared header `agents/plugins/shared/win_str.hpp` (`yuzu::win::to_wide` / `from_wide` / `reg_sz_to_utf8`) rather than hand-rolling another `MultiByteToWideChar`/`WideCharToMultiByte` copy. It is header-only and `#ifdef _WIN32`-guarded, so build isolation is preserved (each plugin compiles its own inline copy). Add `include_directories('../shared')` to the plugin's `meson.build`. Registry **string** reads must go through the wide `Reg*W` APIs (#1662/#1682) — see the ADR-0016 routed-concern row in `CLAUDE.md`. (Agent-core code outside `agents/plugins/` cannot reach this header and keeps its own copies pending a separate consolidation.)
+- Windows code needing wide↔UTF-8 conversion must use the shared header `agents/shared/win_str.hpp` (`yuzu::win::to_wide` / `from_wide` / `reg_sz_to_utf8`) rather than hand-rolling another `MultiByteToWideChar`/`WideCharToMultiByte` copy. It is header-only and `#ifdef _WIN32`-guarded, so build isolation is preserved (each translation unit compiles its own inline copy — no exported symbol crosses the plugin ABI). The header lives at `agents/shared/`, a sibling leaf of both `core` and `plugins`, so both reach it (#1681). Add the include dir to the consumer's `meson.build`: `include_directories('../../shared')` from a plugin (`agents/plugins/<name>/`), or `include_directories('../shared')` from agent-core (`agents/core/`). Registry **string** reads must go through the wide `Reg*W` APIs (#1662/#1682) — see the ADR-0016 routed-concern row in `CLAUDE.md`.
 
 ## Plugin ABI
 

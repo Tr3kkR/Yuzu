@@ -116,6 +116,24 @@ public:
     /// devices' software to another (#1676 cross-operator IDOR class).
     using InventoryScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
+    /// Per-agent Response-scope predicate for the fan-out response/execution
+    /// readers (e.g. GET /api/v1/executions/{id}/visualization, which charts an
+    /// instruction's responses across every agent that replied). Returns true
+    /// iff `username` may see `agent_id`'s rows via a management group. A FILTER,
+    /// not a gate: it writes no response and is invoked per result row to drop
+    /// out-of-scope agents before the chart transform, exactly mirroring the MCP
+    /// query_responses scope fn (server.cpp wires the SAME check_scoped_permission
+    /// chokepoint, bound to ("Response","Read")). Empty/default `{}` = no filter
+    /// (legacy-open, matching the MCP default + require_scoped_permission) —
+    /// production wires it from server.cpp. NOTE (#1634): this filter is the
+    /// FOUNDATION for management-group scoping but is INERT under the current global
+    /// `Response:Read` gate — a global holder passes the gate and check_scoped_permission's
+    /// global step then admits every agent (no-op), while a management-group-confined
+    /// operator is 403'd at the gate before this runs. Its only active effect today is
+    /// failing CLOSED on a corrupt/load-failed rbac.db. It becomes effective once the
+    /// admit-then-filter gate for fan-out reads lands (the remaining #1634 work).
+    using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -230,7 +248,11 @@ public:
         // predicate for GET /api/v1/inventory/software (trailing optional deps;
         // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {});
+        InventoryScopeFn inventory_scope_fn = {},
+        // #1634: per-agent Response-scope predicate for the fan-out response
+        // readers (visualization). Trailing optional dep; MUST be wired from
+        // server.cpp — `{}` scope = unfiltered fan-out read.
+        ResponseScopeFn response_scope_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -266,7 +288,11 @@ public:
         // predicate for GET /api/v1/inventory/software (trailing optional deps;
         // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
         SoftwareInventoryStore* software_inventory_store = nullptr,
-        InventoryScopeFn inventory_scope_fn = {});
+        InventoryScopeFn inventory_scope_fn = {},
+        // #1634: per-agent Response-scope predicate for the fan-out response
+        // readers (visualization). Trailing optional dep; MUST be wired from
+        // server.cpp — `{}` scope = unfiltered fan-out read.
+        ResponseScopeFn response_scope_fn = {});
 };
 
 } // namespace yuzu::server

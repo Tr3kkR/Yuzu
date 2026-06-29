@@ -1659,6 +1659,15 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     if (execution_id.starts_with("bundle-"))
         return;
 
+    // Pre-flight run correlation ids ("preflight-<run>-<check>", minted by
+    // PreflightRoutes / PreflightRunner) are the same case: the run re-dispatches
+    // each check under a stable per-check execution_id only so the grid can read
+    // responses back via query_by_execution. There is no ExecutionTracker row —
+    // the PreflightRunStore is the run's completion authority, NOT the executions
+    // drawer. Notifying here would publish phantom agent-transition events. Skip.
+    if (execution_id.starts_with("preflight-"))
+        return;
+
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
