@@ -236,6 +236,36 @@ public:
     /// rows. Returns InvalidUsername for malformed input.
     std::expected<void, AuthDBError> clear_failed_logins(const std::string& username);
 
+    // ── Break-glass arming (hardened mode) ───────────────────────────────
+    //
+    // SOC 2 CC6.6. See docs/auth-architecture.md "Hardened mode". The single
+    // configured break-glass account (Config::break_glass_user) is exempt from
+    // --auth-mode=sso-only ONLY while armed. "Armed" is a future timestamp in
+    // users.break_glass_armed_until, evaluated in SQL against CURRENT_TIMESTAMP
+    // exactly like locked_until, so the exemption auto-expires and is never a
+    // permanent standing bypass. Arming is an out-of-band host operation
+    // (--break-glass-arm), not a session-authenticated route, so it works when
+    // the IdP is down (the case break-glass exists for).
+
+    struct BreakGlassStatus {
+        bool armed{false};        // break_glass_armed_until set AND still in the future
+        std::string armed_until;  // SQLite DATETIME string, or "" when dormant
+    };
+
+    /// Read-only break-glass arm check. Returns a zero-initialised
+    /// BreakGlassStatus (armed=false) when the user row is absent. Returns
+    /// InvalidUsername for malformed input.
+    std::expected<BreakGlassStatus, AuthDBError> break_glass_status(const std::string& username);
+
+    /// Arm the break-glass account for `window_secs` from now
+    /// (break_glass_armed_until = datetime('now', '+N seconds')). Single
+    /// UPDATE ... RETURNING (no sqlite3_changes() — #1033). Returns
+    /// UserNotFound when no active user row matched (so the host operator gets a
+    /// clear error rather than a silent no-op), InvalidUsername for malformed
+    /// input.
+    std::expected<BreakGlassStatus, AuthDBError> arm_break_glass(const std::string& username,
+                                                                 int window_secs);
+
     // ── MFA / TOTP Operations ────────────────────────────────────────────
     //
     // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and

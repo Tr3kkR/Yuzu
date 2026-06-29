@@ -662,6 +662,45 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         }
 
+        // ── Hardened mode: local-password login disabled (SOC 2 CC6.3) ───
+        // Under --auth-mode=sso-only the local-password path is closed
+        // fleet-wide; only OIDC SSO (/auth/callback, untouched) mints a
+        // session. The single configured break-glass account is exempt ONLY
+        // while armed — an out-of-band host operator ran --break-glass-arm
+        // within the window. A non-exempt or un-armed attempt is rejected with
+        // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
+        // wording, no Retry-After) so the response is not an enumeration / mode
+        // / arm-state oracle, and verify_password (PBKDF2) is skipped — mirroring
+        // the lockout pre-check's posture and its accepted timing residue.
+        bool break_glass_login = false;
+        if (cfg_.auth_mode == "sso-only") {
+            if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
+                if (auto* db = auth_mgr_.auth_db_ptr()) {
+                    // Fail CLOSED on a read error: unlike lockout (which guards
+                    // against wrong passwords and so fails open), this gate is
+                    // the credential path itself — a transient read error must
+                    // not become a free pass to the disabled local-login path.
+                    if (auto bg = db->break_glass_status(username); bg && bg->armed) {
+                        break_glass_login = true;
+                    }
+                }
+            }
+            if (!break_glass_login) {
+                res.status = 401;
+                res.set_content(
+                    R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                audit_log(req, "auth.local_disabled", "denied", "User", username,
+                          "local-password login disabled (auth-mode=sso-only)");
+                return;
+            }
+            // break_glass_login stays true → the success audit + metric + warn
+            // fire only AFTER verify_password below confirms the credential, so a
+            // wrong-password attempt against the armed account audits as a normal
+            // auth.login_failed (and counts toward lockout), never a spurious
+            // "ok" break-glass row.
+        }
+
         auto role_opt = auth_mgr_.verify_password(username, password);
         if (!role_opt) {
             res.status = 401;
@@ -713,6 +752,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
             }
             return;
+        }
+
+        // Password verified for an armed break-glass account under sso-only.
+        // Loud + audited evidence (SOC 2 CC6.6): the OPENED escape-hatch path
+        // gets its own row + metric + warn so an auditor sees every break-glass
+        // use. Emitted here (post-verify) so it reflects an accepted credential,
+        // not merely an attempt; the session is still forced through MFA below.
+        if (break_glass_login) {
+            audit_log_for_principal(req, "auth.breakglass.login", "ok", username,
+                                    auth::role_to_string(*role_opt), "User", username,
+                                    "armed break-glass login under auth-mode=sso-only");
+            emit_event("auth.breakglass.login", req,
+                       {{"source_ip", req.remote_addr}, {"username", username}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_break_glass_login_total").increment();
+            }
+            spdlog::warn("BREAK-GLASS login proceeding for '{}' (source {}) under "
+                         "auth-mode=sso-only — a second factor is still required",
+                         username, req.remote_addr);
         }
 
         // Password verified — reset the lockout counter (the brute-force
@@ -769,7 +828,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // POST /login/mfa/enroll confirm the first code and complete the
         // login. No new session concept; an un-enrolled enforced user
         // never holds a cookie until they finish enrolling.
-        const bool mfa_enforced = mfa_enforcement_protects(cfg_.mfa_enforcement, *role_opt);
+        // A break-glass login ALWAYS requires a second factor, irrespective of
+        // the global mfa_enforcement mode: the boot-time guard already refused
+        // to start sso-only with a break-glass user lacking MFA, so the common
+        // path is the enrolled MFA challenge below. Forcing enforcement here is
+        // belt-and-suspenders for the narrow race where MFA was disabled between
+        // boot and this login — it routes through enrollment rather than minting
+        // a bare-password break-glass session.
+        const bool mfa_enforced =
+            break_glass_login || mfa_enforcement_protects(cfg_.mfa_enforcement, *role_opt);
         if (!mfa_enrolled && mfa_enforced) {
             auto* db = auth_mgr_.auth_db_ptr();
             if (!db) {

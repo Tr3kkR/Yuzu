@@ -199,6 +199,27 @@ struct Config {
     /// between password success and TOTP submission). Default 120 s.
     int mfa_login_pending_secs{120};
 
+    // Hardened authentication mode + break-glass — `/auth-and-authz` skill gap
+    // matrix P0 #3, SOC 2 CC6.3 (disable password fallback) + CC6.6
+    // (constrained break-glass). See docs/auth-architecture.md "Hardened mode".
+    //
+    // "standard" (default) leaves local-password login enabled. "sso-only"
+    // disables the local-password path fleet-wide — only OIDC SSO mints a
+    // session — EXCEPT for a single designated break-glass account that is
+    // exempt ONLY while armed (an out-of-band host operator ran
+    // --break-glass-arm within the window). sso-only refuses to start without
+    // OIDC configured (it would otherwise lock every operator out).
+    std::string auth_mode{"standard"}; // "standard" | "sso-only"
+    /// Username of the single local account exempt from sso-only while armed.
+    /// Empty = no break-glass account. Must exist and have MFA enrolled
+    /// (enforced fail-closed at boot under sso-only).
+    std::string break_glass_user;
+    /// Seconds the break-glass account stays armed after --break-glass-arm
+    /// (default 86400 = 24h). The arm auto-expires (break_glass_armed_until is
+    /// a future timestamp evaluated lazily at login, like locked_until) so it
+    /// can never be a permanent standing exemption.
+    int break_glass_window_secs{86400};
+
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only

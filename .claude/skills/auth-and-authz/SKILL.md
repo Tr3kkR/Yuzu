@@ -78,8 +78,8 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | Feature | Workstream B line | SOC 2 link | Gap class |
 |---|---|---|---|
 | **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
-| **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **MISSING** |
-| **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **MISSING** |
+| **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle) + `auth.local_disabled` audit. See `docs/auth-architecture.md` "Hardened mode". |
+| **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
@@ -149,11 +149,25 @@ matches the customer ask.
    `auth.lockout.applied`/`.cleared`; metrics `yuzu_auth_lockout_applied_total`
    / `yuzu_auth_lockout_blocked_total`. See `docs/auth-architecture.md`
    "Account lockout".
-3. **Hardened-mode local-password disable.** New CLI flag
-   `--auth-mode=sso-only`; `auth_routes.cpp` rejects local-password login
-   with a clear message and logs `auth.local_disabled`. Break-glass account
-   policy: a single named principal exempt from the flag, with mandatory
-   MFA + 24h auto-disable + every action logged at `critical`.
+3. ~~**Hardened-mode local-password disable.**~~ **DONE** — `--auth-mode=sso-only`
+   (`YUZU_AUTH_MODE`) disables the local-password path fleet-wide; only OIDC SSO
+   mints a session, and the server **refuses to start** without OIDC configured
+   (it would otherwise lock everyone out). The `POST /login` gate returns the
+   **same generic 401** as a bad password (no enumeration/mode oracle) + an
+   `auth.local_disabled` audit row. Break-glass account: `--break-glass-user` is
+   the single exempt principal, exempt **only while armed**
+   (`users.break_glass_armed_until`, migration v4 — a future timestamp evaluated
+   in SQL like `locked_until`, so it **auto-expires**; `--break-glass-window-secs`
+   default 24h). **Mandatory MFA** is enforced two ways: boot fails closed if the
+   break-glass user lacks MFA, and the login handler forces the break-glass
+   session through MFA regardless of `--mfa-enforcement`. Arming is an
+   out-of-band **host CLI** op — `yuzu-server --break-glass-arm` (audited
+   `auth.breakglass.armed`, attributed to the kernel OS identity, audit-store
+   writable-checked before mutate; mirrors the `--mfa-reset` contract) — so it
+   works when the IdP is down (the case it exists for). Use is loud:
+   `auth.breakglass.login` audit + `yuzu_auth_break_glass_login_total` metric +
+   a `warn` log. See `docs/auth-architecture.md` "Hardened mode";
+   `tests/unit/server/test_auth_break_glass.cpp` + `test_auth_routes_hardened.cpp`.
 4. ~~**Sampled auth-log evidence export.**~~ **DONE** —
    `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` returns a
    pseudo-random sample of the auth surface (`auth.`/`mfa.`/`session.` action

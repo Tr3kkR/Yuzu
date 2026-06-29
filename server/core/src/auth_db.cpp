@@ -547,6 +547,18 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
             ALTER TABLE users ADD COLUMN last_failed_login_at DATETIME;
             ALTER TABLE users ADD COLUMN locked_until DATETIME;
         )"},
+        // v4: Break-glass arming for hardened mode (--auth-mode=sso-only).
+        // SOC 2 CC6.6 — see the `/auth-and-authz` skill gap matrix entry P0 #3
+        // and docs/auth-architecture.md "Hardened mode". One nullable column on
+        // the existing users table: the "who" (which account is the break-glass
+        // principal) is operator config (Config::break_glass_user), the "when"
+        // (armed until) is this column. NULL = dormant; a future timestamp =
+        // armed, evaluated lazily at login against CURRENT_TIMESTAMP so the
+        // exemption auto-expires and is never a permanent standing bypass.
+        // Defaulted nullable so existing rows survive without backfill.
+        {4, R"(
+            ALTER TABLE users ADD COLUMN break_glass_armed_until DATETIME;
+        )"},
     };
 
     if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
@@ -1232,6 +1244,95 @@ std::expected<void, AuthDBError> AuthDB::clear_failed_logins(const std::string& 
         return std::unexpected(AuthDBError::WriteFailed);
     }
     return {};
+}
+
+// ── Break-glass arming (hardened mode) ───────────────────────────────────────
+
+std::expected<AuthDB::BreakGlassStatus, AuthDBError>
+AuthDB::break_glass_status(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // armed is computed in SQL against CURRENT_TIMESTAMP so the "still armed?"
+    // decision uses the DB clock, not a parsed string — mirrors lockout_status.
+    static const char* sql = R"(
+        SELECT COALESCE(break_glass_armed_until, ''),
+               (break_glass_armed_until IS NOT NULL
+                AND break_glass_armed_until > CURRENT_TIMESTAMP)
+        FROM users
+        WHERE username = ? AND is_active = 1
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare break_glass_status statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+
+    BreakGlassStatus out;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out.armed_until = col_text(stmt, 0);
+        out.armed = sqlite3_column_int(stmt, 1) != 0;
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        spdlog::error("break_glass_status query failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::QueryFailed);
+    }
+    // rc == SQLITE_DONE → no active row → zero-initialised (not-armed) status.
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+std::expected<AuthDB::BreakGlassStatus, AuthDBError>
+AuthDB::arm_break_glass(const std::string& username, int window_secs) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    if (window_secs < 1) {
+        window_secs = 1; // a 0/negative window would expire instantly
+    }
+    // Bound modifier string for datetime('now', ?) — same idiom as
+    // record_failed_login. Value form is "+86400 seconds".
+    std::string window = std::string("+") + std::to_string(window_secs) + " seconds";
+
+    // Single UPDATE ... RETURNING (no sqlite3_changes() race — #1033). The
+    // RETURNING row both confirms a row matched (UserNotFound otherwise, so the
+    // host operator isn't told an arm "succeeded" against a typo'd username) and
+    // carries the post-update armed state for the audit detail.
+    static const char* sql = R"(
+        UPDATE users
+        SET break_glass_armed_until = datetime('now', ?1)
+        WHERE username = ?2 AND is_active = 1
+        RETURNING COALESCE(break_glass_armed_until, ''),
+                  (break_glass_armed_until IS NOT NULL
+                   AND break_glass_armed_until > CURRENT_TIMESTAMP)
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare arm_break_glass statement: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, window.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+
+    BreakGlassStatus out;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out.armed_until = col_text(stmt, 0);
+        out.armed = sqlite3_column_int(stmt, 1) != 0;
+        sqlite3_finalize(stmt);
+        return out;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        spdlog::error("arm_break_glass failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    // SQLITE_DONE with no row → no such active user → tell the caller, don't
+    // silently report a successful arm.
+    return std::unexpected(AuthDBError::UserNotFound);
 }
 
 // ── MFA / TOTP Operations ────────────────────────────────────────────────────
