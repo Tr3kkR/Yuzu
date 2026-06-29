@@ -2928,13 +2928,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
         const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-        // Capture the audit bool (#1549 governance): surface a dropped evidence row on
-        // this usage-class dispatch via Sec-Audit-Failed; HTML surface still renders.
-        if (audit_fn_ &&
-            !audit_fn_(req, "dex.device.perf.query", sent > 0 ? "success" : "no_agents", "Agent",
-                       id, "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
-                               " agent(s) command_id=" + command_id))
-            res.set_header("Sec-Audit-Failed", "true");
+        // Surface a dropped evidence row on this usage-class dispatch via
+        // Sec-Audit-Failed; HTML surface still renders. Shared #1647 chokepoint so a
+        // throwing audit_fn is caught here too (catch-arm parity), not just returns-false.
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, "dex.device.perf.query", sent > 0 ? "success" : "no_agents",
+            "Agent", id,
+            "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
+                " agent(s) command_id=" + command_id);
         if (sent == 0) {
             note(res, "Device offline &mdash; the live performance query needs a connected "
                       "agent.");
@@ -3053,15 +3054,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
                  const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-                 // Capture the audit bool (#1549 governance): the procperf probe is
-                 // usage-class (works-council-relevant); surface a dropped evidence row
-                 // via Sec-Audit-Failed; HTML surface still renders.
-                 if (audit_fn_ &&
-                     !audit_fn_(req, "dex.device.procperf.query",
-                                sent > 0 ? "success" : "no_agents", "Agent", id,
-                                "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
-                                    std::to_string(sent) + " agent(s) command_id=" + command_id))
-                     res.set_header("Sec-Audit-Failed", "true");
+                 // The procperf probe is usage-class (works-council-relevant); surface a
+                 // dropped evidence row via Sec-Audit-Failed; HTML surface still renders.
+                 // Shared #1647 chokepoint adds catch-arm parity for a throwing audit_fn.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.device.procperf.query",
+                     sent > 0 ? "success" : "no_agents", "Agent", id,
+                     "canned tar.sql $ProcPerf_Hourly (usage-class) -> " + std::to_string(sent) +
+                         " agent(s) command_id=" + command_id);
                  if (sent == 0) {
                      note(res, "Device offline &mdash; the live per-app query needs a connected "
                                "agent.");

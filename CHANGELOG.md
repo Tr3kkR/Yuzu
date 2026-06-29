@@ -140,6 +140,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
   evidence-gap signal.
 
+- **Behavioural dispatch-audit sites routed through the shared chokepoint for catch-arm parity
+  (#1647 follow-up).** The remaining per-device/per-signal routes that still called the `AuditFn`
+  raw — `device.live.*` (`/fragments/device/live/run`), `dex.device.perf.query` /
+  `dex.device.procperf.query`, and the `tar_tree_routes` dispatch/read sites
+  (`tar.process_tree.{read,detail}`, `tar.dns.read`, `tar.arp.read`, `tar.sources.{read,configure}`)
+  — now go through `detail::emit_behavioral_audit` in `server/core/src/rest_audit.hpp`. A throwing
+  `audit_fn` (`bad_alloc`-class) is caught and logged instead of escaping the handler (httplib would
+  have turned it into a `500`). Each route keeps its existing **dispatch/set-and-proceed** posture
+  (no read-PII route became a `503`). The `tar_tree_routes` sites previously **discarded** the audit
+  bool and set no header; they now surface `Sec-Audit-Failed: true` on a dropped/throwing audit row,
+  matching the migrated sibling routes. No audit verbs changed.
+
 - **MCP `query_responses` gained a per-agent management-group filter (#1550) — but it is INERT
   under the global gate and does NOT yet isolate operators; see the #1634 entry above.** The tool
   previously gated only flat `Response:Read` and then returned **any** execution's response rows

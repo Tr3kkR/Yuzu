@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -1131,10 +1132,14 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                      const std::string&) { return true; };
     auto fleet = []() { return DexFleet{1, 1}; };
     std::string audited;
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
+    bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
                      const std::string&, const std::string& tid, const std::string&) -> bool {
         audited = a + "|" + r + "|" + tid;
-        return true;
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        return audit_ok;
     };
 
     // Fake dispatch + response store.
@@ -1277,6 +1282,59 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         auto r = sink3.Get("/fragments/dex/device/perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(r->body.find("unavailable") != std::string::npos);
+    }
+
+    // #1647 catch-arm parity: the perf/procperf dispatch audit set Sec-Audit-Failed on a
+    // returns-false but had NO try/catch — a throwing audit_fn escaped the handler.
+    // Routed through the shared rest_audit.hpp chokepoint, a throw is now caught and
+    // flags the header while the set-and-proceed posture (still polls) is unchanged.
+    SECTION("perf: a dropped audit row flags Sec-Audit-Failed, still polls") {
+        audit_ok = false;
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(r->body.find("/fragments/dex/device/perf/result") != std::string::npos);
+    }
+    SECTION("perf: a throwing audit_fn is caught, never escapes the handler") {
+        audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(r->body.find("/fragments/dex/device/perf/result") != std::string::npos);
+    }
+    SECTION("procperf: a throwing audit_fn is caught + flags Sec-Audit-Failed") {
+        audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(seen_sql.find("$ProcPerf_Hourly") != std::string::npos);
+        // The audit verb was actually reached (row recorded before the throw) — not a
+        // header set by some unrelated path.
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("procperf: a dropped audit row flags Sec-Audit-Failed, still polls") {
+        audit_ok = false;
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("perf clean path sets NO Sec-Audit-Failed header") {
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty()); // audit_ok=true, no throw
+        CHECK(audited == "dex.device.perf.query|success|WS-1");
     }
 }
 
