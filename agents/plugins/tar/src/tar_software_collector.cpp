@@ -6,7 +6,7 @@
  *   - machine: HKLM ...\Uninstall (64-bit + WOW6432Node 32-bit) — cheap, no mounts.
  *   - user:    each profile's HKU\<SID>\...\Uninstall. A LOGGED-ON user's hive is
  *              already loaded under HKU (cheap); a LOGGED-OFF user's hive is on
- *              disk and must be mounted with RegLoadKeyA (NTUSER.DAT) to read.
+ *              disk and must be mounted with RegLoadKeyW (NTUSER.DAT) to read.
  *
  * Steady-state TAR ticks call enumerate_machine_software + enumerate_loaded_user_software
  * (loaded hives only — NO mounting) and carry forward logged-off users from the
@@ -21,8 +21,12 @@
  * string) cannot leak an HKEY or, worse, leave a user's NTUSER.DAT permanently
  * mounted (which would pin the file and break that user's next logon).
  *
- * Registry strings are sanitised to valid UTF-8 (legacy system-codepage bytes
- * are replaced). Linux/macOS: every entry point returns empty (kPlanned).
+ * Registry STRING reads use the wide Reg*W APIs and convert to UTF-8 via the
+ * shared win_str.hpp helpers (yuzu::win::reg_sz_to_utf8 / from_wide), per the
+ * project-wide wide-only registry-read contract (#1662/#1682). The old ANSI
+ * Reg*A path returned system-codepage bytes that silently corrupted non-ASCII
+ * application names, publishers, and profile paths before storage. Linux/macOS:
+ * every entry point returns empty (kPlanned).
  */
 
 #include "tar_collectors.hpp"
@@ -32,7 +36,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -44,6 +47,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681/#1682)
 #endif
 
 namespace yuzu::tar {
@@ -70,14 +75,14 @@ public:
         if (h_)
             RegCloseKey(h_);
     }
-    HKEY* put() { return &h_; } // for the &phkResult out-param of RegOpenKeyExA
+    HKEY* put() { return &h_; } // for the &phkResult out-param of RegOpenKeyExW
     HKEY get() const { return h_; }
 
 private:
     HKEY h_{nullptr};
 };
 
-// RAII guard that unmounts a hive (RegUnLoadKeyA) loaded with RegLoadKeyA. Armed
+// RAII guard that unmounts a hive (RegUnLoadKeyW) loaded with RegLoadKeyW. Armed
 // only after a successful load, so the destructor unloads on every exit path —
 // including an exception while enumerating the mounted hive.
 class HiveUnmount {
@@ -85,51 +90,11 @@ public:
     explicit HiveUnmount(std::string mount_key) : key_(std::move(mount_key)) {}
     HiveUnmount(const HiveUnmount&) = delete;
     HiveUnmount& operator=(const HiveUnmount&) = delete;
-    ~HiveUnmount() { RegUnLoadKeyA(HKEY_USERS, key_.c_str()); }
+    ~HiveUnmount() { RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(key_).c_str()); }
 
 private:
-    std::string key_;
+    std::string key_; // ASCII ("YUZU_TAR_SW_<SID>")
 };
-
-// Replace invalid UTF-8 bytes with '?'. Windows registry strings read via the
-// ANSI API may carry legacy system-codepage bytes that are not valid UTF-8.
-std::string sanitize_utf8(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        auto c = static_cast<unsigned char>(s[i]);
-        if (c < 0x80) {
-            out += s[i];
-            ++i;
-        } else if ((c >> 5) == 0x06 && i + 1 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02) {
-            out += s[i];
-            out += s[i + 1];
-            i += 2;
-        } else if ((c >> 4) == 0x0E && i + 2 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02) {
-            out += s[i];
-            out += s[i + 1];
-            out += s[i + 2];
-            i += 3;
-        } else if ((c >> 3) == 0x1E && i + 3 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 3]) >> 6) == 0x02) {
-            out += s[i];
-            out += s[i + 1];
-            out += s[i + 2];
-            out += s[i + 3];
-            i += 4;
-        } else {
-            out += '?';
-            ++i;
-        }
-    }
-    return out;
-}
 
 // Warn once (per process) when the per-cycle software entry cap is hit. Unlike
 // the ARP/DNS auto-clearing rate-limit, a host that genuinely owns >8192
@@ -166,6 +131,8 @@ void dedup(std::vector<SoftwareInfo>& apps) {
 
 // Enumerate one Uninstall key, appending SoftwareInfo records tagged with the
 // supplied scope/user. SystemComponent=1 and nameless entries are skipped.
+// `subkey` is an ASCII key PATH (compile-time literal or SID-derived); it is
+// converted to wide for the open so the whole read path is Reg*W.
 void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                              const std::string& scope, const std::string& user,
                              std::vector<SoftwareInfo>& apps) {
@@ -177,38 +144,41 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
     }
 
     RegKey hkey;
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, hkey.put()) !=
-        ERROR_SUCCESS) {
+    if (RegOpenKeyExW(root, yuzu::win::to_wide(subkey).c_str(), 0,
+                      KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, hkey.put()) != ERROR_SUCCESS) {
         return;
     }
 
-    char name_buf[256]{};
+    // App subkey names can be non-ASCII (some installers key on the DisplayName),
+    // so enumerate wide and re-open with the wide name directly — an ANSI round
+    // trip could mangle the name and fail the re-open.
+    wchar_t name_buf[256]{};
     DWORD idx = 0;
-    DWORD name_len = sizeof(name_buf);
+    DWORD name_len = ARRAYSIZE(name_buf); // RegEnumKeyExW length is in CHARACTERS, not bytes
 
-    while (RegEnumKeyExA(hkey.get(), idx++, name_buf, &name_len, nullptr, nullptr, nullptr,
+    while (RegEnumKeyExW(hkey.get(), idx++, name_buf, &name_len, nullptr, nullptr, nullptr,
                          nullptr) == ERROR_SUCCESS) {
         if (apps.size() >= kSoftwareEntryCap) {
             note_software_truncation();
             break;
         }
         RegKey app_key;
-        if (RegOpenKeyExA(hkey.get(), name_buf, 0, KEY_READ | extra_sam, app_key.put()) ==
+        if (RegOpenKeyExW(hkey.get(), name_buf, 0, KEY_READ | extra_sam, app_key.put()) ==
             ERROR_SUCCESS) {
-            auto read_str = [&](const char* value_name) -> std::string {
-                char buf[512]{};
-                DWORD size = sizeof(buf);
+            auto read_str = [&](const wchar_t* value_name) -> std::string {
+                wchar_t buf[512]{};
+                DWORD size = sizeof(buf); // bytes — RegQueryValueExW reports/consumes byte counts
                 DWORD type = 0;
-                if (RegQueryValueExA(app_key.get(), value_name, nullptr, &type,
+                if (RegQueryValueExW(app_key.get(), value_name, nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
                     // Accept REG_EXPAND_SZ as well as REG_SZ — some installers store
-                    // these values with embedded environment refs. `size` includes
-                    // the trailing NUL when present, but a non-NUL-terminated REG_SZ
-                    // is legal; trim at the first embedded NUL (capped at the buffer)
-                    // rather than blindly dropping the last byte.
+                    // these values with embedded environment refs. reg_sz_to_utf8
+                    // stops at the first NUL (correct for REG_SZ/REG_EXPAND_SZ) and
+                    // returns valid UTF-8, so no system-codepage corruption and no
+                    // separate sanitisation pass is needed.
                     if ((type == REG_SZ || type == REG_EXPAND_SZ) && size > 0) {
                         DWORD cap = size < sizeof(buf) ? size : sizeof(buf);
-                        return std::string(buf, ::strnlen(buf, cap));
+                        return yuzu::win::reg_sz_to_utf8(buf, cap);
                     }
                 }
                 return {};
@@ -218,46 +188,46 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
             // Add/Remove Programs); a REG_SZ-only read made the filter a permanent
             // no-op so system components/patches were collected despite the manual's
             // contract (#1620). Read the DWORD form, falling back to the rare string
-            // form.
+            // form. (A DWORD read carries no encoding; it stays correct under W.)
             auto system_component_set = [&]() -> bool {
                 DWORD val = 0;
                 DWORD size = sizeof(val);
                 DWORD type = 0;
-                if (RegQueryValueExA(app_key.get(), "SystemComponent", nullptr, &type,
+                if (RegQueryValueExW(app_key.get(), L"SystemComponent", nullptr, &type,
                                      reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS &&
                     type == REG_DWORD && size == sizeof(DWORD)) {
                     return val == 1;
                 }
-                return read_str("SystemComponent") == "1";
+                return read_str(L"SystemComponent") == "1";
             };
 
-            auto display_name = read_str("DisplayName");
+            auto display_name = read_str(L"DisplayName");
             if (!display_name.empty() && !system_component_set()) {
                 SoftwareInfo app;
-                app.name = sanitize_utf8(std::move(display_name));
-                app.version = sanitize_utf8(read_str("DisplayVersion"));
-                app.publisher = sanitize_utf8(read_str("Publisher"));
+                app.name = std::move(display_name);
+                app.version = read_str(L"DisplayVersion");
+                app.publisher = read_str(L"Publisher");
                 // InstallDate is usually REG_SZ "YYYYMMDD", but some installers
                 // store it as a REG_DWORD number — fall back to that so the column
                 // is not silently empty.
-                auto install_date = read_str("InstallDate");
+                auto install_date = read_str(L"InstallDate");
                 if (install_date.empty()) {
                     DWORD val = 0;
                     DWORD dsize = sizeof(val);
                     DWORD dtype = 0;
-                    if (RegQueryValueExA(app_key.get(), "InstallDate", nullptr, &dtype,
+                    if (RegQueryValueExW(app_key.get(), L"InstallDate", nullptr, &dtype,
                                          reinterpret_cast<LPBYTE>(&val), &dsize) == ERROR_SUCCESS &&
                         dtype == REG_DWORD && dsize == sizeof(DWORD) && val != 0) {
                         install_date = std::to_string(val);
                     }
                 }
-                app.install_date = sanitize_utf8(install_date);
+                app.install_date = std::move(install_date);
                 app.scope = scope;
                 app.user = user;
                 apps.push_back(std::move(app));
             }
         }
-        name_len = sizeof(name_buf);
+        name_len = ARRAYSIZE(name_buf);
     }
 }
 
@@ -274,18 +244,20 @@ struct ProfileEntry {
 std::vector<ProfileEntry> list_profiles() {
     std::vector<ProfileEntry> profiles;
     RegKey profiles_key;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kProfileListKey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS,
-                      profiles_key.put()) != ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, yuzu::win::to_wide(kProfileListKey).c_str(), 0,
+                      KEY_READ | KEY_ENUMERATE_SUB_KEYS, profiles_key.put()) != ERROR_SUCCESS) {
         return profiles;
     }
 
-    char sid_buf[256]{};
+    // SID subkey names are ASCII by construction (S-1-...), but enumerate wide for
+    // uniformity and to keep the whole path Reg*W; from_wide round-trips ASCII exactly.
+    wchar_t sid_buf[256]{};
     DWORD idx = 0;
-    DWORD sid_len = sizeof(sid_buf);
-    while (RegEnumKeyExA(profiles_key.get(), idx++, sid_buf, &sid_len, nullptr, nullptr, nullptr,
+    DWORD sid_len = ARRAYSIZE(sid_buf); // characters, not bytes
+    while (RegEnumKeyExW(profiles_key.get(), idx++, sid_buf, &sid_len, nullptr, nullptr, nullptr,
                          nullptr) == ERROR_SUCCESS) {
-        std::string sid(sid_buf, sid_len);
-        sid_len = sizeof(sid_buf);
+        std::string sid = yuzu::win::from_wide(sid_buf, static_cast<int>(sid_len));
+        sid_len = ARRAYSIZE(sid_buf);
 
         // Skip the system / service profiles — not real users.
         if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20")
@@ -295,33 +267,32 @@ std::vector<ProfileEntry> list_profiles() {
         p.sid = sid;
 
         RegKey sid_key;
-        if (RegOpenKeyExA(profiles_key.get(), sid.c_str(), 0, KEY_READ, sid_key.put()) !=
+        if (RegOpenKeyExW(profiles_key.get(), sid_buf, 0, KEY_READ, sid_key.put()) !=
             ERROR_SUCCESS) {
             continue;
         }
-        char path_buf[512]{};
-        DWORD path_size = sizeof(path_buf);
+        wchar_t path_buf[512]{};
+        DWORD path_size = sizeof(path_buf); // bytes
         DWORD type = 0;
         std::string username = sid; // fall back to the SID
-        if (RegQueryValueExA(sid_key.get(), "ProfileImagePath", nullptr, &type,
+        if (RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr, &type,
                              reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS &&
             path_size > 0) {
-            // ProfileImagePath is REG_EXPAND_SZ; trim at the first embedded NUL
-            // rather than assuming path_size-1 is the terminator (parity with
-            // read_str — an unterminated value would otherwise drop its last char).
+            // ProfileImagePath is REG_EXPAND_SZ; reg_sz_to_utf8 stops at the first
+            // NUL and yields valid UTF-8 (non-ASCII profile dirs round-trip intact).
             DWORD cap = path_size < sizeof(path_buf) ? path_size : sizeof(path_buf);
-            p.profile_dir.assign(path_buf, ::strnlen(path_buf, cap));
+            p.profile_dir = yuzu::win::reg_sz_to_utf8(path_buf, cap);
             auto last_sep = p.profile_dir.find_last_of("\\/");
             if (last_sep != std::string::npos)
                 username = p.profile_dir.substr(last_sep + 1);
         }
-        p.username = sanitize_utf8(username);
+        p.username = std::move(username);
 
         // HKU\<SID> present ⇒ the hive is already loaded (user logged on or hive
-        // otherwise mounted) and can be read without RegLoadKeyA.
+        // otherwise mounted) and can be read without RegLoadKeyW.
         RegKey loaded_probe;
-        p.loaded =
-            RegOpenKeyExA(HKEY_USERS, sid.c_str(), 0, KEY_READ, loaded_probe.put()) == ERROR_SUCCESS;
+        p.loaded = RegOpenKeyExW(HKEY_USERS, sid_buf, 0, KEY_READ, loaded_probe.put()) ==
+                   ERROR_SUCCESS;
 
         profiles.push_back(std::move(p));
     }
@@ -341,12 +312,13 @@ bool read_offline_user(const ProfileEntry& p, std::vector<SoftwareInfo>& apps) {
     if (p.profile_dir.empty())
         return false;
     std::string ntuser = p.profile_dir + "\\NTUSER.DAT";
-    char expanded[512]{};
-    DWORD n = ExpandEnvironmentStringsA(ntuser.c_str(), expanded, sizeof(expanded));
-    if (n == 0 || n > sizeof(expanded))
+    wchar_t expanded[512]{};
+    DWORD n = ExpandEnvironmentStringsW(yuzu::win::to_wide(ntuser).c_str(), expanded,
+                                        ARRAYSIZE(expanded)); // nSize is in CHARACTERS
+    if (n == 0 || n > ARRAYSIZE(expanded))
         return false; // expansion failed or truncated — skip rather than mount a bad path
     std::string mount_key = "YUZU_TAR_SW_" + p.sid;
-    if (RegLoadKeyA(HKEY_USERS, mount_key.c_str(), expanded) != ERROR_SUCCESS)
+    if (RegLoadKeyW(HKEY_USERS, yuzu::win::to_wide(mount_key).c_str(), expanded) != ERROR_SUCCESS)
         return false;
     HiveUnmount unmount(mount_key); // unloads on every exit, including an exception below
     std::string key = mount_key + "\\" + kUserUninstall;
