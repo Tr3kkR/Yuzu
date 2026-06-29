@@ -364,7 +364,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"windows", OsSupportStatus::kSupported,  "ntsysinfo",
                  "One NtQuerySystemInformation(SystemProcessInformation) "
                  "snapshot per tick — image name, CPU times, working set for "
-                 "every process; no PDH, no WMI, no per-process handles."},
+                 "every process; no PDH, no WMI. The per-app file version is "
+                 "the bounded exception: a least-privilege OpenProcess on each "
+                 "top-N representative only (<= 2N/tick), failures → empty."},
                 {"linux",   OsSupportStatus::kPlanned,    "procfs",
                  "/proc/[pid]/stat utime+stime + VmRSS."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
@@ -379,6 +381,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"ts",          "INTEGER"},
                         {"snapshot_id", "INTEGER"},
                         {"name",        "TEXT"},
+                        {"version",     "TEXT"},
                         {"instances",   "INTEGER"},
                         {"cpu_pct",     "REAL"},
                         {"ws_bytes",    "INTEGER"},
@@ -391,6 +394,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                     .columns = {
                         {"hour_ts",       "INTEGER"},
                         {"name",          "TEXT"},
+                        {"version",       "TEXT"},
                         {"samples",       "INTEGER"},
                         {"instances_max", "INTEGER"},
                         {"cpu_avg",       "REAL"},
@@ -1105,17 +1109,17 @@ GROUP BY (ts / 3600) * 3600)";
         }
     }
 
-    // ── Per-app perf rollups (BRD A2) — per (hour, app name) ─────────────
+    // ── Per-app perf rollups (BRD A2) — per (hour, app name, version) ────
     if (source_name == "procperf") {
         if (target_suffix == "hourly") {
-            return R"(INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max,
+            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max,
     cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
-SELECT (ts / 3600) * 3600, name, COUNT(*), MAX(instances),
+SELECT (ts / 3600) * 3600, name, version, COUNT(*), MAX(instances),
        AVG(cpu_pct), MAX(cpu_pct),
        CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name)";
+GROUP BY (ts / 3600) * 3600, name, version)";
         }
     }
 

@@ -92,6 +92,8 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
                         "device.live.connections"};
     if (kind == "capture_sources")
         return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
+    if (kind == "disk")
+        return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
     return std::nullopt;
 }
 
@@ -123,7 +125,7 @@ constexpr std::size_t kMaxLiveRows = 20000;
 // dataset (process_tree's connections). uptime/processes use the shared live_kinds.hpp
 // parsers (REST parity); the rest parse the dashboard-only wire shapes inline. All
 // agent fields are HTML-escaped at render.
-std::string render_live_result(const std::string& kind, const LiveKind& lk,
+std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
                                const std::string& output, const std::string& output2) {
     const auto lines = yuzu::server::live::split_lines(output);
 
@@ -366,6 +368,35 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         std::string body = render_device_live_capture_sources(rows);
         body += oob("ls-cnt-capture_sources", "ls-cnt",
                     std::to_string(on) + " of " + std::to_string(rows.size()) + " on");
+        return body;
+    }
+
+    if (kind == "disk") { // disk|<path>|<total_bytes>|<free_bytes>|<percent_used>
+        std::vector<LiveDiskVolume> rows;
+        int worst_used = -1; // highest %-used across reported volumes → drives the KPI
+        for (const auto& l : lines) {
+            if (!l.starts_with("disk|")) continue;
+            auto f = pipe_fields(l);
+            if (f.size() < 5) continue;
+            LiveDiskVolume v;
+            v.path = f[1];
+            try { v.total = std::stoll(f[2]); } catch (...) {}
+            try { v.free = std::stoll(f[3]); } catch (...) {}
+            try { v.percent_used = std::stoi(f[4]); } catch (...) {}
+            // Clamp the agent-supplied percent into range, and only let a
+            // MEASURED volume (total > 0) drive the worst-used KPI — a total of 0
+            // (f_frsize==0 / a volume the agent couldn't read) must not render as
+            // "100% free" off a forged or indeterminate row.
+            if (v.percent_used < 0) v.percent_used = 0;
+            if (v.percent_used > 100) v.percent_used = 100;
+            if (v.total > 0 && v.percent_used > worst_used) worst_used = v.percent_used;
+            rows.push_back(std::move(v));
+            if (rows.size() >= kMaxLiveRows) break;
+        }
+        std::string body = render_device_live_disk(rows);
+        body += oob("ls-cnt-disk", "ls-cnt", std::to_string(rows.size()));
+        body += oob("ls-kpi-disk", "n",
+                    worst_used < 0 ? "&mdash;" : std::to_string(100 - worst_used) + "%");
         return body;
     }
 
@@ -678,18 +709,20 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 command_id2 = cid2;
         }
         // Audit the DISPATCH (post-dispatch "dispatched"/"no_agents"). HIGH-1 (review
-        // #1585): AuditFn is bool-returning — capture it and surface Sec-Audit-Failed so
-        // an audit-store outage is visible to a SIEM instead of silently swallowed (the
-        // dashboard fragment still renders; the REST sibling fails closed). NOTE (#1549):
-        // the REST sibling audits "requested" PRE-dispatch; aligning this dashboard path
-        // to pre-dispatch is a tracked follow-up — until then a result= query for
-        // device.live.* must match BOTH "dispatched" and "requested".
-        if (audit_fn_ &&
-            !audit_fn_(req, lk->audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent", id,
-                       lk->plugin + "/" + lk->action +
-                           (lk->plugin2.empty() ? "" : " + " + lk->plugin2 + "/" + lk->action2) +
-                           " -> " + std::to_string(sent) + " agent(s) command_id=" + command_id))
-            res.set_header("Sec-Audit-Failed", "true");
+        // #1585): AuditFn is bool-returning — surface Sec-Audit-Failed so an audit-store
+        // outage is visible to a SIEM instead of silently swallowed (the dashboard
+        // fragment still renders; the REST sibling fails closed). Routed through the
+        // shared #1647 chokepoint so a THROWING audit_fn is caught here too (catch-arm
+        // parity) rather than escaping the handler. NOTE (#1549): the REST sibling audits
+        // "requested" PRE-dispatch; aligning this dashboard path to pre-dispatch is a
+        // tracked follow-up — until then a result= query for device.live.* must match
+        // BOTH "dispatched" and "requested".
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, lk->audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent",
+            id,
+            lk->plugin + "/" + lk->action +
+                (lk->plugin2.empty() ? "" : " + " + lk->plugin2 + "/" + lk->action2) +
+                " -> " + std::to_string(sent) + " agent(s) command_id=" + command_id);
         if (sent == 0) {
             note(res, "Device offline &mdash; live info needs a connected agent.");
             return;

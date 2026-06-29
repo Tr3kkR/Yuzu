@@ -36,6 +36,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <wtsapi32.h>
 #endif
 
@@ -46,17 +47,9 @@ namespace yuzu::tar {
 
 namespace {
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8_user(const wchar_t* wstr) {
-    if (!wstr || !*wstr)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string result(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, result.data(), len, nullptr, nullptr);
-    return result;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8_user for valid input.
+using yuzu::win::from_wide;
 
 } // namespace
 
@@ -82,8 +75,8 @@ std::vector<UserSession> enumerate_users() {
         WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, wts_sessions[i].SessionId,
                                     WTSDomainName, &domain_buf, &domain_len);
 
-        auto user = wide_to_utf8_user(user_buf);
-        auto domain = wide_to_utf8_user(domain_buf);
+        auto user = from_wide(user_buf);
+        auto domain = from_wide(domain_buf);
 
         if (user_buf)
             WTSFreeMemory(user_buf);
@@ -99,7 +92,7 @@ std::vector<UserSession> enumerate_users() {
         us.session_id = std::to_string(wts_sessions[i].SessionId);
 
         // Determine logon type from session name
-        auto station_name = wide_to_utf8_user(wts_sessions[i].pWinStationName);
+        auto station_name = from_wide(wts_sessions[i].pWinStationName);
         if (station_name.find("RDP") != std::string::npos ||
             station_name.find("rdp") != std::string::npos) {
             us.logon_type = "remote";

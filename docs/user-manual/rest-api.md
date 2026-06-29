@@ -2622,6 +2622,53 @@ Each condition object:
 }
 ```
 
+#### `GET /api/v1/inventory/software`
+
+Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the legacy blob store. This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
+
+**Permission:** `Inventory:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Exact software-name filter |
+| `agent_id` | string | No | Exact agent filter |
+| `limit` | integer | No | Max rows (default 100, min 1, max 1000) |
+
+Omit both `name` and `agent_id` for a fleet-wide scan.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "software": [
+      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+    ],
+    "count": 1,
+    "devices_omitted": 0,
+    "result_truncated_by_cap": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+
+Results carry a **per-agent management-group drop filter**: out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. **Scope caveat (ADR-0017):** this confinement is **not yet verified effective** — the endpoint gates on the *global* `Inventory:Read` permission, under which the filter does not narrow results (a confined operator is denied at the gate; a global operator sees all). List-view management-group confinement becomes effective only once the ADR-0017 admit-then-filter gate lands (#1713/#1676 UAT to confirm); until then operator isolation on this surface holds for **per-device** routes only.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 400 | `limit` is not a valid integer |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+On a `503` the store could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
 ---
 
 ### Execution Statistics
@@ -2723,6 +2770,8 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 **Permission:** `Response:Read`
 
+**Hardening (#1634, partial).** Under a **corrupt or unavailable RBAC store** this endpoint now fails **closed** (returns no rows) rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of this endpoint for normal operators is **not yet effective** — a holder of global `Response:Read` currently sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). `rows_capped` (below) is computed on the raw pre-filter result. When rows are dropped (today, the fail-closed path), the success audit detail carries ` scope_dropped=<N>`.
+
 **Path parameters:**
 
 | Param | Description |
@@ -2770,7 +2819,7 @@ When the underlying response set exceeds the per-request row cap (10000), the re
 | `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
 | `503` | Response store or instruction store unavailable. |
 
-**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id>`.
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id> index=<N>` on success (with ` scope_dropped=<N>` appended when out-of-scope agents' rows were dropped), or `<definition_id> reason=<r>` on the failure path.
 
 **Example:**
 
@@ -3785,7 +3834,7 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
-- **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders nine additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all nine is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
+- **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders ten additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`, `disk`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all ten is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
 - **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path.
@@ -4465,6 +4514,8 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
+**Hardening (#1634, partial).** On a **corrupt or unavailable RBAC store**, these three readers fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of these readers for normal operators is **not yet effective**: a holder of global `Response:Read` sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
+
 ---
 
 ### Tags (Legacy)
@@ -4785,7 +4836,7 @@ Render the TAR dashboard page. Requires an authenticated session (302 redirect t
 
 #### `GET /fragments/tar/retention-paused`
 
-Render an HTML table fragment of the calling operator's most-recent TAR retention scan, scoped to the operator's visible-agent set. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources."
+Render an HTML table fragment of the calling operator's most-recent TAR retention scan. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources." **Scope caveat (ADR-0017):** this list gates on the *global* `Infrastructure:Read` permission — management-group confinement of this list/fan-out view is **not yet effective** (a confined operator is denied at the global gate rather than shown a narrowed list); when RBAC is disabled the list is the full enrolled fleet. Per-device confinement remains genuine only on the per-device `reenable` endpoint below.
 
 **Permission:** `Infrastructure:Read`.
 
@@ -4799,9 +4850,9 @@ Dispatch a `tar.status` command to the operator's visible-agent set and record t
 
 **Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
 
-**Request:** no parameters. Scope is implicitly the operator's visible-agent set; the operator cannot widen scope through this endpoint.
+**Request:** no parameters. The dispatch gates on the *global* `Execution:Execute` permission; management-group confinement of the dispatch target is **not yet effective** (ADR-0017 — a confined operator is denied at the global gate, not narrowed). When RBAC is disabled, the target is the full enrolled fleet.
 
-**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder if the operator has zero visible agents in scope.
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder.
 
 **Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
 

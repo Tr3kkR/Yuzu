@@ -1,16 +1,25 @@
 #include "software_inventory_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
+#include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -25,6 +34,12 @@ constexpr const char* kSourceInstalledSoftware = "installed_software";
 // saturated pool — best-effort, the agent retries next cycle + weekly floor.
 constexpr std::chrono::milliseconds kIngestAcquireTimeout{500};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
+// The stale-agents freshness gauge runs on the metrics sweep, whose serial
+// budget is shared with security-relevant revocation teardown (server.cpp). Use
+// a SHORT acquire — well under the ingest/query timeouts — so a saturated pool
+// (the condition this gauge instruments) can never delay teardown; a degrade
+// returns nullopt and the caller leaves the gauge at its previous value.
+constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 // Hard ceiling on rows a single fleet query will materialise, independent of the
 // caller's `limit`, so the store can never allocate an unbounded result set.
 constexpr int kFleetQueryRowCap = 100000;
@@ -59,6 +74,42 @@ const std::vector<pg::PgMigration>& migrations() {
          // order → ordered index scan + early LIMIT termination. Leading `name`
          // subsumes the old single-column index, so the index count is unchanged.
          "CREATE INDEX installed_software_name_idx  ON installed_software (name, agent_id);"},
+        {2,
+         // (source, last_seen) serves the freshness count (count_stale_agents):
+         // `WHERE source=$1 AND last_seen<$2`. Without it the count is a full
+         // seq-scan of inventory_state on every metrics sweep; with it the count
+         // is an index range scan touching only the stale rows — stale-proportional,
+         // not fleet-proportional. This bounds the count's execution time on the
+         // metrics-sweep thread that also runs the revocation-teardown backstop
+         // (CH-IN3/UP-2), complementing the per-statement statement_timeout cap in
+         // count_stale_agents. Leading `source` matches the equality predicate;
+         // `last_seen` serves the range.
+         "CREATE INDEX inventory_state_source_lastseen_idx "
+         "ON inventory_state (source, last_seen);"},
+        {3,
+         // #1685 data-backfill. The WRITE fix (apply_installed_software now stamps
+         // last_seen/first_seen with the server receipt time, not the agent's
+         // collected_at) is forward-only: a dark agent can't re-stamp itself. Any
+         // PRE-FIX row whose last_seen was written from a future-skewed agent clock
+         // sits AHEAD of now and would never satisfy `last_seen < now − 2d`, so a
+         // disappeared endpoint stays hidden from the freshness gauge forever (the
+         // issue's exact worst case, persisting in live data). Clamp every future
+         // timestamp down to now with LEAST — honest past/now values are untouched —
+         // so those rows re-enter the staleness window (a fresh 2d grace from deploy,
+         // after which a still-dark agent flags correctly). first_seen is clamped too
+         // (governance UP-10): it was also seeded from collected_at pre-fix, so a
+         // future content-age consumer could otherwise read now − first_seen as
+         // negative; first_seen has no consumer today, this is forward defence.
+         // NOTE: this one-time backfill uses the Postgres server clock (now()), while
+         // the runtime write + the staleness cutoff (server.cpp) use the app-process
+         // system_clock. Co-located / NTP-synced they agree; any residual app↔PG skew
+         // is immaterial against the 2-day window (governance UP-1, NICE). DML, not
+         // DDL — runs in the migration txn.
+         "UPDATE inventory_state SET "
+         "  last_seen  = LEAST(last_seen,  EXTRACT(EPOCH FROM now())::bigint), "
+         "  first_seen = LEAST(first_seen, EXTRACT(EPOCH FROM now())::bigint) "
+         "WHERE last_seen  > EXTRACT(EPOCH FROM now())::bigint "
+         "   OR first_seen > EXTRACT(EPOCH FROM now())::bigint;"},
     };
     return kMigrations;
 }
@@ -110,6 +161,55 @@ void normalize(std::vector<SoftwareEntry>& entries) {
     entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
 }
 
+// ── Read-degrade observability (#1675) ───────────────────────────────────────
+// The authoritative reads return nullopt on a store/pool/query degrade, but
+// /readyz stays green under pure pool saturation (it trips only on connection
+// failure, to avoid false LB evictions), so a read-degrade is otherwise
+// dashboard-invisible. These reason labels match the alert rule
+// (YuzuInventoryReadDegraded) and the docs.
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+// Sample the per-site WARN: log a new outage episode's leading edge then every
+// Nth within it. Under a sustained read outage at agentic fan-out (10k queries)
+// an unsampled per-read WARN floods the log; the counter is the authoritative
+// continuous signal, the log a sampled breadcrumb.
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+// Quiet gap (seconds) after which the next degrade at a site is treated as a new
+// outage EPISODE, re-logging its leading edge. Without this, process-lifetime
+// sampling spends its one "1st" on the first-ever outage, so a second distinct
+// outage (after recovery) stays silent until the next %N — its onset invisible
+// (UP-6). The lifetime counter is never reset; this governs log fidelity only.
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+// Per-site degrade-WARN state: lifetime occurrence count + the last degrade's
+// timestamp (for episode-boundary detection). One `static` instance per call
+// site.
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+struct DegradeLog {
+    bool should_log;
+    std::uint64_t occurrence;
+};
+
+// Bump the read-degrade counter (always), advance the sampler, and decide whether
+// this degrade should emit a sampled WARN: the leading edge of a new episode, or
+// every Nth within one. The count/timestamp updates are two independent atomics,
+// so under concurrent degrades at one site a benign duplicate leading-edge WARN
+// is possible — acceptable for a log breadcrumb; the counter stays exact.
+DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
+                             DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_inventory_read_degrade_total", {{"reason", reason}}).increment();
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return {new_episode || (n % kReadDegradeLogSample) == 0, n};
+}
+
 } // namespace
 
 std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> entries) {
@@ -147,11 +247,19 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
 
 InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     std::string_view agent_id, std::string_view claimed_hash,
-    const std::optional<std::vector<SoftwareEntry>>& rows, std::int64_t collected_at) {
+    std::optional<std::vector<SoftwareEntry>> rows, [[maybe_unused]] std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return InventoryIngestOutcome::kError;
 
-    const std::int64_t ts = collected_at > 0 ? collected_at : now_secs();
+    // last_seen / first_seen are the SERVER receipt time, NOT the agent-supplied
+    // collected_at. The stale-agents freshness gauge compares last_seen against
+    // `server_now − 2d` (server.cpp), so both sides of that comparison must be on
+    // ONE clock; trusting collected_at let a future-skewed or hostile agent pin
+    // last_seen ahead of now so it never counted as stale — hiding a dark endpoint
+    // (#1685, ADR-0016 Update 2026-06-27). collected_at stays in the ingest
+    // contract (proto-carried) but no longer drives any persisted timestamp;
+    // migration v3 clamps pre-fix rows whose last_seen was stamped into the future.
+    const std::int64_t ts = now_secs();
 
     // ── Hash-only report: compare against the stored (server-recomputed) hash ──
     if (!rows.has_value()) {
@@ -193,7 +301,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     }
 
     // ── Full payload: recompute the hash from the rows, replace atomically ─────
-    std::vector<SoftwareEntry> entries = *rows;
+    // Move out of the by-value optional — no copy of the (up to kMaxEntries) rows.
+    std::vector<SoftwareEntry> entries = std::move(*rows);
     normalize(entries);
     const std::string server_hash = SoftwareInventoryStore::canonical_hash(entries);
     const std::string agent_id_s{agent_id};
@@ -227,13 +336,47 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
             std::vector<std::string>{agent_id_s});
         if (del.status() != PGRES_COMMAND_OK)
             return false;
-        for (const auto& e : entries) {
+        // Batched insert (#1664): one statement carrying the per-row columns as
+        // four parallel text[] arrays — agent_id is the scalar $1, so the param
+        // count is a constant 5 regardless of row count. A multi-row VALUES would
+        // hit libpq's 65535-parameter ceiling at ~13k rows (5 params/row); up to
+        // kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
+        // positionally and they are equal-length by construction. Collapsing up
+        // to 20k single-row INSERTs into one statement shrinks the transaction's
+        // connection-hold + statement_timeout exposure, which is the UP-IN4/5
+        // pool-saturation blast (a need_full herd flipping healthy agents
+        // touched→full) this change targets. Skip entirely when empty (a
+        // legitimate empty inventory): the DELETE above already cleared the rows.
+        if (!entries.empty()) {
+            std::vector<std::string_view> names, versions, publishers, dates;
+            names.reserve(entries.size());
+            versions.reserve(entries.size());
+            publishers.reserve(entries.size());
+            dates.reserve(entries.size());
+            for (const auto& e : entries) {
+                names.emplace_back(e.name);
+                versions.emplace_back(e.version);
+                publishers.emplace_back(e.publisher);
+                dates.emplace_back(e.install_date);
+            }
+            // push_back (not a braced init-list) so each large to_text_array
+            // prvalue is MOVED into params, not copied — an init_list's backing
+            // array is `const std::string[]`, forcing copies of these up-to-MB
+            // literals on the hot path (cpp-expert).
+            std::vector<std::string> params;
+            params.reserve(5);
+            params.push_back(agent_id_s);
+            params.push_back(pg::to_text_array(names));
+            params.push_back(pg::to_text_array(versions));
+            params.push_back(pg::to_text_array(publishers));
+            params.push_back(pg::to_text_array(dates));
             pg::PgResult ins = pg::exec_params(
                 c,
                 "INSERT INTO software_inventory_store.installed_software "
-                "(agent_id, name, version, publisher, install_date) VALUES ($1,$2,$3,$4,$5)",
-                std::vector<std::string>{agent_id_s, e.name, e.version, e.publisher,
-                                         e.install_date});
+                "(agent_id, name, version, publisher, install_date) "
+                "SELECT $1, n, v, p, d "
+                "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS t(n, v, p, d)",
+                params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return false;
         }
@@ -265,7 +408,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     // empty. !open_ / no-lease / query-error are degrades; an empty agent_id is a
     // precondition miss (genuine empty, not a degrade).
     if (!open_) {
-        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — store not open");
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
         return std::nullopt;
     }
     std::vector<SoftwareEntry> out;
@@ -273,8 +420,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         return out;
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — no connection ({})",
-                     pool_.last_error());
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(
@@ -284,8 +434,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         "WHERE agent_id = $1 ORDER BY name, version LIMIT $2::bigint",
         std::vector<std::string>{std::string(agent_id), std::to_string(kFleetQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — query failed: {}",
-                     PQerrorMessage(lease.get()));
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: get_agent_software degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     const int n = PQntuples(res.get());
@@ -307,13 +460,20 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     // (degraded), never a silent empty — a fleet vuln query must not read a PG hiccup
     // as "installed nowhere". An empty value = genuinely no matches.
     if (!open_) {
-        spdlog::warn("SoftwareInventoryStore: query_software degraded — store not open");
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_software degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({})",
-                     pool_.last_error());
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_software degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
     int limit = q.limit > 0 ? q.limit : 1000;
@@ -341,8 +501,11 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("SoftwareInventoryStore: query_software degraded — query failed: {}",
-                     PQerrorMessage(lease.get()));
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_software degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     std::vector<SoftwareFleetRow> out;
@@ -375,6 +538,44 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
             std::vector<std::string>{id});
         return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
     });
+}
+
+std::optional<std::int64_t>
+SoftwareInventoryStore::count_stale_agents(std::int64_t stale_before_secs) {
+    if (!open_)
+        return std::nullopt;
+    std::optional<std::int64_t> result;
+    // Run inside a txn so a `SET LOCAL statement_timeout` caps the count's
+    // EXECUTION, not merely the lease acquire. This runs on the metrics-sweep
+    // thread that next runs the revocation-teardown backstop (server.cpp), so a
+    // bloated-table seq-scan must NOT be allowed to run to the pool's 30s
+    // statement_timeout (CH-IN3/UP-2) — the 250ms acquire bounds only the wait
+    // for a connection, never the query. SET LOCAL reverts at COMMIT/ROLLBACK; a
+    // timeout makes the SELECT error → with_txn_for ROLLs back → nullopt → the
+    // caller holds the gauge at its prior value. The (source,last_seen) index
+    // (migration v2) keeps the steady-state plan an index scan so the cap is
+    // never reached; the cap defends against bloat / plan regression.
+    pool_.with_txn_for(kStaleCountAcquireTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(c, "SET LOCAL statement_timeout = '250ms'",
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT count(*) FROM software_inventory_store.inventory_state "
+            "WHERE source = $1 AND last_seen < $2::bigint",
+            std::vector<std::string>{kSourceInstalledSoftware, std::to_string(stale_before_secs)});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+            return false;
+        const char* txt = PQgetvalue(res.get(), 0, 0);
+        const auto len = static_cast<std::size_t>(PQgetlength(res.get(), 0, 0));
+        std::int64_t count = 0;
+        if (std::from_chars(txt, txt + len, count).ec != std::errc{})
+            return false;
+        result = count;
+        return true;
+    });
+    return result;
 }
 
 } // namespace yuzu::server

@@ -177,6 +177,23 @@ Therefore we **coexist, not replace**:
   section on the existing `/device` drill-down, and a dedicated fleet-wide
   software dashboard.
 
+> **Update (2026-06-26):** the REST read surface shipped as
+> `GET /api/v1/inventory/software` (`Inventory:Read`, management-group scoped,
+> degrade→503-never-empty per §7, set-and-proceed audit per §8) — the REST sibling
+> of `query_installed_software`, mirrored 1:1. See `docs/user-manual/inventory.md`
+> §REST and `docs/user-manual/rest-api.md`. Remaining follow-ons: the `/device`
+> drill-down section and the fleet-wide software dashboard.
+
+> **Update (2026-06-28):** the "management-group scoped" qualifier on the read
+> surfaces above (`query_installed_software` and `GET /api/v1/inventory/software`)
+> is **superseded — not yet effective.** Both gate on the *global* `Inventory:Read`
+> permission, under which the per-agent drop filter does not narrow results (a
+> management-group-confined operator is denied at the global gate; a global operator's
+> filter is a no-op). Read these as "global `Inventory:Read`; per-device confinement
+> only" until the admit-then-filter list gate lands. See **ADR-0017** (the decision +
+> gate design), **#1716** (doc-honesty), and **#1713/#1676** (the inventory
+> effective-vs-inert UAT).
+
 ## Consequences
 
 **Positive**
@@ -218,3 +235,34 @@ Therefore we **coexist, not replace**:
   recorded as a prioritized net-new store in `docs/postgres-migration-ladder.md`.
 - **PR #1620 / `$Software` TAR source** — complementary edge change-history,
   not a substitute for this framework.
+
+## Updates
+
+### 2026-06-27 — freshness keys off server receipt time, not agent `collected_at` (#1685)
+
+**Decision.** `inventory_state.last_seen` (and `first_seen`) is stamped with the
+**server receipt time**, not the agent-supplied `collected_at`. The
+`yuzu_inventory_stale_agents` freshness gauge therefore measures *contact
+freshness* (when the server last heard from the agent for this source), not
+*content-collection time*.
+
+**Why.** The gauge (`count_stale_agents`, surfaced from the metrics sweep)
+flags `last_seen < server_now − 2d`. With `last_seen` written from
+`collected_at`, that comparison straddled **two clocks** — a server-side
+threshold versus an agent-supplied timestamp. A future-skewed or hostile agent
+could pin `last_seen` ahead of `now`, so it never counted as stale and a *dark
+endpoint stayed hidden* (the worst case); a >2d past-skewed agent counted as
+stale while actively syncing (false positive). Server-stamping puts both sides
+of the comparison on one clock, immune to agent skew in either direction. This
+supersedes the implicit "trust `collected_at` for freshness" of §4/§7.
+
+**Implementation.** No schema change and no new column were needed — `last_seen`
+has no display/REST consumer, only the gauge, so the existing column is reused
+with corrected write semantics. `collected_at` remains on the wire
+(proto-carried) and in the ingest signature for a possible future *content-age*
+signal, but drives no persisted timestamp. The write fix is forward-only (a dark
+agent cannot re-stamp itself), so **migration v3** clamps any pre-fix row whose
+`last_seen` was written into the future down to `now`, re-entering it into the
+staleness window. Options weighed and rejected: a `min(collected_at, now)`
+*clamp* (kills only future-skew, not past-skew) and a *separate server-stamped
+column* (correct but an unnecessary migration given the absent display consumer).

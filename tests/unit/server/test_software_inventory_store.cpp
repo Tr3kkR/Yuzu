@@ -14,10 +14,14 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::InventoryIngestOutcome;
@@ -395,4 +399,415 @@ TEST_CASE("ingest rejects a report carrying too many sources (map-cardinality ca
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
     }
+}
+
+TEST_CASE("batched insert round-trips a large set, array metacharacters, and empty (#1664)",
+          "[pg][software_inventory]") {
+    // The per-row INSERT loop is now one `unnest($N::text[])` statement. These
+    // exercise it against a real backend: bulk correctness, the text[] literal
+    // escaping (to_text_array — unit-tested in test_pg_array.cpp, end-to-end
+    // here), and the empty-entries skip.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("the documented max (kMaxEntries) inserts via one unnest() and reads back complete") {
+        // 20 000 rows — the kMaxEntries cap, i.e. the largest payload the ingest
+        // accepts. A multi-row VALUES would exceed libpq's 65535-param ceiling
+        // here (5 params/row); the unnest path binds a constant 5 params.
+        constexpr int kRows = 20000;
+        std::vector<SoftwareEntry> rows;
+        rows.reserve(kRows);
+        for (int i = 0; i < kRows; ++i)
+            rows.push_back({"pkg-" + std::to_string(i), std::to_string(i), "Pub", "2026-01-01"});
+        const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+        REQUIRE(store.apply_installed_software("agent-big", h, rows, 1000) ==
+                InventoryIngestOutcome::kStored);
+        auto got = store.get_agent_software("agent-big");
+        REQUIRE(got.has_value());
+        CHECK(got->size() == kRows);
+    }
+
+    SECTION("array metacharacters in name/publisher survive the text[] literal round-trip") {
+        // Comma, double-quote, backslash, and braces are exactly the bytes
+        // to_text_array escapes; a regression would corrupt or 22P02-reject the
+        // whole batch. Verified via the exact-name fleet query (collation-stable).
+        const std::string meta = "a,b\"c\\d{e}";
+        std::vector<SoftwareEntry> rows = {{meta, "1", "Vendor, Inc.", ""}, {"Plain", "2", "", ""}};
+        const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+        REQUIRE(store.apply_installed_software("agent-meta", h, rows, 1000) ==
+                InventoryIngestOutcome::kStored);
+        SoftwareFleetQuery q;
+        q.name = meta;
+        auto fl = store.query_software(q);
+        REQUIRE(fl.has_value());
+        REQUIRE(fl->size() == 1);
+        CHECK((*fl)[0].agent_id == "agent-meta");
+        CHECK((*fl)[0].entry.name == meta); // exact round-trip, not just queryable
+        CHECK((*fl)[0].entry.publisher == "Vendor, Inc.");
+    }
+
+    SECTION("a full payload with zero entries stores nothing and is a clean empty") {
+        std::vector<SoftwareEntry> none;
+        const std::string h = SoftwareInventoryStore::canonical_hash(none);
+        REQUIRE(store.apply_installed_software("agent-empty", h, none, 1000) ==
+                InventoryIngestOutcome::kStored);
+        auto got = store.get_agent_software("agent-empty");
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+        // Hash-only follow-up with the same (empty) hash → touched proves the
+        // parent row + the empty content_hash persisted.
+        CHECK(store.apply_installed_software("agent-empty", h, std::nullopt, 2000) ==
+              InventoryIngestOutcome::kTouched);
+    }
+}
+
+TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675)",
+          "[pg][software_inventory]") {
+    // The authoritative-read degrade is dashboard-invisible (/readyz stays green
+    // under pure saturation), so the counter is the only signal. Dropping the
+    // schema under the open store forces a query_error on both reads.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareFleetQuery q;
+    q.name = "Chrome";
+    CHECK_FALSE(store.query_software(q).has_value()); // degraded → nullopt
+    CHECK_FALSE(store.get_agent_software("agent-a").has_value());
+    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 2.0);
+}
+
+TEST_CASE("count_stale_agents keys on server receipt time, immune to agent collected_at skew "
+          "(#1685)",
+          "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    std::vector<SoftwareEntry> rows = {{"Chrome", "1", "", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+
+    // A future-skewed (or hostile) agent supplies collected_at far ahead of now.
+    // Pre-fix this stamped last_seen into the future, so the agent could go dark
+    // and never satisfy `last_seen < cutoff` — hidden from the freshness gauge
+    // forever (#1685). Post-fix last_seen is the SERVER receipt time (~now), so the
+    // skew is ignored. collected_at is otherwise unobservable from the store, so
+    // the gauge is the only lever to assert through.
+    const std::int64_t far_future = now + 100'000'000; // ~3 years ahead
+    REQUIRE(store.apply_installed_software("agent-skew", h, rows, far_future) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-honest", h, rows, now) ==
+            InventoryIngestOutcome::kStored);
+
+    // Against a past cutoff neither is stale (both last_seen ≈ now).
+    auto fresh = store.count_stale_agents(now - 1'000);
+    REQUIRE(fresh.has_value());
+    CHECK(*fresh == 0);
+
+    // Against a future cutoff BOTH count — proving agent-skew's last_seen sits at
+    // ~now, NOT the far-future collected_at it supplied. Pre-fix this would be 1
+    // (the skewed agent hidden above the cutoff); the fix makes it 2.
+    auto all_stale = store.count_stale_agents(now + 50'000'000);
+    REQUIRE(all_stale.has_value());
+    CHECK(*all_stale == 2);
+
+    // Partial-count coverage (preserved from the prior collected_at-based test):
+    // backdate one agent's SERVER last_seen 10 days — there is no clock seam, so go
+    // direct — and confirm only it falls outside the real 2-day window.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto upd = pg::exec_params(
+            lease.get(),
+            "UPDATE software_inventory_store.inventory_state SET last_seen = $2::bigint "
+            "WHERE agent_id = $1",
+            std::vector<std::string>{"agent-honest", std::to_string(now - 10 * 86'400)});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    auto window = store.count_stale_agents(now - 2 * 86'400);
+    REQUIRE(window.has_value());
+    CHECK(*window == 1); // only the backdated agent-honest; agent-skew is fresh (~now)
+}
+
+TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phase (#1664)",
+          "[pg][software_inventory][seam]") {
+    // Drives the seam with a LIVE registry (the other seam tests pass nullptr) and
+    // asserts the histogram fires once per phase: a full payload → phase=full, a
+    // hash-only follow-up → phase=hash_only.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+
+    const std::string blob = blob1("Chrome", "119", "Google", "2026-01-01");
+    const std::string h =
+        SoftwareInventoryStore::canonical_hash({{"Chrome", "119", "Google", "2026-01-01"}});
+
+    {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = h;
+        (*rep.mutable_plugin_data())["installed_software"] = blob; // full payload
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-hist", rep, ack, &metrics);
+    }
+    {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = h; // hash-only (no blob)
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-hist", rep, ack, &metrics);
+    }
+
+    auto full = metrics
+                    .histogram("yuzu_inventory_ingest_duration_seconds",
+                               {{"source", "installed_software"}, {"phase", "full"}})
+                    .snapshot();
+    auto hash_only = metrics
+                         .histogram("yuzu_inventory_ingest_duration_seconds",
+                                    {{"source", "installed_software"}, {"phase", "hash_only"}})
+                         .snapshot();
+    CHECK(full.count == 1);
+    CHECK(hash_only.count == 1);
+}
+
+TEST_CASE("read-degrade store_not_open reason fires when the store failed to open (#1675)",
+          "[pg][software_inventory]") {
+    // The store_not_open degrade reason (the other testable degrade besides
+    // query_error). Force open_=false by wiping the version record after a normal
+    // open so a second construction re-runs the v1 DDL against the already-existing
+    // tables → migration fails → !is_open(). Then both authoritative reads must
+    // bump the store_not_open counter.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    { // first construction creates the schema, tables, and the schema_meta row
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    { // wipe the applied-version record so the runner re-applies v1 over live tables
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult del = pg::exec_params(
+            lease.get(),
+            "DELETE FROM public.schema_meta WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(del.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore store{pool};
+    REQUIRE_FALSE(store.is_open()); // migration re-run failed → store_not_open
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    SoftwareFleetQuery q;
+    q.name = "Chrome";
+    CHECK_FALSE(store.query_software(q).has_value());
+    CHECK_FALSE(store.get_agent_software("agent-a").has_value());
+    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "store_not_open"}})
+              .value() == 2.0);
+}
+
+TEST_CASE("migration v3 backfill clamps pre-fix future last_seen/first_seen at re-open "
+          "(#1685 / governance UP-10)",
+          "[pg][software_inventory]") {
+    // The forward write fix can't re-stamp a dark agent, so v3 must clamp rows that
+    // were ALREADY persisted with a future-skewed timestamp. Reproduce a pre-fix
+    // row, roll the recorded schema version back to 2 so a fresh construction
+    // re-runs ONLY v3 (a DML, re-run-safe), and prove the clamp moved it back into
+    // the freshness window.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const std::int64_t far_future = now + 100'000'000;
+    { // first construction creates schema + tables + schema_meta @ v3 (v3 no-ops on empty)
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    { // seed a pre-fix future-skewed row, then roll the recorded version back to 2
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.inventory_state "
+            "(agent_id, source, content_hash, first_seen, last_seen) "
+            "VALUES ('agent-future', 'installed_software', 'deadbeef', $1::bigint, $1::bigint)",
+            std::vector<std::string>{std::to_string(far_future)});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        pg::PgResult back = pg::exec_params(
+            lease.get(),
+            "UPDATE public.schema_meta SET version = 2 WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(back.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore store{pool}; // re-runs v3 → clamps the future row
+    REQUIRE(store.is_open());
+
+    // Discriminator: against a cutoff between now and far_future, the CLAMPED row
+    // (last_seen ≈ now) counts stale; an un-clamped row (last_seen = far_future)
+    // would sit above the cutoff and count 0.
+    auto stale = store.count_stale_agents(now + 50'000'000);
+    REQUIRE(stale.has_value());
+    CHECK(*stale == 1);
+
+    // first_seen is clamped too (UP-10) — assert it is no longer in the future.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult sel = pg::exec_params(
+            lease.get(),
+            "SELECT first_seen FROM software_inventory_store.inventory_state "
+            "WHERE agent_id = 'agent-future'",
+            std::vector<std::string>{});
+        REQUIRE(sel.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(sel.get()) == 1);
+        const std::int64_t first_seen = std::stoll(PQgetvalue(sel.get(), 0, 0));
+        CHECK(first_seen <= now + 5); // clamped to ~now (small margin for a clock tick)
+    }
+}
+
+TEST_CASE("read-degrade sampler is data-race-free under concurrent degraded reads "
+          "(#1686 DegradeSampler — TSan guard)",
+          "[pg][software_inventory]") {
+    // The episode WARN sampler's DegradeSampler uses two std::atomics. A regression
+    // dropping the atomics would be a data race invisible to a single-threaded test
+    // but flagged by ThreadSanitizer here. Drop the schema so every read degrades via
+    // the query_error path, then hammer it from many threads. NB: no Catch2 assertion
+    // runs INSIDE the threads (Catch2's macros aren't thread-safe — that would flag
+    // Catch2, not our code); all assertions run after join on the exact counter.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP SCHEMA software_inventory_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 50;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < kPerThread; ++i) {
+                SoftwareFleetQuery q;
+                q.name = "Chrome";
+                (void)store.query_software(q);       // → query_error degrade
+                (void)store.get_agent_software("agent-x"); // → query_error degrade
+            }
+        });
+    }
+    for (auto& th : threads)
+        th.join();
+    // The counter is exact regardless of WARN sampling: every degraded read bumped it
+    // exactly once, two reads per iteration.
+    const double total =
+        metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}}).value();
+    CHECK(total == static_cast<double>(kThreads * kPerThread * 2));
+}
+
+TEST_CASE("count_stale_agents returns nullopt on a backend degrade (freeze-counter trigger)",
+          "[pg][software_inventory]") {
+    // The server gauge sweep bumps yuzu_inventory_stale_count_unavailable_total in
+    // the else-branch of `if (auto stale = count_stale_agents(...))`. Prove the
+    // store method returns nullopt (not a false 0) when the backend is unavailable,
+    // so the gauge holds its prior value and the freeze counter fires.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(store.count_stale_agents(1'000'000).has_value()); // degrade → nullopt, never 0
+}
+
+TEST_CASE("delete_agent removes both the child rows and the parent state row",
+          "[pg][software_inventory]") {
+    // delete_agent deletes from installed_software AND inventory_state in one txn.
+    // Verify both halves: the child rows are gone (get returns an empty VALUE, not
+    // nullopt) AND the parent state row is gone (a hash-only follow-up sees a cold
+    // cache → kNeedFull, not kTouched on a stale parent).
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
+                                       {"Firefox", "120", "Mozilla", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-del", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    // A bystander agent that must SURVIVE the delete — without this, a DELETE
+    // missing its `WHERE agent_id=$1` (a whole-table wipe) would pass every other
+    // assertion here. This is the minimal proof the delete is agent-scoped.
+    std::vector<SoftwareEntry> by_rows = {{"Edge", "120", "Microsoft", ""}};
+    const std::string by_h = SoftwareInventoryStore::canonical_hash(by_rows);
+    REQUIRE(store.apply_installed_software("agent-bystander", by_h, by_rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    {
+        auto pre = store.get_agent_software("agent-del");
+        REQUIRE(pre.has_value());
+        REQUIRE(pre->size() == 2);
+    }
+
+    store.delete_agent("agent-del");
+
+    auto post = store.get_agent_software("agent-del");
+    REQUIRE(post.has_value()); // store still open + query OK → empty VALUE, not a degrade
+    CHECK(post->empty());      // child rows gone
+    // Parent state row gone: a hash-only report now hits a cold cache.
+    CHECK(store.apply_installed_software("agent-del", h, std::nullopt, 2000) ==
+          InventoryIngestOutcome::kNeedFull);
+
+    // Cross-agent isolation: the bystander's child rows AND parent state row are
+    // untouched (its hash-only follow-up still matches → kTouched, not kNeedFull).
+    auto bystander = store.get_agent_software("agent-bystander");
+    REQUIRE(bystander.has_value());
+    REQUIRE(bystander->size() == 1);
+    CHECK((*bystander)[0].name == "Edge");
+    CHECK(store.apply_installed_software("agent-bystander", by_h, std::nullopt, 2000) ==
+          InventoryIngestOutcome::kTouched);
+
+    // A delete of an unknown agent is a no-op (best-effort), not a throw or a degrade.
+    store.delete_agent("agent-never-existed");
+    auto other = store.get_agent_software("agent-never-existed");
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
 }

@@ -27,6 +27,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 namespace yuzu::tar {
@@ -36,17 +37,9 @@ namespace yuzu::tar {
 
 namespace {
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* wstr) {
-    if (!wstr || !*wstr)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string result(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, result.data(), len, nullptr, nullptr);
-    return result;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 const char* service_state_str(DWORD state) {
     switch (state) {
@@ -104,8 +97,8 @@ std::vector<ServiceInfo> enumerate_services() {
     auto* entries = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
     for (DWORD i = 0; i < service_count; ++i) {
         ServiceInfo si;
-        si.name = wide_to_utf8(entries[i].lpServiceName);
-        si.display_name = wide_to_utf8(entries[i].lpDisplayName);
+        si.name = from_wide(entries[i].lpServiceName);
+        si.display_name = from_wide(entries[i].lpDisplayName);
         si.status = service_state_str(entries[i].ServiceStatusProcess.dwCurrentState);
 
         // Query startup type

@@ -27,6 +27,7 @@
 // <evntrace.h>/<evntcons.h> must follow windows.h; <tdh.h> follows those.
 #include <evntcons.h>
 #include <evntrace.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <sddl.h> // ConvertSidToStringSidA / ConvertStringSidToSidA
 #include <tdh.h>
 
@@ -104,13 +105,7 @@ std::string prop_image_basename(EVENT_RECORD* rec, const wchar_t* name) {
     if (base.empty()) {
         return {};
     }
-    int need = WideCharToMultiByte(CP_UTF8, 0, base.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (need <= 0) {
-        return {};
-    }
-    std::string utf8(static_cast<std::size_t>(need - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, base.c_str(), -1, utf8.data(), need, nullptr, nullptr);
-    return utf8;
+    return yuzu::win::from_wide(base.c_str()); // (#1681) -1 convert, trailing NUL dropped
 }
 
 // RAII for a Win32 HANDLE: closes on scope exit. Keeps capture_sid exception-
@@ -504,12 +499,11 @@ std::vector<ProcEvent> backfill_proc_events_from_etl(const std::string& etl_path
     if (etl_path.empty()) {
         return out;
     }
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, etl_path.c_str(), -1, nullptr, 0);
-    if (wlen <= 0) {
+    // (#1681) etl_path is non-empty (guarded above); only wpath.c_str() is consumed.
+    const std::wstring wpath = yuzu::win::to_wide(etl_path);
+    if (wpath.empty()) {
         return out;
     }
-    std::wstring wpath(static_cast<std::size_t>(wlen - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, etl_path.c_str(), -1, wpath.data(), wlen);
 
     // The AutoLogger may still be running and holding this .etl open — that is
     // fine: OpenTrace reads an actively-written file as long as the logger

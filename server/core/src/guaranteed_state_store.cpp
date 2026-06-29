@@ -3,6 +3,8 @@
 #include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
+#include <yuzu/version_string.hpp> // shared canon_version — re-canon agent input at the boundary
+
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
@@ -140,7 +142,7 @@ namespace {
 // projection rows, never events).
 constexpr const char* kGobsDdl = R"(
     -- DEX read-model PROJECTION of ruleless signal observations (the
-    -- 103-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
+    -- 110-signal catalogue; docs/dex-signal-catalog.md). DERIVED from
     -- guaranteed_state_events (the single source of truth): written in the
     -- SAME transaction as the event, so a redelivered event_id fails the
     -- event PK and rolls back both → the projection inherits the dedup and
@@ -151,6 +153,10 @@ constexpr const char* kGobsDdl = R"(
     --   symbolic  = human name for reason ("ACCESS_VIOLATION", …)
     --   component = secondary entity (faulting module, NIC, MAC…)
     --   metric    = numeric payload (boot duration ms); 0 = none
+    --   version   = the crashed/hung app's file version, canonicalized to the
+    --               4-group quad procperf emits ("" = unknown). Added by
+    --               migration {8}; re-canonicalized server-side at projection so
+    --               an untrusted agent can never persist a non-canonical value.
     -- Reaped in lockstep with the parent events via ttl_expires_at.
     CREATE TABLE IF NOT EXISTS guardian_observations (
         event_id        TEXT PRIMARY KEY,
@@ -304,6 +310,17 @@ void GuaranteedStateStore::create_tables() {
                 ADD COLUMN detail_json TEXT NOT NULL DEFAULT '';
         )"},
         {7, kGobsDdl},
+        {8, R"(
+            -- Per-version stability (DEX app-perf-over-time slice 2b): the crashed/
+            -- hung APP's file version, canonicalized agent-side to the same dotted
+            -- quad procperf emits, so (subject, version) is ONE identity across
+            -- crashes and perf. NOT NULL DEFAULT '' — pre-{8} rows and any signal
+            -- without a version (services, non-Windows crashes, packaged apps) read
+            -- as the single "unknown version" bucket. Append-only ALTER: a fresh DB
+            -- runs {7} then {8}; an upgrading DB runs only {8}.
+            ALTER TABLE guardian_observations
+                ADD COLUMN version TEXT NOT NULL DEFAULT '';
+        )"},
     };
     // Stale-schema self-check (governance UP-2): a dev/UAT DB that ran an
     // intermediate working-tree build may have RECORDED migration {7} with an
@@ -317,8 +334,8 @@ void GuaranteedStateStore::create_tables() {
         SqliteStmt probe;
         return sqlite3_prepare_v2(
                    db_,
-                   "SELECT subject, reason, symbolic, component, metric FROM guardian_observations "
-                   "LIMIT 0",
+                   "SELECT subject, reason, symbolic, component, metric, version "
+                   "FROM guardian_observations LIMIT 0",
                    -1, probe.addr(), nullptr) == SQLITE_OK;
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
@@ -882,6 +899,14 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     if (component.empty())
         component = field("faulting_module");
     const std::string platform = field("platform");
+    // Per-version stability (slice 2b). RE-CANONICALIZE server-side (UP-4): never
+    // trust the agent's string — a hostile/buggy/non-Windows agent could ship a
+    // non-canonical or malicious value (e.g. "<script>…") within the 256-byte
+    // clamp. Re-running the shared canon_version guarantees guardian_observations
+    // .version is ALWAYS a clean 4-group quad or "" (the unknown bucket),
+    // preserving the (subject, version) join invariant and removing any latent
+    // stored-XSS surface for a future renderer regardless of agent behaviour.
+    const std::string version = yuzu::util::canon_version(field("version"));
     double metric = 0.0;
     if (j.is_object())
         if (auto it = j.find("metric"); it != j.end() && it->is_number()) {
@@ -896,8 +921,8 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
         INSERT INTO guardian_observations
             (event_id, agent_id, observed_at, obs_type,
              subject, reason, symbolic, component, metric, platform,
-             ttl_expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             version, ttl_expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
@@ -912,7 +937,8 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     sqlite3_bind_text(stmt.get(), 8, component.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(stmt.get(), 9, metric);
     sqlite3_bind_text(stmt.get(), 10, platform.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 11, ttl);
+    sqlite3_bind_text(stmt.get(), 11, version.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 12, ttl);
     if (sqlite3_step(stmt.get()) != SQLITE_DONE)
         return std::unexpected(std::string("insert(observation) failed: ") + sqlite3_errmsg(db_));
     return {};
@@ -927,7 +953,7 @@ GuaranteedStateStore::query_observations(int limit) const {
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_,
                            "SELECT event_id, agent_id, observed_at, obs_type, subject, "
-                           "reason, symbolic, component, metric, platform "
+                           "reason, symbolic, component, metric, platform, version "
                            "FROM guardian_observations "
                            "ORDER BY observed_at DESC, event_id DESC LIMIT ?",
                            -1, stmt.addr(), nullptr) != SQLITE_OK)
@@ -945,6 +971,7 @@ GuaranteedStateStore::query_observations(int limit) const {
         r.component = col_text(stmt.get(), 7);
         r.metric = sqlite3_column_double(stmt.get(), 8);
         r.platform = col_text(stmt.get(), 9);
+        r.version = col_text(stmt.get(), 10);
         rows.push_back(std::move(r));
     }
     return rows;
@@ -1009,6 +1036,48 @@ GuaranteedStateStore::dex_top_apps(const std::string& since, int limit) const {
         a.crashes = sqlite3_column_int64(st.get(), 1);
         a.hangs = sqlite3_column_int64(st.get(), 2);
         a.distinct_devices = sqlite3_column_int64(st.get(), 3);
+        a.last_seen = col_text(st.get(), 4);
+        out.push_back(std::move(a));
+    }
+    return out;
+}
+
+std::vector<DexAppCrashCount>
+GuaranteedStateStore::dex_device_top_apps(const std::string& agent_id, const std::string& since,
+                                          int limit) const {
+    std::shared_lock lock(mtx_);
+    std::vector<DexAppCrashCount> out;
+    if (!db_ || agent_id.empty())
+        return out;
+    // Per-(app, version) crash+hang on ONE device — the version split slice 2b
+    // adds over dex_top_apps. Uses the idx_gobs_agent_time index (agent_id +
+    // observed_at). An unknown version projects as '' and groups into one bucket.
+    const char* sql = R"(
+        SELECT subject, version,
+               SUM(CASE WHEN obs_type = 'process.crashed' THEN 1 ELSE 0 END) AS crashes,
+               SUM(CASE WHEN obs_type = 'process.hung' THEN 1 ELSE 0 END) AS hangs,
+               MAX(observed_at)
+        FROM guardian_observations
+        WHERE agent_id = ?1
+          AND obs_type IN ('process.crashed', 'process.hung')
+          AND observed_at >= ?2
+        GROUP BY subject, version
+        ORDER BY (crashes + hangs) DESC, subject ASC, version ASC
+        LIMIT ?3
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        DexAppCrashCount a;
+        a.subject = col_text(st.get(), 0);
+        a.version = col_text(st.get(), 1);
+        a.crashes = sqlite3_column_int64(st.get(), 2);
+        a.hangs = sqlite3_column_int64(st.get(), 3);
+        a.distinct_devices = 1; // single agent
         a.last_seen = col_text(st.get(), 4);
         out.push_back(std::move(a));
     }
@@ -1619,6 +1688,55 @@ GuaranteedStateStore::dex_device_history(const std::string& agent_id, const std:
         out.push_back(std::move(r));
     }
     return out;
+}
+
+std::optional<GuardianObservationRow>
+GuaranteedStateStore::dex_observation(const std::string& event_id) const {
+    std::shared_lock lock(mtx_);
+    if (!db_ || event_id.empty())
+        return std::nullopt;
+    // Single-row read of the SAME projection columns the device history lists —
+    // the per-event detail drill. event_id is the projection PK (it shares the
+    // event journal dedup key), so this is an indexed point lookup.
+    const char* sql = R"(
+        SELECT event_id, agent_id, observed_at, obs_type, subject,
+               reason, symbolic, component, metric, platform
+        FROM guardian_observations
+        WHERE event_id = ?1
+        LIMIT 1
+    )";
+    SqliteStmt st;
+    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK) {
+        // A store fault here would otherwise be indistinguishable from "not found"
+        // at the route — log it so it's diagnosable.
+        spdlog::warn("GuaranteedStateStore::dex_observation: prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    sqlite3_bind_text(st.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(st.get());
+    if (rc != SQLITE_ROW) {
+        // SQLITE_DONE is the genuine not-found (no row matched the PK); any other
+        // code (SQLITE_CORRUPT/IOERR/...) is a STORE FAULT that would otherwise be
+        // silently indistinguishable from not-found at the route — log it so a
+        // faulting store is diagnosable, mirroring the prepare-fail arm above.
+        if (rc != SQLITE_DONE)
+            spdlog::warn("GuaranteedStateStore::dex_observation: step failed: {}",
+                         sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    GuardianObservationRow r;
+    r.event_id = col_text(st.get(), 0);
+    r.agent_id = col_text(st.get(), 1);
+    r.observed_at = col_text(st.get(), 2);
+    r.obs_type = col_text(st.get(), 3);
+    r.subject = col_text(st.get(), 4);
+    r.reason = col_text(st.get(), 5);
+    r.symbolic = col_text(st.get(), 6);
+    r.component = col_text(st.get(), 7);
+    r.metric = sqlite3_column_double(st.get(), 8);
+    r.platform = col_text(st.get(), 9);
+    return r;
 }
 
 std::vector<GuaranteedStateEventRow>

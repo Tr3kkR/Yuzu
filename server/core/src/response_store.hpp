@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -60,6 +61,21 @@ struct ResponseQuery {
     int limit{100};
     int offset{0};
 };
+
+/// Management-group scope filter for `aggregate()` (#1634) — a DEDICATED
+/// parameter, deliberately NOT a field on `ResponseQuery`. A folded aggregate
+/// cannot be post-filtered, so the caller's in-scope agent set is pushed into
+/// the WHERE clause; the row-returning readers (`query`/`query_by_execution`)
+/// post-filter instead and never consult this, so keeping it off the shared
+/// query struct removes the trap of a `query()` caller silently getting no
+/// scoping from a field the row path ignores (governance #1634 architect review).
+///   * `nullopt`           = no scoping (legacy-open / RBAC-disabled / global
+///                           operator — totals over all agents, any scale).
+///   * engaged + NON-empty = restrict to `agent_id IN (the set)`.
+///   * engaged + EMPTY     = the operator can see none → ZERO rows (`AND 1=0`),
+///                           never a silent unfiltered read (also the fail-closed
+///                           sink for a corrupt RBAC store / a store-read error).
+using AggregateScope = std::optional<std::vector<std::string>>;
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
 
@@ -130,7 +146,23 @@ public:
     std::vector<StoredResponse> get_by_instruction(const std::string& instruction_id) const;
     std::vector<AggregationResult> aggregate(const std::string& instruction_id,
                                              const AggregationQuery& aq,
-                                             const ResponseQuery& filter = {}) const;
+                                             const ResponseQuery& filter = {},
+                                             const AggregateScope& scope = std::nullopt) const;
+    /// Distinct agent_ids that have a response row for this instruction,
+    /// ordered by agent_id (deterministic). Used to resolve a management-group
+    /// scoped aggregate (#1634): enumerate the candidates, keep only those the
+    /// per-agent scope predicate admits, then pass the survivors back as the
+    /// `aggregate()` `scope` argument so the WHERE clause excludes out-of-scope
+    /// rows from the totals. Bounded by one instruction's fan-out.
+    ///
+    /// Returns `nullopt` on a store-read error (failed prepare/step) — DISTINCT
+    /// from an empty vector (the instruction genuinely has no rows). The caller
+    /// MUST fail closed on `nullopt` (scope to the empty set → zero rows), never
+    /// treat an errored read as "no agents to drop" → unrestricted (governance
+    /// #1634 unhappy-path UP-2: an errored read that looked empty re-opened the
+    /// aggregate to all agents).
+    std::optional<std::vector<std::string>>
+    distinct_agent_ids(const std::string& instruction_id) const;
     std::size_t total_count() const;
     std::uintmax_t db_size_bytes() const;
 

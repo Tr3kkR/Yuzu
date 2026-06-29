@@ -50,6 +50,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -627,6 +628,12 @@ private:
     std::mutex software_collect_mu_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
+    // Per-app version cache, keyed by (pid, create_time): resolves each top-N
+    // process once while it stays in the set (read-once-near-launch). Touched
+    // only by resolve_proc_versions OUTSIDE collect_mu_ — so it has its own
+    // mutex; never hold collect_mu_ across the OpenProcess/file-read it drives.
+    std::mutex proc_ver_mu_;
+    std::unordered_map<std::uint64_t, std::string> version_cache_;
 
     // Gap-free process start/stop stream: ETW on Windows, Endpoint Security on
     // macOS (one concrete collector per platform behind the ProcStreamCollector
@@ -1154,6 +1161,13 @@ private:
             ctx.write_output("tar|collect_procperf|0|baseline");
             return rc;
         }
+        // Resolve each app's on-disk file version OUTSIDE collect_mu_ — the
+        // OpenProcess + version-resource read must never block other collectors.
+        // No-op off Windows (versions stay ""). (#DEX app-perf-over-time slice 1)
+        {
+            std::lock_guard vlock(proc_ver_mu_);
+            yuzu::tar::resolve_proc_versions(samples, version_cache_);
+        }
         const auto snap_id = next_snapshot_id();
         std::vector<yuzu::tar::ProcPerfRow> rows;
         rows.reserve(samples.size());
@@ -1162,6 +1176,7 @@ private:
             r.ts = ts;
             r.snapshot_id = snap_id;
             r.name = std::move(s.name);
+            r.version = std::move(s.version);
             r.instances = s.instances;
             r.cpu_pct = s.cpu_pct;
             r.ws_bytes = s.ws_bytes;

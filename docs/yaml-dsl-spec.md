@@ -1650,6 +1650,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `content.execute` | `content_dist` | Y | Y | Y | Verified |
 | `content.list_staged` | `content_dist` | Y | Y | Y | Verified |
 | `content.cleanup` | `content_dist` | Y | Y | Y | Verified |
+| `storage.free` | `disk_space` | Y | Y | Y | Verified |
+
+`storage.free` (`crossplatform.storage.free`) reports `total_bytes`, `free_bytes`, and `percent_used` for a single volume; the `path` parameter selects the volume (default `C:\` on Windows, `/` on Linux/macOS); the free figure is quota-aware caller headroom (`FreeBytesAvailableToCaller` / `f_bavail`); query each volume in a separate call.
 
 ### 14.8 Security and Compliance
 

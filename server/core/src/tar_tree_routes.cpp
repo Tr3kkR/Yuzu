@@ -5,6 +5,7 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
 
@@ -382,12 +383,14 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}});
         // Audit at DISPATCH (parity with device-live-info / DEX-perf): the live query
         // hitting the endpoint is the access event and must be recorded even when it
-        // reaches no agent or the later poll never completes.
-        if (audit_fn_)
-            audit_fn_(req, "tar.process_tree.read", psent > 0 ? "dispatched" : "no_agents",
-                      "Agent", device,
-                      std::format("dispatch preset={} command_id={}", canonical_tar_preset(preset),
-                                  audit_token(pcmd)));
+        // reaches no agent or the later poll never completes. Shared #1647 chokepoint:
+        // catches a throwing audit_fn (catch-arm parity) and surfaces Sec-Audit-Failed
+        // on a dropped row; dispatch/render posture unchanged (still renders below).
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, "tar.process_tree.read", psent > 0 ? "dispatched" : "no_agents",
+            "Agent", device,
+            std::format("dispatch preset={} command_id={}", canonical_tar_preset(preset),
+                        audit_token(pcmd)));
         if (psent == 0 || tsent == 0) {
             note(res, "Device offline \xE2\x80\x94 the process tree needs a connected agent.");
             return;
@@ -495,9 +498,8 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // see nothing) and we never cache a half-built entry under a weak token.
         auto token_exp = random_hex(16);
         if (!token_exp) {
-            if (audit_fn_)
-                audit_fn_(req, "tar.process_tree.read", "failure", "Agent", device,
-                          "csprng_unavailable");
+            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "tar.process_tree.read",
+                                                "failure", "Agent", device, "csprng_unavailable");
             note(res, "The server could not generate a secure token for this reconstruction "
                       "(entropy temporarily unavailable). Retry in a few seconds.");
             return;
@@ -527,11 +529,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // Record the data class exposed (works-council access-audit posture): `os`
         // distinguishes a names-only Windows read from a behavioral Linux/macOS read
         // (which carries command lines); `conns` flags whether connection data was shown.
-        if (audit_fn_)
-            audit_fn_(req, "tar.process_tree.read", "success", "Agent", device,
-                      std::format("preset={} from={} to={} nodes={} anomalies={} os={} conns={}",
-                                  canonical_tar_preset(preset), win.from_ts, win.to_ts, node_count,
-                                  anomaly_count, normalize_tar_os(os), tcp_ok ? 1 : 0));
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, "tar.process_tree.read", "success", "Agent", device,
+            std::format("preset={} from={} to={} nodes={} anomalies={} os={} conns={}",
+                        canonical_tar_preset(preset), win.from_ts, win.to_ts, node_count,
+                        anomaly_count, normalize_tar_os(os), tcp_ok ? 1 : 0));
         res.set_content(body, "text/html; charset=utf-8");
     });
 
@@ -577,12 +579,17 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                 "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
             const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}});
             const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}});
-            if (audit_fn_) {
-                audit_fn_(req, "tar.dns.read", dsent > 0 ? "dispatched" : "no_agents", "Agent",
-                          device, std::format("command_id={}", audit_token(dc)));
-                audit_fn_(req, "tar.arp.read", asent > 0 ? "dispatched" : "no_agents", "Agent",
-                          device, std::format("command_id={}", audit_token(ac)));
-            }
+            // Shared #1647 chokepoint: catch-arm parity + Sec-Audit-Failed per verb
+            // (DNS is usage-class PII, kept separately countable). Dispatch posture
+            // unchanged; if either evidence row drops, the header is set.
+            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "tar.dns.read",
+                                                dsent > 0 ? "dispatched" : "no_agents", "Agent",
+                                                device,
+                                                std::format("command_id={}", audit_token(dc)));
+            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "tar.arp.read",
+                                                asent > 0 ? "dispatched" : "no_agents", "Agent",
+                                                device,
+                                                std::format("command_id={}", audit_token(ac)));
             if (dsent == 0 || asent == 0) {
                 note(res, "Device offline \xE2\x80\x94 the DNS/ARP panels need a connected agent.");
                 return;
@@ -681,11 +688,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (scmd.empty() || ccmd.empty()) {
             const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {});
             const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {});
-            if (audit_fn_)
-                audit_fn_(req, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents", "Agent",
-                          device,
-                          std::format("status_command_id={} compat_command_id={}",
-                                      audit_token(sc), audit_token(cc)));
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents",
+                "Agent", device,
+                std::format("status_command_id={} compat_command_id={}", audit_token(sc),
+                            audit_token(cc)));
             if (ssent == 0 || csent == 0) {
                 note(res, "Device offline \xE2\x80\x94 capture-source management needs a connected agent.");
                 return;
@@ -777,10 +784,10 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             const std::string enabled = (val == "on") ? "true" : "false";
             const auto [cmd, sent] =
                 dispatch_fn_("tar", "configure", {device}, "", {{src + "_enabled", enabled}});
-            if (audit_fn_)
-                audit_fn_(req, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
-                          "Agent", device,
-                          std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
+                "Agent", device,
+                std::format("{}_enabled={} command_id={}", src, enabled, audit_token(cmd)));
             // Only count a change the operator can observe as applied: when the dispatch
             // reached no agents (sent==0) the audit records `no_agents`, so the toast must
             // not claim it was pushed (ADR-0015 review LOW-D).
@@ -864,9 +871,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // mirrors dex.signal.view). Fires once per row-click — intentionally per-click,
         // bounded by the Execute + scoped-Read + principal gates above. `os` is
         // normalized so the agent-controlled value can't forge an audit field.
-        if (audit_fn_)
-            audit_fn_(req, "tar.process_tree.detail", "success", "Agent", device_id,
-                      std::format("node={} os={}", node_id, normalize_tar_os(os)));
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, "tar.process_tree.detail", "success", "Agent", device_id,
+            std::format("node={} os={}", node_id, normalize_tar_os(os)));
         res.set_content(*html, "text/html; charset=utf-8");
     });
 }

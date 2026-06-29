@@ -7,10 +7,12 @@
 
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -212,8 +214,37 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
             }
         }
 
-        InventoryIngestOutcome outcome =
-            store.apply_installed_software(agent_id, claimed_hash, rows, collected_at);
+        // #1664: time the apply — it holds a pooled connection for the whole
+        // advisory-lock + DELETE + batched-INSERT transaction (and any
+        // lease-acquire wait), the cost that saturates the pool under a
+        // need_full herd and is otherwise invisible. Split by `phase`: a `full`
+        // payload runs the expensive replace transaction; a `hash_only` report
+        // is just a compare + last_seen bump. Without the split the cheap
+        // hash_only samples (the steady-state majority) would bury the
+        // full-replace tail that #1664 is about. `source` matches
+        // yuzu_inventory_ingest_total{source,outcome}.
+        const char* phase = rows.has_value() ? "full" : "hash_only";
+        const auto ingest_t0 = std::chrono::steady_clock::now();
+        // rows is not read after this call (phase is computed above), so move it
+        // in — the store takes the optional by value and moves the entries out,
+        // avoiding a copy of up to kMaxEntries rows on the ingest hot path (UP-8).
+        InventoryIngestOutcome outcome = store.apply_installed_software(
+            agent_id, claimed_hash, std::move(rows), collected_at);
+        if (metrics) {
+            const double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();
+            // SOLE creating site for yuzu_inventory_ingest_duration_seconds — the
+            // bucket boundaries are fixed by whichever call births a (source,phase)
+            // series first, and this is it (unlike pg_acquire there is no registration
+            // birth, because the {source,phase} label sets aren't known up front). Any
+            // NEW call site for this metric MUST pass seconds_buckets_60s() too, or it
+            // would silently birth a default-10s-ceiling series and collapse the tail
+            // (governance #1686 UP-6 / consistency N2).
+            metrics->histogram("yuzu_inventory_ingest_duration_seconds",
+                               {{"source", source}, {"phase", phase}},
+                               yuzu::Histogram::seconds_buckets_60s())
+                .observe(secs);
+        }
         emit(source, outcome == InventoryIngestOutcome::kStored    ? "stored"
                      : outcome == InventoryIngestOutcome::kTouched  ? "touched"
                      : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"

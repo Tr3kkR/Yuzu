@@ -6,7 +6,9 @@
 #include <format>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu {
@@ -152,6 +154,16 @@ public:
         return {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0};
     }
 
+    // Latency buckets extended into the 10-60s saturation tail, for histograms
+    // whose p99 can sit past the default 10s ceiling under load (inventory
+    // full-replace ingest, Postgres pool acquire under contention). Without these
+    // the tail collapses into +Inf and an alert must reconstruct it from the
+    // +Inf-minus-le=10 complement. #1686.
+    static std::vector<double> seconds_buckets_60s() {
+        return {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                15.0, 20.0, 30.0, 45.0, 60.0};
+    }
+
 private:
     mutable std::mutex mu_;
     std::vector<double> boundaries_;
@@ -168,6 +180,24 @@ public:
         auto key = labels_key(l);
         std::lock_guard lock(mu_);
         return instances_[key].metric;
+    }
+
+    // Get-or-create a series whose metric is constructed with `buckets` on first
+    // insertion. std::piecewise_construct builds the metric IN PLACE in the map
+    // node — Histogram holds a std::mutex and is therefore non-movable, so it can
+    // never be constructed-then-moved/copied in. On an existing series `buckets`
+    // is ignored (boundaries are fixed at first creation, per Prometheus). Only
+    // instantiated for metric types whose ctor accepts buckets (Histogram). #1686.
+    T& labels_with_buckets(const Labels& l, std::vector<double> buckets) {
+        auto key = labels_key(l);
+        std::lock_guard lock(mu_);
+        auto it = instances_.find(key);
+        if (it == instances_.end())
+            it = instances_
+                     .emplace(std::piecewise_construct, std::forward_as_tuple(std::move(key)),
+                              std::forward_as_tuple(std::move(buckets)))
+                     .first;
+        return it->second.metric;
     }
 
     T& no_labels() { return labels({}); }
@@ -195,6 +225,11 @@ public:
 private:
     struct LabeledInstance {
         T metric;
+        LabeledInstance() = default;
+        // Construct the wrapped metric in place from a Histogram's custom bucket
+        // boundaries. Only instantiated when labels_with_buckets() is used — i.e.
+        // for MetricFamily<Histogram>; never for Counter/Gauge families. #1686.
+        explicit LabeledInstance(std::vector<double> buckets) : metric(std::move(buckets)) {}
     };
     std::mutex mu_;
     std::unordered_map<std::string, LabeledInstance> instances_;
@@ -238,6 +273,20 @@ public:
     Histogram& histogram(const std::string& name, const Labels& l) {
         std::lock_guard lock(mu_);
         return histograms_[name].labels(l);
+    }
+
+    // Buckets-on-first-creation overloads (#1686). Pass the bucket boundaries the
+    // series should own; ignored once the series exists (boundaries are fixed at
+    // creation). `buckets` is a vector<double>, unambiguous against the Labels
+    // (vector<pair<string,string>>) overloads above.
+    Histogram& histogram(const std::string& name, const Labels& l, std::vector<double> buckets) {
+        std::lock_guard lock(mu_);
+        return histograms_[name].labels_with_buckets(l, std::move(buckets));
+    }
+
+    Histogram& histogram(const std::string& name, std::vector<double> buckets) {
+        std::lock_guard lock(mu_);
+        return histograms_[name].labels_with_buckets({}, std::move(buckets));
     }
 
     void clear_gauge_family(const std::string& name) {

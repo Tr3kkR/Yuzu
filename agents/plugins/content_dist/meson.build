@@ -28,6 +28,7 @@ shared_library(
   'content_dist',
   files('src/content_dist_plugin.cpp'),
   name_prefix: '',
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, _WIN32-gated)
   cpp_args: cd_cpp_args,
   dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep, httplib_dep] + cd_extra_deps,
   install: true,

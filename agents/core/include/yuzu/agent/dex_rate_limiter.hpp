@@ -7,10 +7,9 @@
  * flapping unit, an OOM cascade) must not flood the wire. Each obs_type carries a
  * `max_per_hour` in the signal catalogue (dex_signal_catalog); this is the shared,
  * PURE, platform-agnostic limiter that enforces it at a collector's emit()
- * chokepoint. The Linux collector wires it today; the Windows observer reads the
- * catalogue cap inline and the macOS collector still carries a bespoke cap table —
- * unifying all three onto this limiter is a tracked follow-up (do NOT fold that in
- * here).
+ * chokepoint. The Linux collector AND the Windows DEX observer both wire it today
+ * (the observer no longer carries its own inline bucket); the macOS collector
+ * still carries a bespoke cap table — unifying it too is a tracked follow-up.
  *
  * PURE + logging-free: the limiter classifies an observation as Emit / Drop /
  * DropAndWarn and tells the caller when a drop is the FIRST of its clock-hour (so

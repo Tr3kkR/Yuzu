@@ -2,6 +2,8 @@
 
 #include "tar_collectors.hpp" // should_redact
 
+#include <yuzu/version_string.hpp> // shared format_file_version / normalize_ffi_version
+
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
@@ -19,15 +21,19 @@ std::uint64_t delta(std::uint64_t prev, std::uint64_t cur) {
 
 // (pid, create_time) identity key — PID alone is reused by the OS.
 std::uint64_t proc_key(const ProcCounter& p) {
+    return proc_identity(p.pid, p.create_time_100ns);
+}
+
+} // namespace
+
+std::uint64_t proc_identity(std::uint32_t pid, std::int64_t create_time_100ns) {
     // PID in the high 32 bits XOR'd with the FULL 64-bit create_time; a
     // collision needs two procs whose create_time high-dword aligns with a
     // reused PID — astronomically rare, and at worst costs one interval of CPU
     // mis-attribution for one app row.
-    return (static_cast<std::uint64_t>(p.pid) << 32) ^
-           static_cast<std::uint64_t>(p.create_time_100ns);
+    return (static_cast<std::uint64_t>(pid) << 32) ^
+           static_cast<std::uint64_t>(create_time_100ns);
 }
-
-} // namespace
 
 std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
                                                 const ProcSnapshot& cur,
@@ -47,11 +53,16 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
     for (const auto& p : prev.procs)
         prev_cpu[proc_key(p)] = p.cpu_100ns;
 
-    // Aggregate by image name (app-level, the BRD row-22 unit).
+    // Aggregate by image name (app-level, the BRD row-22 unit). `rep_*` track
+    // the largest-working-set instance — the representative whose on-disk image
+    // version stands in for the app this tick (resolved later, off the lock).
     struct Agg {
         int instances{0};
         std::uint64_t cpu_delta{0};
         std::uint64_t ws{0};
+        std::uint32_t rep_pid{0};
+        std::int64_t rep_create_time{0};
+        std::uint64_t rep_ws{0};
     };
     std::unordered_map<std::string, Agg> by_name;
     for (const auto& p : cur.procs) {
@@ -64,6 +75,11 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
         a.ws += p.ws_bytes;
         if (auto it = prev_cpu.find(proc_key(p)); it != prev_cpu.end())
             a.cpu_delta += delta(it->second, p.cpu_100ns);
+        if (a.rep_pid == 0 || p.ws_bytes > a.rep_ws) {
+            a.rep_ws = p.ws_bytes;
+            a.rep_pid = p.pid;
+            a.rep_create_time = p.create_time_100ns;
+        }
     }
     if (by_name.empty())
         return out;
@@ -78,6 +94,8 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
         s.instances = a.instances;
         s.cpu_pct = std::clamp(static_cast<double>(a.cpu_delta) * 100.0 / capacity, 0.0, 100.0);
         s.ws_bytes = static_cast<std::int64_t>(a.ws);
+        s.rep_pid = a.rep_pid;
+        s.rep_create_time_100ns = a.rep_create_time;
         all.push_back(std::move(s));
     }
 
@@ -120,7 +138,9 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <winternl.h> // SYSTEM_PROCESS_INFORMATION (public/partial), NTSTATUS
+#include <winver.h>   // GetFileVersionInfoW / VerQueryValueW / VS_FIXEDFILEINFO
 
 #include <cstddef>
 #include <ctime>
@@ -178,17 +198,69 @@ using NtQsiFn = NTSTATUS(WINAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG
 constexpr NTSTATUS kStatusInfoLengthMismatch = static_cast<NTSTATUS>(0xC0000004L);
 
 // UTF-16 → UTF-8 for a counted (possibly unterminated) UNICODE_STRING.
+// Delegates to the shared helper (#1681). UNICODE_STRING is COUNTED and not
+// NUL-terminated, so yuzu::win::from_wide's trailing-NUL pop never fires here (a
+// real image name carries no trailing NUL); null buffer / zero length -> {}.
 std::string ucs_to_utf8(const UNICODE_STRING& u) {
-    if (!u.Buffer || u.Length == 0)
+    return yuzu::win::from_wide(u.Buffer, static_cast<int>(u.Length / sizeof(WCHAR)));
+}
+
+// RAII for a process HANDLE — CloseHandle on every exit path (the OpenProcess
+// in resolve_one_version has several early returns; a manual close would leak).
+struct HandleGuard {
+    HANDLE h{nullptr};
+    explicit HandleGuard(HANDLE handle) : h{handle} {}
+    ~HandleGuard() {
+        if (h && h != INVALID_HANDLE_VALUE)
+            ::CloseHandle(h);
+    }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    explicit operator bool() const { return h && h != INVALID_HANDLE_VALUE; }
+};
+
+// Resolve ONE process's on-disk file version, or "" on any failure. The path is
+// read only to feed GetFileVersionInfo and is discarded immediately (it can
+// carry a user-profile dir — privacy). `create_time_100ns` is the snapshot's
+// CreateTime; it MUST match the live process before any path/version read, or a
+// reused PID would get another process's version attributed.
+std::string resolve_one_version(std::uint32_t pid, std::int64_t create_time_100ns) {
+    HandleGuard proc{::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
+    if (!proc)
+        return {}; // protected/system process or gone — version stays ""
+
+    // PID-reuse guard FIRST: FILETIME-to-FILETIME (100 ns since 1601), never
+    // against the Unix-seconds ts_epoch.
+    FILETIME ft_create{}, ft_exit{}, ft_kernel{}, ft_user{};
+    if (!::GetProcessTimes(proc.h, &ft_create, &ft_exit, &ft_kernel, &ft_user))
         return {};
-    const int wlen = static_cast<int>(u.Length / sizeof(WCHAR));
-    const int need =
-        ::WideCharToMultiByte(CP_UTF8, 0, u.Buffer, wlen, nullptr, 0, nullptr, nullptr);
-    if (need <= 0)
+    ULARGE_INTEGER created{};
+    created.LowPart = ft_create.dwLowDateTime;
+    created.HighPart = ft_create.dwHighDateTime;
+    if (static_cast<std::int64_t>(created.QuadPart) != create_time_100ns)
+        return {}; // PID was reused since the snapshot — refuse before reading
+
+    WCHAR path[MAX_PATH * 2];
+    DWORD path_len = static_cast<DWORD>(std::size(path));
+    if (!::QueryFullProcessImageNameW(proc.h, 0, path, &path_len))
         return {};
-    std::string out(static_cast<std::size_t>(need), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, u.Buffer, wlen, out.data(), need, nullptr, nullptr);
-    return out;
+
+    DWORD ignored = 0;
+    const DWORD info_size = ::GetFileVersionInfoSizeW(path, &ignored);
+    if (info_size == 0)
+        return {}; // no version resource (common for many non-vendor exes)
+    std::vector<unsigned char> info(info_size); // RAII buffer
+    if (!::GetFileVersionInfoW(path, 0, info_size, info.data()))
+        return {};
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT ffi_len = 0;
+    if (!::VerQueryValueW(info.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffi_len) ||
+        !ffi || ffi_len < sizeof(VS_FIXEDFILEINFO))
+        return {};
+    // Shared normalization: an all-zero fixed version maps to "" so it shares the
+    // single unknown-version bucket with the crash side's canon_version, keeping
+    // the (name, version) join consistent across perf and stability.
+    return yuzu::util::normalize_ffi_version(ffi->dwFileVersionMS, ffi->dwFileVersionLS);
 }
 
 } // namespace
@@ -269,6 +341,27 @@ ProcSnapshot read_proc_counters() {
     return snap;
 }
 
+void resolve_proc_versions(std::vector<ProcPerfSample>& samples,
+                           std::unordered_map<std::uint64_t, std::string>& cache) {
+    // Rewrite the cache to this tick's live top-N: a process keeps its version
+    // (resolved once at first sighting) while it stays in the set, and the cache
+    // can never grow past <= 2N entries. A failed resolve is cached as "" too,
+    // so a protected process is not re-OpenProcess'd every tick it survives.
+    std::unordered_map<std::uint64_t, std::string> next;
+    next.reserve(samples.size());
+    for (auto& s : samples) {
+        if (s.rep_pid == 0)
+            continue; // no representative instance — leave version ""
+        const auto key = proc_identity(s.rep_pid, s.rep_create_time_100ns);
+        if (auto it = cache.find(key); it != cache.end())
+            s.version = it->second;
+        else
+            s.version = resolve_one_version(s.rep_pid, s.rep_create_time_100ns);
+        next.emplace(key, s.version);
+    }
+    cache.swap(next);
+}
+
 } // namespace yuzu::tar
 
 #else // !_WIN32 — Linux (/proc/[pid]/stat) and macOS (proc_pid_rusage) are kPlanned
@@ -282,6 +375,11 @@ ProcSnapshot read_proc_counters() {
     snap.ts_epoch = static_cast<std::int64_t>(std::time(nullptr));
     return snap; // valid=false — collect_perf records nothing on this platform yet
 }
+
+// No per-process version source yet (the Linux/macOS per-app collectors are
+// kPlanned). Leave every version "" without touching the cache.
+void resolve_proc_versions(std::vector<ProcPerfSample>& /*samples*/,
+                           std::unordered_map<std::uint64_t, std::string>& /*cache*/) {}
 
 } // namespace yuzu::tar
 
