@@ -77,6 +77,10 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "preflight_eval.hpp"
+#include "preflight_routes.hpp"
+#include "preflight_run_store.hpp"
+#include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -1064,6 +1068,22 @@ public:
                 spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // PreflightRunStore — born-on-PG persistence for /auto runs. CONSTRUCTION
+        // is fail-CLOSED per ADR-0012 §1 (a store that cannot migrate/open sets
+        // startup_failed_, same as OfflineEndpointStore above): a reachable
+        // database whose schema can't be created is a deploy error, not a
+        // serve-degraded state. The fail-soft posture is RUNTIME-only (a transient
+        // lease timeout degrades /auto to a note; see preflight_run_store.hpp).
+        if (pg_pool_ && !startup_failed_) {
+            preflight_run_store_ = std::make_unique<PreflightRunStore>(*pg_pool_);
+            if (!preflight_run_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: preflight-run store migration/open failed "
+                              "(database reachable but the preflight_run_store schema could not be "
+                              "created/opened)");
                 startup_failed_ = true;
             }
         }
@@ -2868,6 +2888,13 @@ public:
         if (app_perf_rollup_thread_.joinable()) {
             app_perf_rollup_thread_.join();
         }
+        // Join the pre-flight runner thread (uses preflight_run_store_ +
+        // response_store_ + the dispatch path — stop before teardown), then drop
+        // the runner so its borrowed pointers can't be ticked again.
+        if (preflight_runner_thread_.joinable()) {
+            preflight_runner_thread_.join();
+        }
+        preflight_runner_.reset();
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -2993,6 +3020,9 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
+        // thread that leased it is already joined above).
+        preflight_run_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -3880,6 +3910,28 @@ private:
                                    const std::string& agent_id) {
         return auth_routes_->require_scoped_permission(req, res, securable_type, operation,
                                                        agent_id);
+    }
+
+    /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
+    /// fan-out reader routes through this (legacy `/api/responses/*`, the REST
+    /// visualization ResponseScopeFn, and the MCP query_responses/aggregate_responses
+    /// response_scope_fn) so the posture can never drift between surfaces. Returns
+    /// true iff `username` may see `agent_id`'s rows via a management group. A FILTER,
+    /// not a gate (writes no response).
+    ///
+    /// FAILS CLOSED on a corrupt/load-failed rbac.db (#1634 UP-1): gates on
+    /// `rbac_enforcement_in_effect`, not raw `!is_rbac_enabled()`. The latter is
+    /// fail-OPEN — a corrupt store leaves `db_` null so `is_rbac_enabled()` defaults
+    /// false, which would read as "RBAC off → no filter" and re-open the cross-operator
+    /// IDOR. `rbac_enforcement_in_effect` returns false (→ legacy-open) ONLY for a
+    /// store that is loaded AND explicitly disabled; a null/!is_open() store returns
+    /// true (enforce), and `check_scoped_permission` then denies on the dead handle —
+    /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
+    bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true; // loaded & explicitly disabled → legacy-open
+        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                   agent_id, mgmt_group_store_.get());
     }
 
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
@@ -5800,7 +5852,56 @@ private:
                 return;
             }
 
-            auto results = response_store_->aggregate(instruction_id, aq, filter);
+            // #1634 management-group scope (filter-BEFORE-aggregate; same as MCP
+            // aggregate_responses). The flat Response:Read gate is not a per-agent
+            // ownership check, so resolve the in-scope agent set and push it into the
+            // aggregate WHERE clause. Uses an EXPLICIT positive check, never the
+            // "dropped==0 → unrestricted" inference (#1634 UP-1/2/3):
+            //   * RBAC loaded & explicitly disabled → leave scope nullopt (open).
+            //   * Global Response:Read holder → leave scope nullopt (correct totals at
+            //     any scale; also the perf hoist — skips the distinct scan + per-agent
+            //     loop). check_permission (not is_rbac_enabled) gates this, so a corrupt
+            //     store can't take this branch.
+            //   * Otherwise (group-scoped operator) → resolve and ALWAYS set scope,
+            //     even to the empty set (`AND 1=0` → zero rows), never an unrestricted
+            //     read. A distinct_agent_ids() read error returns 503 (store-availability
+            //     failure is NOT "operator sees no agents" — it must not look like empty
+            //     data; observability-conventions + agentic-first A4 + ADR-0016
+            //     authoritative-reads, #1634 sre review).
+            AggregateScope agg_scope; // nullopt = no restriction
+            std::size_t agg_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                if (rbac_enforcement_in_effect(rbac_store_.get()) &&
+                    !(rbac_store_ &&
+                      rbac_store_->check_permission(session->username, "Response", "Read"))) {
+                    auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                    if (!distinct) {
+                        res.status = 503;
+                        res.set_content(
+                            R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct)
+                        if (response_agent_in_scope(session->username, aid))
+                            in_scope.push_back(std::move(aid));
+                    agg_dropped = distinct->size() - in_scope.size();
+                    agg_scope = std::move(in_scope); // ALWAYS engaged in this branch
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
+            // it so a cross-operator access attempt that was suppressed is auditable on this
+            // surface too (#1634 compliance review; parity with the MCP denied row / the
+            // visualization scope_dropped detail).
+            if (agg_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
+
+            auto results = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
 
             int64_t total_rows = 0;
             nlohmann::json groups = nlohmann::json::array();
@@ -5857,6 +5958,38 @@ private:
             }
 
             auto results = response_store_->query(instruction_id, q);
+
+            // #1634 management-group scope: drop out-of-scope agents' rows before
+            // export (mirrors MCP query_responses / the visualization reader). The
+            // flat Response:Read gate is not a per-agent ownership check.
+            std::size_t export_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
+                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
+                // response_agent_in_scope, rather than skipping it and serving the fleet.
+                if (rbac_enforcement_in_effect(rbac_store_.get())) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(results.size());
+                    for (auto& r : results) {
+                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
+                        if (ins)
+                            m->second = response_agent_in_scope(session->username, r.agent_id);
+                        if (m->second)
+                            visible.push_back(std::move(r));
+                        else if (ins) // count each DISTINCT dropped agent once
+                            ++export_dropped;
+                    }
+                    results.swap(visible);
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
+            if (export_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(export_dropped) + " surface=export");
+
             auto format = req.get_param_value("format");
 
             if (format == "csv") {
@@ -5939,6 +6072,37 @@ private:
             }
 
             auto results = response_store_->query(instruction_id, q);
+
+            // #1634 management-group scope: drop out-of-scope agents' rows before
+            // serving (mirrors the export sibling above + MCP query_responses). The
+            // flat Response:Read gate is not a per-agent ownership check.
+            std::size_t get_dropped = 0;
+            if (auto session = require_auth(req, res)) {
+                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
+                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
+                // response_agent_in_scope, rather than skipping it and serving the fleet.
+                if (rbac_enforcement_in_effect(rbac_store_.get())) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(results.size());
+                    for (auto& r : results) {
+                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
+                        if (ins)
+                            m->second = response_agent_in_scope(session->username, r.agent_id);
+                        if (m->second)
+                            visible.push_back(std::move(r));
+                        else if (ins) // count each DISTINCT dropped agent once
+                            ++get_dropped;
+                    }
+                    results.swap(visible);
+                }
+            } else {
+                return; // require_auth already wrote 401
+            }
+            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
+            if (get_dropped > 0)
+                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
+                                "scope_dropped=" + std::to_string(get_dropped) + " surface=get");
 
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& r : results) {
@@ -8169,6 +8333,43 @@ private:
                 }
             });
         }
+        // PreflightRunner — /auto re-dispatch-on-reconnect + window lifecycle.
+        // Same dispatch lambda as operator commands; per-check execution_ids union
+        // re-dispatches via query_by_execution. Joined BEFORE the stores in stop().
+        metrics_.describe("yuzu_preflight_tick_errors_total",
+                          "Pre-flight runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        preflight_runner_ = std::make_unique<PreflightRunner>(PreflightRunner::Deps{
+            .run_store = preflight_run_store_.get(),
+            .response_store = response_store_.get(),
+            .dispatch_fn = command_dispatch_fn,
+            .now_ms_fn = {},
+            .retention_days = 14,
+        });
+        preflight_runner_thread_ = std::thread([this]() {
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (preflight_runner_) {
+                    // tick() touches JSON, PG and gRPC dispatch — any can throw; an
+                    // escaping exception would std::terminate the process, so a bad
+                    // run must not take it down. Catch, log, keep ticking.
+                    try {
+                        preflight_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
+                        spdlog::error("preflight_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
+                        spdlog::error("preflight_runner: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
 
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
@@ -8809,6 +9010,49 @@ private:
             },
             audit_fn);
 
+        // PreflightRoutes — /auto pre-flight page. A config section (per-check
+        // params + thresholds) runs the live checks (app version / os_version /
+        // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
+        // in a chosen management group (optionally narrowed by OS family), applies
+        // the thresholds server-side, and groups the result BY DEVICE (Pass / Failed
+        // / Warn-only / Incomplete). Reuses DeviceRoutes' scoped device provider
+        // (devices_fn) + the SAME untracked dispatch (execution_id="" → not in the
+        // executions drawer, like device live-info / DEX-perf reads) + a narrow
+        // all-agents ResponseStore seam (query by command_id, no agent filter — the
+        // grid only counts the pinned visible∩group devices, so an extra agent
+        // in the result is ignored). Machine-health facts, not behavioural PII →
+        // operational `preflight.run` audit (set-and-proceed).
+        preflight_routes_ = std::make_unique<PreflightRoutes>();
+        preflight_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            [this](const std::string& group_id) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                if (mgmt_group_store_)
+                    for (const auto& m : mgmt_group_store_->get_members(group_id))
+                        out.push_back(m.agent_id);
+                return out;
+            },
+            // 6-param dispatch: execution_id carried so re-dispatched checks union
+            // via query_by_execution (the runner reuses the same per-check ids).
+            command_dispatch_fn,
+            // Collect: per-check query_by_execution + latest_per_agent (LIVE render
+            // of a running run). NOT under any PreflightRunStore lease.
+            [this](const std::string& run_id,
+                   const std::vector<std::pair<std::string, std::string>>& applicable)
+                -> std::vector<preflight::PreflightCheckResponses> {
+                if (!response_store_)
+                    return {};
+                return preflight::collect_check_responses(*response_store_, run_id, applicable);
+            },
+            audit_fn, preflight_run_store_.get());
+
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
@@ -9291,6 +9535,15 @@ private:
                 return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
                                                             mgmt_group_store_.get());
             },
+            // #1634: per-agent Response-scope predicate for the fan-out response
+            // readers (GET /api/v1/executions/{id}/visualization). Routes through the
+            // single response_agent_in_scope helper so the REST, MCP and legacy
+            // surfaces share ONE fail-closed implementation (UP-1: a corrupt rbac.db
+            // can't re-open the IDOR via a drifted copy). MUST be wired here; the param
+            // defaults to {} = no filter.
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                return response_agent_in_scope(username, agent_id);
+            },
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
             app_perf_providers);
 
@@ -9409,22 +9662,20 @@ private:
                 // N1: the shared network-quality provider (fragments + REST + MCP).
                 net_perf_fn,
                 // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
-                // query_responses{execution_id}. Wired to check_scoped_permission —
-                // the SAME management-group chokepoint the per-device REST/dashboard
-                // routes use — so an operator collects only the agents inside their
-                // groups, not any execution's rows by id. The MCP handler resolves the
-                // principal ONCE (it already authed) and passes `username` in, so this
-                // does NOT re-resolve the session per agent. RBAC off / no store →
-                // legacy-open (no filter), matching require_scoped_permission.
+                // query_responses{execution_id} AND aggregate_responses. Routes through
+                // the single response_agent_in_scope helper — the SAME fail-closed
+                // implementation the REST + legacy surfaces use — so an operator
+                // collects only the agents inside their groups, not any execution's rows
+                // by id, and a corrupt rbac.db fails closed identically on every surface
+                // (#1634 UP-1: was raw is_rbac_enabled, fail-open on store corruption).
+                // The MCP handler resolves the principal ONCE (it already authed) and
+                // passes `username` in, so this does NOT re-resolve the session per agent.
                 // CAVEAT (#1634): for a service-scoped token this checks the token
                 // CREATOR's RBAC scope, not the service-tag confinement that
                 // require_scoped_permission's service branch applies — a pre-existing
                 // MCP confinement limitation this does not fully close.
                 [this](const std::string& username, const std::string& agent_id) -> bool {
-                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                        return true;
-                    return rbac_store_->check_scoped_permission(username, "Response", "Read",
-                                                                agent_id, mgmt_group_store_.get());
+                    return response_agent_in_scope(username, agent_id);
                 },
                 // ADR-0016: the typed daily-sync software store + its per-device
                 // Inventory-scope predicate for query_installed_software. SAME
@@ -9677,6 +9928,9 @@ private:
     /// ingest path; declared here among the stores so it destructs AFTER the
     /// ingest services + BEFORE the pool.
     std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
+    /// Born-on-PG persistence for /auto pre-flight runs. Borrows pg_pool_ →
+    /// declared after it so it destructs before the pool; reset in stop().
+    std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -9722,6 +9976,7 @@ private:
     std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
+    std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -9768,6 +10023,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
@@ -9863,6 +10119,7 @@ private:
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
+    std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

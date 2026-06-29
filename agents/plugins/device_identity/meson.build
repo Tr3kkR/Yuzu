@@ -9,6 +9,7 @@ shared_library(
   'device_identity',
   files('src/device_identity_plugin.cpp'),
   name_prefix: '',
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, _WIN32-gated)
   dependencies: device_identity_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

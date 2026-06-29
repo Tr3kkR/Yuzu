@@ -11,10 +11,10 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The six views
+## The seven views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into five deep pages. A shared sub-nav switches between **Overview ·
+links* into six deep pages. A shared sub-nav switches between **Overview · Apps ·
 Catalogue · Health score · Trends · Performance · Network**; the window selector
 (below) applies to the signal views (Performance and Network are now-views — see
 below). The Network view also has its own URL, `/network`, but it is a DEX
@@ -47,6 +47,17 @@ and links, it does not duplicate their detail.
   side-by-side with **most-affected devices**, and a **by-operating-system**
   summary whose *signal scope* ("N of the monitored types") is derived live so a
   narrower-coverage OS is never mistaken for a healthier one.
+
+### Apps
+
+A **fleet-wide Applications list** ranked by reliability signals — crash counts
+and hang counts, keyed on the process image name. Each row links to the existing
+per-application blast-radius drill-down (top subjects, faulting modules,
+most-affected devices). Built on the same `dex_top_apps` aggregation that drives
+the Overview crash cards — no new agent collection. Per-app performance, version
+breakdown, and attribution of repository/install/service signals to the
+originating app are follow-on slices; the Apps tab today scopes to crash and
+hang signals only.
 
 ### Catalogue
 
@@ -180,6 +191,14 @@ numbers match.
   crashes/hangs are a planned enrichment (a separate central crash-store join).
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
+- **Per-observation** — click any row in a device's signal history to load the
+  **event detail panel**: every captured projection field for that one event
+  (subject, reason, symbolic name, component, metric, platform, exact timestamp,
+  event ID). A point lookup bound to the event's own device — a guessed event ID
+  scoped to the wrong device returns an opaque 200 placeholder (byte-identical to
+  "no such event" — 200 so the htmx swap renders it). Each open is audit-logged
+  (`dex.observation.view`, with the obs_type recorded for works-council
+  countability).
 
 > **Per-device history is behavioral data.** A device's signal history reveals
 > which applications a person runs. Access is gated on `GuaranteedState:Read`

@@ -93,6 +93,9 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
     .gp-table th { text-align: left; padding: 0.42rem 0.55rem; border-bottom: 2px solid var(--border);
                    color: var(--muted); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    /* numeric headers must right-align to sit over their right-aligned data — the
+       `.gp-table th` rule above out-specifies a bare `.gp-num`, so qualify it. */
+    .gp-table th.gp-num { text-align: right; }
     .gp-table td { padding: 0.42rem 0.55rem; border-bottom: 1px solid var(--border); }
     .gp-table tr.click { cursor: pointer; }
     .gp-table tr.click:hover td { background: var(--mds-color-state-hover); }

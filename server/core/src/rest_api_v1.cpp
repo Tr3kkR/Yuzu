@@ -961,7 +961,7 @@ void RestApiV1::register_routes(
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    AppPerfProviders app_perf_providers) {
+    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -973,7 +973,8 @@ void RestApiV1::register_routes(
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
-                    std::move(inventory_scope_fn), std::move(app_perf_providers));
+                    std::move(inventory_scope_fn), std::move(response_scope_fn),
+                    std::move(app_perf_providers));
 }
 
 void RestApiV1::register_routes(
@@ -991,7 +992,7 @@ void RestApiV1::register_routes(
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    AppPerfProviders app_perf_providers) {
+    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -3147,11 +3148,13 @@ void RestApiV1::register_routes(
     // two-segment /api/v1/inventory/{agent}/{plugin} regex.
     //
     // CONSISTENCY NOTE: the sibling generic routes share this securable (Inventory:Read)
-    // but are NOT management-group scoped (the #1676 cross-operator gap). This endpoint
-    // is the SCOPED reference shape they should converge to under #1676 — the fix
-    // direction is "scope the generics up to this bar", not "move this endpoint to a
-    // separate prefix". Until #1676 lands, mixed scoping under /inventory is a known,
-    // ticketed gap, not an oversight.
+    // but apply no per-agent filter at all. This endpoint carries the per-agent drop
+    // filter as a FOUNDATION — but per ADR-0017 the filter is INERT under the global
+    // Inventory:Read gate (a confined operator is denied at the gate before it runs; a
+    // global operator's filter is a no-op), so this endpoint is NOT yet a working
+    // scoped reference. The convergence target is the ADR-0017 admit-then-filter list
+    // gate (#1716), not this endpoint as-is. Until then, list-view management-group
+    // confinement under /inventory is not effective — a known, ticketed gap.
     // Agentic-first A1: a fleet software dashboard + a /device drill-down section
     // (planned follow-ons) sit on this same data + scope contract.
     //
@@ -3247,9 +3250,11 @@ void RestApiV1::register_routes(
                  // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
                  // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                  // filter, so a narrow-scope operator may see few of their own rows in one page
-                 // (signalled by result_truncated_by_cap); cross-operator ISOLATION holds
-                 // regardless. Narrow-scope completeness over a wide fleet is the keyset
-                 // follow-up (#1634).
+                 // (signalled by result_truncated_by_cap). NOTE (ADR-0017): the per-agent filter
+                 // here is INERT under the global Inventory:Read gate, so it does not actually
+                 // narrow by management group today — do not read "ISOLATION holds" as effective
+                 // list-view confinement (that is the ADR-0017 gate, #1716). Narrow-scope
+                 // completeness over a wide fleet is the keyset follow-up (#1634).
                  const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
                  // Management-group scope filter (mirrors the MCP tool / query_responses #1550).
@@ -3491,8 +3496,8 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [auth_fn, perm_fn, audit_fn, response_store, instruction_store](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, response_store, instruction_store, response_scope_fn](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Response", "Read"))
                 return;
             auto session = auth_fn(req, res);
@@ -3584,10 +3589,43 @@ void RestApiV1::register_routes(
             static constexpr int kRowCap = 10000;
             q.limit = kRowCap;
             auto responses = response_store->query(execution_id, q);
+            // rows_capped is computed on the RAW (pre-scope-filter) result, so it
+            // still signals "more rows existed past the 10000 cap" independent of
+            // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
+            // filter below is INERT under the current global Response:Read gate (a
+            // global holder admits every agent → nothing dropped); effective scoping
+            // needs the admit-then-filter gate (remaining #1634 work). Its only active
+            // effect today is failing closed on a corrupt rbac.db.
             bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
             if (rows_capped) {
                 spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
                              kRowCap, execution_id, definition_id);
+            }
+
+            // #1634: management-group scope — drop out-of-scope agents' rows BEFORE
+            // the chart transform, mirroring MCP query_responses. The flat
+            // Response:Read gate is not a per-agent ownership check, so without this
+            // an operator could chart ANOTHER operator's execution by id. Filter
+            // per-agent through the injected predicate (production:
+            // check_scoped_permission, the same chokepoint the per-device routes
+            // use), memoised per distinct agent_id, passing the already-resolved
+            // principal. Unwired / RBAC-off → no filter (legacy-open), matching
+            // require_scoped_permission.
+            std::size_t scope_dropped = 0;
+            if (response_scope_fn) {
+                std::unordered_map<std::string, bool> memo;
+                std::vector<StoredResponse> visible;
+                visible.reserve(responses.size());
+                for (auto& r : responses) {
+                    auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                    if (inserted)
+                        m->second = response_scope_fn(session->username, r.agent_id);
+                    if (m->second)
+                        visible.push_back(std::move(r));
+                    else if (inserted) // count each DISTINCT dropped agent once
+                        ++scope_dropped;
+                }
+                responses.swap(visible);
             }
 
             VisualizationEngine engine;
@@ -3618,8 +3656,14 @@ void RestApiV1::register_routes(
                 final_json += "}";
             }
             res.set_content(ok_json(final_json), "application/json");
+            // Record the out-of-scope drop count on the success audit detail (#1634)
+            // so an operator charting outside their groups leaves a trail, without
+            // changing the single-row audit shape this endpoint already emits.
+            std::string audit_detail = definition_id + " index=" + std::to_string(chart_index);
+            if (scope_dropped > 0)
+                audit_detail += " scope_dropped=" + std::to_string(scope_dropped);
             audit_fn(req, "execution.visualization.fetch", "success", "execution", execution_id,
-                     definition_id + " index=" + std::to_string(chart_index));
+                     audit_detail);
         });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────

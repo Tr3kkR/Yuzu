@@ -2,7 +2,7 @@
 
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
-/// 103-signal catalogue (crashes, hangs, service failures, device stability,
+/// 110-signal catalogue (crashes, hangs, service failures, device stability,
 /// boot/resume performance, network/identity/security/update/print signals;
 /// docs/dex-signal-catalog.md).
 /// A capability-limited READ MODEL over the one Guardian event store
@@ -41,6 +41,7 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
+struct GuardianObservationRow;
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
@@ -179,6 +180,22 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
                                        const std::string& agent_id, const std::string& window,
                                        const DexPerfSnapshot* perf_snap = nullptr);
+
+/// Single-observation detail panel — the device-history row click target. Lays
+/// out every captured projection field (subject / code / symbolic / component /
+/// metric / device / platform / exact timestamp / event id) for one event. Pure
+/// + free so it is unit-testable directly against a `GuardianObservationRow`.
+/// (This is the panel Option-D enrichment later extends with `extra{}` fields.)
+std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
+
+/// Applications list — the dedicated app-centric DEX lens (a new top-level
+/// subnav tab). Ranks apps by reliability signals (crashes + hangs) keyed on the
+/// process image, each row drilling to the per-app blast-radius view. `since` is
+/// the ISO cutoff; `window_days` drives the chips + drill links. Pure + free so
+/// it is unit-testable directly against a seeded store. (Per-app performance,
+/// version, and non-crash signal attribution are follow-on slices.)
+std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                     int window_days);
 
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 

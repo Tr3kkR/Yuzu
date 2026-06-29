@@ -35,7 +35,7 @@ namespace {
 YuzuPluginContext* g_ctx = nullptr;
 
 #ifdef _WIN32
-// to_wide now comes from the shared agents/plugins/shared/win_str.hpp (#1681)
+// to_wide now comes from the shared agents/shared/win_str.hpp (#1681)
 // instead of a local copy; behaviour-identical for valid input.
 using yuzu::win::to_wide;
 

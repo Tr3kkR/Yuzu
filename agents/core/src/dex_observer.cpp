@@ -1,5 +1,7 @@
 #include <yuzu/agent/dex_observer.hpp>
 
+#include <yuzu/agent/dex_rate_limiter.hpp> // shared per-obs_type hourly cap (Windows + Linux)
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -109,11 +111,13 @@ EventSystemFields extract_system_fields(const std::string& xml) {
 #include "dex_win_poll.hpp" // IStatePoller (storage.low / battery state poll)
 
 #include <winevt.h>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include <spdlog/spdlog.h>
@@ -130,26 +134,12 @@ using EvtSubHandle = ScopedWinHandle<&evt_close_>;
 namespace yuzu::agent {
 namespace {
 
-std::string wide_to_utf8(const wchar_t* w) {
-    if (!w) return {};
-    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1) return {}; // n counts the NUL; <=1 means empty
-    std::string out(static_cast<std::size_t>(n - 1), '\0');
-    // Pass the full size `n` (content + NUL): out.data()[n-1] is the std::string's
-    // own writable NUL slot. The house pattern everywhere else (process_enum,
-    // hardware_plugin, …) is allocate len-1, pass len — match it.
-    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring utf8_to_wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 1) return {};
-    std::wstring out(static_cast<std::size_t>(n - 1), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), n);
-    return out;
-}
+// wide_to_utf8 / utf8_to_wide now delegate to the shared agents/shared/win_str.hpp
+// helpers (#1681). The removed local copies used the same allocate-(n-1)/pass-n
+// idiom (trailing NUL dropped), matching yuzu::win::from_wide / yuzu::win::to_wide
+// (both total on null/empty -> {}).
+std::string wide_to_utf8(const wchar_t* w) { return yuzu::win::from_wide(w); }
+std::wstring utf8_to_wide(const std::string& s) { return yuzu::win::to_wide(s); }
 
 // Render the event to XML once; the pure helpers split out the <System> facts
 // and <EventData> fields (both tested off Windows against real records).
@@ -279,12 +269,6 @@ public:
     int armed_channels() const override { return armed_; }
 
 private:
-    struct RateBucket {
-        std::int64_t hour_start{0};
-        int count{0};
-        bool warned{false};
-    };
-
     struct State {
         std::mutex mu;
         std::condition_variable cv;
@@ -292,7 +276,11 @@ private:
         bool stopping = false;
         SignalSink sink;                // guarded by mu
         std::function<void()> on_error; // runtime-error handler (UP-1), guarded by mu
-        std::unordered_map<std::string, RateBucket> rate; // per obs_type, guarded by mu
+        // Shared, pure, cross-collector per-obs_type hourly cap. Guarded by mu (the
+        // limiter is single-threaded by contract; mu provides that). Replaces the
+        // old inline RateBucket map and unifies the Windows observer onto the same
+        // limiter the Linux collector uses.
+        DexRateLimiter rate; // guarded by mu
     };
 
     struct CallbackCtx {
@@ -366,29 +354,19 @@ private:
             return; // not a catalogued signal (defensive — the kernel filter should match)
         obs->timestamp_unix = now_unix(); // delivery is near-real-time
 
-        // Per-type rate cap (catalogue max_per_hour, fixed hour buckets). One WARN
-        // per (type, bucket) so a storm floods neither the wire nor the log.
+        // Per-obs_type hourly cap (shared DexRateLimiter — the Windows observer and
+        // the Linux collector both use it). One WARN per (type, hour) so a storm
+        // floods neither the wire nor the log.
+        RateDecision decision = RateDecision::Emit;
         {
-            const SignalSpec* spec = find_signal_spec(sys.channel, sys.provider, sys.event_id);
-            const int cap = spec ? spec->max_per_hour : 60;
-            const std::int64_t hour = obs->timestamp_unix / 3600;
             std::lock_guard lk(st.mu);
-            auto& b = st.rate[obs->obs_type];
-            if (b.hour_start != hour) {
-                b.hour_start = hour;
-                b.count = 0;
-                b.warned = false;
-            }
-            if (++b.count > cap) {
-                if (!b.warned) {
-                    b.warned = true;
-                    spdlog::warn("dex_observer: rate cap hit for {} ({}/h) — dropping until the "
-                                 "next hour bucket",
-                                 obs->obs_type, cap);
-                }
-                return;
-            }
+            decision = st.rate.check(obs->obs_type, obs->timestamp_unix);
         }
+        if (decision == RateDecision::DropAndWarn)
+            spdlog::warn("dex_observer: rate cap hit for {} — dropping until the next hour bucket",
+                         obs->obs_type);
+        if (decision != RateDecision::Emit)
+            return; // over cap this hour — suppressed
 
         spdlog::info("dex_observer: observed {} subject='{}'{}", obs->obs_type, obs->subject,
                      obs->reason.empty() ? std::string{} : " reason=" + obs->reason);

@@ -57,9 +57,9 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
-### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`)
+### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`)
 
-`notify_exec_tracker` skips two server-minted correlation-id prefixes that ride
+`notify_exec_tracker` skips three server-minted correlation-id prefixes that ride
 the `execution_id` column on `responses` (so their rows are retrievable via
 `ResponseStore::query_by_execution`) but are **NOT operator executions** —
 creating a tracker row for them would publish a phantom `agent-transition` SSE
@@ -72,6 +72,12 @@ event and leave an orphan `agent_exec_status` row that the executions drawer /
   agent, so the agent-counted tracker would mark it complete after the first
   step — collate (`received`/`succeeded` vs `expected`) is the bundle's sole
   completion authority, deliberately outside this ladder.
+- **`preflight-`** — minted by `PreflightRoutes` / `PreflightRunner` as
+  `preflight-<run_id>-<check_key>`; the `/auto` pre-flight checks. A run
+  re-dispatches each check under the same per-check id so `query_by_execution`
+  unions the re-dispatches per agent. There is no `ExecutionTracker` row —
+  `PreflightRunStore` is the run's completion authority, deliberately outside
+  this ladder.
 
 Both ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
 and their namespaces are disjoint from real tracker ids (32-hex, no prefix), so a
@@ -116,18 +122,23 @@ scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
 **Management-group scope is applied AFTER the LIMIT, in the handler — not in the
-SQL.** The MCP `query_responses` collect path filters the returned rows per-agent
-through `check_scoped_permission` (cross-operator isolation, #1550) *after* the
-store has already applied `ORDER BY timestamp DESC LIMIT`. So for an execution
-that fans out wider than the row cap and spans both in- and out-of-scope agents,
-the cap can be consumed by out-of-scope rows and the in-scope caller's view is
-truncated (or a row present in one poll vanishes from the next as newer
-out-of-scope rows shift the window). The isolation guarantee holds regardless
-(never another operator's rows); completeness does not. The handler flags this
-with `result_truncated_by_cap:true` so a collector can detect it; the durable fix
-(scope-aware keyset pagination, and pushing the scope predicate into the WHERE
-clause) is the #1634 follow-up. The same applies to every other operator-facing
-reader of this store once #1634 scopes them.
+SQL.** The MCP `query_responses` collect path runs a per-agent
+`check_scoped_permission` filter on the returned rows (#1550), *after* the store
+has applied `ORDER BY timestamp DESC LIMIT`. **NOTE (#1634): this filter is INERT
+under the current global `Response:Read` gate** — a holder of global `Response:Read`
+(the only principal that passes the gate) admits every agent, so no rows are
+dropped, while a management-group-confined operator is 403'd at the gate before the
+filter runs. So it does **not** today provide cross-operator isolation: a normal
+caller sees all agents' rows. Its only active effect is failing **closed** on a
+corrupt/load-failed `rbac.db`. When the #1634 admit-then-filter gate makes scoping
+effective, this after-LIMIT placement means an execution that fans out wider than
+the row cap and spans both in- and out-of-scope agents can have the cap consumed by
+out-of-scope rows, truncating the in-scope caller's view (or a row present in one
+poll vanishes from the next as the window shifts) — at that point the isolation
+holds (never another operator's rows) but completeness does not. The handler flags
+truncation with `result_truncated_by_cap:true`; the durable fix (scope-aware keyset
+pagination + pushing the predicate into the WHERE clause) is part of the #1634
+follow-up. The same applies to every other operator-facing reader of this store.
 
 ## PR 3 — SSE live updates
 

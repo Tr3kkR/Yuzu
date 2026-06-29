@@ -16,7 +16,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,7 +57,9 @@ struct TarHarness {
     std::string scope_device; // empty = unrestricted; else scoped Read denied elsewhere
     std::string os = "linux";
     std::string proc_output = kProcOut;
-    std::string tcp_output; // empty → tree renders without conns (best-effort TCP)
+    std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
+    bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
 
     struct AuditRow {
         std::string action, result, target_id, detail;
@@ -114,7 +118,11 @@ struct TarHarness {
                             const std::string&, const std::string& tid,
                             const std::string& d) -> bool {
             audit_log.push_back({a, r, tid, d});
-            return true; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
+            // #1647: the row is recorded before the throw so find_audit still proves the
+            // site was reached; the throw then exercises the shared helper's catch-arm.
+            if (audit_throws)
+                throw std::runtime_error("audit DB write blew up");
+            return audit_ok; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit);
     }
@@ -307,4 +315,163 @@ TEST_CASE("tar routes: /run is denied for a Read-but-no-Execute operator",
     CHECK(r->body.find("Execute") != std::string::npos);
     // No dispatch audit when the Execute gate stops the reconstruction.
     CHECK(h.find_audit("tar.process_tree.read", "dispatched") == nullptr);
+}
+
+// #1647 catch-arm parity: a THROWING audit_fn at every tar dispatch/read site must be
+// caught by the shared rest_audit.hpp chokepoint — never escape the handler (which
+// httplib would turn into a 500) — and must surface Sec-Audit-Failed while the route
+// keeps its existing dispatch/render posture. Before #1647 these sites discarded the
+// audit bool with no try/catch, so a bad_alloc-class throw escaped and a dropped row
+// was invisible. One section per distinct call site.
+TEST_CASE("tar routes: a throwing audit_fn is caught + flags Sec-Audit-Failed at every site",
+          "[tar][routes][audit]") {
+    SECTION("/run — tar.process_tree.read dispatched") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/process-tree/run?device=dev-A&preset=10m"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Posture preserved: the dispatch still rendered the polling fragment.
+        CHECK(r->body.find("process-tree/result") != std::string::npos);
+        CHECK(h.find_audit("tar.process_tree.read", "dispatched") != nullptr);
+    }
+    SECTION("/result success — tar.process_tree.read success (renders PII tree)") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.run_result());
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Set-and-proceed: the tree still rendered (a detail token was minted).
+        CHECK(is_32_hex(extract_token(r->body)));
+    }
+    SECTION("/result csprng failure — tar.process_tree.read failure") {
+        TarHarness h;
+        h.audit_throws = true;
+        test_hooks::force_next_failure_for_this_thread(); // forces the failure-audit branch
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.run_result());
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("secure token") != std::string::npos); // honest note still rendered
+        CHECK(h.find_audit("tar.process_tree.read", "failure") != nullptr);
+    }
+    SECTION("/detail — tar.process_tree.detail") {
+        TarHarness h;
+        const std::string token = extract_token(h.run_result()->body); // clean reconstruction
+        REQUIRE(is_32_hex(token));
+        h.audit_throws = true; // throw only on the detail open
+        std::unique_ptr<httplib::Response> d;
+        CHECK_NOTHROW(d = h.get_detail(token, 0));
+        REQUIRE(d);
+        CHECK(d->status == 200);
+        CHECK(d->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(d->body.find("tar-detail") != std::string::npos); // detail still rendered
+    }
+    SECTION("/device-net — tar.dns.read + tar.arp.read") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Both verbs were reached before the throw was caught.
+        CHECK(h.find_audit("tar.dns.read", "dispatched") != nullptr);
+        CHECK(h.find_audit("tar.arp.read", "dispatched") != nullptr);
+    }
+    SECTION("/capture-sources/load — tar.sources.read") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/capture-sources/load?device=dev-A"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.find_audit("tar.sources.read", "dispatched") != nullptr);
+    }
+    SECTION("/capture-sources/push — tar.sources.configure") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        // changes=process=on (url-encoded '='); a known source toggled on.
+        CHECK_NOTHROW(
+            r = h.sink.Post("/fragments/tar/capture-sources/push?device=dev-A&changes=process%3Don",
+                            ""));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.find_audit("tar.sources.configure", "dispatched") != nullptr);
+    }
+}
+
+// #1647: a DROPPED (returns-false) audit row is the realistic failure path (audit DB
+// locked/full). Before this PR the tar sites discarded the bool and set NO header; now
+// they surface Sec-Audit-Failed while still rendering (set-and-proceed). Also pins the
+// idempotent-header guard: the two MULTI-CALL surfaces (dns+arp, the configure loop)
+// must emit Sec-Audit-Failed AT MOST ONCE even when several audits in one request fail.
+TEST_CASE("tar routes: dropped audit row flags Sec-Audit-Failed once; clean path sets none",
+          "[tar][routes][audit]") {
+    SECTION("/run dropped row — set-and-proceed (header + still dispatches)") {
+        TarHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/tar/process-tree/run?device=dev-A&preset=10m");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("process-tree/result") != std::string::npos); // dispatch not blocked
+    }
+    SECTION("/device-net both dns+arp drop — header emitted exactly once (multimap guard)") {
+        TarHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1); // not two field-lines
+        CHECK(h.find_audit("tar.dns.read", "dispatched") != nullptr);
+        CHECK(h.find_audit("tar.arp.read", "dispatched") != nullptr);
+    }
+    SECTION("/device-net both dns+arp throw — header still exactly once") {
+        TarHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/tar/process-tree/device-net?device=dev-A"));
+        REQUIRE(r);
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        // BOTH verbs must have fired (the first throw was caught, the second still ran)
+        // — otherwise count==1 would prove single-emission, not de-duplication.
+        CHECK(h.find_audit("tar.dns.read", "dispatched") != nullptr);
+        CHECK(h.find_audit("tar.arp.read", "dispatched") != nullptr);
+    }
+    SECTION("/capture-sources/push two sources both drop — header exactly once over the loop") {
+        TarHarness h;
+        h.audit_ok = false;
+        // Two known sources toggled in one request; the per-source audit loop fails twice.
+        auto r = h.sink.Post(
+            "/fragments/tar/capture-sources/push?device=dev-A&changes=process%3Don,tcp%3Doff", "");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->get_header_value_count("Sec-Audit-Failed") == 1);
+        // BOTH loop iterations must have reached the audit chokepoint — otherwise
+        // count==1 could mean the loop skipped the second source, not de-duplication.
+        int cfg_rows = 0;
+        for (const auto& row : h.audit_log)
+            if (row.action == "tar.sources.configure")
+                ++cfg_rows;
+        CHECK(cfg_rows == 2);
+    }
+    SECTION("clean path sets NO Sec-Audit-Failed header") {
+        TarHarness h; // audit_ok=true, audit_throws=false
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(is_32_hex(extract_token(r->body))); // tree rendered normally
+    }
 }

@@ -42,6 +42,7 @@ yuzu_agent_core_lib = shared_library(
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),
+    include_directories('../shared'),  # win_str.hpp shared wide<->UTF-8 helpers (#1681, _WIN32-gated)
   ],
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, sqlite3_dep, nlohmann_dep] + agent_crypto_deps + agent_platform_deps,
   cpp_args: ['-DYUZU_AGENT_CORE_BUILDING'] + agent_platform_args,

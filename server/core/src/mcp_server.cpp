@@ -217,10 +217,20 @@ static const ToolDef kTools[] = {
      "definition. At least one of execution_id / instruction_id is required. When "
      "both are given, execution_id wins. Returns up to `limit` rows (max 1000); an "
      "empty result can mean the dispatch is still in flight (responses not yet "
-     "landed) — use get_execution_status to confirm a run reached a terminal state.",
+     "landed) — use get_execution_status to confirm a run reached a terminal state. "
+     "A per-agent management-group filter is applied but is INERT under the current "
+     "global Response:Read gate (a normal holder receives rows for all agents; "
+     "effective scoping needs the #1634 gate change); its active effect today is "
+     "failing closed (zero rows) when the RBAC store is corrupt.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j"},
 
-    {"aggregate_responses", "Aggregate response data (COUNT, SUM, AVG) grouped by a column.",
+    {"aggregate_responses",
+     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
+     "filter is applied before aggregation but is INERT under the current global Response:Read gate "
+     "(a normal Response:Read holder aggregates across all agents; effective scoping needs the #1634 "
+     "gate change). Active effect today: fails closed (a JSON-RPC error, never empty totals) when the "
+     "RBAC store is corrupt or the response read errors. A denied-scope audit row is emitted on a "
+     "drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
 
     {"query_inventory",
@@ -242,7 +252,9 @@ static const ToolDef kTools[] = {
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
      "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
      "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
-     "follow-up). Results are scoped to your management groups — out-of-scope devices are omitted.",
+     "follow-up). A per-agent management-group drop filter is applied (devices_omitted reports the "
+     "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
+     "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
      R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
@@ -1343,6 +1355,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // out-of-scope agents may truncate the in-scope view (keyset follow-up
                 // #1634); the isolation guarantee — never another operator's rows —
                 // holds regardless, and result_truncated_by_cap signals the gap.
+                // NOTE (ADR-0017): like the inventory sibling, this responses filter is
+                // INERT under the global Response:Read gate (it does not narrow by
+                // management group today); the list-view correction is tracked #1718 PR-B.
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
                 if (response_scope_fn) {
@@ -1465,9 +1480,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // instruction_id), an empty-filter call here is an unbounded fleet-wide
                 // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
                 // filter — so a narrow-scope operator may see few of their own rows in one
-                // page, signalled by result_truncated_by_cap. Cross-operator ISOLATION
-                // (never another operator's rows) holds regardless; completeness for a
-                // narrow scope over a wide fleet is the keyset follow-up (#1634).
+                // page, signalled by result_truncated_by_cap. NOTE (ADR-0017): the
+                // per-agent filter here is INERT under the global Inventory:Read gate, so
+                // it does not actually narrow by management group today — do not read
+                // "ISOLATION holds" as effective list-view confinement (that is the
+                // ADR-0017 admit-then-filter gate, #1716). Completeness for a narrow scope
+                // over a wide fleet is the keyset follow-up (#1634).
                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
 
                 // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat
@@ -1564,7 +1582,52 @@ McpServer::HandlerFn McpServer::build_handler(
                     aq.op = AggregateOp::Max;
                 else
                     aq.op = AggregateOp::Count;
-                auto results = response_store->aggregate(instr_id, aq);
+
+                // #1634: management-group scope (filter-BEFORE-aggregate). The flat
+                // Response:Read gate above is not a per-agent ownership check, so
+                // without this an operator could aggregate ANOTHER operator's
+                // instruction rows (e.g. count-by-status across agents outside their
+                // groups). A folded aggregate can't be post-filtered — the out-of-
+                // scope rows are already summed in — so we resolve the in-scope agent
+                // set and push it into the aggregate's WHERE clause via the dedicated
+                // `scope` arg. response_scope_fn routes through the single fail-closed
+                // response_agent_in_scope helper, so a corrupt rbac.db drops EVERY agent
+                // here → empty scope → zero rows (UP-1). A distinct_agent_ids() read
+                // ERROR returns nullopt → we fail CLOSED to the empty set, never an
+                // unrestricted read (UP-2). Only when the read succeeds AND no agent is
+                // dropped (operator sees every responding agent / RBAC cleanly disabled)
+                // do we leave scope nullopt — unrestricted, correct totals at any scale
+                // (the residual dropped==0 TOCTOU window is an acknowledged LOW, #1634).
+                AggregateScope agg_scope; // nullopt = unrestricted
+                std::size_t dropped_agents = 0;
+                if (response_scope_fn) {
+                    auto distinct = response_store->distinct_agent_ids(instr_id);
+                    if (!distinct) {
+                        // Store-read error resolving the in-scope set. Surface it as an
+                        // internal error — NOT success+empty: an empty aggregate reads as
+                        // "no responses" to an agentic caller, masking a store outage
+                        // (agentic-first A4 failure-vs-empty; ADR-0016 authoritative-reads;
+                        // #1634 sre review). Audit the degraded access for CC7.2 parity.
+                        mcp_audit("failure", "store degraded; " + instr_id);
+                        res.set_content(
+                            error_response(id, kInternalError,
+                                           "Response store degraded — aggregate failed"),
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct) {
+                        if (response_scope_fn(session->username, aid))
+                            in_scope.push_back(std::move(aid));
+                        else
+                            ++dropped_agents;
+                    }
+                    if (dropped_agents > 0)
+                        agg_scope = std::move(in_scope);
+                }
+
+                auto results = response_store->aggregate(instr_id, aq, {}, agg_scope);
                 JArr arr;
                 for (const auto& r : results) {
                     arr.add(JObj()
@@ -1572,13 +1635,24 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("count", r.count)
                                 .add("aggregate_value", r.aggregate_value));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
-                mcp_audit("success", instr_id);
-                res.set_content(success_response(id, result), "application/json");
+                // A scope-dropped aggregate is a security-relevant event → a distinct
+                // "denied" audit row carrying the DISTINCT dropped-agent count, beside
+                // the served success row (parity with query_responses #1550/#1634).
+                // Fold the denied-row persistence bool into audit_persisted — a dropped
+                // denial-evidence row is the MORE security-relevant gap, not less.
+                bool denied_ok = true;
+                if (dropped_agents > 0)
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group agent(s) for " +
+                                                        instr_id);
+                const bool audit_ok = mcp_audit("success", instr_id) && denied_ok;
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
 

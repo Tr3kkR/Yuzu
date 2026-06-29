@@ -45,6 +45,7 @@
 #pragma comment(lib, "advapi32.lib")
 
 #include "guard_win_handle.hpp"
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <algorithm>
 #include <charconv>
@@ -79,24 +80,15 @@ HKEY parse_hive(const std::string& hive) {
     return nullptr;
 }
 
-std::wstring to_wide(const std::string& s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (len <= 0) return {};
-    std::wstring w(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), len);
-    if (!w.empty() && w.back() == L'\0') w.pop_back(); // drop the NUL the API appends
-    return w;
-}
-
-std::string from_wide(const wchar_t* w, int wlen) {
-    if (!w || wlen <= 0) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w, wlen, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string s(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, wlen, s.data(), len, nullptr, nullptr);
-    return s;
-}
+// to_wide / from_wide now delegate to the shared agents/shared/win_str.hpp
+// helpers (#1681). The removed local copies were behaviour-equivalent here:
+//   - to_wide popped the trailing NUL the -1 convert appends, which is exactly
+//     yuzu::win::to_wide's size-based (NUL-excluded) result;
+//   - from_wide is only ever reached from read_value() AFTER it strips trailing
+//     NUL(s) on REG_SZ/EXPAND_SZ (see below), so yuzu::win::from_wide's
+//     trailing-NUL pop is a no-op on the wlen passed here.
+using yuzu::win::from_wide;
+using yuzu::win::to_wide;
 
 // REG_NOTIFY_CHANGE_LAST_SET catches value writes; _NAME catches add/delete of the
 // value itself. Subtree is FALSE — we watch this key's values only.
