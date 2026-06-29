@@ -6,6 +6,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "ca_store.hpp"
+#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -164,7 +165,8 @@ public:
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             InventoryScopeFn inventory_scope_fn = {},
-                            yuzu::MetricsRegistry* metrics = nullptr);
+                            yuzu::MetricsRegistry* metrics = nullptr,
+                            AppPerfProviders app_perf_providers = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -183,7 +185,8 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          InventoryScopeFn inventory_scope_fn = {},
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         AppPerfProviders app_perf_providers = {});
 };
 
 } // namespace yuzu::server::mcp

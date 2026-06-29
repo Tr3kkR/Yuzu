@@ -7,6 +7,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -254,7 +255,10 @@ public:
         // #1634: per-agent Response-scope predicate for the fan-out response
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
-        ResponseScopeFn response_scope_fn = {});
+        ResponseScopeFn response_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -294,7 +298,10 @@ public:
         // #1634: per-agent Response-scope predicate for the fan-out response
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
-        ResponseScopeFn response_scope_fn = {});
+        ResponseScopeFn response_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 };
 
 } // namespace yuzu::server

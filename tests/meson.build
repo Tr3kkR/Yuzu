@@ -133,6 +133,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
   ),
@@ -191,6 +192,7 @@ tar_test_exe = executable(
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
+    'unit/test_app_perf_rollup_query.cpp',
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
@@ -212,7 +214,8 @@ tar_test_exe = executable(
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
-    include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681)
+    include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681, relocated plugins/shared -> agents/shared)
+    include_directories('../agents/core/src'),        # sync_source_app_perf.hpp — app_perf rollup-query integration test
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
@@ -292,6 +295,8 @@ if build_server
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
+      'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -350,6 +355,10 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_app_perf_daily_store.cpp',
+      'unit/server/test_app_perf_ingestion.cpp',
+      'unit/server/test_app_perf_rollup.cpp',
+      'unit/server/test_app_perf_group_reader.cpp',
       'unit/server/test_pg_array.cpp',
     ),
     include_directories: [
