@@ -184,6 +184,16 @@ Therefore we **coexist, not replace**:
 > §REST and `docs/user-manual/rest-api.md`. Remaining follow-ons: the `/device`
 > drill-down section and the fleet-wide software dashboard.
 
+> **Update (2026-06-28):** the "management-group scoped" qualifier on the read
+> surfaces above (`query_installed_software` and `GET /api/v1/inventory/software`)
+> is **superseded — not yet effective.** Both gate on the *global* `Inventory:Read`
+> permission, under which the per-agent drop filter does not narrow results (a
+> management-group-confined operator is denied at the global gate; a global operator's
+> filter is a no-op). Read these as "global `Inventory:Read`; per-device confinement
+> only" until the admit-then-filter list gate lands. See **ADR-0017** (the decision +
+> gate design), **#1716** (doc-honesty), and **#1713/#1676** (the inventory
+> effective-vs-inert UAT).
+
 ## Consequences
 
 **Positive**
