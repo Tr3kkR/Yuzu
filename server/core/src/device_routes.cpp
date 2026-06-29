@@ -709,18 +709,20 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 command_id2 = cid2;
         }
         // Audit the DISPATCH (post-dispatch "dispatched"/"no_agents"). HIGH-1 (review
-        // #1585): AuditFn is bool-returning — capture it and surface Sec-Audit-Failed so
-        // an audit-store outage is visible to a SIEM instead of silently swallowed (the
-        // dashboard fragment still renders; the REST sibling fails closed). NOTE (#1549):
-        // the REST sibling audits "requested" PRE-dispatch; aligning this dashboard path
-        // to pre-dispatch is a tracked follow-up — until then a result= query for
-        // device.live.* must match BOTH "dispatched" and "requested".
-        if (audit_fn_ &&
-            !audit_fn_(req, lk->audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent", id,
-                       lk->plugin + "/" + lk->action +
-                           (lk->plugin2.empty() ? "" : " + " + lk->plugin2 + "/" + lk->action2) +
-                           " -> " + std::to_string(sent) + " agent(s) command_id=" + command_id))
-            res.set_header("Sec-Audit-Failed", "true");
+        // #1585): AuditFn is bool-returning — surface Sec-Audit-Failed so an audit-store
+        // outage is visible to a SIEM instead of silently swallowed (the dashboard
+        // fragment still renders; the REST sibling fails closed). Routed through the
+        // shared #1647 chokepoint so a THROWING audit_fn is caught here too (catch-arm
+        // parity) rather than escaping the handler. NOTE (#1549): the REST sibling audits
+        // "requested" PRE-dispatch; aligning this dashboard path to pre-dispatch is a
+        // tracked follow-up — until then a result= query for device.live.* must match
+        // BOTH "dispatched" and "requested".
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, lk->audit_action, sent > 0 ? "dispatched" : "no_agents", "Agent",
+            id,
+            lk->plugin + "/" + lk->action +
+                (lk->plugin2.empty() ? "" : " + " + lk->plugin2 + "/" + lk->action2) +
+                " -> " + std::to_string(sent) + " agent(s) command_id=" + command_id);
         if (sent == 0) {
             note(res, "Device offline &mdash; live info needs a connected agent.");
             return;

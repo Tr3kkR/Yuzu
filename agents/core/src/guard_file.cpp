@@ -56,15 +56,8 @@ namespace {
 // healthy path never uses this — it stays fully event-driven (no poll).
 constexpr DWORD kArmFailRetryMs = 30000;
 
-std::wstring to_wide(const std::string& s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (len <= 0) return {};
-    std::wstring w(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), len);
-    if (!w.empty() && w.back() == L'\0') w.pop_back();
-    return w;
-}
+// (A dead, uncalled local to_wide copy was removed here in the #1681 win_str
+// de-dup — guard_file does no wide<->UTF-8 conversion of its own.)
 
 // Case-insensitive wide compare (Windows filenames are case-insensitive). Ordinal
 // (not locale) — a filename match is a byte/codepoint identity check, not a

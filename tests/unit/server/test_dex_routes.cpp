@@ -16,6 +16,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -81,7 +83,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
     CHECK(html.find("unavailable") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quiet ones too",
+TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quiet ones too",
           "[dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
@@ -103,7 +105,7 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
           "Security & protection", "Updates & installs", "Policy & management", "Printing"})
         html += render_dex_catalogue_group_fragment(&store, "", 7, family, all_os);
 
-    // All 107 labels.
+    // All 114 labels.
     for (const char* label :
          {// wave 1
           "App crash", "App hang", "Service crash", "Service start failure",
@@ -142,25 +144,30 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 107 monitored types, quie
           "Certificate enrollment failure", "Update check failure", "Update download failure",
           "Policy extension failure", "MDM/Intune error",
           // A3 sustained perf breaches (Windows state poll, dex_perf_breach)
-          "Sustained high CPU", "Memory pressure", "High disk latency"})
+          "Sustained high CPU", "Memory pressure", "High disk latency",
+          // wave 4 (2026-06-22) — power-management + driver reliability
+          "Modern standby exit", "Adapter driver dump", "Driver load failure",
+          "Battery error",
+          // wave 4 batch 2 — cheap additions on already-armed channels
+          "Service unresponsive", "Service shutdown failure", "Adapter reset"})
         CHECK(html.find(label) != std::string::npos);
 
     // No fabricated numbers: quiet rows carry a literal zero count. (The "All
-    // 107 monitored signal types" headline is asserted on Catalogue View 1 by
+    // 114 monitored signal types" headline is asserted on Catalogue View 1 by
     // the "lists every family + the sub-nav" test below.)
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
 
 TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
-    // windows connected → all 107 catalogue types are monitored (coverage-first).
+    // windows connected → all 114 catalogue types are monitored (coverage-first).
     const auto html =
         render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
     CHECK(html.find("actively monitored") != std::string::npos);
-    CHECK(html.find("of 107 signal types") != std::string::npos);
+    CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
     for (const char* fam : {"App reliability", "Network", "Hardware &amp; storage", "Printing",
                             "Service health", "Identity &amp; logon"})
@@ -298,8 +305,8 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
     CHECK(html.find("Signal families over time") != std::string::npos);  // small-multiples
     CHECK(html.find("Activity heatmap") != std::string::npos);           // heatmap
     CHECK(html.find("App reliability") != std::string::npos);            // a family row
-    // DERIVED-LIVE scope caption — "of 107 signal types", not the mockup's stale 6
-    CHECK(html.find("of 107 signal types") != std::string::npos);
+    // DERIVED-LIVE scope caption — "of 114 signal types", not the mockup's stale 6
+    CHECK(html.find("of 114 signal types") != std::string::npos);
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
@@ -385,6 +392,13 @@ TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=
     seed_signal(store, "e2", "BENIGN-1", "os.uptime_report",
                 R"({"subject":"host","platform":"windows"})", kDayA + "T10:00:00Z");
     CHECK(dex_device_score(&store, "BENIGN-1", "") == 100);
+    // os.modern_standby_exit (wave 4) fires on EVERY resume — it lives in the
+    // benign "Boot, start-up & shutdown" family, so a laptop that sleeps a lot
+    // must NOT have its score dragged down (mirrors os.uptime_report above).
+    seed_signal(store, "e3", "SLEEPER-1", "os.modern_standby_exit",
+                R"({"subject":"modern standby","reason":"32","metric":0,"platform":"windows"})",
+                kDayA + "T10:00:00Z");
+    CHECK(dex_device_score(&store, "SLEEPER-1", "") == 100);
 }
 
 TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
@@ -496,6 +510,159 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
 
+TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "ev-100", "WS-7", "app.staterepo_error",
+                R"({"subject":"app state repository","reason":"sr-100",)"
+                R"("symbolic":"STATEREPO_ERROR","platform":"windows"})",
+                kDayA + "T11:27:41Z");
+
+    // store: indexed point lookup by event_id; unknown / empty id → nullopt
+    auto obs = store.dex_observation("ev-100");
+    REQUIRE(obs.has_value());
+    CHECK(obs->agent_id == "WS-7");
+    CHECK(obs->obs_type == "app.staterepo_error");
+    CHECK(obs->reason == "sr-100");
+    CHECK(obs->symbolic == "STATEREPO_ERROR");
+    CHECK_FALSE(store.dex_observation("nope").has_value());
+    CHECK_FALSE(store.dex_observation("").has_value());
+
+    // render: friendly label + the raw obs_type + every captured field
+    auto html = render_dex_observation_fragment(*obs);
+    CHECK(html.find("App repository error") != std::string::npos);
+    CHECK(html.find("app.staterepo_error") != std::string::npos);
+    CHECK(html.find("sr-100") != std::string::npos);
+    CHECK(html.find("STATEREPO_ERROR") != std::string::npos);
+    CHECK(html.find("WS-7") != std::string::npos);
+}
+
+TEST_CASE("DEX single-observation detail: escapes fields (no XSS)",
+          "[dex][routes][security]") {
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "ev-x", "WS-7", "process.crashed",
+                R"({"subject":"<img src=x>","reason":"0x1",)"
+                R"("symbolic":"<b>evil</b>","platform":"windows"})",
+                kDayA + "T10:00:00Z");
+    auto obs = store.dex_observation("ev-x");
+    REQUIRE(obs.has_value());
+    auto html = render_dex_observation_fragment(*obs);
+    CHECK(html.find("<img src=x>") == std::string::npos);
+    CHECK(html.find("<b>evil</b>") == std::string::npos);
+    CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
+}
+
+TEST_CASE("DEX observation render: metric 0 → em-dash; unknown obs_type → escaped fallback",
+          "[dex][routes]") {
+    GuardianObservationRow r;
+    r.event_id = "ev-z";
+    r.agent_id = "WS-1";
+    r.obs_type = "<weird>future.type"; // uncatalogued + hostile
+    r.subject = "x";
+    r.platform = "windows";
+    r.metric = 0.0; // "no metric" sentinel — the Metric cell shows an em-dash, not "0"
+    const auto html = render_dex_observation_fragment(r);
+    CHECK(html.find("Metric</span><code>&mdash;</code>") != std::string::npos);
+    // unknown obs_type falls back to the escaped raw label (no XSS, no crash)
+    CHECK(html.find("<weird>") == std::string::npos);
+    CHECK(html.find("&lt;weird&gt;future.type") != std::string::npos);
+    // a real metric DOES render (no sci-notation for in-range values)
+    r.metric = 75.0;
+    const auto html2 = render_dex_observation_fragment(r);
+    CHECK(html2.find("Metric</span><code>75</code>") != std::string::npos);
+}
+
+TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymorphic)",
+          "[dex][routes]") {
+    auto render = [](const std::string& obs_type, double metric) {
+        GuardianObservationRow r;
+        r.event_id = "e";
+        r.agent_id = "WS-1";
+        r.platform = "windows";
+        r.obs_type = obs_type;
+        r.metric = metric;
+        return render_dex_observation_fragment(r);
+    };
+    // DRIPS residency is a PERCENT, not a duration — must NOT render as "75 ms".
+    CHECK(render("os.modern_standby_exit", 75.0).find("Metric</span><code>75%</code>") !=
+          std::string::npos);
+    // 0% DRIPS is a REAL reading (never reached deep idle) — it must render "0%",
+    // NOT the "no metric" em-dash (grill #1: the signal's headline value was hidden).
+    CHECK(render("os.modern_standby_exit", 0.0).find("Metric</span><code>0%</code>") !=
+          std::string::npos);
+    CHECK(render("os.modern_standby_exit", 0.0).find("Metric</span><code>&mdash;</code>") ==
+          std::string::npos);
+    // A forged negative DRIPS can't arise (extractor clamps [0,100]) but pins the
+    // new guard's negative arm → em-dash, never a bogus "-1%".
+    CHECK(render("os.modern_standby_exit", -1.0).find("Metric</span><code>&mdash;</code>") !=
+          std::string::npos);
+    // Duration metrics humanize ms → s.
+    CHECK(render("os.boot", 64934.0).find("Metric</span><code>64.9 s</code>") != std::string::npos);
+    // A long boot never flips to scientific notation (the bare-{:g} hazard).
+    const auto big = render("os.boot", 1200000.0);
+    CHECK(big.find("e+0") == std::string::npos);
+    CHECK(big.find("Metric</span><code>1200.0 s</code>") != std::string::npos);
+    // Seconds-valued (uptime) humanizes across all fmt_secs branches (d / h / min / s).
+    CHECK(render("os.uptime_report", 90000.0).find("Metric</span><code>1.0 d</code>") !=
+          std::string::npos);
+    CHECK(render("os.uptime_report", 7200.0).find("Metric</span><code>2.0 h</code>") !=
+          std::string::npos);
+    CHECK(render("os.uptime_report", 300.0).find("Metric</span><code>5.0 min</code>") !=
+          std::string::npos);
+    CHECK(render("os.uptime_report", 30.0).find("Metric</span><code>30 s</code>") !=
+          std::string::npos);
+    // Counts + uncatalogued render as plain integers (no unit, no sci).
+    CHECK(render("hw.battery_error", 2.0).find("Metric</span><code>2</code>") != std::string::npos);
+    // A3 perf-breach family is reachable in this panel (projection stores any obs_type,
+    // history filters none) — render with the RIGHT unit, not a bare number (governance
+    // consistency S1). cpu/memory are %; disk latency is direct ms (NOT fmt_ms's "s").
+    CHECK(render("perf.cpu_sustained", 85.0).find("Metric</span><code>85%</code>") !=
+          std::string::npos);
+    CHECK(render("perf.memory_pressure", 92.0).find("Metric</span><code>92%</code>") !=
+          std::string::npos);
+    CHECK(render("perf.disk_latency_high", 25.0).find("Metric</span><code>25 ms</code>") !=
+          std::string::npos);
+    // NaN / +inf / absurd are rejected defensively → em-dash, never "inf%" / "inf d"
+    // / a 300-digit blob (UP-4/UP-5). The store range-guards on write; this keeps the
+    // formatter robust independent of that.
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(render("os.modern_standby_exit", inf).find("inf") == std::string::npos);
+    CHECK(render("os.modern_standby_exit", inf).find("Metric</span><code>&mdash;</code>") !=
+          std::string::npos);
+    CHECK(render("os.boot", 1e300).find("Metric</span><code>&mdash;</code>") != std::string::npos);
+}
+
+TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
+               kDayA + "T10:00:00Z");
+    auto html = render_dex_device_fragment(&store, "WS-7", "all");
+    // each row hx-gets its single-observation detail into the slot div
+    CHECK(html.find("/fragments/dex/observation?agent_id=WS-7&amp;event_id=ev-1") !=
+          std::string::npos);
+    CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
+}
+
+TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
+    seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
+
+    auto html = render_dex_apps_fragment(&store, "", 7);
+    CHECK(html.find("Applications") != std::string::npos);
+    CHECK(html.find("AcmeCRM.exe") != std::string::npos);
+    CHECK(html.find("chrome.exe") != std::string::npos);
+    // app rows drill to the per-app blast-radius view; the Apps subnav tab is present
+    CHECK(html.find("name=AcmeCRM.exe") != std::string::npos);
+    CHECK(html.find("/fragments/dex/apps") != std::string::npos);
+}
+
+TEST_CASE("DEX apps list: empty store → no-data placeholder", "[dex][routes]") {
+    GuaranteedStateStore store(":memory:");
+    auto html = render_dex_apps_fragment(&store, "", 7);
+    CHECK(html.find("No data") != std::string::npos);
+}
+
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     GuaranteedStateStore store(":memory:");
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
@@ -514,13 +681,14 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         return false;
     };
     auto fleet = []() { return DexFleet{4, 5}; };
-    std::string audited;
+    std::string audited, audited_detail;
     bool audit_ok = true;      // flip to simulate a dropped evidence row (#1549)
     bool audit_throws = false; // flip to simulate a bad_alloc-class throw (#1647)
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string&,
                      const std::string& ttype, const std::string& tid,
-                     const std::string&) -> bool {
+                     const std::string& detail) -> bool {
         audited = a + "|" + ttype + "|" + tid; // capture target_type to pin the PascalCase fix
+        audited_detail = detail;               // capture detail to pin obs_type (works-council)
         if (audit_throws)
             throw std::runtime_error("audit DB write blew up");
         return audit_ok;
@@ -576,6 +744,115 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         CHECK(sig->body.find("Windows only") == std::string::npos);
     }
 
+    // Per-event observation route: the novel security-load-bearing logic (scope
+    // gate before audit, binding-404 against a foreign event_id, audit-on-success
+    // with the obs_type in the detail) must be exercised THROUGH the route, not
+    // just via the store/render fns (gov QE BLOCKING; F1 works-council).
+    SECTION("per-event /observation: permitted opens audit obs_type+event; foreign id is an opaque placeholder") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+
+        // (1) Permitted open of the seeded WS-1 crash (event_id "e1") → 200 + audit;
+        //     the detail carries the obs_type (usage-class countability) + the event id.
+        auto ok = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(audited == "dex.observation.view|Agent|WS-1");
+        CHECK(audited_detail.find("process.crashed") != std::string::npos); // F1 obs_type
+        CHECK(audited_detail.find("e1") != std::string::npos);              // event id traceable
+
+        // (2) Binding case: the event exists but on a DIFFERENT device → the same
+        //     "Observation not found" placeholder as a genuinely-unknown id, with NO
+        //     foreign data leaked. Status is 200 NOT 404 — the dashboard htmx config
+        //     drops 4xx bodies (swap:false), so a 404 would blank the slot; 200 still
+        //     closes the enumeration oracle (foreign == absent, indistinguishable) and
+        //     the not-found branch does NOT audit.
+        audited.clear();
+        auto foreign = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=e1");
+        REQUIRE(foreign);
+        CHECK(foreign->status == 200);
+        CHECK(foreign->body.find("Observation not found") != std::string::npos);
+        CHECK(foreign->body.find("chrome.exe") == std::string::npos); // WS-1's data does not leak
+        auto unknown = sink.Get("/fragments/dex/observation?agent_id=WS-2&event_id=nope");
+        REQUIRE(unknown);
+        CHECK(unknown->status == 200);
+        CHECK(foreign->body == unknown->body); // indistinguishable — oracle closed
+        // Empty event_id (the degenerate guard) also lands on the placeholder, not a 500.
+        auto empty = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=");
+        REQUIRE(empty);
+        CHECK(empty->status == 200);
+        CHECK(empty->body == unknown->body); // complete oracle closure: empty ≡ unknown ≡ foreign
+        CHECK(audited.empty());              // none of the not-found paths audit
+    }
+
+    SECTION("per-event /observation: agent-controlled obs_type/event_id sanitized in the audit detail") {
+        // A compromised/buggy agent could emit an obs_type/event_id with control
+        // chars or an embedded NUL; appended raw to the audit detail that would
+        // truncate the audit row (sqlite3_bind_text -1) or inject into the trail
+        // (UP-3). The event_id is clean here so the URL lookup resolves; the obs_type
+        // carries a control byte that must be STRIPPED before it reaches the detail.
+        seed_signal(store, "ev-ctrl", "WS-1", std::string("bad\x01type", 8),
+                    R"({"subject":"x","platform":"windows"})", kDayA + "T10:00:00Z");
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=ev-ctrl");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(audited == "dex.observation.view|Agent|WS-1");
+        CHECK(audited_detail.find('\x01') == std::string::npos); // control byte stripped
+        CHECK(audited_detail.find("badtype") != std::string::npos); // rest of obs_type intact
+    }
+
+    SECTION("per-event /observation + /apps: perm gate runs before audit/render") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, noPerm, &store, fleet, audit);
+
+        auto obsv = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obsv);
+        CHECK(obsv->status == 403);
+        CHECK(audited.empty()); // perm gate before audit
+
+        auto apps = sink.Get("/fragments/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 403);
+    }
+
+    SECTION("per-event /observation is management-scoped: out-of-scope device → 403 before audit") {
+        seed_crash(store, "e9", "WS-OTHER", "chrome.exe", "ntdll.dll", "windows",
+                   kDayA + "T12:00:00Z");
+        auto scopedPerm = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                             const std::string&, const std::string& id) {
+            if (id == "WS-OTHER") {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm);
+        auto other = sink.Get("/fragments/dex/observation?agent_id=WS-OTHER&event_id=e9");
+        REQUIRE(other);
+        CHECK(other->status == 403);
+        CHECK(audited.empty()); // scoped denial neither audits nor renders
+        auto mine = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(mine);
+        CHECK(mine->status == 200);
+    }
+
+    SECTION("/fragments/dex/apps renders the ranked app table when permitted") {
+        yuzu::server::test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto apps = sink.Get("/fragments/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 200);
+        CHECK(apps->body.find("chrome.exe") != std::string::npos); // the seeded crasher ranks
+    }
+
     SECTION("unauthenticated shell redirects to /login") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
@@ -628,6 +905,14 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 200);
         CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The new per-event observation drill (#1639) now routes through the SAME
+        // emit_behavioral_audit chokepoint — a dropped evidence row flags the header
+        // but the detail panel still renders (HTML set-and-proceed).
+        auto obs = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obs);
+        CHECK(obs->status == 200);
+        CHECK(obs->get_header_value("Sec-Audit-Failed") == "true");
     }
 
     // #1647 item 1: a throwing audit_fn (bad_alloc-class) was previously silent on
@@ -649,6 +934,13 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
         REQUIRE(sig);
         CHECK(sig->status == 200);
         CHECK(sig->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The per-event observation drill (#1639) is caught by the same shared helper:
+        // the throw never escapes the handler, header flagged, fragment still rendered.
+        auto obs = sink.Get("/fragments/dex/observation?agent_id=WS-1&event_id=e1");
+        REQUIRE(obs);
+        CHECK(obs->status == 200);
+        CHECK(obs->get_header_value("Sec-Audit-Failed") == "true");
     }
 
     // Re-review blocker: the per-device DEX surface must be management-scoped (mirror
@@ -840,10 +1132,14 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                      const std::string&) { return true; };
     auto fleet = []() { return DexFleet{1, 1}; };
     std::string audited;
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
+    bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
                      const std::string&, const std::string& tid, const std::string&) -> bool {
         audited = a + "|" + r + "|" + tid;
-        return true;
+        if (audit_throws)
+            throw std::runtime_error("audit DB write blew up");
+        return audit_ok;
     };
 
     // Fake dispatch + response store.
@@ -986,6 +1282,59 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         auto r = sink3.Get("/fragments/dex/device/perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(r->body.find("unavailable") != std::string::npos);
+    }
+
+    // #1647 catch-arm parity: the perf/procperf dispatch audit set Sec-Audit-Failed on a
+    // returns-false but had NO try/catch — a throwing audit_fn escaped the handler.
+    // Routed through the shared rest_audit.hpp chokepoint, a throw is now caught and
+    // flags the header while the set-and-proceed posture (still polls) is unchanged.
+    SECTION("perf: a dropped audit row flags Sec-Audit-Failed, still polls") {
+        audit_ok = false;
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(r->body.find("/fragments/dex/device/perf/result") != std::string::npos);
+    }
+    SECTION("perf: a throwing audit_fn is caught, never escapes the handler") {
+        audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(r->body.find("/fragments/dex/device/perf/result") != std::string::npos);
+    }
+    SECTION("procperf: a throwing audit_fn is caught + flags Sec-Audit-Failed") {
+        audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(seen_sql.find("$ProcPerf_Hourly") != std::string::npos);
+        // The audit verb was actually reached (row recorded before the throw) — not a
+        // header set by some unrelated path.
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("procperf: a dropped audit row flags Sec-Audit-Failed, still polls") {
+        audit_ok = false;
+        auto r = sink.Get("/fragments/dex/device/procperf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(dispatched == 1);
+        CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    SECTION("perf clean path sets NO Sec-Audit-Failed header") {
+        auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty()); // audit_ok=true, no throw
+        CHECK(audited == "dex.device.perf.query|success|WS-1");
     }
 }
 

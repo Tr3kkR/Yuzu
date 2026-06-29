@@ -58,12 +58,18 @@ public:
     /// Per-agent response-scope predicate (#1550 HIGH-1 / #1634). Returns true iff
     /// the principal `username` may read responses for `agent_id`. Production wires
     /// it to rbac_store->check_scoped_permission(username,"Response","Read",agent_id,
-    /// mgmt_store) — the same chokepoint the per-device REST/dashboard routes use —
-    /// so an operator collecting an execution's rows by execution_id sees only the
-    /// agents inside their management groups. The handler resolves the principal
-    /// ONCE (it already authed the request) and passes `username` in, so the
-    /// predicate does NOT re-resolve the session per call. RBAC-off → returns true
-    /// (legacy-open, matching require_scoped_permission).
+    /// mgmt_store) — the same chokepoint the per-device REST/dashboard routes use.
+    /// NOTE (#1634): this filter is INERT under the current global `Response:Read`
+    /// gate — a holder of global Response:Read passes the gate and
+    /// check_scoped_permission's global step then admits every agent (no rows
+    /// dropped), while a management-group-confined operator is 403'd at the gate
+    /// before this runs. So it does NOT yet bound a normal operator to their groups;
+    /// its only active effect today is failing CLOSED on a corrupt/load-failed
+    /// rbac.db. Effective per-operator scoping needs the admit-then-filter gate for
+    /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
+    /// The handler resolves the principal ONCE (it already authed the request) and
+    /// passes `username` in, so the predicate does NOT re-resolve the session per
+    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required

@@ -148,7 +148,7 @@ struct GuardianAgentRuleStatus {
 // guardian_observations read model). DERIVED from guaranteed_state_events: written
 // atomically with the event so it inherits the event_id dedup, reaped in lockstep.
 // Promotes the detail_json UNIFORM facts into queryable columns the DEX
-// aggregations GROUP BY. Column semantics are generic across the 103-signal
+// aggregations GROUP BY. Column semantics are generic across the 110-signal
 // catalogue (docs/dex-signal-catalog.md): subject = the failing entity (app,
 // service, printer, update title, SSID…), reason = failure code, component =
 // secondary entity (faulting module, NIC…), metric = numeric payload (boot ms).
@@ -161,6 +161,7 @@ struct GuardianObservationRow {
     std::string reason;            // e.g. "0xC0000005", "0x80070643", "timeout"
     std::string symbolic;          // e.g. "ACCESS_VIOLATION", "WIFI_DISCONNECT"
     std::string component;         // e.g. "ntdll.dll" (faulting module)
+    std::string version;           // crashed/hung app's file version "a.b.c.d", "" if unknown
     double metric{0.0};            // numeric payload (boot duration ms); 0 = none
     std::string platform;          // "windows" | "linux" | "macos"
 };
@@ -180,6 +181,7 @@ struct DexCrashSummary {
 };
 struct DexAppCrashCount {          // top unreliable apps + blast radius
     std::string subject;           // process name
+    std::string version;           // app file version, "" = unknown/all (version-blind query)
     int64_t crashes{0};
     int64_t hangs{0};
     int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
@@ -314,6 +316,14 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "") const;
     // Spans process.crashed + process.hung (the app-reliability table).
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
+    // Per-DEVICE app reliability, split by VERSION (slice 2b) — the per-(app,
+    // version) crash/hang counts on ONE device, joinable to that device's
+    // procperf (name, version) for the perf+stability-by-version drill. Rows with
+    // an unknown version ("") bucket together. distinct_devices is always 1 here
+    // (single agent) — kept for struct reuse. blast radius lives in dex_top_apps.
+    std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
+                                                      const std::string& since = "",
+                                                      int limit = 50) const;
     std::vector<DexModuleCrashCount> dex_top_modules(const std::string& since = "", int limit = 20) const;
     std::vector<DexDeviceCrashCount> dex_top_devices(const std::string& since = "", int limit = 20) const;
     std::vector<DexOsCrashCount> dex_crashes_by_os(const std::string& since = "") const;
@@ -367,6 +377,11 @@ public:
     std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
                                                            const std::string& since = "",
                                                            int limit = 100) const;
+    // Single projected observation by event_id — the per-event detail drill (the
+    // device-history row click target). std::nullopt if the id is unknown. The
+    // caller binds it to a scoped agent_id before rendering, so a guessed id can
+    // never reveal another device's row.
+    std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
     // Per-device obs_type rollup — the per-device analog of dex_signal_summary
     // (one GROUP BY pass, indexed by agent_id). Drives the per-device DEX score.
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,

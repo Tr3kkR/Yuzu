@@ -1,5 +1,5 @@
 // test_win_str_utils.cpp -- unit coverage for the shared Windows wide<->UTF-8
-// helpers extracted in #1681 (agents/plugins/shared/win_str.hpp).
+// helpers extracted in #1681 (agents/shared/win_str.hpp).
 //
 // Windows-only: the helpers and the cases that exercise them are #ifdef _WIN32.
 // On other platforms this compiles to an empty translation unit, so the file is

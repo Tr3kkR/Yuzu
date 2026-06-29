@@ -1,5 +1,7 @@
 #include <yuzu/agent/dex_signal_catalog.hpp>
 
+#include <yuzu/version_string.hpp> // shared canon_version (perf/crash/server agree)
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -68,6 +70,30 @@ std::uint32_t parse_hex_u32(const std::string& s) {
     }
 }
 
+// Parse a small non-negative count field (battery counts etc.); garbage / empty /
+// negative → 0, so a drifted or forged field is a no-op rather than a throw.
+// Upper-clamped: a forged field near INT_MAX would otherwise overflow (UB) when
+// two parsed counts are summed (cf. x_battery_error's nerr + naband). Real count
+// fields are single digits, so a 1e6 ceiling is loss-free for any genuine value.
+int parse_int(const std::string& s) {
+    if (s.empty()) return 0;
+    try {
+        const int v = std::stoi(s);
+        if (v <= 0) return 0;
+        constexpr int kMaxCount = 1'000'000;
+        return v > kMaxCount ? kMaxCount : v;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// canon_version (WER AppVersion -> the same 4-group quad procperf emits) is now
+// the shared yuzu::util::canon_version in <yuzu/version_string.hpp>, so the
+// agent crash/hang extractor, the agent perf collector, and the SERVER projection
+// boundary all normalize identically. Pulled into a header-only util to close the
+// arity mismatch (UP-2) and let the server re-canon untrusted agent input (UP-4).
+using yuzu::util::canon_version;
+
 double parse_metric_ms(const std::string& s) {
     if (s.empty()) return 0.0;
     try {
@@ -90,6 +116,12 @@ double parse_metric_ms(const std::string& s) {
 // — silently dropping the whole observation (governance cpp-B1). Trim back to a
 // codepoint boundary before appending the ellipsis.
 std::string clip(std::string s, std::size_t max = 160) {
+    // Strip C0 control bytes + DEL first: untrusted event fields (adapter / service
+    // names, error text) must not carry NUL / control chars into the projection or
+    // the dashboard HTML — esc() neutralizes HTML metachars but NOT control bytes
+    // (the "control-char 400" precedent). These are single-line label/code fields,
+    // so no legitimate control char is lost.
+    std::erase_if(s, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
     if (s.size() > max) {
         s.resize(max);
         while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80)
@@ -100,6 +132,12 @@ std::string clip(std::string s, std::size_t max = 160) {
     }
     return s;
 }
+
+// Forward declarations: a few path/error-shaping helpers are defined further down
+// (beside the extractors that first used them); the wave-4 extractors below use
+// them earlier in the file, so declare them here.
+std::string strip_path(const std::string& s);
+std::string hex_reason(const std::string& s);
 
 // ── Extractors — one per signal family. PURE: fields in, observation out. ────
 // Each fills subject/reason/symbolic/component/metric + the human sentence; the
@@ -112,6 +150,12 @@ SignalObservation x_app_crash(const EventFields& f, int) {
     SignalObservation o;
     o.subject = named(f, "AppName");
     o.component = named(f, "ModuleName");
+    // The crashed APP's file version (event-1000 manifested field). WER reports
+    // the fixed quad — canon_version drops any "0.0.0.0" sentinel / odd suffix so
+    // it joins to procperf's (name, version). Deliberately AppVersion, NOT
+    // ModuleVersion: we attribute the crash to the application build, matching the
+    // perf identity. Empty for store/packaged apps (Teams, new Outlook) → "".
+    o.version = canon_version(named(f, "AppVersion"));
     o.kind = "exception";
     const std::uint32_t code = parse_hex_u32(named(f, "ExceptionCode"));
     o.reason = std::format("0x{:08X}", code);
@@ -132,6 +176,7 @@ SignalObservation x_app_hang(const EventFields& f, int) {
     SignalObservation o;
     // 1002 is classic-style: positional Data ([0]=program, [1]=version, [2]=pid hex).
     o.subject = named_or_pos(f, "AppName", 0);
+    o.version = canon_version(named_or_pos(f, "AppVersion", 1)); // [1] = the hung app's version
     o.pid = parse_hex_u32(named_or_pos(f, "ProcessId", 2));
     o.kind = "hang";
     o.symbolic = "NOT_RESPONDING";
@@ -182,15 +227,167 @@ SignalObservation x_bugcheck(const EventFields& f, int) {
 SignalObservation x_power_loss(const EventFields& f, int) {
     SignalObservation o;
     o.subject = "system";
-    const std::string bc = named(f, "BugcheckCode"); // decimal; "0" when pure power loss
+    o.symbolic = "UNEXPECTED_REBOOT";
+    const std::string bc = clip(named(f, "BugcheckCode"), 16); // decimal; "0" when no bugcheck
     if (!bc.empty() && bc != "0") {
         o.reason = "bugcheck " + bc;
         o.sentence = "rebooted without clean shutdown (bugcheck " + bc + ")";
+        return o;
+    }
+    // No bugcheck. Kernel-Power 41 records a non-zero PowerButtonTimestamp (a
+    // FILETIME) when the power button was pressed before the unclean reboot —
+    // i.e. someone held it to force the machine off (the classic hard-hang
+    // recovery), as opposed to a sudden supply loss (timestamp 0). We surface the
+    // distinction as a FACT; we do not infer WHY it hung. LongPowerButtonPressDetected
+    // (when present) marks the firmware-detected 4-second force hold specifically.
+    const std::string pbt = named(f, "PowerButtonTimestamp"); // "0" or a FILETIME
+    const bool button = !pbt.empty() && pbt != "0";
+    if (button) {
+        const bool long_hold = named(f, "LongPowerButtonPressDetected") == "true";
+        o.reason = "power button";
+        o.sentence = long_hold
+                         ? "rebooted without clean shutdown — power button held (forced power-off)"
+                         : "rebooted without clean shutdown — power button pressed (hard hang or "
+                           "manual power-off)";
     } else {
         o.reason = "power loss";
-        o.sentence = "rebooted without clean shutdown (power loss or hard hang)";
+        o.sentence = "rebooted without clean shutdown — sudden power loss";
     }
-    o.symbolic = "UNEXPECTED_REBOOT";
+    return o;
+}
+
+// ── Wave 4 (2026-06-22): power-management + driver reliability ───────────────
+// Real-record-pinned from a live HP ZBook Firefly 14 G8 (Win11 26100); field
+// layouts captured before coding (specimens in the PR notes). We surface FACTS
+// (counts, residency %, status codes, driver/adapter names) and do NOT infer the
+// root cause — DEX observes; the operator diagnoses.
+
+// Kernel-Power 507 — exit from Modern (connected) standby. The event is rich;
+// the DEX-meaningful number is the fraction of the standby spent in the deep
+// low-power (DRIPS) state. 0% means the platform never reached deep idle while
+// "asleep" (something kept it awake). Selecting that field is not inference.
+SignalObservation x_modern_standby_exit(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = "modern standby";
+    o.symbolic = "MODERN_STANDBY_EXIT";
+    o.reason = clip(named(f, "Reason"), 16); // provider's numeric exit-reason code
+    const double dur_us = parse_metric_ms(named(f, "DurationInUs")); // µs (parse_metric_ms = ≥0, finite)
+    const double drips_us = parse_metric_ms(named(f, "DripsResidencyInUs"));
+    double drips_pct = dur_us > 0.0 ? 100.0 * drips_us / dur_us : 0.0;
+    if (drips_pct > 100.0) drips_pct = 100.0; // guard a drifted/forged field pair
+    o.metric = drips_pct;                      // deep-idle residency %, the quality signal
+    o.sentence = std::format(
+        "exited modern standby after {:.0f}s — deep-idle (DRIPS) residency {:.0f}%",
+        dur_us / 1.0e6, drips_pct);
+    return o;
+}
+
+// Netwtw10 (Intel Wi-Fi) 7025 — the driver produced a diagnostic dump after a
+// power-state (D3) transition. CLASSIC source: positional Data[0]=NDIS device,
+// Data[1]=adapter description. Vendor-coupled by nature (the IDs are Intel-
+// driver-specific); the label is generic. Only 7025 is catalogued — 7026 is the
+// paired completion record and co-fires, so cataloguing both would double-count
+// each incident (cf. the 6008/41 exclusion).
+SignalObservation x_adapter_driver_dump(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(pos(f, 1), 120);   // adapter, e.g. "Intel(R) Wi-Fi 6 AX201 160MHz"
+    o.component = clip(pos(f, 0), 120); // NDIS device path, e.g. "\Device\NDMP5"
+    o.reason = "d3-dump";
+    o.symbolic = "ADAPTER_DRIVER_DUMP";
+    o.sentence = "network adapter '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' driver produced a diagnostic dump after a power-state (D3) transition";
+    return o;
+}
+
+// Kernel-PnP 219 — a driver failed to load for a device. Named FailureName (the
+// driver, e.g. "\Driver\WUDFRd"), DriverName (the device instance), Status
+// (decimal NTSTATUS). Distinct from hw.device_start_failed (PnP 411, the device
+// failing to START). The device instance id can encode hardware identity but no
+// user content; we keep the driver as subject and the device basename as
+// component.
+SignalObservation x_driver_load_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(strip_path(named(f, "FailureName")), 80); // driver that failed, e.g. "WUDFRd"
+    // The device instance id ("HID\Vid_8087&Pid_0AC2\…") is hardware identity, no
+    // user content — keep it (clipped), don't strip to a meaningless leaf token.
+    o.component = clip(named(f, "DriverName"), 120);
+    o.reason = clip(hex_reason(named(f, "Status")), 40); // decimal NTSTATUS → 0x… hex (clip the non-numeric passthrough)
+    o.symbolic = "DRIVER_LOAD_FAILED";
+    o.sentence = "driver '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' failed to load" + (o.reason.empty() ? "" : " (" + o.reason + ")");
+    return o;
+}
+
+// Kernel-Power 521 — active battery count changed. Fires on every change, most
+// benign (Error=0/Abandoned=0). Only a non-zero Error/Abandoned count is a DEX
+// signal — a battery the firmware put into an error/abandoned state. A healthy
+// change is SUPPRESSED (not emitted), so this type carries only real battery
+// faults. Complements the state-poll wear signal (hw.error subject=battery,
+// full-charge < 80% of design).
+SignalObservation x_battery_error(const EventFields& f, int) {
+    SignalObservation o;
+    const std::string err = named(f, "ErrorBatteryCount");
+    const std::string aband = named(f, "AbandonedBatteryCount");
+    const int nerr = parse_int(err);
+    const int naband = parse_int(aband);
+    if (nerr <= 0 && naband <= 0) {
+        o.suppress = true; // benign battery-count change — not a signal
+        return o;
+    }
+    o.subject = "battery";
+    o.reason = naband > 0 ? "abandoned" : "error";
+    o.symbolic = "BATTERY_ERROR";
+    o.metric = static_cast<double>(nerr + naband); // how many batteries are faulted
+    o.sentence = std::format("{} batter{} reported in an error/abandoned state",
+                             nerr + naband, (nerr + naband) == 1 ? "y" : "ies");
+    return o;
+}
+
+// SCM 7011 — a service stopped responding to a control request (transaction-
+// response timeout). Distinct from service.hung (7022 = hung on *starting*): this
+// is RUNTIME unresponsiveness. Params are REVERSED like 7009 — param1 = timeout
+// ms, param2 = service — so this needs its own extractor, NOT a fold into
+// service.hung (which reads param1 as the service). Real-record: param2="HPAudioAnalytics".
+SignalObservation x_service_unresponsive(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "param2", 1), 80);
+    const std::string ms = clip(named_or_pos(f, "param1", 0), 16);
+    o.reason = ms.empty() ? "timeout" : "timeout " + ms + " ms";
+    o.symbolic = "SERVICE_UNRESPONSIVE";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' did not respond to a control request in time";
+    return o;
+}
+
+// SCM 7043 — a service did not shut down properly after a pre-shutdown control.
+// Normal SCM layout (param1 = service). Real-record: param1="Windows Biometric Service".
+SignalObservation x_service_shutdown_failed(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named_or_pos(f, "param1", 0), 80);
+    o.symbolic = "SERVICE_SHUTDOWN_FAILED";
+    o.kind = "service";
+    o.sentence = "service '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' did not shut down properly";
+    return o;
+}
+
+// NDIS 10317 — a network miniport reported a fatal/reset event (e.g. failed a
+// power transition). VENDOR-NEUTRAL: NDIS is the generic networking layer, so it
+// fires for ANY NIC — the generic complement to the Intel-specific
+// network.adapter_driver_dump. Named AdapterName + MiniportEventEnum (the
+// provider's numeric event code; no public text map, surfaced verbatim). NOTE:
+// virtual adapters (Wi-Fi Direct, Hyper-V, VPN) also raise 10317 and can be
+// noisier than physical NICs — AdapterName makes that visible and the rate cap
+// bounds volume. Real-record: AdapterName="Microsoft Wi-Fi Direct Virtual Adapter #2".
+SignalObservation x_adapter_reset(const EventFields& f, int) {
+    SignalObservation o;
+    o.subject = clip(named(f, "AdapterName"), 120);
+    const std::string ev = clip(named(f, "MiniportEventEnum"), 16);
+    o.reason = ev.empty() ? "miniport-fatal" : "miniport-event " + ev;
+    o.symbolic = "ADAPTER_RESET";
+    o.sentence = "network adapter '" + (o.subject.empty() ? "<unknown>" : o.subject) +
+                 "' reported a fatal miniport event (NDIS reset / power-transition failure)";
     return o;
 }
 
@@ -1200,7 +1397,7 @@ SignalObservation x_mdm_error(const EventFields& f, int id) {
 }
 
 // ── The catalogue ─────────────────────────────────────────────────────────────
-// 103 obs_types (waves 1–3). Some are backed by dual provider spellings (e.g.
+// 110 obs_types (waves 1–4). Some are backed by dual provider spellings (e.g.
 // BugCheck / Ntfs ship under both classic and manifest names depending on build),
 // so the spec count is higher than the obs_type count. Caps are per-type
 // events/hour — generous for real incident rates,
@@ -1434,6 +1631,34 @@ const std::vector<SignalSpec>& catalog_impl() {
          "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin",
          "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider", {}, 2, 12,
          &x_mdm_error},
+
+        // ── Wave 4 (2026-06-22): power-management + driver reliability ────────
+        // Modern-standby exit quality (DRIPS residency). Fires every resume; cap
+        // generous for a thrashing box (overflow is dropped per the hourly cap).
+        {"os.modern_standby_exit", "System", "Microsoft-Windows-Kernel-Power", {507}, 0, 60,
+         &x_modern_standby_exit},
+        // Intel Wi-Fi driver D3 diagnostic dump (7025 only; 7026 is the paired
+        // completion). A thrashing adapter storms past the cap; the overflow is
+        // dropped with one warn per hour (a count-preserving summary is deferred).
+        {"network.adapter_driver_dump", "System", "Netwtw10", {7025}, 0, 60,
+         &x_adapter_driver_dump},
+        // Driver-load failure (distinct from device-start failure, PnP 411).
+        {"hw.driver_load_failed", "System", "Microsoft-Windows-Kernel-PnP", {219}, 0, 30,
+         &x_driver_load_failed},
+        // Battery error/abandoned (benign count changes self-suppress in the
+        // extractor, so only real faults emit).
+        {"hw.battery_error", "System", "Microsoft-Windows-Kernel-Power", {521}, 0, 12,
+         &x_battery_error},
+        // Service runtime unresponsiveness (7011, params reversed) + unclean
+        // shutdown (7043). System/SCM channel already armed.
+        {"service.unresponsive", "System", "Service Control Manager", {7011}, 0, 30,
+         &x_service_unresponsive},
+        {"service.shutdown_failed", "System", "Service Control Manager", {7043}, 0, 30,
+         &x_service_shutdown_failed},
+        // Vendor-neutral network adapter fatal/reset (NDIS miniport) — the generic
+        // complement to the Intel-specific network.adapter_driver_dump.
+        {"network.adapter_reset", "System", "Microsoft-Windows-NDIS", {10317}, 0, 60,
+         &x_adapter_reset},
     };
     return kCatalog;
 }
@@ -1527,6 +1752,8 @@ std::optional<SignalObservation> extract_signal(const std::string& channel,
     if (spec->max_level > 0 && (level < 1 || level > spec->max_level))
         return std::nullopt;
     SignalObservation o = spec->extract(fields, event_id);
+    if (o.suppress)
+        return std::nullopt; // matched a benign-mostly event that is not a signal here
     o.obs_type = spec->obs_type;
     o.platform = "windows"; // sole collector today; Linux/macOS collectors set theirs
     if (o.sentence.empty())

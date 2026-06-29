@@ -945,7 +945,8 @@ void RestApiV1::register_routes(
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
-    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn) {
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
+    ResponseScopeFn response_scope_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -957,7 +958,7 @@ void RestApiV1::register_routes(
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
-                    std::move(inventory_scope_fn));
+                    std::move(inventory_scope_fn), std::move(response_scope_fn));
 }
 
 void RestApiV1::register_routes(
@@ -974,7 +975,8 @@ void RestApiV1::register_routes(
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
-    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn) {
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
+    ResponseScopeFn response_scope_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -3478,8 +3480,8 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [auth_fn, perm_fn, audit_fn, response_store, instruction_store](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, response_store, instruction_store, response_scope_fn](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Response", "Read"))
                 return;
             auto session = auth_fn(req, res);
@@ -3571,10 +3573,43 @@ void RestApiV1::register_routes(
             static constexpr int kRowCap = 10000;
             q.limit = kRowCap;
             auto responses = response_store->query(execution_id, q);
+            // rows_capped is computed on the RAW (pre-scope-filter) result, so it
+            // still signals "more rows existed past the 10000 cap" independent of
+            // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
+            // filter below is INERT under the current global Response:Read gate (a
+            // global holder admits every agent → nothing dropped); effective scoping
+            // needs the admit-then-filter gate (remaining #1634 work). Its only active
+            // effect today is failing closed on a corrupt rbac.db.
             bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
             if (rows_capped) {
                 spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
                              kRowCap, execution_id, definition_id);
+            }
+
+            // #1634: management-group scope — drop out-of-scope agents' rows BEFORE
+            // the chart transform, mirroring MCP query_responses. The flat
+            // Response:Read gate is not a per-agent ownership check, so without this
+            // an operator could chart ANOTHER operator's execution by id. Filter
+            // per-agent through the injected predicate (production:
+            // check_scoped_permission, the same chokepoint the per-device routes
+            // use), memoised per distinct agent_id, passing the already-resolved
+            // principal. Unwired / RBAC-off → no filter (legacy-open), matching
+            // require_scoped_permission.
+            std::size_t scope_dropped = 0;
+            if (response_scope_fn) {
+                std::unordered_map<std::string, bool> memo;
+                std::vector<StoredResponse> visible;
+                visible.reserve(responses.size());
+                for (auto& r : responses) {
+                    auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                    if (inserted)
+                        m->second = response_scope_fn(session->username, r.agent_id);
+                    if (m->second)
+                        visible.push_back(std::move(r));
+                    else if (inserted) // count each DISTINCT dropped agent once
+                        ++scope_dropped;
+                }
+                responses.swap(visible);
             }
 
             VisualizationEngine engine;
@@ -3605,8 +3640,14 @@ void RestApiV1::register_routes(
                 final_json += "}";
             }
             res.set_content(ok_json(final_json), "application/json");
+            // Record the out-of-scope drop count on the success audit detail (#1634)
+            // so an operator charting outside their groups leaves a trail, without
+            // changing the single-row audit shape this endpoint already emits.
+            std::string audit_detail = definition_id + " index=" + std::to_string(chart_index);
+            if (scope_dropped > 0)
+                audit_detail += " scope_dropped=" + std::to_string(scope_dropped);
             audit_fn(req, "execution.visualization.fetch", "success", "execution", execution_id,
-                     definition_id + " index=" + std::to_string(chart_index));
+                     audit_detail);
         });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────

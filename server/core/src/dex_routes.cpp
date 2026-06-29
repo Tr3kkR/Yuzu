@@ -51,7 +51,7 @@ std::string num(int64_t n) { return std::to_string(n); }
   // dex_routes.hpp) since F1: the Settings → DEX alerts panel renders the
   // routable-type list from the same single source of truth.
 
-// The catalogued signal types (107 today), GROUPED for display — the server-side mirror
+// The catalogued signal types (114 today), GROUPED for display — the server-side mirror
 // of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
 // signal). The All-signals panel renders EVERY entry, fired or not, so
 // operators see what the fleet is monitoring — not just what happened to fire
@@ -70,28 +70,32 @@ const std::vector<DexSignalGroup>& dex_signal_groups() {
          {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
           "boot.degraded_device", "boot.fast_startup_failed", "os.shutdown",
           "shutdown.degraded", "os.restart_initiated", "os.standby", "os.standby_degraded",
-          "os.resume_report", "os.uptime_report"}},
+          "os.modern_standby_exit", "os.resume_report", "os.uptime_report"}},
         {"Service health",
          {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
-          "service.logon_failed", "service.recovery_failed", "service.dependency_failed"}},
+          "service.unresponsive", "service.logon_failed", "service.recovery_failed",
+          "service.shutdown_failed", "service.dependency_failed"}},
         {"System stability",
          {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
           "os.activation_failed", "os.vss_error", "os.shadow_copies_lost",
           "os.crashdump_disabled", "display.driver_reset", "display.dwm_exited",
           "memory.exhausted"}},
         {"Hardware & storage",
-         {"hw.error", "hw.device_start_failed", "hw.user_driver_error", "hw.cpu_throttled",
-          "hw.tpm_error", "disk.error", "disk.smart_failure", "disk.port_reset", "storage.low"}},
+         {"hw.error", "hw.device_start_failed", "hw.driver_load_failed", "hw.user_driver_error",
+          "hw.cpu_throttled", "hw.battery_error", "hw.tpm_error", "disk.error",
+          "disk.smart_failure", "disk.port_reset", "storage.low"}},
         {"Performance",
          {"perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high"}},
         {"File system",
          {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
           "fs.hive_recovered", "fs.autochk_ran"}},
         {"Network",
-         {"network.wifi_drop", "network.wifi_connect_failed", "network.dns_timeout",
-          "network.dns_register_failed", "network.dhcp_failed", "network.vpn_failed",
-          "network.smb_failed", "network.smb_write_lost", "network.ip_conflict",
-          "network.name_conflict", "network.port_exhaustion", "session.rdp_disconnected"}},
+         {"network.wifi_drop", "network.wifi_connect_failed", "network.adapter_driver_dump",
+          "network.adapter_reset", "network.dns_timeout", "network.dns_register_failed",
+          "network.dhcp_failed",
+          "network.vpn_failed", "network.smb_failed", "network.smb_write_lost",
+          "network.ip_conflict", "network.name_conflict", "network.port_exhaustion",
+          "session.rdp_disconnected"}},
         {"Identity & logon",
          {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
           "logon.folder_redirect_failed", "logon.no_dc", "logon.winlogon_terminated",
@@ -280,6 +284,14 @@ std::string dex_signal_label(const std::string& obs_type) {
     if (obs_type == "perf.cpu_sustained") return "Sustained high CPU";
     if (obs_type == "perf.memory_pressure") return "Memory pressure";
     if (obs_type == "perf.disk_latency_high") return "High disk latency";
+    // Wave 4 (2026-06-22) — power-management + driver reliability
+    if (obs_type == "os.modern_standby_exit") return "Modern standby exit";
+    if (obs_type == "network.adapter_driver_dump") return "Adapter driver dump";
+    if (obs_type == "hw.driver_load_failed") return "Driver load failure";
+    if (obs_type == "hw.battery_error") return "Battery error";
+    if (obs_type == "service.unresponsive") return "Service unresponsive";
+    if (obs_type == "service.shutdown_failed") return "Service shutdown failure";
+    if (obs_type == "network.adapter_reset") return "Adapter reset";
     return esc(obs_type); // forward-compatible fallback
 }
 
@@ -391,6 +403,77 @@ std::string fmt_ms(double ms) {
     return std::format("{:.0f} ms", ms);
 }
 
+// Human form for a seconds-valued metric (uptime, unsynced clock).
+std::string fmt_secs(double s) {
+    if (s >= 86400.0)
+        return std::format("{:.1f} d", s / 86400.0);
+    if (s >= 3600.0)
+        return std::format("{:.1f} h", s / 3600.0);
+    if (s >= 60.0)
+        return std::format("{:.1f} min", s / 60.0);
+    return std::format("{:.0f} s", s);
+}
+
+// Sanitize an AGENT-CONTROLLED identifier (obs_type, event_id) before it enters an
+// audit detail: strip C0 control bytes + DEL and cap the length. The audit detail is
+// bound via sqlite3_bind_text(..,-1,..), so an embedded NUL would silently TRUNCATE
+// the audit row, and control chars are log-injection into the audit trail (and a
+// non-UTF-8 byte throws on a later strict-JSON SIEM export — the #1593 class).
+// esc() handles HTML metachars but NOT control bytes, so this is a separate guard.
+std::string clean_audit_id(std::string s, std::size_t max = 96) {
+    std::erase_if(s, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    if (s.size() > max)
+        s.resize(max);
+    return s;
+}
+
+// Human form for the per-event detail "Metric" cell. The metric column is
+// POLYMORPHIC — its unit depends on the obs_type (durations in ms, a residency %,
+// a count) — so a single formatter can't assume ms (that would mis-render a 75%
+// DRIPS residency as "75 ms"). Keep these sets in sync with the agent extractors'
+// `o.metric =` sites (dex_signal_catalog.cpp); a metric-bearing type missing here
+// degrades to a bare, fixed-notation number — never a WRONG unit, and never the
+// scientific-notation a bare {:g} flips to on a >16-min boot.
+std::string dex_metric_display(const std::string& obs_type, double metric) {
+    // Reject NaN / +-inf / negative / absurd up front (defence-in-depth — the
+    // projection store already range-guards on write, but keep the formatter robust
+    // independent of that): all → the "no metric" em-dash. The `!(0<=m<=1e12)` form
+    // is NaN-safe (any comparison with NaN is false → the negation is true → reject)
+    // and +inf-safe (inf<=1e12 is false). 0.0 survives (it's a valid reading).
+    if (!(metric >= 0.0 && metric <= 1.0e12))
+        return {};
+    // DRIPS residency is a percentage where 0% is a REAL reading — the worst case:
+    // the platform never reached deep idle while "asleep" (the exact symptom this
+    // signal was built to surface). It must NOT collapse to the em-dash, so it runs
+    // before the "0 = no data" guard below. (Negatives/NaN already excluded above.)
+    if (obs_type == "os.modern_standby_exit")
+        return std::format("{:.0f}%", metric);
+    if (metric <= 0.0)
+        return {}; // other types: 0 = "no data" → em-dash
+    static constexpr std::string_view kMs[] = {
+        "os.boot",          "os.shutdown",          "os.standby",
+        "os.standby_degraded", "os.resume_report",  "shutdown.degraded",
+        "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
+        "boot.degraded_device"};
+    for (std::string_view t : kMs)
+        if (obs_type == t)
+            return fmt_ms(metric); // milliseconds → "12.3 s"
+    if (obs_type == "os.uptime_report" || obs_type == "os.time_unsynced")
+        return fmt_secs(metric); // seconds → humanized
+    // A3 Performance-breach family (metrics emitted by dex_perf_breach.cpp — a SECOND
+    // metric source besides the agent extractors): cpu/memory are sustained % over the
+    // window, disk latency is an average service time in the tens-of-ms range (so a
+    // direct "ms" suffix, NOT fmt_ms which humanizes thousands-of-ms durations to "s").
+    // These ARE reachable here: the projection stores any obs_type and the device
+    // history filters none, so a perf.* row is clickable into this panel (#1638 owns
+    // the durable carry-unit-in-catalogue fix; this stops the wrong DISPLAY).
+    if (obs_type == "perf.cpu_sustained" || obs_type == "perf.memory_pressure")
+        return std::format("{:.0f}%", metric);
+    if (obs_type == "perf.disk_latency_high")
+        return std::format("{:.0f} ms", metric);
+    return std::format("{:.0f}", metric); // counts + any future type: plain, no sci
+}
+
 // The per-row "What happened" cell of the device history: prefer the symbolic
 // name (+ reason when it adds information); os.boot rows show the duration.
 std::string history_detail(const GuardianObservationRow& r) {
@@ -431,6 +514,7 @@ std::string dex_subnav(const std::string& active, int window_days) {
                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
     };
     return "<div class=\"gp-subnav\">" + tab("overview", "Overview", "/fragments/dex/overview") +
+           tab("apps", "Apps", "/fragments/dex/apps") +
            tab("catalogue", "Catalogue", "/fragments/dex/catalogue") +
            tab("health", "Health score", "/fragments/dex/health") +
            tab("trends", "Trends", "/fragments/dex/trends") +
@@ -2049,13 +2133,84 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     h += "<table class=\"gp-table\"><thead><tr><th>When</th><th>Signal</th><th>Subject</th>"
          "<th>What happened</th><th>Component</th></tr></thead><tbody>";
     for (const auto& r : history) {
-        h += "<tr><td class=\"gp-mute\">" + esc(r.observed_at) + "</td><td>" +
+        // Each row drills to its single-observation detail (hx-get → the
+        // #dex-obs-detail slot). event_id is the projection PK; agent_id rides
+        // along so the route can scope-check before revealing the row.
+        h += "<tr class=\"click\" hx-get=\"/fragments/dex/observation?agent_id=" +
+             url_encode(agent_id) + "&amp;event_id=" + url_encode(r.event_id) +
+             "\" hx-target=\"#dex-obs-detail\" hx-swap=\"innerHTML\">"
+             "<td class=\"gp-mute\">" + esc(r.observed_at) + "</td><td>" +
              dex_signal_label(r.obs_type) + "</td><td>" + esc(r.subject) +
              "</td><td class=\"gp-drift\">" + history_detail(r) + "</td><td>" + esc(r.component) +
              "</td></tr>";
     }
     h += "</tbody></table>";
+    // The per-event detail panel swaps in here when a history row is clicked
+    // (hx-get /fragments/dex/observation). Empty until then.
+    h += "<div id=\"dex-obs-detail\"></div>";
     h += perf_panel;
+    return h;
+}
+
+std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
+    // The per-event detail: every captured projection field for one observation.
+    // Behavioral PII — the route gates + audits each open. No inference, just the
+    // facts we hold (Option-D enrichment later adds the event's own ErrorCode /
+    // operation / app into the same panel).
+    std::string h = "<div class=\"gp-sech\">" + dex_signal_label(r.obs_type) +
+                    " <span class=\"gp-mute\" style=\"font-family:var(--mono);"
+                    "text-transform:none;letter-spacing:0\">" + esc(r.obs_type) + "</span></div>";
+    h += "<div class=\"gp-spec\">";
+    auto row = [&](const char* k, const std::string& v) {
+        h += "<span class=\"k\">" + std::string(k) + "</span><code>" +
+             (v.empty() ? std::string("&mdash;") : esc(v)) + "</code>";
+    };
+    row("When", r.observed_at);
+    row("Subject", r.subject);
+    row("Code", r.reason);
+    row("Symbolic", r.symbolic);
+    row("Component", r.component);
+    row("Metric", dex_metric_display(r.obs_type, r.metric));
+    row("Device", r.agent_id);
+    row("Platform", r.platform);
+    row("Event id", r.event_id);
+    h += "</div>";
+    return h;
+}
+
+std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                     int window_days) {
+    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("apps", window_days);
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
+         "<div class=\"gp-sub\">Stability per application across the fleet &mdash; crashes &amp; "
+         "hangs, keyed on the process image.</div></div></div>";
+    h += dex_window_chips("/fragments/dex/apps", window_days);
+    if (!store)
+        return h + placeholder("Apps unavailable", "The signal store is not open.");
+    const auto apps = store->dex_top_apps(since, 100);
+    if (apps.empty())
+        return h + placeholder("No data", "No app crashes or hangs recorded in this window.");
+    const std::string w = dex_window_token(window_days);
+    h += "<table class=\"gp-table\"><thead><tr><th>Application</th>"
+         "<th class=\"gp-num\">Crashes</th><th class=\"gp-num\">Hangs</th>"
+         "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
+    for (const auto& a : apps) {
+        const std::string label =
+            a.subject.empty()
+                ? std::string("&lt;unknown&gt;")
+                : drill_link("/fragments/dex/app", "name=" + url_encode(a.subject) + "&window=" + w,
+                             esc(a.subject));
+        h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(a.crashes) +
+             "</td><td class=\"gp-num\">" + num(a.hangs) + "</td><td class=\"gp-num\">" +
+             num(a.distinct_devices) + "</td><td class=\"gp-mute\">" + esc(a.last_seen) +
+             "</td></tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">Stability by application (crashes + hangs). Devices = blast radius "
+         "(distinct devices); row &rarr; app detail. Repository / install / other reliability "
+         "signals attribute to an app once per-event app capture lands (Option&nbsp;D); per-app "
+         "performance and version are follow-on slices.</div>";
     return h;
 }
 
@@ -2085,10 +2240,14 @@ std::string dex_procperf_sql() {
                             .count() -
                         86400;
     return std::format(
+        // COUNT(DISTINCT hour_ts), not COUNT(*): the rollup now keys on
+        // (hour, name, version), so one app can have >1 row per hour during an
+        // in-place version change. "Hours seen" must count distinct hourly windows,
+        // not (hour x version) tuples, or it over-counts across a version flip.
         "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
         "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
         "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
-        "MAX(ws_max_bytes) AS ws_max, COUNT(*) AS hours "
+        "MAX(ws_max_bytes) AS ws_max, COUNT(DISTINCT hour_ts) AS hours "
         "FROM $ProcPerf_Hourly WHERE hour_ts >= {} "
         "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25",
         cutoff);
@@ -2435,6 +2594,17 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                         "text/html; charset=utf-8");
     });
 
+    // -- Applications: the app-centric DEX lens (stability by app) --
+    sink.Get("/fragments/dex/apps", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string since = iso_days_ago(window_days);
+        res.set_content(render_dex_apps_fragment(store_, since, window_days),
+                        "text/html; charset=utf-8");
+    });
+
     // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --
     sink.Get("/fragments/dex/catalogue", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
@@ -2561,6 +2731,60 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
                         "text/html; charset=utf-8");
     });
+
+    // -- Per-event detail (single observation; behavioral PII → audit each open).
+    //    ?agent_id=<id>&event_id=<id> — the device-history row click target. --
+    sink.Get("/fragments/dex/observation",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 const std::string event_id =
+                     req.has_param("event_id") ? req.get_param_value("event_id") : "";
+                 // Same per-device scope as /fragments/dex/device: an operator can
+                 // only drill an event on a device inside their scope.
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 // Degenerate empty ids can't identify an event — fall through to the
+                 // same opaque placeholder (defence-in-depth vs a malformed empty-
+                 // agent_id row, which an enrolled agent can't produce). After the perm
+                 // gate, so a denied caller still gets 403, never a 200 placeholder.
+                 std::optional<GuardianObservationRow> obs;
+                 if (store_ && !id.empty() && !event_id.empty())
+                     obs = store_->dex_observation(event_id);
+                 // Bind the event to the SCOPED agent — a guessed or foreign event_id
+                 // reveals nothing (defence in depth over the scope gate). Return 200
+                 // (NOT 404): the dashboard htmx config sets swap:false for 4xx, so a
+                 // 404 body never renders into #dex-obs-detail and the operator's click
+                 // on a stale row leaves the slot empty. 200 + the identical placeholder
+                 // both renders AND keeps the enumeration oracle closed (foreign-id and
+                 // genuinely-absent are indistinguishable). Cf. guardian_routes 200-placeholder.
+                 if (!obs || obs->agent_id != id) {
+                     res.set_content(
+                         placeholder("Observation not found", "No such event on this device."),
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 // Record the obs_type in the detail so usage-class opens (e.g.
+                 // process.crashed/hung — what a person ran) stay SEPARATELY
+                 // COUNTABLE from machine-class opens in the audit log (the
+                 // works-council co-determination requirement; cf.
+                 // dex.device.procperf.query). obs_type is a controlled catalogue
+                 // string, never user input.
+                 // obs_type + event_id are AGENT-controlled — sanitize before the
+                 // audit detail (a compromised agent could embed NUL/control chars;
+                 // see clean_audit_id). Parameterized binding stops SQL injection;
+                 // this stops audit-trail truncation/log-injection.
+                 // Shared #1647 chokepoint (mirrors dex.device.view above): a dropped
+                 // evidence row flags via Sec-Audit-Failed but STILL renders — HTML
+                 // surface set-and-proceed; a throwing audit_fn is caught, not silent.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.observation.view", "success", "Agent", id,
+                     "DEX single-observation detail: " + clean_audit_id(obs->obs_type, 64) +
+                         " (event " + clean_audit_id(obs->event_id) + ")");
+                 res.set_content(render_dex_observation_fragment(*obs),
+                                 "text/html; charset=utf-8");
+             });
 
     // -- F2a: fleet Performance tab (now-view over registry heartbeat state) ---
     //
@@ -2704,13 +2928,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
         const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-        // Capture the audit bool (#1549 governance): surface a dropped evidence row on
-        // this usage-class dispatch via Sec-Audit-Failed; HTML surface still renders.
-        if (audit_fn_ &&
-            !audit_fn_(req, "dex.device.perf.query", sent > 0 ? "success" : "no_agents", "Agent",
-                       id, "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
-                               " agent(s) command_id=" + command_id))
-            res.set_header("Sec-Audit-Failed", "true");
+        // Surface a dropped evidence row on this usage-class dispatch via
+        // Sec-Audit-Failed; HTML surface still renders. Shared #1647 chokepoint so a
+        // throwing audit_fn is caught here too (catch-arm parity), not just returns-false.
+        (void)detail::emit_behavioral_audit(
+            audit_fn_, req, res, "dex.device.perf.query", sent > 0 ? "success" : "no_agents",
+            "Agent", id,
+            "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
+                " agent(s) command_id=" + command_id);
         if (sent == 0) {
             note(res, "Device offline &mdash; the live performance query needs a connected "
                       "agent.");
@@ -2829,15 +3054,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
                  const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
-                 // Capture the audit bool (#1549 governance): the procperf probe is
-                 // usage-class (works-council-relevant); surface a dropped evidence row
-                 // via Sec-Audit-Failed; HTML surface still renders.
-                 if (audit_fn_ &&
-                     !audit_fn_(req, "dex.device.procperf.query",
-                                sent > 0 ? "success" : "no_agents", "Agent", id,
-                                "canned tar.sql $ProcPerf_Hourly (usage-class) -> " +
-                                    std::to_string(sent) + " agent(s) command_id=" + command_id))
-                     res.set_header("Sec-Audit-Failed", "true");
+                 // The procperf probe is usage-class (works-council-relevant); surface a
+                 // dropped evidence row via Sec-Audit-Failed; HTML surface still renders.
+                 // Shared #1647 chokepoint adds catch-arm parity for a throwing audit_fn.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.device.procperf.query",
+                     sent > 0 ? "success" : "no_agents", "Agent", id,
+                     "canned tar.sql $ProcPerf_Hourly (usage-class) -> " + std::to_string(sent) +
+                         " agent(s) command_id=" + command_id);
                  if (sent == 0) {
                      note(res, "Device offline &mdash; the live per-app query needs a connected "
                                "agent.");

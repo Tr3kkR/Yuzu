@@ -12,7 +12,7 @@ shared_library(
   'interaction',
   files('src/interaction_plugin.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../shared'),  # win_str.hpp (#1681)
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681)
   dependencies: interaction_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
