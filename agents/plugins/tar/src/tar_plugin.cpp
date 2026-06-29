@@ -404,9 +404,8 @@ public:
             ctx.register_trigger("tar.perf", "interval", perf_config);
         }
 
-        // Software install/uninstall sampler: hourly default. Installs are rare
-        // and the per-user path mounts NTUSER.DAT hives, so this runs on its own
-        // slower trigger rather than the 60s/300s collectors.
+        // Software install/uninstall sampler: hourly default. Installs are rare,
+        // so this runs on its own slower trigger rather than the 60s/300s collectors.
         // software_interval_seconds = 0 disables registration entirely; the
         // per-source software_enabled config gates collection at run time.
         int software_interval = 3600;
@@ -1646,8 +1645,7 @@ private:
                               "       (user || '@' || COALESCE(domain,'')) AS summary "
                               "  FROM user_live WHERE ts >= {} AND ts <= {} UNION ALL "
                               "SELECT 'software', ts, snapshot_id, action, "
-                              "       (name || ' ' || COALESCE(version,'') || ' [' || scope || ']') "
-                              "       AS summary "
+                              "       (name || ' ' || COALESCE(version,'')) AS summary "
                               "  FROM software_live WHERE ts >= {} AND ts <= {}"
                               ") ORDER BY ts ASC LIMIT {}",
                               from, to, from, to, from, to, from, to, from, to, limit);

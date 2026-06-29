@@ -183,6 +183,30 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     CHECK(daily->rows[0][0] == "3");
 }
 
+TEST_CASE("tar.export $Software summary projection references only existing columns",
+          "[tar][store][software][export]") {
+    // Regression guard (#1620): do_export's `software` UNION branch builds a summary
+    // expression over software_live. After dropping the per-user `scope`/`user`
+    // columns, that projection must reference only columns that still exist — a stale
+    // column (the removed `scope`) failed at runtime with "no such column: scope".
+    // This mirrors do_export's software projection so a future re-introduction of a
+    // dropped column in that SELECT is caught by the unit suite.
+    auto t = make_test_db();
+    SoftwareEvent ev;
+    ev.ts = 1000;
+    ev.snapshot_id = 1;
+    ev.action = "installed";
+    ev.name = "7-Zip";
+    ev.version = "23.01";
+    REQUIRE(t.db.insert_software_events({ev}));
+    auto r = t.db.execute_query(
+        "SELECT 'software', ts, snapshot_id, action, "
+        "(name || ' ' || COALESCE(version,'')) AS summary FROM software_live");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][4] == "7-Zip 23.01");
+}
+
 TEST_CASE("TarDatabase: insert and query network events", "[tar][store][crud]") {
     auto t = make_test_db();
 
