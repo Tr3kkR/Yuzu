@@ -72,6 +72,10 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "device_routes.hpp"
+#include "preflight_eval.hpp"
+#include "preflight_routes.hpp"
+#include "preflight_run_store.hpp"
+#include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
@@ -1021,6 +1025,22 @@ public:
                 spdlog::error("[PG] Refusing to start: offline-endpoint store migration/open "
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // PreflightRunStore — born-on-PG persistence for /auto runs. CONSTRUCTION
+        // is fail-CLOSED per ADR-0012 §1 (a store that cannot migrate/open sets
+        // startup_failed_, same as OfflineEndpointStore above): a reachable
+        // database whose schema can't be created is a deploy error, not a
+        // serve-degraded state. The fail-soft posture is RUNTIME-only (a transient
+        // lease timeout degrades /auto to a note; see preflight_run_store.hpp).
+        if (pg_pool_ && !startup_failed_) {
+            preflight_run_store_ = std::make_unique<PreflightRunStore>(*pg_pool_);
+            if (!preflight_run_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: preflight-run store migration/open failed "
+                              "(database reachable but the preflight_run_store schema could not be "
+                              "created/opened)");
                 startup_failed_ = true;
             }
         }
@@ -2775,6 +2795,14 @@ public:
             policy_eval_thread_.join();
         }
 
+        // Join the pre-flight runner thread (uses preflight_run_store_ +
+        // response_store_ + the dispatch path — stop before teardown), then drop
+        // the runner so its borrowed pointers can't be ticked again.
+        if (preflight_runner_thread_.joinable()) {
+            preflight_runner_thread_.join();
+        }
+        preflight_runner_.reset();
+
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
@@ -2899,6 +2927,9 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
+        // thread that leased it is already joined above).
+        preflight_run_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -8152,6 +8183,44 @@ private:
             }
         });
 
+        // PreflightRunner — /auto re-dispatch-on-reconnect + window lifecycle.
+        // Same dispatch lambda as operator commands; per-check execution_ids union
+        // re-dispatches via query_by_execution. Joined BEFORE the stores in stop().
+        metrics_.describe("yuzu_preflight_tick_errors_total",
+                          "Pre-flight runner tick() exceptions caught (alertable on sustained rate)",
+                          "counter");
+        preflight_runner_ = std::make_unique<PreflightRunner>(PreflightRunner::Deps{
+            .run_store = preflight_run_store_.get(),
+            .response_store = response_store_.get(),
+            .dispatch_fn = command_dispatch_fn,
+            .now_ms_fn = {},
+            .retention_days = 14,
+        });
+        preflight_runner_thread_ = std::thread([this]() {
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (preflight_runner_) {
+                    // tick() touches JSON, PG and gRPC dispatch — any can throw; an
+                    // escaping exception would std::terminate the process, so a bad
+                    // run must not take it down. Catch, log, keep ticking.
+                    try {
+                        preflight_runner_->tick();
+                    } catch (const std::exception& e) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
+                        spdlog::error("preflight_runner: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        metrics_.counter("yuzu_preflight_tick_errors_total").increment();
+                        spdlog::error("preflight_runner: tick threw unknown exception — continuing");
+                    }
+                }
+            }
+        });
+
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,
         // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
@@ -8733,6 +8802,49 @@ private:
                 return out;
             },
             audit_fn);
+
+        // PreflightRoutes — /auto pre-flight page. A config section (per-check
+        // params + thresholds) runs the live checks (app version / os_version /
+        // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
+        // in a chosen management group (optionally narrowed by OS family), applies
+        // the thresholds server-side, and groups the result BY DEVICE (Pass / Failed
+        // / Warn-only / Incomplete). Reuses DeviceRoutes' scoped device provider
+        // (devices_fn) + the SAME untracked dispatch (execution_id="" → not in the
+        // executions drawer, like device live-info / DEX-perf reads) + a narrow
+        // all-agents ResponseStore seam (query by command_id, no agent filter — the
+        // grid only counts the pinned visible∩group devices, so an extra agent
+        // in the result is ignored). Machine-health facts, not behavioural PII →
+        // operational `preflight.run` audit (set-and-proceed).
+        preflight_routes_ = std::make_unique<PreflightRoutes>();
+        preflight_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            [this](const std::string& group_id) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                if (mgmt_group_store_)
+                    for (const auto& m : mgmt_group_store_->get_members(group_id))
+                        out.push_back(m.agent_id);
+                return out;
+            },
+            // 6-param dispatch: execution_id carried so re-dispatched checks union
+            // via query_by_execution (the runner reuses the same per-check ids).
+            command_dispatch_fn,
+            // Collect: per-check query_by_execution + latest_per_agent (LIVE render
+            // of a running run). NOT under any PreflightRunStore lease.
+            [this](const std::string& run_id,
+                   const std::vector<std::pair<std::string, std::string>>& applicable)
+                -> std::vector<preflight::PreflightCheckResponses> {
+                if (!response_store_)
+                    return {};
+                return preflight::collect_check_responses(*response_store_, run_id, applicable);
+            },
+            audit_fn, preflight_run_store_.get());
 
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
@@ -9596,6 +9708,9 @@ private:
     /// ingest path; declared here among the stores so it destructs AFTER the
     /// ingest services + BEFORE the pool.
     std::unique_ptr<OfflineEndpointStore> offline_endpoint_store_;
+    /// Born-on-PG persistence for /auto pre-flight runs. Borrows pg_pool_ →
+    /// declared after it so it destructs before the pool; reset in stop().
+    std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -9641,6 +9756,7 @@ private:
     std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
+    std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
@@ -9687,6 +9803,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
@@ -9772,6 +9889,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)

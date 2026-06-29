@@ -16,8 +16,9 @@ Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Upd
 
 | Store | Schema | Notes |
 |---|---|---|
-| `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). durability-on-top. |
+| `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). Construction fail-closed (ADR-0012 §1); runtime durability-on-top. |
 | `SoftwareInventoryStore` | `software_inventory_store` | Born-on-Pg (ADR-0016). Typed projection for the daily-sync `installed_software` source (normalized rows, no JSONB). authoritative reads; ingest fail-soft (next sync + weekly floor self-heal). **Coexists with the generic `InventoryStore` (Wave 1 below) — it is NOT that store's migration.** |
+| `PreflightRunStore` | `preflight_run_store` | Born-on-Pg (ADR-0006). Persists `/auto` pre-flight run metadata, the frozen target cohort, and the computed per-device check grid (`runs` + `run_device`, FK cascade). Construction fail-closed (ADR-0012 §1: `!is_open()`→`startup_failed_`); runtime durability-on-top (a transient lease error degrades /auto to a note). 14-day retention via best-effort prune in the background runner; owner-scoped reads. |
 
 ## Wave 1 — cross-store-join / durable / high-write
 
