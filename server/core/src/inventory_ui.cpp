@@ -132,8 +132,8 @@ std::string scope_caveat() {
     return "<div class=\"inv-caveat\">Scope (ADR-0017): management-group confinement is "
            "<b>not yet effective</b> under the global <span class=\"inv-mono\">Inventory:Read</span> "
            "gate, so these fleet-wide counts span all groups. A scope filter + access audit run on "
-           "every read but do not narrow results today. (The Devices tab + per-device drill are "
-           "scope-correct.)</div>";
+           "every read but do not narrow results today. (The Devices tab, the per-device drill, and "
+           "Find <b>are</b> scope-correct.)</div>";
 }
 
 std::string page_head() {
