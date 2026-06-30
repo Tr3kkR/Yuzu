@@ -75,7 +75,9 @@
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
+#include "inventory_routes.hpp"
 #include "network_routes.hpp"
+#include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
@@ -374,6 +376,19 @@ public:
                           "Epoch seconds of the last successful B1->B2 roll-up. The sole writer of "
                           "the 180-day B2 trend store; alert when now - this exceeds the roll-up "
                           "cadence (a stuck/failing rollup thread leaves B2 silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_catalog_rollup_total",
+                          "/inventory Software-tab catalogue rollup recompute outcomes, by outcome "
+                          "(success/error). Keep-last-good on error.",
+                          "counter");
+        metrics_.describe("yuzu_inventory_catalog_rollup_duration_seconds",
+                          "Wall-clock of the last catalogue rollup recompute (the full-table "
+                          "GROUP BY, off the request path)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_catalog_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful catalogue rollup refresh; alert when "
+                          "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
+                          "/inventory catalogue silently stale)",
                           "gauge");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
@@ -2055,6 +2070,15 @@ public:
                 agent_service_.set_software_inventory_store(software_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_software_inventory_store(software_inventory_store_.get());
+                // Catalogue rollup background thread — refreshes the precomputed
+                // catalog_rollup/version_rollup the /inventory Software tab reads, so page
+                // reads never run the full-table GROUP BY (the data changes only on the
+                // daily sync). Hourly, matching the app-perf rollup cadence; runs one
+                // refresh on start so the catalogue populates from existing rows at boot.
+                // Borrows the store + pool → MUST be stopped before they tear down (in stop()).
+                software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
+                    *software_inventory_store_, std::chrono::hours{1}, &metrics_);
+                software_catalog_rollup_->start();
             }
         }
 
@@ -3048,6 +3072,9 @@ public:
         // pool resets (no UAF today since the gRPC drain has quiesced every ingest
         // handler, but it matches the offline-store contract and is safe if the store
         // ever gains a pool-touching dtor).
+        // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
+        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
+        software_catalog_rollup_.reset();
         agent_service_.set_software_inventory_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
@@ -9048,6 +9075,126 @@ private:
             },
             audit_fn);
 
+        // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
+        // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
+        // the GLOBAL Inventory:Read (the catalogue/find aggregates are NOT mgmt-group
+        // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
+        // FIND applies the SAME per-row Inventory:Read drop filter the REST sibling does).
+        // Plus a THIN device-CI tab sourced from the persisted, offline-survivable
+        // endpoint_state store (so offline devices still appear) joined to the registry's
+        // online set; the per-device software drill gates on scoped_perm_fn(Inventory,Read,id)
+        // and audits the access (set-and-proceed — machine-scope data). Reuses the shared
+        // auth/perm/scoped-perm/audit closures + the SAME check_scoped_permission predicate
+        // the REST /api/v1/inventory/software route uses (cross-surface parity).
+        auto inv_human_age = [](std::int64_t ms) -> std::string {
+            if (ms < 0)
+                ms = 0;
+            const std::int64_t s = ms / 1000;
+            if (s < 90)
+                return "just now";
+            const std::int64_t m = s / 60;
+            if (m < 90)
+                return std::to_string(m) + "m ago";
+            const std::int64_t h = m / 60;
+            if (h < 48)
+                return std::to_string(h) + "h ago";
+            return std::to_string(h / 24) + "d ago";
+        };
+        auto inv_devices_fn = [this, visible_set_fn,
+                               inv_human_age](const std::string& username)
+            -> std::vector<InventoryDeviceRow> {
+            std::vector<InventoryDeviceRow> out;
+            if (!offline_endpoint_store_)
+                return out;
+            // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
+            // point of the device tab: readable when a device is offline). Aged-out hosts
+            // beyond the window are withheld so the list doesn't accrete dead hosts forever.
+            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            // currently-connected agents (live registry). all_ids() copies only the ids
+            // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
+            // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
+            // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
+            auto online_ids = registry_.all_ids();
+            std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
+            const auto visible = visible_set_fn(username); // nullopt = sees all (global read)
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            for (const auto& e : eps) {
+                if (visible && !visible->count(e.agent_id))
+                    continue; // out of the operator's management scope
+                InventoryDeviceRow r;
+                r.agent_id = e.agent_id;
+                r.hostname = e.hostname;
+                r.os = e.os;
+                r.online = online.count(e.agent_id) > 0;
+                const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
+                r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
+                out.push_back(std::move(r));
+            }
+            return out;
+        };
+        inventory_routes_ = std::make_unique<InventoryRoutes>();
+        inventory_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn,
+            [this](const SoftwareCatalogQuery& q)
+                -> std::optional<std::vector<SoftwareCatalogRow>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->software_catalog(q);
+            },
+            [this]() -> std::optional<CatalogRollupMeta> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->catalog_rollup_meta();
+            },
+            [this](const std::string& name,
+                   int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->software_versions(name, limit);
+            },
+            [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->query_software(q);
+            },
+            [this](const std::string& id) -> std::optional<std::vector<SoftwareEntry>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->get_agent_software(id);
+            },
+            inv_devices_fn,
+            // FIND per-row Inventory:Read management-group scope predicate — the SAME
+            // check_scoped_permission chokepoint the REST route + MCP tool use.
+            // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
+            // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
+            // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
+            // response_agent_in_scope (server.cpp); the REST/MCP siblings still carry the raw
+            // form pending the #1717 global-gate fix, but each new list-read takes the safe
+            // primitive now (ADR-0017 ship-now, decision-independent hardening).
+            [this](const std::string& username, const std::string& agent_id) -> bool {
+                if (!rbac_enforcement_in_effect(rbac_store_.get()))
+                    return true; // loaded & explicitly disabled → legacy-open
+                return rbac_store_ && rbac_store_->check_scoped_permission(
+                                          username, "Inventory", "Read", agent_id,
+                                          mgmt_group_store_.get());
+            },
+            // Freshness KPI: current stale count (nullopt on degrade → "—" in the UI).
+            // SAME 2-missed-cycles window as the metrics sweep.
+            [this]() -> std::optional<std::int64_t> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                constexpr std::int64_t kWin = 2 * 24 * 60 * 60;
+                const std::int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count() -
+                                            kWin;
+                return software_inventory_store_->count_stale_agents(cutoff);
+            },
+            audit_fn);
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
@@ -10088,6 +10235,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
@@ -10162,6 +10310,7 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
