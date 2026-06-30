@@ -178,6 +178,13 @@ public:
     /// `initialize()` spawns; safe to call manually as well.
     std::expected<int, AuthDBError> cleanup_expired_sessions();
 
+    /// Best-effort durable mirror of a session's `last_activity_at` for the
+    /// idle-timeout feature (SOC 2 CC6.3). The in-memory session map is the
+    /// authoritative idle-timeout read path; AuthManager throttles this call to
+    /// at most once per session per `kActivityPersistGranularity`, so it is not
+    /// a per-request SQL write. Parameterised, no `sqlite3_changes()` (#1033).
+    std::expected<void, AuthDBError> touch_session_activity(const std::string& session_token);
+
     /// Reap provisional MFA enrollment rows (init'd but never verified)
     /// older than `older_than`. Clears `mfa_totp_secret` to NULL on any
     /// row whose `mfa_enrolled_at IS NULL` AND `updated_at` is older

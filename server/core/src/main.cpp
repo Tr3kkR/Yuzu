@@ -301,6 +301,16 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
+    // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
+    app.add_option("--session-inactivity-secs", cfg.session_inactivity_secs,
+                   "Seconds of inactivity after which an operator dashboard session is invalidated "
+                   "server-side — a sliding window UNDER the absolute 8h session lifetime "
+                   "(default: 0 = disabled; recommended 900 = 15 min). Only affects cookie "
+                   "sessions; OIDC re-login and API tokens are unaffected.")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber) // 0 disables; negative is rejected
+        ->envname("YUZU_SESSION_INACTIVITY_SECS");
+
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
@@ -516,6 +526,23 @@ int main(int argc, char* argv[]) {
         spdlog::warn("Account lockout DISABLED (--auth-lockout-threshold=0) — local-password "
                      "logins have no brute-force throttle.");
     }
+    // Idle (inactivity) session-timeout posture (SOC 2 CC6.3 evidence). Unlike
+    // lockout this is an in-memory control (no auth.db dependency), so it is
+    // honestly "active" whenever configured. The absolute 8h session lifetime
+    // applies regardless.
+    if (cfg.session_inactivity_secs > 0) {
+        spdlog::info("Idle session timeout active: operator dashboard sessions are invalidated "
+                     "after {}s of inactivity (under the absolute 8h lifetime).",
+                     cfg.session_inactivity_secs);
+        if (cfg.session_inactivity_secs >= 28800) {
+            spdlog::warn("--session-inactivity-secs={} >= the absolute 8h session lifetime "
+                         "(28800s); the idle window will never trigger before absolute expiry.",
+                         cfg.session_inactivity_secs);
+        }
+    } else {
+        spdlog::info("Idle session timeout DISABLED (--session-inactivity-secs=0) — only the "
+                     "absolute 8h session lifetime applies.");
+    }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
     // window_secs <= 0 as an "escape hatch" that lets every request
     // through without re-prompting. The helper itself doesn't log on
@@ -687,6 +714,9 @@ int main(int argc, char* argv[]) {
         config_file.empty() ? auth::default_config_path() : std::filesystem::path(config_file);
 
     auth::AuthManager auth_mgr;
+    // Idle (inactivity) session timeout — SOC 2 CC6.3. In-memory feature, set
+    // unconditionally (works with or without auth.db). 0 = disabled.
+    auth_mgr.set_session_inactivity(std::chrono::seconds(cfg.session_inactivity_secs));
 
     if (!auth_mgr.load_config(cfg_path)) {
         spdlog::warn("No user config found at {}", cfg_path.string());

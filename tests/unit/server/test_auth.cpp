@@ -6,6 +6,7 @@
  */
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -207,6 +208,78 @@ TEST_CASE("invalidate_session destroys session", "[auth][session]") {
 
     mgr->invalidate_session(*token);
     REQUIRE_FALSE(mgr->validate_session(*token).has_value());
+}
+
+// ── Idle (inactivity) session timeout — SOC 2 CC6.3 ──────────────────────────
+// The window is a real steady_clock interval, so these use a short (1-2s)
+// window + sleeps and are tagged [slow] (excludable with ~[slow]), matching the
+// account-lockout expiry test.
+
+TEST_CASE("idle timeout disabled by default: a session survives inactivity",
+          "[auth][session][idle][slow]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    auto token = mgr->authenticate("alice", "secret123456");
+    REQUIRE(token.has_value());
+    // session_inactivity_ defaults to 0 (disabled) — a pause does not
+    // invalidate the session (only the absolute 8h lifetime applies).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    CHECK(mgr->validate_session(*token).has_value());
+}
+
+TEST_CASE("idle timeout invalidates and evicts an inactive session",
+          "[auth][session][idle][slow]") {
+    auto mgr = make_temp_auth();
+    mgr->set_session_inactivity(std::chrono::seconds(1));
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    auto token = mgr->authenticate("alice", "secret123456");
+    REQUIRE(token.has_value());
+    CHECK(mgr->validate_session(*token).has_value()); // active immediately
+
+    // Idle past the 1s window (1.6s for calendar-second margin / runner I/O).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    CHECK_FALSE(mgr->validate_session(*token).has_value());
+    // Evicted, not merely rejected — a replayed cookie cannot be re-touched
+    // back to life; a second check is still nullopt.
+    CHECK_FALSE(mgr->validate_session(*token).has_value());
+}
+
+TEST_CASE("idle timeout slides forward on activity (active session stays alive)",
+          "[auth][session][idle][slow]") {
+    auto mgr = make_temp_auth();
+    mgr->set_session_inactivity(std::chrono::seconds(2));
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    auto token = mgr->authenticate("alice", "secret123456");
+    REQUIRE(token.has_value());
+
+    // Validate every 0.7s for ~3.5s total. Each touch is within the 2s window,
+    // so the session lives well past the original 2s-from-creation mark — the
+    // window slides on every authenticated request.
+    for (int i = 0; i < 5; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        REQUIRE(mgr->validate_session(*token).has_value());
+    }
+    // Stop touching it; after > 2s idle it expires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2400));
+    CHECK_FALSE(mgr->validate_session(*token).has_value());
+}
+
+TEST_CASE("AuthDB::touch_session_activity is a best-effort mirror", "[auth][session][authdb]") {
+    auto dir = yuzu::test::unique_temp_path("yuzu-touch-");
+    fs::create_directories(dir);
+    yuzu::server::AuthDB db(dir, /*cleanup_interval_secs=*/0); // no reaper thread
+    REQUIRE(db.initialize().has_value());
+
+    auto token = db.create_session("alice", Role::admin);
+    REQUIRE(token.has_value());
+    // Touching an existing row succeeds.
+    CHECK(db.touch_session_activity(*token).has_value());
+    // Best-effort: a no-match UPDATE is still success (the in-memory map is the
+    // authoritative idle path; this durable mirror is fire-and-forget).
+    CHECK(db.touch_session_activity("deadbeefdeadbeef").has_value());
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 TEST_CASE("invalidate_user_sessions wipes every session for a user (multi-token)",

@@ -1813,6 +1813,32 @@ AuthDB::mfa_mark_session_stepup(const std::string& session_token) {
     return {};
 }
 
+std::expected<void, AuthDBError>
+AuthDB::touch_session_activity(const std::string& session_token) {
+    // Best-effort durable mirror of the in-memory session's last_activity_at
+    // for the idle-timeout feature (SOC 2 CC6.3). The in-memory sessions_ map
+    // is the authoritative idle-timeout read path; this column keeps the (v1
+    // dead-write) sessions row fresh for housekeeping + the future v2
+    // session-persistence work. AuthManager throttles the call to at most once
+    // per session per kActivityPersistGranularity, so this is NOT a per-request
+    // write. Same shape as mfa_mark_session_stepup: no sqlite3_changes() (#1033)
+    // — match-vs-not doesn't matter for a best-effort persist.
+    static const char* sql = R"(
+        UPDATE sessions SET last_activity_at = CURRENT_TIMESTAMP WHERE session_token = ?
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, session_token.c_str(), -1, SQLITE_STATIC);
+    auto rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return {};
+}
+
 // ── Enrollment Token Operations (C2 FIX: Atomic Consumption) ─────────────────
 
 std::expected<std::string, AuthDBError>

@@ -451,6 +451,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     s.role = it->second.role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token] = std::move(s);
 
     spdlog::info("User '{}' authenticated (role={})", username, role_to_string(it->second.role));
@@ -527,6 +529,8 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     if (mfa_verified) {
         s.mfa_verified_at = std::chrono::steady_clock::now();
     }
@@ -567,6 +571,8 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     if (token.size() > auth::kMaxSessionTokenLength)
         return std::nullopt;
 
+    const bool idle_enabled = session_inactivity_ > std::chrono::seconds(0);
+
     std::shared_lock lock(mu_);
 
     auto it = sessions_.find(token);
@@ -574,17 +580,79 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
         return std::nullopt;
 
     auto now = std::chrono::steady_clock::now();
-    if (now > it->second.expires_at)
+    if (now > it->second.expires_at) // absolute lifetime — always enforced
         return std::nullopt;
 
-    // Opportunistic reap: if sessions exceed threshold, upgrade lock and sweep (G2-SEC-A1-004).
-    // Copy the session BEFORE any lock manipulation to avoid dangling iterator after erase_if.
+    // Idle (inactivity) timeout (SOC 2 CC6.3): a sliding window UNDER the
+    // absolute expiry. Decided here, BEFORE the touch below, so an active
+    // session is kept alive while one idle past the window is rejected.
+    const bool idle_expired =
+        idle_enabled && (now - it->second.last_activity_at > session_inactivity_);
+
+    // Copy the session BEFORE any lock manipulation to avoid a dangling
+    // iterator after the erase/reap below.
     auto session_copy = it->second;
-    if (sessions_.size() > 100) {
+
+    // A write lock is needed to (a) evict an idle session, (b) touch
+    // last_activity on an active one, or (c) run the opportunistic
+    // expired-session reap when the map is large. None of these apply on the
+    // common idle-disabled small-map read, which stays a pure shared lock.
+    const bool need_write = idle_expired || idle_enabled || sessions_.size() > 100;
+    bool persist = false;
+    if (need_write) {
         lock.unlock();
         std::unique_lock wlock(mu_);
-        auto reap_now = std::chrono::steady_clock::now();
-        std::erase_if(sessions_, [&](const auto& p) { return reap_now > p.second.expires_at; });
+        auto wnow = std::chrono::steady_clock::now();
+
+        // Opportunistic reap (G2-SEC-A1-004), extended to drop idle sessions
+        // when the feature is on. Bounded to the large-map case so it stays
+        // off the hot path for typical operator-scale session counts.
+        if (sessions_.size() > 100) {
+            std::erase_if(sessions_, [&](const auto& p) {
+                if (wnow > p.second.expires_at)
+                    return true;
+                return idle_enabled && (wnow - p.second.last_activity_at > session_inactivity_);
+            });
+        }
+
+        if (idle_expired) {
+            // Evict THIS session, but only if it is STILL idle under the write
+            // lock — a concurrent request may have refreshed it at the boundary
+            // (don't kill a now-active session). Either way this request, which
+            // observed it idle, is rejected.
+            if (auto wit = sessions_.find(token);
+                wit != sessions_.end() &&
+                std::chrono::steady_clock::now() - wit->second.last_activity_at >
+                    session_inactivity_) {
+                sessions_.erase(wit);
+            }
+            return std::nullopt;
+        }
+
+        if (idle_enabled) {
+            // Touch: slide the window forward. Throttle the durable AuthDB
+            // mirror to at most one write per kActivityPersistGranularity so
+            // the per-request touch is not a per-request SQL write.
+            if (auto wit = sessions_.find(token); wit != sessions_.end()) {
+                wit->second.last_activity_at = wnow;
+                session_copy.last_activity_at = wnow;
+                if (auth_db_ && wnow - wit->second.last_activity_persisted_at >=
+                                    kActivityPersistGranularity) {
+                    wit->second.last_activity_persisted_at = wnow;
+                    persist = true;
+                }
+            } else {
+                // Raced an evict/invalidate between the two locks → reject.
+                return std::nullopt;
+            }
+        }
+        wlock.unlock();
+
+        // Snapshot-and-release: the AuthDB mirror write happens OUTSIDE mu_
+        // (AuthDB invariant — never call a sibling subsystem under the lock).
+        // Best-effort: touch_session_activity is fail-silent.
+        if (persist && auth_db_)
+            auth_db_->touch_session_activity(token);
     }
 
     return session_copy;
@@ -799,6 +867,8 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
     s.oidc_sub = oidc_sub;
+    s.last_activity_at = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 

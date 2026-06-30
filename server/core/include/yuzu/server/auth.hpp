@@ -49,6 +49,19 @@ struct Session {
     /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
     /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
     std::chrono::steady_clock::time_point mfa_verified_at{};
+
+    /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
+    /// bumped to `steady_clock::now()` on every authenticated request when the
+    /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`);
+    /// `validate_session` rejects the session once `now - last_activity_at`
+    /// exceeds the window — a sliding window UNDER the absolute `expires_at`.
+    /// steady_clock (monotonic) so an NTP step can neither extend nor collapse
+    /// it. `last_activity_persisted_at` throttles the best-effort AuthDB mirror
+    /// (`touch_session_activity`) to at most one write per session per
+    /// kActivityPersistGranularity, keeping the hot path off a per-request SQL
+    /// write. Both default to the session's creation time.
+    std::chrono::steady_clock::time_point last_activity_at{};
+    std::chrono::steady_clock::time_point last_activity_persisted_at{};
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
@@ -151,6 +164,12 @@ class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
     static constexpr int kPbkdf2Iterations = 100'000;
+    /// Minimum spacing between best-effort AuthDB `last_activity_at` mirror
+    /// writes for one session, so the per-request idle-timeout touch does not
+    /// become a per-request SQL write. The in-memory `Session::last_activity_at`
+    /// is always fresh; only the durable mirror is throttled. 60 s matches the
+    /// AuthDB cleanup-thread cadence.
+    static constexpr auto kActivityPersistGranularity = std::chrono::seconds(60);
 
     /// Load users from config file. Returns false if file missing/corrupt.
     bool load_config(const std::filesystem::path& cfg_path);
@@ -242,6 +261,13 @@ public:
     /// If set, user operations go through the DB instead of config file.
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
+    /// `validate_session` rejects a cookie session idle longer than `window` and
+    /// bumps `last_activity_at` on each authenticated touch. 0 (default)
+    /// disables the feature — only the absolute `kSessionDuration` applies.
+    /// Wired from Config::session_inactivity_secs at startup.
+    void set_session_inactivity(std::chrono::seconds window) { session_inactivity_ = window; }
 
     /// Non-owning AuthDB pointer (or nullptr if not configured). Exposed
     /// for the MFA-aware login flow at AuthRoutes::POST /login, which
@@ -442,6 +468,11 @@ private:
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
+    /// Read on the validate_session hot path; set once at startup before any
+    /// request is served, so a plain member (no extra lock) is sufficient.
+    std::chrono::seconds session_inactivity_{0};
 
     // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
     yuzu::MetricsRegistry* metrics_ = nullptr;
