@@ -185,6 +185,14 @@ curl -s -b cookies.txt -X POST http://localhost:8080/logout
 
 Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side and the `yuzu_session` cookie is cleared via `Set-Cookie` with `Max-Age=0`.
 
+### Session lifetime
+
+Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to `/login`. Sessions are also invalidated server-side on logout, on session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), and on server restart.
+
+An optional **idle (inactivity) timeout** can shorten this. When `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`) is set to a positive value, a session idle longer than that window is invalidated server-side and the operator is prompted to log in again — regardless of the 8-hour absolute limit. The default `0` disables it (only the absolute lifetime applies). The window is **sliding**: any authenticated request resets it. Scope is **cookie sessions only** — API tokens and MCP tokens are never idle-timed-out, and OIDC users simply re-authenticate via SSO. A recommended hardened value is `900` (15 minutes).
+
+See [Server Administration — CLI flags](server-admin.md) for configuration and `docs/auth-architecture.md` "Inactivity session timeout" for design detail.
+
 ### Auth Middleware Behavior
 
 | Client type | Unauthenticated behavior |

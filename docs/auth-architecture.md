@@ -96,6 +96,53 @@ scope here.
 - **Metrics** — `yuzu_auth_lockout_applied_total`,
   `yuzu_auth_lockout_blocked_total`.
 
+## Inactivity (idle) session timeout (SOC 2 CC6.3)
+
+`/auth-and-authz` skill gap matrix P1 #8. A **sliding** idle window that
+invalidates an operator dashboard cookie session after a period of inactivity,
+*under* the absolute 8-hour session lifetime (`kSessionDuration`). Wires the
+previously-reserved `sessions.last_activity_at` column end-to-end.
+
+- **Config** — `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`),
+  `Config::session_inactivity_secs`. **Default 0 = disabled** (opt-in): the
+  absolute lifetime already exists and an idle-logout that drops a legitimate
+  user mid-coffee-break is a behaviour change, so it is off unless an operator
+  turns it on (recommended `900` = 15 min). Boot posture is logged for CC6.3
+  evidence. Enabling it satisfies the CC6.3 inactivity-timeout control.
+- **In-memory is authoritative.** Sessions are validated from the in-memory
+  `AuthManager::sessions_` map (the `auth.db` `sessions` rows are v1
+  dead-writes), so the idle state lives on the in-memory `Session`:
+  `last_activity_at` (a monotonic `steady_clock` stamp — an NTP step can neither
+  extend nor collapse the window). `AuthManager::session_inactivity_` holds the
+  configured window (set once at startup via `set_session_inactivity`).
+- **Enforcement is in `validate_session`** (the same place the absolute
+  `expires_at` is checked, and which already conditionally upgrades its shared
+  lock for the opportunistic reap). When the feature is on: a session idle
+  longer than the window is **rejected and evicted** (the reap re-reads
+  `last_activity_at` under the write lock so a concurrent touch at the boundary
+  doesn't kill a now-active session); an active one has `last_activity_at`
+  **slid forward** (the window slides). **The touch is throttled** — the window
+  is advanced (which needs the exclusive lock) at most once per
+  `touch_granularity` (a quarter of the idle window, capped at 30 s), so a burst
+  of requests for an active session stays on the **shared** lock rather than
+  serialising on `mu_`; `last_activity_at` therefore lags real activity by at
+  most the granularity (far inside any minutes-scale window, so an active session
+  is never wrongly evicted — idle-out fires within `[window − granularity,
+  window]`). The idle-*disabled* small-map read stays a pure shared-lock path (no
+  behaviour change for deployments that leave it off).
+- **Scope: cookie sessions only.** API tokens and MCP tokens resolve through
+  `synthesize_token_session` (their own store), never `validate_session`, so a
+  long-lived automation token is **never** idle-timed-out. OIDC sessions are
+  subject to the same idle window but the user simply re-authenticates via SSO.
+- **Durable mirror is best-effort + throttled.** On a touch, the in-memory stamp
+  is authoritative; the `auth.db` column is updated via
+  `AuthDB::touch_session_activity` (mirrors `mfa_mark_session_stepup`) at most
+  once per session per `kActivityPersistGranularity` (60 s), off the `mu_` lock
+  (snapshot-and-release), so the per-request touch is **not** a per-request SQL
+  write. Idle expiry is not separately audited (neither is absolute expiry) and
+  emits **no Prometheus counter** — the observable signal is the `auth.login`
+  audit row on re-authentication.
+
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 
 Full design: `docs/auth-mfa-design.md`. Summary:

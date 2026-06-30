@@ -61,6 +61,16 @@ struct Config {
         90}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
+    // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
+    // Seconds of inactivity after which a cookie session is invalidated
+    // server-side (a sliding window UNDER the absolute 8h session lifetime).
+    // 0 (default) disables it — only the absolute lifetime applies; existing
+    // deployments are unaffected. Enabling it (recommended 900 = 15 min)
+    // satisfies the CC6.3 inactivity-timeout control. Wired via
+    // --session-inactivity-secs / YUZU_SESSION_INACTIVITY_SECS into
+    // AuthManager::set_session_inactivity. See docs/auth-architecture.md.
+    int session_inactivity_secs{0};
+
     // Authentication
     std::filesystem::path auth_config_path; // yuzu-server.cfg path
 
