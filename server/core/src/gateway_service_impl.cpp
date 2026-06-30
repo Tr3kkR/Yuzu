@@ -10,6 +10,8 @@
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
 #include "guaranteed_state_store.hpp"
+#include "app_perf_daily_store.hpp"
+#include "app_perf_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_ingestion.hpp"
@@ -528,8 +530,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
             collected_epoch = request->collected_at().millis_epoch() / 1000;
         }
         for (const auto& [plugin_name, data_bytes] : request->plugin_data()) {
-            if (plugin_name == "installed_software")
-                continue; // typed projection, handled below
+            if (plugin_name == "installed_software" || plugin_name == "app_perf")
+                continue; // typed projections, handled by their seams below
             std::string json_str(data_bytes.begin(), data_bytes.end());
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
@@ -548,6 +550,20 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
                          agent_id, ex.what());
         } catch (...) {
             spdlog::warn("[gateway] ProxyInventory: inventory ingest threw (unknown) for agent={} "
+                         "— acked",
+                         agent_id);
+        }
+    }
+    // Typed app_perf via its shared seam (DEX app-perf-over-time B1) — byte-identical
+    // to the direct ReportInventory path, independently guarded + isolated.
+    if (app_perf_daily_store_ && app_perf_daily_store_->is_open()) {
+        try {
+            ingest_app_perf_report(*app_perf_daily_store_, agent_id, *request, *response, metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: app_perf ingest threw for agent={} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: app_perf ingest threw (unknown) for agent={} "
                          "— acked",
                          agent_id);
         }

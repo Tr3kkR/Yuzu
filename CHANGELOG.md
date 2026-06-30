@@ -25,6 +25,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists and has MFA enrolled — configure OIDC and pre-enroll the break-glass account before
   restarting. See `docs/auth-architecture.md` "Hardened mode", `docs/user-manual/upgrading.md`, and the
   `docs/ops-runbooks/auth-db-recovery.md` break-glass arm runbook. Closes `/auth-and-authz` P0 #3.
+- **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
+  history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
+  surface: an "Application performance over time" panel on the `/device` DEX drill, beside the
+  live Top-applications query. It reads the **central** B1 store (no live device query, no
+  `Execute` permission — a read-only operator can open it), groups each application with its
+  **versions** as sub-rows, and renders a per-`(app, version)` CPU-over-time sparkline plus the
+  window's sample-weighted avg / peak CPU and working set, so a per-version regression on one
+  device reads straight off adjacent rows. Behavioural PII: per-device-scoped
+  `GuaranteedState:Read` + the **same `dex.device.app_perf.view`** audit verb as the REST drill,
+  under the dashboard set-and-proceed posture (sets `Sec-Audit-Failed` but still renders, distinct
+  from the REST fail-closed surface). A new pure reduction `app_perf_device_summaries` (in the
+  shared `dex_app_perf_model`) feeds the renderer; REST stays raw daily rows; still **no MCP twin**
+  (the fail-closed contract can't be expressed on MCP). Deferred: the per-version crashes/hangs
+  join (a separate central crash-store join on `(name, version)`).
+- **DEX app-performance over time (slice 2) — the operator read surface.** The B1/B2 stores
+  below are now readable. REST (all `GuaranteedState:Read`): `GET /api/v1/dex/perf/apps` (the
+  picker — apps with retained data), `GET /api/v1/dex/perf/app?app=&version=` (fleet trend, per
+  `(version, day)`), `GET /api/v1/dex/perf/group?group_id=&app=&version=` (one management group's
+  on-the-fly trend), and the per-device `GET /api/v1/dex/devices/{id}/app-perf`. MCP twins
+  (read-only): `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf` (the per-device
+  drill has no MCP twin; its dashboard panel is in the entry above). Dashboard: a picker + per-version trend on the DEX
+  Performance tab, fleet-wide or scoped to a group via a selector. One shared pure transform
+  (`app_perf_fleet_trend`/`app_perf_group_trend`/`app_perf_version_summaries`) feeds REST, MCP and
+  the dashboard so they cannot disagree. **Privacy:** both the fleet AND group aggregates suppress
+  any `(version, day)` point below `kDexCohortFloor` (10) devices to a count only — a sub-floor
+  aggregate singles out an individual even without an `agent_id`; percentiles are
+  bucket-resolution (`lower_bound`/"≥" when in the open top bucket) and withheld (`hist_stale`)
+  for a row under a superseded histogram scheme. The per-device drill is behavioural PII — scoped
+  to the caller's management group and audited fail-closed (`dex.device.app_perf.view`; 503 +
+  `Sec-Audit-Failed` if the audit row can't persist). Aggregate reads are not individually audited
+  (cohort posture). Group trend reads B1 (≤31 days); fleet trend reads B2 (≤180 days); per-app
+  sampling stays opt-in (`procperf_enabled`, off by default), so data appears only after the first
+  completed UTC midnight on an opted-in device. Deferred: per-version crashes/hangs join and a
+  device-drill MCP tool. (The per-device drill's dashboard UI shipped — see the entry above.)
+- **DEX app-performance over time (B1) — per-device daily app-version perf, centralized.**
+  New daily-sync source `app_perf` (agent) rolls the on-device `procperf_hourly` warehouse up to
+  per-`(app, version, day)` daily summaries — sample-weighted CPU/working-set, max-of-max peaks,
+  the last 2 completed UTC days per cycle — and ships them over the existing `ReportInventory`
+  transport as a new `plugin_data` key (no proto change, no gateway regen). New born-on-Postgres
+  `AppPerfDailyStore` (schema `app_perf_daily_store`, 31-day retention, plain table + per-agent
+  prune) persists them via a shared ingest seam wired identically on the direct `ReportInventory`
+  and gateway `ProxyInventory` paths, so fleet questions like "which devices ran v124 and how did
+  it perform" become answerable without federating to every endpoint. Version is canonicalized at
+  ingest (the same `canon_version` the stability side uses) so perf joins app stability by
+  `(app, version)`. Hash-less (perf changes daily → always full); scope is resource-significant
+  (procperf top-N) app-versions, not a full app census. Windows-fed today (procperf is
+  Windows-only); gated by `procperf_enabled` + the `--inventory-disable` daily-sync master switch.
+  Its read surface (per-device drill + group trend) shipped in slice 2 — see the entry above.
+- **DEX app-performance over time (B2) — fleet-aggregate trend substrate.** New born-on-Postgres
+  `AppPerfFleetStore` (schema `app_perf_fleet_store`, 180-day retention) holds one row per
+  `(app, version, UTC day)`: fleet device-count, exact CPU/working-set sums + maxima, and a
+  fixed-bucket histogram of per-device daily values (CPU low-end-weighted, working-set log-scale)
+  so true fleet percentiles (p50/p95) are computable over the long window without storing
+  per-device rows. Built from B1 by `AppPerfRollup` — the ADR-0012 cross-store query owner — as one
+  server-side `INSERT … SELECT … ON CONFLICT` per day (histogram via `COUNT(*) FILTER` over
+  half-open buckets; no per-device data crosses the wire), driven by an hourly background thread
+  that re-rolls a 4-day trailing window (idempotent; absorbs late-arriving B1) and prunes beyond
+  180 days. Full version grain (coarsen to major.minor on read). Histogram boundaries are frozen
+  (`hist_version` stamps the scheme); derived percentiles are bucket-resolution approximations.
+  Its read surface (fleet trend + picker, REST/MCP/dashboard) shipped in slice 2 — see the entry
+  above. The aggregate carries no `agent_id`, and sub-floor `(version, day)` points are suppressed
+  to a count only on read — no per-device attribution, no singling-out.
 - **Pre-flight readiness page (`/auto`).** New dashboard page for operator-initiated go/no-go checks
   across a scoped device cohort before a fleet change. Checks: application version (min/max), OS version
   floor, OS architecture, minimum free disk, and pending-reboot status — grouped per device
@@ -727,9 +789,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Postgres. New `GET /api/v1/dex/perf/cohort-diff?key=&a=&b=` + MCP
   `get_dex_perf_cohort_diff` (both `GuaranteedState:Read`, A1 parity with the
   rest of the `/dex/perf` surface). The *fleet-per-app* benchmark view (per-app
-  perf across the fleet) is **not** included — per-app data is device-drill-only
-  (federated), not fleet render-time; it remains deferred. See
-  `docs/user-manual/dex.md` and `docs/user-manual/rest-api.md`.
+  perf across the fleet) was deferred at the time of this entry — it has since
+  **shipped** as DEX app-performance-over-time (B1/B2 + the slice-2 read surface;
+  see the `[Unreleased]` entries), reading the retained Postgres aggregate rather
+  than the federated device drill. See `docs/user-manual/dex.md` and
+  `docs/user-manual/rest-api.md`.
 
 - **Network quality dashboard (`/network`).** A new **Network** view — a sub-view
   under DEX (the Network tab in the DEX sub-nav, also reachable directly at

@@ -500,6 +500,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "pg/pg_raii.hpp"               // PgResult
+#include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
 #include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
@@ -597,6 +598,11 @@ struct McpTestServer {
     /// "Software inventory store unavailable" path with no filter.
     yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
     yuzu::server::mcp::McpServer::InventoryScopeFn inventory_scope_fn_for_test{};
+
+    /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
+    /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
+    /// can be exercised. Default empty keeps existing tests on the unavailable path.
+    yuzu::server::AppPerfProviders app_perf_providers_for_test{};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -717,7 +723,9 @@ private:
             /*net_perf_fn=*/net_perf_fn_for_test,
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
-            /*inventory_scope_fn=*/inventory_scope_fn_for_test);
+            /*inventory_scope_fn=*/inventory_scope_fn_for_test,
+            /*metrics=*/nullptr,
+            /*app_perf_providers=*/app_perf_providers_for_test);
     }
 };
 
@@ -806,7 +814,8 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
         "list_definitions",  "get_definition",        "query_responses",
         "validate_scope",    "preview_scope_targets", "list_pending_approvals",
         "list_dex_signals",  "get_dex_signal_scope",  "get_dex_signal_detail",
-        "get_dex_perf_cohort_diff", // F2c discovery pin
+        "get_dex_perf_cohort_diff",                                          // F2c discovery pin
+        "list_dex_perf_apps", "get_dex_app_perf", "get_dex_group_app_perf",  // B1/B2 discovery pin
         "get_network_fleet", "list_network_devices"}; // N1: A2 discovery pin
     for (const auto& name : expected_names) {
         bool found = false;
@@ -1297,6 +1306,129 @@ TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.apps =
+        [](bool& truncated) -> std::optional<std::vector<yuzu::server::AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<yuzu::server::AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 2, .last_day = 1'700'000'000}};
+    };
+    auto mk_row = [](std::int64_t dc) {
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "chrome.exe";
+        r.version = "124.0";
+        r.day = 1'700'000'000;
+        r.device_count = dc;
+        r.cpu_sum = static_cast<double>(dc) * 5.0; // mean 5.0
+        r.cpu_max = 9.0;
+        r.ws_sum = dc * 100;
+        r.ws_max = 200;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        return r;
+    };
+    ts.app_perf_providers_for_test.fleet =
+        [mk_row](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)}; // >= kDexCohortFloor
+    };
+    ts.app_perf_providers_for_test.group =
+        [mk_row](std::string_view, std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
+    };
+    ts.start("readonly");
+
+    auto apps = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"list_dex_perf_apps","arguments":{}}})")
+            ->body);
+    REQUIRE(apps["apps"].size() == 1);
+    CHECK(apps["apps"][0]["app_name"] == "chrome.exe");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+            ->body);
+    CHECK(fleet["app"] == "chrome.exe");
+    REQUIRE(fleet["points"].size() == 1);
+    CHECK(fleet["points"][0]["version"] == "124.0");
+    CHECK(fleet["points"][0]["device_count"] == 20);
+
+    auto group = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})")
+            ->body);
+    CHECK(group["floor"] == yuzu::server::kDexCohortFloor); // floor echoed
+    REQUIRE(group["points"].size() == 1);
+    CHECK(group["points"][0]["device_count"] == 20);
+}
+
+TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",
+          "[mcp][integration][dex][app_perf]") {
+    // The fleet path floors too now — a sub-floor (version,day) point must serialize
+    // suppressed=true with device_count only, NOT zeroed stats that read as
+    // "3 devices @ 0% CPU" (security re-review of 5ebde07f).
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.fleet =
+        [](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        return std::vector<yuzu::server::AppPerfFleetRow>{r};
+    };
+    ts.start("readonly");
+    auto p = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_app_perf","arguments":{"app":"niche.exe"}}})")
+            ->body);
+    REQUIRE(p["points"].size() == 1);
+    CHECK(p["points"][0]["suppressed"] == true);
+    CHECK(p["points"][0]["device_count"] == 3);
+    CHECK_FALSE(p["points"][0].contains("cpu_mean")); // stats omitted when suppressed
+}
+
+TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
+          "[mcp][integration][dex][app_perf]") {
+    {
+        McpTestServer ts; // no providers wired
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"list_dex_perf_apps","arguments":{}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.fleet =
+            [](std::string_view, std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+            return std::vector<yuzu::server::AppPerfFleetRow>{};
+        };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_dex_app_perf","arguments":{}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
+    }
 }
 
 TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)",

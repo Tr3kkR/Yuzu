@@ -177,6 +177,18 @@ numbers match.
   read-only query surface deliberately hides plugin config, so the server
   does not guess which. App rows cross-link to the per-application
   reliability drill.
+
+  A third **Application performance over time** panel (behind its own "Load
+  history" click) is the *retained* companion to the live Top-applications query:
+  it reads the **central** Postgres B1 store (the daily per-app-version summaries
+  the device ships on the daily sync, ≤31 days), so it runs **no live query** and
+  needs **no Execute permission** — a read-only operator can open it. Each
+  application is grouped with its **versions** as sub-rows, each carrying its own
+  CPU-over-time sparkline and the window's sample-weighted avg / peak CPU and
+  working set, so a per-version regression on this device reads straight off
+  adjacent rows. It is the same behavioral-PII access class as the REST drill and
+  carries the **same audit action (`dex.device.app_perf.view`)**; per-version
+  crashes/hangs are a planned enrichment (a separate central crash-store join).
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 - **Per-observation** — click any row in a device's signal history to load the
@@ -190,10 +202,13 @@ numbers match.
 
 > **Per-device history is behavioral data.** A device's signal history reveals
 > which applications a person runs. Access is gated on `GuaranteedState:Read`
-> and **every open is audit-logged** (`dex.device.view`). The same audit applies
-> to the agent-scoped REST query `GET /api/v1/guaranteed-state/events?agent_id=…`.
-> See the works-council / co-determination posture in
-> `docs/enterprise-readiness-soc2-first-customer.md`.
+> and **every open is audit-logged** (`dex.device.view` for the signal-history
+> view; the *Application performance over time* panel emits the distinct verb
+> `dex.device.app_perf.view`, and the live per-app query emits
+> `dex.device.procperf.query` — kept separate so usage-class reads stay
+> separately countable). The same audit applies to the agent-scoped REST query
+> `GET /api/v1/guaranteed-state/events?agent_id=…`. See the works-council /
+> co-determination posture in `docs/enterprise-readiness-soc2-first-customer.md`.
 
 ## Agentic access (REST)
 
@@ -219,17 +234,35 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/devices?metric=&filter=&cohort_key=&cohort_value=`**
   — the one device list behind every Performance drill (worst-by-metric,
   not-reporting, cohort members).
+- **`GET /api/v1/dex/perf/apps`** — the application-performance-over-time picker
+  (apps with retained fleet data; `{app_name, versions, last_day}`).
+- **`GET /api/v1/dex/perf/app?app=&version=`** — the fleet trend for one app, one
+  point per `(version, day)` over the retained B2 window (≤180 days).
+- **`GET /api/v1/dex/perf/group?group_id=&app=&version=`** — the same trend for one
+  management group's members (on-the-fly over B1, ≤31 days).
+- **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
+  history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
 
-The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all`; the perf
-endpoints are now-views (no window). All are gated on `GuaranteedState:Read`.
-The per-signal drill-down returns a most-affected **devices** list
-(behavioral) and is **audit-logged** (`dex.signal.view`) on every call,
-exactly like the dashboard view; the rollup, scope and perf endpoints are
-aggregates / machine-health telemetry and are not audited. The same seven reads
-are exposed as MCP tools (`list_dex_signals`, `get_dex_signal_scope`,
-`get_dex_signal_detail`, `get_dex_perf_fleet`, `get_dex_perf_cohorts`,
-`get_dex_perf_cohort_diff`, `list_dex_perf_devices`). Full request/response shapes are in
-[`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
+The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all`; the
+fleet-now/cohort perf endpoints are now-views (no window), while the
+**application-performance-over-time** endpoints (`/perf/apps`, `/perf/app`,
+`/perf/group`) read **retained Postgres** data (≤180 days fleet / ≤31 days
+group), not a now-view. All are gated on `GuaranteedState:Read`. The per-signal
+drill-down returns a most-affected **devices** list (behavioral) and is
+**audit-logged** (`dex.signal.view`) on every call, exactly like the dashboard
+view; the rollup, scope and aggregate perf endpoints are aggregates /
+machine-health telemetry and are not audited — and the app-perf aggregates
+suppress any sub-floor `(version, day)` point (fewer than 10 devices) to a count
+only. The per-device app-perf drill IS audited (`dex.device.app_perf.view`,
+fail-closed). The aggregate reads are exposed as MCP tools (`list_dex_signals`,
+`get_dex_signal_scope`, `get_dex_signal_detail`, `get_dex_perf_fleet`,
+`get_dex_perf_cohorts`, `get_dex_perf_cohort_diff`, `list_dex_perf_devices`,
+`list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`); the
+per-device app-perf drill is exposed via REST **and** the dashboard device drill
+(the "Application performance over time" panel, same `dex.device.app_perf.view`
+audit) but has **no MCP twin** (MCP's set-and-proceed posture can't express the
+REST fail-closed contract). Full request/response
+shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 
 ## Platform coverage

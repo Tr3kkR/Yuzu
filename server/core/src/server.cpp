@@ -37,6 +37,11 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "app_perf_daily_store.hpp"
+#include "app_perf_fleet_store.hpp"
+#include "app_perf_group_reader.hpp"
+#include "app_perf_rollup.hpp"
+#include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_inventory_store.hpp"
@@ -342,6 +347,44 @@ public:
                           "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
                           "was held at its prior value — a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
+                          "counter");
+        // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
+        // Described up front so the HELP/TYPE lines exist on an idle server (a
+        // low-traffic deployment otherwise ships these series invisible until the
+        // first event).
+        metrics_.describe("yuzu_app_perf_ingest_total",
+                          "DEX app-perf daily-sync ingest outcomes by outcome "
+                          "(stored/need_full/dropped/error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_ingest_duration_seconds",
+                          "Time to apply one agent's app-perf daily report (pooled-connection + "
+                          "upsert hold time)",
+                          "histogram");
+        metrics_.describe("yuzu_app_perf_rollup_total",
+                          "B1->B2 app-perf roll-up outcomes per day rolled, by outcome "
+                          "(success/fail)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_rollup_duration_seconds",
+                          "Time to roll one completed UTC day from B1 (per-device daily) into B2 "
+                          "(fleet aggregate + histogram)",
+                          "histogram");
+        metrics_.describe("yuzu_app_perf_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful B1->B2 roll-up. The sole writer of "
+                          "the 180-day B2 trend store; alert when now - this exceeds the roll-up "
+                          "cadence (a stuck/failing rollup thread leaves B2 silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_app_perf_read_degrade_total",
+                          "Authoritative B1 (per-device app-perf) reads that returned a degrade "
+                          "rather than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_fleet_read_degrade_total",
+                          "Authoritative B2 (fleet app-perf) reads that returned a degrade rather "
+                          "than a result, by reason",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_group_read_degrade_total",
+                          "Management-group app-perf trend reads that returned a degrade rather than "
+                          "a result, by reason",
                           "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
@@ -2000,6 +2043,51 @@ public:
             }
         }
 
+        // Typed per-device app-perf daily projection — born-on-Postgres (DEX
+        // app-perf-over-time B1). Independent of the software store above (its own
+        // schema, its own fail-closed). Wires BOTH server entry points (direct
+        // ReportInventory + gateway ProxyInventory) to the typed app_perf seam.
+        if (pg_pool_ && !startup_failed_) {
+            app_perf_daily_store_ = std::make_unique<AppPerfDailyStore>(*pg_pool_);
+            if (!app_perf_daily_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_perf daily store migration/open failed "
+                              "(database reachable but the app_perf_daily_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_perf_daily_store_->set_metrics(&metrics_);
+                agent_service_.set_app_perf_daily_store(app_perf_daily_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_app_perf_daily_store(app_perf_daily_store_.get());
+            }
+        }
+
+        // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
+        // long-retention trend substrate, built from B1 by a daily background job.
+        // AppPerfFleetStore owns the schema (fail-closed like every PG store);
+        // AppPerfRollup is the ADR-0012 cross-store query owner (reads the B1
+        // schema, writes the B2 schema, on ONE lease — neither store grows a
+        // cross-schema method).
+        if (pg_pool_ && !startup_failed_) {
+            app_perf_fleet_store_ = std::make_unique<AppPerfFleetStore>(*pg_pool_);
+            if (!app_perf_fleet_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_perf fleet store migration/open failed "
+                              "(database reachable but the app_perf_fleet_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_perf_fleet_store_->set_metrics(&metrics_);
+                app_perf_rollup_ = std::make_unique<AppPerfRollup>(*pg_pool_);
+                app_perf_rollup_->set_metrics(&metrics_); // rollup-thread liveness signal
+
+                // Group-trend reader (slice 2): on-the-fly B1 aggregate over a
+                // management group's members. Borrows the pool, no schema of its
+                // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
+                app_perf_group_reader_ = std::make_unique<AppPerfGroupReader>(*pg_pool_);
+                app_perf_group_reader_->set_metrics(&metrics_);
+            }
+        }
+
         // Phase 7: Directory Sync (AD/Entra integration)
         {
             auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
@@ -2795,6 +2883,11 @@ public:
             policy_eval_thread_.join();
         }
 
+        // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
+        // app_perf_fleet_store_ — must stop before they / the pool are torn down).
+        if (app_perf_rollup_thread_.joinable()) {
+            app_perf_rollup_thread_.join();
+        }
         // Join the pre-flight runner thread (uses preflight_run_store_ +
         // response_store_ + the dispatch path — stop before teardown), then drop
         // the runner so its borrowed pointers can't be ticked again.
@@ -2940,6 +3033,14 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        agent_service_.set_app_perf_daily_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_app_perf_daily_store(nullptr);
+        app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
+        app_perf_daily_store_.reset();
+        // B2: roll-up (query owner) then the fleet store; both before the pool.
+        app_perf_rollup_.reset();
+        app_perf_fleet_store_.reset();
         pg_pool_.reset();
     }
 
@@ -4438,11 +4539,14 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
+            bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok;
+                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
+                                 app_perf_fleet_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4459,7 +4563,9 @@ private:
                   {"offload_target", offload_target_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
-                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"}}},
+                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
+                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4620,6 +4726,10 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                {"app_perf_daily_store",
+                 app_perf_daily_store_ && app_perf_daily_store_->is_open()},
+                {"app_perf_fleet_store",
+                 app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8183,6 +8293,46 @@ private:
             }
         });
 
+        // App-perf B1->B2 roll-up thread (DEX app-perf-over-time). Re-rolls the
+        // trailing window into B2 (idempotent) + prunes B2 beyond 180d, hourly.
+        // Borrows app_perf_rollup_ + app_perf_fleet_store_, so it MUST be joined
+        // before they / the pool are torn down (join sits with the policy-eval join
+        // in stop()). Rolls once at start so B2 populates from existing B1 at boot.
+        if (app_perf_rollup_ && app_perf_fleet_store_ && app_perf_fleet_store_->is_open()) {
+            app_perf_rollup_thread_ = std::thread([this]() {
+                spdlog::info("App-perf roll-up thread started (cadence=1h, B2 retention=180d)");
+                bool first = true;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    if (!first) {
+                        // ~1h in 5s steps so shutdown stays responsive.
+                        for (int i = 0;
+                             i < 720 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                            std::this_thread::sleep_for(std::chrono::seconds{5});
+                        if (stop_requested_.load(std::memory_order_acquire))
+                            break;
+                    }
+                    first = false;
+                    // roll_window/prune touch PG; an exception escaping a std::thread
+                    // entry calls std::terminate — catch, log, keep ticking.
+                    try {
+                        const std::int64_t now =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+                        app_perf_rollup_->roll_window(now);
+                        const std::int64_t today = (now / 86400) * 86400;
+                        app_perf_fleet_store_->prune(
+                            today -
+                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400);
+                    } catch (const std::exception& e) {
+                        spdlog::error("app_perf_rollup: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("app_perf_rollup: tick threw unknown exception — continuing");
+                    }
+                }
+            });
+        }
         // PreflightRunner — /auto re-dispatch-on-reconnect + window lifecycle.
         // Same dispatch lambda as operator commands; per-check execution_ids union
         // re-dispatches via query_by_execution. Joined BEFORE the stores in stop().
@@ -8505,6 +8655,61 @@ private:
             dex_perf_fn_ = dex_perf_fn;
         }
 
+        // App-perf-over-time providers (F2b) — ONE bundle threaded through the
+        // dashboard (DexRoutes), the REST surface (RestApiV1) and the MCP tools, so
+        // all three read the SAME stores. nullopt from any seam = an honest degrade
+        // (the read surfaces map it to a 503 / "unavailable" note, never a silent
+        // empty). The fleet + picker seams read B2; the per-device drill reads B1
+        // (audited at the route); the group roll-up resolves members then aggregates
+        // B1 — two bounded single-store reads composed, never a held cross-store
+        // lease (ADR-0012 §1).
+        AppPerfProviders app_perf_providers;
+        app_perf_providers.fleet =
+            [this](std::string_view app, std::string_view version)
+            -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
+        };
+        app_perf_providers.apps =
+            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+            if (!app_perf_fleet_store_)
+                return std::nullopt;
+            return app_perf_fleet_store_->list_apps(truncated);
+        };
+        app_perf_providers.device =
+            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+            if (!app_perf_daily_store_)
+                return std::nullopt;
+            return app_perf_daily_store_->get_agent_app_perf(agent_id);
+        };
+        app_perf_providers.group =
+            [this](std::string_view group_id, std::string_view app,
+                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_group_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN aggregate B1
+            // (a second bounded read) — never a lease held across the other (ADR-0012
+            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
+        };
+        // The dashboard scope-selector's group list (id + name only). NO per-group
+        // member count: that would be an N+1 get_members() over the store on every
+        // render (UP-7); the selector needs names, not counts.
+        DexRoutes::GroupListFn dex_group_list_fn = [this]() -> std::vector<DexGroupOption> {
+            std::vector<DexGroupOption> out;
+            if (!mgmt_group_store_)
+                return out;
+            for (const auto& g : mgmt_group_store_->list_groups())
+                out.push_back({g.id, g.name});
+            return out;
+        };
+
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
         // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
@@ -8586,7 +8791,9 @@ private:
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
-            scoped_perm_fn, visible_set_fn);
+            scoped_perm_fn, visible_set_fn,
+            // F2b app-perf-over-time providers + the scope-selector group list.
+            app_perf_providers, dex_group_list_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -9083,6 +9290,14 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
+        // store seams shared by the REST endpoints and the MCP twins so both read
+        // the SAME substrate. Each lambda null-checks the store at call time and
+        // returns std::nullopt on an unwired/closed store (the read surfaces map a
+        // nullopt to a 503 degrade, never a silent empty). The `app_perf_providers`
+        // bundle is built once ABOVE (before the DexRoutes registration) so the
+        // dashboard, REST and MCP surfaces all share the same store seams.
+
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
         rest_api_v1_ = std::make_unique<RestApiV1>();
@@ -9328,7 +9543,9 @@ private:
             // defaults to {} = no filter.
             [this](const std::string& username, const std::string& agent_id) -> bool {
                 return response_agent_in_scope(username, agent_id);
-            });
+            },
+            // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
+            app_perf_providers);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -9475,7 +9692,10 @@ private:
                 },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
-                &metrics_);
+                &metrics_,
+                // DEX app-perf-over-time read providers (slice 2) — same bundle the
+                // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
+                app_perf_providers);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -9876,6 +10096,15 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    // Typed per-device app-perf daily projection — born-on-Postgres (DEX
+    // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
+    // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
+    // Declared after pg_pool_ so they destruct before the pool.
+    std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
+    std::unique_ptr<AppPerfRollup> app_perf_rollup_;
+    // Slice-2 group-trend reader (reads B1 by member list; borrows the pool).
+    std::unique_ptr<AppPerfGroupReader> app_perf_group_reader_;
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
@@ -9889,6 +10118,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread result_set_maint_thread_;
 

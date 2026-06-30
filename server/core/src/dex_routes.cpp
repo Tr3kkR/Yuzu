@@ -2088,7 +2088,8 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "hx-get=\"/fragments/dex/device/perf?agent_id=" +
         url_encode(agent_id) +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load performance</button> "
-        "<span class=\"gp-mute\">runs a live read-only query on the device</span></div>";
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; needs Execute "
+        "permission</span></div>";
 
     // PR2: vs-fleet/cohort percentile strips — render-time registry state, no
     // dispatch, no extra permission, so they render directly (no click).
@@ -2107,8 +2108,22 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "hx-get=\"/fragments/dex/device/procperf?agent_id=" +
         url_encode(agent_id) + "&amp;window=" + window +
         "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load applications</button> "
-        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; audited "
-        "separately &mdash; per-app is usage-class telemetry</span></div>";
+        "<span class=\"gp-mute\">runs a live read-only query on the device &middot; needs Execute "
+        "permission &middot; audited separately &mdash; per-app is usage-class telemetry</span></div>";
+
+    // B1 retained app-perf-over-time: reads the CENTRAL store (no dispatch, no
+    // Execute probe), so it loads for a read-only operator too — the "over time, on
+    // this box" companion to the live top-applications query above. Same usage-class
+    // audit verb as the REST drill (dex.device.app_perf.view), set-and-proceed.
+    perf_panel +=
+        "<div class=\"gp-sech\">Application performance over time "
+        "<span class=\"gp-mute\">(retained daily, central store)</span></div>"
+        "<div class=\"gp-note\"><button class=\"gp-btn accent\" "
+        "hx-get=\"/fragments/dex/device/app-perf?agent_id=" +
+        url_encode(agent_id) +
+        "\" hx-target=\"closest div\" hx-swap=\"innerHTML\">Load history</button> "
+        "<span class=\"gp-mute\">retained daily summary &middot; no live query &middot; per-app "
+        "usage-class, audited</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
     std::string h = back_to_overview(window);
@@ -2514,19 +2529,22 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
-                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn));
+                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
+                    std::move(app_perf_providers), std::move(group_list_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
-                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn) {
+                                ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2537,6 +2555,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
     perf_fn_ = std::move(perf_fn);
+    app_perf_providers_ = std::move(app_perf_providers);
+    group_list_fn_ = std::move(group_list_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
     // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
@@ -2881,6 +2901,111 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                         "text/html; charset=utf-8");
     });
 
+    // -- F2b: application performance over time (per version) ------------------
+    //
+    // The retained per-(app,version) trend the fleet-now Performance tab deferred
+    // until the Postgres store landed (dex_perf_model.hpp). Two fragments share
+    // ONE renderer family + the ONE reduction (app_perf_version_summaries over
+    // app_perf_fleet_trend/app_perf_group_trend) the REST/MCP twins use — so the
+    // dashboard, /api/v1/dex/perf/* and the MCP tools cannot disagree. Aggregate
+    // surface → GuaranteedState:Read, NOT audited (cohort posture; the per-device
+    // drill is the audited surface and ships separately).
+    sink.Get("/fragments/dex/perf/apps",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const int window_days = window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d");
+                 if (!app_perf_providers_.apps) {
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "This server has no app-perf store wired."),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 bool truncated = false;
+                 const auto apps = app_perf_providers_.apps(truncated);
+                 if (!apps) { // nullopt = a real read error → honest degrade, not empty
+                     // Render the note at 200, not 503: the dashboard htmx drops
+                     // 4xx/5xx bodies (responseHandling swap:false), so a 503 would
+                     // swap nothing. The store already counted the degrade
+                     // (yuzu_app_perf_read_degrade_total) before returning nullopt.
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "The app-perf store could not be read right now."),
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days),
+                                 "text/html; charset=utf-8");
+             });
+
+    sink.Get("/fragments/dex/perf/app", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+        const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
+        // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
+        // re-floor the REST and MCP app-perf surfaces apply, so the three agree (a
+        // NUL would truncate the bound libpq text param). `app` must be non-empty.
+        if (app.empty() || !app_perf_param_valid(app) ||
+            (!group.empty() && !app_perf_param_valid(group))) {
+            res.status = 400;
+            res.set_content(placeholder("Pick an application",
+                                        "Choose an application from the list to see its "
+                                        "per-version trend."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::vector<DexGroupOption> groups =
+            group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
+
+        // group empty → fleet B2 (app_perf_fleet_trend); group set → the named-
+        // group on-the-fly B1 aggregate (app_perf_group_trend, sub-floor
+        // suppression at the SAME kDexCohortFloor the REST group endpoint uses).
+        std::optional<std::vector<AppPerfFleetRow>> rows;
+        std::vector<AppPerfVersionSummary> versions;
+        if (group.empty()) {
+            if (!app_perf_providers_.fleet) {
+                res.set_content(placeholder("Application performance unavailable",
+                                            "This server has no fleet app-perf store wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.fleet(app, "");
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
+                // already counted the degrade. (REST twin stays fail-closed.)
+                res.set_content(placeholder("Application performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
+        } else {
+            if (!app_perf_providers_.group) {
+                res.set_content(placeholder("Group performance unavailable",
+                                            "This server has no group app-perf reader wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.group(group, app, "");
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
+                // reader already counted the degrade. (REST twin stays fail-closed.)
+                res.set_content(placeholder("Group performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        }
+        res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
+                                                  window_days),
+                        "text/html; charset=utf-8");
+    });
+
     // -- A4: device perf panel — live federated TAR query + result poll --------
     //
     // The panel mechanically EXECUTES a (canned, server-authored) tar.sql on the
@@ -3137,6 +3262,67 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  }
                  res.set_content(procperf_pending(command_id, id, attempt + 1, w),
+                                 "text/html; charset=utf-8");
+             });
+
+    // B1 per-device app-perf-over-time drill — the retained-daily companion to the
+    // live procperf query above. Reads the CENTRAL Postgres B1 store
+    // (app_perf_providers_.device → AppPerfDailyStore::get_agent_app_perf): NO
+    // dispatch, NO Execute probe (it does not touch the device). Per-device
+    // behavioural PII, so it is scoped-Read gated AND audited per access; the HTML
+    // fragment posture is set-and-proceed (flag via Sec-Audit-Failed, still render)
+    // — the REST twin GET /dex/devices/{id}/app-perf is the fail-closed 503 surface.
+    sink.Get("/fragments/dex/device/app-perf",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id =
+                     req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 // Per-device scoped Read floor (tier + management group). Mirrors the
+                 // sibling fallback so a deployment without scoped_perm_fn still gates.
+                 if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
+                                     : !perm_fn_(req, res, "GuaranteedState", "Read"))
+                     return;
+                 // Missing agent_id (direct URL / misconfigured hx-get; the rendered
+                 // button always includes it). Reject BEFORE the audit so we never log
+                 // a blank-target PII-access row, and BEFORE the read so we never serve
+                 // a misleading empty-state for a malformed request. Status stays 200 so
+                 // the dashboard htmx swaps the note in (it drops 4xx/5xx bodies).
+                 if (id.empty()) {
+                     res.set_content("<div class=\"gp-note\">Missing agent_id.</div>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 if (!app_perf_providers_.device) {
+                     res.set_content(
+                         "<div class=\"gp-note\">Application performance history is unavailable on "
+                         "this server (no app-perf store wired).</div>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 // Audit the behavioural-PII access before serving (provider-null
+                 // checked first, so a no-store server does not log a read that
+                 // returns nothing — matches the REST twin's ordering). result=success
+                 // records that access was GRANTED + attempted (the established
+                 // pre-read convention, same as the REST twin); a subsequent store
+                 // degrade still carries this row — it over-audits, never under-audits.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
+                     "device app-perf-over-time drill (B1 retained)");
+                 const auto rows = app_perf_providers_.device(id);
+                 if (!rows) {
+                     // nullopt = a real read degrade. Render the honest note at status
+                     // 200, NOT 503: the dashboard htmx config drops 4xx/5xx bodies
+                     // (responseHandling swap:false), so a 503 here would render
+                     // nothing — the exact "fake empty" we mean to avoid. The store
+                     // already counted the degrade (yuzu_app_perf_read_degrade_total)
+                     // before returning nullopt, so monitoring is unaffected. The REST
+                     // twin keeps its fail-closed 503 (its JSON consumer reads status).
+                     res.set_content(
+                         "<div class=\"gp-note\">Application performance history could not be read "
+                         "right now &mdash; the store degraded. Retry shortly.</div>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 res.set_content(render_dex_device_app_perf(app_perf_device_summaries(*rows)),
                                  "text/html; charset=utf-8");
              });
 }
