@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/auto` deploy — stage + execute an upgrade on a pre-flight go-cohort.** The `/auto` page
+  gains an ACT stage after the ASSESS (pre-flight) stage: as soon as a pre-flight run has a
+  go-cohort (≥1 device in bucket go / warn-only — the run need not be complete; the button
+  appears with the first cleared device and the count grows mid-run), **Deploy go-cohort**
+  stages an installer (download + SHA-256 verify) and then executes it on the devices cleared
+  at click time, tracking a per-device stage→execute state machine. A re-deploy of the same run
+  excludes devices an earlier deployment already installed (cross-deployment execute-once).
+  Pre-flight completion is now event-driven (the result self-poll completes a run the moment its
+  cohort settles, not on the up-to-60s background-runner tick). Built on the existing `content_dist` plugin (`stage` /
+  `execute_staged`); no new agent code. Born-on-Postgres `DeploymentRunStore` (schema
+  `deployment_run_store`) persists the artifact spec, the frozen cohort, and each device's
+  step. The result is **aggregate-first** (a KPI strip + progress bar headline the counts;
+  the per-device list is problem-first and render-capped) so it reads at fleet scale. Driven
+  by an operator today; the engine (`deployment::advance`) is HTTP-agnostic so an agentic
+  worker can drive the same path via MCP later. **Safety:** the execute step MUTATES, so —
+  unlike the read-only pre-flight checks — it is dispatched **at most once per device**
+  (`claim_for_exec` commits `staged→executing` before the command leaves the server; this
+  run-once guarantee survives concurrent advances and a server restart), and execute-once is
+  also enforced **across deployments** by a create-time resume guard (a partial unique index +
+  `find_running_for_run`) so re-clicking Deploy re-attaches to the in-flight run instead of
+  re-installing. Every advance **re-authorizes** against the operator's current visible set
+  (`devices_fn(viewer) ∩ cohort`); a device the operator has lost scope to is skipped, never run.
+  Slice-1 *liveness* is page-driven (no background runner): a closed/timed-out page pauses the
+  deployment durably and is resumed by re-opening it. A human `confirm()` gates the deploy. RBAC:
+  `SoftwareDeployment:Read` opens the config; the result poll needs `Read`+`Execute` (it advances
+  the engine); create needs `Infrastructure:Read`+`Execute`; delete needs `Execute`; owner-scoped;
+  operational `deployment.{create,advance,delete}` audit. URL-only on `/auto` (not a new nav tab).
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the
@@ -315,6 +342,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DEX Catalogue now credits the full Linux signal coverage (was 7, now 17 types).** The per-OS
+  coverage map (`dex_obs_platforms`) that colours the Catalogue's "monitored / not collected on
+  Linux" badges was frozen at the original 7-type conservative set from before the Linux
+  kernel/sysfs collectors existed — the collectors landed without the map being updated in the same
+  change. A Linux fleet's Catalogue therefore showed `perf.disk_latency_high`, `hw.cpu_throttled`,
+  `service.hung`, `os.time_unsynced`, `os.bugcheck`, `os.dirty_shutdown`, `disk.error`,
+  `fs.corruption`, `hw.error`, and `process.hung` as *not collected* even though the agent emits
+  them — via `poll_perf` (the `/proc` CPU/memory/diskstats breach trio), the sysfs CPU-throttle
+  poll, and the journald poll whose kernel-transport lines are classified by `dex_linux_kmsg`. The
+  map is now authoritative at 17 types, so those families render as monitored on any connected
+  Linux agent. macOS coverage (16) was already correct and is unchanged. No agent change, no data
+  change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
+  platforms.
 - **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
   `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
   list carry a per-agent management-group drop filter that is **not yet effective** under the

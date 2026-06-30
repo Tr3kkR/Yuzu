@@ -57,9 +57,9 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
-### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`)
+### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`, `deployment-`)
 
-`notify_exec_tracker` skips three server-minted correlation-id prefixes that ride
+`notify_exec_tracker` skips four server-minted correlation-id prefixes that ride
 the `execution_id` column on `responses` (so their rows are retrievable via
 `ResponseStore::query_by_execution`) but are **NOT operator executions** —
 creating a tracker row for them would publish a phantom `agent-transition` SSE
@@ -78,8 +78,16 @@ event and leave an orphan `agent_exec_status` row that the executions drawer /
   unions the re-dispatches per agent. There is no `ExecutionTracker` row —
   `PreflightRunStore` is the run's completion authority, deliberately outside
   this ladder.
+- **`deployment-`** — minted by the deployment engine as
+  `deployment-<deployment_id>-stage` / `-exec`; the `/auto` DEPLOY stage's
+  content_dist stage + execute_staged commands. The engine reads each phase's
+  responses back via `query_by_execution` to advance the per-device state machine;
+  `DeploymentRunStore` is the run's completion authority. (Unlike the read-only
+  `preflight-` checks, the execute phase MUTATES — but that safety lives in the
+  store's claim-before-dispatch CAS, not here; this ladder only keeps the phantom
+  tracker rows out.)
 
-Both ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
+All ids are **server-minted, never caller-supplied** into `notify_exec_tracker`,
 and their namespaces are disjoint from real tracker ids (32-hex, no prefix), so a
 caller cannot collide a real execution into the skip. **Any new correlation-id
 prefix that stamps `responses` for internal retrieval but is not an operator

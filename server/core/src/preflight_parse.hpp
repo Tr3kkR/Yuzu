@@ -303,9 +303,10 @@ struct PreflightDeviceResult {
     std::vector<PreflightDeviceCheck> checks; ///< applicable checks, in catalogue order
 };
 
-/// One applicable check + each agent's best (status, output) so far. The caller
-/// builds `by_agent` from whatever response seam it has (routes: per-command
-/// poll; runner: query_by_execution + latest_per_agent).
+/// One applicable check + each agent's best (status, output) so far. Both the live
+/// result route and the background runner build `by_agent` via the SAME
+/// `collect_check_responses` (query_by_execution + latest_per_agent), so the two
+/// paths compute an identical grid.
 struct PreflightCheckResponses {
     std::string key;
     std::string label;

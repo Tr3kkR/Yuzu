@@ -19,8 +19,10 @@ separate sources — the macOS IOKit poll, the Windows state poll, and the Linux
 `/proc`+`statvfs` collector, see those sections below; it began macOS-only) **+
 the three A3 `perf.*` sustained-breach types** (`perf.cpu_sustained`,
 `perf.memory_pressure`, `perf.disk_latency_high` — the "Performance" display
-family, Windows state poll + the Linux `/proc` poll for cpu_sustained &
-memory_pressure; disk_latency_high stays Windows-only, see below).
+family, Windows state poll + the Linux `/proc` poll, which emits all three: cpu
+and memory from `/proc/stat`+`/proc/meminfo` and disk-latency from the
+`/proc/diskstats` await breach (ordinary disks only — exotic/fabric storage is
+excluded), see below).
 The Windows *event* catalogue is 110; the state-poll signals (`storage.low`,
 battery via `hw.error`, the `perf.*` breaches) ride alongside it without
 catalogue entries, exactly like the macOS and Linux poll mechanisms.
