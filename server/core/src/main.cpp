@@ -1015,16 +1015,14 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         // Non-atomic across two databases: the arm mutated auth.db; the audit
-        // row goes to audit.db, so they cannot share a transaction (Hermes D).
-        // The order is deliberate — arm-then-audit, matching the --mfa-reset
-        // contract (#1226): we prefer "armed but maybe no evidence" over
-        // "evidence but maybe not armed" (a false audit row for an arm that
-        // didn't happen is worse). The is_open() pre-check above caught the
-        // common audit-unwritable case before mutating; the only residual window
-        // is a SIGKILL / power loss in the ~microseconds between the UPDATE and
-        // this INSERT, after which the next break-glass login still emits
-        // auth.breakglass.login. An audit-write FAILURE (not a crash) is surfaced
-        // loudly below with a non-zero exit so the operator records it manually.
+        // row goes to audit.db, so they cannot share a transaction. The order is
+        // arm-then-audit (a false audit row for an arm that didn't happen would
+        // be worse), but a HANDLED audit-write failure is COMPENSATED below by
+        // un-arming, so the "never granted without a record" guarantee holds
+        // (review #1735 HIGH-2). The only residual window is a SIGKILL / power
+        // loss in the ~microseconds between the UPDATE and the INSERT — genuinely
+        // unavoidable without cross-DB atomicity, and the next break-glass login
+        // still emits auth.breakglass.login as a backstop signal.
         const std::string os_user = resolve_os_principal();
         yuzu::server::AuditEvent ev;
         ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1040,10 +1038,27 @@ int main(int argc, char* argv[]) {
                                 "CLI (os_identity={})",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
         if (!audit.log(ev)) {
-            spdlog::error("--break-glass-arm: armed '{}' but the audit row failed to persist — "
-                          "record this manually in change management NOW",
+            // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence
+            // row didn't persist, so roll the arm back — the exemption must never
+            // stand without a record (docs/ops-runbooks/auth-db-recovery.md).
+            if (auto un = auth_db->disarm_break_glass(cfg.break_glass_user); !un) {
+                // Double fault: audit AND the rollback both failed. The account
+                // may be left armed with no record — this needs manual operator
+                // intervention NOW.
+                spdlog::error("--break-glass-arm: audit row FAILED to persist AND the compensating "
+                              "un-arm of '{}' ALSO failed (error {}). The account may be ARMED "
+                              "WITH NO AUDIT RECORD — manually clear break_glass_armed_until and "
+                              "record this in change management IMMEDIATELY.",
+                              cfg.break_glass_user, static_cast<int>(un.error()));
+                std::cerr << "error: audit failed AND un-arm failed; account may be armed without "
+                             "a record — manual intervention required\n";
+                return EXIT_FAILURE;
+            }
+            spdlog::error("--break-glass-arm: audit row for '{}' failed to persist; the arm was "
+                          "ROLLED BACK (account NOT armed). Fix audit.db (disk/permissions) and "
+                          "retry.",
                           cfg.break_glass_user);
-            std::cerr << "error: armed but audit row failed to persist; record this manually\n";
+            std::cerr << "error: audit row failed to persist; arm rolled back (account not armed)\n";
             return EXIT_FAILURE;
         }
         spdlog::warn("Break-glass account '{}' ARMED until {} ({}s). It can now sign in locally "
@@ -1087,11 +1102,17 @@ int main(int argc, char* argv[]) {
         // sso-only disables the local-password path, so OIDC must be configured
         // or every operator is locked out (the break-glass account is for an IdP
         // OUTAGE, not for never wiring SSO at all). Fail closed rather than
-        // booting an unreachable server.
-        if (cfg.oidc_issuer.empty()) {
-            spdlog::error("--auth-mode=sso-only disables local-password login but no OIDC "
-                          "provider is configured (--oidc-issuer is empty). This would lock "
-                          "every operator out. Configure OIDC SSO, or use --auth-mode=standard.");
+        // booting an unreachable server. Gate on the SAME predicate the OIDC
+        // provider uses to enable itself — `oidc::Config::is_enabled()` requires
+        // BOTH issuer and client-id (oidc_provider.hpp), and `/auth/oidc/start`
+        // 404s when the provider is disabled — so checking only `oidc_issuer`
+        // would let `--oidc-issuer=… ` with NO `--oidc-client-id` boot with SSO
+        // silently non-functional (review #1735 HIGH-1).
+        if (cfg.oidc_issuer.empty() || cfg.oidc_client_id.empty()) {
+            spdlog::error("--auth-mode=sso-only disables local-password login but OIDC is not "
+                          "fully configured (need both --oidc-issuer and --oidc-client-id). This "
+                          "would lock every operator out (SSO would be non-functional). Configure "
+                          "OIDC SSO completely, or use --auth-mode=standard.");
             return EXIT_FAILURE;
         }
         // The break-glass account is the ONLY local-login path under sso-only, so

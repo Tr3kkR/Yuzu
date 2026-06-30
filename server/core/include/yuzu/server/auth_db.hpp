@@ -266,6 +266,15 @@ public:
     std::expected<BreakGlassStatus, AuthDBError> arm_break_glass(const std::string& username,
                                                                  int window_secs);
 
+    /// Disarm the break-glass account (set break_glass_armed_until = NULL).
+    /// Used as the compensating un-arm when the mandatory `auth.breakglass.armed`
+    /// audit row fails to persist after `arm_break_glass` succeeded — so the
+    /// exemption is never left standing without an evidence row (review #1735
+    /// HIGH-2; honours the "never granted without a record" guarantee in
+    /// docs/ops-runbooks/auth-db-recovery.md). Idempotent; InvalidUsername for
+    /// malformed input. Parameterised, no sqlite3_changes() (#1033).
+    std::expected<void, AuthDBError> disarm_break_glass(const std::string& username);
+
     // ── MFA / TOTP Operations ────────────────────────────────────────────
     //
     // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and

@@ -92,12 +92,18 @@ Closes `/auth-and-authz` gap-matrix **P0 #3** (both halves of Workstream B line
   **deliberately rejected** — it would re-introduce the PBKDF2-cost amplification
   DoS the skip exists to avoid. Same accepted trade-off as the shipped lockout
   pre-check.
-- **Arm + audit non-atomic across two DBs (Hermes D, accepted).** A SIGKILL in
-  the microsecond window between the `auth.db` arm and the `audit.db` row leaves
-  the account armed with no audit row. Cross-DB atomicity is impossible; the
-  arm-then-audit order fails safe (matches the `--mfa-reset` #1226 contract), the
-  `is_open()` pre-check catches the common audit-unwritable case, and the next
-  break-glass login still emits `auth.breakglass.login`.
+- **Arm + audit non-atomic across two DBs — handled (review #1735 HIGH-2).** The
+  `auth.db` arm and the `audit.db` row cannot share a transaction. A **handled**
+  `audit.log() == false` now triggers a **compensating un-arm**
+  (`AuthDB::disarm_break_glass`) before the non-zero exit, so the exemption is
+  never left standing without a record — the "never granted without a record"
+  guarantee holds in code, not just in the doc. The only residual is a SIGKILL /
+  power loss in the microsecond window between the `UPDATE` and the `INSERT`
+  (genuinely unavoidable without cross-DB atomicity); the `is_open()` pre-check
+  catches the common audit-unwritable case before mutating, and the next
+  break-glass login still emits `auth.breakglass.login` as a backstop. A double
+  fault (audit write AND the un-arm both fail) is logged loudly for manual
+  intervention.
 - **No `--break-glass-disarm` / arm-expiry audit event (compliance SHOULD).**
   The window auto-expires silently; an explicit early-disarm command + an
   expiry/disarm audit row are tracked follow-ups.

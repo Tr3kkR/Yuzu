@@ -153,10 +153,13 @@ account policy)"* — this ships **both** halves.
   the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
   banner + this counter (the `{target}` label, cardinality 2, flags probing of
   the break-glass account itself for SIEM alerting).
-- **Boot guard (fail-closed).** `sso-only` **refuses to start** when no OIDC
-  provider is configured (`--oidc-issuer` empty) — it would otherwise lock every
-  operator out. The break-glass account is for an IdP **outage**, not for never
-  wiring SSO. The active posture is logged once at boot for CC6.3 evidence.
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
+  **fully** configured — the guard requires both `--oidc-issuer` **and**
+  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
+  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
+  operator is locked out. The break-glass account is for an IdP **outage**, not
+  for never wiring SSO. The active posture is logged once at boot for CC6.3
+  evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a

@@ -1335,6 +1335,32 @@ AuthDB::arm_break_glass(const std::string& username, int window_secs) {
     return std::unexpected(AuthDBError::UserNotFound);
 }
 
+std::expected<void, AuthDBError> AuthDB::disarm_break_glass(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Compensating un-arm: clear the armed window. Idempotent (a no-match or
+    // already-NULL row is success — the desired post-state is "not armed").
+    // No sqlite3_changes() (#1033) — match-vs-not is irrelevant.
+    static const char* sql = R"(
+        UPDATE users SET break_glass_armed_until = NULL WHERE username = ?
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare disarm_break_glass statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        spdlog::error("disarm_break_glass failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return {};
+}
+
 std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::string& username) {
     if (!is_valid_username(username)) {
         return "not a valid username";

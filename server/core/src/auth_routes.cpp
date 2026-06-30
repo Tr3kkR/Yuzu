@@ -870,8 +870,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // break-glass account is a deliberate out-of-band operation.
         if (break_glass_login && !mfa_enrolled) {
             res.status = 403;
+            // A4 error envelope (review #1735 MEDIUM): correlation_id so an
+            // agentic worker can tie this 403 to its auth.breakglass.denied audit
+            // row, plus a remediation hint. Uses the canonical detail::error_json_a4
+            // (the local a4_denial omits the remediation field). No retry_after_ms
+            // — re-enrolling a second factor is a manual out-of-band operation,
+            // not a timed backoff. (Unlike the sso-only LOCAL-disabled 401, this
+            // 403 is already a distinct status, so enriching it is not an
+            // enumeration oracle.)
+            std::string cid = res.get_header_value("X-Correlation-Id");
+            if (cid.empty()) {
+                cid = detail::make_correlation_id();
+                res.set_header("X-Correlation-Id", cid);
+            }
             res.set_content(
-                R"({"error":{"code":403,"message":"break-glass account requires an enrolled second factor"},"meta":{"api_version":"v1"}})",
+                detail::error_json_a4(
+                    403, "break-glass account requires an enrolled second factor", cid,
+                    "the break-glass account has no enrolled second factor; enroll MFA for it "
+                    "(Settings -> Multi-Factor Authentication, reachable by an admin via SSO) "
+                    "before using it under --auth-mode=sso-only"),
                 "application/json");
             audit_log_for_principal(
                 req, "auth.breakglass.denied", "denied", username,

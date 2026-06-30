@@ -92,6 +92,27 @@ TEST_CASE_METHOD(BreakGlassFixture, "arm_break_glass arms the account", "[auth][
     CHECK(st->armed_until == armed->armed_until);
 }
 
+TEST_CASE_METHOD(BreakGlassFixture, "disarm_break_glass rolls back an arm", "[auth][breakglass]") {
+    // The compensating un-arm used when the mandatory audit row fails to persist
+    // (review #1735 HIGH-2) — so the exemption is never left standing without a
+    // record.
+    REQUIRE(db->arm_break_glass("alice", 3600).has_value());
+    REQUIRE(db->break_glass_status("alice")->armed);
+
+    REQUIRE(db->disarm_break_glass("alice").has_value());
+    auto st = db->break_glass_status("alice");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->armed);
+    CHECK(st->armed_until.empty());
+
+    // Idempotent: disarming an already-dormant account (and a non-existent one)
+    // is success — the desired post-state ("not armed") already holds.
+    CHECK(db->disarm_break_glass("alice").has_value());
+    CHECK(db->disarm_break_glass("nobody").has_value());
+    // Malformed input is still rejected.
+    CHECK_FALSE(db->disarm_break_glass("alice:admin").has_value());
+}
+
 TEST_CASE_METHOD(BreakGlassFixture, "re-arming refreshes the window", "[auth][breakglass]") {
     auto first = db->arm_break_glass("alice", 3600);
     REQUIRE(first.has_value());

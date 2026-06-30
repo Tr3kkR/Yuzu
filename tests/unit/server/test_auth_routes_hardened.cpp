@@ -32,6 +32,7 @@
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "../test_helpers.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -68,6 +69,7 @@ struct TmpDirGuard {
 struct HardenedHarness {
     TmpDirGuard tmp;
     Config cfg{};
+    yuzu::MetricsRegistry metrics; // wired so the CC6.3/CC6.6 SIEM counters fire (review #1735 LOW)
     auth::AuthManager auth_mgr{};
     AuthDB auth_db;
     std::unique_ptr<ApiTokenStore> api_tokens;
@@ -92,6 +94,7 @@ struct HardenedHarness {
         seed_user("admin", "adminpassword1", auth::Role::admin);
         seed_user("alice", "alicepassword1", auth::Role::user);
         auth_mgr.set_auth_db(&auth_db);
+        auth_mgr.set_metrics_registry(&metrics);
 
         api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
@@ -142,6 +145,14 @@ struct HardenedHarness {
             q.principal = principal;
         return static_cast<int>(audit_store->query(q).size());
     }
+
+    // Read a metric counter value (review #1735 LOW). The label set must match
+    // the production emission exactly, or counter(name, labels) returns a fresh
+    // 0-valued series.
+    double counter(const std::string& name, const yuzu::Labels& labels = {}) {
+        return labels.empty() ? metrics.counter(name).value()
+                              : metrics.counter(name, labels).value();
+    }
 };
 
 std::string form(std::initializer_list<std::pair<std::string, std::string>> kv) {
@@ -184,8 +195,10 @@ TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401"
     CHECK(res->body.find("disabled") == std::string::npos);
     CHECK(res->get_header_value("Set-Cookie").empty());
     // UP-2: the sso-only denial is metric-only (yuzu_auth_local_disabled_total),
-    // NEVER a per-attempt audit row — assert no audit row is written.
+    // NEVER a per-attempt audit row — assert no audit row is written, but the
+    // CC6.3 SIEM counter DID increment (review #1735 LOW).
     CHECK(h.count_audits("auth.local_disabled") == 0);
+    CHECK(h.counter("yuzu_auth_local_disabled_total", {{"target", "other"}}) == 1.0);
 }
 
 TEST_CASE("sso-only: a valid password is still rejected when local login is disabled",
@@ -234,6 +247,8 @@ TEST_CASE("sso-only: armed break-glass user with MFA proceeds to the MFA challen
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(h.count_audits("auth.breakglass.login", "admin") == 1);
     CHECK(h.count_audits("auth.local_disabled") == 0);
+    // The CC6.6 break-glass-use SIEM counter incremented (review #1735 LOW).
+    CHECK(h.counter("yuzu_auth_break_glass_login_total") == 1.0);
 }
 
 TEST_CASE("sso-only: a non-break-glass user is rejected even while another is armed",
