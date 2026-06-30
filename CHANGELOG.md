@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Idle (inactivity) session timeout (`--session-inactivity-secs`, SOC 2 CC6.3).** Operator dashboard
+  cookie sessions can now be invalidated after a configurable period of inactivity — a **sliding**
+  window that resets on each authenticated request, *under* the existing absolute 8h session lifetime.
+  Wires the previously-reserved `sessions.last_activity_at` column end-to-end (enforced in
+  `AuthManager::validate_session`; best-effort throttled `auth.db` mirror via
+  `AuthDB::touch_session_activity`). **Default 0 = disabled** (opt-in; existing deployments unaffected;
+  recommended `900` = 15 min). Scope is cookie sessions only — **API tokens and MCP tokens are never
+  idle-timed-out**, and OIDC users re-authenticate via SSO. `YUZU_SESSION_INACTIVITY_SECS`. Closes
+  `/auth-and-authz` gap-matrix P1 #8. See `docs/auth-architecture.md` "Inactivity session timeout".
+
 - **Hardened authentication mode (`--auth-mode=sso-only`) + break-glass account (SOC 2 CC6.3/CC6.6).**
   Local-password login can be disabled fleet-wide so only OIDC SSO mints a session
   (`--auth-mode=sso-only` / `YUZU_AUTH_MODE`). A rejected local login returns the same generic 401 as a
