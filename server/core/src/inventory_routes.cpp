@@ -13,6 +13,7 @@
 #include "rest_audit.hpp" // detail::try_persist_audit — throw-safe set-and-proceed audit kernel (#1647)
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -46,25 +47,28 @@ void send_html(httplib::Response& res, std::string body) {
 
 void InventoryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
-                                      VersionsFn versions_fn, FleetSoftwareFn fleet_fn,
-                                      AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                                      ScopeFn scope_fn, StaleFn stale_fn, AuditFn audit_fn) {
+                                      CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
+                                      FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
+                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
+                                      AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
-                    std::move(catalog_fn), std::move(versions_fn), std::move(fleet_fn),
-                    std::move(agent_sw_fn), std::move(devices_fn), std::move(scope_fn),
-                    std::move(stale_fn), std::move(audit_fn));
+                    std::move(catalog_fn), std::move(catalog_meta_fn), std::move(versions_fn),
+                    std::move(fleet_fn), std::move(agent_sw_fn), std::move(devices_fn),
+                    std::move(scope_fn), std::move(stale_fn), std::move(audit_fn));
 }
 
 void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
-                                      VersionsFn versions_fn, FleetSoftwareFn fleet_fn,
-                                      AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                                      ScopeFn scope_fn, StaleFn stale_fn, AuditFn audit_fn) {
+                                      CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
+                                      FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
+                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
+                                      AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     catalog_fn_ = std::move(catalog_fn);
+    catalog_meta_fn_ = std::move(catalog_meta_fn);
     versions_fn_ = std::move(versions_fn);
     fleet_fn_ = std::move(fleet_fn);
     agent_sw_fn_ = std::move(agent_sw_fn);
@@ -107,17 +111,24 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::optional<std::vector<SoftwareCatalogRow>> cat;
                  if (catalog_fn_)
                      cat = catalog_fn_(q);
+                 std::optional<CatalogRollupMeta> meta;
+                 if (catalog_meta_fn_)
+                     meta = catalog_meta_fn_();
                  const bool capped = cat && static_cast<int>(cat->size()) == q.limit;
                  std::optional<std::int64_t> stale;
                  if (stale_fn_)
                      stale = stale_fn_();
+                 const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
                  // Set-and-proceed audit via the #1647 throw-safe kernel (a throwing
                  // audit sink → false, never an httplib 500): parity with the REST sibling.
                  (void)detail::try_persist_audit(
                      audit_fn_, req, "inventory.software.catalog", cat ? "success" : "failure",
                      "Inventory", q.name_filter.empty() ? "fleet" : ("q=" + q.name_filter),
                      cat ? ("titles=" + std::to_string(cat->size())) : "store degraded");
-                 send_html(res, render_inventory_software_fragment(cat, q.name_filter, stale, capped));
+                 send_html(res, render_inventory_software_fragment(cat, meta, q.name_filter, stale,
+                                                                   capped, now));
              });
 
     // -- SOFTWARE version drill (installs per version for one title) --

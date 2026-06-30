@@ -57,9 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   title, publisher, install count, distinct versions, with an installs-per-version drill),
   **Devices** (a thin, offline-survivable device list sourced from the persisted endpoint
   state + the live registry; click a device for its installed software), and **Find software**
-  (which devices run a given title). Backed by two new authoritative aggregate reads on
-  `SoftwareInventoryStore` (`software_catalog` / `software_versions`, fleet-wide `GROUP BY`
-  bounded by a tight statement-timeout). Gated on the existing `Inventory:Read` (per-device
+  (which devices run a given title). The catalogue/version counts are served from a
+  **precomputed rollup** (`catalog_rollup` / `version_rollup` / `catalog_rollup_meta`,
+  refreshed hourly by a background `SoftwareCatalogRollup` thread, keep-last-good on
+  failure) so page reads never run a full-table `GROUP BY` — the underlying data changes
+  only on the daily sync. The KPI strip shows an "updated N ago" stamp and a "building"
+  state before the first refresh. Gated on the existing `Inventory:Read` (per-device
   reads use the management-group-scoped gate); fleet-wide catalogue/find counts are not yet
   management-group scoped (ADR-0017 confinement inert under the global gate — caveated in the
   UI). On store degradation the authoritative reads (Software/Find/per-device-software) show an

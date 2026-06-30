@@ -65,13 +65,17 @@ struct InventoryDeviceRow {
 // "data unavailable" banner, NEVER an empty table (authoritative reads, ADR-0016 §7:
 // an empty table reads as "installed nowhere" — the fail-open the store forbids).
 
-/// SOFTWARE tab: the fleet catalogue table (title · publisher · installs · versions ·
-/// installs-per-version bar) + an empty drill container. `name_filter` is echoed into
-/// the search box; `capped` flags that the row set hit the catalogue cap; `stale_count`
-/// feeds the freshness KPI (nullopt → "—").
+/// SOFTWARE tab: the fleet catalogue table (title · publisher · installs · versions) +
+/// an empty drill container, fed by the precomputed rollup. `meta` carries the rollup
+/// freshness stamp + headline counts (KPIs + "as of" line); `meta->refreshed_at == 0`
+/// renders the "catalogue building" state (distinct from a refreshed-but-empty fleet).
+/// `name_filter` is echoed into the search box; `capped` flags the row-cap; `stale_count`
+/// feeds the stale KPI (nullopt → "—"); `now_secs` lets the pure renderer format the
+/// "as of" relative time without calling the clock itself.
 std::string render_inventory_software_fragment(
-    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue, const std::string& name_filter,
-    std::optional<std::int64_t> stale_count, bool capped);
+    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue,
+    const std::optional<CatalogRollupMeta>& meta, const std::string& name_filter,
+    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs);
 
 /// SOFTWARE drill: installs-per-version for one title (the catalogue row click target).
 std::string render_inventory_versions_fragment(
@@ -119,6 +123,8 @@ public:
     /// no provider wired → the route renders the "unavailable" state.
     using CatalogFn =
         std::function<std::optional<std::vector<SoftwareCatalogRow>>(const SoftwareCatalogQuery&)>;
+    /// Catalogue rollup freshness stamp + headline counts (the "as of" line + KPIs).
+    using CatalogMetaFn = std::function<std::optional<CatalogRollupMeta>()>;
     using VersionsFn = std::function<std::optional<std::vector<SoftwareVersionCount>>(
         const std::string& name, int limit)>;
     using FleetSoftwareFn =
@@ -147,14 +153,16 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn, VersionsFn versions_fn,
+                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
+                         CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn, VersionsFn versions_fn,
+                         ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
+                         CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {});
 
@@ -163,6 +171,7 @@ private:
     PermFn perm_fn_;
     ScopedPermFn scoped_perm_fn_;
     CatalogFn catalog_fn_;
+    CatalogMetaFn catalog_meta_fn_;
     VersionsFn versions_fn_;
     FleetSoftwareFn fleet_fn_;
     AgentSoftwareFn agent_sw_fn_;

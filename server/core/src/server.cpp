@@ -77,6 +77,7 @@
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "network_routes.hpp"
+#include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
@@ -375,6 +376,19 @@ public:
                           "Epoch seconds of the last successful B1->B2 roll-up. The sole writer of "
                           "the 180-day B2 trend store; alert when now - this exceeds the roll-up "
                           "cadence (a stuck/failing rollup thread leaves B2 silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_catalog_rollup_total",
+                          "/inventory Software-tab catalogue rollup recompute outcomes, by outcome "
+                          "(success/error). Keep-last-good on error.",
+                          "counter");
+        metrics_.describe("yuzu_inventory_catalog_rollup_duration_seconds",
+                          "Wall-clock of the last catalogue rollup recompute (the full-table "
+                          "GROUP BY, off the request path)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_catalog_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful catalogue rollup refresh; alert when "
+                          "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
+                          "/inventory catalogue silently stale)",
                           "gauge");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
@@ -2056,6 +2070,15 @@ public:
                 agent_service_.set_software_inventory_store(software_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_software_inventory_store(software_inventory_store_.get());
+                // Catalogue rollup background thread — refreshes the precomputed
+                // catalog_rollup/version_rollup the /inventory Software tab reads, so page
+                // reads never run the full-table GROUP BY (the data changes only on the
+                // daily sync). Hourly, matching the app-perf rollup cadence; runs one
+                // refresh on start so the catalogue populates from existing rows at boot.
+                // Borrows the store + pool → MUST be stopped before they tear down (in stop()).
+                software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
+                    *software_inventory_store_, std::chrono::hours{1}, &metrics_);
+                software_catalog_rollup_->start();
             }
         }
 
@@ -3049,6 +3072,9 @@ public:
         // pool resets (no UAF today since the gRPC drain has quiesced every ingest
         // handler, but it matches the offline-store contract and is safe if the store
         // ever gains a pool-touching dtor).
+        // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
+        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
+        software_catalog_rollup_.reset();
         agent_service_.set_software_inventory_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
@@ -9118,6 +9144,11 @@ private:
                     return std::nullopt;
                 return software_inventory_store_->software_catalog(q);
             },
+            [this]() -> std::optional<CatalogRollupMeta> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->catalog_rollup_meta();
+            },
             [this](const std::string& name,
                    int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
                 if (!software_inventory_store_)
@@ -10272,6 +10303,7 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;

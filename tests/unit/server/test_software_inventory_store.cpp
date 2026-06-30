@@ -834,6 +834,18 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
                 "cat-a3", "", Rows{{"Google Chrome", "125", "Google", ""}}, 1) ==
             InventoryIngestOutcome::kStored);
 
+    // The catalogue/version reads are served from the PRECOMPUTED rollup — recompute it
+    // from the just-seeded rows before asserting.
+    REQUIRE(store.refresh_catalog_rollup());
+
+    SECTION("catalog_rollup_meta carries the freshness stamp + headline counts") {
+        auto meta = store.catalog_rollup_meta();
+        REQUIRE(meta.has_value());
+        CHECK(meta->refreshed_at > 0);  // refreshed → not the "building" sentinel
+        CHECK(meta->total_titles == 2); // Google Chrome + 7-Zip
+        CHECK(meta->total_devices == 3);
+    }
+
     SECTION("catalogue rolls up device_count + version_count, most-installed first") {
         auto cat = store.software_catalog({});
         REQUIRE(cat.has_value());
@@ -885,4 +897,38 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
         REQUIRE(v.has_value());
         CHECK(v->empty());
     }
+}
+
+TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before first refresh",
+          "[pg][software_inventory]") {
+    // Before any refresh_catalog_rollup(), the rollup tables are empty and the seeded meta
+    // row reports refreshed_at==0 ("building") — distinct from a refreshed-but-empty fleet.
+    // This is the state the dashboard shows as "catalogue building", not a false empty.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.apply_installed_software(
+                "pre-a1", "", std::vector<SoftwareEntry>{{"Google Chrome", "126", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // No refresh yet: meta is the building sentinel, reads are empty (NOT degraded/nullopt).
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0);
+    auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    CHECK(cat->empty());
+
+    // After a refresh the seeded row appears and the stamp advances.
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta2 = store.catalog_rollup_meta();
+    REQUIRE(meta2.has_value());
+    CHECK(meta2->refreshed_at > 0);
+    auto cat2 = store.software_catalog({});
+    REQUIRE(cat2.has_value());
+    REQUIRE(cat2->size() == 1);
+    CHECK((*cat2)[0].name == "Google Chrome");
 }

@@ -45,42 +45,58 @@ SoftwareFleetRow fleet_row(std::string agent, std::string name, std::string ver)
 // ───────────────────────── PURE renderers ──────────────────────────────────────
 
 TEST_CASE("software fragment: degrade is a banner, never an empty table", "[inventory][ui]") {
-    const std::string degraded = render_inventory_software_fragment(std::nullopt, "", std::nullopt, false);
+    // cat nullopt = rollup unreadable → degrade banner (meta irrelevant).
+    const std::string degraded =
+        render_inventory_software_fragment(std::nullopt, std::nullopt, "", std::nullopt, false, 2000);
     REQUIRE(contains(degraded, "unavailable"));
     REQUIRE(contains(degraded, "authoritative"));
     // A degrade must NOT masquerade as a genuine "nothing installed".
     REQUIRE_FALSE(contains(degraded, "No installed-software inventory has been reported"));
 }
 
-TEST_CASE("software fragment: genuine empty is an honest note, not a degrade", "[inventory][ui]") {
+TEST_CASE("software fragment: building vs genuine empty are distinct", "[inventory][ui]") {
+    // meta.refreshed_at == 0 → rollup never computed → "building", NOT a false empty.
+    const std::string building = render_inventory_software_fragment(
+        std::optional<std::vector<SoftwareCatalogRow>>(std::vector<SoftwareCatalogRow>{}),
+        std::optional<CatalogRollupMeta>(CatalogRollupMeta{0, 0, 0}), "", std::int64_t{0}, false,
+        2000);
+    REQUIRE(contains(building, "building"));
+    REQUIRE_FALSE(contains(building, "No installed-software inventory has been reported"));
+
+    // meta.refreshed_at > 0 + empty rollup → honest "nothing installed", not building/degrade.
     const std::string empty = render_inventory_software_fragment(
-        std::optional<std::vector<SoftwareCatalogRow>>(std::vector<SoftwareCatalogRow>{}), "",
-        std::int64_t{0}, false);
+        std::optional<std::vector<SoftwareCatalogRow>>(std::vector<SoftwareCatalogRow>{}),
+        std::optional<CatalogRollupMeta>(CatalogRollupMeta{1000, 0, 0}), "", std::int64_t{0}, false,
+        2000);
     REQUIRE(contains(empty, "No installed-software inventory has been reported"));
     REQUIRE_FALSE(contains(empty, "unavailable"));
+    REQUIRE_FALSE(contains(empty, "building"));
 }
 
-TEST_CASE("software fragment: rows render with counts + a drill link", "[inventory][ui]") {
+TEST_CASE("software fragment: rows render with counts, KPIs from meta, drill link", "[inventory][ui]") {
     std::vector<SoftwareCatalogRow> rows{cat_row("Google Chrome", "Google LLC", 1180, 3),
                                          cat_row("7-Zip", "Igor Pavlov", 889, 1)};
-    const std::string html =
-        render_inventory_software_fragment(rows, "", std::int64_t{37}, /*capped=*/false);
+    const std::string html = render_inventory_software_fragment(
+        rows, std::optional<CatalogRollupMeta>(CatalogRollupMeta{1000, 2, 1284}), "",
+        std::int64_t{37}, /*capped=*/false, /*now=*/2000);
     REQUIRE(contains(html, "Google Chrome"));
     REQUIRE(contains(html, "1180"));
     REQUIRE(contains(html, "Igor Pavlov"));
     // Each row drills into the version breakdown.
     REQUIRE(contains(html, "/fragments/inventory/software/versions?name=Google%20Chrome"));
-    // Freshness KPI surfaces the stale count.
-    REQUIRE(contains(html, "37"));
+    // KPIs come from the rollup meta: titles, devices-reporting, stale, and the "as of" line.
+    REQUIRE(contains(html, "1284")); // devices reporting (meta.total_devices)
+    REQUIRE(contains(html, "37"));   // stale count
+    REQUIRE(contains(html, "updated")); // "updated 16m ago" (now-refreshed_at = 1000s)
     // Fleet-wide scope caveat is present (ADR-0017 honesty).
     REQUIRE(contains(html, "not yet effective"));
 }
 
-TEST_CASE("software fragment: capped marks the title count with a '+'", "[inventory][ui]") {
+TEST_CASE("software fragment: capped shows the list-capped banner", "[inventory][ui]") {
     std::vector<SoftwareCatalogRow> rows{cat_row("A", "p", 1, 1)};
-    const std::string html =
-        render_inventory_software_fragment(rows, "", std::nullopt, /*capped=*/true);
-    REQUIRE(contains(html, "1+"));
+    const std::string html = render_inventory_software_fragment(
+        rows, std::optional<CatalogRollupMeta>(CatalogRollupMeta{1000, 1, 1}), "", std::nullopt,
+        /*capped=*/true, /*now=*/2000);
     REQUIRE(contains(html, "list capped"));
 }
 
@@ -207,6 +223,11 @@ struct InvHarness {
                 return std::nullopt;
             return std::vector<SoftwareCatalogRow>{cat_row("Chrome", "Google", 5, 2)};
         };
+        auto catalog_meta = [this]() -> std::optional<CatalogRollupMeta> {
+            if (degrade)
+                return std::nullopt;
+            return CatalogRollupMeta{1000, 1, 5}; // refreshed_at>0 → not "building"
+        };
         auto versions = [this](const std::string&, int)
             -> std::optional<std::vector<SoftwareVersionCount>> {
             if (degrade)
@@ -250,8 +271,8 @@ struct InvHarness {
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             return true;
         };
-        routes.register_routes(sink, auth, perm, scoped, catalog, versions, fleet, agent_sw, devices,
-                               scope, stale, audit);
+        routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
+                               agent_sw, devices, scope, stale, audit);
     }
 };
 

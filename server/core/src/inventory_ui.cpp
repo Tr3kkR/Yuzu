@@ -61,6 +61,23 @@ const char* os_cls(const std::string& os) {
     return "";
 }
 
+// Relative-time string for a past epoch (the rollup "as of" line). PURE — the caller
+// passes `now` so the renderer never touches the clock.
+std::string rel_time(std::int64_t now_secs, std::int64_t then_secs) {
+    if (then_secs <= 0)
+        return "never";
+    std::int64_t d = now_secs - then_secs;
+    if (d < 0)
+        d = 0;
+    if (d < 90)
+        return "just now";
+    if (d < 5400)
+        return std::to_string(d / 60) + "m ago";
+    if (d < 172800)
+        return std::to_string(d / 3600) + "h ago";
+    return std::to_string(d / 86400) + "d ago";
+}
+
 // Inlined component CSS — emitted once per top-level fragment so styling is present
 // on any tab entry point (duplicate <style> on a tab swap is idempotent/harmless).
 std::string inv_style() {
@@ -146,35 +163,57 @@ std::string page_head() {
 } // namespace
 
 std::string render_inventory_software_fragment(
-    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue, const std::string& name_filter,
-    std::optional<std::int64_t> stale_count, bool capped) {
+    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue,
+    const std::optional<CatalogRollupMeta>& meta, const std::string& name_filter,
+    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs) {
     std::string h = page_head();
     h += inv_subnav("software");
 
-    // Freshness KPIs (cheap): titles shown + stale count. Devices-reporting / total-rows
-    // are deliberately omitted (each would be its own full-table scan — see the store).
-    const std::string titles = catalogue ? std::to_string(catalogue->size()) + (capped ? "+" : "")
-                                          : "&mdash;";
-    const std::string stale = stale_count ? std::to_string(*stale_count) : "&mdash;";
+    // KPIs come from the precomputed rollup meta (the page never runs a COUNT): distinct
+    // titles + devices reporting + the stale count (a separate cheap probe) + the "as of"
+    // freshness of the rollup itself.
+    const bool building = meta && meta->refreshed_at == 0;
+    const std::string titles = meta ? std::to_string(meta->total_titles) : std::string("&mdash;");
+    const std::string devices = meta ? std::to_string(meta->total_devices) : std::string("&mdash;");
+    const std::string stale = stale_count ? std::to_string(*stale_count) : std::string("&mdash;");
+    const std::string as_of =
+        (meta && meta->refreshed_at > 0) ? ("updated " + rel_time(now_secs, meta->refreshed_at))
+        : building                       ? std::string("building…")
+                                         : std::string("&mdash;");
     h += "<div class=\"inv-kpis\">"
-         "<div class=\"inv-kpi\"><div class=\"h\">Titles shown</div><div class=\"big\">" +
-         titles + "</div><div class=\"s2\">distinct installed-software names</div></div>"
-                  "<div class=\"inv-kpi warn\"><div class=\"h\">Stale (&gt;2 daily cycles)</div>"
-                  "<div class=\"big\">" +
-         stale + "</div><div class=\"s2\">last sync &gt; 48h ago · server time</div></div></div>";
+         "<div class=\"inv-kpi\"><div class=\"h\">Titles</div><div class=\"big\">" +
+         titles +
+         "</div><div class=\"s2\">distinct installed-software names</div></div>"
+         "<div class=\"inv-kpi\"><div class=\"h\">Devices reporting</div><div class=\"big\">" +
+         devices +
+         "</div><div class=\"s2\">in the inventory</div></div>"
+         "<div class=\"inv-kpi warn\"><div class=\"h\">Stale (&gt;2 daily cycles)</div>"
+         "<div class=\"big\">" +
+         stale +
+         "</div><div class=\"s2\">last sync &gt; 48h ago · server time</div></div>"
+         "<div class=\"inv-kpi\"><div class=\"h\">Catalogue</div>"
+         "<div class=\"big\" style=\"font-size:.95rem\">" +
+         as_of + "</div><div class=\"s2\">rollup refreshes hourly</div></div></div>";
 
     h += scope_caveat();
     h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter titles…\" "
          "value=\"" +
          esc(name_filter) +
          "\" oninput=\"gpSearch(this)\" data-gpf=\"invsw\"></div>"
-         "<div class=\"inv-banner\">Installed-software list rolled up across the fleet. "
-         "<b>Installs</b> = devices carrying the title. Click a title for its "
-         "<b>installs per version</b>. Counts are a Postgres aggregate, not capped flat rows.</div>";
+         "<div class=\"inv-banner\">Installed-software list rolled up across the fleet "
+         "(precomputed; refreshes hourly). <b>Installs</b> = devices carrying the title. Click a "
+         "title for its <b>installs per version</b>.</div>";
 
     if (!catalogue) {
         h += degrade_banner("Software catalogue");
         h += "</div>";
+        return h;
+    }
+    if (building) {
+        // Rollup never computed yet (refreshed_at==0) — distinct from a genuinely empty
+        // fleet. The thread refreshes shortly after startup.
+        h += "<div class=\"inv-empty\">Catalogue is building — the rollup refreshes hourly and "
+             "populates shortly after startup. Reload in a moment.</div></div>";
         return h;
     }
     if (catalogue->empty()) {

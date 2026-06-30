@@ -219,15 +219,17 @@ gate.
     same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
     present).
   - **⚠ `SoftwareInventoryStore::software_catalog` / `software_versions`** (the `/inventory`
-    Software-tab fleet aggregates) are a DIFFERENT shape: they are `GROUP BY count(DISTINCT
-    agent_id)` aggregates that **cannot** take a per-row admit-then-filter (a row filter applied
-    after the aggregate is meaningless — the counts already span all groups). They are safe **only**
-    while the `Inventory:Read` gate stays global (a confined operator is denied at the gate). When
-    PR-D below flips Inventory to admit-then-filter, these two methods **MUST** either (a) filter
-    **before** the aggregate (`WHERE agent_id IN (visible_set)` inside the GROUP BY) or (b) stay
-    pinned to a global-only permission — they **MUST NOT** be left on the flipped gate, or they
-    become an INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows
-    only to operators who already hold global read); this ADR entry is.
+    Software-tab fleet aggregates) are a DIFFERENT shape: they read a **precomputed, fleet-wide
+    rollup** (`catalog_rollup` / `version_rollup`, recomputed across ALL agents by the background
+    `SoftwareCatalogRollup` thread). A shared global rollup **cannot** take a per-row
+    admit-then-filter at read time — the counts are already aggregated across every group, and the
+    rollup is one shared table, not a per-operator view. They are safe **only** while the
+    `Inventory:Read` gate stays global (a confined operator is denied at the gate). When PR-D below
+    flips Inventory to admit-then-filter, the catalogue **MUST stay pinned to a global-only
+    permission** (per-operator rollups — one materialised table per management group — are the only
+    alternative and are out of scope). It **MUST NOT** be left on the flipped gate, or it becomes an
+    INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows only to
+    operators who already hold global read); this ADR entry is.
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)

@@ -180,11 +180,14 @@ same data, with three tabs:
   `Inventory:Read` — they are **not** management-group scoped (the same ADR-0017 caveat
   as the REST/MCP surfaces: confinement is inert under the global gate, so the counts
   span all groups; the UI says so inline). A freshness KPI shows the **stale** count
-  (devices that have not synced within two daily cycles). **Scale note:** the catalogue
-  is a live `GROUP BY` over the whole installed-software table, bounded by a ~3-second
-  execution budget; on a very large fleet it may exceed that budget and degrade to the
-  "unavailable" banner. That is intended fail-safe behaviour, not a defect — a
-  materialised rollup that removes the ceiling is a tracked follow-on.
+  (devices that have not synced within two daily cycles). **The catalogue is a
+  precomputed rollup**, not an on-demand query: a background thread recomputes the
+  per-title and per-version counts on a cadence (hourly) and the page reads the small
+  precomputed tables — the underlying installed-software changes only on the daily sync,
+  so recomputing per page-load would be wasteful and would not scale. The KPI strip shows
+  an **"updated N ago"** stamp for the rollup; immediately after a fresh server starts (or
+  before the first refresh) the catalogue shows a **"building"** note until the first
+  recompute lands. This keeps the default tab fast at any fleet size.
 - **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
   status, and last-seen, sourced from the server's persisted endpoint state so a device
   appears here **even when it is offline** (joined to the live registry for the online
