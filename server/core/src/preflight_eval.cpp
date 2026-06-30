@@ -1,5 +1,6 @@
 #include "preflight_eval.hpp"
 
+#include "preflight_run_store.hpp"
 #include "response_store.hpp"
 
 #include <nlohmann/json.hpp>
@@ -141,6 +142,47 @@ std::string config_to_json(const PreflightConfig& cfg) {
                         {"volume", cfg.volume},
                         {"reboot_block", cfg.reboot_block}};
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool persist_and_maybe_complete(PreflightRunStore& store, const std::string& run_id,
+                                const std::vector<PreflightDeviceResult>& grid,
+                                std::int64_t now_ms, bool past_deadline, bool any_pending) {
+    int go = 0, warn = 0, nogo = 0, inc = 0;
+    std::vector<PreflightRunDeviceRow> rows;
+    rows.reserve(grid.size());
+    for (const auto& dr : grid) {
+        PreflightRunDeviceRow row;
+        row.agent_id = dr.agent_id;
+        row.hostname = dr.hostname;
+        row.os = dr.os;
+        row.bucket = bucket_token(dr.bucket);
+        row.checks_json = checks_to_json(dr.checks);
+        row.updated_at_ms = now_ms;
+        rows.push_back(std::move(row));
+        switch (dr.bucket) {
+        case Bucket::kPass:
+            ++go;
+            break;
+        case Bucket::kFailed:
+            ++nogo;
+            break;
+        case Bucket::kWarnOnly:
+            ++warn;
+            break;
+        default:
+            ++inc;
+            break;
+        }
+    }
+    // compute → persist → THEN complete, so a viewer arriving right after completion
+    // reads the final grid, not a one-tick-stale one. Complete ONLY once the grid is
+    // durably persisted (#governance UP-1/CH-1): completing on a failed persist would
+    // freeze the run 'complete' with the seed grid; the next call retries instead.
+    const bool persisted =
+        store.persist_grid(run_id, rows, static_cast<int>(grid.size()), go, warn, nogo, inc);
+    if (persisted && (past_deadline || !any_pending))
+        return store.complete_run(run_id, now_ms);
+    return false;
 }
 
 PreflightConfig config_from_json(const std::string& json) {

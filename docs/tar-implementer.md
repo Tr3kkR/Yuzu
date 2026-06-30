@@ -318,9 +318,11 @@ header):
    touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
    `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
-   branch per non-live tier. **Usage-class / PII sources are opt-in**
-   (`default_enabled = false`, like `module`/`procperf`/`netqual`) under the
-   works-council posture.
+   branch per non-live tier. **Privacy-sensitive / usage-class sources are opt-in**
+   (`default_enabled = false`, like `module`/`procperf`/`netqual`/`dns`) under the
+   works-council posture. A source MAY also ship `default_enabled = false` as a
+   cautious roll-out default even when it carries no PII (e.g. `software` —
+   machine-scope asset inventory), letting an operator opt in per host.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
    `set_state` (advance the diff baseline **only on insert success**). For an

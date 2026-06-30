@@ -250,6 +250,45 @@ public:
     /// rows. Returns InvalidUsername for malformed input.
     std::expected<void, AuthDBError> clear_failed_logins(const std::string& username);
 
+    // ── Break-glass arming (hardened mode) ───────────────────────────────
+    //
+    // SOC 2 CC6.6. See docs/auth-architecture.md "Hardened mode". The single
+    // configured break-glass account (Config::break_glass_user) is exempt from
+    // --auth-mode=sso-only ONLY while armed. "Armed" is a future timestamp in
+    // users.break_glass_armed_until, evaluated in SQL against CURRENT_TIMESTAMP
+    // exactly like locked_until, so the exemption auto-expires and is never a
+    // permanent standing bypass. Arming is an out-of-band host operation
+    // (--break-glass-arm), not a session-authenticated route, so it works when
+    // the IdP is down (the case break-glass exists for).
+
+    struct BreakGlassStatus {
+        bool armed{false};        // break_glass_armed_until set AND still in the future
+        std::string armed_until;  // SQLite DATETIME string, or "" when dormant
+    };
+
+    /// Read-only break-glass arm check. Returns a zero-initialised
+    /// BreakGlassStatus (armed=false) when the user row is absent. Returns
+    /// InvalidUsername for malformed input.
+    std::expected<BreakGlassStatus, AuthDBError> break_glass_status(const std::string& username);
+
+    /// Arm the break-glass account for `window_secs` from now
+    /// (break_glass_armed_until = datetime('now', '+N seconds')). Single
+    /// UPDATE ... RETURNING (no sqlite3_changes() — #1033). Returns
+    /// UserNotFound when no active user row matched (so the host operator gets a
+    /// clear error rather than a silent no-op), InvalidUsername for malformed
+    /// input.
+    std::expected<BreakGlassStatus, AuthDBError> arm_break_glass(const std::string& username,
+                                                                 int window_secs);
+
+    /// Disarm the break-glass account (set break_glass_armed_until = NULL).
+    /// Used as the compensating un-arm when the mandatory `auth.breakglass.armed`
+    /// audit row fails to persist after `arm_break_glass` succeeded — so the
+    /// exemption is never left standing without an evidence row (review #1735
+    /// HIGH-2; honours the "never granted without a record" guarantee in
+    /// docs/ops-runbooks/auth-db-recovery.md). Idempotent; InvalidUsername for
+    /// malformed input. Parameterised, no sqlite3_changes() (#1033).
+    std::expected<void, AuthDBError> disarm_break_glass(const std::string& username);
+
     // ── MFA / TOTP Operations ────────────────────────────────────────────
     //
     // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and
@@ -387,5 +426,16 @@ private:
 /// Validate username format.
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
+
+/// Validate that `username` is usable as the hardened-mode break-glass account:
+/// a syntactically valid username naming an existing ACTIVE user that has MFA
+/// enrolled. Returns std::nullopt when usable, otherwise an operator-facing
+/// reason string. Mandatory-MFA is enforced here, fail-closed (SOC 2 CC6.6) so
+/// the sso-only escape hatch can never be a bare-password account; a store read
+/// error is also a problem (never report a broken account as usable). Because
+/// `mfa_status` filters `is_active = 1`, a soft-deleted user reads as
+/// not-enrolled and is correctly rejected. Shared by the server boot guard and
+/// the `--break-glass-arm` one-shot so both apply one contract.
+std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::string& username);
 
 } // namespace yuzu::server

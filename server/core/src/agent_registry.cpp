@@ -672,8 +672,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"tar.export", "Export timeline events as structured data"},
         {"tar.configure", "Update TAR collection intervals and retention settings"},
         {"tar.collect_fast", "Run fast collectors (processes + network connections)"},
-        {"tar.collect_slow", "Run slow collectors (services + users + installed apps)"},
+        {"tar.collect_slow", "Run slow collectors (services + users)"},
         {"tar.collect_perf", "Record one device performance sample (CPU/memory/disk/network)"},
+        {"tar.collect_software",
+         "Scan installed software and record install/uninstall/upgrade events"},
     };
     return m;
 }

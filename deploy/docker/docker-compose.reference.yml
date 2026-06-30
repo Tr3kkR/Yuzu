@@ -158,14 +158,16 @@ services:
       # First-boot init refuses to run if they are equal or if this is
       # unset. The server's YUZU_POSTGRES_DSN carries this credential.
       YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (app role password, distinct from YUZU_POSTGRES_PASSWORD)}
-      # PG18 defaults PGDATA to a version-pinned subdir (/var/lib/postgresql/18/
-      # docker); pin it back to the mounted /data path so the data lands in the
-      # named volume below (else PG18 treats the /data mount as unused and aborts).
-      PGDATA: /var/lib/postgresql/data
     volumes:
       # Database state — same persistence rules as server-data: back it up,
       # never `down -v` unless you intend to destroy it.
-      - postgres-data:/var/lib/postgresql/data
+      # PG18 mount point: the parent dir, NOT .../data. The postgres:18 image
+      # stores data in a version-pinned subdir (default $PGDATA=/var/lib/
+      # postgresql/18/docker, which lives inside this mount); a volume at the
+      # legacy /data path is read as an un-migrated upgrade and the container
+      # refuses to boot (docker-library/postgres#1259). Leave PGDATA at the
+      # image default — do not pin it back to /data.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       # -h 127.0.0.1 forces a TCP probe — during first-boot init the
       # temporary server listens on the unix socket only, so a socket

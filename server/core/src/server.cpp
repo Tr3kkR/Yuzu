@@ -78,6 +78,8 @@
 #include "network_routes.hpp"
 #include "device_routes.hpp"
 #include "preflight_eval.hpp"
+#include "deployment_routes.hpp"
+#include "deployment_run_store.hpp"
 #include "preflight_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "preflight_runner.hpp"
@@ -1083,6 +1085,19 @@ public:
             if (!preflight_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: preflight-run store migration/open failed "
                               "(database reachable but the preflight_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // DeploymentRunStore — born-on-PG persistence for the /auto DEPLOY stage
+        // (the per-device stage→execute state machine). Same fail-CLOSED
+        // construction posture as PreflightRunStore (ADR-0012 §1).
+        if (pg_pool_ && !startup_failed_) {
+            deployment_run_store_ = std::make_unique<DeploymentRunStore>(*pg_pool_);
+            if (!deployment_run_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
+                              "(database reachable but the deployment_run_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -3023,6 +3038,10 @@ public:
         // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
         // thread that leased it is already joined above).
         preflight_run_store_.reset();
+        // DeploymentRunStore likewise borrows pg_pool_ — drop before the pool
+        // (no background thread in slice 1, but keep the ADR-0012 teardown
+        // discipline so a future DeploymentRunner can't UAF).
+        deployment_run_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -8370,6 +8389,25 @@ private:
                         spdlog::error("preflight_runner: tick threw unknown exception — continuing");
                     }
                 }
+                // 14-day retention for deployment runs. DeploymentRunStore has no
+                // background runner of its own in slice 1, so the prune piggy-backs
+                // this thread (mirrors the preflight prune cadence) — without it the
+                // documented retention never runs and deployment_device grows
+                // unbounded (#governance H2/CAP-1).
+                if (deployment_run_store_ && deployment_run_store_->is_open()) {
+                    try {
+                        const auto cutoff =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count() -
+                            14LL * 24 * 60 * 60 * 1000;
+                        deployment_run_store_->prune_older_than(cutoff);
+                    } catch (const std::exception& e) {
+                        spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
+                    } catch (...) {
+                        spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
             }
         });
 
@@ -9054,6 +9092,32 @@ private:
                 return preflight::collect_check_responses(*response_store_, run_id, applicable);
             },
             audit_fn, preflight_run_store_.get());
+
+        // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
+        // a go-cohort (mid-run, no completion required), stages + executes an
+        // installer (content_dist) on the cleared-so-far devices, tracking the
+        // per-device stage→execute state machine. Reuses the scoped
+        // device provider (devices_fn) for the live re-authorization the MUTATING
+        // execute step requires, the SAME 6-param untracked dispatch (execution_id
+        // "deployment-<id>-{stage,exec}" → skipped by notify_exec_tracker, like
+        // preflight-), and a narrow ResponseStore poll seam (query_by_execution +
+        // latest_per_agent). The cohort is read from preflight_run_store_.
+        deployment_routes_ = std::make_unique<DeploymentRoutes>();
+        deployment_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_fn,
+            // Poll seam: execution_id → best (status, output) per agent. Same
+            // scoring as the pre-flight collect (terminal beats running, then
+            // non-empty output, then later arrival).
+            [this](const std::string& execution_id)
+                -> std::unordered_map<std::string, deployment::AgentResponse> {
+                if (!response_store_)
+                    return {};
+                ResponseQuery q;
+                q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
+                return deployment::best_response_per_agent(
+                    response_store_->query_by_execution(execution_id, q));
+            },
+            audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
 
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
@@ -9933,6 +9997,7 @@ private:
     /// Born-on-PG persistence for /auto pre-flight runs. Borrows pg_pool_ →
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
+    std::unique_ptr<DeploymentRunStore> deployment_run_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -10026,6 +10091,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
+    std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =

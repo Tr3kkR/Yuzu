@@ -131,18 +131,28 @@ std::size_t dex_catalogued_type_count() {
 // in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
 std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
     static const char* const kLinux[] = {
-        // /proc + statvfs polls (dex_linux_proc / dex_linux_storage)
-        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
-        // systemd-structured journal (dex_linux_journal)
-        "process.crashed", "service.crashed", "memory.exhausted"};
-    // NOTE: the expanded Linux kernel/sysfs signals — perf.disk_latency_high,
-    // hw.cpu_throttled (dex_linux_sysfs); service.hung, os.time_unsynced
-    // (journal); os.bugcheck, os.dirty_shutdown, disk.error, fs.corruption,
-    // hw.error, process.hung (dex_linux_kmsg) — land WITH their collectors in the
-    // dex-linux-signals batch (#1523). Re-add them here in the same change that
-    // brings those collectors onto this branch, and extend the drift-net test in
-    // test_dex_routes.cpp. Until then the map must not advertise a Linux signal
-    // nothing collects, or a Linux fleet reads "monitored, quiet" as healthy.
+        // poll_perf: /proc/stat + /proc/meminfo + /proc/diskstats breaches (all three
+        // via the SAME win::breach_update used on Windows) + statvfs storage + uptime
+        "perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high", "storage.low",
+        "os.uptime_report",
+        // poll_throttle: sysfs thermal-throttle counter (dex_linux_sysfs → dex_linux_collector)
+        "hw.cpu_throttled",
+        // systemd-structured journal records (dex_linux_journal)
+        "process.crashed", "service.crashed", "service.hung", "os.time_unsynced",
+        // kernel-transport journal lines, classified by dex_linux_kmsg
+        // (classify_kernel_message, delegated from parse_journal_line)
+        "memory.exhausted", "os.bugcheck", "os.dirty_shutdown", "disk.error", "fs.corruption",
+        "hw.error", "process.hung"};
+    // The Linux DEX observer (dex_linux_collector) drives all of the above: poll_perf
+    // (the /proc CPU + memory + diskstats breach trio — perf.disk_latency_high is the
+    // /proc/diskstats await breach, as live as cpu/mem on any ordinary sd*/nvme*/mmcblk
+    // disk; only exotic/fabric storage is excluded, dex_linux_proc.hpp is_whole_disk) +
+    // statvfs storage + the sysfs throttle counter + the journald poll, whose every
+    // `_TRANSPORT=kernel` line is delegated to dex_linux_kmsg's classify_kernel_message
+    // (so the kmsg-classified types ARE emitted at runtime via journald, not a separate
+    // unwired reader). Keep this map and the drift-net test in test_dex_routes.cpp in
+    // lockstep with the collectors — they are hand-maintained because the server suite
+    // can't introspect the agent (durable fix: generate from the collector registries).
     static const char* const kMac[] = {
         "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
         "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",

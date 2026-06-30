@@ -195,6 +195,7 @@ Add `parameters` map to the existing signature so the SQL can be forwarded to th
 | TAR: Daily Connection Summary | `SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC` |
 | TAR: User Sessions | `SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200` |
 | TAR: Process Tree | `SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts` |
+| TAR: Software Changes | `SELECT ts, action, name, version, prev_version, scope, user FROM $Software_Live ORDER BY ts DESC LIMIT 200` |
 
 ---
 
@@ -209,8 +210,8 @@ Add `parameters` map to the existing signature so the SQL can be forwarded to th
 ## Phase 8: Additional Capture Sources
 
 ### Wave 1: Cross-platform
-1. **Software installations** -- Windows: registry. Linux: dpkg/rpm. macOS: Applications + pkgutil. Tables: `software_live`, `software_daily`
-2. **Device performance** -- CPU %, memory, disk I/O. Tables: `performance_live`, `performance_hourly`
+1. **Software installations** ✅ (Windows) -- diffs the machine-wide registry Uninstall keys (HKLM 64/32-bit; machine scope only — no per-user `HKU\<SID>`/`NTUSER.DAT`, so no profile-name PII) on the `tar.software` tick. Tables: `software_live`, `software_daily`, `software_monthly`. Linux (dpkg/rpm) + macOS (pkgutil) collectors are a fast-follow (schema is queryable-empty there). Off by default (opt-in via `software_enabled`). See `docs/user-manual/tar.md`.
+2. **Device performance** ✅ -- CPU %, memory, disk I/O. Tables: `perf_live`, `perf_hourly` (shipped as the `perf`/`procperf` sources).
 
 ### Wave 2: Windows + partial macOS
 3. **Boot performance** -- Event Log / uptime. Live-only

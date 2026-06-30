@@ -448,6 +448,97 @@ TEST_CASE("TAR compute_process_events: macOS is names-only; cmdline kept elsewhe
 }
 
 // =============================================================================
+// Software install/uninstall diff tests (compute_software_events)
+// =============================================================================
+
+namespace {
+SoftwareInfo sw(std::string name, std::string version) {
+    SoftwareInfo s;
+    s.name = std::move(name);
+    s.version = std::move(version);
+    s.publisher = "Acme";
+    s.install_date = "20260101";
+    return s;
+}
+} // namespace
+
+TEST_CASE("TAR software diff: install detected", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev;
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "23.01")};
+
+    auto events = compute_software_events(prev, curr, 1000, 1);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "installed");
+    CHECK(events[0].name == "7-Zip");
+    CHECK(events[0].version == "23.01");
+    CHECK(events[0].prev_version.empty());
+    CHECK(events[0].ts == 1000);
+    CHECK(events[0].snapshot_id == 1);
+}
+
+TEST_CASE("TAR software diff: removal detected", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr;
+
+    auto events = compute_software_events(prev, curr, 2000, 2);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "removed");
+    CHECK(events[0].name == "7-Zip");
+}
+
+TEST_CASE("TAR software diff: version change is one upgrade, not remove+install",
+          "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "24.00")};
+
+    auto events = compute_software_events(prev, curr, 3000, 3);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "upgraded");
+    CHECK(events[0].version == "24.00");
+    CHECK(events[0].prev_version == "23.01");
+}
+
+TEST_CASE("TAR software diff: same version produces no event", "[tar][diff][software]") {
+    std::vector<SoftwareInfo> prev = {sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("7-Zip", "23.01")};
+
+    auto events = compute_software_events(prev, curr, 4000, 4);
+
+    CHECK(events.empty());
+}
+
+TEST_CASE("TAR software diff: empty snapshots produce no events (cold-start contract)",
+          "[tar][diff][software]") {
+    // The plugin seeds the baseline silently on first run; at the diff level an
+    // empty-vs-empty comparison must produce nothing.
+    std::vector<SoftwareInfo> prev;
+    std::vector<SoftwareInfo> curr;
+
+    auto events = compute_software_events(prev, curr, 7000, 7);
+
+    CHECK(events.empty());
+}
+
+TEST_CASE("TAR software diff: an unchanged entry is inert while a sibling changes",
+          "[tar][diff][software]") {
+    // An entry byte-identical in previous and current must emit NO event even when
+    // another entry in the same snapshot genuinely changes — only the real change
+    // is reported.
+    std::vector<SoftwareInfo> prev = {sw("Notepad++", "8.6"), sw("7-Zip", "23.01")};
+    std::vector<SoftwareInfo> curr = {sw("Notepad++", "8.6"),  // unchanged
+                                      sw("7-Zip", "24.00")};    // real upgrade
+
+    auto events = compute_software_events(prev, curr, 8000, 8);
+
+    REQUIRE(events.size() == 1); // only the upgrade — the unchanged entry is inert
+    CHECK(events[0].action == "upgraded");
+    CHECK(events[0].name == "7-Zip");
+}
+
+// =============================================================================
 // ARP diff tests (ADR-0015) — keyed on (iface, ip, mac); entry_type not keyed
 // =============================================================================
 
