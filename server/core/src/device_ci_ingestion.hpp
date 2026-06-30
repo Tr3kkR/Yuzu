@@ -28,8 +28,6 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-class DeviceInventoryStore;
-
 /// Parse the `device_ci` canonical wire blob into a record: one 0x1E-terminated
 /// record of 0x1F-separated fields, each UTF-8-scrubbed + clamped IDENTICALLY to the
 /// agent (sync_source_device_ci.cpp) so the store's recomputed hash equals the

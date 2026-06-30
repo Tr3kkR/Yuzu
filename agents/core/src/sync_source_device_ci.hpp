@@ -61,6 +61,21 @@ struct CiRecord {
 /// (`device_ci_ingestion.cpp`) so the server-recomputed hash equals this one.
 YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 
+/// True when the platform's core-identity subsystem was unavailable for this
+/// collection — Windows WMI down (every WMI-gated action returns the `"unknown"`
+/// sentinel at rc=0, so the per-action rc check does NOT catch it) or the Linux
+/// DMI tables unreadable. The tell is `manufacturer` AND `model` both `"unknown"`:
+/// both come from the SAME query behind ONE availability gate, so on a functioning
+/// machine — physical OR virtual — both are always real (a VM reports e.g.
+/// "VMware, Inc."/"VMware7,1"). Using AND (not OR) avoids skipping a healthy host
+/// that reports a real manufacturer but an empty model forever. When true, the
+/// collect skips the cycle rather than persist a degraded record whose
+/// `serial`/`system_uuid` collapsed to `"unknown"` — which would overwrite the
+/// last-good CI row and flap the content hash on every WMI blip (UP-1). A
+/// genuinely serial-less host (a VM with real manufacturer/model) is NOT skipped;
+/// its stable `"unknown"` serial persists. Pure/deterministic — unit-tested.
+YUZU_EXPORT bool core_identity_unavailable(const CiRecord& rec);
+
 /// Build the `device_ci` SyncSource. Each argument is a loaded plugin descriptor;
 /// if ANY required plugin is null (not built/loaded — e.g. `build_examples=false`)
 /// the source's collect returns `std::nullopt` and the scheduler no-ops it (a

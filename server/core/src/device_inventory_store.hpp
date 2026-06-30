@@ -25,9 +25,10 @@
 ///   - `last_seen`/`first_seen` are the **SERVER receipt time**, never the
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
-#include "software_inventory_store.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
+#include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -77,10 +78,13 @@ struct DeviceCiRecord {
     std::int64_t last_seen{0};  ///< server receipt time (epoch seconds)
 };
 
-/// Authoritative single-record read outcome — `kDegraded` (store/pool/query
-/// failure) is distinct from `kAbsent` (read succeeded, no CI record for this
-/// agent yet) so a caller can show an error banner vs a "not yet synced" note.
-enum class CiReadOutcome { kFound, kAbsent, kDegraded };
+/// Error type for the authoritative single-record read. The success type is
+/// `std::optional<DeviceCiRecord>`: a value == found, `std::nullopt` == absent
+/// (read succeeded, no CI record for this agent yet). `std::unexpected(kDegraded)`
+/// == store/pool/query failure (the caller shows an error banner vs a "not yet
+/// synced" note). Out-params are forbidden in new code (docs/cpp-conventions.md) —
+/// hence `std::expected` rather than an enum + out-param.
+enum class CiReadError { kDegraded };
 
 class DeviceInventoryStore {
 public:
@@ -119,9 +123,12 @@ public:
                                            std::optional<DeviceCiRecord> rec,
                                            std::int64_t collected_at);
 
-    /// One agent's CI record (per-device drill). Authoritative: `kDegraded` on a
-    /// store/pool/query failure, `kAbsent` when there is genuinely no row.
-    [[nodiscard]] CiReadOutcome get_device_ci(std::string_view agent_id, DeviceCiRecord& out);
+    /// One agent's CI record (per-device drill). Authoritative: `std::unexpected(
+    /// CiReadError::kDegraded)` on a store/pool/query failure; a value holding
+    /// `std::nullopt` when there is genuinely no row; a value holding the record
+    /// when found.
+    [[nodiscard]] std::expected<std::optional<DeviceCiRecord>, CiReadError>
+    get_device_ci(std::string_view agent_id);
 
     /// The whole device-CI roster (the PR2 devices tab source), hostname-sorted,
     /// capped at a hard ceiling regardless of `limit`. Authoritative: `std::nullopt`

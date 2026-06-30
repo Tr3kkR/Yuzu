@@ -1,6 +1,7 @@
 // Device-CI daily-sync tests (ADR-0016): the canonical-hash cross-pin with the
-// server (tests/unit/server/test_device_inventory_store.cpp — identical constant)
-// and the SyncSource idle-when-a-plugin-is-missing contract.
+// server (tests/unit/server/test_device_inventory_store.cpp — identical constants),
+// the dirty-input cross-pin that locks the scrub/clamp copies, the core-identity
+// skip guard (UP-1), and the SyncSource idle-when-a-plugin-is-missing contract.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -8,19 +9,26 @@
 #include "sync_source_installed_software.hpp" // yuzu::agent::sha256_hex
 
 #include <chrono>
+#include <string>
 
 using yuzu::agent::CiRecord;
+using yuzu::agent::core_identity_unavailable;
 using yuzu::agent::device_ci_canonical_blob;
 using yuzu::agent::make_device_ci_source;
 using yuzu::agent::sha256_hex;
 
 namespace {
-// THE cross-side pin (ADR-0016 §4): the server computes the SAME hash for the SAME
-// record (tests/unit/server/test_device_inventory_store.cpp — identical constant).
+// THE cross-side pins (ADR-0016 §4): the server computes the SAME hash for the SAME
+// record (tests/unit/server/test_device_inventory_store.cpp — identical constants).
 // A one-byte drift in either canonicalisation fails one assertion and the hash-skip
 // optimisation is broken before it ships.
 constexpr const char* kCrossPinHash =
     "467abd73a70803c5c762a26a4c7ffce536dda060d296ad83aed649473388f975";
+// Dirty-input pin: locks the UTF-8 scrub + >1024 clamp across the agent's copy and
+// the server's shared utf8_sanitize.hpp — the clean pin alone never exercises them
+// (gov consensus: security MEDIUM + cpp-expert/architect/quality/consistency SHOULD).
+constexpr const char* kDirtyCrossPinHash =
+    "d569640762613846756047c953a0bc53b8e01c1e05aea4c4c62b68021434d7bc";
 
 // The fixed cross-pin record. All fields are clean ASCII (no separator/control
 // bytes), so the agent clamp is a no-op and the bytes equal the server's raw
@@ -51,10 +59,43 @@ CiRecord sample() {
     r.arch = "x86_64";
     return r;
 }
+
+// The dirty cross-pin record. Real manufacturer/model (so the skip guard never
+// fires), with divergence-prone fields: a valid multibyte sequence (must survive),
+// an invalid UTF-8 byte (must scrub to U+FFFD), and a >1024-byte field (must clamp
+// on a codepoint boundary). NO interior 0x1F/0x1E — the agent strips those before
+// hashing, so a real agent never emits one; only the scrub + clamp can diverge.
+// The literal field values here MUST be byte-identical to the server twin.
+CiRecord dirty() {
+    CiRecord r = sample();
+    r.manufacturer = "M\xC3\xBCller GmbH"; // valid UTF-8 ü (C3 BC) — preserved
+    r.model = "OptiPlex 7090";
+    r.serial = "S\xFF"
+               "N123";                     // invalid byte 0xFF → U+FFFD
+    r.cpu_model = std::string(1100, 'Z');  // > kMaxFieldLen (1024) → truncated
+    return r;
+}
 } // namespace
 
 TEST_CASE("device_ci canonical hash matches the cross-pin", "[sync][device_ci][hash]") {
     CHECK(sha256_hex(device_ci_canonical_blob(sample())) == kCrossPinHash);
+}
+
+TEST_CASE("device_ci dirty-input canonical hash matches the cross-pin",
+          "[sync][device_ci][hash]") {
+    CHECK(sha256_hex(device_ci_canonical_blob(dirty())) == kDirtyCrossPinHash);
+}
+
+TEST_CASE("core_identity_unavailable: AND of manufacturer+model unknown", "[sync][device_ci]") {
+    CiRecord r = sample();
+    CHECK(!core_identity_unavailable(r)); // both real
+    r.serial = "unknown";
+    r.system_uuid = "unknown";
+    CHECK(!core_identity_unavailable(r)); // a serial-less VM (real mfr/model) is NOT skipped
+    r.manufacturer = "unknown";
+    CHECK(!core_identity_unavailable(r)); // only one of mfr/model unknown → not skipped (AND)
+    r.model = "unknown";
+    CHECK(core_identity_unavailable(r)); // both unknown → WMI/DMI wholesale down → skip
 }
 
 TEST_CASE("device_ci source idles when a required plugin is missing", "[sync][device_ci]") {

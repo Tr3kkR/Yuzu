@@ -1539,11 +1539,11 @@ public:
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
-                        // control): never start the daily-sync thread, collect or push no
-                        // installed-software inventory.
+                        // control): never start the daily-sync thread — NO source collects
+                        // or pushes (installed_software, app_perf, device_ci device identity).
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
-                                     "YUZU_AGENT_INVENTORY_DISABLE) — no installed-software "
-                                     "inventory collected or pushed");
+                                     "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
+                                     "pushed (sources: installed_software, app_perf, device_ci)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);

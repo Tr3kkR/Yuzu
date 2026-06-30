@@ -2,6 +2,7 @@
 
 #include "agent.pb.h"
 #include "device_inventory_store.hpp"
+#include "utf8_sanitize.hpp" // shared yuzu::server::sanitize_utf8_strict (server side of the pair)
 
 #include <yuzu/metrics.hpp>
 
@@ -33,64 +34,13 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // missing trailing fields stay empty.
 constexpr std::size_t kFieldCount = 22;
 
-// ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
-// VERBATIM copy of sync_source_device_ci.cpp's sanitize_utf8_strict + clamp_field
-// (which is itself a copy of the installed_software pair). The bytes MUST be
-// identical on both sides, or the agent- and server-recomputed canonical hashes
-// diverge → permanent need_full. Scrub BEFORE clamp; strip only the framing
-// separators (0x1F/0x1E) + NUL (NOT all control bytes — the agent keeps e.g. tabs).
-std::string sanitize_utf8_strict(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    const std::size_t n = s.size();
-    const auto cont = [&](std::size_t j) -> bool {
-        return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
-    };
-    std::size_t i = 0;
-    while (i < n) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
-        std::size_t len = 0;
-        bool ok = false;
-        if (c < 0x80) {
-            ok = true;
-            len = 1;
-        } else if (c >= 0xC2 && c <= 0xDF) {
-            ok = cont(i + 1);
-            len = 2;
-        } else if (c == 0xE0) {
-            ok = c1 >= 0xA0 && c1 <= 0xBF && cont(i + 2);
-            len = 3;
-        } else if (c >= 0xE1 && c <= 0xEC) {
-            ok = cont(i + 1) && cont(i + 2);
-            len = 3;
-        } else if (c == 0xED) {
-            ok = c1 >= 0x80 && c1 <= 0x9F && cont(i + 2);
-            len = 3;
-        } else if (c >= 0xEE && c <= 0xEF) {
-            ok = cont(i + 1) && cont(i + 2);
-            len = 3;
-        } else if (c == 0xF0) {
-            ok = c1 >= 0x90 && c1 <= 0xBF && cont(i + 2) && cont(i + 3);
-            len = 4;
-        } else if (c >= 0xF1 && c <= 0xF3) {
-            ok = cont(i + 1) && cont(i + 2) && cont(i + 3);
-            len = 4;
-        } else if (c == 0xF4) {
-            ok = c1 >= 0x80 && c1 <= 0x8F && cont(i + 2) && cont(i + 3);
-            len = 4;
-        }
-        if (ok) {
-            out.append(s.data() + i, len);
-            i += len;
-        } else {
-            out.append("\xEF\xBF\xBD", 3); // U+FFFD, advance one byte
-            i += 1;
-        }
-    }
-    return out;
-}
-
+// ── field clamp ─────────────────────────────────────────────────────────────
+// UTF-8 scrub via the shared server-side yuzu::server::sanitize_utf8_strict
+// (utf8_sanitize.hpp) — the SAME impl installed_software's seam uses, byte-pinned
+// against the agent's copy by the cross-pin test. clamp_field stays local because it
+// strips only the framing separators (0x1F/0x1E) + NUL (NOT all control bytes — the
+// agent keeps e.g. tabs), unlike app_perf's all-C0 variant. Scrub BEFORE clamp
+// (U+FFFD is 3 bytes; clamping first would budget differently on each side).
 std::string clamp_field(std::string_view raw) {
     std::string f = sanitize_utf8_strict(raw);
     if (f.size() > kMaxFieldLen) {
@@ -200,8 +150,24 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
     }
     // rec == nullopt → hash-only report: the store compares claimed_hash against the
     // stored hash (kTouched on match, kNeedFull on cold/drift).
+    // Time the apply (parity with the installed_software / app_perf seams), split by
+    // phase: a `full` payload runs the upsert; a `hash_only` report is a compare +
+    // last_seen bump. Computed BEFORE the move (rec is consumed by apply).
+    const char* phase = rec.has_value() ? "full" : "hash_only";
+    const auto ingest_t0 = std::chrono::steady_clock::now();
     const InventoryIngestOutcome outcome =
         store.apply_device_ci(agent_id, claimed_hash, std::move(rec), collected_at);
+    if (metrics) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - ingest_t0).count();
+        // Shares the yuzu_inventory_ingest_duration_seconds family with installed_software;
+        // MUST pass seconds_buckets_60s() (the bucket-ceiling contract, #1686 UP-6).
+        metrics
+            ->histogram("yuzu_inventory_ingest_duration_seconds",
+                        {{"source", kSourceDeviceCi}, {"phase", phase}},
+                        yuzu::Histogram::seconds_buckets_60s())
+            .observe(secs);
+    }
     emit(outcome == InventoryIngestOutcome::kStored    ? "stored"
          : outcome == InventoryIngestOutcome::kTouched ? "touched"
          : outcome == InventoryIngestOutcome::kNeedFull ? "need_full"

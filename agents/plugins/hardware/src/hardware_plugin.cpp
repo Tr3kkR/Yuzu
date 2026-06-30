@@ -323,9 +323,13 @@ int do_bios(yuzu::CommandContext& ctx) {
 
 int do_system(yuzu::CommandContext& ctx) {
 #ifdef __linux__
-    // /sys/class/dmi/id/product_serial and product_uuid are root-readable only.
-    // The agent runs as a service account / root (docs/agent-privilege-model.md),
-    // so this succeeds in production; a non-privileged run yields "unknown".
+    // /sys/class/dmi/id/product_serial and product_uuid are 0400 (root-owned). The
+    // Linux agent runs as the UNPRIVILEGED `yuzu` account, not root — the default
+    // install grants the binary cap_dac_read_search+eip (scripts/install-agent-user.sh),
+    // which this in-process ifstream inherits in its effective set, so the read
+    // succeeds. (A spawned child — e.g. dmidecode — would NOT inherit the effective
+    // cap, so reading the file in-process is deliberate.) With --no-setcap, missing
+    // libcap, or a dev/manual launch the read fails and both yield "unknown".
     auto serial = read_dmi_file("/sys/class/dmi/id/product_serial");
     auto uuid = read_dmi_file("/sys/class/dmi/id/product_uuid");
     ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));

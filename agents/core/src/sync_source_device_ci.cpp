@@ -196,6 +196,13 @@ std::string device_ci_canonical_blob(const CiRecord& rec) {
     return canon;
 }
 
+bool core_identity_unavailable(const CiRecord& rec) {
+    // manufacturer + model share one availability gate (Win32_ComputerSystem behind
+    // wmi.valid(); /sys/class/dmi/id behind the DMI read). Both "unknown" ⇒ the whole
+    // identity subsystem was down for this collection. AND, not OR (see the header).
+    return rec.manufacturer == "unknown" && rec.model == "unknown";
+}
+
 SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
                                  const YuzuPluginDescriptor* device_identity,
                                  const YuzuPluginDescriptor* os_info,
@@ -238,7 +245,7 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
 
         auto manufacturer = run(hardware, "manufacturer");
         auto model = run(hardware, "model");
-        auto system = run(hardware, "system");
+        auto system_out = run(hardware, "system");
         auto bios = run(hardware, "bios");
         auto processors = run(hardware, "processors");
         auto memory = run(hardware, "memory");
@@ -251,7 +258,7 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         auto os_build = run(os_info, "os_build");
         auto os_arch = run(os_info, "os_arch");
         auto adapters = run(network_config, "adapters");
-        if (!manufacturer || !model || !system || !bios || !processors || !memory || !disks ||
+        if (!manufacturer || !model || !system_out || !bios || !processors || !memory || !disks ||
             !device_name || !domain || !ou || !os_name || !os_version || !os_build || !os_arch ||
             !adapters)
             return std::nullopt; // a required action failed → skip the cycle
@@ -259,8 +266,8 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         CiRecord rec;
         rec.manufacturer = scalar(*manufacturer, "manufacturer");
         rec.model = scalar(*model, "model");
-        rec.serial = scalar(*system, "serial");
-        rec.system_uuid = scalar(*system, "system_uuid");
+        rec.serial = scalar(*system_out, "serial");
+        rec.system_uuid = scalar(*system_out, "system_uuid");
         rec.hostname = scalar(*device_name, "device_name");
         rec.domain = scalar(*domain, "domain");
         rec.ou = scalar(*ou, "ou");
@@ -334,6 +341,18 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
             if (i)
                 rec.macs_summary += ",";
             rec.macs_summary += macs[i];
+        }
+
+        // UP-1: a transient WMI/DMI outage makes the identity actions emit the
+        // "unknown" sentinel at rc=0 (the per-action rc check above can't see it).
+        // Persisting that record would overwrite the last-good CI row and flap the
+        // content hash every blip; worse, every affected host stores the same
+        // serial/uuid="unknown". Skip the cycle instead — the next cycle re-collects.
+        // A genuinely serial-less VM (real manufacturer/model) is NOT caught here.
+        if (core_identity_unavailable(rec)) {
+            spdlog::warn("sync: device_ci core identity unavailable (manufacturer + model both "
+                         "'unknown' — WMI/DMI down) — skipping this cycle");
+            return std::nullopt;
         }
 
         std::string blob = device_ci_canonical_blob(rec);

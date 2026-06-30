@@ -11,9 +11,13 @@
 #include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,11 +42,45 @@ constexpr int kListRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
+// so a sustained PG outage during a roster poll cannot flood the log — the counter
+// is the continuous signal, the log a sampled breadcrumb. Values match the
+// SoftwareInventoryStore sibling (consistency S1; a 4th copy is the convention).
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// Per-site degrade-WARN state (one static instance per call site).
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+struct DegradeLog {
+    bool should_log;
+    std::uint64_t occurrence;
+};
+
+// Always increment the SHARED read-degrade counter with a source label (so the
+// existing YuzuInventoryReadDegraded alert — which sums yuzu_inventory_read_degrade_total
+// — covers device_ci too, while the label keeps it distinguishable from
+// installed_software; sre BLOCKING reconciled with consistency N1). Decide whether
+// this degrade emits a sampled WARN. Mirrors SoftwareInventoryStore::note_read_degrade.
+DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
+                             DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", reason}, {"source", "device_ci"}})
+            .increment();
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return {new_episode || (n % kReadDegradeLogSample) == 0, n};
 }
 
 std::int64_t to_i64(const char* s) {
@@ -53,8 +91,11 @@ std::int64_t to_i64(const char* s) {
 
 // Normalise a wire decimal string to a canonical bigint literal for the typed
 // columns. A malformed/empty value becomes "0" (never an invalid SQL literal).
+// from_chars is locale-independent and leaves `v` at 0 on a parse miss.
 std::string bigint_param(const std::string& s) {
-    return std::to_string(static_cast<long long>(s.empty() ? 0 : std::strtoll(s.c_str(), nullptr, 10)));
+    long long v = 0;
+    std::from_chars(s.data(), s.data() + s.size(), v);
+    return std::to_string(v);
 }
 
 std::string sha256_hex(const std::string& in) {
@@ -124,7 +165,7 @@ constexpr const char* kSelectCols =
 
 void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     int c = 0;
-    const auto col = [&](void) { return PQgetvalue(res, row, c++); };
+    const auto col = [&]() { return PQgetvalue(res, row, c++); };
     out.agent_id = col();
     out.manufacturer = col();
     out.model = col();
@@ -293,61 +334,55 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
     return InventoryIngestOutcome::kStored;
 }
 
-CiReadOutcome DeviceInventoryStore::get_device_ci(std::string_view agent_id, DeviceCiRecord& out) {
+std::expected<std::optional<DeviceCiRecord>, CiReadError>
+DeviceInventoryStore::get_device_ci(std::string_view agent_id) {
     if (!open_) {
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonStoreNotOpen}})
-                .increment();
-        return CiReadOutcome::kDegraded;
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: get on a closed store");
+        return std::unexpected(CiReadError::kDegraded);
     }
     if (agent_id.empty())
-        return CiReadOutcome::kAbsent;
+        return std::optional<DeviceCiRecord>{}; // precondition miss → absent, not a degrade
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::warn("DeviceInventoryStore: get skipped, no connection in time ({})",
-                     pool_.last_error());
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonPoolTimeout}})
-                .increment();
-        return CiReadOutcome::kDegraded;
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: get skipped, no connection in time ({})",
+                         pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
     }
     const std::string sql = std::string("SELECT ") + kSelectCols +
                             " FROM device_inventory_store.device_ci WHERE agent_id = $1";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
                                        std::vector<std::string>{std::string(agent_id)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("DeviceInventoryStore: get failed for agent={}: {}", agent_id,
-                     PQerrorMessage(lease.get()));
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonQueryError}})
-                .increment();
-        return CiReadOutcome::kDegraded;
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: get failed for agent={}: {}", agent_id,
+                         PQerrorMessage(lease.get()));
+        return std::unexpected(CiReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
-        return CiReadOutcome::kAbsent;
+        return std::optional<DeviceCiRecord>{}; // read succeeded, no CI row yet → absent
+    DeviceCiRecord out;
     fill_record(res.get(), 0, out);
-    return CiReadOutcome::kFound;
+    return std::optional<DeviceCiRecord>{std::move(out)};
 }
 
 std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(int limit) {
     if (!open_) {
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonStoreNotOpen}})
-                .increment();
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: list on a closed store");
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::warn("DeviceInventoryStore: list skipped, no connection in time ({})",
-                     pool_.last_error());
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonPoolTimeout}})
-                .increment();
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: list skipped, no connection in time ({})",
+                         pool_.last_error());
         return std::nullopt;
     }
     int eff = limit > 0 && limit < kListRowCap ? limit : kListRowCap;
@@ -357,11 +392,9 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
                                        std::vector<std::string>{std::to_string(eff)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("DeviceInventoryStore: list failed: {}", PQerrorMessage(lease.get()));
-        if (metrics_)
-            metrics_->counter("yuzu_device_inventory_read_degrade_total",
-                              {{"reason", kReasonQueryError}})
-                .increment();
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: list failed: {}", PQerrorMessage(lease.get()));
         return std::nullopt;
     }
     const int rows = PQntuples(res.get());
