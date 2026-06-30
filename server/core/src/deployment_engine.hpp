@@ -34,6 +34,7 @@
 namespace yuzu::server {
 
 class DeploymentRunStore;
+struct StoredResponse; // response_store.hpp
 
 namespace deployment {
 
@@ -42,6 +43,13 @@ struct AgentResponse {
     int status = 0;
     std::string output;
 };
+
+/// Best response per agent for a set of rows sharing an execution_id: terminal
+/// (status != 0) beats running, then non-empty output, then the latest arrival.
+/// Extracted from the server.cpp poll lambda so the borrowed-pointer best-pick is
+/// unit-tested + sanitizer-reachable (#governance cpp-safety SHOULD).
+std::unordered_map<std::string, AgentResponse>
+best_response_per_agent(const std::vector<StoredResponse>& rows);
 
 /// Poll seam: execution_id → best response per agent (the server wires this to
 /// ResponseStore::query_by_execution + latest_per_agent; tests pass a fake).

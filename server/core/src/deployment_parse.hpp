@@ -185,7 +185,7 @@ inline bool is_valid_args(std::string_view a) {
 
 /// All required artifact fields valid (args optional). `why` (optional) names the
 /// first failing field for an honest operator error.
-inline bool config_valid(const DeploymentConfig& c, std::string* why = nullptr) {
+[[nodiscard]] inline bool config_valid(const DeploymentConfig& c, std::string* why = nullptr) {
     auto fail = [&](const char* m) {
         if (why)
             *why = m;

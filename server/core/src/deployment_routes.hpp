@@ -12,8 +12,13 @@
 /// blocks hx-on). Reuses the shared full-page shell + `.gp-*` CSS.
 ///
 /// AUTH / scope:
-///   * config/result gate SoftwareDeployment:Read; run/delete add
-///     SoftwareDeployment:Execute (+Infrastructure:Read on run for the device read).
+///   * config gates SoftwareDeployment:Read; the result poll gates
+///     SoftwareDeployment:Read+Execute (it ADVANCES the mutating engine, not just
+///     renders); run gates Infrastructure:Read+SoftwareDeployment:Execute; delete
+///     gates SoftwareDeployment:Execute.
+///   * Execute-once is per-deployment, so a create-time resume guard
+///     (find_running_for_run + a partial unique index) re-attaches a duplicate
+///     'Deploy' to the in-flight run instead of re-installing the cohort.
 ///   * The cohort is the SOURCE pre-flight run's go-cohort, read OWNER-SCOPED
 ///     (`PreflightRunStore::get_run(run, viewer)`), then re-intersected with
 ///     `devices_fn(viewer)` — so a deployment can only target devices the operator

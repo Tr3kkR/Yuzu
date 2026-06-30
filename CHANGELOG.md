@@ -21,12 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by an operator today; the engine (`deployment::advance`) is HTTP-agnostic so an agentic
   worker can drive the same path via MCP later. **Safety:** the execute step MUTATES, so —
   unlike the read-only pre-flight checks — it is dispatched **at most once per device**
-  (`claim_for_exec` commits `staged→executing` before the command leaves the server, surviving
-  concurrent advances and restart), and every advance **re-authorizes** against the operator's
-  current visible set (`devices_fn(viewer) ∩ cohort`); a device the operator has lost scope to
-  is skipped, never run. A human `confirm()` gates the deploy. RBAC: `SoftwareDeployment:Read`
-  to view, `:Execute` to deploy / delete; operational `deployment.{create,advance,delete}`
-  audit. URL-only on `/auto` (not a new nav tab).
+  (`claim_for_exec` commits `staged→executing` before the command leaves the server; this
+  run-once guarantee survives concurrent advances and a server restart), and execute-once is
+  also enforced **across deployments** by a create-time resume guard (a partial unique index +
+  `find_running_for_run`) so re-clicking Deploy re-attaches to the in-flight run instead of
+  re-installing. Every advance **re-authorizes** against the operator's current visible set
+  (`devices_fn(viewer) ∩ cohort`); a device the operator has lost scope to is skipped, never run.
+  Slice-1 *liveness* is page-driven (no background runner): a closed/timed-out page pauses the
+  deployment durably and is resumed by re-opening it. A human `confirm()` gates the deploy. RBAC:
+  `SoftwareDeployment:Read` opens the config; the result poll needs `Read`+`Execute` (it advances
+  the engine); create needs `Infrastructure:Read`+`Execute`; delete needs `Execute`; owner-scoped;
+  operational `deployment.{create,advance,delete}` audit. URL-only on `/auto` (not a new nav tab).
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the

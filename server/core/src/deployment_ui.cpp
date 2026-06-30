@@ -258,7 +258,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
     for (const auto& [bkey, title] : order) {
         int n = 0;
         for (const auto& d : devices)
-            if (std::string(disp_bucket(deployment::step_from_token(d.step)).key) == bkey)
+            if (std::string_view(disp_bucket(deployment::step_from_token(d.step)).key) == bkey)
                 ++n;
         if (n == 0)
             continue;
@@ -267,7 +267,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
              std::to_string(n) + ")</span></div>";
         int rendered = 0;
         for (const auto& d : devices) {
-            if (std::string(disp_bucket(deployment::step_from_token(d.step)).key) != bkey)
+            if (std::string_view(disp_bucket(deployment::step_from_token(d.step)).key) != bkey)
                 continue;
             if (rendered >= kRenderCapPerGroup) {
                 h += "<div class=\"dp-more\">+ " + std::to_string(n - rendered) +
@@ -291,8 +291,10 @@ std::string render_deploy_results(const DeploymentRow& dep,
              "or non-zero exit; <b>Skipped</b> = out of your scope at dispatch (never run). Click a "
              "KPI to filter.</div>";
     else if (repoll_url.empty())
-        h += "<div class=\"gp-note\">This page paused polling; the deployment continues server-side "
-             "\xE2\x80\x94 reopen it from the recent list to refresh.</div>";
+        h += "<div class=\"gp-note\">This page paused polling. The deployment is durably saved but "
+             "does <b>not</b> advance while this page is closed \xE2\x80\x94 re-open the deploy panel "
+             "for this pre-flight run and click <b>Deploy go-cohort</b> again to resume it (it picks "
+             "up the in-flight run, it does not start a second one).</div>";
 
     // CSP-safe inline filter JS — re-applies window.__dp on every poll swap.
     h += "<script>(function(){window.__dp=window.__dp||{b:'all'};var P=window.__dp;"

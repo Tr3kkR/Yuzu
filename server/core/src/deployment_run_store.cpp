@@ -48,13 +48,20 @@ const std::vector<pg::PgMigration>& migrations() {
          "  active            INT NOT NULL DEFAULT 0);"
          "CREATE INDEX deployments_owner_idx  ON deployments (created_by, created_at_ms DESC);"
          "CREATE INDEX deployments_status_idx ON deployments (status);"
+         // At most ONE running deployment per source pre-flight run — the race-safe
+         // backstop to the create-time resume guard, so a second 'Deploy' click (or
+         // a concurrent create) can't mint a duplicate run that re-installs the
+         // cohort (#governance security HIGH-1).
+         "CREATE UNIQUE INDEX deployments_one_running_per_run "
+         "  ON deployments (source_run_id) WHERE status = 'running';"
          "CREATE TABLE deployment_device ("
          "  deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id) ON DELETE CASCADE,"
          "  agent_id      TEXT NOT NULL,"
          "  hostname      TEXT NOT NULL DEFAULT '',"
          "  os            TEXT NOT NULL DEFAULT '',"
          "  step          TEXT NOT NULL DEFAULT 'pending',"
-         "  exit_code     INT NOT NULL DEFAULT 0,"
+         "  exit_code     BIGINT NOT NULL DEFAULT 0," // int64 model (parse_i64 saturates) — NOT int4
+
          "  error         TEXT NOT NULL DEFAULT '',"
          "  updated_at_ms BIGINT NOT NULL DEFAULT 0,"
          "  PRIMARY KEY (deployment_id, agent_id));"},
@@ -238,6 +245,24 @@ std::vector<DeploymentRow> DeploymentRunStore::list_deployments(const std::strin
     return out;
 }
 
+std::optional<std::string>
+DeploymentRunStore::find_running_for_run(const std::string& source_run_id,
+                                         const std::string& created_by) {
+    if (!open_ || source_run_id.empty())
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT deployment_id FROM deployment_run_store.deployments "
+        "WHERE source_run_id = $1 AND created_by = $2 AND status = 'running' LIMIT 1",
+        std::vector<std::string>{source_run_id, created_by});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return std::string(PQgetvalue(res.get(), 0, 0));
+}
+
 std::vector<DeploymentDeviceRow> DeploymentRunStore::get_devices(const std::string& deployment_id) {
     std::vector<DeploymentDeviceRow> out;
     if (!open_ || deployment_id.empty())
@@ -296,7 +321,7 @@ bool DeploymentRunStore::apply_results(const std::string& deployment_id,
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE deployment_run_store.deployment_device AS d "
-            "SET step = v.to_step, exit_code = v.exit_code::int, error = v.error, "
+            "SET step = v.to_step, exit_code = v.exit_code::bigint, error = v.error, "
             "    updated_at_ms = $7::bigint "
             "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) "
             "  AS v(agent, from_step, to_step, exit_code, error) "

@@ -104,6 +104,12 @@ public:
     [[nodiscard]] std::vector<DeploymentRow> list_deployments(const std::string& viewer,
                                                               bool is_admin, int limit);
 
+    /// The owner's RUNNING deployment for a source pre-flight run, if any — the
+    /// create-time guard against a duplicate run that would re-install the cohort
+    /// (#governance security HIGH-1). Owner-scoped at the seam.
+    [[nodiscard]] std::optional<std::string> find_running_for_run(const std::string& source_run_id,
+                                                                  const std::string& created_by);
+
     /// The device grid (frozen identity + current step), ordered by hostname.
     [[nodiscard]] std::vector<DeploymentDeviceRow> get_devices(const std::string& deployment_id);
 

@@ -3038,6 +3038,10 @@ public:
         // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
         // thread that leased it is already joined above).
         preflight_run_store_.reset();
+        // DeploymentRunStore likewise borrows pg_pool_ — drop before the pool
+        // (no background thread in slice 1, but keep the ADR-0012 teardown
+        // discipline so a future DeploymentRunner can't UAF).
+        deployment_run_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -8383,6 +8387,25 @@ private:
                         spdlog::error("preflight_runner: tick threw unknown exception — continuing");
                     }
                 }
+                // 14-day retention for deployment runs. DeploymentRunStore has no
+                // background runner of its own in slice 1, so the prune piggy-backs
+                // this thread (mirrors the preflight prune cadence) — without it the
+                // documented retention never runs and deployment_device grows
+                // unbounded (#governance H2/CAP-1).
+                if (deployment_run_store_ && deployment_run_store_->is_open()) {
+                    try {
+                        const auto cutoff =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count() -
+                            14LL * 24 * 60 * 60 * 1000;
+                        deployment_run_store_->prune_older_than(cutoff);
+                    } catch (const std::exception& e) {
+                        spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
+                    } catch (...) {
+                        spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
             }
         });
 
@@ -9084,35 +9107,12 @@ private:
             // non-empty output, then later arrival).
             [this](const std::string& execution_id)
                 -> std::unordered_map<std::string, deployment::AgentResponse> {
-                std::unordered_map<std::string, deployment::AgentResponse> best;
                 if (!response_store_)
-                    return best;
+                    return {};
                 ResponseQuery q;
                 q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
-                auto rows = response_store_->query_by_execution(execution_id, q);
-                auto score = [](const StoredResponse& r) {
-                    int s = 0;
-                    if (r.status != 0)
-                        s += 2;
-                    if (!r.output.empty())
-                        s += 1;
-                    return s;
-                };
-                std::unordered_map<std::string, const StoredResponse*> pick;
-                for (const auto& r : rows) {
-                    auto it = pick.find(r.agent_id);
-                    if (it == pick.end()) {
-                        pick.emplace(r.agent_id, &r);
-                        continue;
-                    }
-                    const StoredResponse& cur = *it->second;
-                    if (score(r) > score(cur) ||
-                        (score(r) == score(cur) && r.received_at_ms > cur.received_at_ms))
-                        it->second = &r;
-                }
-                for (const auto& [agent, rp] : pick)
-                    best[agent] = {rp->status, rp->output};
-                return best;
+                return deployment::best_response_per_agent(
+                    response_store_->query_by_execution(execution_id, q));
             },
             audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
 

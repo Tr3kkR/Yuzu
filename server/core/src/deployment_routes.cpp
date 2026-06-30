@@ -64,7 +64,14 @@ deployment::DeploymentConfig config_from_req(const httplib::Request& req) {
     deployment::DeploymentConfig c;
     c.url = param(req, "url");
     c.filename = param(req, "filename");
+    // Normalize the SHA-256 to lowercase at intake: content_dist computes a
+    // lowercase digest and compares EXACT, so an uppercase paste (the default of
+    // PowerShell Get-FileHash / certutil) would otherwise fail stage on every
+    // device despite being correct (#governance HIGH). We store + dispatch the
+    // normalized form; is_valid_sha256 stays case-insensitive for the accept check.
     c.sha256 = param(req, "sha256");
+    for (char& ch : c.sha256)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     c.args = param(req, "args");
     return c;
 }
@@ -189,6 +196,28 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
                             "text/html; charset=utf-8");
             return;
         }
+        // Server-side completeness gate (the button only shows on a complete run,
+        // but a hand-crafted POST must not deploy from a still-running run's partial
+        // go-cohort) (#governance security L-5).
+        if (run->status != "complete") {
+            res.set_content(render_deploy_note("Deploy only from a completed pre-flight run."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // RESUME guard (#governance security HIGH-1): if this owner already has a
+        // RUNNING deployment for this source run, render IT instead of creating a
+        // second — a second deployment mints a new id, runs an independent CAS, and
+        // would RE-EXECUTE the installer on devices the first already installed
+        // (execute-once is per-deployment). This also makes "reopen to resume"
+        // real. The partial unique index is the race-safe backstop below.
+        if (auto existing = deploy_store_->find_running_for_run(run_id, session->username)) {
+            if (audit_fn_)
+                audit_fn_(req, "deployment.create", "resumed", "SoftwareDeployment", *existing,
+                          "run=" + run_id);
+            res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+                            "text/html; charset=utf-8");
+            return;
+        }
 
         // Cohort = the run's go+warn devices ∩ what the operator can CURRENTLY see.
         std::unordered_set<std::string> visible;
@@ -225,14 +254,23 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
         dep.created_at_ms = now_ms();
 
         if (!deploy_store_->create_deployment(dep, cohort)) {
+            // A concurrent create won the partial unique index race — resume the
+            // winner rather than error (#governance security HIGH-1 backstop).
+            if (auto existing = deploy_store_->find_running_for_run(run_id, session->username)) {
+                res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+                                "text/html; charset=utf-8");
+                return;
+            }
             res.set_content(render_deploy_note("Could not persist the deployment."),
                             "text/html; charset=utf-8");
             return;
         }
         if (audit_fn_)
+            // Audit the artifact's SHA-256 (the content identity of what ran on the
+            // fleet) + URL, not just the cosmetic filename (#governance M-1 / SOC2).
             audit_fn_(req, "deployment.create", "success", "SoftwareDeployment", dep.deployment_id,
-                      "run=" + run_id + " file=" + cfg.filename +
-                          " devices=" + std::to_string(cohort.size()));
+                      "run=" + run_id + " file=" + cfg.filename + " sha256=" + cfg.sha256 +
+                          " url=" + cfg.url + " devices=" + std::to_string(cohort.size()));
 
         // First advance (stage dispatch) + render — advance_and_render re-resolves
         // the live authorized set and ticks the engine once.

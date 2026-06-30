@@ -1,8 +1,10 @@
 #include "deployment_engine.hpp"
 
 #include "deployment_run_store.hpp"
+#include "response_store.hpp" // StoredResponse (best_response_per_agent)
 
 #include <chrono>
+#include <cstdint>
 
 namespace yuzu::server::deployment {
 
@@ -14,7 +16,40 @@ std::int64_t now_ms() {
         .count();
 }
 
+int response_score(const StoredResponse& r) {
+    int s = 0;
+    if (r.status != 0) // 0 = RUNNING; terminal beats running
+        s += 2;
+    if (!r.output.empty())
+        s += 1;
+    return s;
+}
+
 } // namespace
+
+std::unordered_map<std::string, AgentResponse>
+best_response_per_agent(const std::vector<StoredResponse>& rows) {
+    // Pick the best row per agent without copying every row: addresses into `rows`
+    // (a stable local vector — not mutated here) feed `best`, which is consumed
+    // into the value-typed result before returning.
+    std::unordered_map<std::string, const StoredResponse*> best;
+    for (const auto& r : rows) {
+        auto it = best.find(r.agent_id);
+        if (it == best.end()) {
+            best.emplace(r.agent_id, &r);
+            continue;
+        }
+        const StoredResponse& cur = *it->second;
+        if (response_score(r) > response_score(cur) ||
+            (response_score(r) == response_score(cur) && r.received_at_ms > cur.received_at_ms))
+            it->second = &r;
+    }
+    std::unordered_map<std::string, AgentResponse> out;
+    out.reserve(best.size());
+    for (const auto& [agent, rp] : best)
+        out.emplace(agent, AgentResponse{rp->status, rp->output});
+    return out;
+}
 
 void advance(const EngineDeps& deps, const std::string& deployment_id, const DeploymentConfig& cfg,
              const std::unordered_set<std::string>& authorized) {

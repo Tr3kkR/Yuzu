@@ -89,8 +89,15 @@ Two safety properties matter because executing an installer changes the endpoint
   device that has dropped out of your scope since the pre-flight run is **skipped**,
   not executed.
 
-A deployment is driven by the open page today; closing it pauses progress (the
-state is durable) and reopening resumes. The same engine is designed to be driven
+A deployment is driven by the open page today (there is no background runner in
+this slice). Closing the page — or the page reaching its automatic poll limit
+after roughly ten minutes — **pauses** the deployment: its state is durably saved,
+but it does not advance while no page is polling it. To **resume**, re-open the
+deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
+server detects the in-flight deployment and re-attaches to it rather than starting
+a second one (so the installer is never run twice). A device that is offline when
+its stage or execute step is dispatched is not retried in this slice; delete the
+deployment and re-deploy once it is back. The same engine is designed to be driven
 headless by an automation worker later.
 
 ## Permissions
@@ -100,9 +107,18 @@ headless by an automation worker later.
 | View the page / a result / the rail | `Infrastructure:Read` |
 | Run a pre-flight | `Infrastructure:Read` + `Execution:Execute` |
 | Delete a saved run | `Execution:Execute` (and you must be the owner) |
-| Open the deploy panel / view a deployment | `SoftwareDeployment:Read` |
-| Deploy to a go-cohort / advance / delete a deployment | `SoftwareDeployment:Execute` (and you must be the owner) |
+| Open the deploy config panel for a run | `SoftwareDeployment:Read` |
+| Deploy to a go-cohort (create + first advance) | `Infrastructure:Read` + `SoftwareDeployment:Execute` |
+| View / track a deployment — each poll also advances the engine | `SoftwareDeployment:Read` + `SoftwareDeployment:Execute` |
+| Delete a deployment | `SoftwareDeployment:Execute` |
+
+Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
+require you to be the creator; another operator's deployment reads as not-found).
+The result poll requires `Execute` as well as `Read` because the same request
+**advances the mutating engine**, not just renders — a read-only operator cannot
+drive a deployment.
 
 Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
-`preflight.run` and `preflight.run.delete`; deployments as `deployment.create`,
-`deployment.advance`, and `deployment.delete`.
+`preflight.run` and `preflight.run.delete`; deployments as `deployment.create`
+(result `success` / `resumed` / `no_devices`), `deployment.advance`, and
+`deployment.delete`.

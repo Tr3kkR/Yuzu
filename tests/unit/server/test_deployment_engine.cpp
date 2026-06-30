@@ -8,6 +8,7 @@
 #include "deployment_engine.hpp"
 #include "deployment_run_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "response_store.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -87,6 +88,31 @@ DeploymentRow make_dep(const std::string& id) {
 }
 
 } // namespace
+
+TEST_CASE("best_response_per_agent picks terminal > running, then output, then latest",
+          "[deployment][engine]") {
+    auto mk = [](const std::string& agent, int status, const std::string& out, std::int64_t ts) {
+        StoredResponse r;
+        r.agent_id = agent;
+        r.status = status;
+        r.output = out;
+        r.received_at_ms = ts;
+        return r;
+    };
+    std::vector<StoredResponse> rows = {
+        mk("a", 0, "", 100),               // running, no output
+        mk("a", 1, "status|ok", 90),       // terminal + output (earlier) → wins over running
+        mk("b", 2, "", 50),                // terminal, no output
+        mk("b", 2, "error|x", 60),         // terminal + output (later) → wins
+        mk("c", 0, "", 10),                // only a running row → still surfaced
+    };
+    auto best = best_response_per_agent(rows);
+    REQUIRE(best.size() == 3);
+    CHECK(best["a"].status == 1);
+    CHECK(best["a"].output == "status|ok");
+    CHECK(best["b"].output == "error|x");
+    CHECK(best["c"].status == 0); // a not-yet-terminal agent is still represented
+}
 
 TEST_CASE("deployment engine drives stage→execute, skips out-of-scope, runs once",
           "[pg][deployment][engine]") {
