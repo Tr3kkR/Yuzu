@@ -380,6 +380,7 @@ extern const char* const kDashboardIndexHtml =
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
+    <a href="/inventory" class="nav-link">Inventory</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
@@ -996,6 +997,7 @@ extern const char* const kDashboardIndexHtml =
       navEntries: [
         { name: 'Dashboard', desc: 'Main dashboard view', url: '/', type: 'Navigation' },
         { name: 'Instructions', desc: 'Browse instruction definitions', url: '/instructions', type: 'Navigation' },
+        { name: 'Inventory', desc: 'Installed software & device inventory', url: '/inventory', type: 'Navigation' },
         { name: 'Settings', desc: 'Server settings', url: '/settings', type: 'Navigation' },
         { name: 'About', desc: 'About Yuzu', url: '#about', type: 'Navigation' }
       ],

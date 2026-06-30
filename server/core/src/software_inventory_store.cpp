@@ -43,6 +43,21 @@ constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 // Hard ceiling on rows a single fleet query will materialise, independent of the
 // caller's `limit`, so the store can never allocate an unbounded result set.
 constexpr int kFleetQueryRowCap = 100000;
+// Hard ceiling on catalogue / version-drill rows, independent of the caller's
+// `limit`. The catalogue is one row per distinct title; the drill is one per
+// distinct version of a title — both bounded sets.
+constexpr int kCatalogRowCap = 2000;
+// Execution BUDGET (not a guarantee) for the BACKGROUND catalogue recompute
+// (refresh_catalog_rollup) — the single expensive full-table GROUP BY. It runs off the
+// request path on the SoftwareCatalogRollup thread (the page never waits on it) and
+// overrides the pool's 30s default for that one txn. 60s bounds BOTH the worst-case
+// pooled-connection hold AND the shutdown-join stall (stop() can't cancel an in-flight
+// statement, so the join waits up to this long). KEEP-LAST-GOOD on a timeout: the txn
+// rolls back, the prior rollup + freshness stamp survive (the "as of" stamp ages, and
+// yuzu_inventory_catalog_rollup_total{outcome="error"} increments). If a genuine 400k
+// recompute ever exceeds 60s it stays "building"/stale until it fits — observable via the
+// metrics; raise this then. The page READS hit the small precomputed tables, no bound.
+constexpr const char* kRollupStatementTimeout = "60s";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -110,6 +125,55 @@ const std::vector<pg::PgMigration>& migrations() {
          "  first_seen = LEAST(first_seen, EXTRACT(EPOCH FROM now())::bigint) "
          "WHERE last_seen  > EXTRACT(EPOCH FROM now())::bigint "
          "   OR first_seen > EXTRACT(EPOCH FROM now())::bigint;"},
+        {4,
+         // Catalogue ROLLUP tables — the /inventory Software tab reads these precomputed
+         // aggregates, NOT an on-demand GROUP BY (the underlying installed_software only
+         // changes on the daily sync, so recomputing per page-load is wasteful + degrades
+         // at fleet scale). A background thread refreshes them on a cadence via
+         // refresh_catalog_rollup(); the page reads are cheap indexed scans of these small
+         // tables. The rollup is FLEET-WIDE by construction — it cannot be per-operator
+         // scoped (see the software_catalog header + ADR-0017): the catalogue MUST stay
+         // global-gated.
+         //   catalog_rollup   — one row per distinct title.
+         //   version_rollup   — one row per (title, version).
+         //   catalog_rollup_meta — single row (id=1): the freshness stamp + headline counts
+         //     so the page never runs a COUNT either. refreshed_at=0 ⇒ never refreshed yet
+         //     ("building"), distinct from a refreshed-but-empty fleet.
+         // IF NOT EXISTS / ON CONFLICT DO NOTHING — idempotent so a partial-migration
+         // retry (or a white-box schema_meta rewind in tests) re-runs cleanly.
+         // UNIQUE(name) / UNIQUE(name,version): the rollup is keyed by title (and
+         // version) — one row each. The unique constraint is LOAD-BEARING for
+         // multi-instance safety (gov ARCH-1/UP-1): two server instances sharing one
+         // Postgres both run their hourly recompute; without a unique key a racing
+         // DELETE+INSERT under READ COMMITTED can leave DUPLICATE title rows (B's
+         // pre-A-commit snapshot doesn't see A's rows to delete, then inserts its own).
+         // The unique key makes the duplicate INSERT fail → that recompute rolls back →
+         // keep-last-good. (refresh_catalog_rollup also takes a cluster-wide advisory
+         // lock so the loser skips cleanly rather than churning a unique violation.)
+         "CREATE TABLE IF NOT EXISTS catalog_rollup ("
+         "  name          TEXT   NOT NULL,"
+         "  publisher     TEXT   NOT NULL DEFAULT '',"
+         "  device_count  BIGINT NOT NULL,"
+         "  version_count BIGINT NOT NULL,"
+         "  CONSTRAINT catalog_rollup_name_key UNIQUE (name));"
+         "CREATE INDEX IF NOT EXISTS catalog_rollup_rank_idx "
+         "ON catalog_rollup (device_count DESC, name);"
+         "CREATE TABLE IF NOT EXISTS version_rollup ("
+         "  name          TEXT   NOT NULL,"
+         "  version       TEXT   NOT NULL DEFAULT '',"
+         "  device_count  BIGINT NOT NULL,"
+         "  CONSTRAINT version_rollup_nv_key UNIQUE (name, version));"
+         "CREATE INDEX IF NOT EXISTS version_rollup_name_idx "
+         "ON version_rollup (name, device_count DESC);"
+         "CREATE TABLE IF NOT EXISTS catalog_rollup_meta ("
+         "  id           INT    PRIMARY KEY,"
+         "  refreshed_at BIGINT NOT NULL DEFAULT 0,"
+         "  total_titles BIGINT NOT NULL DEFAULT 0,"
+         "  total_devices BIGINT NOT NULL DEFAULT 0);"
+         // Seed the singleton row with refreshed_at=0 so a read before the first refresh
+         // returns the explicit "building" state, not an empty result.
+         "INSERT INTO catalog_rollup_meta (id, refreshed_at, total_titles, total_devices) "
+         "VALUES (1, 0, 0, 0) ON CONFLICT (id) DO NOTHING;"},
     };
     return kMigrations;
 }
@@ -193,6 +257,16 @@ struct DegradeLog {
     bool should_log;
     std::uint64_t occurrence;
 };
+
+// Parse a Postgres text-format integer cell into int64 (count(*) etc. are text on
+// the wire). Mirrors the count_stale_agents from_chars pattern.
+std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
+    const char* txt = PQgetvalue(res.get(), row, col);
+    const auto len = static_cast<std::size_t>(PQgetlength(res.get(), row, col));
+    std::int64_t v = 0;
+    std::from_chars(txt, txt + len, v); // leaves v=0 on parse failure (count cells never fail)
+    return v;
+}
 
 // Bump the read-degrade counter (always), advance the sampler, and decide whether
 // this degrade should emit a sampled WARN: the leading edge of a new episode, or
@@ -521,6 +595,237 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         out.push_back(std::move(row));
     }
     return out;
+}
+
+std::optional<std::vector<SoftwareCatalogRow>>
+SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
+    // AUTHORITATIVE read of the PRECOMPUTED catalog_rollup — a cheap indexed scan of a
+    // small table, NOT an on-demand GROUP BY (refresh_catalog_rollup writes it on a
+    // cadence). FLEET-WIDE (global rollup; caller gates GLOBAL Inventory:Read). nullopt on
+    // degrade, never a silent empty; an empty value = the rollup has no rows (pair with
+    // catalog_rollup_meta() to tell "building" from a genuinely empty fleet).
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    int limit = q.limit > 0 ? q.limit : 200;
+    if (limit > kCatalogRowCap)
+        limit = kCatalogRowCap;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive title
+    // filter; over a small (one-row-per-title) table the scan+sort is trivial.
+    std::string sql = "SELECT name, publisher, device_count, version_count "
+                      "FROM software_inventory_store.catalog_rollup ";
+    std::vector<std::string> params;
+    int p = 0;
+    if (!q.name_filter.empty()) {
+        sql += "WHERE name ILIKE '%' || $" + std::to_string(++p) + " || '%' ";
+        params.push_back(q.name_filter);
+    }
+    sql += "ORDER BY device_count DESC, name LIMIT $" + std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit));
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<SoftwareCatalogRow> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        SoftwareCatalogRow r;
+        r.name = PQgetvalue(res.get(), i, 0);
+        r.publisher = PQgetvalue(res.get(), i, 1);
+        r.device_count = result_i64(res, i, 2);
+        r.version_count = result_i64(res, i, 3);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<SoftwareVersionCount>>
+SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
+    // AUTHORITATIVE read of the precomputed version_rollup (title-scoped, name index). An
+    // empty name is a precondition miss → empty value, not a degrade.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty())
+        return std::vector<SoftwareVersionCount>{};
+    int lim = limit > 0 ? limit : 200;
+    if (lim > kCatalogRowCap)
+        lim = kCatalogRowCap;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT version, device_count FROM software_inventory_store.version_rollup "
+        "WHERE name = $1 ORDER BY device_count DESC, version LIMIT $2::bigint",
+        std::vector<std::string>{std::string(name), std::to_string(lim)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<SoftwareVersionCount> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        SoftwareVersionCount v;
+        v.version = PQgetvalue(res.get(), i, 0);
+        v.device_count = result_i64(res, i, 1);
+        out.push_back(std::move(v));
+    }
+    return out;
+}
+
+bool SoftwareInventoryStore::refresh_catalog_rollup() {
+    if (!open_)
+        return false;
+    // ONE transaction: bound execution with a GENEROUS background statement_timeout,
+    // recompute both rollup tables + the meta from installed_software, atomic replace.
+    // KEEP-LAST-GOOD: any lease/SQL failure (incl. timeout) returns false → with_txn_for
+    // ROLLs back → the prior rollup + freshness stamp survive untouched.
+    return pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(c, std::string("SET LOCAL statement_timeout = '")
+                                                .append(kRollupStatementTimeout)
+                                                .append("'")
+                                                .c_str(),
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        // Cluster-wide serialization (gov ARCH-1/UP-1): on a multi-instance shared-PG
+        // deploy, only one server recomputes the SHARED rollup at a time. try_ (not
+        // blocking): if a peer holds the lock it is already recomputing the shared table,
+        // so this instance SKIPS — not a failure (the rollup will be fresh via the peer),
+        // avoiding a redundant recompute AND the unique-violation churn two racing
+        // DELETE+INSERTs would otherwise produce. Transaction-scoped → auto-released at
+        // COMMIT/ROLLBACK and self-healing if the holder dies. The UNIQUE constraints on
+        // the rollup tables are the belt-and-braces correctness backstop behind this lock.
+        pg::PgResult lk =
+            pg::exec_params(c,
+                            "SELECT pg_try_advisory_xact_lock(hashtextextended('"
+                            "software_catalog_rollup', 0))",
+                            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
+        if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
+            return true; // a peer instance is refreshing the shared rollup — skip, success
+        // catalog_rollup: one row per title (device_count, version_count). max(publisher)
+        // picks a representative when a title carries >1 publisher across the fleet.
+        if (pg::exec_params(c, "DELETE FROM software_inventory_store.catalog_rollup",
+                            std::vector<std::string>{})
+                .status() != PGRES_COMMAND_OK)
+            return false;
+        if (pg::exec_params(
+                c,
+                "INSERT INTO software_inventory_store.catalog_rollup "
+                "(name, publisher, device_count, version_count) "
+                "SELECT name, max(publisher), count(DISTINCT agent_id), count(DISTINCT version) "
+                "FROM software_inventory_store.installed_software GROUP BY name",
+                std::vector<std::string>{})
+                .status() != PGRES_COMMAND_OK)
+            return false;
+        // version_rollup: one row per (title, version).
+        if (pg::exec_params(c, "DELETE FROM software_inventory_store.version_rollup",
+                            std::vector<std::string>{})
+                .status() != PGRES_COMMAND_OK)
+            return false;
+        if (pg::exec_params(
+                c,
+                "INSERT INTO software_inventory_store.version_rollup (name, version, device_count) "
+                "SELECT name, version, count(DISTINCT agent_id) "
+                "FROM software_inventory_store.installed_software GROUP BY name, version",
+                std::vector<std::string>{})
+                .status() != PGRES_COMMAND_OK)
+            return false;
+        // meta: server receipt clock (now()), titles from the just-built rollup, devices
+        // from the source table. RETURNING to carry the result (no sqlite3_changes-style
+        // count needed; #1033 idiom).
+        pg::PgResult m = pg::exec_params(
+            c,
+            "INSERT INTO software_inventory_store.catalog_rollup_meta "
+            "(id, refreshed_at, total_titles, total_devices) "
+            "VALUES (1, EXTRACT(EPOCH FROM now())::bigint, "
+            "  (SELECT count(*) FROM software_inventory_store.catalog_rollup), "
+            "  (SELECT count(DISTINCT agent_id) FROM software_inventory_store.installed_software)) "
+            "ON CONFLICT (id) DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at, "
+            "  total_titles = EXCLUDED.total_titles, total_devices = EXCLUDED.total_devices "
+            "RETURNING id",
+            std::vector<std::string>{});
+        return m.status() == PGRES_TUPLES_OK;
+    });
+}
+
+std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: catalog_rollup_meta degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: catalog_rollup_meta degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT refreshed_at, total_titles, total_devices "
+        "FROM software_inventory_store.catalog_rollup_meta WHERE id = 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: catalog_rollup_meta degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    CatalogRollupMeta m; // migration seeds id=1 with refreshed_at=0; default if absent.
+    if (PQntuples(res.get()) == 1) {
+        m.refreshed_at = result_i64(res, 0, 0);
+        m.total_titles = result_i64(res, 0, 1);
+        m.total_devices = result_i64(res, 0, 2);
+    }
+    return m;
 }
 
 void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {

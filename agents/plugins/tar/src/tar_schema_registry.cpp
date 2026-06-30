@@ -562,6 +562,84 @@ const std::vector<CaptureSourceDef>& build_sources() {
             },
         },
 
+        // ── Software install/uninstall events (Phase 8 Wave 1) ────────────────
+        // Diffs the installed-software inventory on the `tar.software` tick
+        // (hourly default) and records install/remove/upgrade events over time —
+        // the historical "what was installed/removed on this box, when" the
+        // point-in-time installed_apps inventory cannot answer. MACHINE SCOPE ONLY
+        // (HKLM Uninstall): an event is the host's software, never attributed to a
+        // Windows profile, so the capture carries no user identity / personal data
+        // (#1620). Opt-in (default_enabled=false): shipped disabled as the cautious
+        // posture for a new capture source — an operator turns it on per host via
+        // tar.configure software_enabled=true.
+        //
+        // Windows captures machine-wide (HKLM Uninstall 64-bit + WOW6432Node 32-bit).
+        // Linux (dpkg/rpm) and macOS (pkgutil) are kPlanned (queryable-empty) until a
+        // fast-follow wires the installed_apps enumeration into a collector.
+        {
+            .name = "software",
+            .dollar_name = "Software",
+            // Opt-in (cautious new-source posture): a fresh agent reports it disabled
+            // on tar.status, matching the explicit "false" collection gate.
+            .default_enabled = false,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "registry",
+                 "Registry Uninstall keys, polled-and-diffed on the tar.software "
+                 "tick: HKLM 64-bit + WOW6432Node 32-bit (machine scope only). "
+                 "SystemComponent entries are skipped. No command line / no usage "
+                 "data — names, versions, publisher only."},
+                {"linux",   OsSupportStatus::kPlanned, "dpkg_rpm",
+                 "dpkg-query / rpm -qa / pacman -Q diff (reuse of the installed_apps "
+                 "enumeration). Wired in a fast-follow."},
+                {"macos",   OsSupportStatus::kPlanned, "pkgutil",
+                 "system_profiler SPApplicationsDataType + pkgutil diff (reuse of "
+                 "the installed_apps enumeration). Wired in a fast-follow."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Install/uninstall is very low-volume — 5000 rows holds years
+                    // of change history on a normal endpoint.
+                    .retention_default = 5000,
+                    .columns = {
+                        {"ts",           "INTEGER"},
+                        {"snapshot_id",  "INTEGER"},
+                        {"action",       "TEXT"}, // installed, removed, upgraded
+                        {"name",         "TEXT"},
+                        {"version",      "TEXT"},
+                        {"prev_version", "TEXT"}, // populated only for 'upgraded'
+                        {"publisher",    "TEXT"},
+                        {"install_date", "TEXT"}, // registry InstallDate (YYYYMMDD) where present
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days
+                    .columns = {
+                        {"day_ts",        "INTEGER"},
+                        {"name",          "TEXT"},
+                        {"install_count", "INTEGER"},
+                        {"remove_count",  "INTEGER"},
+                        {"upgrade_count", "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "monthly",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 31536000, // 12 months (~365 days)
+                    .columns = {
+                        {"month_ts",      "INTEGER"},
+                        {"name",          "TEXT"},
+                        {"install_count", "INTEGER"},
+                        {"remove_count",  "INTEGER"},
+                        {"upgrade_count", "INTEGER"},
+                    },
+                },
+            },
+        },
+
         // ── ARP / address-resolution table (ADR-0015) ─────────────────────
         // Host L2 adjacency: IP<->MAC bindings per interface. Snapshot-diff
         // appeared/removed keyed on the (interface, ip_address, mac_address)
@@ -844,6 +922,10 @@ std::string generate_warehouse_ddl() {
                 ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_remote ON {0}(remote_addr);\n",
                                    table_name);
             }
+            if (g.suffix == "live" && src.name == "software") {
+                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(name);\n",
+                                   table_name);
+            }
             if (g.suffix == "live" && src.name == "module") {
                 ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(module_name);\n",
                                    table_name);
@@ -1060,6 +1142,32 @@ SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEG
 FROM module_daily
 WHERE day_ts >= ? AND day_ts < ?
 GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_state, is_kernel)";
+        }
+    }
+
+    // ── Software rollups (Phase 8 Wave 1) — per name ─────────────────────────
+    // Counts install/remove/upgrade events per application name (machine scope
+    // only). The count tier is "how many install events", not "by which build"
+    // (that detail stays at full fidelity in software_live).
+    if (source_name == "software") {
+        if (target_suffix == "daily") {
+            return R"(INSERT INTO software_daily (day_ts, name, install_count, remove_count, upgrade_count)
+SELECT (ts / 86400) * 86400, name,
+       SUM(CASE WHEN action = 'installed' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN action = 'upgraded' THEN 1 ELSE 0 END)
+FROM software_live
+WHERE ts >= ? AND ts < ?
+GROUP BY (ts / 86400) * 86400, name)";
+        }
+        if (target_suffix == "monthly") {
+            return R"(INSERT INTO software_monthly (month_ts, name, install_count, remove_count, upgrade_count)
+SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
+       name,
+       SUM(install_count), SUM(remove_count), SUM(upgrade_count)
+FROM software_daily
+WHERE day_ts >= ? AND day_ts < ?
+GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), name)";
         }
     }
 

@@ -32,6 +32,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
   central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
   deploy→verify cohort auto-fill.
+- **Idle (inactivity) session timeout (`--session-inactivity-secs`, SOC 2 CC6.3).** Operator dashboard
+  cookie sessions can now be invalidated after a configurable period of inactivity — a **sliding**
+  window that resets on each authenticated request, *under* the existing absolute 8h session lifetime.
+  Wires the previously-reserved `sessions.last_activity_at` column end-to-end (enforced in
+  `AuthManager::validate_session`; best-effort throttled `auth.db` mirror via
+  `AuthDB::touch_session_activity`). **Default 0 = disabled** (opt-in; existing deployments unaffected;
+  recommended `900` = 15 min). Scope is cookie sessions only — **API tokens and MCP tokens are never
+  idle-timed-out**, and OIDC users re-authenticate via SSO. `YUZU_SESSION_INACTIVITY_SECS`. Closes
+  `/auth-and-authz` gap-matrix P1 #8. See `docs/auth-architecture.md` "Inactivity session timeout".
+
+- **Hardened authentication mode (`--auth-mode=sso-only`) + break-glass account (SOC 2 CC6.3/CC6.6).**
+  Local-password login can be disabled fleet-wide so only OIDC SSO mints a session
+  (`--auth-mode=sso-only` / `YUZU_AUTH_MODE`). A rejected local login returns the same generic 401 as a
+  bad password (no enumeration/mode oracle) and is counted via `yuzu_auth_local_disabled_total` (metric,
+  not a per-attempt audit row). A single `--break-glass-user` is exempt **only while armed**, armed
+  out-of-band via the host CLI `yuzu-server --break-glass-arm` (auto-expiring, default 24h via
+  `--break-glass-window-secs`; audited `auth.breakglass.armed`, attributed to the kernel OS identity).
+  Mandatory MFA is enforced fail-closed at boot and at login (an un-enrolled break-glass login is
+  hard-denied `403`, never offered enrollment). Use is audited at `Severity::kCritical`
+  (`auth.breakglass.login` / `auth.breakglass.denied`) + metric `yuzu_auth_break_glass_login_total`.
+  AuthDB migration v4 adds a nullable `users.break_glass_armed_until` column (additive, data-safe).
+  **Opt-in: existing deployments default to `standard` and are unaffected.** Enabling `sso-only`
+  **refuses to start** without `--oidc-issuer` configured and (if set) a `--break-glass-user` that
+  exists and has MFA enrolled — configure OIDC and pre-enroll the break-glass account before
+  restarting. See `docs/auth-architecture.md` "Hardened mode", `docs/user-manual/upgrading.md`, and the
+  `docs/ops-runbooks/auth-db-recovery.md` break-glass arm runbook. Closes `/auth-and-authz` P0 #3.
+- **`/auto` deploy — stage + execute an upgrade on a pre-flight go-cohort.** The `/auto` page
+  gains an ACT stage after the ASSESS (pre-flight) stage: as soon as a pre-flight run has a
+  go-cohort (≥1 device in bucket go / warn-only — the run need not be complete; the button
+  appears with the first cleared device and the count grows mid-run), **Deploy go-cohort**
+  stages an installer (download + SHA-256 verify) and then executes it on the devices cleared
+  at click time, tracking a per-device stage→execute state machine. A re-deploy of the same run
+  excludes devices an earlier deployment already installed (cross-deployment execute-once).
+  Pre-flight completion is now event-driven (the result self-poll completes a run the moment its
+  cohort settles, not on the up-to-60s background-runner tick). Built on the existing `content_dist` plugin (`stage` /
+  `execute_staged`); no new agent code. Born-on-Postgres `DeploymentRunStore` (schema
+  `deployment_run_store`) persists the artifact spec, the frozen cohort, and each device's
+  step. The result is **aggregate-first** (a KPI strip + progress bar headline the counts;
+  the per-device list is problem-first and render-capped) so it reads at fleet scale. Driven
+  by an operator today; the engine (`deployment::advance`) is HTTP-agnostic so an agentic
+  worker can drive the same path via MCP later. **Safety:** the execute step MUTATES, so —
+  unlike the read-only pre-flight checks — it is dispatched **at most once per device**
+  (`claim_for_exec` commits `staged→executing` before the command leaves the server; this
+  run-once guarantee survives concurrent advances and a server restart), and execute-once is
+  also enforced **across deployments** by a create-time resume guard (a partial unique index +
+  `find_running_for_run`) so re-clicking Deploy re-attaches to the in-flight run instead of
+  re-installing. Every advance **re-authorizes** against the operator's current visible set
+  (`devices_fn(viewer) ∩ cohort`); a device the operator has lost scope to is skipped, never run.
+  Slice-1 *liveness* is page-driven (no background runner): a closed/timed-out page pauses the
+  deployment durably and is resumed by re-opening it. A human `confirm()` gates the deploy. RBAC:
+  `SoftwareDeployment:Read` opens the config; the result poll needs `Read`+`Execute` (it advances
+  the engine); create needs `Infrastructure:Read`+`Execute`; delete needs `Execute`; owner-scoped;
+  operational `deployment.{create,advance,delete}` audit. URL-only on `/auto` (not a new nav tab).
+- **Inventory dashboard (`/inventory`).** A point-and-click view over the daily-sync
+  installed-software data (ADR-0016). Three tabs: **Software** (the fleet software list —
+  title, publisher, install count, distinct versions, with an installs-per-version drill),
+  **Devices** (a thin, offline-survivable device list sourced from the persisted endpoint
+  state + the live registry; click a device for its installed software), and **Find software**
+  (which devices run a given title). The catalogue/version counts are served from a
+  **precomputed rollup** (`catalog_rollup` / `version_rollup` / `catalog_rollup_meta`,
+  refreshed hourly by a background `SoftwareCatalogRollup` thread, keep-last-good on
+  failure) so page reads never run a full-table `GROUP BY` — the underlying data changes
+  only on the daily sync. The KPI strip shows an "updated N ago" stamp and a "building"
+  state before the first refresh. Gated on the existing `Inventory:Read` (per-device
+  reads use the management-group-scoped gate); fleet-wide catalogue/find counts are not yet
+  management-group scoped (ADR-0017 confinement inert under the global gate — caveated in the
+  UI). On store degradation the authoritative reads (Software/Find/per-device-software) show an
+  "unavailable" banner, never an empty table (ADR-0016 §7); the fail-soft device roster may show an
+  empty list during a database incident (its empty-state copy says so). New audit verbs
+  `inventory.software.{catalog,versions}`, `inventory.device.software`, and `inventory.devices` (the
+  Devices roster read — set-and-proceed); `inventory.software.query` (pre-existing on the REST
+  endpoint) is now also emitted by the dashboard Find tab and documented.
+  New nav item + command-palette entry.
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the
@@ -284,6 +357,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `tar.configure` now advertises every per-source enable toggle and the software
+  tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
+  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
+  were already accepted by the agent but missing from the
+  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
+  discover or tune them (notably the enable toggle for the opt-in, off-by-default
+  `software` source). No runtime behaviour change — the params were always honoured; they
+  are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
+  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
+  perf collection at runtime.)
 - **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
   Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
   leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
@@ -338,6 +421,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PostgreSQL substrate container refused to boot on PostgreSQL 18 (#1739).** Every bundled
+  Docker Compose mounted the `postgres-data` volume at `/var/lib/postgresql/data` (the pre-18
+  `PGDATA` path). The `postgres:18` image stores data in a version-pinned subdirectory
+  (`/var/lib/postgresql/18/docker`) and treats a volume mounted at the legacy path as an
+  un-migrated upgrade, so the container exited 1 in a restart loop and the `server` service
+  (which `depends_on` the postgres healthcheck) never started (docker-library/postgres#1259).
+  The volume is now mounted at the PG18-recommended parent `/var/lib/postgresql` across all
+  eight affected composes (including the base `docker-compose.yml` the original report missed),
+  the two reference composes' non-working `PGDATA: /var/lib/postgresql/data` override has been
+  removed (PGDATA is left at the image default), and the Compose Wizard generator
+  (`tools/compose-wizard/`, a packaged release asset) now emits the parent mount and the
+  correct "PostgreSQL 18" label. Unreleased — postgres is a `dev`-only feature with no
+  `Dockerfile.postgres` at v0.12.0, so no shipped release is affected.
+  **Dev/UAT upgrade note:** an operator who already ran one of these stacks before this fix
+  has a pre-18 cluster at the volume root that PG18 cannot read in place; on first boot under
+  the new mount PostgreSQL silently re-initialises an empty cluster at `…/18/docker` and the
+  old data is orphaned (not destroyed) inside the same volume. Since the substrate carries no
+  production data yet, discard just the stale Postgres volume before the first PG18 boot —
+  `docker compose down` then `docker volume rm <project>_postgres-data` (or
+  `<project>_postgres-uat-data` for full-UAT). **Do not** use `docker compose down -v`: it
+  also removes `server-data` and the reference compose's `certs` volume (the per-install CA +
+  leaf certs), which would force the entire fleet to re-enroll.
 - **DEX Catalogue now credits the full Linux signal coverage (was 7, now 17 types).** The per-OS
   coverage map (`dex_obs_platforms`) that colours the Catalogue's "monitored / not collected on
   Linux" badges was frozen at the original 7-type conservative set from before the Linux
@@ -368,8 +473,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
   now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
   (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
-  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
-  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  round-trip intact. Affects both machine-scope registry read paths (`list`, `query`). The ingest seam's UTF-8 scrub remains as
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
 
@@ -421,6 +525,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR — software install/uninstall capture source (`$Software`).** A new TAR
+  warehouse source records application **installed / removed / upgraded** events over
+  time by diffing the installed-software inventory on a dedicated hourly trigger
+  (`tar.software`; tune the cadence via `software_interval`, `0`–86400 s). On Windows it
+  captures **machine-scope only** (HKLM Uninstall 64-bit + WOW6432Node) installs — no
+  per-user enumeration, no Windows profile names, and **no user identity / no PII**.
+  Tiers: `$Software_Live` (5000 rows) →
+  `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`name`
+  install/remove/upgrade counts. **The source is off by default** (opt-in) — an operator
+  enables it per host with `tar.configure software_enabled=true`. Even though the
+  machine-scope data carries no user identity (device asset-management /
+  vulnerability-relevance data, like Services and User sessions), a brand-new capture
+  source ships disabled out of caution so a host only collects it once the operator has
+  decided to; enabling or disabling re-baselines the source so neither emits a spurious
+  install/remove storm. Names, versions, and publisher only
+  — no command lines or usage data. The first
+  scan on a host **seeds the baseline silently** so an `installed` event always means
+  "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
+  `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
+  `software_last_run_ts` lines
+  — update any field-count parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
+  `$Software_*` tables are queryable but empty there until then. Disabling the source
+  (`software_enabled=false`) is **atomic with the collector** — it holds the same
+  `software_collect_mu_` the collector takes and the collector re-checks the flag under
+  that lock, so a disable racing an in-flight scan can never insert events from the paused
+  window or leave a stale baseline (no ghost install/remove/upgrade events on re-enable;
+  same #538 contract as the other snapshot-diff sources). `SystemComponent` entries are
+  read as `REG_DWORD` (their canonical type) so system components/patches are correctly
+  excluded, and `software` rows are reachable from the legacy `tar.query`/`tar.export`
+  typed paths as well as `tar.sql`. Enumeration is bounded by a per-cycle entry cap
+  (`kSoftwareEntryCap`, warns once on truncation) so a bloated/corrupt registry cannot grow
+  the tick unbounded, and same-name dedup compares versions **numerically** (so `10.0`
+  outranks `9.0` — a lexicographic compare previously suppressed real upgrades). `tar.snapshot`
+  now collects the source too. See `docs/user-manual/tar.md` and the data-handling
+  classification in `docs/enterprise-readiness-soc2-first-customer.md`.
 - **DEX: wave-4 reliability signals — power, driver, and service health (Windows).**
   Seven new signal types (Windows event catalogue 103→110, server display catalogue
   107→114), all real-record-pinned from a live HP ZBook Firefly 14 G8:

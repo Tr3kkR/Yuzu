@@ -78,12 +78,12 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | Feature | Workstream B line | SOC 2 link | Gap class |
 |---|---|---|---|
 | **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
-| **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **MISSING** |
-| **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **MISSING** |
+| **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
+| **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
-| **Inactivity session timeout** — `auth_db.cpp:363` reserves `last_activity_at` column with DEFAULT but **no `UPDATE` writes anywhere** in the codebase; expiry-only today. Treat as from-scratch work, not a tweak. | "inactivity timeout" | CC6.3 | **MISSING (column reserved)** |
+| **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
 | **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
 | **API token inventory + last-used view** — data layer shipped (`api_tokens.last_used_at` written/read at `api_token_store.cpp:291,325-345`); dashboard inventory view missing. | "token inventory" | CC6.6 | **PARTIAL — UI only** |
@@ -149,11 +149,30 @@ matches the customer ask.
    `auth.lockout.applied`/`.cleared`; metrics `yuzu_auth_lockout_applied_total`
    / `yuzu_auth_lockout_blocked_total`. See `docs/auth-architecture.md`
    "Account lockout".
-3. **Hardened-mode local-password disable.** New CLI flag
-   `--auth-mode=sso-only`; `auth_routes.cpp` rejects local-password login
-   with a clear message and logs `auth.local_disabled`. Break-glass account
-   policy: a single named principal exempt from the flag, with mandatory
-   MFA + 24h auto-disable + every action logged at `critical`.
+3. ~~**Hardened-mode local-password disable.**~~ **DONE** — `--auth-mode=sso-only`
+   (`YUZU_AUTH_MODE`) disables the local-password path fleet-wide; only OIDC SSO
+   mints a session, and the server **refuses to start** without OIDC configured
+   (it would otherwise lock everyone out). The `POST /login` gate returns the
+   **same generic 401** as a bad password (no enumeration/mode oracle); the
+   denial is **metric-only** (`yuzu_auth_local_disabled_total{target}`), NOT a
+   per-attempt audit row (anti-flood, matches the lockout-blocked posture).
+   Break-glass account: `--break-glass-user` is the single exempt principal,
+   exempt **only while armed** (`users.break_glass_armed_until`, migration v4 — a
+   future timestamp evaluated in SQL like `locked_until`, so it **auto-expires**;
+   `--break-glass-window-secs` default 24h). **Mandatory MFA** is enforced two
+   ways: boot fails closed if the break-glass user lacks MFA
+   (`break_glass_account_problem`), and at login an un-enrolled break-glass
+   account is **hard-denied 403** (`auth.breakglass.denied`) — enrollment is
+   never offered (it would defeat the second factor; governance UP-1). Arming is
+   an out-of-band **host CLI** op — `yuzu-server --break-glass-arm` (audited
+   `auth.breakglass.armed` at `kCritical`, attributed to the kernel OS identity,
+   audit-store writable-checked before mutate; mirrors the `--mfa-reset`
+   contract) — so it works when the IdP is down. Use is loud: `kCritical`
+   `auth.breakglass.login` audit + `yuzu_auth_break_glass_login_total` metric.
+   See `docs/auth-architecture.md` "Hardened mode",
+   `docs/security-reviews/auth-hardened-mode-2026-06-29.md`, the
+   `docs/ops-runbooks/auth-db-recovery.md` arm runbook;
+   `tests/unit/server/test_auth_break_glass.cpp` + `test_auth_routes_hardened.cpp`.
 4. ~~**Sampled auth-log evidence export.**~~ **DONE** —
    `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` returns a
    pseudo-random sample of the auth surface (`auth.`/`mfa.`/`session.` action
@@ -175,11 +194,19 @@ matches the customer ask.
 7. **SCIM v2 provisioning** — auto-create/disable users from the IdP.
    Reuses `auth.db` user table; new endpoint surface under `/scim/v2/`
    with bearer-token auth (separate from operator API tokens).
-8. **Inactivity session timeout** — wire the reserved `last_activity_at`
-   column at `auth_db.cpp:363` end-to-end: per-request `UPDATE` on every
-   authenticated touch, expiry check inside `validate_session()` against
-   `now - last_activity_at > inactivity_window`, configurable per
-   deployment. Treat as from-scratch since no `UPDATE` writes exist today.
+8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
+   (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
+   0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
+   Enforced in `AuthManager::validate_session` against the in-memory `Session`
+   (the authoritative read path — `auth.db` sessions are v1 dead-writes): a
+   **monotonic `steady_clock` `last_activity_at`** is bumped on each
+   authenticated touch (sliding window) and the session is rejected + evicted
+   once idle past the window, *under* the absolute 8h `kSessionDuration`. Cookie
+   sessions only — API/MCP tokens resolve via `synthesize_token_session`, never
+   `validate_session`, so they are **never idle-timed-out**. The `auth.db`
+   `last_activity_at` mirror is best-effort + throttled (`touch_session_activity`,
+   ≤1 write/session/60s, off `mu_`). See `docs/auth-architecture.md` "Inactivity
+   session timeout"; `tests/unit/server/test_auth.cpp` `[idle]`.
 9. **JIT admin elevation** — `POST /api/v1/elevate` accepting a justification
    + duration; promotes the caller's effective role for the window, audits
    `role.elevation.requested|granted|expired`. Returns to base role on TTL.

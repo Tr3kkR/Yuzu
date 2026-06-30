@@ -61,6 +61,16 @@ struct Config {
         90}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
+    // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
+    // Seconds of inactivity after which a cookie session is invalidated
+    // server-side (a sliding window UNDER the absolute 8h session lifetime).
+    // 0 (default) disables it — only the absolute lifetime applies; existing
+    // deployments are unaffected. Enabling it (recommended 900 = 15 min)
+    // satisfies the CC6.3 inactivity-timeout control. Wired via
+    // --session-inactivity-secs / YUZU_SESSION_INACTIVITY_SECS into
+    // AuthManager::set_session_inactivity. See docs/auth-architecture.md.
+    int session_inactivity_secs{0};
+
     // Authentication
     std::filesystem::path auth_config_path; // yuzu-server.cfg path
 
@@ -198,6 +208,27 @@ struct Config {
     /// How long the intermediate "mfa_pending" token is valid (window
     /// between password success and TOTP submission). Default 120 s.
     int mfa_login_pending_secs{120};
+
+    // Hardened authentication mode + break-glass — `/auth-and-authz` skill gap
+    // matrix P0 #3, SOC 2 CC6.3 (disable password fallback) + CC6.6
+    // (constrained break-glass). See docs/auth-architecture.md "Hardened mode".
+    //
+    // "standard" (default) leaves local-password login enabled. "sso-only"
+    // disables the local-password path fleet-wide — only OIDC SSO mints a
+    // session — EXCEPT for a single designated break-glass account that is
+    // exempt ONLY while armed (an out-of-band host operator ran
+    // --break-glass-arm within the window). sso-only refuses to start without
+    // OIDC configured (it would otherwise lock every operator out).
+    std::string auth_mode{"standard"}; // "standard" | "sso-only"
+    /// Username of the single local account exempt from sso-only while armed.
+    /// Empty = no break-glass account. Must exist and have MFA enrolled
+    /// (enforced fail-closed at boot under sso-only).
+    std::string break_glass_user;
+    /// Seconds the break-glass account stays armed after --break-glass-arm
+    /// (default 86400 = 24h). The arm auto-expires (break_glass_armed_until is
+    /// a future timestamp evaluated lazily at login, like locked_until) so it
+    /// can never be a permanent standing exemption.
+    int break_glass_window_secs{86400};
 
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests

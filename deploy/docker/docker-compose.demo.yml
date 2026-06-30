@@ -103,7 +103,11 @@ services:
       POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:-yuzu-demo}
       YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:-yuzu-demo-app}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # PG18 mount point: the parent dir, NOT .../data. The postgres:18 image
+      # stores data in a version-pinned subdir ($PGDATA=/var/lib/postgresql/18/
+      # docker) and treats a volume at the legacy /data path as an un-migrated
+      # upgrade — it refuses to boot (docker-library/postgres#1259).
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       # -h 127.0.0.1 forces TCP — the init-phase temporary server is
       # unix-socket-only, so a socket probe could pass mid-init. psql

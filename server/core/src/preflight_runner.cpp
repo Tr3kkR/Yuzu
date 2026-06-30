@@ -78,46 +78,12 @@ void PreflightRunner::tick() {
             }
         }
 
-        // Persist grid (compute → persist → THEN complete, so a viewer arriving
-        // right after completion reads a final grid, not a one-tick-stale one).
-        int go = 0, warn = 0, nogo = 0, inc = 0;
-        std::vector<PreflightRunDeviceRow> rows;
-        rows.reserve(grid.size());
-        for (const auto& dr : grid) {
-            PreflightRunDeviceRow row;
-            row.agent_id = dr.agent_id;
-            row.hostname = dr.hostname;
-            row.os = dr.os;
-            row.bucket = preflight::bucket_token(dr.bucket);
-            row.checks_json = preflight::checks_to_json(dr.checks);
-            row.updated_at_ms = t;
-            rows.push_back(std::move(row));
-            switch (dr.bucket) {
-            case preflight::Bucket::kPass:
-                ++go;
-                break;
-            case preflight::Bucket::kFailed:
-                ++nogo;
-                break;
-            case preflight::Bucket::kWarnOnly:
-                ++warn;
-                break;
-            default:
-                ++inc;
-                break;
-            }
-        }
-        const bool persisted = d_.run_store->persist_grid(run.run_id, rows,
-                                                          static_cast<int>(grid.size()), go, warn,
-                                                          nogo, inc);
-
-        // Complete ONLY once the grid is durably persisted (#governance UP-1/CH-1).
-        // persist_grid and complete_run take independent leases — completing on a
-        // failed persist would flip the run to 'complete' with the stale/seed grid
-        // forever (it then leaves list_running, never retried). On a persist
-        // failure the run stays running and the next tick retries.
-        if (persisted && (past_deadline || !any_pending))
-            d_.run_store->complete_run(run.run_id, t);
+        // Persist the grid + complete-when-settled. Shared with the live result
+        // route (preflight::persist_and_maybe_complete) so a run completes the
+        // moment its cohort settles on WHICHEVER path notices first — the route's
+        // self-poll or this tick — and both build the grid identically.
+        preflight::persist_and_maybe_complete(*d_.run_store, run.run_id, grid, t, past_deadline,
+                                              any_pending);
     }
 }
 

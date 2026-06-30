@@ -96,6 +96,53 @@ scope here.
 - **Metrics** — `yuzu_auth_lockout_applied_total`,
   `yuzu_auth_lockout_blocked_total`.
 
+## Inactivity (idle) session timeout (SOC 2 CC6.3)
+
+`/auth-and-authz` skill gap matrix P1 #8. A **sliding** idle window that
+invalidates an operator dashboard cookie session after a period of inactivity,
+*under* the absolute 8-hour session lifetime (`kSessionDuration`). Wires the
+previously-reserved `sessions.last_activity_at` column end-to-end.
+
+- **Config** — `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`),
+  `Config::session_inactivity_secs`. **Default 0 = disabled** (opt-in): the
+  absolute lifetime already exists and an idle-logout that drops a legitimate
+  user mid-coffee-break is a behaviour change, so it is off unless an operator
+  turns it on (recommended `900` = 15 min). Boot posture is logged for CC6.3
+  evidence. Enabling it satisfies the CC6.3 inactivity-timeout control.
+- **In-memory is authoritative.** Sessions are validated from the in-memory
+  `AuthManager::sessions_` map (the `auth.db` `sessions` rows are v1
+  dead-writes), so the idle state lives on the in-memory `Session`:
+  `last_activity_at` (a monotonic `steady_clock` stamp — an NTP step can neither
+  extend nor collapse the window). `AuthManager::session_inactivity_` holds the
+  configured window (set once at startup via `set_session_inactivity`).
+- **Enforcement is in `validate_session`** (the same place the absolute
+  `expires_at` is checked, and which already conditionally upgrades its shared
+  lock for the opportunistic reap). When the feature is on: a session idle
+  longer than the window is **rejected and evicted** (the reap re-reads
+  `last_activity_at` under the write lock so a concurrent touch at the boundary
+  doesn't kill a now-active session); an active one has `last_activity_at`
+  **slid forward** (the window slides). **The touch is throttled** — the window
+  is advanced (which needs the exclusive lock) at most once per
+  `touch_granularity` (a quarter of the idle window, capped at 30 s), so a burst
+  of requests for an active session stays on the **shared** lock rather than
+  serialising on `mu_`; `last_activity_at` therefore lags real activity by at
+  most the granularity (far inside any minutes-scale window, so an active session
+  is never wrongly evicted — idle-out fires within `[window − granularity,
+  window]`). The idle-*disabled* small-map read stays a pure shared-lock path (no
+  behaviour change for deployments that leave it off).
+- **Scope: cookie sessions only.** API tokens and MCP tokens resolve through
+  `synthesize_token_session` (their own store), never `validate_session`, so a
+  long-lived automation token is **never** idle-timed-out. OIDC sessions are
+  subject to the same idle window but the user simply re-authenticates via SSO.
+- **Durable mirror is best-effort + throttled.** On a touch, the in-memory stamp
+  is authoritative; the `auth.db` column is updated via
+  `AuthDB::touch_session_activity` (mirrors `mfa_mark_session_stepup`) at most
+  once per session per `kActivityPersistGranularity` (60 s), off the `mu_` lock
+  (snapshot-and-release), so the per-request touch is **not** a per-request SQL
+  write. Idle expiry is not separately audited (neither is absolute expiry) and
+  emits **no Prometheus counter** — the observable signal is the `auth.login`
+  audit row on re-authentication.
+
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 
 Full design: `docs/auth-mfa-design.md`. Summary:
@@ -133,6 +180,81 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
+
+## Hardened mode (sso-only) + break-glass (SOC 2 CC6.3/CC6.6)
+
+`/auth-and-authz` skill gap matrix P0 #3. Closes Workstream B *"Disable
+local-password fallback in hardened mode (or tightly constrain break-glass
+account policy)"* — this ships **both** halves.
+
+- **`--auth-mode <standard|sso-only>`** (`YUZU_AUTH_MODE`, default `standard`).
+  Under `sso-only` the local-password login path is disabled fleet-wide — only
+  OIDC SSO (`/auth/callback`, untouched) mints a session. The rejection at
+  `POST /login` returns the **same generic 401** as a bad password (no
+  "disabled"/"sso-only" wording, no `Retry-After`) so the response BODY carries
+  no enumeration/mode/arm-state oracle, and `verify_password` (PBKDF2) is
+  skipped — same posture and accepted *timing* residue as the lockout pre-check.
+  The denial is recorded as a **metric, not a per-attempt audit row**
+  (`yuzu_auth_local_disabled_total{target=break_glass|other}`) — a credential
+  spray would otherwise grow `audit.db` without bound, the exact amplification
+  the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
+  banner + this counter (the `{target}` label, cardinality 2, flags probing of
+  the break-glass account itself for SIEM alerting).
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
+  **fully** configured — the guard requires both `--oidc-issuer` **and**
+  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
+  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
+  operator is locked out. The break-glass account is for an IdP **outage**, not
+  for never wiring SSO. The active posture is logged once at boot for CC6.3
+  evidence.
+- **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
+  designates the single local account exempt from `sso-only`, exempt **only
+  while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
+  future timestamp evaluated in SQL against `CURRENT_TIMESTAMP` exactly like
+  `locked_until`, so the exemption **auto-expires** (default 24h,
+  `--break-glass-window-secs` / `YUZU_BREAK_GLASS_WINDOW_SECS`, `86400`) and can
+  never be a permanent standing bypass. A non-exempt or un-armed attempt gets
+  the same generic 401 + `auth.local_disabled`.
+- **Mandatory MFA, enforced two ways.** (1) Boot **fails closed** if the
+  break-glass user doesn't exist or has no MFA enrolled
+  (`break_glass_account_problem` in `auth_db`, shared by the boot guard and the
+  arm one-shot; because `mfa_status` filters `is_active=1`, a soft-deleted user
+  also reads as un-enrolled and is rejected). (2) If MFA is cleared out-of-band
+  between boot and login, the login handler **hard-denies** the break-glass login
+  (`403` + `auth.breakglass.denied`, `Severity::kCritical`) — it does **not**
+  fall through to TOTP *enrollment*, because enrollment would hand a fresh secret
+  to whoever proved the password and let a password-only adversary self-enrol and
+  break the glass with no real second factor (governance UP-1). An enrolled
+  break-glass login that proceeds emits `auth.breakglass.login` (`result=ok`,
+  `kCritical` — `result=ok` means the *password* was accepted; the row's `detail`
+  is explicit that the mandatory TOTP challenge still runs before a session is
+  minted) + the metric `yuzu_auth_break_glass_login_total` + a `warn` log.
+- **Lockout-exempt under sso-only (availability).** The break-glass account is
+  exempt from failed-login lockout while `--auth-mode=sso-only`, so an attacker
+  who learns its username cannot spray wrong passwords to keep it locked and
+  render the escape hatch unreachable during an IdP outage (governance Hermes-F /
+  UP-13). Safe because the second factor is still mandatory and, while un-armed,
+  the password is never evaluated; wrong attempts are still audited
+  (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
+  standard mode.
+- **Arming is an out-of-band host operation, never a session route.** The IdP
+  being down is *why* you break the glass, so arming cannot depend on a login.
+  `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--data-dir`)
+  arms the account for the window and exits — mirroring the `--mfa-reset`
+  break-glass contract (#1226): it validates the account (exists + MFA),
+  verifies the audit store is **writable before** mutating, and writes
+  `auth.breakglass.armed` attributed to the **kernel-authoritative OS identity**
+  (`resolve_os_principal`, not the forgeable `USER` env var), `principal_role =
+  break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
+  audit row can't persist.
+
+Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
+pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
+`arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
+#1033); flags + boot guard + arm one-shot in `main.cpp`; `Config::auth_mode` /
+`break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
+`tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
+`test_auth_routes_hardened.cpp` (wire path).
 
 ## Granular RBAC (Phase 3)
 

@@ -110,6 +110,56 @@ warning and the numbers are unreliable — narrow the group or shorten the windo
 The same comparison is available to automation: REST `GET /api/v1/dex/perf/compare`
 and MCP `compare_app_perf_versions` return the aggregate (no per-machine identity).
 
+## Deploying to the go-cohort
+
+Pre-flight is the **assess** half of a change; the **act** half lives on the same
+page. As soon as a run has a go-cohort — at least one device in **Pass** or
+**Warn-only** — a **Deploy go-cohort** button appears on the result. **The run does
+not need to finish first**; the button's count grows as more devices clear. It opens
+a deploy panel where you give an **artifact** — a download **URL**, a **filename**,
+the expected **SHA-256**, and optional silent-install **arguments** — and confirm.
+The deployment targets the devices that had cleared **at the moment you clicked
+Deploy** (the cohort is frozen then). On those devices it:
+
+1. **Stages** the installer — the agent downloads it and verifies the SHA-256 (a
+   hash mismatch fails the device; the file is never executed).
+2. **Executes** the staged installer once the hash is confirmed, and records the
+   exit code.
+
+The progress view is **aggregate-first**: a count strip (targeted / succeeded /
+executing / in-flight / failed / skipped) and a progress bar are the headline, with
+the per-device list below, problem-first. A device is **Succeeded** on exit 0,
+**Failed** on a stage error or a non-zero exit, and **Skipped** if you no longer
+have scope to it when the step is dispatched — it is never run.
+
+Two safety properties matter because executing an installer changes the endpoint:
+
+- **Run-once.** The execute step is claimed before it is dispatched, so an
+  installer runs **at most once per device** even if you reload the page, several
+  tabs poll at once, or the server restarts mid-deployment.
+- **Re-authorization.** Every tick re-checks the devices you can currently see. A
+  device that has dropped out of your scope since the pre-flight run is **skipped**,
+  not executed.
+
+**Deploying mid-run, and covering later devices.** Because you can deploy before
+the run finishes, a deployment only covers the devices that had cleared when you
+clicked. Devices that clear **afterward** are not added to the running deployment —
+clicking **Deploy go-cohort** again while it is still running just re-attaches to
+that same deployment. Once it **completes**, click **Deploy go-cohort** again to
+cover the newly-cleared (and any **Failed**) devices: the new deployment automatically
+**excludes devices an earlier deployment already installed successfully**, so the
+installer is never run twice on one device across the run.
+
+A deployment is driven by the open page today (there is no background runner in
+this slice). Closing the page — or the page reaching its automatic poll limit
+after roughly ten minutes — **pauses** the deployment: its state is durably saved,
+but it does not advance while no page is polling it. To **resume**, re-open the
+deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
+server detects the in-flight deployment and re-attaches to it rather than starting
+a second one. A device that is offline when its stage or execute step is dispatched
+is not retried in this slice; delete the deployment and re-deploy once it is back.
+The same engine is designed to be driven headless by an automation worker later.
+
 ## Permissions
 
 | Action | Permission |
@@ -117,12 +167,24 @@ and MCP `compare_app_perf_versions` return the aggregate (no per-machine identit
 | View the page / a result / the rail | `Infrastructure:Read` |
 | Run a pre-flight | `Infrastructure:Read` + `Execution:Execute` |
 | Delete a saved run | `Execution:Execute` (and you must be the owner) |
+| Open the deploy config panel for a run | `SoftwareDeployment:Read` |
+| Deploy to a go-cohort (create + first advance) | `Infrastructure:Read` + `SoftwareDeployment:Execute` |
+| View / track a deployment — each poll also advances the engine | `SoftwareDeployment:Read` + `SoftwareDeployment:Execute` |
+| Delete a deployment | `SoftwareDeployment:Execute` |
 | Open the Verify form | `Infrastructure:Read` |
 | Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
+Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
+require you to be the creator; another operator's deployment reads as not-found).
+The result poll requires `Execute` as well as `Read` because the same request
+**advances the mutating engine**, not just renders — a read-only operator cannot
+drive a deployment.
+
 Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
-`preflight.run` and `preflight.run.delete`. A Verify aggregate comparison is recorded
-as `dex.app_perf.compare`; opening the per-machine pairs carries its own
+`preflight.run` and `preflight.run.delete`; deployments as `deployment.create`
+(result `success` / `resumed` / `no_devices`), `deployment.advance`, and
+`deployment.delete`. A Verify aggregate comparison is recorded as
+`dex.app_perf.compare`; opening the per-machine pairs carries its own
 `dex.app_perf.compare.drill` verb so per-machine access stays separately countable.
 (Over MCP, `compare_app_perf_versions` is recorded under the generic
 `mcp.compare_app_perf_versions` tool-call audit.)

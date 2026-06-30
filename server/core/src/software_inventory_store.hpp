@@ -70,6 +70,45 @@ struct SoftwareFleetRow {
     SoftwareEntry entry;
 };
 
+/// One fleet-catalogue row — a software title rolled up across the WHOLE fleet
+/// (`software_catalog`). **FLEET-WIDE aggregate, NOT management-group scoped:** the
+/// GROUP BY runs in Postgres and cannot apply the per-agent C++ scope predicate the
+/// flat-row reads use, so `device_count` spans every management group. Under the
+/// GLOBAL `Inventory:Read` gate this matches today's behaviour (ADR-0017 confinement
+/// is inert — a confined operator is denied at the gate, a global one sees all), but
+/// the day list-view confinement lands this aggregate MUST become scope-aware or stay
+/// global-gated. Callers caveat the counts, exactly like the `query_software` route.
+struct SoftwareCatalogRow {
+    std::string name;
+    std::string publisher;         ///< representative publisher (max over the group); may vary
+    std::int64_t device_count{0};  ///< COUNT(DISTINCT agent_id) carrying the title
+    std::int64_t version_count{0}; ///< COUNT(DISTINCT version) of the title
+};
+
+/// One version's install count for a title — the "installs per version" drill.
+struct SoftwareVersionCount {
+    std::string version;
+    std::int64_t device_count{0}; ///< COUNT(DISTINCT agent_id) on this version
+};
+
+/// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
+/// titles; empty matches all. `limit` caps the returned rows (ordered by install
+/// count); the store also enforces a hard ceiling independent of `limit`.
+struct SoftwareCatalogQuery {
+    std::string name_filter;
+    int limit{200};
+};
+
+/// Freshness + headline counts for the catalogue rollup (the `/inventory` Software-tab
+/// "as of" stamp + KPI strip, so the page never runs a COUNT). `refreshed_at == 0`
+/// means the rollup has never been computed yet ("building" state) — distinct from a
+/// refreshed-but-empty fleet (`refreshed_at > 0`, `total_titles == 0`).
+struct CatalogRollupMeta {
+    std::int64_t refreshed_at{0}; ///< epoch seconds of the last successful refresh; 0 = never
+    std::int64_t total_titles{0};
+    std::int64_t total_devices{0};
+};
+
 /// Fleet-wide software query. Empty filters match all; results are capped.
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
@@ -141,6 +180,42 @@ public:
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
     query_software(const SoftwareFleetQuery& q);
+
+    /// Fleet software catalogue — every title with its (device_count, version_count),
+    /// most-installed first (the `/inventory` Software list). Reads the PRECOMPUTED
+    /// `catalog_rollup` table (refreshed by `refresh_catalog_rollup`), NOT an on-demand
+    /// GROUP BY — the underlying `installed_software` changes only on the daily sync, so
+    /// recomputing per request is wasteful and degrades at fleet scale. This read is a
+    /// cheap indexed scan of the small rollup. **FLEET-WIDE** (see `SoftwareCatalogRow`):
+    /// the rollup is global by construction and CANNOT be per-operator scoped, so the
+    /// caller MUST gate on the GLOBAL `Inventory:Read` (ADR-0017). AUTHORITATIVE read:
+    /// `std::nullopt` on a store/pool/query degrade, NEVER a silent empty. An empty value
+    /// means the rollup has no rows — pair with `catalog_rollup_meta()` to tell a
+    /// never-refreshed ("building") rollup from a genuinely empty fleet.
+    [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
+    software_catalog(const SoftwareCatalogQuery& q);
+
+    /// Installs-per-version for ONE title (the catalogue drill), most-installed first.
+    /// Reads the precomputed `version_rollup` (same cadence/scope as `software_catalog`).
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade. An empty `name`
+    /// is a precondition miss → empty value (not a degrade).
+    [[nodiscard]] std::optional<std::vector<SoftwareVersionCount>>
+    software_versions(std::string_view name, int limit);
+
+    /// Recompute the catalogue rollup from `installed_software` and atomically replace
+    /// `catalog_rollup` / `version_rollup` / `catalog_rollup_meta` in ONE transaction —
+    /// the single expensive `GROUP BY`, run OFF the request path by the background
+    /// `SoftwareCatalogRollup` thread on a cadence. KEEP-LAST-GOOD: on any lease/SQL
+    /// failure (incl. the generous background `statement_timeout`) the transaction rolls
+    /// back, leaving the prior rollup + its freshness stamp intact (the stamp visibly
+    /// ages). Returns false on failure (the caller logs/metrics it). Idempotent.
+    bool refresh_catalog_rollup();
+
+    /// The catalogue rollup's freshness stamp + headline counts (the Software-tab "as of"
+    /// stamp + KPI strip). AUTHORITATIVE read: `std::nullopt` on a store/pool/query
+    /// degrade. The singleton meta row is seeded at migration with `refreshed_at = 0`
+    /// (the "building" sentinel), so a successful read always returns a value.
+    [[nodiscard]] std::optional<CatalogRollupMeta> catalog_rollup_meta();
 
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);

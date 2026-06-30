@@ -526,6 +526,51 @@ groups:
             last value and may read healthy during an actual outage. Investigate
             Postgres pool saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryCatalogRollupStale
+        # The /inventory Software-tab catalogue is a precomputed rollup refreshed hourly
+        # by the SoftwareCatalogRollup thread. If recomputes stop succeeding (PG outage /
+        # the 60s recompute budget exceeded at fleet scale), keep-last-good keeps serving
+        # the PRIOR rollup — the page's "updated N ago" stamp ages but there is no
+        # automated signal otherwise, and a stale catalogue under-reports a title that
+        # hasn't rolled up yet. `> 0` GUARD IS LOAD-BEARING: last_success_timestamp is
+        # seeded to 0 (epoch 1970, the "building" sentinel) at thread start, so a naive
+        # `now - ts` fires immediately on every cold boot; the guard skips the building
+        # window. The never-succeeded / ongoing-failure case is covered by the error-rate
+        # alert below, NOT this rule.
+        expr: |
+          (time() - yuzu_inventory_catalog_rollup_last_success_timestamp) > 7200
+          and yuzu_inventory_catalog_rollup_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software catalogue rollup is stale"
+          description: >-
+            The /inventory catalogue rollup has not refreshed in over 2h (cadence is 1h).
+            Keep-last-good is serving an aging catalogue; counts may under-report recent
+            installs. Check yuzu_inventory_catalog_rollup_total{outcome="error"} and the
+            SoftwareCatalogRollup thread log (Postgres outage or the 60s recompute budget
+            exceeded at scale — raise kRollupStatementTimeout or shard the rollup).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryCatalogRollupFailing
+        # Catches the case the staleness alert's `> 0` guard deliberately skips: a server
+        # whose recomputes keep FAILING (incl. one that has never succeeded, last_success
+        # still 0). A sustained error rate means the catalogue is building/stale with no
+        # success to age off.
+        expr: |
+          sum(rate(yuzu_inventory_catalog_rollup_total{outcome="error"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software catalogue rollup recomputes are failing"
+          description: >-
+            yuzu_inventory_catalog_rollup_total{outcome="error"} is rising: the catalogue
+            rollup thread cannot complete a recompute. If last_success_timestamp is still 0
+            the catalogue has never populated ("building"); otherwise it is frozen at the
+            last good rollup. Investigate Postgres availability / the recompute duration
+            (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
       # is no fleet-size-independent absolute threshold: >50 is day-one noise on a

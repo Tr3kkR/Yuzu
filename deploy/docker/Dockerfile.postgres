@@ -36,7 +36,11 @@
 #                       if it is unset or equal to the superuser password
 #                       (a leaked app DSN must never disclose superuser
 #                       credentials — PR #1334 review, S1).
-#   Data dir: /var/lib/postgresql/data (mount a named volume).
+#   Data dir: $PGDATA = /var/lib/postgresql/18/docker (postgres:18 default,
+#   version-pinned subdir). Mount a named volume at the PARENT /var/lib/
+#   postgresql — NOT the legacy /var/lib/postgresql/data, which the 18
+#   entrypoint reads as an un-migrated upgrade and refuses to boot
+#   (docker-library/postgres#1259).
 #   Healthcheck lives in the composes: pg_isready -h 127.0.0.1 (liveness)
 #   && psql over the app DSN for SELECT 1 (proves the app credential).
 #   (-h 127.0.0.1 is load-bearing — during docker-entrypoint-initdb.d the

@@ -50,6 +50,37 @@ JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy
 - 4 prompts: `fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`
 - Settings UI section with enable/disable and read-only toggles
 
+## Agentic Demo Layer
+
+Yuzu also exposes a v1 MCP-native demo and incident-orientation layer for LLM clients. It is intentionally endpoint-evidence first: OpenShift, KVM/libvirt, Postgres/Oracle, Teams/Zoom, registry/build-cache, and similar platform internals are labelled as connector gaps unless the facts are already present in Yuzu inventory/responses or supplied by the user.
+
+### Resources
+
+- `yuzu://about` — product primer, glossary, and safe operating rules.
+- `yuzu://capabilities` — what MCP can answer now, what may need live read-only dispatch, what requires external connectors, and what is unsafe without approval.
+- `yuzu://operating-model` — classify → plan → read → narrow scope → dry run/read-only probe → request approval → execute → monitor.
+- `yuzu://demo/playbooks` — deterministic incident/demo playbooks with live-fleet variants.
+- `yuzu://golden-prompts/enterprise-it-v1` — versioned golden prompt/eval catalogue.
+
+### High-level tools
+
+These tools are read-only and available to the `readonly` MCP tier, subject to normal RBAC checks. They advertise `outputSchema` and return both legacy MCP `content[]` text and `structuredContent`.
+
+- `get_fleet_posture_fast` — compact cached posture summary. The cache TTL defaults to 30 seconds and responses include `generated_at`, `data_age_seconds`, `partial`, and `missing_sources`. `data_age_seconds` reflects the **real age of the cached snapshot at read time** — it is recomputed per request, so a cache hit reports a non-zero age (it is not the value baked in at generation).
+- `classify_operational_question` — classifies a question as `answerable_now`, `answerable_with_live_dispatch`, `requires_external_connector`, `unsafe_without_approval`, or `outside_yuzu_scope`. **This classification is advisory only — a UX hint for the agentic worker, not a security control.** It uses ASCII keyword matching that can be evaded by rephrasing or Unicode homoglyphs; never treat it as an authorization decision. Real enforcement is the MCP tier + RBAC check on each tool, and its `recommended_next_tools` are always read-only.
+- `get_incident_playbook` — returns a scenario workflow, first tool, safe tool path, connector gaps, and approval boundaries. `scenario` is matched **exactly** against a playbook name, category, or curated tag (e.g. `openshift`, `teams`, `postgres`) — not by loose substring, so a short/generic query returns "unknown scenario" rather than the wrong playbook.
+- `summarize_working_set` — summarizes a fleet, agent, execution, or result-set working set into a bounded model-ready narrative with resource links. The `agent` kind is management-group scoped (an out-of-scope agent is reported as not-present, never leaking its hostname/os); the `execution` kind additionally requires `Execution:Read`.
+
+> **No fabricated-data demo mode (ADR-0016).** Yuzu demos run **live against the real fleet** and never return canned findings. The earlier `prepare_demo_scenario` tool and its `mode=curated` "DEMO DATA" path are **retired**. Realism comes from constructing a real environment that genuinely exhibits a condition (a staged device with a real pending reboot, a really-degraded link, a really-crashing service), then observing it live and remediating it live through the normal tier/RBAC + approval path. The `ceo_demo_agentic_endpoint_management` prompt drives that live flow.
+
+### Prompts
+
+Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_agentic_endpoint_management`, `fleet_health_briefing`, `investigate_collaboration_quality_issue`, `investigate_endpoint_security_client_outage`, `investigate_patch_or_reboot_risk`, `investigate_container_or_build_failure`, `investigate_java_gateway_or_node_service_degradation`, `investigate_database_client_or_host_bottleneck`, and `prepare_remediation_plan`. User-supplied prompt arguments are wrapped as untrusted data; closed-enum prompt arguments (e.g. the CEO demo's `mode`) are instead normalized server-side to a known-safe value, so caller text never reaches the model as task instructions.
+
+### Golden Prompt Pack
+
+`enterprise-it-v1` covers enterprise incident topics: OpenShift, KVM/libvirt, Chisel/Ubuntu containers, Docker buildx, Node, Spring Cloud Gateway/Java, Postgres/Oracle, Teams/Zoom, Windows/macOS endpoint operations, and security clients such as CrowdStrike, Check Point, zScaler, and Cisco Secure Client. Each fixture records the expected first tool, allowed tool path, pass/fail rubric, safety behavior, and curated/live support.
+
 ## Phase 2 (Planned)
 
 - 5 remaining write tools: `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device`

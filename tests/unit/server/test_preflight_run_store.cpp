@@ -8,6 +8,7 @@
 
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "preflight_eval.hpp"
 #include "preflight_run_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -24,6 +25,7 @@ using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 using yuzu::server::preflight::PreflightTarget;
+namespace preflight = yuzu::server::preflight;
 
 namespace {
 
@@ -148,6 +150,72 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
         CHECK_FALSE(store.get_run("rOld").has_value());
         CHECK(store.get_devices("rOld").empty()); // cascaded
         CHECK(store.get_run("rL").has_value());    // newer run survives
+    }
+}
+
+// Shared persist+complete helper (used by BOTH the runner tick and the live result
+// route): persists the grid, completes only when settled or past-deadline, and —
+// via persist_grid's status guard — leaves a COMPLETE run's grid immutable so a
+// stale route-persist can't overwrite it (#governance architect/consistency).
+TEST_CASE("persist_and_maybe_complete: completes only when settled; complete grid is immutable",
+          "[pg][preflight][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+    const auto t = now_ms();
+
+    auto mk_grid = [](preflight::Bucket b) {
+        std::vector<preflight::PreflightDeviceResult> g;
+        preflight::PreflightDeviceResult dr;
+        dr.agent_id = "a1";
+        dr.hostname = "host-a1";
+        dr.os = "windows";
+        dr.bucket = b;
+        g.push_back(std::move(dr));
+        return g;
+    };
+
+    SECTION("any_pending → persists grid but does NOT complete") {
+        REQUIRE(store.create_run(make_run("pmc1", "alice", t), {tgt("a1")}));
+        auto g = mk_grid(preflight::Bucket::kIncomplete);
+        CHECK_FALSE(preflight::persist_and_maybe_complete(store, "pmc1", g, t,
+                                                          /*past_deadline=*/false,
+                                                          /*any_pending=*/true));
+        auto row = store.get_run("pmc1");
+        REQUIRE(row);
+        CHECK(row->status == "running");
+        CHECK(row->incomplete == 1);
+    }
+    SECTION("settled → completes; then a stale persist on the complete run is a no-op") {
+        REQUIRE(store.create_run(make_run("pmc2", "alice", t), {tgt("a1")}));
+        auto g = mk_grid(preflight::Bucket::kWarnOnly);
+        CHECK(preflight::persist_and_maybe_complete(store, "pmc2", g, t, false, /*any_pending=*/false));
+        auto row = store.get_run("pmc2");
+        REQUIRE(row);
+        CHECK(row->status == "complete");
+        CHECK(row->warn == 1);
+        // Immutability: a slower route-persist landing after completion must NOT
+        // overwrite the final grid (persist_grid is status='running'-guarded).
+        auto stale = mk_grid(preflight::Bucket::kFailed);
+        CHECK_FALSE(preflight::persist_and_maybe_complete(store, "pmc2", stale, t, false, false));
+        auto after = store.get_run("pmc2");
+        REQUIRE(after);
+        CHECK(after->warn == 1); // unchanged
+        CHECK(after->nogo == 0); // NOT overwritten by the stale kFailed grid
+        // The run_device grid itself must be immutable too — that's what the deploy
+        // cohort reads (get_devices → bucket), not the summary counters (#gov Gate-8).
+        auto devs = store.get_devices("pmc2");
+        REQUIRE(devs.size() == 1);
+        CHECK(devs[0].bucket == "warn"); // NOT "nogo" from the rolled-back stale persist
+    }
+    SECTION("past_deadline completes even with a pending device") {
+        REQUIRE(store.create_run(make_run("pmc3", "alice", t), {tgt("a1")}));
+        auto g = mk_grid(preflight::Bucket::kIncomplete);
+        CHECK(preflight::persist_and_maybe_complete(store, "pmc3", g, t, /*past_deadline=*/true,
+                                                    /*any_pending=*/true));
+        CHECK(store.get_run("pmc3")->status == "complete");
     }
 }
 
