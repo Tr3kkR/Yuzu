@@ -118,12 +118,18 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
 - **Enforcement is in `validate_session`** (the same place the absolute
   `expires_at` is checked, and which already conditionally upgrades its shared
   lock for the opportunistic reap). When the feature is on: a session idle
-  longer than the window is **rejected and evicted** (re-checked under the write
-  lock so a concurrent touch at the boundary doesn't kill a now-active session);
-  an active one has `last_activity_at` **bumped to now** (the window slides). The
-  opportunistic large-map reap is extended to drop idle sessions too. The common
-  idle-*disabled* small-map read stays a pure shared-lock path (no behaviour
-  change for deployments that leave it off).
+  longer than the window is **rejected and evicted** (the reap re-reads
+  `last_activity_at` under the write lock so a concurrent touch at the boundary
+  doesn't kill a now-active session); an active one has `last_activity_at`
+  **slid forward** (the window slides). **The touch is throttled** — the window
+  is advanced (which needs the exclusive lock) at most once per
+  `touch_granularity` (a quarter of the idle window, capped at 30 s), so a burst
+  of requests for an active session stays on the **shared** lock rather than
+  serialising on `mu_`; `last_activity_at` therefore lags real activity by at
+  most the granularity (far inside any minutes-scale window, so an active session
+  is never wrongly evicted — idle-out fires within `[window − granularity,
+  window]`). The idle-*disabled* small-map read stays a pure shared-lock path (no
+  behaviour change for deployments that leave it off).
 - **Scope: cookie sessions only.** API tokens and MCP tokens resolve through
   `synthesize_token_session` (their own store), never `validate_session`, so a
   long-lived automation token is **never** idle-timed-out. OIDC sessions are
@@ -133,8 +139,9 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   `AuthDB::touch_session_activity` (mirrors `mfa_mark_session_stepup`) at most
   once per session per `kActivityPersistGranularity` (60 s), off the `mu_` lock
   (snapshot-and-release), so the per-request touch is **not** a per-request SQL
-  write. Idle expiry is not separately audited (neither is absolute expiry); the
-  user re-login emits `auth.login`.
+  write. Idle expiry is not separately audited (neither is absolute expiry) and
+  emits **no Prometheus counter** — the observable signal is the `auth.login`
+  audit row on re-authentication.
 
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 

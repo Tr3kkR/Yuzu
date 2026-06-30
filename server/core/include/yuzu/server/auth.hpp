@@ -51,15 +51,24 @@ struct Session {
     std::chrono::steady_clock::time_point mfa_verified_at{};
 
     /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
-    /// bumped to `steady_clock::now()` on every authenticated request when the
-    /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`);
-    /// `validate_session` rejects the session once `now - last_activity_at`
-    /// exceeds the window — a sliding window UNDER the absolute `expires_at`.
-    /// steady_clock (monotonic) so an NTP step can neither extend nor collapse
-    /// it. `last_activity_persisted_at` throttles the best-effort AuthDB mirror
-    /// (`touch_session_activity`) to at most one write per session per
-    /// kActivityPersistGranularity, keeping the hot path off a per-request SQL
-    /// write. Both default to the session's creation time.
+    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
+    /// throttled to once per touch-granularity; `validate_session` rejects the
+    /// session once `now - last_activity_at` exceeds the window — a sliding
+    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
+    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
+    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
+    /// most one write per session per kActivityPersistGranularity, keeping the
+    /// hot path off a per-request SQL write.
+    ///
+    /// Both are STAMPED at each of the three session-creation sites
+    /// (authenticate / create_local_session / create_oidc_session). The `{}`
+    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
+    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any future path that inserts a Session into
+    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
+    /// work) MUST stamp `last_activity_at`, or the restored session is
+    /// idle-evicted on its first validate when the feature is on.
     std::chrono::steady_clock::time_point last_activity_at{};
     std::chrono::steady_clock::time_point last_activity_persisted_at{};
 };

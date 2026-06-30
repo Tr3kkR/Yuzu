@@ -531,13 +531,19 @@ int main(int argc, char* argv[]) {
     // honestly "active" whenever configured. The absolute 8h session lifetime
     // applies regardless.
     if (cfg.session_inactivity_secs > 0) {
+        // Derive the absolute-lifetime seconds from the single source of truth
+        // (kSessionDuration) so this warn threshold and the docs can't silently
+        // drift if the absolute lifetime ever changes (governance consistency).
+        const auto abs_lifetime_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                           yuzu::server::auth::AuthManager::kSessionDuration)
+                                           .count();
         spdlog::info("Idle session timeout active: operator dashboard sessions are invalidated "
-                     "after {}s of inactivity (under the absolute 8h lifetime).",
-                     cfg.session_inactivity_secs);
-        if (cfg.session_inactivity_secs >= 28800) {
-            spdlog::warn("--session-inactivity-secs={} >= the absolute 8h session lifetime "
-                         "(28800s); the idle window will never trigger before absolute expiry.",
-                         cfg.session_inactivity_secs);
+                     "after {}s of inactivity (under the absolute {}s session lifetime).",
+                     cfg.session_inactivity_secs, abs_lifetime_secs);
+        if (cfg.session_inactivity_secs >= abs_lifetime_secs) {
+            spdlog::warn("--session-inactivity-secs={} >= the absolute session lifetime ({}s); "
+                         "the idle window will never trigger before absolute expiry.",
+                         cfg.session_inactivity_secs, abs_lifetime_secs);
         }
     } else {
         spdlog::info("Idle session timeout DISABLED (--session-inactivity-secs=0) — only the "

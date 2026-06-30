@@ -259,15 +259,19 @@ TEST_CASE("idle timeout slides forward on activity (active session stays alive)"
         std::this_thread::sleep_for(std::chrono::milliseconds(700));
         REQUIRE(mgr->validate_session(*token).has_value());
     }
-    // Stop touching it; after > 2s idle it expires.
-    std::this_thread::sleep_for(std::chrono::milliseconds(2400));
+    // Stop touching it; after > 2s idle it expires. 2.7s (vs the 2s window)
+    // leaves a full 700ms margin over the touch cadence so a starved CI runner
+    // can't dip the measured steady_clock gap below the eviction threshold.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2700));
     CHECK_FALSE(mgr->validate_session(*token).has_value());
 }
 
 TEST_CASE("AuthDB::touch_session_activity is a best-effort mirror", "[auth][session][authdb]") {
-    auto dir = yuzu::test::unique_temp_path("yuzu-touch-");
-    fs::create_directories(dir);
-    yuzu::server::AuthDB db(dir, /*cleanup_interval_secs=*/0); // no reaper thread
+    // TempDir = RAII cleanup, so a failed REQUIRE below cannot leak the temp dir
+    // (governance qe SHOULD-1).
+    yuzu::test::TempDir td;
+    fs::create_directories(td.path);
+    yuzu::server::AuthDB db(td.path, /*cleanup_interval_secs=*/0); // no reaper thread
     REQUIRE(db.initialize().has_value());
 
     auto token = db.create_session("alice", Role::admin);
@@ -277,9 +281,6 @@ TEST_CASE("AuthDB::touch_session_activity is a best-effort mirror", "[auth][sess
     // Best-effort: a no-match UPDATE is still success (the in-memory map is the
     // authoritative idle path; this durable mirror is fire-and-forget).
     CHECK(db.touch_session_activity("deadbeefdeadbeef").has_value());
-
-    std::error_code ec;
-    fs::remove_all(dir, ec);
 }
 
 TEST_CASE("invalidate_user_sessions wipes every session for a user (multi-token)",
