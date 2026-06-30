@@ -315,6 +315,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DEX Catalogue now credits the full Linux signal coverage (was 7, now 17 types).** The per-OS
+  coverage map (`dex_obs_platforms`) that colours the Catalogue's "monitored / not collected on
+  Linux" badges was frozen at the original 7-type conservative set from before the Linux
+  kernel/sysfs collectors existed — the collectors landed without the map being updated in the same
+  change. A Linux fleet's Catalogue therefore showed `perf.disk_latency_high`, `hw.cpu_throttled`,
+  `service.hung`, `os.time_unsynced`, `os.bugcheck`, `os.dirty_shutdown`, `disk.error`,
+  `fs.corruption`, `hw.error`, and `process.hung` as *not collected* even though the agent emits
+  them — via `poll_perf` (the `/proc` CPU/memory/diskstats breach trio), the sysfs CPU-throttle
+  poll, and the journald poll whose kernel-transport lines are classified by `dex_linux_kmsg`. The
+  map is now authoritative at 17 types, so those families render as monitored on any connected
+  Linux agent. macOS coverage (16) was already correct and is unchanged. No agent change, no data
+  change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
+  platforms.
 - **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
   `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
   list carry a per-agent management-group drop filter that is **not yet effective** under the
