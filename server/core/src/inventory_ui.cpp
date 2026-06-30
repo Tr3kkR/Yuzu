@@ -149,8 +149,8 @@ std::string scope_caveat() {
     return "<div class=\"inv-caveat\">Scope (ADR-0017): management-group confinement is "
            "<b>not yet effective</b> under the global <span class=\"inv-mono\">Inventory:Read</span> "
            "gate, so these fleet-wide counts span all groups. A scope filter + access audit run on "
-           "every read but do not narrow results today. (The Devices tab, the per-device drill, and "
-           "Find <b>are</b> scope-correct.)</div>";
+           "every read but do not narrow results today. (The Devices tab and the per-device drill "
+           "<b>are</b> scope-correct; Find is also fleet-wide — see its own note.)</div>";
 }
 
 std::string page_head() {
@@ -446,7 +446,9 @@ std::string render_inventory_find_results_fragment(
     h += "</div>";
 
     if (rows->empty()) {
-        h += "<div class=\"inv-empty\">No devices in your scope run \"" + esc(name) + "\"";
+        // Fleet-wide honest (gov consistency/security): Find is not scope-narrowed today
+        // (global Inventory:Read), so don't imply "your scope".
+        h += "<div class=\"inv-empty\">No devices run \"" + esc(name) + "\"";
         if (hit_cap)
             h += " in this page (result was capped — narrow the query)";
         h += ".</div>";

@@ -68,8 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UI). On store degradation the authoritative reads (Software/Find/per-device-software) show an
   "unavailable" banner, never an empty table (ADR-0016 §7); the fail-soft device roster may show an
   empty list during a database incident (its empty-state copy says so). New audit verbs
-  `inventory.software.{catalog,versions}` and `inventory.device.software`; `inventory.software.query`
-  (pre-existing on the REST endpoint) is now also emitted by the dashboard Find tab and documented.
+  `inventory.software.{catalog,versions}`, `inventory.device.software`, and `inventory.devices` (the
+  Devices roster read — set-and-proceed); `inventory.software.query` (pre-existing on the REST
+  endpoint) is now also emitted by the dashboard Find tab and documented.
   New nav item + command-palette entry.
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard

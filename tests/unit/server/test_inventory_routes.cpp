@@ -172,10 +172,12 @@ TEST_CASE("find results: truncated + omitted signals; degrade vs empty", "[inven
     REQUIRE(contains(render_inventory_find_results_fragment("X", std::nullopt, false, 0),
                      "unavailable"));
 
-    // Empty (non-null) → honest "no devices in scope", not a degrade.
+    // Empty (non-null) → honest fleet-wide "no devices run X", not a degrade and not
+    // implying scope-narrowing (Find is fleet-wide today; gov consistency/security).
     const std::string empty = render_inventory_find_results_fragment(
         "X", std::optional<std::vector<SoftwareFleetRow>>(std::vector<SoftwareFleetRow>{}), false, 0);
-    REQUIRE(contains(empty, "No devices in your scope"));
+    REQUIRE(contains(empty, "No devices run"));
+    REQUIRE_FALSE(contains(empty, "in your scope"));
 
     std::vector<SoftwareFleetRow> rows{fleet_row("a1", "X", "1.0")};
     const std::string html = render_inventory_find_results_fragment("X", rows, /*hit_cap=*/true,
