@@ -21,6 +21,11 @@ namespace {
 /// strict-weak ordering → OOB read), and a finite-but-out-of-range value (e.g.
 /// 1e300) would blow the means/percentiles. Sanitising here closes both independent
 /// of the upstream writer (gov 2026-06-30, convergent finding across reviewers).
+///
+/// `ws_avg_bytes` is deliberately NOT given a sibling clamp: it is `int64`, so it
+/// cannot be NaN/Inf (no sort-UB to close), and there is no principled byte ceiling
+/// for a working set (the store's ingest clamp at 2^50 already bounds the persisted
+/// value). The asymmetry is intentional, not an oversight (gov round-2 INFO).
 double sanitize_cpu(double v) { return std::isfinite(v) ? std::clamp(v, 0.0, 100.0) : 0.0; }
 
 /// PURE: the p-th percentile (p in [0,1]) of a scalar sample by the platform

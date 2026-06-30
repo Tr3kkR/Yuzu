@@ -1429,6 +1429,21 @@ TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInter
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     }
+    SECTION("truncated cohort surfaces truncated:true in the payload") {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.cohort =
+            [](std::string_view, std::string_view, std::string_view, std::string_view)
+            -> std::optional<yuzu::server::CohortRead> {
+            yuzu::server::CohortRead cr;
+            cr.member_count = 2;
+            cr.truncated = true;
+            cr.rows = {{"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500}};
+            return cr;
+        };
+        ts.start("readonly");
+        auto p = mcp_tool_payload(ts.call(call)->body);
+        CHECK(p["truncated"] == true);
+    }
 }
 
 TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",

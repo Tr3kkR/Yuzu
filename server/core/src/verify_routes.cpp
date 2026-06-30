@@ -194,7 +194,10 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
         const PairedComparison c =
             build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                              yuzu::util::canon_version(candidate), window);
-        res.set_content(render_verify_drill(c), "text/html");
+        // The drill is normally reached behind the /run banner, but a direct-URL hit
+        // must carry the same truncation warning — a capped read drops machines here
+        // too (gov round-2 consistency).
+        res.set_content(render_verify_drill(c, cohort->truncated), "text/html");
     });
 }
 

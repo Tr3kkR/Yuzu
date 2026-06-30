@@ -37,7 +37,7 @@ namespace yuzu::server {
 /// PURE: the per-machine pairs table (the audited drill) — device, CPU before/after/Δ,
 /// WS before/after/Δ, samples; largest CPU mover first. Per-device behavioural data,
 /// so the route audits its open.
-[[nodiscard]] std::string render_verify_drill(const PairedComparison& c);
+[[nodiscard]] std::string render_verify_drill(const PairedComparison& c, bool truncated);
 
 /// PURE: an honest note body (degrade, no provider, no group selected, etc.).
 [[nodiscard]] std::string render_verify_note(const std::string& message);

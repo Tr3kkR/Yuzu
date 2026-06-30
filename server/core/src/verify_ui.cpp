@@ -284,13 +284,21 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
     return h;
 }
 
-std::string render_verify_drill(const PairedComparison& c) {
+std::string render_verify_drill(const PairedComparison& c, bool truncated) {
     if (c.pairs.empty())
         return render_verify_note("No paired machines to show.");
-    std::string h = "<table class=\"vf-tbl\"><thead><tr><th>Device</th>"
-                    "<th class=\"n\">CPU before</th><th class=\"n\">CPU after</th><th class=\"n\">\xCE\x94 CPU</th>"
-                    "<th class=\"n\">WS before</th><th class=\"n\">WS after</th><th class=\"n\">\xCE\x94 WS</th>"
-                    "<th class=\"n\">Samples</th></tr></thead><tbody>";
+    std::string h;
+    // A direct-URL drill hit on a capped cohort must carry the same warning the /run
+    // banner shows — machines are missing and some pairings may be wrong (gov round-2).
+    if (truncated)
+        h += "<div class=\"vf-ind\" style=\"color:#e57373;background:#241010;border-color:#5a2323\">"
+             "\xE2\x9A\xA0 Truncated \xE2\x80\x94 the cohort exceeded the read cap, so machines are "
+             "missing from this list and some pairings may be wrong. Narrow the group or shorten the "
+             "window.</div>";
+    h += "<table class=\"vf-tbl\"><thead><tr><th>Device</th>"
+         "<th class=\"n\">CPU before</th><th class=\"n\">CPU after</th><th class=\"n\">\xCE\x94 CPU</th>"
+         "<th class=\"n\">WS before</th><th class=\"n\">WS after</th><th class=\"n\">\xCE\x94 WS</th>"
+         "<th class=\"n\">Samples</th></tr></thead><tbody>";
     for (const auto& p : c.pairs) { // engine already sorts largest CPU mover first
         const std::string dc = cpu_dir(p.cpu_delta);
         const std::string dw = ws_dir(p.ws_delta);
