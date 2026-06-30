@@ -46,6 +46,16 @@ The word **agent** is overloaded; the rest of this file relies on these definiti
 
 When in doubt in commit messages, PR descriptions, or new docs, use the disambiguated form.
 
+## Context discipline
+
+Context is the scarce resource. Keep this thread lean; spend file-reading budget in subagents.
+
+- **Search before reading.** Use the Grep tool (it *is* ripgrep) or `rg` to locate symbols, call sites, config keys, tests, and error strings. It already skips everything in `.gitignore` (build dirs, `vcpkg_installed/`, generated `*.pb.*`, `*.beam`, `tests-build-*`, coverage/asan/tsan dirs). Then Read only the line ranges you need (`offset`/`limit`) — not whole directories.
+- **Read / Glob / `find` do NOT honor `.gitignore`** — don't point them at build, vendored, or generated trees; don't open generated protobuf (`*.pb.h/.cc`) or `vcpkg_installed/` unless explicitly required.
+- **Delegate broad reads.** When you don't yet know where code lives, or answering means sweeping many files, launch an `Explore` (or `general-purpose`) subagent and have it return conclusions — not file dumps. Prefer a summary of findings over pasting large code blocks into this thread.
+- **Summarise and hand off proactively** — you can't read your own context %, and the harness auto-compacts, so don't wait for a threshold. When a thread gets long, record: files touched, facts learned, open questions, next command — then continue or spawn a fresh agent from that summary.
+- **For code changes:** find the owning module → find its tests → make the smallest coherent patch → run the targeted suite (`meson test -C build-<os> --suite <agent|server|tar>`) before the broad one.
+
 ## Agent Team & Governance
 
 Specialized agents live in `.claude/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.claude/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
