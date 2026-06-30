@@ -295,12 +295,14 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
              std::to_string(inc) + " incomplete</span>";
     h += "</div>";
 
-    // ACT stage — "Deploy go-cohort": once the run is COMPLETE and there is a
-    // go-cohort (go + warn-only), offer to stage + execute an installer on exactly
-    // those devices. Loads the deploy panel into the sibling #auto-deploy container
-    // (outside #auto-grid, so it persists across this grid's repolls). Shown only on
-    // a complete run so the cohort is final.
-    if (run_complete && (go + warn) > 0 && !run_id.empty()) {
+    // ACT stage — "Deploy go-cohort": as soon as there is a go-cohort (≥1 go /
+    // warn-only device), offer to stage + execute an installer on exactly the
+    // devices cleared SO FAR — the button appears with the first result, it does not
+    // wait for the run to finish (the go-cohort only ever contains fully-evaluated,
+    // cleared devices, so a mid-run deploy is safe). The count updates as more
+    // devices clear. Loads the deploy panel into the sibling #auto-deploy container
+    // (outside #auto-grid, so it persists across this grid's repolls).
+    if ((go + warn) > 0 && !run_id.empty()) {
         h += "<div style=\"margin:.1rem 0 .8rem\">"
              "<button class=\"gp-chip\" style=\"background:#1f7a47;border-color:#1f7a47;color:#fff;"
              "font-weight:600;cursor:pointer\" hx-get=\"/fragments/auto/deploy?run=" +

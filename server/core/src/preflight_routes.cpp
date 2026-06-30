@@ -412,7 +412,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
 // Shared render: a RUNNING run computes live (collect + compute); a COMPLETE run
 // reads the stored grid. Repoll while running + pending + under the page-poll cap.
 std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt) {
-    const bool running = (run.status == "running");
+    bool running = (run.status == "running");
     const auto cfg = preflight::config_from_json(run.config_json);
 
     std::vector<preflight::PreflightDeviceResult> grid;
@@ -424,6 +424,18 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
         auto checks = collect_fn_ ? collect_fn_(run.run_id, applicable)
                                   : std::vector<preflight::PreflightCheckResponses>{};
         grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);
+        // Persist the live grid on EVERY self-poll (not just at completion) so the
+        // stored go-cohort is always current — the Deploy stage can then act on the
+        // devices cleared SO FAR, mid-run, without waiting for the run to finish. The
+        // same helper completes the run the moment its cohort settles (or the window
+        // closes), so completion is also event-driven (no up-to-60s runner lag) — on
+        // whichever path notices first, this poll or the runner tick. No
+        // PreflightRunStore lease is held here (get_targets/collect already released);
+        // the helper takes its own.
+        const bool past_deadline = now_ms() >= run.deadline_at_ms;
+        if (run_store_ && preflight::persist_and_maybe_complete(*run_store_, run.run_id, grid,
+                                                                now_ms(), past_deadline, any_pending))
+            running = false; // settled/closed this pass → render Complete, stop polling
     } else {
         // Stored grid (durable revisit, survives ResponseStore pruning).
         for (const auto& r : run_store_->get_devices(run.run_id)) {

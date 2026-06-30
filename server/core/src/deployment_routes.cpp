@@ -196,14 +196,14 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
                             "text/html; charset=utf-8");
             return;
         }
-        // Server-side completeness gate (the button only shows on a complete run,
-        // but a hand-crafted POST must not deploy from a still-running run's partial
-        // go-cohort) (#governance security L-5).
-        if (run->status != "complete") {
-            res.set_content(render_deploy_note("Deploy only from a completed pre-flight run."),
-                            "text/html; charset=utf-8");
-            return;
-        }
+        // NOTE: deploy does NOT require the pre-flight run to be 'complete' — the
+        // operator can act on the devices cleared so far, mid-run (the button appears
+        // with the first result). This is SAFE because the cohort below is filtered
+        // to bucket go/warn, and a device only reaches go/warn once ALL its checks
+        // have answered (a still-evaluating device is 'incomplete', never go/warn) —
+        // so the cohort is always fully-evaluated, cleared devices, never a partial
+        // per-device verdict. The result route persists the live grid every poll, so
+        // get_devices below reads the current cohort even while the run is running.
         // RESUME guard (#governance security HIGH-1): if this owner already has a
         // RUNNING deployment for this source run, render IT instead of creating a
         // second — a second deployment mints a new id, runs an independent CAS, and
