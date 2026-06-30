@@ -184,6 +184,12 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   tokens resolve through `synthesize_token_session` (no cookie, no
   `elevated_until`), so a long-lived automation credential can **never** be
   elevated.
+- **v1 limitation — local TOTP required.** The mandatory-MFA check is the local
+  `mfa_status` (`auth.db`), so an **OIDC-only operator with no local TOTP
+  enrolled cannot elevate** (fail-closed: `role.elevation.denied` / no MFA
+  enrolled). This is safe but restrictive for SSO-first deployments; elevation
+  gated on the OIDC `amr` MFA assertion (so an IdP-MFA'd SSO operator can elevate
+  without a local TOTP) is a tracked follow-up.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
   (`role.elevation.revoked`). Passive expiry on lapse is implicit from the
   `granted` row + its `duration_secs` (no separate `role.elevation.expired` event

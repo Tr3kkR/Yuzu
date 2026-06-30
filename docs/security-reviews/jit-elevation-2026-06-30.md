@@ -101,6 +101,10 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
   absolute expiry.** Cosmetic; an absolute `expires_at` is a tracked follow-up.
 - **Migration v4 collides with the break-glass PR (#1735, also v4).** A merge-gate
   renumber-to-v5 item, flagged in-code.
+- **OIDC-only operators cannot elevate (v1 limitation).** The mandatory-MFA gate
+  checks the local `mfa_status`, so an SSO operator with no local TOTP is
+  fail-closed-denied. Elevation gated on the OIDC `amr` assertion is a tracked
+  follow-up — safe-but-restrictive for SSO-first deployments.
 
 ## Validation
 

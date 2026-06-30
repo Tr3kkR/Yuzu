@@ -1936,6 +1936,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // POST /api/v1/elevate/revoke — manual step-down (clear an active elevation).
     sink.Post("/api/v1/elevate/revoke",
               [this](const httplib::Request& req, httplib::Response& res) {
+                  res.set_header("X-Correlation-Id", detail::make_correlation_id());
                   auto token = extract_session_cookie(req);
                   if (token.empty()) {
                       res.status = 401;
