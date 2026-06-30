@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/auto` deploy — stage + execute an upgrade on a pre-flight go-cohort.** The `/auto` page
+  gains an ACT stage after the ASSESS (pre-flight) stage: from a completed pre-flight run,
+  **Deploy go-cohort** stages an installer (download + SHA-256 verify) and then executes it on
+  exactly the devices that cleared (bucket go / warn-only), tracking a per-device
+  stage→execute state machine. Built on the existing `content_dist` plugin (`stage` /
+  `execute_staged`); no new agent code. Born-on-Postgres `DeploymentRunStore` (schema
+  `deployment_run_store`) persists the artifact spec, the frozen cohort, and each device's
+  step. The result is **aggregate-first** (a KPI strip + progress bar headline the counts;
+  the per-device list is problem-first and render-capped) so it reads at fleet scale. Driven
+  by an operator today; the engine (`deployment::advance`) is HTTP-agnostic so an agentic
+  worker can drive the same path via MCP later. **Safety:** the execute step MUTATES, so —
+  unlike the read-only pre-flight checks — it is dispatched **at most once per device**
+  (`claim_for_exec` commits `staged→executing` before the command leaves the server, surviving
+  concurrent advances and restart), and every advance **re-authorizes** against the operator's
+  current visible set (`devices_fn(viewer) ∩ cohort`); a device the operator has lost scope to
+  is skipped, never run. A human `confirm()` gates the deploy. RBAC: `SoftwareDeployment:Read`
+  to view, `:Execute` to deploy / delete; operational `deployment.{create,advance,delete}`
+  audit. URL-only on `/auto` (not a new nav tab).
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the

@@ -1681,6 +1681,14 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     if (execution_id.starts_with("preflight-"))
         return;
 
+    // Deployment correlation ids ("deployment-<id>-stage" / "-exec", minted by the
+    // deployment engine) are the same case: the deployment re-reads stage/execute
+    // responses via query_by_execution; the DeploymentRunStore is the completion
+    // authority, not the executions drawer. Notifying here would publish phantom
+    // agent-transition events. Skip.
+    if (execution_id.starts_with("deployment-"))
+        return;
+
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();

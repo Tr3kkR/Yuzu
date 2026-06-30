@@ -1,0 +1,456 @@
+#include "deployment_run_store.hpp"
+
+#include "pg/pg_array.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include <libpq-fe.h>
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <string_view>
+
+namespace yuzu::server {
+
+namespace {
+
+constexpr const char* kStoreName = "deployment_run_store";
+
+constexpr std::chrono::milliseconds kWriteTimeout{3000};
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr int kRowCap = 20000;     // device rows materialised per read
+constexpr int kListCap = 200;      // deployments listed
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL — the runner sets search_path to the store schema for the
+    // migration txn; runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE deployments ("
+         "  deployment_id     TEXT PRIMARY KEY,"
+         "  source_run_id     TEXT NOT NULL DEFAULT '',"
+         "  created_by        TEXT NOT NULL DEFAULT '',"
+         "  name              TEXT NOT NULL DEFAULT '',"
+         "  artifact_url      TEXT NOT NULL DEFAULT '',"
+         "  artifact_filename TEXT NOT NULL DEFAULT '',"
+         "  artifact_sha256   TEXT NOT NULL DEFAULT '',"
+         "  exec_args         TEXT NOT NULL DEFAULT '',"
+         "  status            TEXT NOT NULL DEFAULT 'running',"
+         "  created_at_ms     BIGINT NOT NULL,"
+         "  completed_at_ms   BIGINT NOT NULL DEFAULT 0,"
+         "  total             INT NOT NULL DEFAULT 0,"
+         "  succeeded         INT NOT NULL DEFAULT 0,"
+         "  failed            INT NOT NULL DEFAULT 0,"
+         "  skipped           INT NOT NULL DEFAULT 0,"
+         "  active            INT NOT NULL DEFAULT 0);"
+         "CREATE INDEX deployments_owner_idx  ON deployments (created_by, created_at_ms DESC);"
+         "CREATE INDEX deployments_status_idx ON deployments (status);"
+         "CREATE TABLE deployment_device ("
+         "  deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id) ON DELETE CASCADE,"
+         "  agent_id      TEXT NOT NULL,"
+         "  hostname      TEXT NOT NULL DEFAULT '',"
+         "  os            TEXT NOT NULL DEFAULT '',"
+         "  step          TEXT NOT NULL DEFAULT 'pending',"
+         "  exit_code     INT NOT NULL DEFAULT 0,"
+         "  error         TEXT NOT NULL DEFAULT '',"
+         "  updated_at_ms BIGINT NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (deployment_id, agent_id));"},
+    };
+    return kMigrations;
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
+
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+constexpr const char* kDeploymentCols =
+    "deployment_id, source_run_id, created_by, name, artifact_url, artifact_filename, "
+    "artifact_sha256, exec_args, status, created_at_ms, completed_at_ms, total, succeeded, "
+    "failed, skipped, active";
+
+DeploymentRow read_deployment(PGresult* res, int i) {
+    DeploymentRow r;
+    int c = 0;
+    r.deployment_id = PQgetvalue(res, i, c++);
+    r.source_run_id = PQgetvalue(res, i, c++);
+    r.created_by = PQgetvalue(res, i, c++);
+    r.name = PQgetvalue(res, i, c++);
+    r.artifact_url = PQgetvalue(res, i, c++);
+    r.artifact_filename = PQgetvalue(res, i, c++);
+    r.artifact_sha256 = PQgetvalue(res, i, c++);
+    r.exec_args = PQgetvalue(res, i, c++);
+    r.status = PQgetvalue(res, i, c++);
+    r.created_at_ms = to_i64(PQgetvalue(res, i, c++));
+    r.completed_at_ms = to_i64(PQgetvalue(res, i, c++));
+    r.total = to_int(PQgetvalue(res, i, c++));
+    r.succeeded = to_int(PQgetvalue(res, i, c++));
+    r.failed = to_int(PQgetvalue(res, i, c++));
+    r.skipped = to_int(PQgetvalue(res, i, c++));
+    r.active = to_int(PQgetvalue(res, i, c++));
+    return r;
+}
+
+// to_text_array wants string_views; the candidate vectors outlive the call.
+std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
+    std::vector<std::string_view> out;
+    out.reserve(v.size());
+    for (const auto& s : v)
+        out.emplace_back(s);
+    return out;
+}
+
+std::vector<std::string> returned_ids(const pg::PgResult& res) {
+    std::vector<std::string> out;
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+DeploymentRunStore::DeploymentRunStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("DeploymentRunStore: no database connection at construction ({}) — deployment "
+                      "persistence disabled",
+                      pool_.last_error());
+        return;
+    }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("DeploymentRunStore: schema migration failed — deployment persistence "
+                      "disabled");
+        return;
+    }
+    open_ = true;
+}
+
+bool DeploymentRunStore::create_deployment(const DeploymentRow& dep,
+                                           const std::vector<preflight::PreflightTarget>& targets) {
+    if (!open_ || dep.deployment_id.empty())
+        return false;
+    std::vector<std::string_view> agent_ids, hostnames, oses;
+    agent_ids.reserve(targets.size());
+    hostnames.reserve(targets.size());
+    oses.reserve(targets.size());
+    for (const auto& t : targets) {
+        agent_ids.emplace_back(t.agent_id);
+        hostnames.emplace_back(t.hostname);
+        oses.emplace_back(t.os);
+    }
+    const std::string ts = std::to_string(now_ms());
+    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult r1 = pg::exec_params(
+            conn,
+            "INSERT INTO deployment_run_store.deployments "
+            "(deployment_id, source_run_id, created_by, name, artifact_url, artifact_filename, "
+            " artifact_sha256, exec_args, status, created_at_ms, total, active) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'running',$9::bigint,$10::int,$10::int) "
+            "RETURNING deployment_id",
+            std::vector<std::string>{dep.deployment_id, dep.source_run_id, dep.created_by, dep.name,
+                                     dep.artifact_url, dep.artifact_filename, dep.artifact_sha256,
+                                     dep.exec_args, std::to_string(dep.created_at_ms),
+                                     std::to_string(static_cast<int>(targets.size()))});
+        if (r1.status() != PGRES_TUPLES_OK) {
+            spdlog::warn("DeploymentRunStore: deployment insert failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (targets.empty())
+            return true;
+        pg::PgResult r2 = pg::exec_params(
+            conn,
+            "INSERT INTO deployment_run_store.deployment_device "
+            "(deployment_id, agent_id, hostname, os, step, updated_at_ms) "
+            "SELECT $1, a, h, o, 'pending', $5::bigint "
+            "FROM unnest($2::text[], $3::text[], $4::text[]) AS t(a, h, o)",
+            std::vector<std::string>{dep.deployment_id, pg::to_text_array(agent_ids),
+                                     pg::to_text_array(hostnames), pg::to_text_array(oses), ts});
+        if (r2.status() != PGRES_COMMAND_OK && r2.status() != PGRES_TUPLES_OK) {
+            spdlog::warn("DeploymentRunStore: cohort seed insert failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        return true;
+    });
+}
+
+std::optional<DeploymentRow> DeploymentRunStore::get_deployment(const std::string& deployment_id,
+                                                                const std::string& created_by) {
+    if (!open_ || deployment_id.empty())
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    std::string sql = std::string("SELECT ") + kDeploymentCols +
+                      " FROM deployment_run_store.deployments WHERE deployment_id = $1";
+    std::vector<std::string> params{deployment_id};
+    if (!created_by.empty()) {
+        sql += " AND created_by = $2"; // owner-scope at the seam
+        params.push_back(created_by);
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_deployment(res.get(), 0);
+}
+
+std::vector<DeploymentRow> DeploymentRunStore::list_deployments(const std::string& viewer,
+                                                                bool is_admin, int limit) {
+    std::vector<DeploymentRow> out;
+    if (!open_)
+        return out;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
+    const int cap = (limit > 0 && limit < kListCap) ? limit : kListCap;
+    const std::string sql_admin =
+        std::string("SELECT ") + kDeploymentCols +
+        " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC LIMIT $1::bigint";
+    const std::string sql_owner =
+        std::string("SELECT ") + kDeploymentCols +
+        " FROM deployment_run_store.deployments WHERE created_by = $1 ORDER BY created_at_ms DESC "
+        "LIMIT $2::bigint";
+    pg::PgResult res =
+        is_admin ? pg::exec_params(lease.get(), sql_admin.c_str(),
+                                   std::vector<std::string>{std::to_string(cap)})
+                 : pg::exec_params(lease.get(), sql_owner.c_str(),
+                                   std::vector<std::string>{viewer, std::to_string(cap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_deployment(res.get(), i));
+    return out;
+}
+
+std::vector<DeploymentDeviceRow> DeploymentRunStore::get_devices(const std::string& deployment_id) {
+    std::vector<DeploymentDeviceRow> out;
+    if (!open_ || deployment_id.empty())
+        return out;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, hostname, os, step, exit_code, error, updated_at_ms "
+        "FROM deployment_run_store.deployment_device WHERE deployment_id = $1 "
+        "ORDER BY hostname LIMIT $2::bigint",
+        std::vector<std::string>{deployment_id, std::to_string(kRowCap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        DeploymentDeviceRow d;
+        d.agent_id = PQgetvalue(res.get(), i, 0);
+        d.hostname = PQgetvalue(res.get(), i, 1);
+        d.os = PQgetvalue(res.get(), i, 2);
+        d.step = PQgetvalue(res.get(), i, 3);
+        d.exit_code = to_i64(PQgetvalue(res.get(), i, 4));
+        d.error = PQgetvalue(res.get(), i, 5);
+        d.updated_at_ms = to_i64(PQgetvalue(res.get(), i, 6));
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+bool DeploymentRunStore::apply_results(const std::string& deployment_id,
+                                       const std::vector<DeviceTransition>& transitions) {
+    if (!open_ || deployment_id.empty())
+        return false;
+    if (transitions.empty())
+        return true;
+    std::vector<std::string> agents, froms, tos, exits, errors;
+    agents.reserve(transitions.size());
+    froms.reserve(transitions.size());
+    tos.reserve(transitions.size());
+    exits.reserve(transitions.size());
+    errors.reserve(transitions.size());
+    for (const auto& t : transitions) {
+        agents.push_back(t.agent_id);
+        froms.push_back(t.from_step);
+        tos.push_back(t.to_step);
+        exits.push_back(std::to_string(t.exit_code));
+        errors.push_back(t.error);
+    }
+    const std::string ts = std::to_string(now_ms());
+    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // ONE batched, source-step-GUARDED update: a row only moves if it is still
+        // in its expected `from_step`, so a concurrent advance that already moved
+        // it is a silent no-op (the keystone of execute-once correctness).
+        pg::PgResult r = pg::exec_params(
+            conn,
+            "UPDATE deployment_run_store.deployment_device AS d "
+            "SET step = v.to_step, exit_code = v.exit_code::int, error = v.error, "
+            "    updated_at_ms = $7::bigint "
+            "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) "
+            "  AS v(agent, from_step, to_step, exit_code, error) "
+            "WHERE d.deployment_id = $1 AND d.agent_id = v.agent AND d.step = v.from_step",
+            std::vector<std::string>{deployment_id, pg::to_text_array(as_views(agents)),
+                                     pg::to_text_array(as_views(froms)),
+                                     pg::to_text_array(as_views(tos)),
+                                     pg::to_text_array(as_views(exits)),
+                                     pg::to_text_array(as_views(errors)), ts});
+        if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
+            spdlog::warn("DeploymentRunStore: apply_results failed (dep={}): {}", deployment_id,
+                         PQerrorMessage(conn));
+            return false;
+        }
+        return true;
+    });
+}
+
+std::vector<std::string>
+DeploymentRunStore::claim_for_stage(const std::string& deployment_id,
+                                    const std::vector<std::string>& candidates) {
+    if (!open_ || deployment_id.empty() || candidates.empty())
+        return {};
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return {};
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE deployment_run_store.deployment_device "
+        "SET step='staging', updated_at_ms=$3::bigint "
+        "WHERE deployment_id=$1 AND agent_id = ANY($2::text[]) AND step='pending' "
+        "RETURNING agent_id",
+        std::vector<std::string>{deployment_id, pg::to_text_array(as_views(candidates)),
+                                 std::to_string(now_ms())});
+    return returned_ids(res);
+}
+
+std::vector<std::string>
+DeploymentRunStore::claim_for_exec(const std::string& deployment_id,
+                                   const std::vector<std::string>& candidates) {
+    if (!open_ || deployment_id.empty() || candidates.empty())
+        return {};
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return {};
+    // THE execute-once CAS: only rows still in 'staged' transition + are RETURNED;
+    // a concurrent / post-restart advance matches zero for an already-claimed row.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE deployment_run_store.deployment_device "
+        "SET step='executing', updated_at_ms=$3::bigint "
+        "WHERE deployment_id=$1 AND agent_id = ANY($2::text[]) AND step='staged' "
+        "RETURNING agent_id",
+        std::vector<std::string>{deployment_id, pg::to_text_array(as_views(candidates)),
+                                 std::to_string(now_ms())});
+    return returned_ids(res);
+}
+
+int DeploymentRunStore::mark_skipped(const std::string& deployment_id,
+                                     const std::vector<std::string>& agent_ids) {
+    if (!open_ || deployment_id.empty() || agent_ids.empty())
+        return 0;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return 0;
+    // Only devices NOT yet executed (pending / staged) — a 'staging'/'executing'
+    // device is in flight and must not be skipped out from under a dispatch.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE deployment_run_store.deployment_device "
+        "SET step='skipped', error='out of scope at dispatch', updated_at_ms=$3::bigint "
+        "WHERE deployment_id=$1 AND agent_id = ANY($2::text[]) AND step IN ('pending','staged') "
+        "RETURNING agent_id",
+        std::vector<std::string>{deployment_id, pg::to_text_array(as_views(agent_ids)),
+                                 std::to_string(now_ms())});
+    if (res.status() != PGRES_TUPLES_OK)
+        return 0;
+    return PQntuples(res.get());
+}
+
+bool DeploymentRunStore::refresh_counts(const std::string& deployment_id) {
+    if (!open_ || deployment_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE deployment_run_store.deployments d SET "
+        "  total=c.total, succeeded=c.succeeded, failed=c.failed, skipped=c.skipped, "
+        "  active=c.active "
+        "FROM (SELECT "
+        "    count(*) AS total, "
+        "    count(*) FILTER (WHERE step='succeeded') AS succeeded, "
+        "    count(*) FILTER (WHERE step='failed') AS failed, "
+        "    count(*) FILTER (WHERE step='skipped') AS skipped, "
+        "    count(*) FILTER (WHERE step IN ('pending','staging','staged','executing')) AS active "
+        "  FROM deployment_run_store.deployment_device WHERE deployment_id=$1) c "
+        "WHERE d.deployment_id=$1 RETURNING d.deployment_id",
+        std::vector<std::string>{deployment_id});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+}
+
+bool DeploymentRunStore::complete_deployment(const std::string& deployment_id,
+                                             std::int64_t completed_at_ms) {
+    if (!open_ || deployment_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+    // Settled-check IN SQL: complete only if running AND nothing is still in flight,
+    // so completion is correct regardless of the caller's (possibly stale) read.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE deployment_run_store.deployments SET status='complete', completed_at_ms=$2::bigint "
+        "WHERE deployment_id=$1 AND status='running' AND NOT EXISTS ("
+        "  SELECT 1 FROM deployment_run_store.deployment_device "
+        "  WHERE deployment_id=$1 AND step IN ('pending','staging','staged','executing')) "
+        "RETURNING deployment_id",
+        std::vector<std::string>{deployment_id, std::to_string(completed_at_ms)});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+}
+
+int DeploymentRunStore::prune_older_than(std::int64_t cutoff_ms) {
+    if (!open_)
+        return -1;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return -1;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM deployment_run_store.deployments WHERE created_at_ms < $1::bigint "
+        "RETURNING deployment_id",
+        std::vector<std::string>{std::to_string(cutoff_ms)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return -1;
+    return PQntuples(res.get());
+}
+
+bool DeploymentRunStore::delete_deployment(const std::string& deployment_id,
+                                           const std::string& created_by) {
+    if (!open_ || deployment_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+    // Owner-scope enforced HERE at the sole seam: a non-owner / unknown id deletes
+    // 0 rows. deployment_device cascades via the FK ON DELETE CASCADE.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM deployment_run_store.deployments WHERE deployment_id=$1 AND created_by=$2 "
+        "RETURNING deployment_id",
+        std::vector<std::string>{deployment_id, created_by});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+}
+
+} // namespace yuzu::server

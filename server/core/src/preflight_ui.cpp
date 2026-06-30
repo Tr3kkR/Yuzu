@@ -211,6 +211,10 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
          "<div class=\"gp-placeholder\"><b>Configure and run</b>"
          "Results group by device as each one answers.</div></div>";
 
+    // Deploy panel target (the ACT stage). Sibling of #auto-results so it persists
+    // across the pre-flight grid's repolls; filled by the "Deploy go-cohort" button.
+    h += "<div id=\"auto-deploy\" style=\"margin-top:.9rem\"></div>";
+
     // CSP-safe helper: collapse the config so the results (verdict + pills) rise
     // to the top. Called by Run and by each saved-run in the rail. Defined once
     // with the page; persists on window for the standalone rail re-render.
@@ -222,7 +226,8 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
 
 std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
-                                const std::string& repoll_url, bool run_complete) {
+                                const std::string& repoll_url, bool run_complete,
+                                const std::string& run_id) {
     using preflight::Bucket;
     using preflight::Verdict;
 
@@ -289,6 +294,20 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
         h += "<span class=\"af-pill inc\" data-b=\"inc\" onclick=\"pfSetBucket('inc')\">" +
              std::to_string(inc) + " incomplete</span>";
     h += "</div>";
+
+    // ACT stage — "Deploy go-cohort": once the run is COMPLETE and there is a
+    // go-cohort (go + warn-only), offer to stage + execute an installer on exactly
+    // those devices. Loads the deploy panel into the sibling #auto-deploy container
+    // (outside #auto-grid, so it persists across this grid's repolls). Shown only on
+    // a complete run so the cohort is final.
+    if (run_complete && (go + warn) > 0 && !run_id.empty()) {
+        h += "<div style=\"margin:.1rem 0 .8rem\">"
+             "<button class=\"gp-chip\" style=\"background:#1f7a47;border-color:#1f7a47;color:#fff;"
+             "font-weight:600;cursor:pointer\" hx-get=\"/fragments/auto/deploy?run=" +
+             esc(run_id) +
+             "\" hx-target=\"#auto-deploy\" hx-swap=\"innerHTML\">Deploy go-cohort (" +
+             std::to_string(go + warn) + ") \xE2\x86\x92</button></div>";
+    }
 
     // "Failed by" chips (narrow the Failed group to one failure type).
     if (!fail_kinds.empty()) {

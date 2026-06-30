@@ -60,6 +60,39 @@ failure — restore the schema or redeploy from a clean database. (A *transient*
 store error while the server is already running just degrades `/auto` to an
 "unavailable" note; it does not take the server down.)
 
+## Deploying to the go-cohort
+
+Pre-flight is the **assess** half of a change; the **act** half lives on the same
+page. When a run completes and has a go-cohort (devices in **Pass** or
+**Warn-only**), a **Deploy go-cohort** button appears on the result. It opens a
+deploy panel where you give an **artifact** — a download **URL**, a **filename**,
+the expected **SHA-256**, and optional silent-install **arguments** — and confirm.
+The deployment then, on exactly the devices that cleared:
+
+1. **Stages** the installer — the agent downloads it and verifies the SHA-256 (a
+   hash mismatch fails the device; the file is never executed).
+2. **Executes** the staged installer once the hash is confirmed, and records the
+   exit code.
+
+The progress view is **aggregate-first**: a count strip (targeted / succeeded /
+executing / in-flight / failed / skipped) and a progress bar are the headline, with
+the per-device list below, problem-first. A device is **Succeeded** on exit 0,
+**Failed** on a stage error or a non-zero exit, and **Skipped** if you no longer
+have scope to it when the step is dispatched — it is never run.
+
+Two safety properties matter because executing an installer changes the endpoint:
+
+- **Run-once.** The execute step is claimed before it is dispatched, so an
+  installer runs **at most once per device** even if you reload the page, several
+  tabs poll at once, or the server restarts mid-deployment.
+- **Re-authorization.** Every tick re-checks the devices you can currently see. A
+  device that has dropped out of your scope since the pre-flight run is **skipped**,
+  not executed.
+
+A deployment is driven by the open page today; closing it pauses progress (the
+state is durable) and reopening resumes. The same engine is designed to be driven
+headless by an automation worker later.
+
 ## Permissions
 
 | Action | Permission |
@@ -67,6 +100,9 @@ store error while the server is already running just degrades `/auto` to an
 | View the page / a result / the rail | `Infrastructure:Read` |
 | Run a pre-flight | `Infrastructure:Read` + `Execution:Execute` |
 | Delete a saved run | `Execution:Execute` (and you must be the owner) |
+| Open the deploy panel / view a deployment | `SoftwareDeployment:Read` |
+| Deploy to a go-cohort / advance / delete a deployment | `SoftwareDeployment:Execute` (and you must be the owner) |
 
 Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
-`preflight.run` and `preflight.run.delete`.
+`preflight.run` and `preflight.run.delete`; deployments as `deployment.create`,
+`deployment.advance`, and `deployment.delete`.

@@ -78,6 +78,8 @@
 #include "network_routes.hpp"
 #include "device_routes.hpp"
 #include "preflight_eval.hpp"
+#include "deployment_routes.hpp"
+#include "deployment_run_store.hpp"
 #include "preflight_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "preflight_runner.hpp"
@@ -1083,6 +1085,19 @@ public:
             if (!preflight_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: preflight-run store migration/open failed "
                               "(database reachable but the preflight_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // DeploymentRunStore — born-on-PG persistence for the /auto DEPLOY stage
+        // (the per-device stage→execute state machine). Same fail-CLOSED
+        // construction posture as PreflightRunStore (ADR-0012 §1).
+        if (pg_pool_ && !startup_failed_) {
+            deployment_run_store_ = std::make_unique<DeploymentRunStore>(*pg_pool_);
+            if (!deployment_run_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
+                              "(database reachable but the deployment_run_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -9053,6 +9068,54 @@ private:
             },
             audit_fn, preflight_run_store_.get());
 
+        // DeploymentRoutes — the /auto DEPLOY stage. From a completed pre-flight
+        // run, stages + executes an installer (content_dist) on the go-cohort,
+        // tracking the per-device stage→execute state machine. Reuses the scoped
+        // device provider (devices_fn) for the live re-authorization the MUTATING
+        // execute step requires, the SAME 6-param untracked dispatch (execution_id
+        // "deployment-<id>-{stage,exec}" → skipped by notify_exec_tracker, like
+        // preflight-), and a narrow ResponseStore poll seam (query_by_execution +
+        // latest_per_agent). The cohort is read from preflight_run_store_.
+        deployment_routes_ = std::make_unique<DeploymentRoutes>();
+        deployment_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_fn,
+            // Poll seam: execution_id → best (status, output) per agent. Same
+            // scoring as the pre-flight collect (terminal beats running, then
+            // non-empty output, then later arrival).
+            [this](const std::string& execution_id)
+                -> std::unordered_map<std::string, deployment::AgentResponse> {
+                std::unordered_map<std::string, deployment::AgentResponse> best;
+                if (!response_store_)
+                    return best;
+                ResponseQuery q;
+                q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
+                auto rows = response_store_->query_by_execution(execution_id, q);
+                auto score = [](const StoredResponse& r) {
+                    int s = 0;
+                    if (r.status != 0)
+                        s += 2;
+                    if (!r.output.empty())
+                        s += 1;
+                    return s;
+                };
+                std::unordered_map<std::string, const StoredResponse*> pick;
+                for (const auto& r : rows) {
+                    auto it = pick.find(r.agent_id);
+                    if (it == pick.end()) {
+                        pick.emplace(r.agent_id, &r);
+                        continue;
+                    }
+                    const StoredResponse& cur = *it->second;
+                    if (score(r) > score(cur) ||
+                        (score(r) == score(cur) && r.received_at_ms > cur.received_at_ms))
+                        it->second = &r;
+                }
+                for (const auto& [agent, rp] : pick)
+                    best[agent] = {rp->status, rp->output};
+                return best;
+            },
+            audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
+
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
@@ -9931,6 +9994,7 @@ private:
     /// Born-on-PG persistence for /auto pre-flight runs. Borrows pg_pool_ →
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
+    std::unique_ptr<DeploymentRunStore> deployment_run_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -10024,6 +10088,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
+    std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =

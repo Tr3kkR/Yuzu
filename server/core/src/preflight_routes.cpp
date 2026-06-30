@@ -442,7 +442,8 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
         repoll = "/fragments/auto/result?run=" + url_encode(run.run_id) + "&n=" +
                  std::to_string(attempt + 1);
 
-    return render_auto_results(grid, config_summary(cfg), run.scope_label, repoll, /*run_complete=*/!running);
+    return render_auto_results(grid, config_summary(cfg), run.scope_label, repoll,
+                               /*run_complete=*/!running, run.run_id);
 }
 
 } // namespace yuzu::server
