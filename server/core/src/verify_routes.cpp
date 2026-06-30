@@ -117,26 +117,28 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                 "text/html");
             return;
         }
+        const PairedComparison c =
+            build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
+                             yuzu::util::canon_version(candidate), window);
         // OPERATIONAL audit, set-and-proceed (records who compared whose canary —
         // the accountability that stands in for the absent floor). The dashboard
         // proceeds even on a lost audit row (Sec-Audit-Failed header set); the
-        // per-machine PII is behind the separate drill click below.
+        // per-machine PII is behind the separate drill click below. `paired=` makes a
+        // singleton (paired=1) aggregate distinguishable in the log (gov UP-7).
         const auto cid = detail::make_correlation_id();
         detail::emit_behavioral_audit(audit_fn_, req, res, "dex.app_perf.compare", "success",
                                       "GuaranteedState", group,
                                       "app=" + app + " base=" + baseline + " cand=" + candidate +
                                           " cohort=" + std::to_string(cohort->member_count) +
+                                          " paired=" + std::to_string(c.paired) +
                                           " view=aggregate cid=" + cid);
 
-        const PairedComparison c =
-            build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                             yuzu::util::canon_version(candidate), window);
         const std::string drill_url =
             "/fragments/auto/verify/drill?group=" + url_encode(group) + "&app=" + url_encode(app) +
             "&baseline=" + url_encode(baseline) + "&candidate=" + url_encode(candidate) +
             "&window=" + std::to_string(window);
-        res.set_content(render_verify_result(c, cohort->member_count, app, baseline, candidate,
-                                             window, drill_url),
+        res.set_content(render_verify_result(c, cohort->member_count, cohort->truncated, app,
+                                             baseline, candidate, window, drill_url),
                         "text/html");
     });
 

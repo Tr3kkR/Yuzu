@@ -57,10 +57,17 @@ public:
     /// being compared (both canonicalized to match the stored key; a version may
     /// be empty for the "" unknown bucket). Ordered `(agent_id, version, day)`,
     /// `agent_id` preserved. AUTHORITATIVE: `std::nullopt` on a pool/query degrade;
-    /// empty value when `agent_ids`/`app_name` is empty or no rows match. Capped.
+    /// empty value when `agent_ids`/`app_name` is empty or no rows match.
+    ///
+    /// `truncated` (out-param) is set true when the result hit the hard row cap. The
+    /// cap drops the alphabetically-last `agent_id`s mid-machine, so a truncated read
+    /// can MIS-classify a machine that ran both versions as `baseline_only` — the
+    /// comparison must NOT be presented as reliable when truncated (gov UP-1). Callers
+    /// surface it loudly (REST/MCP `truncated` field, dashboard warning), never silently.
     [[nodiscard]] std::optional<std::vector<AppPerfCohortRow>>
     get_cohort_rows(const std::vector<std::string>& agent_ids, std::string_view app_name,
-                    std::string_view baseline_version, std::string_view candidate_version);
+                    std::string_view baseline_version, std::string_view candidate_version,
+                    bool& truncated);
 
 private:
     pg::PgPool& pool_;

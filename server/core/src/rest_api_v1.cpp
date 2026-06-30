@@ -6798,18 +6798,22 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
-            // aggregate, the per-machine drill is the fail-closed surface). Records
-            // who compared whose canary; the header flags a lost evidence row.
-            detail::emit_behavioral_audit(
-                audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
-                "app=" + app + " base=" + baseline + " cand=" + candidate +
-                    " cohort=" + std::to_string(cohort->member_count) + " cid=" + cid);
-
             const PairedComparison c =
                 build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                                  yuzu::util::canon_version(candidate), window);
             const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+
+            // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
+            // aggregate, the per-machine drill is the fail-closed surface). Records
+            // who compared whose canary; the header flags a lost evidence row. The
+            // detail carries `paired=` so a singleton (paired=1) aggregate — which IS
+            // individual data — is distinguishable in the audit log (gov UP-7), and
+            // `view=aggregate` matches the dashboard sibling + the documented contract.
+            detail::emit_behavioral_audit(
+                audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
+                "app=" + app + " base=" + baseline + " cand=" + candidate +
+                    " cohort=" + std::to_string(cohort->member_count) +
+                    " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
             const std::string cpu = JObj()
                                         .add("before_mean", c.cpu_before_mean)
@@ -6843,6 +6847,10 @@ void RestApiV1::register_routes(
                                         .add("no_data", no_data)
                                         .add("small_cohort", c.small_cohort)
                                         .add("insufficient", c.insufficient)
+                                        // truncated=true → the cohort exceeded the read
+                                        // cap; the counts above are UNRELIABLE (a machine
+                                        // that ran both may be mis-read as baseline_only).
+                                        .add("truncated", cohort->truncated)
                                         .raw("cpu", cpu)
                                         .raw("ws", ws)
                                         .raw("distribution", dist)

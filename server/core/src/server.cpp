@@ -388,6 +388,14 @@ public:
                           "Management-group app-perf trend reads that returned a degrade rather than "
                           "a result, by reason",
                           "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_degrade_total",
+                          "/auto VERIFY cohort B1 reads that returned a degrade rather than a "
+                          "result, by reason (pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_cap_hit_total",
+                          "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
+                          "comparison is incomplete and may mis-pair machines)",
+                          "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
@@ -8725,10 +8733,13 @@ private:
             out.member_count = static_cast<std::int64_t>(agent_ids.size());
             if (agent_ids.empty())
                 return out; // empty/unknown group → member_count 0, no rows (not a degrade)
-            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate);
+            bool truncated = false;
+            auto rows =
+                app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate, truncated);
             if (!rows)
                 return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
             out.rows = std::move(*rows);
+            out.truncated = truncated;
             return out;
         };
         // COPY the cohort provider (std::function is copyable) so the /auto VERIFY

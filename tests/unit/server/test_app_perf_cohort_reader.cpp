@@ -77,8 +77,10 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
     seed(b1, "a1", "Other.exe", "4.2.0.0", d1, 1.0, 90000000);   // different app
 
     SECTION("member + app + two-version filter, agent_id preserved") {
-        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0");
+        bool tr = false;
+        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
         REQUIRE(rows.has_value());
+        CHECK_FALSE(tr); // 4 rows is far below the cap
         // a1×{4.2,4.3} + a2×{4.2,4.3} = 4 rows; a3 excluded (member filter); 4.1.0.0
         // and Other.exe excluded (version/app filters).
         CHECK(rows->size() == 4);
@@ -91,7 +93,8 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
     }
 
     SECTION("the read drives build_comparison end-to-end (real SQL → engine)") {
-        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0");
+        bool tr = false;
+        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
         REQUIRE(rows.has_value());
         auto c = build_comparison(*rows, yuzu::util::canon_version("4.2.0.0"),
                                   yuzu::util::canon_version("4.3.0.0"), 7);
@@ -104,13 +107,15 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
     }
 
     SECTION("empty member list is a precondition miss, not a degrade") {
-        auto rows = reader.get_cohort_rows({}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0");
+        bool tr = false;
+        auto rows = reader.get_cohort_rows({}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
         REQUIRE(rows.has_value()); // empty value, NOT nullopt
         CHECK(rows->empty());
     }
 
     SECTION("empty app is a precondition miss, not a degrade") {
-        auto rows = reader.get_cohort_rows({"a1"}, "", "4.2.0.0", "4.3.0.0");
+        bool tr = false;
+        auto rows = reader.get_cohort_rows({"a1"}, "", "4.2.0.0", "4.3.0.0", tr);
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
     }

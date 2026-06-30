@@ -29,9 +29,10 @@ namespace yuzu::server {
 /// audited per-device surface). A small (sub-floor) cohort gets an "indicative"
 /// note; an empty/insufficient cohort gets an honest note instead of fabricated 0s.
 [[nodiscard]] std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_size,
-                                 const std::string& app, const std::string& baseline,
-                                 const std::string& candidate, int window,
-                                 const std::string& drill_url);
+                                               bool truncated, const std::string& app,
+                                               const std::string& baseline,
+                                               const std::string& candidate, int window,
+                                               const std::string& drill_url);
 
 /// PURE: the per-machine pairs table (the audited drill) — device, CPU before/after/Δ,
 /// WS before/after/Δ, samples; largest CPU mover first. Per-device behavioural data,

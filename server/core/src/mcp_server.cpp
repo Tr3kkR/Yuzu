@@ -3042,29 +3042,43 @@ McpServer::HandlerFn McpServer::build_handler(
                                              .add("flat", c.moved_flat)
                                              .add("down", c.moved_down)
                                              .str();
-                const std::string payload = JObj()
-                                                .add("app", app)
-                                                .add("group_id", group)
-                                                .add("baseline_version", baseline)
-                                                .add("candidate_version", candidate)
-                                                .add("window_days", static_cast<int64_t>(window))
-                                                .add("cohort_size", cohort->member_count)
-                                                .add("paired", c.paired)
-                                                .add("baseline_only", c.baseline_only)
-                                                .add("candidate_only", c.candidate_only)
-                                                .add("no_data", no_data)
-                                                .add("small_cohort", c.small_cohort)
-                                                .add("insufficient", c.insufficient)
-                                                .raw("cpu", cpu)
-                                                .raw("ws", ws)
-                                                .raw("distribution", dist)
-                                                .str();
+                // Audit the read (load-bearing — it is the accountability that replaces
+                // the absent cohort floor, and MCP is the highest-exposure programmatic
+                // sweep path). Carry the SUBJECT (group/app/versions/cohort) + paired so
+                // a singleton aggregate is distinguishable — empty detail here was the
+                // governance HIGH (gov compliance/consistency). Set-and-proceed: capture
+                // the persist bool and surface `audit_persisted:false` in the body (MCP
+                // has no Sec-Audit-Failed header channel — the documented MCP posture).
+                const bool audit_ok = mcp_audit(
+                    "success", "group=" + group + " app=" + app + " base=" + baseline + " cand=" +
+                                   candidate + " cohort=" + std::to_string(cohort->member_count) +
+                                   " paired=" + std::to_string(c.paired));
+                JObj payload_obj;
+                payload_obj.add("app", app)
+                    .add("group_id", group)
+                    .add("baseline_version", baseline)
+                    .add("candidate_version", candidate)
+                    .add("window_days", static_cast<int64_t>(window))
+                    .add("cohort_size", cohort->member_count)
+                    .add("paired", c.paired)
+                    .add("baseline_only", c.baseline_only)
+                    .add("candidate_only", c.candidate_only)
+                    .add("no_data", no_data)
+                    .add("small_cohort", c.small_cohort)
+                    .add("insufficient", c.insufficient)
+                    // truncated=true → cohort exceeded the read cap; counts UNRELIABLE.
+                    .add("truncated", cohort->truncated)
+                    .raw("cpu", cpu)
+                    .raw("ws", ws)
+                    .raw("distribution", dist);
+                if (!audit_ok)
+                    payload_obj.add("audit_persisted", false);
+                const std::string payload = payload_obj.str();
                 auto result =
                     JObj()
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", payload)).str())
                         .str();
-                mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

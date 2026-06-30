@@ -66,17 +66,40 @@ TEST_CASE("reduce_version_window: caps to the most recent window_days days", "[v
     CHECK(a[0].day_count == 2);
 }
 
-TEST_CASE("reduce_version_window: zero-sample window falls back to unweighted mean",
+TEST_CASE("reduce_version_window: a zero-sample machine measured nothing → EXCLUDED",
           "[verify][compare]") {
+    // Without a cohort floor, a canary whose only in-window day has zero samples
+    // would otherwise pair on noise and swing the median. It carries no real scalar.
     std::vector<AppPerfCohortRow> rows = {
         row("m1", "A", 10, 0, 2.0, 1000),
         row("m1", "A", 11, 0, 6.0, 3000),
+        row("m2", "A", 10, 50, 3.0, 1000), // a real machine still shows
     };
     auto a = reduce_version_window(rows, "A", 7);
     REQUIRE(a.size() == 1);
-    CHECK(a[0].cpu == Approx(4.0)); // (2+6)/2
-    CHECK(a[0].ws == 2000);
-    CHECK(a[0].samples == 0);
+    CHECK(a[0].agent_id == "m2");
+    CHECK(a[0].cpu == Approx(3.0));
+    // A zero-sample candidate makes a machine unpaired (no candidate measurement),
+    // NOT a 0%-CPU pair.
+    std::vector<AppPerfCohortRow> mixed = {
+        row("z", "A", 10, 100, 4.0, 1000), // real baseline
+        row("z", "B", 11, 0, 9.0, 9000),   // zero-sample candidate → no scalar
+    };
+    auto c = compare(reduce_version_window(mixed, "A", 7), reduce_version_window(mixed, "B", 7), "A",
+                     "B", 7);
+    CHECK(c.paired == 0);
+    CHECK(c.baseline_only == 1); // honestly: we measured baseline, not candidate
+}
+
+TEST_CASE("reduce/compare: cpu is clamped to [0,100] at the scalar boundary", "[verify][compare]") {
+    // A future LIVE candidate could feed a finite-but-out-of-range cpu (e.g. 1e9);
+    // it must not blow the means.
+    std::vector<MachineVersionScalar> base = {{"m1", 5.0, 1000, 100, 1}};
+    std::vector<MachineVersionScalar> cand = {{"m1", 1e9, 1500, 100, 1}}; // absurd
+    auto c = compare(base, cand, "A", "B", 7);
+    REQUIRE(c.paired == 1);
+    CHECK(c.cpu_after_mean <= 100.0);
+    CHECK(c.cpu_after_mean == Approx(100.0));
 }
 
 TEST_CASE("compare: staggered upgrades still pair — window is per-machine, not today-anchored",

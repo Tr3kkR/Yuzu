@@ -94,9 +94,18 @@ per-machine identity; the **per-machine pairs** are behind a separate *"Show
 per-machine pairs"* click, so opening that view is a deliberate, separately-audited
 action.
 
-Verify reads the retained per-device performance history, so a candidate version only
-appears once the upgraded machines have reported it (the next daily sync after the
-upgrade). It does not dispatch anything to the devices.
+**Prerequisite:** Verify reads the retained per-device performance history, which only
+exists if **per-application performance collection is enabled** on the devices (it is
+opt-in and off by default). Without it, every Verify comparison returns *insufficient*
+with no data — pick the cohort accordingly. Even with collection on, a just-upgraded
+candidate version only appears once the upgraded machines have reported it (the next
+daily report after the upgrade), so running Verify immediately after a deploy may show
+*insufficient* until the cohort reports back. Verify dispatches nothing to the devices.
+
+You pick the cohort (a management group) manually; automatically pre-filling it from the
+ACT/deploy stage is a planned future convenience, not yet available. Very large cohorts
+(thousands of devices) can exceed the read cap, in which case Verify shows a *truncated*
+warning and the numbers are unreliable — narrow the group or shorten the window.
 
 The same comparison is available to automation: REST `GET /api/v1/dex/perf/compare`
 and MCP `compare_app_perf_versions` return the aggregate (no per-machine identity).

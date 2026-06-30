@@ -47,7 +47,8 @@ void note_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
 std::optional<std::vector<AppPerfCohortRow>>
 AppPerfCohortReader::get_cohort_rows(const std::vector<std::string>& agent_ids,
                                      std::string_view app_name, std::string_view baseline_version,
-                                     std::string_view candidate_version) {
+                                     std::string_view candidate_version, bool& truncated) {
+    truncated = false;
     std::vector<AppPerfCohortRow> out;
     if (agent_ids.empty() || app_name.empty())
         return out; // precondition miss, not a degrade
@@ -94,6 +95,19 @@ AppPerfCohortReader::get_cohort_rows(const std::vector<std::string>& agent_ids,
         return std::nullopt;
     }
     const int n = PQntuples(res.get());
+    if (n >= kQueryRowCap) {
+        // The ORDER BY agent_id cap drops the last agents mid-machine → a machine
+        // that ran both versions can be mis-read as baseline_only. Flag it so the
+        // surfaces refuse to present the comparison as reliable (gov UP-1), and make
+        // the truncation discoverable on an idle server (gov sre).
+        truncated = true;
+        if (metrics_)
+            metrics_->counter("yuzu_app_perf_cohort_read_cap_hit_total", {}).increment();
+        spdlog::warn("AppPerfCohortReader: cohort read hit the {}-row cap for app='{}' "
+                     "({} members) — the comparison is truncated and may mis-pair machines; "
+                     "narrow the group or shorten the window",
+                     kQueryRowCap, app_name, agent_ids.size());
+    }
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         AppPerfCohortRow r;

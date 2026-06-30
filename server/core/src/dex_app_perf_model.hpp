@@ -254,6 +254,10 @@ using AppPerfGroupFn = std::function<std::optional<std::vector<AppPerfFleetRow>>
 struct CohortRead {
     std::int64_t member_count{0};
     std::vector<AppPerfCohortRow> rows;
+    /// The B1 read hit the hard row cap — `rows` is incomplete AND may mis-pair a
+    /// boundary machine (gov UP-1). The surface must present the comparison as
+    /// unreliable when this is set, never as a silent undercount.
+    bool truncated{false};
 };
 
 /// VERIFY: resolve `group_id`'s members, then read their raw B1 rows for

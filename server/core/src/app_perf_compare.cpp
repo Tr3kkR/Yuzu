@@ -12,14 +12,16 @@ namespace yuzu::server {
 
 namespace {
 
-/// Map a non-finite double (NaN/Inf) to 0.0. The store clamps B1 `cpu_avg` finite
-/// at ingest, so this is unreachable through the authenticated agent→B1→reader
-/// chain TODAY — but `compare()` is documented as the seam a future LIVE candidate
-/// (fan-out procperf) feeds directly, bypassing the store clamp, and a NaN reaching
-/// either `std::sort` below would be undefined behaviour (NaN breaks strict-weak
-/// ordering → OOB read). Sanitising at the scalar boundary closes it independent of
-/// the upstream writer (gov 2026-06-30, convergent finding from 5 reviewers).
-double finite_or_zero(double v) { return std::isfinite(v) ? v : 0.0; }
+/// Sanitise a CPU% value at the scalar boundary: NaN/Inf → 0, and clamp to the
+/// valid [0, 100] share-of-machine-capacity range. The B1 store clamps `cpu_avg`
+/// finite + ≤100 at ingest, so this is unreachable through the authenticated
+/// agent→B1→reader chain TODAY — but `compare()` is documented as the seam a future
+/// LIVE candidate (fan-out procperf) feeds directly, bypassing the store clamp. A
+/// NaN reaching either `std::sort` below would be undefined behaviour (NaN breaks
+/// strict-weak ordering → OOB read), and a finite-but-out-of-range value (e.g.
+/// 1e300) would blow the means/percentiles. Sanitising here closes both independent
+/// of the upstream writer (gov 2026-06-30, convergent finding across reviewers).
+double sanitize_cpu(double v) { return std::isfinite(v) ? std::clamp(v, 0.0, 100.0) : 0.0; }
 
 /// PURE: the p-th percentile (p in [0,1]) of a scalar sample by the platform
 /// nearest-rank DIRECTION — rank `r = ceil(p·n)`, clamped to `[1, n]`, value of
@@ -81,31 +83,30 @@ std::vector<MachineVersionScalar> reduce_version_window(const std::vector<AppPer
         const std::size_t take = std::min<std::size_t>(recs.size(), static_cast<std::size_t>(window_days));
 
         double cpu_ws = 0.0, ws_ws = 0.0; // sample-weighted sums
-        double cpu_uw = 0.0, ws_uw = 0.0; // unweighted fallback sums
         std::int64_t samples = 0;
         for (std::size_t i = 0; i < take; ++i) {
             const AppPerfCohortRow& r = *recs[i];
-            const double cpu = finite_or_zero(r.cpu_avg); // NaN/Inf → 0 (sort-UB defence)
             const double w = static_cast<double>(r.samples > 0 ? r.samples : 0);
-            cpu_ws += cpu * w;
+            cpu_ws += sanitize_cpu(r.cpu_avg) * w; // NaN/Inf→0, clamp [0,100] (sort-UB + range)
             ws_ws += static_cast<double>(r.ws_avg_bytes) * w;
-            cpu_uw += cpu;
-            ws_uw += static_cast<double>(r.ws_avg_bytes);
             samples += (r.samples > 0 ? r.samples : 0);
         }
+
+        // A machine whose entire in-window history for this version has ZERO samples
+        // measured nothing — it carries no real scalar, so it is EXCLUDED (not paired
+        // on noise). Without a cohort floor, one zero-sample canary would otherwise
+        // swing the median/distribution with a full equal vote (gov UP-3). It will
+        // read as having no data for this version (→ baseline_only/candidate_only or
+        // no_data), which is the honest answer: we have no measurement for it.
+        if (samples <= 0)
+            continue;
 
         MachineVersionScalar m;
         m.agent_id = agent_id;
         m.samples = samples;
         m.day_count = static_cast<std::int64_t>(take);
-        if (samples > 0) {
-            m.cpu = cpu_ws / static_cast<double>(samples);
-            m.ws = static_cast<std::int64_t>(std::llround(ws_ws / static_cast<double>(samples)));
-        } else if (take > 0) {
-            // No sample weights present — honest unweighted mean over the days.
-            m.cpu = cpu_uw / static_cast<double>(take);
-            m.ws = static_cast<std::int64_t>(std::llround(ws_uw / static_cast<double>(take)));
-        }
+        m.cpu = cpu_ws / static_cast<double>(samples);
+        m.ws = static_cast<std::int64_t>(std::llround(ws_ws / static_cast<double>(samples)));
         out.push_back(std::move(m));
     }
     return out;
@@ -147,8 +148,8 @@ PairedComparison compare(const std::vector<MachineVersionScalar>& baseline,
         // Sanitise at the scalar boundary: a LIVE candidate (slice 2) feeds these
         // scalars to compare() directly, bypassing the B1 store's NaN clamp; a
         // non-finite cpu would make the cpu_delta sort below UB.
-        const double cb = finite_or_zero(b.cpu);
-        const double ca = finite_or_zero(c.cpu);
+        const double cb = sanitize_cpu(b.cpu);
+        const double ca = sanitize_cpu(c.cpu);
         p.cpu_before = cb;
         p.cpu_after = ca;
         p.cpu_delta = ca - cb;

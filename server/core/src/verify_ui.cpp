@@ -144,6 +144,11 @@ std::string render_verify_config(const std::vector<std::pair<std::string, std::s
          "hx-include=\"#verify-cfg input, #verify-cfg select\" hx-target=\"#verify-results\" "
          "hx-swap=\"innerHTML\">Compare</button>";
     h += "</div>";
+    h += "<div class=\"gp-mute\" style=\"font-size:.68rem;margin:-.2rem 0 .4rem\">Tip: the app name "
+         "must match what the devices report (e.g. <span class=\"v\" style=\"font-family:ui-monospace,"
+         "Consolas,monospace\">AcmeVPN.exe</span>). Discover apps with retained data via "
+         "<span class=\"v\" style=\"font-family:ui-monospace,Consolas,monospace\">GET "
+         "/api/v1/dex/perf/apps</span>. Performance collection is opt-in (off by default).</div>";
 
     h += "<div id=\"verify-results\"><div class=\"gp-placeholder\">"
          "Pick a cohort, app, and two versions, then Compare.</div></div>";
@@ -154,7 +159,7 @@ std::string render_verify_note(const std::string& message) {
     return "<div class=\"gp-placeholder\">" + esc(message) + "</div>";
 }
 
-std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_size,
+std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_size, bool truncated,
                                  const std::string& app, const std::string& baseline,
                                  const std::string& candidate, int window,
                                  const std::string& drill_url) {
@@ -175,10 +180,29 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
     h += "<span class=\"sep\">\xC2\xB7</span><span>" + std::to_string(window) + " d each side</span>";
     h += "</div>";
 
+    // Truncation is LOUD, not silent: a capped read can mis-pair a boundary machine,
+    // so the comparison below must not be trusted (gov UP-1). Red, above everything.
+    if (truncated)
+        h += "<div class=\"vf-ind\" style=\"color:#e57373;background:#241010;border-color:#5a2323\">"
+             "\xE2\x9A\xA0 This cohort is too large to compare reliably \xE2\x80\x94 the read hit the "
+             "100,000-row cap, so some machines are dropped and a machine that ran both versions can "
+             "be mis-counted as one-version-only. <b>Narrow the group or shorten the window.</b> The "
+             "numbers below are incomplete.</div>";
+
     if (c.insufficient) {
-        h += render_verify_note("No machine in this cohort ran BOTH versions in-window, so there is "
-                                "nothing to pair. Pick versions the cohort has actually run, or "
-                                "widen the window.");
+        // Distinguish "no app-perf data at all for this cohort/app" (likely the app
+        // name is wrong, or performance collection is off) from "there is data but no
+        // machine ran BOTH versions" — the remediation differs (gov UP-10 / enterprise).
+        if (unpaired == 0 && no_data == cohort_size)
+            h += render_verify_note("No performance data for this application on this cohort. Check "
+                                    "the application name, and that performance collection is enabled "
+                                    "on these devices (it is opt-in and off by default); a just-"
+                                    "upgraded version also only appears after the devices' next "
+                                    "daily report.");
+        else
+            h += render_verify_note("No machine in this cohort ran BOTH versions in-window, so there "
+                                    "is nothing to pair. Pick versions the cohort has actually run, "
+                                    "or widen the window.");
         return h;
     }
     if (c.small_cohort)

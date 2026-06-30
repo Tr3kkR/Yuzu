@@ -1405,9 +1405,28 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         // EVIDENTIAL — there must be NO verdict/pass/fail field.
         CHECK_FALSE(j["data"].contains("verdict"));
         CHECK_FALSE(j["data"].contains("pass"));
-        // The read IS audited (the accountability that replaces the absent floor).
+        // The read IS audited (the accountability that replaces the absent floor),
+        // and the detail carries paired= (singleton-visible) + view=aggregate.
         REQUIRE(h.audit_log.size() == 1);
         CHECK(h.audit_log[0].action == "dex.app_perf.compare");
+        CHECK(h.audit_log[0].detail.find("paired=2") != std::string::npos);
+        CHECK(h.audit_log[0].detail.find("view=aggregate") != std::string::npos);
+        CHECK_FALSE(j["data"]["truncated"].get<bool>());
+    }
+    SECTION("truncated cohort → truncated:true in the response (loud, not silent)") {
+        RestGsHarness h;
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        cr.truncated = true; // the read hit the row cap
+        cr.rows = {
+            {"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500},
+        };
+        h.cohort_read_ = cr;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(nlohmann::json::parse(res->body)["data"]["truncated"].get<bool>() == true);
     }
     SECTION("audit drop → 200 set-and-proceed + Sec-Audit-Failed (aggregate has no PII)") {
         RestGsHarness h;
