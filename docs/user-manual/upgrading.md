@@ -354,7 +354,7 @@ export YUZU_VERSION=0.9.0
 docker compose -f docker-compose.reference.yml up -d server
 ```
 
-**Never** run `docker compose down -v` unless you intend to delete `server-data` and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
+**Never** run `docker compose down -v` unless you intend to delete `server-data`, `postgres-data` (the PostgreSQL substrate — the server's primary data store), and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
 
 ### Windows
 
