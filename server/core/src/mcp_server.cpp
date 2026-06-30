@@ -1,20 +1,21 @@
 #include "mcp_server.hpp"
-#include "mcp_agentic_catalog.hpp"
+#include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
-#include "rest_audit.hpp"          // detail::try_persist_audit (behavioural-audit kernel, #1647)
-#include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
-#include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
+#include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
+#include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
+#include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -234,344 +235,343 @@ std::string lower_copy(std::string v) {
 }
 
 // All 26 Phase 1 read-only tools.
-static const ToolDef
-    kTools
-        [] =
-            {
-                {"list_agents",
-                 "List all connected agents with hostname, OS, architecture, and version.",
-                 R"({"type":"object","properties":{}})"},
+static const ToolDef kTools[] = {
+    {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
+     R"({"type":"object","properties":{}})"},
 
-                {"get_agent_details",
-                 "Get detailed info for a single agent including tags and inventory.",
-                 R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+    {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
 
-                {"query_audit_log",
-                 "Query the audit log with filters. Returns timestamped entries showing who did "
-                 "what, when.",
-                 R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
+    {"query_audit_log",
+     "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
 
-                {"list_definitions",
-                 "List available instruction definitions (commands that can be dispatched to "
-                 "agents).",
-                 R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})"},
+    {"list_definitions",
+     "List available instruction definitions (commands that can be dispatched to agents).",
+     R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})"},
 
-                {"get_definition",
-                 "Get a single instruction definition with its parameter and result schemas.",
-                 R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})"},
+    {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
+     R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})"},
 
-                {"query_responses",
-                 "Query command response data. Provide execution_id to collect exactly the "
-                 "responses produced by a single execute_instruction dispatch (closing the "
-                 "agentic dispatch->collect loop), or instruction_id for every response to a "
-                 "definition. At least one of execution_id / instruction_id is required. When "
-                 "both are given, execution_id wins. Returns up to `limit` rows (max 1000); an "
-                 "empty result can mean the dispatch is still in flight (responses not yet "
-                 "landed) — use get_execution_status to confirm a run reached a terminal state.",
-                 R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j"},
+    {"query_responses",
+     "Query command response data. Provide execution_id to collect exactly the "
+     "responses produced by a single execute_instruction dispatch (closing the "
+     "agentic dispatch->collect loop), or instruction_id for every response to a "
+     "definition. At least one of execution_id / instruction_id is required. When "
+     "both are given, execution_id wins. Returns up to `limit` rows (max 1000); an "
+     "empty result can mean the dispatch is still in flight (responses not yet "
+     "landed) — use get_execution_status to confirm a run reached a terminal state. "
+     "A per-agent management-group filter is applied but is INERT under the current "
+     "global Response:Read gate (a normal holder receives rows for all agents; "
+     "effective scoping needs the #1634 gate change); its active effect today is "
+     "failing closed (zero rows) when the RBAC store is corrupt.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j"},
 
-                {"aggregate_responses",
-                 "Aggregate response data (COUNT, SUM, AVG) grouped by a column.",
-                 R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
+    {"aggregate_responses",
+     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
+     "filter is applied before aggregation but is INERT under the current global Response:Read gate "
+     "(a normal Response:Read holder aggregates across all agents; effective scoping needs the #1634 "
+     "gate change). Active effect today: fails closed (a JSON-RPC error, never empty totals) when the "
+     "RBAC store is corrupt or the response read errors. A denied-scope audit row is emitted on a "
+     "drop.",
+     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
 
-                {"query_inventory",
-                 "Query inventory data across agents. Filter by agent or plugin.",
-                 R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})"},
+    {"query_inventory",
+     "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
+     "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
+     "query_installed_software instead.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})"},
 
-                {"list_inventory_tables", "List available inventory data types with agent counts.",
-                 R"({"type":"object","properties":{}})"},
+    {"list_inventory_tables", "List available inventory data types with agent counts.",
+     R"({"type":"object","properties":{}})"},
 
-                {"get_agent_inventory", "Get all inventory data for a specific agent.",
-                 R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+    {"get_agent_inventory", "Get all inventory data for a specific agent.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
 
-                {"get_tags", "Get all tags for a specific agent.",
-                 R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+    {"query_installed_software",
+     "Query the typed installed-software inventory collected by the agent daily-sync framework "
+     "(ADR-0016) — machine-wide installed packages (name, version, publisher, install_date) per "
+     "device, fleet-wide. Filter by software `name` and/or `agent_id`. This is DISTINCT from "
+     "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
+     "Infrastructure:Read. Requires Inventory:Read. Returns up to `limit` rows (max 1000); when "
+     "result_truncated_by_cap is true more rows exist past the cap (keyset pagination is a "
+     "follow-up). A per-agent management-group drop filter is applied (devices_omitted reports the "
+     "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
+     "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
+     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j"},
 
-                {"search_agents_by_tag",
-                 "Find agents that have a specific tag key (and optionally value).",
-                 R"({"type":"object","properties":{"key":{"type":"string","description":"Tag key"},"value":{"type":"string","description":"Optional tag value filter"}},"required":["key"]})"},
+    {"get_tags", "Get all tags for a specific agent.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
 
-                {"list_policies", "List compliance policies.",
-                 R"({"type":"object","properties":{"enabled":{"type":"boolean"}}})"},
+    {"search_agents_by_tag", "Find agents that have a specific tag key (and optionally value).",
+     R"({"type":"object","properties":{"key":{"type":"string","description":"Tag key"},"value":{"type":"string","description":"Optional tag value filter"}},"required":["key"]})"},
 
-                {"get_compliance_summary",
-                 "Get per-policy compliance breakdown (compliant/non-compliant/unknown counts).",
-                 R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})"},
+    {"list_policies", "List compliance policies.",
+     R"({"type":"object","properties":{"enabled":{"type":"boolean"}}})"},
 
-                {"get_fleet_compliance",
-                 "Get fleet-wide compliance percentages across all policies.",
-                 R"({"type":"object","properties":{}})"},
+    {"get_compliance_summary",
+     "Get per-policy compliance breakdown (compliant/non-compliant/unknown counts).",
+     R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})"},
 
-                {"list_management_groups", "List management groups (hierarchical device grouping).",
-                 R"({"type":"object","properties":{}})"},
+    {"get_fleet_compliance", "Get fleet-wide compliance percentages across all policies.",
+     R"({"type":"object","properties":{}})"},
 
-                {"get_execution_status",
-                 "Check status of a running or completed command execution.",
-                 R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})"},
+    {"list_management_groups", "List management groups (hierarchical device grouping).",
+     R"({"type":"object","properties":{}})"},
 
-                {"list_executions", "List recent command executions.",
-                 R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})"},
+    {"get_execution_status", "Check status of a running or completed command execution.",
+     R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})"},
 
-                {"list_schedules", "List scheduled (recurring) instructions.",
-                 R"({"type":"object","properties":{}})"},
+    {"list_executions", "List recent command executions.",
+     R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})"},
 
-                {"validate_scope",
-                 "Validate a scope expression without executing it. Returns parse errors if "
-                 "invalid.",
-                 R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})"},
+    {"list_schedules", "List scheduled (recurring) instructions.",
+     R"({"type":"object","properties":{}})"},
 
-                {"preview_scope_targets", "Show which agents match a scope expression.", R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})"},
+    {"validate_scope",
+     "Validate a scope expression without executing it. Returns parse errors if invalid.",
+     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})"},
 
-                {"list_pending_approvals", "List pending approval requests.",
-                 R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
+    {"preview_scope_targets", "Show which agents match a scope expression.",
+     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})"},
 
-                {"get_guardian_schemas",
-                 "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
-                 "spark/assertion/remediation types and their JSON Schemas. Use this to discover "
-                 "how to "
-                 "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas "
-                 "catalog.",
-                 R"({"type":"object","properties":{}})"},
+    {"list_pending_approvals", "List pending approval requests.",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
 
-                // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
-                {"list_dex_signals",
-                 "List the DEX signal catalogue rollup: every observation type seen in the window "
-                 "with its "
-                 "event count, blast radius (distinct devices) and last-seen time. Fleet "
-                 "aggregate. Mirrors "
-                 "GET /api/v1/dex/signals. Requires GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"}}})j"},
+    {"get_guardian_schemas",
+     "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
+     "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
+     "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas catalog.",
+     R"({"type":"object","properties":{}})"},
 
-                {"get_dex_signal_scope",
-                 "Get DEX per-OS signal coverage: how many distinct observation types each "
-                 "platform reports, "
-                 "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
-                 "GuaranteedState:Read.",
-                 R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
+    // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
+    {"list_dex_signals",
+     "List the DEX signal catalogue rollup: every observation type seen in the window with its "
+     "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate. Mirrors "
+     "GET /api/v1/dex/signals. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"}}})j"},
 
-                {"get_dex_signal_detail",
-                 "Drill into one DEX signal type: top subjects, per-OS split, most-affected "
-                 "devices, and the "
-                 "per-day trend. The devices list names affected agent IDs (behavioral data) — "
-                 "every call is "
-                 "audit-logged (dex.signal.view). Mirrors GET /api/v1/dex/signals/{obs_type}. "
-                 "Requires "
-                 "GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("obs_type":{"type":"string","description":"Catalogue key, e.g. process.crashed, os.boot (pattern [A-Za-z0-9._-]{1,64})"},)j"
-                 R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
-                 R"j("limit":{"type":"integer","default":50,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
-                 R"j(},"required":["obs_type"]})j"},
+    {"get_dex_signal_scope",
+     "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
+     "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
+     "GuaranteedState:Read.",
+     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
 
-                // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
-                {"get_dex_perf_fleet",
-                 "Fleet device-performance now-stats: avg/p50/p90/max + reporting population for "
-                 "CPU "
-                 "utilization %, memory commit %, and disk I/O latency (current heartbeat cycle — "
-                 "the same "
-                 "numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance "
-                 "tab). A null "
-                 "metric means no device reported it (absent, never zero). Mirrors GET "
-                 "/api/v1/dex/perf/fleet. "
-                 "Requires GuaranteedState:Read.",
-                 R"({"type":"object","properties":{}})"},
+    {"get_dex_signal_detail",
+     "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
+     "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
+     "audit-logged (dex.signal.view). Mirrors GET /api/v1/dex/signals/{obs_type}. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("obs_type":{"type":"string","description":"Catalogue key, e.g. process.crashed, os.boot (pattern [A-Za-z0-9._-]{1,64})"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
+     R"j(},"required":["obs_type"]})j"},
 
-                {"get_dex_perf_cohorts",
-                 "Fleet-relative performance percentiles per cohort of an operator-chosen tag key "
-                 "(e.g. "
-                 "model, image). Cohorts under the statistical floor are suppressed=true with "
-                 "population "
-                 "only; devices without the key form the explicit cohort=\"\" (untagged) residual. "
-                 "Mirrors "
-                 "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
+    // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
+    {"get_dex_perf_fleet",
+     "Fleet device-performance now-stats: avg/p50/p90/max + reporting population for CPU "
+     "utilization %, memory commit %, and disk I/O latency (current heartbeat cycle — the same "
+     "numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab). A null "
+     "metric means no device reported it (absent, never zero). Mirrors GET /api/v1/dex/perf/fleet. "
+     "Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
 
-                {"get_dex_perf_cohort_diff",
-                 "Direct cohort-vs-cohort performance comparison (F2c): diffs two cohorts of a tag "
-                 "key "
-                 "head-to-head (e.g. image_type vanilla vs layered), where get_dex_perf_cohorts "
-                 "benchmarks "
-                 "each cohort against the fleet. Both cohort values a and b are required (empty "
-                 "value = the "
-                 "untagged residual). delta_pct is A's p50 relative to B's p50 (B the baseline), "
-                 "null unless "
-                 "BOTH cohorts expose the metric (neither suppressed below the floor); "
-                 "found_a/found_b are "
-                 "false when a cohort has no reporting devices. Mirrors GET "
-                 "/api/v1/dex/perf/cohort-diff. "
-                 "Requires GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"},)j"
-                 R"j("a":{"type":"string","description":"First cohort value (empty string = untagged residual)"},)j"
-                 R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
-                 R"j(},"required":["a","b"]})j"},
+    {"get_dex_perf_cohorts",
+     "Fleet-relative performance percentiles per cohort of an operator-chosen tag key (e.g. "
+     "model, image). Cohorts under the statistical floor are suppressed=true with population "
+     "only; devices without the key form the explicit cohort=\"\" (untagged) residual. Mirrors "
+     "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
 
-                {"list_dex_perf_devices",
-                 "The device list behind every fleet-performance drill: worst devices by a metric "
-                 "(default), "
-                 "devices NOT reporting perf (filter=not_reporting), or one cohort's members "
-                 "(cohort_key + "
-                 "cohort_value; empty value = untagged). Machine-health telemetry (device state, "
-                 "not "
-                 "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires "
-                 "GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
-                 R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
-                 R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
-                 R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
-                 R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-                 R"j(}})j"},
+    {"get_dex_perf_cohort_diff",
+     "Direct cohort-vs-cohort performance comparison (F2c): diffs two cohorts of a tag key "
+     "head-to-head (e.g. image_type vanilla vs layered), where get_dex_perf_cohorts benchmarks "
+     "each cohort against the fleet. Both cohort values a and b are required (empty value = the "
+     "untagged residual). delta_pct is A's p50 relative to B's p50 (B the baseline), null unless "
+     "BOTH cohorts expose the metric (neither suppressed below the floor); found_a/found_b are "
+     "false when a cohort has no reporting devices. Mirrors GET /api/v1/dex/perf/cohort-diff. "
+     "Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"},)j"
+     R"j("a":{"type":"string","description":"First cohort value (empty string = untagged residual)"},)j"
+     R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
+     R"j(},"required":["a","b"]})j"},
 
-                // ── N1: network quality read tools — parity with /api/v1/network/* ──
-                {"get_network_fleet",
-                 "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for "
-                 "smoothed RTT "
-                 "(ms), the interval TCP retransmit rate (%), and device throughput (bps) — "
-                 "current heartbeat "
-                 "cycle. These are OS-blended fleet stats over the same per-device heartbeat facts "
-                 "as the "
-                 "per-OS yuzu_fleet_net_* Prometheus gauges (a gauge series, split by os, differs "
-                 "from this "
-                 "blended number on a mixed fleet) and the /network Overview cards. A null metric "
-                 "means no "
-                 "device reported it (absent, never zero); rtt_reporting is the "
-                 "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show "
-                 "device-perf "
-                 "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
-                 "/api/v1/network/fleet. Requires GuaranteedState:Read.",
-                 R"({"type":"object","properties":{}})"},
+    {"list_dex_perf_devices",
+     "The device list behind every fleet-performance drill: worst devices by a metric (default), "
+     "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
+     "cohort_value; empty value = untagged). Machine-health telemetry (device state, not "
+     "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
+     R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
+     R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500})j"
+     R"j(}})j"},
 
-                {"list_network_devices",
-                 "The device list behind every network-quality drill: worst devices by a metric "
-                 "(default rtt), "
-                 "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
-                 "(cooc=device|app|network_only|degraded), or one cohort's members (key + "
-                 "cohort_value; empty "
-                 "value = untagged). Rows carry the co-occurring facts (under_pressure, "
-                 "app_unstable) — "
-                 "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires "
-                 "GuaranteedState:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
-                 R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
-                 R"j("cooc":{"type":"string","enum":["device","app","network_only","degraded"],"description":"co-occurrence band over net-degraded devices"},)j"
-                 R"j("key":{"type":"string","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
-                 R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of key (empty string = untagged residual)"},)j"
-                 R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-                 R"j(}})j"},
+    // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
+    {"list_dex_perf_apps",
+     "Apps with retained fleet performance-over-time data: the picker for "
+     "get_dex_app_perf, so you discover which app names are answerable instead of "
+     "guessing. Each entry carries the count of distinct retained versions and the "
+     "most recent UTC-midnight epoch day seen; truncated=true means the list hit the "
+     "server cap. Fleet metadata — not individually identifying. Mirrors GET "
+     "/api/v1/dex/perf/apps. Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
 
-                // Phase 2 write tool
-                {"execute_instruction",
-                 "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
-                 "agents_reached, plugin, and action. Poll results with query_responses or "
-                 "subscribe to "
-                 "live JSON events via GET /api/v1/events?execution_id=<id>. "
-                 "WARNING: If neither scope nor agent_ids is provided, the command targets ALL "
-                 "connected "
-                 "agents.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
-                 R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
-                 R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
-                 R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-                 R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
-                 R"j(},"required":["plugin","action"]})j"},
+    {"get_dex_app_perf",
+     "Fleet performance-over-time trend for ONE app — the 'over time' companion to "
+     "get_dex_perf_fleet (which is right-now): reads the retained B1/B2 substrate to "
+     "answer 'did this app regress across the fleet'. One point per (version, UTC day) "
+     "over up to 180 days. Omit version for all versions (each point tagged with its "
+     "canonicalized version); a supplied version is canonicalized to match the stored "
+     "key. Each point has the EXACT fleet mean+max (cpu_mean share-of-capacity %, "
+     "ws_mean working-set bytes) plus bucket-resolution p50/p95 as {value, "
+     "lower_bound}: lower_bound=true => value is a FLOOR ('>= value', the open top "
+     "bucket); a percentile is null when the population is empty or the row predates "
+     "the current histogram scheme (hist_stale=true). Fleet aggregate (no agent_id) — "
+     "not audited. Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j(},"required":["app"]})j"},
 
-                // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
-                // One instruction → several plugin actions on ONE device → collated results,
-                // via server-side async fan-out. The agent is unchanged.
-                {"execute_bundle",
-                 "Fan one instruction out into several plugin actions on ONE device, async. The "
-                 "server "
-                 "dispatches each step as an ordinary command under a shared correlation id and "
-                 "returns "
-                 "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with "
-                 "the "
-                 "bundle_id for the collated result. Use this instead of N execute_instruction "
-                 "calls when "
-                 "refreshing a device (cut N round-trips to 1). Each step is {plugin, action, "
-                 "params?}; 1-32 "
-                 "steps, distinct (plugin,action). Mirrors POST /api/v1/bundles. Requires "
-                 "Execution:Execute.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
-                 R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
-                 R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
-                 R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
-                 R"j(},"required":["plugin","action"]}})j"
-                 R"j(},"required":["agent_id","steps"]})j"},
+    {"get_dex_group_app_perf",
+     "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
+     "trend aggregated over a single group's members (computed on-the-fly from the "
+     "per-device B1 store). One point per (version, UTC day) with exact group mean+max "
+     "+ bucket-resolution p50/p95 (same histogram scheme as the fleet trend). Because "
+     "a group is a set of specific devices, any point covering fewer than the floor "
+     "(10) devices is returned suppressed=true with device_count only "
+     "(means/percentiles withheld — a small named-group aggregate is de-facto "
+     "individual behaviour). Aggregate (no agent_id) — not audited. Mirrors GET "
+     "/api/v1/dex/perf/group. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j(},"required":["group_id","app"]})j"},
 
-                {"get_bundle_result",
-                 "Collate a bundle dispatched by execute_bundle: server-grouped "
-                 "{complete, received, succeeded, expected, steps[]} in request order, each step "
-                 "carrying its "
-                 "state (pending|responded|dispatch_failed), status, and output. complete=true "
-                 "once every step "
-                 "is terminal — NOT a success signal (a bundle to an offline device completes with "
-                 "succeeded=0); check succeeded==expected for success. Mirrors GET "
-                 "/api/v1/bundles/{id}. "
-                 "Requires Response:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
-                 R"j(},"required":["bundle_id"]})j"},
+    // ── N1: network quality read tools — parity with /api/v1/network/* ──
+    {"get_network_fleet",
+     "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
+     "(ms), the interval TCP retransmit rate (%), and device throughput (bps) — current heartbeat "
+     "cycle. These are OS-blended fleet stats over the same per-device heartbeat facts as the "
+     "per-OS yuzu_fleet_net_* Prometheus gauges (a gauge series, split by os, differs from this "
+     "blended number on a mixed fleet) and the /network Overview cards. A null metric means no "
+     "device reported it (absent, never zero); rtt_reporting is the "
+     "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
+     "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
+     "/api/v1/network/fleet. Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
 
-                // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
-                {"list_issued_certs",
-                 "List certificates issued by the internal CA (inventory: serial, subject, "
-                 "purpose, status, "
-                 "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
-                 R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
-                 R"j(}})j"},
+    {"list_network_devices",
+     "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
+     "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
+     "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
+     "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
+     "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
+     R"j("cooc":{"type":"string","enum":["device","app","network_only","degraded"],"description":"co-occurrence band over net-degraded devices"},)j"
+     R"j("key":{"type":"string","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
+     R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of key (empty string = untagged residual)"},)j"
+     R"j("limit":{"type":"integer","default":50,"maximum":500})j"
+     R"j(}})j"},
 
-                {"revoke_certificate",
-                 "Revoke an issued certificate by serial and republish the CRL. Mirrors "
-                 "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP "
-                 "tier; "
-                 "approval-gated like every other destructive MCP op).",
-                 R"j({"type":"object","properties":{)j"
-                 R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
-                 R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
-                 R"j(},"required":["serial_hex"]})j"},
+    // Phase 2 write tool
+    {"execute_instruction",
+     "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
+     "agents_reached, plugin, and action. Poll results with query_responses or subscribe to "
+     "live JSON events via GET /api/v1/events?execution_id=<id>. "
+     "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
+     "agents.",
+     R"j({"type":"object","properties":{)j"
+     R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
+     R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
+     R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j(},"required":["plugin","action"]})j"},
 
-                // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
-                {"get_fleet_posture_fast",
-                 "Return a compact fleet-health briefing for an agentic worker: OS mix, online "
-                 "population, "
-                 "optional compliance, DEX/network source availability, freshness metadata, and "
-                 "honest "
-                 "missing-source flags. Use this first for executive briefings and incident "
-                 "triage; do not "
-                 "use it as proof of cluster/database internals.",
-                 R"({"type":"object","properties":{"ttl_seconds":{"type":"integer","default":30,"minimum":5,"maximum":300}}})",
-                 R"({"type":"object","required":["generated_at","data_age_seconds","partial","missing_sources","agents","os_mix","recommended_next_tools"],"properties":{"generated_at":{"type":"string"},"data_age_seconds":{"type":"integer"},"partial":{"type":"boolean"},"missing_sources":{"type":"array","items":{"type":"string"}},"agents":{"type":"object"},"os_mix":{"type":"object"},"recommended_next_tools":{"type":"array","items":{"type":"string"}}}})",
-                 R"({"readOnlyHint":true,"title":"Get fleet posture fast","safety":"summary-only; no endpoint execution"})"},
-                {"classify_operational_question",
-                 "Classify an operator question into answerable_now, "
-                 "answerable_with_live_dispatch, "
-                 "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use "
-                 "this "
-                 "before planning incident work, especially for OpenShift, KVM, database, and SaaS "
-                 "asks.",
-                 R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
-                 kObjectOutputSchema,
-                 R"({"readOnlyHint":true,"title":"Classify operational question","safety":"advisory classification only; not a security gate"})"},
-                {"get_incident_playbook",
-                 "Return the recommended Yuzu investigation workflow for a named incident "
-                 "scenario, including "
-                 "the first tool, safe tool path, connector gaps, and approval boundaries.",
-                 R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
-                 kObjectOutputSchema,
-                 R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
-                {"summarize_working_set",
-                 "Summarize an agent/result-set/execution scope into a model-ready narrative with "
-                 "resource "
-                 "links and next tools instead of dumping unbounded rows.",
-                 R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
-                 kObjectOutputSchema,
-                 R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
+    // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
+    // One instruction → several plugin actions on ONE device → collated results,
+    // via server-side async fan-out. The agent is unchanged.
+    {"execute_bundle",
+     "Fan one instruction out into several plugin actions on ONE device, async. The server "
+     "dispatches each step as an ordinary command under a shared correlation id and returns "
+     "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
+     "bundle_id for the collated result. Use this instead of N execute_instruction calls when "
+     "refreshing a device (cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 "
+     "steps, distinct (plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
+     R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
+     R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
+     R"j(},"required":["plugin","action"]}})j"
+     R"j(},"required":["agent_id","steps"]})j"},
+
+    {"get_bundle_result",
+     "Collate a bundle dispatched by execute_bundle: server-grouped "
+     "{complete, received, succeeded, expected, steps[]} in request order, each step carrying its "
+     "state (pending|responded|dispatch_failed), status, and output. complete=true once every step "
+     "is terminal — NOT a success signal (a bundle to an offline device completes with "
+     "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
+     "Requires Response:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
+     R"j(},"required":["bundle_id"]})j"},
+
+    // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
+    {"list_issued_certs",
+     "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
+     "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
+     R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
+     R"j(}})j"},
+
+    {"revoke_certificate",
+     "Revoke an issued certificate by serial and republish the CRL. Mirrors "
+     "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
+     "approval-gated like every other destructive MCP op).",
+     R"j({"type":"object","properties":{)j"
+     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
+     R"j(},"required":["serial_hex"]})j"},
+
+    // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
+    {"get_fleet_posture_fast",
+     "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
+     "optional compliance, DEX/network source availability, freshness metadata, and honest "
+     "missing-source flags. Use this first for executive briefings and incident triage; do not "
+     "use it as proof of cluster/database internals.",
+     R"({"type":"object","properties":{"ttl_seconds":{"type":"integer","default":30,"minimum":5,"maximum":300}}})",
+     R"({"type":"object","required":["generated_at","data_age_seconds","partial","missing_sources","agents","os_mix","recommended_next_tools"],"properties":{"generated_at":{"type":"string"},"data_age_seconds":{"type":"integer"},"partial":{"type":"boolean"},"missing_sources":{"type":"array","items":{"type":"string"}},"agents":{"type":"object"},"os_mix":{"type":"object"},"recommended_next_tools":{"type":"array","items":{"type":"string"}}}})",
+     R"({"readOnlyHint":true,"title":"Get fleet posture fast","safety":"summary-only; no endpoint execution"})"},
+    {"classify_operational_question",
+     "Classify an operator question into answerable_now, answerable_with_live_dispatch, "
+     "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
+     "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks.",
+     R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Classify operational question","safety":"advisory classification only; not a security gate"})"},
+    {"get_incident_playbook",
+     "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
+     "the first tool, safe tool path, connector gaps, and approval boundaries.",
+     R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
+    {"summarize_working_set",
+     "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
+     "links and next tools instead of dumping unbounded rows.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -584,8 +584,9 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 //                                                     approve_request, reject_request,
 //                                                     quarantine_device
 static const std::unordered_set<std::string> kWriteTools = {
-    "set_tag",        "delete_tag",        "execute_instruction", "approve_request",
-    "reject_request", "quarantine_device", "revoke_certificate",  "execute_bundle",
+    "set_tag",         "delete_tag",     "execute_instruction",
+    "approve_request", "reject_request", "quarantine_device",
+    "revoke_certificate", "execute_bundle",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -608,6 +609,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
+    {"query_installed_software", {"Inventory", "Read"}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -626,6 +628,9 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
+    {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_app_perf", {"GuaranteedState", "Read"}},
+    {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
@@ -751,7 +756,8 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
-    yuzu::MetricsRegistry* metrics) {
+    SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
+    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1284,9 +1290,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // a strict robustness improvement for every MCP tool.
             auto mcp_audit = [&](const std::string& result_status,
                                  const std::string& detail = {}) -> bool {
-                return yuzu::server::detail::try_persist_audit(audit_fn, req, "mcp." + tool_name,
-                                                               result_status, "mcp_tool", tool_name,
-                                                               detail);
+                return yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
 
             // A4 error envelope for the MCP layer (#1470). The shared tier /
@@ -1308,8 +1313,8 @@ McpServer::HandlerFn McpServer::build_handler(
             auto a4_error = [&id](int code, std::string_view message,
                                   std::string_view remediation = {}) {
                 const std::string cid = yuzu::server::detail::make_correlation_id();
-                std::string data =
-                    R"({"correlation_id":")" + cid + R"(","retry_after_ms":null,"remediation":)";
+                std::string data = R"({"correlation_id":")" + cid +
+                                   R"(","retry_after_ms":null,"remediation":)";
                 if (remediation.empty()) {
                     data += "null";
                 } else {
@@ -1346,9 +1351,9 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
 
@@ -1369,12 +1374,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     // approval) is the honest shape; the remediation points the
                     // caller at the surfaces where the supervised tier does work.
                     res.set_content(
-                        a4_error(kTierDenied,
-                                 "This operation requires approval, but approval-gated "
-                                 "MCP execution is not yet implemented. Use the REST API "
-                                 "or dashboard for operations that require the supervised tier.",
-                                 "approval-gated MCP execution is not implemented; perform this "
-                                 "operation via the REST API or dashboard"),
+                        a4_error(
+                            kTierDenied,
+                            "This operation requires approval, but approval-gated "
+                            "MCP execution is not yet implemented. Use the REST API "
+                            "or dashboard for operations that require the supervised tier.",
+                            "approval-gated MCP execution is not implemented; perform this "
+                            "operation via the REST API or dashboard"),
                         "application/json");
                     mcp_audit("denied", "approval-gated execution not implemented");
                     return;
@@ -1384,9 +1390,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_agents ───────────────────────────────────────────────
             if (tool_name == "list_agents") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -1414,9 +1420,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_agent_details ─────────────────────────────────────────
             if (tool_name == "get_agent_details") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -1472,9 +1478,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── query_audit_log ───────────────────────────────────────────
             if (tool_name == "query_audit_log") {
                 if (!tier_allows(tier, "AuditLog", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "AuditLog", "Read"))
@@ -1517,9 +1523,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_definitions ──────────────────────────────────────────
             if (tool_name == "list_definitions") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
@@ -1559,9 +1565,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_definition ────────────────────────────────────────────
             if (tool_name == "get_definition") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
@@ -1605,9 +1611,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── query_responses ───────────────────────────────────────────
             if (tool_name == "query_responses") {
                 if (!tier_allows(tier, "Response", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Response", "Read"))
@@ -1623,12 +1629,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (exec_id.empty() && instr_id.empty()) {
                     // A4 error.data: correlation_id + remediation (#1550 review MEDIUM —
                     // sibling MCP tools build A4 error.data; this validation error omitted it).
-                    auto a4 =
-                        JObj()
-                            .add("correlation_id", yuzu::server::detail::make_correlation_id())
-                            .add("remediation", "pass execution_id (from execute_instruction) or "
-                                                "instruction_id")
-                            .str();
+                    auto a4 = JObj()
+                                  .add("correlation_id", yuzu::server::detail::make_correlation_id())
+                                  .add("remediation",
+                                       "pass execution_id (from execute_instruction) or "
+                                       "instruction_id")
+                                  .str();
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "one of execution_id / instruction_id is required", a4),
@@ -1665,7 +1671,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
                 auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
-                                                  : response_store->query(instr_id, rq);
+                                                   : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
@@ -1693,6 +1699,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // out-of-scope agents may truncate the in-scope view (keyset follow-up
                 // #1634); the isolation guarantee — never another operator's rows —
                 // holds regardless, and result_truncated_by_cap signals the gap.
+                // NOTE (ADR-0017): like the inventory sibling, this responses filter is
+                // INERT under the global Response:Read gate (it does not narrow by
+                // management group today); the list-view correction is tracked #1718 PR-B.
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
                 if (response_scope_fn) {
@@ -1736,9 +1745,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // row is the MORE security-relevant gap, not less (governance compliance).
                 bool denied_ok = true;
                 if (scope_filtered)
-                    denied_ok =
-                        mcp_audit("denied", "scope: filtered " + std::to_string(dropped_agents) +
-                                                " out-of-management-group agent(s) for " + key);
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group agent(s) for " +
+                                                        key);
                 // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
                 // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
                 const bool audit_ok = mcp_audit("success", key) && denied_ok;
@@ -1758,12 +1768,140 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── aggregate_responses ───────────────────────────────────────
-            if (tool_name == "aggregate_responses") {
-                if (!tier_allows(tier, "Response", "Read")) {
+            // ── query_installed_software ──────────────────────────────────
+            // Typed daily-sync software store (ADR-0016), DISTINCT from the generic
+            // query_inventory above. Mirrors query_responses: tier → RBAC → store →
+            // cap → management-group scope filter → audit (success + distinct denied).
+            if (tool_name == "query_installed_software") {
+                if (!tier_allows(tier, "Inventory", "Read")) {
                     res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
                                              kTierRemediation),
                                     "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Inventory", "Read"))
+                    return;
+                if (!software_inventory_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Software inventory store unavailable"),
+                        "application/json");
+                    return;
+                }
+                SoftwareFleetQuery q;
+                q.agent_id = param_str(args, "agent_id");
+                q.name = param_str(args, "name");
+                // Clamp in 64-bit BEFORE narrowing (same posture as query_responses):
+                // limit:0 reads as "done, no rows"; a negative/wrapped limit binds
+                // unbounded and defeats the cap. No offset — the scope filter runs AFTER
+                // the store LIMIT, so paging would yield unstable windows over a table
+                // that mutates on sync cadence; keyset is the #1634 follow-up.
+                q.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                const std::string audit_key = !q.name.empty() ? ("name=" + q.name)
+                                              : !q.agent_id.empty() ? ("agent=" + q.agent_id)
+                                                                    : std::string("fleet");
+                auto rows_opt = software_inventory_store->query_software(q);
+                if (!rows_opt) {
+                    // Store degraded (pool/query failure) — surface it, never return
+                    // success+[]. A silent empty here reads as "installed nowhere" for a
+                    // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
+                    // failure-vs-empty). Distinct message from the null-store case above.
+                    // Audit the degraded access (gov compliance CC7.2): a CVE-triage caller
+                    // under a sustained outage must still leave a behavioural trail
+                    // (who/when/what filter), mirroring the success/denied audits below.
+                    mcp_audit("failure", "store degraded; " + audit_key);
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Software inventory store degraded — query failed"),
+                                    "application/json");
+                    return;
+                }
+                auto& rows = *rows_opt;
+
+                // Cap hit BEFORE scope filtering → result incomplete (the store's hard
+                // ceiling kFleetQueryRowCap >> 1000, so the binding cap is q.limit).
+                // Captured pre-filter: the filter shrinks `rows`. NOTE: unlike the
+                // correlation-bounded query_responses (which requires execution_id/
+                // instruction_id), an empty-filter call here is an unbounded fleet-wide
+                // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
+                // filter — so a narrow-scope operator may see few of their own rows in one
+                // page, signalled by result_truncated_by_cap. NOTE (ADR-0017): the
+                // per-agent filter here is INERT under the global Inventory:Read gate, so
+                // it does not actually narrow by management group today — do not read
+                // "ISOLATION holds" as effective list-view confinement (that is the
+                // ADR-0017 admit-then-filter gate, #1716). Completeness for a narrow scope
+                // over a wide fleet is the keyset follow-up (#1634).
+                const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
+
+                // Management-group scope (mirrors query_responses #1550 HIGH-1). The flat
+                // Inventory:Read gate above is not a per-device ownership check, so without
+                // this an operator could read other operators' devices' software fleet-wide
+                // by name. Filter per-agent through the injected Inventory-scoped predicate
+                // (production: check_scoped_permission), memoised per distinct agent_id,
+                // passing the already-resolved principal. Unwired/RBAC-off → no filter
+                // (legacy-open), matching require_scoped_permission.
+                bool scope_filtered = false;
+                std::size_t dropped_agents = 0;
+                if (inventory_scope_fn) {
+                    std::unordered_map<std::string, bool> memo;
+                    std::vector<SoftwareFleetRow> visible;
+                    visible.reserve(rows.size());
+                    for (auto& r : rows) {
+                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
+                        if (inserted)
+                            m->second = inventory_scope_fn(session->username, r.agent_id);
+                        if (m->second) {
+                            visible.push_back(std::move(r));
+                        } else {
+                            scope_filtered = true;
+                            if (inserted) // count each DISTINCT dropped device once
+                                ++dropped_agents;
+                        }
+                    }
+                    rows.swap(visible);
+                }
+
+                JArr arr;
+                for (const auto& r : rows) {
+                    arr.add(JObj()
+                                .add("agent_id", r.agent_id)
+                                .add("name", r.entry.name)
+                                .add("version", r.entry.version)
+                                .add("publisher", r.entry.publisher)
+                                .add("install_date", r.entry.install_date));
+                }
+                // A scope-dropped read is security-relevant — audit it distinctly (mirrors
+                // #1634) with the DISTINCT dropped-device count, and fold its persistence
+                // bool into audit_persisted (a dropped denial-evidence row is the MORE
+                // security-relevant gap).
+                bool denied_ok = true;
+                if (scope_filtered)
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group device(s) for " +
+                                                        audit_key);
+                const bool audit_ok = mcp_audit("success", audit_key) && denied_ok;
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                if (hit_cap)
+                    result_obj.raw("result_truncated_by_cap", "true");
+                // Surface the count of devices dropped by the management-group scope filter
+                // (0 when none) so an agentic caller can tell "out of my scope" from "not
+                // installed anywhere" — the partial- and all-out-of-scope false-negative
+                // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
+                result_obj.raw("devices_omitted", std::to_string(dropped_agents));
+                res.set_content(success_response(id, result_obj.str()), "application/json");
+                return;
+            }
+
+            // ── aggregate_responses ───────────────────────────────────────
+            if (tool_name == "aggregate_responses") {
+                if (!tier_allows(tier, "Response", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Response", "Read"))
@@ -1788,7 +1926,52 @@ McpServer::HandlerFn McpServer::build_handler(
                     aq.op = AggregateOp::Max;
                 else
                     aq.op = AggregateOp::Count;
-                auto results = response_store->aggregate(instr_id, aq);
+
+                // #1634: management-group scope (filter-BEFORE-aggregate). The flat
+                // Response:Read gate above is not a per-agent ownership check, so
+                // without this an operator could aggregate ANOTHER operator's
+                // instruction rows (e.g. count-by-status across agents outside their
+                // groups). A folded aggregate can't be post-filtered — the out-of-
+                // scope rows are already summed in — so we resolve the in-scope agent
+                // set and push it into the aggregate's WHERE clause via the dedicated
+                // `scope` arg. response_scope_fn routes through the single fail-closed
+                // response_agent_in_scope helper, so a corrupt rbac.db drops EVERY agent
+                // here → empty scope → zero rows (UP-1). A distinct_agent_ids() read
+                // ERROR returns nullopt → we fail CLOSED to the empty set, never an
+                // unrestricted read (UP-2). Only when the read succeeds AND no agent is
+                // dropped (operator sees every responding agent / RBAC cleanly disabled)
+                // do we leave scope nullopt — unrestricted, correct totals at any scale
+                // (the residual dropped==0 TOCTOU window is an acknowledged LOW, #1634).
+                AggregateScope agg_scope; // nullopt = unrestricted
+                std::size_t dropped_agents = 0;
+                if (response_scope_fn) {
+                    auto distinct = response_store->distinct_agent_ids(instr_id);
+                    if (!distinct) {
+                        // Store-read error resolving the in-scope set. Surface it as an
+                        // internal error — NOT success+empty: an empty aggregate reads as
+                        // "no responses" to an agentic caller, masking a store outage
+                        // (agentic-first A4 failure-vs-empty; ADR-0016 authoritative-reads;
+                        // #1634 sre review). Audit the degraded access for CC7.2 parity.
+                        mcp_audit("failure", "store degraded; " + instr_id);
+                        res.set_content(
+                            error_response(id, kInternalError,
+                                           "Response store degraded — aggregate failed"),
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct) {
+                        if (response_scope_fn(session->username, aid))
+                            in_scope.push_back(std::move(aid));
+                        else
+                            ++dropped_agents;
+                    }
+                    if (dropped_agents > 0)
+                        agg_scope = std::move(in_scope);
+                }
+
+                auto results = response_store->aggregate(instr_id, aq, {}, agg_scope);
                 JArr arr;
                 for (const auto& r : results) {
                     arr.add(JObj()
@@ -1796,22 +1979,33 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("count", r.count)
                                 .add("aggregate_value", r.aggregate_value));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
-                mcp_audit("success", instr_id);
-                res.set_content(success_response(id, result), "application/json");
+                // A scope-dropped aggregate is a security-relevant event → a distinct
+                // "denied" audit row carrying the DISTINCT dropped-agent count, beside
+                // the served success row (parity with query_responses #1550/#1634).
+                // Fold the denied-row persistence bool into audit_persisted — a dropped
+                // denial-evidence row is the MORE security-relevant gap, not less.
+                bool denied_ok = true;
+                if (dropped_agents > 0)
+                    denied_ok = mcp_audit("denied", "scope: filtered " +
+                                                        std::to_string(dropped_agents) +
+                                                        " out-of-management-group agent(s) for " +
+                                                        instr_id);
+                const bool audit_ok = mcp_audit("success", instr_id) && denied_ok;
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
 
             // ── query_inventory ───────────────────────────────────────────
             if (tool_name == "query_inventory") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -1848,9 +2042,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_inventory_tables ─────────────────────────────────────
             if (tool_name == "list_inventory_tables") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -1882,9 +2076,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_agent_inventory ───────────────────────────────────────
             if (tool_name == "get_agent_inventory") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -1922,9 +2116,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_tags ──────────────────────────────────────────────────
             if (tool_name == "get_tags") {
                 if (!tier_allows(tier, "Tag", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Tag", "Read"))
@@ -1957,9 +2151,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── search_agents_by_tag ──────────────────────────────────────
             if (tool_name == "search_agents_by_tag") {
                 if (!tier_allows(tier, "Tag", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Tag", "Read"))
@@ -1988,9 +2182,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_policies ─────────────────────────────────────────────
             if (tool_name == "list_policies") {
                 if (!tier_allows(tier, "Policy", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
@@ -2024,9 +2218,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_compliance_summary ────────────────────────────────────
             if (tool_name == "get_compliance_summary") {
                 if (!tier_allows(tier, "Policy", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
@@ -2059,9 +2253,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_fleet_compliance ──────────────────────────────────────
             if (tool_name == "get_fleet_compliance") {
                 if (!tier_allows(tier, "Policy", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
@@ -2091,9 +2285,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_management_groups ────────────────────────────────────
             if (tool_name == "list_management_groups") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
@@ -2128,9 +2322,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_execution_status ──────────────────────────────────────
             if (tool_name == "get_execution_status") {
                 if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Execution", "Read"))
@@ -2176,9 +2370,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_executions ───────────────────────────────────────────
             if (tool_name == "list_executions") {
                 if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Execution", "Read"))
@@ -2218,9 +2412,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_schedules ────────────────────────────────────────────
             if (tool_name == "list_schedules") {
                 if (!tier_allows(tier, "Schedule", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Schedule", "Read"))
@@ -2281,9 +2475,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── preview_scope_targets ─────────────────────────────────────
             if (tool_name == "preview_scope_targets") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
@@ -2334,8 +2528,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Blast-radius guard: warn when scope matches many agents (G4-UHP-MCP-011)
                 constexpr size_t kMcpScopeWarnThreshold = 50;
-                bool scope_warning =
-                    static_cast<std::size_t>(matching.size()) > kMcpScopeWarnThreshold;
+                bool scope_warning = matching.size() > kMcpScopeWarnThreshold;
 
                 auto obj = JObj()
                                .add("expression", expression)
@@ -2359,9 +2552,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── list_pending_approvals ────────────────────────────────────
             if (tool_name == "list_pending_approvals") {
                 if (!tier_allows(tier, "Approval", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Approval", "Read"))
@@ -2399,9 +2592,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── get_guardian_schemas ──────────────────────────────────────
             if (tool_name == "get_guardian_schemas") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -2431,9 +2624,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // dashboard, REST and MCP behavioral-access surfaces alike.
             if (tool_name == "list_dex_signals") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -2466,9 +2659,9 @@ McpServer::HandlerFn McpServer::build_handler(
 
             if (tool_name == "get_dex_signal_scope") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -2500,9 +2693,9 @@ McpServer::HandlerFn McpServer::build_handler(
 
             if (tool_name == "get_dex_signal_detail") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -2517,14 +2710,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Same catalogue-key validation as the REST sibling: [A-Za-z0-9._-]
                 // up to 64 chars. Reject before the audit so a malformed request
                 // leaves no trace of a behavioral view that never happened.
-                const bool ok = !obs_type.empty() && obs_type.size() <= 64 &&
-                                obs_type.find_first_not_of(
-                                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                    "abcdefghijklmnopqrstuvwxyz0123456789._-") == std::string::npos;
+                const bool ok =
+                    !obs_type.empty() && obs_type.size() <= 64 &&
+                    obs_type.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                               "abcdefghijklmnopqrstuvwxyz0123456789._-") ==
+                        std::string::npos;
                 if (!ok) {
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "obs_type must match [A-Za-z0-9._-]{1,64}"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "obs_type must match [A-Za-z0-9._-]{1,64}"),
+                        "application/json");
                     return;
                 }
                 const std::string since =
@@ -2733,9 +2928,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (!found)
                             return "null";
                         JObj o;
-                        o.add("cohort", c.cohort)
-                            .add("devices", c.devices)
-                            .add("suppressed", c.suppressed);
+                        o.add("cohort", c.cohort).add("devices", c.devices).add("suppressed",
+                                                                                c.suppressed);
                         if (!c.suppressed)
                             o.raw("cpu_pct", stat_json(c.cpu))
                                 .raw("commit_pct", stat_json(c.commit))
@@ -2776,9 +2970,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string cohort_key = param_str(args, "cohort_key", kDexDefaultCohortKey);
                     if (!TagStore::validate_key(cohort_key)) {
                         res.set_content(
-                            error_response(
-                                id, kInvalidParams, "invalid cohort_key",
-                                a4_data(0, "cohort_key must match [A-Za-z0-9_.:-]{1,64}")),
+                            error_response(id, kInvalidParams, "invalid cohort_key",
+                                           a4_data(0, "cohort_key must match [A-Za-z0-9_.:-]{1,64}")),
                             "application/json");
                         return;
                     }
@@ -2798,9 +2991,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     const int limit = (std::min)(raw_limit, 500);
                     JArr arr;
-                    for (const auto& r :
-                         dex_perf_device_list(dex_perf_fn(cohort_key), metric, not_reporting,
-                                              cohort_filter, limit)) {
+                    for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
+                                                              not_reporting, cohort_filter,
+                                                              limit)) {
                         JObj o;
                         o.add("agent_id", r.agent_id).add("cohort", r.cohort);
                         if (r.cpu_pct)
@@ -2825,6 +3018,236 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── DEX app-perf-over-time tools (parity with /api/v1/dex/perf/app[s]) ──
+            // The retained-substrate companion to the heartbeat-now dex-perf tools
+            // above. Fleet aggregates (no agent_id) — generic mcp.<tool> audit only.
+            // The shared app_perf_fleet_trend transform is reused so the MCP payload
+            // matches the REST body field-for-field.
+            if (tool_name == "list_dex_perf_apps" || tool_name == "get_dex_app_perf" ||
+                tool_name == "get_dex_group_app_perf") {
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                auto a4_data = [&](std::int64_t retry_ms, std::string_view remediation) {
+                    JObj o;
+                    o.add("correlation_id", cid);
+                    if (retry_ms > 0)
+                        o.add("retry_after_ms", retry_ms);
+                    else
+                        o.raw("retry_after_ms", "null");
+                    if (remediation.empty())
+                        o.raw("remediation", "null");
+                    else
+                        o.add("remediation", remediation);
+                    return o.str();
+                };
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation",
+                                       a4_data(0, "this MCP tier lacks GuaranteedState:Read; use a "
+                                                  "higher-tier token")),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                auto app_pct_json = [](const std::optional<HistPctile>& p) -> std::string {
+                    if (!p)
+                        return "null"; // absent-not-zero: empty population OR stale-scheme row
+                    return JObj().add("value", p->value).add("lower_bound", p->lower_bound).str();
+                };
+                std::string payload;
+                if (tool_name == "list_dex_perf_apps") {
+                    if (!app_perf_providers.apps) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    bool truncated = false;
+                    auto apps = app_perf_providers.apps(truncated);
+                    if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr arr;
+                    for (const auto& a : *apps)
+                        arr.add(JObj()
+                                    .add("app_name", a.app_name)
+                                    .add("versions", a.versions)
+                                    .add("last_day", a.last_day));
+                    payload = JObj().raw("apps", arr.str()).add("truncated", truncated).str();
+                } else if (tool_name == "get_dex_app_perf") {
+                    if (!app_perf_providers.fleet) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("app") || !args["app"].is_string() ||
+                        args["app"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "missing required parameter 'app'",
+                                           a4_data(0, "supply app=<name>; discover names via "
+                                                      "list_dex_perf_apps")),
+                            "application/json");
+                        return;
+                    }
+                    const auto app = args["app"].get<std::string>();
+                    if (!app_perf_param_valid(app)) { // shared cap + control-char/NUL re-floor
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    const auto version = param_str(args, "version");
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    auto rows = app_perf_providers.fleet(app, version);
+                    if (!rows) { // AUTHORITATIVE read degrade
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr points;
+                    for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                        // Fleet floors now too — emit suppressed + gate stats, same
+                        // shape as get_dex_group_app_perf (a suppressed point must not
+                        // read as "N devices @ 0% CPU").
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(std::move(o));
+                    }
+                    payload = JObj()
+                                  .add("app", app)
+                                  .add("version", version)
+                                  .raw("points", points.str())
+                                  .str();
+                } else { // get_dex_group_app_perf
+                    if (!app_perf_providers.group) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("group_id") || !args["group_id"].is_string() ||
+                        args["group_id"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "missing required parameter 'group_id'",
+                                           a4_data(0, "supply group_id=<management group id>")),
+                            "application/json");
+                        return;
+                    }
+                    const auto group_id = args["group_id"].get<std::string>();
+                    if (!app_perf_param_valid(group_id)) { // shared cap + control-char/NUL re-floor
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'group_id'",
+                                           a4_data(0, "group_id must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("app") || !args["app"].is_string() ||
+                        args["app"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "missing required parameter 'app'",
+                                           a4_data(0, "supply app=<name>; discover names via "
+                                                      "list_dex_perf_apps")),
+                            "application/json");
+                        return;
+                    }
+                    const auto app = args["app"].get<std::string>();
+                    if (!app_perf_param_valid(app)) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    const auto version = param_str(args, "version");
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    auto rows = app_perf_providers.group(group_id, app, version);
+                    if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf group read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr points;
+                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(o);
+                    }
+                    payload = JObj()
+                                  .add("group_id", group_id)
+                                  .add("app", app)
+                                  .add("version", version)
+                                  .add("floor", static_cast<int64_t>(kDexCohortFloor))
+                                  .raw("points", points.str())
+                                  .str();
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── N1: network quality tools (parity with /api/v1/network/*) ──
             // Same NetPerfFn provider the REST endpoints and /network fragments
             // use — two surfaces, one read model. Cohort handling mirrors the
@@ -2833,9 +3256,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // telemetry: only the generic mcp.<tool> audit.
             if (tool_name == "get_network_fleet" || tool_name == "list_network_devices") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
@@ -2860,21 +3283,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string payload;
                 if (tool_name == "get_network_fleet") {
                     const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
-                    payload =
-                        JObj()
-                            .raw("rtt_ms", stat_json(now.rtt))
-                            .raw("retrans_pct", stat_json(now.retrans))
-                            .raw("throughput_bps", stat_json(now.throughput))
-                            .add("reporting", now.reporting)
-                            .add("rtt_reporting", now.rtt_reporting)
-                            .add("online", now.online)
-                            .raw("cooccurrence", JObj()
-                                                     .add("degraded", now.cooc.degraded)
-                                                     .add("also_device", now.cooc.also_device)
-                                                     .add("also_app", now.cooc.also_app)
-                                                     .add("network_only", now.cooc.network_only)
-                                                     .str())
-                            .str();
+                    payload = JObj()
+                                  .raw("rtt_ms", stat_json(now.rtt))
+                                  .raw("retrans_pct", stat_json(now.retrans))
+                                  .raw("throughput_bps", stat_json(now.throughput))
+                                  .add("reporting", now.reporting)
+                                  .add("rtt_reporting", now.rtt_reporting)
+                                  .add("online", now.online)
+                                  .raw("cooccurrence",
+                                       JObj()
+                                           .add("degraded", now.cooc.degraded)
+                                           .add("also_device", now.cooc.also_device)
+                                           .add("also_app", now.cooc.also_app)
+                                           .add("network_only", now.cooc.network_only)
+                                           .str())
+                                  .str();
                 } else { // list_network_devices
                     const auto metric =
                         net_perf_metric_from_token(param_str(args, "metric", "rtt"));
@@ -2897,9 +3320,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     const int limit = (std::min)(raw_limit, 500);
                     JArr arr;
-                    for (const auto& r :
-                         net_perf_device_list(net_perf_fn(cohort_key), metric, not_reporting, cooc,
-                                              cohort_filter, limit)) {
+                    for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
+                                                              not_reporting, cooc, cohort_filter,
+                                                              limit)) {
                         JObj o;
                         o.add("agent_id", r.agent_id)
                             .add("platform", r.platform)
@@ -3163,12 +3586,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Per-step audit ("bundle.<plugin>.<action>", target_type=Agent —
                 // the works-council device-access lens, identical to the REST path)
                 // bound to this request; the orchestrator stays req-free.
-                auto bundle_audit =
-                    [&audit_fn, &req](const std::string& verb, const std::string& result_status,
-                                      const std::string& type, const std::string& tid,
-                                      const std::string& detail) {
-                        audit_fn(req, verb, result_status, type, tid, detail);
-                    };
+                auto bundle_audit = [&audit_fn, &req](
+                                        const std::string& verb, const std::string& result_status,
+                                        const std::string& type, const std::string& tid,
+                                        const std::string& detail) {
+                    audit_fn(req, verb, result_status, type, tid, detail);
+                };
                 BundleOrchestrator::DispatchResult r;
                 try {
                     r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit);
@@ -3185,10 +3608,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                       .add("agent_id", agent_id);
                 auto result =
                     JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", result_obj.str()))
-                                 .str())
+                        .raw("content", JArr()
+                                            .add(JObj().add("type", "text").add("text",
+                                                                                result_obj.str()))
+                                            .str())
                         .str();
                 mcp_audit("success", std::string("bundle_id=") + r.correlation_id +
                                          " steps=" + std::to_string(r.expected));
@@ -3204,9 +3627,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Response", "Read"))
                     return;
                 if (!bundle_orch) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Response store unavailable"),
-                        "application/json");
+                    res.set_content(error_response(id, kInternalError, "Response store unavailable"),
+                                    "application/json");
                     return;
                 }
                 auto bundle_id = param_str(args, "bundle_id");
@@ -3225,12 +3647,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto result =
                     JObj()
-                        .raw(
-                            "content",
-                            JArr()
-                                .add(
-                                    JObj().add("type", "text").add("text", aggregate_to_json(*agg)))
-                                .str())
+                        .raw("content",
+                             JArr()
+                                 .add(JObj().add("type", "text").add("text", aggregate_to_json(*agg)))
+                                 .str())
                         .str();
                 mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
@@ -3258,12 +3678,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                              now - posture_cache->generated_at)
                                              .count();
                         if (age <= ttl) {
-                            std::string payload = "{\"data_age_seconds\":" +
-                                                  std::to_string(age) + "," +
-                                                  posture_cache->body.substr(1);
+                            std::string payload = "{\"data_age_seconds\":" + std::to_string(age) +
+                                                  "," + posture_cache->body.substr(1);
                             auto result = tool_result(payload, kObjectOutputSchema);
-                            mcp_audit("success",
-                                      "cache_hit age_seconds=" + std::to_string(age));
+                            mcp_audit("success", "cache_hit age_seconds=" + std::to_string(age));
                             res.set_content(success_response(id, result), "application/json");
                             return;
                         }
@@ -3362,9 +3780,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (question.size() > kAgenticParamMaxLen) {
                     mcp_audit("error", "question_too_long");
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "question exceeds maximum length"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "question exceeds maximum length"),
+                        "application/json");
                     return;
                 }
                 // NOTE (G-S9): this keyword classifier is ADVISORY ONLY — a UX hint
@@ -3462,9 +3880,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string scenario = param_str(args, "scenario");
                 if (scenario.size() > kAgenticParamMaxLen) {
                     mcp_audit("error", "scenario_too_long");
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "scenario exceeds maximum length"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "scenario exceeds maximum length"),
+                        "application/json");
                     return;
                 }
                 const auto* pb = agentic::find_playbook(scenario);
@@ -3581,9 +3999,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // forensic-only, large). Security:Read.
             if (tool_name == "list_issued_certs") {
                 if (!tier_allows(tier, "Security", "Read")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Security", "Read"))
@@ -3626,13 +4044,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {"has_more", has_more}};
                 if (has_more)
                     payload["next_offset"] = offset + limit;
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", payload.dump()))
-                                 .str())
-                        .str();
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
                 return;
@@ -3649,9 +4066,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // surface-agnostic.
             if (tool_name == "revoke_certificate") {
                 if (!tier_allows(tier, "Security", "Delete")) {
-                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
-                                             kTierRemediation),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
                     return;
                 }
                 if (!perm_fn(req, res, "Security", "Delete"))
@@ -3677,14 +4094,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!ca_store->revoke(serial, reason)) {
                     // Idempotent reject-without-state-change → "denied" (matches REST).
                     // M1 (#1240): surface a dropped denied-row via the error data.
-                    const bool denied_audit_ok =
-                        audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
-                                 "serial not found or already revoked");
+                    const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",
+                                                          "AgentCertificate", serial,
+                                                          "serial not found or already revoked");
                     res.set_content(
                         error_response(id, kInvalidParams, "serial not found or already revoked",
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
                         "application/json");
                     return;
                 }
@@ -3703,17 +4119,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                            : "CRL build/record failed after revocation; CRL may "
                                              "be stale") &&
                            audit_ok;
-                nlohmann::json payload = {
-                    {"revoked", true}, {"serial_hex", serial}, {"crl_republished", crl_ok}};
+                nlohmann::json payload = {{"revoked", true},
+                                          {"serial_hex", serial},
+                                          {"crl_republished", crl_ok}};
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", payload.dump()))
-                                 .str())
-                        .str();
+                auto result = JObj()
+                                  .raw("content", JArr()
+                                                      .add(JObj().add("type", "text").add(
+                                                          "text", payload.dump()))
+                                                      .str())
+                                  .str();
                 // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
                 // MCP usage correlates with the ca.* domain events in the audit store.
                 mcp_audit("success");
@@ -3736,24 +4152,34 @@ McpServer::HandlerFn McpServer::build_handler(
 
 // ── Route registration ────────────────────────────────────────────────────
 
-void McpServer::register_routes(
-    httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn,
-    RbacStore* rbac_store, InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
-    ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
-    InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
-    ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
-    const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
-    PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
-    yuzu::MetricsRegistry* metrics) {
+void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker, ResponseStore* response_store,
+                                AuditStore* audit_store, TagStore* tag_store,
+                                InventoryStore* inventory_store, PolicyStore* policy_store,
+                                ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
+                                ScheduleEngine* schedule_engine, const bool& read_only_mode,
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store,
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                ResponseScopeFn response_scope_fn,
+                                SoftwareInventoryStore* software_inventory_store,
+                                InventoryScopeFn inventory_scope_fn,
+                                yuzu::MetricsRegistry* metrics,
+                                AppPerfProviders app_perf_providers) {
     svr.Post("/mcp/v1/",
-             build_handler(
-                 std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
-                 rbac_store, instruction_store, execution_tracker, response_store, audit_store,
-                 tag_store, inventory_store, policy_store, mgmt_store, approval_manager,
-                 schedule_engine, read_only_mode, mcp_disabled, std::move(dispatch_fn), ca_store,
-                 std::move(publish_crl_fn), guaranteed_state_store, std::move(dex_perf_fn),
-                 std::move(net_perf_fn), std::move(response_scope_fn), metrics));
+             build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                           std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                           response_store, audit_store, tag_store, inventory_store, policy_store,
+                           mgmt_store, approval_manager, schedule_engine, read_only_mode,
+                           mcp_disabled, std::move(dispatch_fn), ca_store,
+                           std::move(publish_crl_fn), guaranteed_state_store,
+                           std::move(dex_perf_fn), std::move(net_perf_fn),
+                           std::move(response_scope_fn), software_inventory_store,
+                           std::move(inventory_scope_fn), metrics,
+                           std::move(app_perf_providers)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

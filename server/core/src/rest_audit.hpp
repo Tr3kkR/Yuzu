@@ -104,7 +104,13 @@ template <class AuditFn>
                                   const std::string& target_id, const std::string& detail) {
     const bool persisted =
         try_persist_audit(audit_fn, req, action, result, target_type, target_id, detail);
-    if (!persisted)
+    // Set the flag at most once per response. httplib's set_header EMPLACES into a
+    // header multimap (append, not replace), so a route that calls this helper more
+    // than once on the same `res` — the tar.dns.read + tar.arp.read pair and the
+    // per-source tar.sources.configure loop — would emit duplicate `Sec-Audit-Failed`
+    // field-lines if several audits failed. The guard keeps the header idempotent for
+    // a strict downstream parser; single-call callers are unaffected (#1647 follow-up).
+    if (!persisted && !res.has_header("Sec-Audit-Failed"))
         res.set_header("Sec-Audit-Failed", "true");
     return persisted;
 }

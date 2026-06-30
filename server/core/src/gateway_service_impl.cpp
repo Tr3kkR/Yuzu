@@ -10,10 +10,14 @@
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
 #include "guaranteed_state_store.hpp"
+#include "app_perf_daily_store.hpp"
+#include "app_perf_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "software_inventory_store.hpp"
 #include "peer_ip.hpp"
 
 namespace yuzu::server::detail {
@@ -516,22 +520,53 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
         return grpc::Status::OK;
     }
 
-    // Persist inventory data via InventoryStore (Issue 7.17)
+    // Generic per-source blob persistence (sync-framework baseline; backs the
+    // kInventoryQuery scope source + the inventory eval engine). installed_software
+    // is the typed normalized source — skip it in the generic loop; it is
+    // persisted via the shared seam below (ADR-0016 coexistence).
     if (inventory_store_ && inventory_store_->is_open()) {
         int64_t collected_epoch = 0;
         if (request->has_collected_at()) {
             collected_epoch = request->collected_at().millis_epoch() / 1000;
         }
         for (const auto& [plugin_name, data_bytes] : request->plugin_data()) {
+            if (plugin_name == "installed_software" || plugin_name == "app_perf")
+                continue; // typed projections, handled by their seams below
             std::string json_str(data_bytes.begin(), data_bytes.end());
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
-        spdlog::info("[gateway] ProxyInventory persisted for agent={}, plugins={}", agent_id,
-                     request->plugin_data_size());
-    } else {
-        spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={} "
-                     "(inventory store not available)",
-                     agent_id, request->plugin_data_size());
+    }
+    // Typed installed_software via the shared seam (ADR-0016 §5) — byte-identical
+    // to the direct ReportInventory path; fills response->need_full for any
+    // source needing a cold-cache resync.
+    if (software_inventory_store_ && software_inventory_store_->is_open()) {
+        // Isolate ingest failures, identical to the direct ReportInventory path
+        // — otherwise an exception escapes as gRPC UNKNOWN (UP-9 / parity).
+        try {
+            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response,
+                                    metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: inventory ingest threw for agent={} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: inventory ingest threw (unknown) for agent={} "
+                         "— acked",
+                         agent_id);
+        }
+    }
+    // Typed app_perf via its shared seam (DEX app-perf-over-time B1) — byte-identical
+    // to the direct ReportInventory path, independently guarded + isolated.
+    if (app_perf_daily_store_ && app_perf_daily_store_->is_open()) {
+        try {
+            ingest_app_perf_report(*app_perf_daily_store_, agent_id, *request, *response, metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: app_perf ingest threw for agent={} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: app_perf ingest threw (unknown) for agent={} "
+                         "— acked",
+                         agent_id);
+        }
     }
     response->set_received(true);
     return grpc::Status::OK;

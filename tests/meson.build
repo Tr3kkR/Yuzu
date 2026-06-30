@@ -132,11 +132,17 @@ agent_test_exe = executable(
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
+    'unit/test_inventory_sync.cpp',
+    'unit/test_sync_source_app_perf.cpp',
+    'unit/test_win_str_utils.cpp',
+    'unit/test_installed_apps_registry_utf8.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
+    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
@@ -160,6 +166,7 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
+  tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -185,6 +192,7 @@ tar_test_exe = executable(
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
+    'unit/test_app_perf_rollup_query.cpp',
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
@@ -206,6 +214,8 @@ tar_test_exe = executable(
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
+    include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681, relocated plugins/shared -> agents/shared)
+    include_directories('../agents/core/src'),        # sync_source_app_perf.hpp — app_perf rollup-query integration test
   ],
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
@@ -232,6 +242,9 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
+      'unit/server/test_preflight_parse.cpp',
+      'unit/server/test_preflight_eval.cpp',
+      'unit/server/test_preflight_run_store.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -282,6 +295,8 @@ if build_server
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
+      'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -314,6 +329,7 @@ if build_server
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_rest_software_packages.cpp',
+      'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',
@@ -338,6 +354,12 @@ if build_server
       'unit/server/test_pg_hardening.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
+      'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_app_perf_daily_store.cpp',
+      'unit/server/test_app_perf_ingestion.cpp',
+      'unit/server/test_app_perf_rollup.cpp',
+      'unit/server/test_app_perf_group_reader.cpp',
+      'unit/server/test_pg_array.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

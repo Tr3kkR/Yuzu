@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,8 @@ struct LiveHarness {
     std::unordered_map<std::string, std::vector<DexAgentResponse>> rows_by_cmd; // per-command override
     std::string audited;                                      // "action|result|target_id"
     bool allow_execute = true;
+    bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
+    bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
 
     LiveHarness() {
         auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -78,7 +81,11 @@ struct LiveHarness {
                             const std::string&, const std::string& tid,
                             const std::string&) -> bool {
             audited = a + "|" + r + "|" + tid;
-            return true; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
+            // #1647: the row is recorded before the throw so `audited` still proves the
+            // site was reached; the throw then exercises the shared helper's catch-arm.
+            if (audit_throws)
+                throw std::runtime_error("audit DB write blew up");
+            return audit_ok; // DexRoutes::AuditFn (aliased by DeviceRoutes) is bool-returning (#1549)
         };
         // store is unused by the live routes — pass nullptr deliberately.
         routes.register_routes(sink, okAuth, perm, scoped_perm, devices, lookup, /*store=*/nullptr,
@@ -155,6 +162,44 @@ TEST_CASE("device live run: dispatches the right plugin and audits per-kind", "[
         REQUIRE(r);
         CHECK(r->body.find("Execute") != std::string::npos);
         CHECK(h.dispatched == 0);
+    }
+}
+
+// #1647 catch-arm parity: the device.live.* DISPATCH audit set Sec-Audit-Failed on a
+// returns-false but had NO try/catch — a throwing audit_fn escaped the handler (httplib
+// → 500). Routed through the shared rest_audit.hpp chokepoint, a throw is now caught and
+// flags the header, while the post-dispatch SET-AND-PROCEED posture is unchanged (the
+// dispatch already happened; the panel still polls for the result).
+TEST_CASE("device live run: audit-persist gap surfaces Sec-Audit-Failed, still polls",
+          "[device][routes][audit]") {
+    SECTION("a dropped audit row (audit_fn → false)") {
+        LiveHarness h;
+        h.audit_ok = false;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime");
+        REQUIRE(r);
+        CHECK(r->status == 200); // set-and-proceed
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatched == 1); // the audit failure did not block the dispatch
+        CHECK(r->body.find("/fragments/device/live/result") != std::string::npos);
+    }
+    SECTION("a throwing audit_fn is caught, never escapes the handler") {
+        LiveHarness h;
+        h.audit_throws = true;
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.dispatched == 1);
+        CHECK(r->body.find("/fragments/device/live/result") != std::string::npos);
+    }
+    SECTION("clean path sets NO Sec-Audit-Failed header") {
+        LiveHarness h; // audit_ok=true, audit_throws=false
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=uptime");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(h.audited == "device.live.uptime|dispatched|a-1");
     }
 }
 
@@ -274,6 +319,7 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"listening", "network_diag", "listening", "device.live.listening"},
         {"connections", "network_diag", "connections", "device.live.connections"},
         {"capture_sources", "tar", "status", "device.live.capture_sources"},
+        {"disk", "disk_space", "free", "device.live.disk"},
     };
     for (const auto& c : cases) {
         LiveHarness h;
@@ -393,6 +439,31 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         REQUIRE(r);
         CHECK(r->body.find("445") != std::string::npos);
         CHECK(r->body.find("id=\"ls-kpi-listen\"") != std::string::npos);
+    }
+    SECTION("disk well-formed line: table + free-% KPI (100 - used)") {
+        LiveHarness h;
+        // 100 GiB total, 25 GiB free, 75% used.
+        h.fake_rows = {{"a-1", 1, "disk|C:\\|107374182400|26843545600|75", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_space-test"
+                            "&agent_id=a-1&kind=disk&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("id=\"ls-kpi-disk\"") != std::string::npos);
+        CHECK(r->body.find("25%") != std::string::npos);       // KPI free% = 100 - 75
+        CHECK(r->body.find("100.0 GiB") != std::string::npos); // human()-formatted total
+    }
+    SECTION("disk: short line skipped; unmeasured total<=0 dashed + off the KPI; bad field zeros") {
+        LiveHarness h;
+        // line1 (3 fields) -> skipped; line2 total 0 -> dash, excluded from worst-used;
+        // line3 non-numeric pct -> zero-default, no crash, drives the KPI.
+        h.fake_rows = {{"a-1", 1, "disk|C:\\|123\n"
+                                  "disk|D:\\|0|0|0\n"
+                                  "disk|/|107374182400|107374182400|x", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_space-test"
+                            "&agent_id=a-1&kind=disk&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("&mdash;") != std::string::npos);        // D: total 0 -> dash
+        CHECK(r->body.find("id=\"ls-cnt-disk\"") != std::string::npos);
+        CHECK(r->body.find(">2<") != std::string::npos);            // 2 rows parsed (short line skipped)
     }
 }
 

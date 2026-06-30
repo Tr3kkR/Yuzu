@@ -111,7 +111,7 @@ jobs:
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - name: Probe runner health
@@ -131,7 +131,7 @@ jobs:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -153,7 +153,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
@@ -229,7 +229,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
@@ -300,6 +300,19 @@ jobs:
       # drift / version skew). Runs on the merge-guarding path, not only release.
       - name: Verify vendored grpcbox integrity
         run: bash gateway/scripts/verify-vendored-grpcbox.sh
+
+      # ADR-0016 / gov build-ci: the committed gateway _pb.erl are GENERATED from
+      # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
+      # un-regenerated, silently field-dropping _pb.erl (e.g. management_pb, which
+      # no test exercises) fails the merge-guarding path — not only release.yml.
+      # Warm gateway _build first: check-proto-codegen.sh needs _build/.../gpb/ebin,
+      # which nothing earlier provisions. On a cold/wiped workspace the check would
+      # otherwise exit before the meson build that warms _build — an unrecoverable
+      # deadlock (gov build-ci). rebar3 compile is idempotent/fast on a warm runner.
+      - name: Compile gateway (warm _build for the codegen check)
+        run: cd gateway && rebar3 compile
+      - name: Verify gateway proto codegen is up to date
+        run: bash gateway/scripts/check-proto-codegen.sh
 
       # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
       # runner, which persists in the github-runner user's home between
@@ -529,7 +542,7 @@ jobs:
             rm -rf "$GITHUB_WORKSPACE/build-windows"
           fi
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
@@ -777,7 +790,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           persist-credentials: false
@@ -985,7 +998,7 @@ jobs:
     outputs:
       workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -1032,7 +1045,7 @@ jobs:
     # margin; warm runs still finish in ~6 min.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           persist-credentials: false

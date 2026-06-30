@@ -16,7 +16,11 @@ Schema name = `snake_case(FullClassName)` incl. the `Store` suffix (ADR-0008 Upd
 
 | Store | Schema | Notes |
 |---|---|---|
-| `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). durability-on-top. |
+| `OfflineEndpointStore` | `offline_endpoint_store` | First born-on-Pg store (#1320 PR 3). **Schema rename pending**: ships today as `endpoint_state`; renamed to conform to the ADR-0008 naming rule (safe pre-alpha — data reconstructs from heartbeats). Construction fail-closed (ADR-0012 §1); runtime durability-on-top. |
+| `SoftwareInventoryStore` | `software_inventory_store` | Born-on-Pg (ADR-0016). Typed projection for the daily-sync `installed_software` source (normalized rows, no JSONB). authoritative reads; ingest fail-soft (next sync + weekly floor self-heal). **Coexists with the generic `InventoryStore` (Wave 1 below) — it is NOT that store's migration.** |
+| `AppPerfFleetStore` | `app_perf_fleet_store` | Born-on-Pg (DEX app-perf-over-time B2). Fleet aggregate `(app, version, day)` + fixed-bucket CPU/WS histogram + device_count, 180-day retention (the trend window). **Single-schema owner** — it does NOT write itself; the B1→B2 roll-up is the dedicated cross-store query owner `AppPerfRollup` (ADR-0012 §3 seam: one lease, schema-qualified `INSERT … SELECT` spanning `app_perf_daily_store` → `app_perf_fleet_store`). authoritative reads; derived aggregate (rebuilt by the next roll-up). No `agent_id` (no per-device attribution). No backfill (greenfield). |
+| `AppPerfDailyStore` | `app_perf_daily_store` | Born-on-Pg (DEX app-perf-over-time B1). Typed per-device daily app-version perf projection for the daily-sync `app_perf` source (plain table, PK `(agent_id, app_name, version, day)`, 31-day per-agent prune, no JSONB). authoritative reads; ingest fail-soft. **Hash-less** (perf changes daily → no hash-skip), so unlike `SoftwareInventoryStore` it stores no content hash and a hash-only report is answered `need_full`. No backfill (greenfield). |
+| `PreflightRunStore` | `preflight_run_store` | Born-on-Pg (ADR-0006). Persists `/auto` pre-flight run metadata, the frozen target cohort, and the computed per-device check grid (`runs` + `run_device`, FK cascade). Construction fail-closed (ADR-0012 §1: `!is_open()`→`startup_failed_`); runtime durability-on-top (a transient lease error degrades /auto to a note). 14-day retention via best-effort prune in the background runner; owner-scoped reads. |
 
 ## Wave 1 — cross-store-join / durable / high-write
 
@@ -26,7 +30,7 @@ query-owner seam (ADR-0012 §3) when scoring lands.
 
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
-| `InventoryStore` | `inventory_store` | authoritative | vuln-graph join input; high-write. |
+| `InventoryStore` | `inventory_store` | authoritative | Generic per-source blob store (backs the `kInventoryQuery` scope source + eval engine). Still SQLite. **Note:** the typed `installed_software` projection already went born-on-Pg as `SoftwareInventoryStore` (ADR-0016, Done above); this row is the *generic* store's own migration, still pending. vuln-graph join input; high-write. |
 | `GuaranteedStateStore` | `guaranteed_state_store` | authoritative | Guardian state; high-write; join input. Uses `SqliteTxn`/`SqliteStmt` today. |
 | `FleetTopologyStore` | `fleet_topology_store` | authoritative | durable topology; viz; join-adjacent. |
 | `ResponseStore` | `response_store` | durability-on-top? | high-write, TTL'd 90d; backfill **skippable** (ADR-0009). |

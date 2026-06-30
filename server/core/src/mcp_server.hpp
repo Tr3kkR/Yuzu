@@ -6,6 +6,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "ca_store.hpp"
+#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -31,6 +32,10 @@ namespace yuzu {
 class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 }
 
+namespace yuzu::server {
+class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+}
+
 namespace yuzu::server::mcp {
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
@@ -54,12 +59,18 @@ public:
     /// Per-agent response-scope predicate (#1550 HIGH-1 / #1634). Returns true iff
     /// the principal `username` may read responses for `agent_id`. Production wires
     /// it to rbac_store->check_scoped_permission(username,"Response","Read",agent_id,
-    /// mgmt_store) — the same chokepoint the per-device REST/dashboard routes use —
-    /// so an operator collecting an execution's rows by execution_id sees only the
-    /// agents inside their management groups. The handler resolves the principal
-    /// ONCE (it already authed the request) and passes `username` in, so the
-    /// predicate does NOT re-resolve the session per call. RBAC-off → returns true
-    /// (legacy-open, matching require_scoped_permission).
+    /// mgmt_store) — the same chokepoint the per-device REST/dashboard routes use.
+    /// NOTE (#1634): this filter is INERT under the current global `Response:Read`
+    /// gate — a holder of global Response:Read passes the gate and
+    /// check_scoped_permission's global step then admits every agent (no rows
+    /// dropped), while a management-group-confined operator is 403'd at the gate
+    /// before this runs. So it does NOT yet bound a normal operator to their groups;
+    /// its only active effect today is failing CLOSED on a corrupt/load-failed
+    /// rbac.db. Effective per-operator scoping needs the admit-then-filter gate for
+    /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
+    /// The handler resolves the principal ONCE (it already authed the request) and
+    /// passes `username` in, so the predicate does NOT re-resolve the session per
+    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required
@@ -75,9 +86,27 @@ public:
     /// view; the result then carries `result_truncated_by_cap:true` so the caller
     /// can detect it. Completeness for >cap collection is the keyset follow-up
     /// (#1634); the cross-operator ISOLATION guarantee (never another operator's
-    /// rows) holds regardless. NOTE: service-scoped tokens are scoped by the token
+    /// rows) holds regardless. NOTE (ADR-0017): this filter is INERT under the
+    /// global Response:Read gate (does not narrow by management group today); the
+    /// list-view correction is tracked #1718 PR-B. NOTE: service-scoped tokens are scoped by the token
     /// creator's RBAC, not the service tag (pre-existing, tracked in #1634).
     using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
+
+    /// Per-agent INVENTORY-scope predicate — same shape as ResponseScopeFn but
+    /// bound to ("Inventory","Read"), so `query_installed_software` filters its
+    /// fleet rows to the caller's management groups (INTENDED cross-operator
+    /// isolation, mirrors the #1550 query_responses filter — same inert-under-the-
+    /// global-gate class, NOT achieved isolation). NOTE (ADR-0017): this
+    /// filter is INERT under the global Inventory:Read gate — a confined operator
+    /// is denied at the gate before it runs, a global operator's filter is a no-op —
+    /// so it does not yet narrow list reads; it is the foundation the ADR-0017
+    /// admit-then-filter list gate builds on (#1716). Same fail-open-when-unwired
+    /// contract: an unset predicate (`= {}`) applies NO filter (legacy-open /
+    /// RBAC-off). The SOLE production caller (server.cpp) MUST wire it to
+    /// rbac_store->check_scoped_permission(username,"Inventory","Read",agent_id,
+    /// mgmt_store). Do NOT add a new production registration without wiring it.
+    using InventoryScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
@@ -134,7 +163,10 @@ public:
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
                             DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                             ResponseScopeFn response_scope_fn = {},
-                            yuzu::MetricsRegistry* metrics = nullptr);
+                            SoftwareInventoryStore* software_inventory_store = nullptr,
+                            InventoryScopeFn inventory_scope_fn = {},
+                            yuzu::MetricsRegistry* metrics = nullptr,
+                            AppPerfProviders app_perf_providers = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -151,7 +183,10 @@ public:
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
                          DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
                          ResponseScopeFn response_scope_fn = {},
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         SoftwareInventoryStore* software_inventory_store = nullptr,
+                         InventoryScopeFn inventory_scope_fn = {},
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         AppPerfProviders app_perf_providers = {});
 };
 
 } // namespace yuzu::server::mcp

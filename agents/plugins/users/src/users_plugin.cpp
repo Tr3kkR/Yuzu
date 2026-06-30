@@ -45,6 +45,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <lm.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
@@ -96,17 +97,9 @@ std::string run_command(const char* cmd) {
 }
 
 #ifdef _WIN32
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    std::string result(len > 0 ? len - 1 : 0, '\0');
-    if (len > 0) {
-        WideCharToMultiByte(CP_UTF8, 0, ws, -1, result.data(), len, nullptr, nullptr);
-    }
-    return result;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 // Format a Windows FILETIME as "YYYY-MM-DD HH:MM:SS" or "Never" if zero
 std::string format_filetime(DWORD low, DWORD high) {
@@ -189,8 +182,8 @@ int do_logged_on(yuzu::CommandContext& ctx) {
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
                                         WTSDomainName, &domain_buf, &domain_len);
 
-            auto user = wide_to_utf8(user_buf);
-            auto domain = wide_to_utf8(domain_buf);
+            auto user = from_wide(user_buf);
+            auto domain = from_wide(domain_buf);
 
             if (user_buf)
                 WTSFreeMemory(user_buf);
@@ -201,7 +194,7 @@ int do_logged_on(yuzu::CommandContext& ctx) {
                 continue;
 
             std::string logon_type = "console";
-            auto session_name = wide_to_utf8(sessions[i].pWinStationName);
+            auto session_name = from_wide(sessions[i].pWinStationName);
             if (session_name.find("RDP") != std::string::npos ||
                 session_name.find("rdp") != std::string::npos) {
                 logon_type = "RDP";
@@ -262,7 +255,7 @@ int do_sessions(yuzu::CommandContext& ctx) {
             DWORD user_len = 0;
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
                                         WTSUserName, &user_buf, &user_len);
-            auto user = wide_to_utf8(user_buf);
+            auto user = from_wide(user_buf);
             if (user_buf)
                 WTSFreeMemory(user_buf);
 
@@ -296,7 +289,7 @@ int do_sessions(yuzu::CommandContext& ctx) {
             DWORD client_len = 0;
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
                                         WTSClientName, &client_buf, &client_len);
-            auto client = wide_to_utf8(client_buf);
+            auto client = from_wide(client_buf);
             if (client_buf)
                 WTSFreeMemory(client_buf);
 
@@ -470,9 +463,9 @@ int do_local_users(yuzu::CommandContext& ctx) {
         if (status == NERR_Success || status == ERROR_MORE_DATA) {
             for (DWORD i = 0; i < entries_read; ++i) {
                 auto& u = buf[i];
-                auto name = wide_to_utf8(u.usri2_name);
+                auto name = from_wide(u.usri2_name);
                 bool enabled = !(u.usri2_flags & UF_ACCOUNTDISABLE);
-                auto comment = wide_to_utf8(u.usri2_comment);
+                auto comment = from_wide(u.usri2_comment);
 
                 // Format last logon
                 std::string last_logon = "Never";
@@ -544,7 +537,7 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     if (status == NERR_Success) {
         for (DWORD i = 0; i < entries_read; ++i) {
             auto& m = buf[i];
-            auto name = wide_to_utf8(m.lgrmi2_domainandname);
+            auto name = from_wide(m.lgrmi2_domainandname);
 
             const char* type_str = "unknown";
             switch (m.lgrmi2_sidusage) {
@@ -672,7 +665,7 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (status == NERR_Success || status == ERROR_MORE_DATA) {
         for (DWORD i = 0; i < entries_read; ++i) {
             auto& m = buf[i];
-            auto name = wide_to_utf8(m.lgrmi2_domainandname);
+            auto name = from_wide(m.lgrmi2_domainandname);
 
             const char* type_str = "unknown";
             switch (m.lgrmi2_sidusage) {

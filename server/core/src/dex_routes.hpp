@@ -2,7 +2,7 @@
 
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
-/// 103-signal catalogue (crashes, hangs, service failures, device stability,
+/// 110-signal catalogue (crashes, hangs, service failures, device stability,
 /// boot/resume performance, network/identity/security/update/print signals;
 /// docs/dex-signal-catalog.md).
 /// A capability-limited READ MODEL over the one Guardian event store
@@ -23,6 +23,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
 
 #include <httplib.h>
@@ -40,6 +41,7 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
+struct GuardianObservationRow;
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
@@ -178,6 +180,22 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
 std::string render_dex_device_fragment(const GuaranteedStateStore* store,
                                        const std::string& agent_id, const std::string& window,
                                        const DexPerfSnapshot* perf_snap = nullptr);
+
+/// Single-observation detail panel — the device-history row click target. Lays
+/// out every captured projection field (subject / code / symbolic / component /
+/// metric / device / platform / exact timestamp / event id) for one event. Pure
+/// + free so it is unit-testable directly against a `GuardianObservationRow`.
+/// (This is the panel Option-D enrichment later extends with `extra{}` fields.)
+std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
+
+/// Applications list — the dedicated app-centric DEX lens (a new top-level
+/// subnav tab). Ranks apps by reliability signals (crashes + hangs) keyed on the
+/// process image, each row drilling to the per-app blast-radius view. `since` is
+/// the ISO cutoff; `window_days` drives the chips + drill links. Pure + free so
+/// it is unit-testable directly against a seeded store. (Per-app performance,
+/// version, and non-crash signal attribution are follow-on slices.)
+std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
+                                     int window_days);
 
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
@@ -353,6 +371,11 @@ public:
     /// empty → the Performance tab renders an honest "unavailable" placeholder.
     using PerfFn = DexPerfFn;
 
+    /// F2b: the management groups offered in the app-perf scope selector (id +
+    /// name + member count), sourced from ManagementGroupStore::list_groups. May
+    /// be empty → the scope selector is omitted (whole-fleet only).
+    using GroupListFn = std::function<std::vector<DexGroupOption>()>;
+
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
     /// Guardian read surface — a dedicated DEX:Read perm is deferred). `store` may
@@ -363,7 +386,8 @@ public:
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {});
+                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         GroupListFn group_list_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -372,7 +396,8 @@ public:
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {});
+                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         GroupListFn group_list_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -385,6 +410,8 @@ private:
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
     PerfFn perf_fn_;
+    AppPerfProviders app_perf_providers_;
+    GroupListFn group_list_fn_;
 };
 
 } // namespace yuzu::server

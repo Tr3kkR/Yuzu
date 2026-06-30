@@ -27,10 +27,26 @@ enabled = true
 > migrate (e.g. a corrupt `rbac.db`), the server fails **closed**: device
 > visibility falls back to the role-scoped path for every caller, so agents stop
 > appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
-> the whole fleet being exposed. A corrupt store therefore looks like "no agents
-> in scope," not a visibility leak — check the server startup log for `RbacStore`
+> the whole fleet being exposed. **The same fail-closed posture covers MOST
+> response/execution readers (#1634):** `query_responses`, `aggregate_responses`,
+> `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
+> / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
+> returns `503`) on a corrupt store rather than reopening the cross-operator
+> fleet-wide read. **Not yet covered (#1634 follow-up — these still fail OPEN on a
+> corrupt store):** the dashboard `/fragments/results/…` table and the workflow
+> executions-drawer reader have no per-agent filter and will expose the whole
+> fleet's responses on a corrupt `rbac.db`. So a corrupt store looks like "no
+> agents in scope" / "no responses" **on the covered surfaces, but is a visibility
+> leak via those two uncovered ones** — check the server startup log for `RbacStore`
 > errors and the `/health` store status, then restore or remove the file and
-> restart.
+> restart immediately. (If Grafana panels or scripted aggregate consumers show zero
+> rows after an upgrade or restart, check for `RbacStore` open/migrate errors first.)
+>
+> **Note (#1634):** the per-agent filter on the covered response readers is, under
+> *normal* RBAC operation, currently **inert** — a holder of global `Response:Read`
+> sees all agents' responses; per-management-group scoping of these reads is not yet
+> effective (the gate change is tracked in #1634). Today the filter's only active
+> effect is the corrupt-store fail-closed described above.
 
 ## Concepts
 
@@ -49,12 +65,12 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 19 securable types, plus Push on GuaranteedState (96 permissions) | Server admins, security team leads |
-| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
-| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
+| **Administrator** | All 5 CRUD operations on all 20 securable types, plus Push on GuaranteedState (101 permissions) | Server admins, security team leads |
+| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
+| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 16 securable types, plus Push on GuaranteedState (81 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 18 securable types (all except Infrastructure) (18 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 5 CRUD operations on 17 securable types, plus Push on GuaranteedState (86 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 19 securable types (all except Infrastructure) (19 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
 
@@ -79,6 +95,7 @@ Six roles are created automatically and cannot be deleted:
 | `License` | Enterprise license records |
 | `FileRetrieval` | File upload and download operations |
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
+| `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 
 ## Operations
 

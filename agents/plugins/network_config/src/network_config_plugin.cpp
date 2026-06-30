@@ -37,6 +37,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias (arp)
 #include <winhttp.h>
@@ -77,17 +78,9 @@ std::string format_mac(const BYTE* addr, DWORD len) {
                        addr[3], addr[4], addr[5]);
 }
 
-// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
-std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    std::string result(len > 0 ? len - 1 : 0, '\0');
-    if (len > 0) {
-        WideCharToMultiByte(CP_UTF8, 0, ws, -1, result.data(), len, nullptr, nullptr);
-    }
-    return result;
-}
+// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
+// behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::win::from_wide;
 
 // Convert a SOCKADDR to a string
 std::string sockaddr_to_string(LPSOCKADDR sa) {
@@ -129,7 +122,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
         if (a->IfType == IF_TYPE_TUNNEL)
             continue;
 
-        auto name = wide_to_utf8(a->FriendlyName);
+        auto name = from_wide(a->FriendlyName);
         auto mac = format_mac(a->PhysicalAddress, a->PhysicalAddressLength);
         auto speed_mbps = a->TransmitLinkSpeed / 1'000'000;
         const char* status = (a->OperStatus == IfOperStatusUp) ? "up" : "down";
@@ -263,7 +256,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         if (a->IfType == IF_TYPE_TUNNEL)
             continue;
 
-        auto adapter_name = wide_to_utf8(a->FriendlyName);
+        auto adapter_name = from_wide(a->FriendlyName);
 
         // Collect first gateway
         std::string gateway = "-";
@@ -397,7 +390,7 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
         if (a->IfType == IF_TYPE_TUNNEL)
             continue;
 
-        auto adapter_name = wide_to_utf8(a->FriendlyName);
+        auto adapter_name = from_wide(a->FriendlyName);
 
         for (auto* dns = a->FirstDnsServerAddress; dns; dns = dns->Next) {
             auto addr = sockaddr_to_string(dns->Address.lpSockaddr);
@@ -448,17 +441,17 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (proxy_cfg.lpszAutoConfigUrl) {
             ctx.write_output(std::format("proxy_type|pac"));
             ctx.write_output(
-                std::format("proxy_address|{}", wide_to_utf8(proxy_cfg.lpszAutoConfigUrl)));
+                std::format("proxy_address|{}", from_wide(proxy_cfg.lpszAutoConfigUrl)));
             GlobalFree(proxy_cfg.lpszAutoConfigUrl);
         }
         if (proxy_cfg.lpszProxy) {
-            auto proxy = wide_to_utf8(proxy_cfg.lpszProxy);
+            auto proxy = from_wide(proxy_cfg.lpszProxy);
             ctx.write_output(std::format("proxy_type|http"));
             ctx.write_output(std::format("proxy_address|{}", proxy));
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
-            ctx.write_output(std::format("bypass|{}", wide_to_utf8(proxy_cfg.lpszProxyBypass)));
+            ctx.write_output(std::format("bypass|{}", from_wide(proxy_cfg.lpszProxyBypass)));
             GlobalFree(proxy_cfg.lpszProxyBypass);
         }
         if (!proxy_cfg.lpszAutoConfigUrl && !proxy_cfg.lpszProxy) {
@@ -619,7 +612,7 @@ private:
         auto iface_name = [](const NET_LUID& luid, NET_IFINDEX idx) -> std::string {
             wchar_t alias[IF_MAX_STRING_SIZE + 1]{};
             if (ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1) == NO_ERROR)
-                return wide_to_utf8(alias);
+                return from_wide(alias);
             return std::format("if{}", static_cast<unsigned long>(idx));
         };
 
@@ -689,7 +682,7 @@ private:
             int count = 0;
             for (auto* entry = root.pNext; entry; entry = entry->pNext) {
                 if (entry->pszName) {
-                    auto name = wide_to_utf8(entry->pszName);
+                    auto name = from_wide(entry->pszName);
                     // wType: 1=A, 28=AAAA, 5=CNAME, etc.
                     const char* type = "unknown";
                     switch (entry->wType) {

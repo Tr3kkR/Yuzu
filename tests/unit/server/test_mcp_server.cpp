@@ -222,7 +222,9 @@ namespace {
 
 struct TempDb {
     std::filesystem::path path;
-    TempDb() : path(std::filesystem::temp_directory_path() / "test_mcp_tokens.db") {
+    // #473: per-instance unique path (was a shared `test_mcp_tokens.db` in the system
+    // temp dir, which collided across concurrent CI shards / a crash-without-cleanup).
+    TempDb() : path(yuzu::test::unique_temp_path("mcp-tokens-")) {
         std::filesystem::remove(path);
     }
     ~TempDb() { std::filesystem::remove(path); }
@@ -497,9 +499,16 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include "mcp_server.hpp"
 
+#include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
+#include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "pg/pg_raii.hpp"               // PgResult
+#include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
+#include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
+
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
 #include <httplib.h>
+#include <libpq-fe.h> // PGRES_COMMAND_OK
 
 #include <memory>
 #include <stdexcept>
@@ -591,6 +600,18 @@ struct McpTestServer {
     /// denial: the mock sets 403 + an error body, matching require_permission.
     std::function<bool(const std::string& securable, const std::string& op)>
         perm_override_for_test{};
+
+    /// ADR-0016: optionally wire a typed SoftwareInventoryStore + an Inventory-scope
+    /// predicate so query_installed_software is exercised end-to-end, including the
+    /// management-group drop path. Default nullptr/{} keeps existing tests on the
+    /// "Software inventory store unavailable" path with no filter.
+    yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
+    yuzu::server::mcp::McpServer::InventoryScopeFn inventory_scope_fn_for_test{};
+
+    /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
+    /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
+    /// can be exercised. Default empty keeps existing tests on the unavailable path.
+    yuzu::server::AppPerfProviders app_perf_providers_for_test{};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -715,7 +736,11 @@ private:
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
             /*dex_perf_fn=*/dex_perf_fn_for_test,
             /*net_perf_fn=*/net_perf_fn_for_test,
-            /*response_scope_fn=*/response_scope_fn_for_test);
+            /*response_scope_fn=*/response_scope_fn_for_test,
+            /*software_inventory_store=*/software_inventory_store_for_test,
+            /*inventory_scope_fn=*/inventory_scope_fn_for_test,
+            /*metrics=*/nullptr,
+            /*app_perf_providers=*/app_perf_providers_for_test);
     }
 };
 
@@ -811,9 +836,12 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
                                                "list_dex_signals",
                                                "get_dex_signal_scope",
                                                "get_dex_signal_detail",
-                                               "get_dex_perf_cohort_diff", // F2c discovery pin
+                                               "get_dex_perf_cohort_diff",     // F2c discovery pin
+                                               "list_dex_perf_apps",
+                                               "get_dex_app_perf",
+                                               "get_dex_group_app_perf",       // B1/B2 discovery pin
                                                "get_network_fleet",
-                                               "list_network_devices", // N1: A2 discovery pin
+                                               "list_network_devices",         // N1: A2 discovery pin
                                                "get_fleet_posture_fast",
                                                "classify_operational_question",
                                                "get_incident_playbook",
@@ -1311,6 +1339,129 @@ TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.apps =
+        [](bool& truncated) -> std::optional<std::vector<yuzu::server::AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<yuzu::server::AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 2, .last_day = 1'700'000'000}};
+    };
+    auto mk_row = [](std::int64_t dc) {
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "chrome.exe";
+        r.version = "124.0";
+        r.day = 1'700'000'000;
+        r.device_count = dc;
+        r.cpu_sum = static_cast<double>(dc) * 5.0; // mean 5.0
+        r.cpu_max = 9.0;
+        r.ws_sum = dc * 100;
+        r.ws_max = 200;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        return r;
+    };
+    ts.app_perf_providers_for_test.fleet =
+        [mk_row](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)}; // >= kDexCohortFloor
+    };
+    ts.app_perf_providers_for_test.group =
+        [mk_row](std::string_view, std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
+    };
+    ts.start("readonly");
+
+    auto apps = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"list_dex_perf_apps","arguments":{}}})")
+            ->body);
+    REQUIRE(apps["apps"].size() == 1);
+    CHECK(apps["apps"][0]["app_name"] == "chrome.exe");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+            ->body);
+    CHECK(fleet["app"] == "chrome.exe");
+    REQUIRE(fleet["points"].size() == 1);
+    CHECK(fleet["points"][0]["version"] == "124.0");
+    CHECK(fleet["points"][0]["device_count"] == 20);
+
+    auto group = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":82,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})")
+            ->body);
+    CHECK(group["floor"] == yuzu::server::kDexCohortFloor); // floor echoed
+    REQUIRE(group["points"].size() == 1);
+    CHECK(group["points"][0]["device_count"] == 20);
+}
+
+TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",
+          "[mcp][integration][dex][app_perf]") {
+    // The fleet path floors too now — a sub-floor (version,day) point must serialize
+    // suppressed=true with device_count only, NOT zeroed stats that read as
+    // "3 devices @ 0% CPU" (security re-review of 5ebde07f).
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.fleet =
+        [](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        return std::vector<yuzu::server::AppPerfFleetRow>{r};
+    };
+    ts.start("readonly");
+    auto p = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_app_perf","arguments":{"app":"niche.exe"}}})")
+            ->body);
+    REQUIRE(p["points"].size() == 1);
+    CHECK(p["points"][0]["suppressed"] == true);
+    CHECK(p["points"][0]["device_count"] == 3);
+    CHECK_FALSE(p["points"][0].contains("cpu_mean")); // stats omitted when suppressed
+}
+
+TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
+          "[mcp][integration][dex][app_perf]") {
+    {
+        McpTestServer ts; // no providers wired
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"list_dex_perf_apps","arguments":{}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.fleet =
+            [](std::string_view, std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+            return std::vector<yuzu::server::AppPerfFleetRow>{};
+        };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_dex_app_perf","arguments":{}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
+    }
 }
 
 TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)",
@@ -3374,4 +3525,211 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
     auto p = bundle_payload(resp);
     CHECK(p["steps"][0]["state"] == "responded");
+}
+
+// ── query_installed_software (ADR-0016 typed store + management-group scope) ──
+
+TEST_CASE("MCP query_installed_software: store unavailable → internal error",
+          "[mcp][inventory]") {
+    McpTestServer ts; // no software_inventory_store wired
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":78,)"
+                       R"("params":{"name":"query_installed_software","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("Software inventory store unavailable") != std::string::npos);
+}
+
+TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's groups",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    using yuzu::server::InventoryIngestOutcome;
+    using yuzu::server::SoftwareEntry;
+    using yuzu::server::SoftwareInventoryStore;
+    // Two devices both run Chrome.
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-in", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-out", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    // Caller may see agent-in, never agent-out (the management-group drop path).
+    ts.inventory_scope_fn_for_test = [](const std::string& /*user*/, const std::string& agent_id) {
+        return agent_id == "agent-in";
+    };
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":77,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res->status == 200);
+    // In-scope device present; out-of-scope device filtered OUT (cross-operator isolation).
+    CHECK(res->body.find("agent-in") != std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    // The drop is audited distinctly as a denied event, alongside the success row.
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.query_installed_software|denied")
+            saw_denied = true;
+        if (a == "mcp.query_installed_software|success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
+          "(ADR-0016 §7 / fjarvis HIGH)",
+          "[mcp][pg][inventory]") {
+    // THE regression guard for the blocking finding: when the store cannot read
+    // (pool/query failure → query_software returns nullopt), the tool must return a
+    // JSON-RPC error, NOT success with empty content — a fleet vuln query must not
+    // read a transient PG failure as "installed nowhere" (authoritative reads, A4).
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Degrade: drop the schema so the next query's PGRES status is an error.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA software_inventory_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":78,)"
+                       R"("params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("\"error\"") != std::string::npos); // JSON-RPC error, not a result
+    CHECK(res->body.find("Software inventory store degraded") != std::string::npos);
+    CHECK(res->body.find("-32603") != std::string::npos);    // kInternalError, not kInvalidParams (gov QE)
+    CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
+    // The degraded access is audited (gov compliance CC7.2): a CVE-triage caller under a
+    // sustained outage still leaves a behavioural trail.
+    bool saw_failure_audit = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
+}
+
+// ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──
+//
+// aggregate_responses folds rows into COUNT/SUM/AVG totals, so an out-of-scope
+// row cannot be post-filtered out — it must be excluded from the WHERE clause
+// before aggregation. These prove an operator's totals never include another
+// operator's agents' rows.
+
+TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + denied audit (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    // instr-1: two SUCCESS (status 0), one FAILURE (status 1). Only agent-1 is
+    // in the caller's management group.
+    store.store(mk_resp("exec-1", "instr-1", "agent-1", 0, "ok", 500)); // in scope
+    store.store(mk_resp("exec-1", "instr-1", "agent-2", 0, "ok", 501)); // OUT of scope
+    store.store(mk_resp("exec-1", "instr-1", "agent-3", 1, "err", 502)); // OUT of scope
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.response_scope_fn_for_test = [](const std::string&, const std::string& agent_id) -> bool {
+        return agent_id == "agent-1";
+    };
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-1","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    // Only agent-1's SUCCESS survives: status "0" count 1, and NO status "1"
+    // group (agent-3's failure belonged to an out-of-scope agent).
+    std::int64_t count0 = 0, count1 = 0;
+    for (const auto& g : groups) {
+        if (g["group_value"] == "0")
+            count0 = g["count"].get<std::int64_t>();
+        if (g["group_value"] == "1")
+            count1 = g["count"].get<std::int64_t>();
+    }
+    CHECK(count0 == 1); // NOT 2 — agent-2 excluded from the total
+    CHECK(count1 == 0); // agent-3's failure never folded in
+    // The drop is a security-relevant event → distinct denied audit + success.
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.aggregate_responses|denied")
+            saw_denied = true;
+        if (a == "mcp.aggregate_responses|success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-2", "instr-2", "agent-1", 0, "ok", 510));
+    store.store(mk_resp("exec-2", "instr-2", "agent-2", 0, "ok", 511));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store; // response_scope_fn_for_test left empty
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-2","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    std::int64_t count0 = 0;
+    for (const auto& g : groups)
+        if (g["group_value"] == "0")
+            count0 = g["count"].get<std::int64_t>();
+    CHECK(count0 == 2); // both agents counted — RBAC-off legacy posture
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.aggregate_responses|denied");
+    CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
+          "[mcp][integration][response][aggregate][scope]") {
+    yuzu::server::ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-3", "instr-3", "agent-1", 0, "ok", 520));
+    store.store(mk_resp("exec-3", "instr-3", "agent-2", 1, "err", 521));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.response_scope_fn_for_test = [](const std::string&, const std::string&) -> bool {
+        return false; // caller can see NONE of this instruction's agents
+    };
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-3","group_by":"status","aggregate":"count"}}})");
+    REQUIRE(res);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    CHECK(groups.empty()); // zero rows — not a silent unfiltered read
+    // No row leaked into the body at all.
+    CHECK(res->body.find("\"count\"") == std::string::npos);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.aggregate_responses|denied")
+            saw_denied = true;
+    CHECK(saw_denied);
 }

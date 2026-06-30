@@ -336,7 +336,15 @@ void PgPool::release(PGconn* conn) noexcept {
 }
 
 bool PgPool::with_txn(const std::function<bool(PGconn*)>& fn) {
-    Lease lease = acquire();
+    return run_in_txn(acquire(), fn);
+}
+
+bool PgPool::with_txn_for(std::chrono::milliseconds timeout,
+                          const std::function<bool(PGconn*)>& fn) {
+    return run_in_txn(try_acquire_for(timeout), fn);
+}
+
+bool PgPool::run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn) {
     if (!lease)
         return false;
 

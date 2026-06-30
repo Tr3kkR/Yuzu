@@ -161,6 +161,8 @@ struct LiveConnRow { std::string proto, local, remote, state; };
 struct LiveService { std::string name, display, status, startup; };
 struct LiveUserRow { std::string user, host, logon_type, session; };
 struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
+/// One volume's capacity reading (disk_space/free → disk|<path>|<total>|<free>|<percent_used>).
+struct LiveDiskVolume { std::string path; long long total = 0, free = 0; int percent_used = 0; };
 /// One TAR capture source's local state (tar/status → config|<src>_enabled / _live_rows).
 /// `dollar`/`category` are server-side presentation metadata (the agent schema registry
 /// is not linked into the server, so the source list is hand-held in device_routes.cpp;
@@ -184,6 +186,7 @@ std::string render_device_live_connections(const std::vector<LiveConnRow>& rows)
 std::string render_device_live_services(const std::vector<LiveService>& rows);
 std::string render_device_live_users(const std::vector<LiveUserRow>& rows);
 std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
+std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows);
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
 
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).

@@ -38,7 +38,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
 
 #### `Sec-Audit-Failed` and the behavioural-PII audit posture
 
-Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
+Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `dex.device.app_perf.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
 
 - **REST JSON endpoints fail closed:** they return `503` + `Sec-Audit-Failed: true` and serve **no** data, so a machine integration (CMDB / ServiceNow / agentic worker) never records evidence-less PII as audited. Distinguish this transient, retryable `503` from a non-transient misconfiguration `503` by the presence of the `Sec-Audit-Failed` header.
 - **Dashboard HTMX fragments set-and-proceed:** they set `Sec-Audit-Failed: true` but **still render**, so a transient audit hiccup never blanks a human operator's lens.
@@ -2622,6 +2622,53 @@ Each condition object:
 }
 ```
 
+#### `GET /api/v1/inventory/software`
+
+Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the legacy blob store. This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
+
+**Permission:** `Inventory:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Exact software-name filter |
+| `agent_id` | string | No | Exact agent filter |
+| `limit` | integer | No | Max rows (default 100, min 1, max 1000) |
+
+Omit both `name` and `agent_id` for a fleet-wide scan.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "software": [
+      {"agent_id": "agent-001", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC", "install_date": "2024-01-15"}
+    ],
+    "count": 1,
+    "devices_omitted": 0,
+    "result_truncated_by_cap": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+
+Results carry a **per-agent management-group drop filter**: out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. **Scope caveat (ADR-0017):** this confinement is **not yet verified effective** — the endpoint gates on the *global* `Inventory:Read` permission, under which the filter does not narrow results (a confined operator is denied at the gate; a global operator sees all). List-view management-group confinement becomes effective only once the ADR-0017 admit-then-filter gate lands (#1713/#1676 UAT to confirm); until then operator isolation on this surface holds for **per-device** routes only.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 400 | `limit` is not a valid integer |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+On a `503` the store could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
 ---
 
 ### Execution Statistics
@@ -2723,6 +2770,8 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 **Permission:** `Response:Read`
 
+**Hardening (#1634, partial).** Under a **corrupt or unavailable RBAC store** this endpoint now fails **closed** (returns no rows) rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of this endpoint for normal operators is **not yet effective** — a holder of global `Response:Read` currently sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). `rows_capped` (below) is computed on the raw pre-filter result. When rows are dropped (today, the fail-closed path), the success audit detail carries ` scope_dropped=<N>`.
+
 **Path parameters:**
 
 | Param | Description |
@@ -2770,7 +2819,7 @@ When the underlying response set exceeds the per-request row cap (10000), the re
 | `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
 | `503` | Response store or instruction store unavailable. |
 
-**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id>`.
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id> index=<N>` on success (with ` scope_dropped=<N>` appended when out-of-scope agents' rows were dropped), or `<definition_id> reason=<r>` on the failure path.
 
 **Example:**
 
@@ -3624,35 +3673,45 @@ Per-agent status. Returns placeholder counts today; per-agent aggregation lands 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 
-#### `GET /api/v1/guaranteed-state/baselines/{baseline_id}/devices/{agent_id}`
+#### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 
-Baseline-anchored per-device compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding one Baseline's Guards (and a device's verdicts) into an external CMDB / ITSM record. For one Baseline and one device, returns the Baseline's **deployed** Guards each with that device's last reported verdict.
+Name-anchored, device-applicable Guardian compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding a device's compliance against a curated Baseline into an external CMDB / ITSM record. Looks the Baseline up by **name** and returns the Guards **actually applicable to the device**, each with that device's last reported verdict.
 
+- **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
-- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`. **Fail-closed:** the audit fires before any compliance data is serialized; if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no Guards — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council; parity with `GET /api/v1/dex/devices/{id}`).
-- **Path params:** `baseline_id` (the Guardian Baseline id), `agent_id` (the device).
-- **`404`** if `baseline_id` is unknown; **`400`** if a path param exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected); **`403`** if the caller lacks `Read` on the device's scope; **`503`** in two distinct cases — (a) the route is **misconfigured** (its stores or scoped-permission function are unwired — **non-transient, do not auto-retry**), or (b) the access-audit row **could not persist** (audit DB locked/full), which carries the **`Sec-Audit-Failed: true`** header and **is transient — retry** after the audit store recovers. The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`; the audit-failure `503` also carries `retry_after_ms`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason). **Integrator note:** distinguish the two `503` cases by the `Sec-Audit-Failed` header — retry when present, treat as a permanent misconfiguration when absent.
+- **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **Evidence integrity — fail-closed (CC7.2).** This is a behavioural-PII read, so if the `guardian.device.view` audit row cannot persist (locked store, disk-full, or a pipeline exception — including a throwing audit pipeline) the endpoint **refuses to serve**: it returns **`503` + `Sec-Audit-Failed: true`** with an A4 envelope carrying a `retry_after_ms` hint, and **withholds the compliance body** — parity with `GET /api/v1/dex/devices/{id}`. Serving audited per-device compliance while the evidence row is known-lost is exactly what audit-on-open prevents. The `503` is returned **before** the `404`, so an audit outage never reveals baseline existence without durable evidence. A CMDB integration should treat `Sec-Audit-Failed: true` as "retry after the audit subsystem recovers," not a permanent error; an audit-off deployment (no audit callback wired) serves normally. (The realistic failure modes also increment `yuzu_server_audit_emit_failed_total` and log to `spdlog`.) **Blast radius:** because this is the fleet-polled CMDB endpoint and there is no degraded-serve fallback, a *sustained* audit-store outage 503s **every** poll fleet-wide — size audit-store availability for the polling load, and expect a compliance-data blackout (not stale data) for the duration. (Per-route retry jitter to avoid synchronized retries across pollers is a tracked platform-wide hardening, #1647.)
+- **Query params:** `baseline` (the Baseline **name**, unique; URL-encode spaces, e.g. `ServiceNow%20Compliance`), `agent_id` (the device). Both required.
+- **`400`** if either param is missing, exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected), or contains control characters (bytes `< 0x20`); **`403`** if the caller lacks `Read` on the device's scope (checked **before** the baseline lookup, so an out-of-scope caller gets `403` even for an unknown name — no name-existence oracle); **`404`** if no Baseline has that name; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry) **or if the baseline store itself faults** (DB locked/corrupt — *retryable*; a transient store fault returns `503`, not the `404` a CMDB would otherwise read as "no such baseline → delete this CI"). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
 - **Response keys:**
   - `baseline` — `{ baseline_id, name, lifecycle }`.
-  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — the consumer should render a "No Baseline Deployed" placeholder.
+  - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — render a "No Baseline Deployed" placeholder.
+  - `assessable` — **machine-readable go/no-go.** `true` only when the Baseline is `deployed` **and** at least one applicable Guard has reported (`total_guards > 0`). `false` for a draft Baseline, or a deployed Baseline this device has reported no applicable Guard against (newly-enrolled / offline / all out-of-scope). **When `assessable` is `false`, do not compute or render a compliance percentage** — branch a business rule on this flag instead of reconstructing the `deployed`+`total_guards`+`last_updated` conjunction. It is the machine signal that closes the `0/0` green-wash.
   - `agent_id`.
-  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Baseline's deployed Guards. Invariant: `total_guards == compliant + drifted + errored + pending`.
-  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` if none reported.
-  - `guards[]` — `{ rule_id, name, status, updated_at }` per deployed Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, or `null` when `pending`.
+  - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Guards **applicable to this device** (see Semantics + the **compliance-percentage caution** below). Invariant: `total_guards == compliant + drifted + errored + pending`.
+  - `snapshot_total` — the Baseline's full deployed-member count (the **superset** across all devices, an upper bound — **not** this device's in-scope count). `total_guards <= snapshot_total`; a gap is expected for a per-machine-scoped Baseline, but a large gap is a cue that this device's coverage may be partial.
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` **only when this device has reported no applicable guard**. A guard the device *did* report contributes its timestamp even if its verdict token is unrecognized (`pending`).
+  - `guards[]` — `{ rule_id, name, status, updated_at }` per **applicable** Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, `null` **only when this device has not reported the guard** (a reported guard carries its timestamp even when `status` is `pending`).
 
-**Semantics.** The Guard set is the Baseline's **`deployed_snapshot`** — the set captured at the last deploy, i.e. what is actually enforced/observed — **not** the live (possibly draft-edited) member list. Two consequences for setup: (1) a Baseline that has never been deployed returns `deployed: false` with no Guards, and (2) **member edits to a deployed Baseline appear here only after a re-deploy** rewrites the snapshot. A deployed Guard the device has not reported on yet shows `status: "pending"` (`updated_at: null`); verdicts are the device's last *reported* state (no device-liveness fold — combine with your own online/offline signal and `updated_at` for freshness).
+**Semantics — device-applicable subset.** One Baseline can carry a **superset** of Guards, each with its own `scope_expr`; the push fan-out arms a **different subset on each machine**. This endpoint returns only the Guards **actually applicable to the device** — the Baseline's `deployed_snapshot` intersected with the Guards the device has reported. A Guard that is out of scope for this device (never armed → never reported) is **absent** (not `pending`), so `total_guards` and `guards[]` reflect *this machine's* applicable set: different machines, querying the **same** Baseline name, legitimately see different Guards. (`pending` therefore means a Guard the device reported with an unrecognized verdict — normally `0`; an elevated `pending` after a partial fleet upgrade can indicate **agent/server version skew** — a newer agent emitting a verdict token this server build does not yet recognize, which upgrading the server resolves. The Guard still carries its real `updated_at` in that case.) Verdicts are the device's last *reported*, Observe-mode state, with no device-liveness fold.
 
-**Applicability (Baseline assignment).** Management-group assignment (included − excluded groups) is **deferred product-wide — deploy is fleet-wide** (see [Guaranteed State → Assignment](guaranteed-state.md#assignment)). So a *deployed* Baseline applies to **every** device, and this endpoint returns the device's compliance against that deployed Baseline's guards. When assignment lands, this endpoint will become assignment-aware (returning *not-applicable* for a device outside the Baseline's assigned scope); until then, do not interpret the verdict as "this Baseline was specifically targeted at this device" — it means "this device's state for this deployed Baseline's guards".
+> **Report-driven caveats.** Applicability is inferred from what the device has *reported*, with two consequences: (1) an in-scope Guard on an **offline** device is absent (not `pending`) until it reports — track device online/offline yourself and use `last_updated` for freshness; (2) a Guard that was **re-scoped out and re-deployed** keeps its last reported row, so it lingers on the CI until that row is overwritten or cleared (the forward direction — tag a device so a Guard *starts* applying — appears promptly; the reverse lags). The honest fix for both — evaluating each Guard's `scope_expr` against the device so in-scope-unreported shows `pending` and out-of-scope never shows — is a tracked computed-denominator upgrade.
 
-Branch on the **`deployed`** flag (not `total_guards`) to decide whether to render "No Baseline Deployed": a *deployed* Baseline that happens to have zero members legitimately returns `deployed: true, total_guards: 0`, whereas a draft/never-deployed Baseline returns `deployed: false`.
+> ⚠️ **Compliance percentage — do not gate on it (yet).** Because the denominator is *reported* applicable Guards, an in-scope Guard the agent has not yet reported drops **out of** `total_guards` rather than counting against it. So `compliant / total_guards` **over-estimates** compliance — a device reporting 3 of its 10 in-scope Guards, all compliant, reads as **100%** — and it over-estimates worst exactly when Guards are broken or the device is flaky. **Do not gate automated remediation or a CMDB compliance flag on this percentage** until the per-device `scope_expr` computed denominator ships (tracked follow-up). Treat the numbers as advisory: branch on `assessable`, watch the `snapshot_total − total_guards` gap as a partial-coverage cue, and cross-reference `last_updated` and your own device-liveness signal. (The `assessable:false` / `0/0` case below is the *zero*-coverage corner of this same caveat.)
 
-Obtain the `baseline_id` from the Baseline detail page URL (`/guardian/baseline/<id>`) in the dashboard; a `GET .../baselines` list endpoint for scripted discovery is a tracked follow-up.
+> ⚠️ **Do not rename a referenced Baseline.** This route resolves the Baseline by **name**; renaming a Baseline that an integration pins (e.g. `ServiceNow Compliance`) makes every poll `404` until that integration is reconfigured to the new name — silently, until CIs stop updating. Treat the Baseline name as a **stable external identifier**; see the rename note in [Guaranteed State](guaranteed-state.md).
+
+**Setup.** The Baseline must be **deployed** (a draft returns `deployed: false`), and **member edits appear here only after a re-deploy** rewrites the `deployed_snapshot`. Branch on the **`deployed`** flag (not `total_guards`) to decide "No Baseline Deployed": a deployed Baseline with zero applicable Guards legitimately returns `deployed: true, total_guards: 0`. **Treat `deployed: true` with `total_guards: 0` and `last_updated: null` as _not assessable_, not compliant** — it means no applicable Guard has reported yet (the device is offline / newly-enrolled, or every Guard is out of its scope). Do **not** compute a compliance percentage from a zero denominator, and do not render `0/0` as a pass — an unreachable or dead device would otherwise read as green. Per-machine variation is driven by each Guard's `scope_expr` (tag / OS / group) — see [Guaranteed State](guaranteed-state.md).
+
+**Bulk CMDB sync.** This is a point-in-time, **single-device** read (not a push/subscription). To populate many CI records, poll per-device on a cadence (15–60 min is typical for a CMDB) rather than bursting every CI at once — concurrent fleet-wide polls contend on the same store locks the agent-heartbeat ingest path uses, so a synchronized stampede can delay heartbeat processing.
 
 **Example:**
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "$YUZU_URL/api/v1/guaranteed-state/baselines/$BASELINE_ID/devices/$AGENT_ID"
+curl -s -H "Authorization: Bearer $TOKEN" --get \
+  "$YUZU_URL/api/v1/guaranteed-state/device-compliance" \
+  --data-urlencode "baseline=ServiceNow Compliance" \
+  --data-urlencode "agent_id=$AGENT_ID"
 ```
 
 ```json
@@ -3660,8 +3719,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "data": {
     "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
     "deployed": true,
+    "assessable": true,
     "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
     "total_guards": 3,
+    "snapshot_total": 3,
     "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
     "last_updated": "2026-06-20T13:45:00Z",
     "guards": [
@@ -3741,7 +3802,7 @@ Fleet-relative performance percentiles per **cohort** — the distinct values of
 
 #### `GET /api/v1/dex/perf/cohort-diff`
 
-The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf across the fleet — is not here: per-app data is device-drill-only, not fleet render-time.)*
+The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, or `model` X vs Y) — where `/perf/cohorts` benchmarks each cohort against the *fleet*, this diffs two cohorts head-to-head. Closes the cohort-vs-cohort half of the benchmarking residual. *(The fleet-per-app benchmark — per-app perf over time across the fleet — is the separate **app-performance-over-time** surface below: `GET /api/v1/dex/perf/apps` / `app` / `group`, reading the retained Postgres aggregate.)*
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `key` — the cohort tag key (`[A-Za-z0-9_.:-]{1,64}`, default `model`); `a`, `b` — the two cohort values to compare (**both required**; an empty value is the untagged residual).
@@ -3755,6 +3816,35 @@ The one device list behind every Performance drill: worst devices by a metric (d
 - **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
+### Application performance over time
+
+Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling is opt-in (`procperf_enabled`, off by default); a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
+
+> **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** any `(version, day)` point covering fewer than **10** devices (`kDexCohortFloor`) is suppressed — its stats are withheld and only `device_count` is honest (a sub-floor aggregate would single out an individual). This applies to **both** the fleet and the group endpoints.
+
+#### `GET /api/v1/dex/perf/apps`
+
+The picker: applications that currently have retained fleet data, so a worker discovers which `app=` values are answerable (A2 discoverability).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `{apps[], truncated}` where each app is `{app_name, versions, last_day}` (`versions` = distinct retained versions; `last_day` = most recent UTC-midnight epoch day with data). `truncated: true` when the distinct-app set exceeded the picker cap. `503` (with `retry_after_ms`) when the store provider is unwired or the read degrades. Not audited.
+
+#### `GET /api/v1/dex/perf/app`
+
+The fleet trend for one application — one point per `(version, UTC day)` over the B2 window (**up to 180 days**).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
+- **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
+
+#### `GET /api/v1/dex/perf/group`
+
+The same trend shape, aggregated **on-the-fly over one management group's member devices** (B1, **up to 31 days** — shorter than the fleet's 180-day B2 window, so a group series is shorter for the same app).
+
+- **Permission:** `GuaranteedState:Read`. Gated on the **global** permission (like the cohort surface), not the per-device scope gate: the global check excludes management-group-scoped-only principals, so only a fleet-wide-Read caller — who can already compute every fleet/cohort aggregate — reaches it. No cross-operator exposure.
+- **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
+- **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade. Not audited.
+
 #### `GET /api/v1/dex/devices/{id}`
 
 Per-device DEX read model — the machine-readable equivalent of the **DEX** lens on the `/device?id=` dashboard page.
@@ -3766,6 +3856,17 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
 - **Audit:** emits `dex.device.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the behavioral PII is served (audit-on-open). **Fail-closed:** if the audit row cannot persist (audit DB locked/full/corrupt), the endpoint returns `503` + `Sec-Audit-Failed: true` and serves **no** device data — serving audited PII while the evidence row is known-lost is exactly what audit-on-open prevents (SOC 2 CC7.2 / works-council).
 
+#### `GET /api/v1/dex/devices/{id}/app-perf`
+
+One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. This endpoint also backs the `/device` dashboard DEX drill's *Application performance over time* panel (same `dex.device.app_perf.view` verb, dashboard set-and-proceed posture); there is deliberately **no** MCP twin (MCP's set-and-proceed audit posture cannot express this REST fail-closed contract).
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameter:** `app` — optional display filter applied **in memory** to the device's returned rows (not a bound query parameter — the device's retained rows are fetched by `agent_id`, then narrowed by `app`), so there is no length/charset gate or `400` on it. Omitted = every resource-significant app-version on the device.
+- **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
+- **Headers:** `X-Correlation-Id` echoed on every response path.
+- **Audit:** emits `dex.device.app_perf.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the PII is served — kept a separate verb from `dex.device.view` / `dex.device.procperf.query` so usage-class reads stay separately countable for works-council evidence. Fail-closed as above.
+
 #### `POST /api/v1/dex/devices/{id}/live`
 
 Dispatches a read-only instruction to the live agent **now** and synchronously returns the result (~20 s). The machine-readable equivalent of the dashboard **"Get live info"** button. **POST, not GET** — it has a side effect (it dispatches a command), so it must not be fired speculatively by prefetchers/proxies/retry libraries.
@@ -3773,7 +3874,7 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
-- **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders nine additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all nine is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
+- **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders ten additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`, `disk`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all ten is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
 - **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path.
@@ -4453,6 +4554,8 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
+**Hardening (#1634, partial).** On a **corrupt or unavailable RBAC store**, these three readers fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of these readers for normal operators is **not yet effective**: a holder of global `Response:Read` sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
+
 ---
 
 ### Tags (Legacy)
@@ -4773,7 +4876,7 @@ Render the TAR dashboard page. Requires an authenticated session (302 redirect t
 
 #### `GET /fragments/tar/retention-paused`
 
-Render an HTML table fragment of the calling operator's most-recent TAR retention scan, scoped to the operator's visible-agent set. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources."
+Render an HTML table fragment of the calling operator's most-recent TAR retention scan. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources." **Scope caveat (ADR-0017):** this list gates on the *global* `Infrastructure:Read` permission — management-group confinement of this list/fan-out view is **not yet effective** (a confined operator is denied at the global gate rather than shown a narrowed list); when RBAC is disabled the list is the full enrolled fleet. Per-device confinement remains genuine only on the per-device `reenable` endpoint below.
 
 **Permission:** `Infrastructure:Read`.
 
@@ -4787,9 +4890,9 @@ Dispatch a `tar.status` command to the operator's visible-agent set and record t
 
 **Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
 
-**Request:** no parameters. Scope is implicitly the operator's visible-agent set; the operator cannot widen scope through this endpoint.
+**Request:** no parameters. The dispatch gates on the *global* `Execution:Execute` permission; management-group confinement of the dispatch target is **not yet effective** (ADR-0017 — a confined operator is denied at the global gate, not narrowed). When RBAC is disabled, the target is the full enrolled fleet.
 
-**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder if the operator has zero visible agents in scope.
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder.
 
 **Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
 
@@ -4990,6 +5093,16 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+
+**Additional read-only tools (post-Phase-1).** Beyond the Phase 1 set the server also exposes the DEX signal/perf, network, and inventory read tools. The **application-performance-over-time** tools (this release) are:
+
+| Tool | Description |
+|---|---|
+| `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
+| `get_dex_app_perf` | Fleet trend for one application, by version, over time |
+| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices) |
+
+All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

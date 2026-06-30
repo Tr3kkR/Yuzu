@@ -7,6 +7,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -49,10 +50,13 @@
 // explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
-// Baseline-anchored per-device Guardian status route borrows the BaselineStore.
+// Name-anchored per-device Guardian status route borrows the BaselineStore.
 // Forward-declared (used only as a pointer in register_routes); the .cpp includes
 // baseline_store.hpp for the definition.
 class BaselineStore;
+// ADR-0016: the typed daily-sync software store backs GET /api/v1/inventory/software.
+// Forward-declared (pointer-only in register_routes); the .cpp includes the header.
+class SoftwareInventoryStore;
 }
 
 #include <httplib.h>
@@ -95,12 +99,44 @@ public:
     /// source-stability of the other (unrelated) call sites — a route that requires
     /// this gate treats an unwired fn as misconfiguration and FAILS CLOSED (503); it
     /// does NOT silently fall back to the flat PermFn (that would re-introduce the
-    /// group-scoped lockout this typedef exists to fix). See the baseline-device route
-    /// in rest_api_v1.cpp for the fail-closed contract.
+    /// group-scoped lockout this typedef exists to fix). See the device-compliance
+    /// route in rest_api_v1.cpp for the fail-closed contract.
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
+    /// Per-device Inventory-scope predicate for the fleet-wide installed-software
+    /// read (GET /api/v1/inventory/software). Returns true iff `username` may see
+    /// `agent_id`'s rows via a management group. A FILTER, not a gate: unlike
+    /// ScopedPermFn it writes no response and is invoked per result row to drop
+    /// out-of-scope devices (the fleet query returns many agents). Mirrors the MCP
+    /// query_installed_software scope fn exactly (server.cpp wires the SAME
+    /// check_scoped_permission chokepoint). Empty/default `{}` = no filter
+    /// (legacy-open, matching the MCP default + require_scoped_permission).
+    /// NOTE (ADR-0017): wiring this does NOT close the #1676 cross-operator gap —
+    /// the filter is INERT under the global Inventory:Read gate (a confined operator
+    /// is denied at the gate before it runs; a global operator's filter is a no-op).
+    /// It is the foundation the ADR-0017 admit-then-filter list gate builds on (#1716).
+    using InventoryScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
+    /// Per-agent Response-scope predicate for the fan-out response/execution
+    /// readers (e.g. GET /api/v1/executions/{id}/visualization, which charts an
+    /// instruction's responses across every agent that replied). Returns true
+    /// iff `username` may see `agent_id`'s rows via a management group. A FILTER,
+    /// not a gate: it writes no response and is invoked per result row to drop
+    /// out-of-scope agents before the chart transform, exactly mirroring the MCP
+    /// query_responses scope fn (server.cpp wires the SAME check_scoped_permission
+    /// chokepoint, bound to ("Response","Read")). Empty/default `{}` = no filter
+    /// (legacy-open, matching the MCP default + require_scoped_permission) —
+    /// production wires it from server.cpp. NOTE (#1634): this filter is the
+    /// FOUNDATION for management-group scoping but is INERT under the current global
+    /// `Response:Read` gate — a global holder passes the gate and check_scoped_permission's
+    /// global step then admits every agent (no-op), while a management-group-confined
+    /// operator is 403'd at the gate before this runs. Its only active effect today is
+    /// failing CLOSED on a corrupt/load-failed rbac.db. It becomes effective once the
+    /// admit-then-filter gate for fan-out reads lands (the remaining #1634 work).
+    using ResponseScopeFn =
+        std::function<bool(const std::string& username, const std::string& agent_id)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -208,9 +244,21 @@ public:
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
         LockoutClearFn lockout_clear_fn = {},
-        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
+        // ADR-0016: typed installed-software store + its per-device Inventory-scope
+        // predicate for GET /api/v1/inventory/software (trailing optional deps;
+        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        SoftwareInventoryStore* software_inventory_store = nullptr,
+        InventoryScopeFn inventory_scope_fn = {},
+        // #1634: per-agent Response-scope predicate for the fan-out response
+        // readers (visualization). Trailing optional dep; MUST be wired from
+        // server.cpp — `{}` scope = unfiltered fan-out read.
+        ResponseScopeFn response_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -239,9 +287,21 @@ public:
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
         LockoutClearFn lockout_clear_fn = {},
-        // Baseline-anchored per-device Guardian status route (appended as a trailing
+        // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
-        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {});
+        BaselineStore* baseline_store = nullptr, ScopedPermFn scoped_perm_fn = {},
+        // ADR-0016: typed installed-software store + its per-device Inventory-scope
+        // predicate for GET /api/v1/inventory/software (trailing optional deps;
+        // both MUST be wired from server.cpp — `{}` scope = unfiltered fleet read).
+        SoftwareInventoryStore* software_inventory_store = nullptr,
+        InventoryScopeFn inventory_scope_fn = {},
+        // #1634: per-agent Response-scope predicate for the fan-out response
+        // readers (visualization). Trailing optional dep; MUST be wired from
+        // server.cpp — `{}` scope = unfiltered fan-out read.
+        ResponseScopeFn response_scope_fn = {},
+        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
+        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
+        AppPerfProviders app_perf_providers = {});
 };
 
 } // namespace yuzu::server

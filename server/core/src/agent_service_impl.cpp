@@ -14,9 +14,13 @@
 #include "grpc_audit_signal.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
+#include "app_perf_daily_store.hpp"
+#include "app_perf_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
+#include "software_inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -642,6 +646,81 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* context,
     response->mutable_server_time()->set_millis_epoch(now_ms);
 
     spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
+    return grpc::Status::OK;
+}
+
+// -- ReportInventory ----------------------------------------------------------
+
+grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
+                                               const pb::InventoryReport* request,
+                                               pb::InventoryAck* response) {
+    metrics_
+        .counter("yuzu_grpc_requests_total",
+                 {{"method", "ReportInventory"}, {"status", "received"}})
+        .increment();
+
+    if (auto s = reject_revoked_peer(context, "report_inventory"); !s.ok())
+        return s;
+
+    // Validate session → resolve agent_id (mirrors Heartbeat).
+    const auto& session_id = request->session_id();
+    std::string agent_id;
+    {
+        std::lock_guard lock(pending_mu_);
+        auto it = pending_by_session_id_.find(std::string(session_id));
+        if (it != pending_by_session_id_.end())
+            agent_id = it->second.agent_id;
+    }
+    if (agent_id.empty()) {
+        auto session = registry_.find_by_session(session_id);
+        if (session)
+            agent_id = session->agent_id;
+    }
+    if (agent_id.empty()) {
+        response->set_received(false);
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
+    }
+
+    response->set_received(true);
+
+    // Each typed source ingests through its own shared seam (ADR-0016 §5) — the SAME
+    // seam the gateway ProxyInventory path uses — independently guarded + isolated, so
+    // one store being down or one payload being bad can't fail the RPC into a retry
+    // loop. ack=received is already set, so a skipped ingest just defers to the next
+    // sync + the weekly full-floor.
+    //
+    // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
+    // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
+    // Both live sources (installed_software, app_perf) are TYPED and routed through
+    // their typed seams on both paths, so the two paths stay symmetric; a future
+    // GENERIC source must fold its upsert into ingest_inventory_report (pass the
+    // InventoryStore&), not add a parallel loop here.
+    if (software_inventory_store_ && software_inventory_store_->is_open()) {
+        try {
+            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response,
+                                    &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: inventory ingest threw for agent {} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: inventory ingest threw unknown exception for agent {} "
+                         "— acked",
+                         agent_id);
+        }
+    }
+    if (app_perf_daily_store_ && app_perf_daily_store_->is_open()) {
+        try {
+            ingest_app_perf_report(*app_perf_daily_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: app_perf ingest threw for agent {} — acked: {}", agent_id,
+                         ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: app_perf ingest threw unknown exception for agent {} — "
+                         "acked",
+                         agent_id);
+        }
+    }
+    spdlog::debug("ReportInventory from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
 }
 
@@ -1591,6 +1670,15 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // `agent-transition` SSE event and create an orphan agent_exec_status row
     // for a phantom execution. Skip; collate is the bundle's completion authority.
     if (execution_id.starts_with("bundle-"))
+        return;
+
+    // Pre-flight run correlation ids ("preflight-<run>-<check>", minted by
+    // PreflightRoutes / PreflightRunner) are the same case: the run re-dispatches
+    // each check under a stable per-check execution_id only so the grid can read
+    // responses back via query_by_execution. There is no ExecutionTracker row —
+    // the PreflightRunStore is the run's completion authority, NOT the executions
+    // drawer. Notifying here would publish phantom agent-transition events. Skip.
+    if (execution_id.starts_with("preflight-"))
         return;
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(

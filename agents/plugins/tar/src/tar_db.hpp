@@ -130,11 +130,13 @@ struct PerfRow {
 };
 
 /// One procperf_live row (BRD A2 — top-N per-application samples). One row
-/// per (tick, app); `name` is the image name only (never a command line).
+/// per (tick, app); `name` is the image name only (never a command line),
+/// `version` the on-disk image file version ("" if unresolved / off-Windows).
 struct ProcPerfRow {
     int64_t ts{0};
     int64_t snapshot_id{0};
     std::string name;
+    std::string version;
     int instances{0};
     double cpu_pct{0.0};
     int64_t ws_bytes{0};

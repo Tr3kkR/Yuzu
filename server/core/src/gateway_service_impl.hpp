@@ -28,6 +28,8 @@
 namespace yuzu::server {
 class ManagementGroupStore;
 class InventoryStore;
+class SoftwareInventoryStore;
+class AppPerfDailyStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -51,6 +53,10 @@ public:
 
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+    void set_software_inventory_store(SoftwareInventoryStore* store) {
+        software_inventory_store_ = store;
+    }
+    void set_app_perf_daily_store(AppPerfDailyStore* store) { app_perf_daily_store_ = store; }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
     // topology store so BatchHeartbeat ingests pushes from agents that
@@ -136,6 +142,8 @@ private:
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    SoftwareInventoryStore* software_inventory_store_{nullptr};
+    AppPerfDailyStore* app_perf_daily_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};

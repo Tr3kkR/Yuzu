@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <format>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -353,6 +354,10 @@ const char* live_snapshot_css() {
     .ls-po .po-head .t{font-size:.92rem;font-weight:700;color:var(--fg)}
     .ls-po .po-close{background:none;border:1px solid var(--border);color:var(--fg);border-radius:.35rem;padding:.2rem .55rem;cursor:pointer}
     .ls-po .po-body{padding:.6rem .8rem;max-height:76vh;overflow:auto}
+    .ls-bar{display:inline-block;width:84px;height:.5rem;background:var(--border);border-radius:.3rem;overflow:hidden;vertical-align:middle;margin-right:.4rem}
+    .ls-bar>span{display:block;height:100%;background:var(--accent)}
+    .ls-bar-warn>span{background:var(--yellow)}.ls-bar-bad>span{background:var(--red)}
+    .ls-barlbl{font-size:.64rem;color:var(--muted);font-variant-numeric:tabular-nums}
     </style>)CSS";
 }
 
@@ -376,6 +381,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += kpi("ls-kpi-listen", "Listening");
     h += kpi("ls-kpi-conn", "Connections");
     h += kpi("ls-kpi-users", "Users");
+    h += kpi("ls-kpi-disk", "Disk free");
     h += "</div>";
     // Hidden uptime loader: fills the Uptime KPI (uptime has no card of its own).
     h += "<div style=\"display:none\" hx-get=\"/fragments/device/live/run?id=" + e +
@@ -409,6 +415,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
+    h += card("disk", "Disk space", "", "system volume only");
     h += "</div></div>";
     return h;
 }
@@ -792,6 +799,54 @@ std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows) {
              (r.gateway.empty() ? "<span class=\"gp-mute\">&mdash;</span>"
                                 : "<code>" + esc(r.gateway) + "</code>") +
              "</td></tr>";
+    h += "</tbody></table>";
+    return h;
+}
+
+std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
+    if (rows.empty())
+        return "<div class=\"gp-note\">No volume reported (the path may not exist on this "
+               "device).</div>";
+    // Bytes → "NN.N GiB" / "NN.N TiB" for display only (raw bytes stay on the wire).
+    auto human = [](long long b) {
+        if (b < 0) b = 0;
+        const char* unit[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
+        double v = static_cast<double>(b);
+        int i = 0;
+        while (v >= 1024.0 && i < 5) { v /= 1024.0; ++i; }
+        // Two literal format strings — std::format needs a consteval format arg.
+        return i == 0 ? std::format("{:.0f} {}", v, unit[i])
+                      : std::format("{:.1f} {}", v, unit[i]);
+    };
+    // < 5 GiB free latches red even below 90% used — the same threshold SHAPE the
+    // storage.low DEX signal uses (>= 90% used OR < 5 GiB free; dex_win_poll). Note
+    // this aligns the *thresholds*, not necessarily the *inputs*: the plugin's free
+    // is caller-quota (Windows FreeBytesAvailableToCaller / POSIX f_bavail), so under
+    // a per-user NTFS/FSRM quota it can read below storage.low's volume-wide basis.
+    constexpr long long kLowFreeBytes = 5LL * 1024 * 1024 * 1024;
+    std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Volume</th>"
+                    "<th class=\"ls-num\">Size</th><th class=\"ls-num\">Free</th>"
+                    "<th>Used</th></tr></thead><tbody>";
+    for (const auto& r : rows) {
+        int pct = r.percent_used;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        std::string used_cell;
+        if (r.total <= 0) {
+            // Unmeasured volume (f_frsize==0 / unreadable / forged) — never render
+            // a "0% used / 100% free" green bar off a row we couldn't measure.
+            used_cell = "<span class=\"gp-mute\">&mdash;</span>";
+        } else {
+            const char* tone =
+                (pct >= 90 || r.free < kLowFreeBytes) ? "bad" : pct >= 75 ? "warn" : "ok";
+            used_cell = "<div class=\"ls-bar ls-bar-" + std::string(tone) +
+                        "\"><span style=\"width:" + std::to_string(pct) +
+                        "%\"></span></div><span class=\"ls-barlbl\">" + std::to_string(pct) + "%</span>";
+        }
+        h += "<tr><td class=\"name\"><code>" + esc(r.path) + "</code></td><td class=\"ls-num\">" +
+             esc(human(r.total)) + "</td><td class=\"ls-num\">" + esc(human(r.free)) + "</td><td>" +
+             used_cell + "</td></tr>";
+    }
     h += "</tbody></table>";
     return h;
 }
