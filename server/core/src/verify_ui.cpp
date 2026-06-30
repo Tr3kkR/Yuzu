@@ -9,7 +9,6 @@
 #include "web_utils.hpp" // html_escape
 
 #include <array>
-#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -46,7 +45,10 @@ std::string fmt_bytes(double b) {
 
 std::string fmt_signed_bytes(std::int64_t v) {
     const char* sign = v > 0 ? "+" : (v < 0 ? "\xE2\x88\x92" : ""); // − (U+2212) for negatives
-    return std::string(sign) + fmt_bytes(static_cast<double>(v < 0 ? -v : v));
+    // Negate in double, not int64 — `-v` is UB at INT64_MIN (unreachable given the
+    // store's ±2^50 ws clamp, but the negation is a latent trap if it ever widens).
+    const double mag = v < 0 ? -static_cast<double>(v) : static_cast<double>(v);
+    return std::string(sign) + fmt_bytes(mag);
 }
 
 // CPU delta direction class (matches the engine's flat band).
@@ -156,10 +158,7 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
                                  const std::string& app, const std::string& baseline,
                                  const std::string& candidate, int window,
                                  const std::string& drill_url) {
-    std::int64_t accounted = c.paired + c.baseline_only + c.candidate_only;
-    std::int64_t no_data = cohort_size - accounted;
-    if (no_data < 0)
-        no_data = 0;
+    const std::int64_t no_data = cohort_no_data(c, cohort_size);
     const std::int64_t unpaired = c.baseline_only + c.candidate_only;
 
     std::string h;
@@ -247,7 +246,7 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
     h += "<div class=\"vf-sech\">Per-machine pairs</div>";
     h += "<div class=\"gp-mute\" style=\"font-size:.72rem;margin-bottom:.4rem\">Opening the "
          "per-machine table records a <span class=\"v\" style=\"font-family:ui-monospace,Consolas,"
-         "monospace;color:#a5d6ff\">dex.device.app_perf.view</span> access-audit row.</div>";
+         "monospace;color:#a5d6ff\">dex.app_perf.compare.drill</span> access-audit row.</div>";
     h += "<button class=\"gp-chip\" style=\"cursor:pointer\" hx-get=\"" + esc(drill_url) +
          "\" hx-target=\"#verify-drill\" hx-swap=\"innerHTML\">Show per-machine pairs</button>";
     h += "<div id=\"verify-drill\" style=\"margin-top:.5rem\"></div>";

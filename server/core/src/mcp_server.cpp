@@ -3022,10 +3022,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const PairedComparison c =
                     build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                                      yuzu::util::canon_version(candidate), window);
-                std::int64_t no_data =
-                    cohort->member_count - (c.paired + c.baseline_only + c.candidate_only);
-                if (no_data < 0)
-                    no_data = 0;
+                const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
                 const std::string cpu = JObj()
                                             .add("before_mean", c.cpu_before_mean)
                                             .add("after_mean", c.cpu_after_mean)

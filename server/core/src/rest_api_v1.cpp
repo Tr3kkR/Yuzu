@@ -6809,10 +6809,7 @@ void RestApiV1::register_routes(
             const PairedComparison c =
                 build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                                  yuzu::util::canon_version(candidate), window);
-            const std::int64_t accounted = c.paired + c.baseline_only + c.candidate_only;
-            std::int64_t no_data = cohort->member_count - accounted;
-            if (no_data < 0)
-                no_data = 0;
+            const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
 
             const std::string cpu = JObj()
                                         .add("before_mean", c.cpu_before_mean)

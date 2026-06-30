@@ -21,14 +21,14 @@ namespace yuzu::server {
 /// PURE: the VERIFY config form (group dropdown + app/baseline/candidate inputs +
 /// window) and an empty results container. `groups` = (id, name) for the cohort
 /// dropdown. Inlines the `.vf-*` CSS once (this fragment loads with the page).
-std::string render_verify_config(const std::vector<std::pair<std::string, std::string>>& groups);
+[[nodiscard]] std::string render_verify_config(const std::vector<std::pair<std::string, std::string>>& groups);
 
 /// PURE: the aggregate result — factual summary line, the per-metric shift cards
 /// (baseline mean → candidate mean + median per-machine delta), the up/flat/down
 /// distribution, and a "Show per-machine pairs" button (hx-get `drill_url`, the
 /// audited per-device surface). A small (sub-floor) cohort gets an "indicative"
 /// note; an empty/insufficient cohort gets an honest note instead of fabricated 0s.
-std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_size,
+[[nodiscard]] std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_size,
                                  const std::string& app, const std::string& baseline,
                                  const std::string& candidate, int window,
                                  const std::string& drill_url);
@@ -36,9 +36,9 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
 /// PURE: the per-machine pairs table (the audited drill) — device, CPU before/after/Δ,
 /// WS before/after/Δ, samples; largest CPU mover first. Per-device behavioural data,
 /// so the route audits its open.
-std::string render_verify_drill(const PairedComparison& c);
+[[nodiscard]] std::string render_verify_drill(const PairedComparison& c);
 
 /// PURE: an honest note body (degrade, no provider, no group selected, etc.).
-std::string render_verify_note(const std::string& message);
+[[nodiscard]] std::string render_verify_note(const std::string& message);
 
 } // namespace yuzu::server

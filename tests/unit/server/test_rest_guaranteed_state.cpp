@@ -1405,6 +1405,38 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         // EVIDENTIAL — there must be NO verdict/pass/fail field.
         CHECK_FALSE(j["data"].contains("verdict"));
         CHECK_FALSE(j["data"].contains("pass"));
+        // The read IS audited (the accountability that replaces the absent floor).
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "dex.app_perf.compare");
+    }
+    SECTION("audit drop → 200 set-and-proceed + Sec-Audit-Failed (aggregate has no PII)") {
+        RestGsHarness h;
+        h.audit_succeeds = false; // simulate a lost evidence row
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        cr.rows = {
+            {"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500},
+            {"m2", "4.2.0.0", 10, 100, 3.0, 1000}, {"m2", "4.3.0.0", 11, 100, 4.0, 1100},
+        };
+        h.cohort_read_ = cr;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 200); // operational set-and-proceed, NOT fail-closed
+        CHECK(res->has_header("Sec-Audit-Failed"));
+        CHECK(nlohmann::json::parse(res->body)["data"]["paired"].get<int64_t>() == 2);
+    }
+    SECTION("perm denied → 403 BEFORE the cohort read or audit") {
+        RestGsHarness h;
+        h.grant_perms = false;
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        h.cohort_read_ = cr;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audit_log.empty()); // gate runs first — no read, no audit
     }
 }
 

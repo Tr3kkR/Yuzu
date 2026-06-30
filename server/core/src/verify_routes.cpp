@@ -158,6 +158,14 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                             "text/html");
             return;
         }
+        // Same baseline!=candidate reject as /run + REST + MCP — a direct /drill hit
+        // with equal versions would self-pair every machine (all-zero deltas).
+        if (yuzu::util::canon_version(baseline) == yuzu::util::canon_version(candidate)) {
+            res.set_content(
+                render_verify_note("Baseline and candidate must be two different versions."),
+                "text/html");
+            return;
+        }
         const int window = parse_window(req);
         if (!cohort_fn_) {
             res.set_content(render_verify_note("The app-perf store is still warming up; retry."),
@@ -171,13 +179,16 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                 "text/html");
             return;
         }
-        // The per-machine view IS the behavioural-PII access → audited on open
-        // (set-and-proceed on the HTML surface; the header flags a lost row).
+        // The per-machine view IS the behavioural-PII access → its OWN verb
+        // (`dex.app_perf.compare.drill`, distinct from the identity-free aggregate's
+        // `dex.app_perf.compare`) so works-council per-machine-PII access stays
+        // independently countable. Set-and-proceed on the HTML surface; the header
+        // flags a lost row.
         const auto cid = detail::make_correlation_id();
-        detail::emit_behavioral_audit(audit_fn_, req, res, "dex.app_perf.compare", "success",
+        detail::emit_behavioral_audit(audit_fn_, req, res, "dex.app_perf.compare.drill", "success",
                                       "GuaranteedState", group,
                                       "app=" + app + " base=" + baseline + " cand=" + candidate +
-                                          " view=per_machine cid=" + cid);
+                                          " cid=" + cid);
         const PairedComparison c =
             build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                              yuzu::util::canon_version(candidate), window);

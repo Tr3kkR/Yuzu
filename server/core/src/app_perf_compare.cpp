@@ -6,10 +6,20 @@
 #include <cmath>
 #include <map>
 #include <unordered_map>
+#include <utility>
 
 namespace yuzu::server {
 
 namespace {
+
+/// Map a non-finite double (NaN/Inf) to 0.0. The store clamps B1 `cpu_avg` finite
+/// at ingest, so this is unreachable through the authenticated agent→B1→reader
+/// chain TODAY — but `compare()` is documented as the seam a future LIVE candidate
+/// (fan-out procperf) feeds directly, bypassing the store clamp, and a NaN reaching
+/// either `std::sort` below would be undefined behaviour (NaN breaks strict-weak
+/// ordering → OOB read). Sanitising at the scalar boundary closes it independent of
+/// the upstream writer (gov 2026-06-30, convergent finding from 5 reviewers).
+double finite_or_zero(double v) { return std::isfinite(v) ? v : 0.0; }
 
 /// PURE: the p-th percentile (p in [0,1]) of a scalar sample by the platform
 /// nearest-rank DIRECTION — rank `r = ceil(p·n)`, clamped to `[1, n]`, value of
@@ -75,10 +85,11 @@ std::vector<MachineVersionScalar> reduce_version_window(const std::vector<AppPer
         std::int64_t samples = 0;
         for (std::size_t i = 0; i < take; ++i) {
             const AppPerfCohortRow& r = *recs[i];
+            const double cpu = finite_or_zero(r.cpu_avg); // NaN/Inf → 0 (sort-UB defence)
             const double w = static_cast<double>(r.samples > 0 ? r.samples : 0);
-            cpu_ws += r.cpu_avg * w;
+            cpu_ws += cpu * w;
             ws_ws += static_cast<double>(r.ws_avg_bytes) * w;
-            cpu_uw += r.cpu_avg;
+            cpu_uw += cpu;
             ws_uw += static_cast<double>(r.ws_avg_bytes);
             samples += (r.samples > 0 ? r.samples : 0);
         }
@@ -133,9 +144,14 @@ PairedComparison compare(const std::vector<MachineVersionScalar>& baseline,
         const MachineVersionScalar& c = *it->second;
         MachinePair p;
         p.agent_id = b.agent_id;
-        p.cpu_before = b.cpu;
-        p.cpu_after = c.cpu;
-        p.cpu_delta = c.cpu - b.cpu;
+        // Sanitise at the scalar boundary: a LIVE candidate (slice 2) feeds these
+        // scalars to compare() directly, bypassing the B1 store's NaN clamp; a
+        // non-finite cpu would make the cpu_delta sort below UB.
+        const double cb = finite_or_zero(b.cpu);
+        const double ca = finite_or_zero(c.cpu);
+        p.cpu_before = cb;
+        p.cpu_after = ca;
+        p.cpu_delta = ca - cb;
         p.ws_before = b.ws;
         p.ws_after = c.ws;
         p.ws_delta = c.ws - b.ws;
@@ -193,6 +209,11 @@ PairedComparison build_comparison(const std::vector<AppPerfCohortRow>& rows,
     return compare(reduce_version_window(rows, baseline_version, window_days),
                    reduce_version_window(rows, candidate_version, window_days), baseline_version,
                    candidate_version, window_days);
+}
+
+std::int64_t cohort_no_data(const PairedComparison& c, std::int64_t member_count) {
+    const std::int64_t nd = member_count - (c.paired + c.baseline_only + c.candidate_only);
+    return nd < 0 ? 0 : nd;
 }
 
 } // namespace yuzu::server

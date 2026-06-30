@@ -112,5 +112,8 @@ and MCP `compare_app_perf_versions` return the aggregate (no per-machine identit
 | Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
 Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
-`preflight.run` and `preflight.run.delete`. A Verify comparison (aggregate read and
-the per-machine drill) is recorded as `dex.app_perf.compare`.
+`preflight.run` and `preflight.run.delete`. A Verify aggregate comparison is recorded
+as `dex.app_perf.compare`; opening the per-machine pairs carries its own
+`dex.app_perf.compare.drill` verb so per-machine access stays separately countable.
+(Over MCP, `compare_app_perf_versions` is recorded under the generic
+`mcp.compare_app_perf_versions` tool-call audit.)

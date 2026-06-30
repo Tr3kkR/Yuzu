@@ -1408,6 +1408,29 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
     }
 }
 
+TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInternalError",
+          "[mcp][integration][dex][app_perf][verify]") {
+    const char* call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})";
+    SECTION("cohort provider unwired → kInternalError") {
+        McpTestServer ts; // app_perf_providers_for_test.cohort left null
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(ts.call(call)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    SECTION("AUTHORITATIVE degrade (cohort read nullopt) → kInternalError") {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.cohort =
+            [](std::string_view, std::string_view, std::string_view, std::string_view)
+            -> std::optional<yuzu::server::CohortRead> { return std::nullopt; };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(ts.call(call)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+}
+
 TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",
           "[mcp][integration][dex][app_perf]") {
     // The fleet path floors too now — a sub-floor (version,day) point must serialize

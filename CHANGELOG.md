@@ -27,8 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compare_app_perf_versions`, and the `/auto` dashboard VERIFY stage (aggregate cards + distribution
   + an audited per-machine drill). Pure engine `app_perf_compare` (reducer + `compare` split so a
   later *live* candidate plugs the same slot); B1 cohort read `app_perf_cohort_reader` (agent_id
-  preserved). Deferred: per-version crashes/hangs (the central crash-store join), live
-  measure-right-after-deploy (fan-out procperf), and the deploy→verify cohort auto-fill.
+  preserved). The per-machine pairs are a **dashboard-only** audited drill
+  (`dex.app_perf.compare.drill`); REST/MCP expose only the identity-free aggregate.
+  Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
+  central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
+  deploy→verify cohort auto-fill.
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the

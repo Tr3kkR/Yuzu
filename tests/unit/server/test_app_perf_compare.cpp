@@ -18,6 +18,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -207,4 +209,61 @@ TEST_CASE("build_comparison: the single assembly == reduce×2 + compare", "[veri
     CHECK(built.cpu_after_mean == Approx(direct.cpu_after_mean));
     CHECK(built.moved_up == direct.moved_up);
     REQUIRE(built.pairs.size() == direct.pairs.size());
+    // pairs sorted by descending CPU delta (m1 Δ+3.0 before m2 Δ+1.0)
+    REQUIRE(built.pairs.size() == 2);
+    CHECK(built.pairs.front().agent_id == "m1");
+    CHECK(built.pairs.front().cpu_delta >= built.pairs.back().cpu_delta);
+}
+
+TEST_CASE("reduce/compare: non-finite cpu is sanitized — no std::sort UB", "[verify][compare]") {
+    // A hostile agent (or a future LIVE candidate bypassing the store clamp) could
+    // present NaN/Inf cpu. The engine must sanitize to finite so the cpu_delta sorts
+    // are valid strict-weak-orders (a NaN would be sort UB).
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<AppPerfCohortRow> rows = {
+        row("m1", "A", 10, 100, nan, 1000), row("m1", "B", 11, 100, inf, 1500),
+        row("m2", "A", 10, 100, 2.0, 1000), row("m2", "B", 11, 100, 5.0, 1500),
+    };
+    for (const auto& s : reduce_version_window(rows, "A", 7))
+        CHECK(std::isfinite(s.cpu));
+    auto c = build_comparison(rows, "A", "B", 7); // must not UB-sort
+    CHECK(c.paired == 2);
+    for (const auto& p : c.pairs) {
+        CHECK(std::isfinite(p.cpu_before));
+        CHECK(std::isfinite(p.cpu_after));
+        CHECK(std::isfinite(p.cpu_delta));
+    }
+    CHECK(std::isfinite(c.cpu_delta_median));
+    CHECK(std::isfinite(c.cpu_after_mean));
+}
+
+TEST_CASE("reduce_version_window: window_days <= 0 is treated as 1", "[verify][compare]") {
+    std::vector<AppPerfCohortRow> rows = {row("m1", "A", 10, 100, 1.0, 0),
+                                          row("m1", "A", 11, 100, 9.0, 0)};
+    auto a = reduce_version_window(rows, "A", 0); // → 1 day = most recent (day 11)
+    REQUIRE(a.size() == 1);
+    CHECK(a[0].day_count == 1);
+    CHECK(a[0].cpu == Approx(9.0));
+}
+
+TEST_CASE("compare: a duplicate agent within one side takes the first (defence)",
+          "[verify][compare]") {
+    // {agent_id, cpu, ws, samples, day_count}
+    std::vector<MachineVersionScalar> base = {{"m1", 2.0, 1000, 100, 1}, {"m1", 9.0, 9000, 100, 1}};
+    std::vector<MachineVersionScalar> cand = {{"m1", 5.0, 1500, 100, 1}};
+    auto c = compare(base, cand, "A", "B", 7);
+    CHECK(c.paired == 1);
+    REQUIRE(c.pairs.size() == 1);
+    CHECK(c.pairs[0].cpu_before == Approx(2.0)); // first wins, not 9.0
+}
+
+TEST_CASE("cohort_no_data: accounts members with no data, clamped >= 0", "[verify][compare]") {
+    PairedComparison c;
+    c.paired = 3;
+    c.baseline_only = 1;
+    c.candidate_only = 1; // accounted = 5
+    CHECK(cohort_no_data(c, 10) == 5);
+    CHECK(cohort_no_data(c, 5) == 0);
+    CHECK(cohort_no_data(c, 4) == 0); // negative clamps to 0
 }

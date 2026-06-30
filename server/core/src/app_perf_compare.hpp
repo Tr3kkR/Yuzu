@@ -164,4 +164,11 @@ compare(const std::vector<MachineVersionScalar>& baseline,
                                                 std::string_view baseline_version,
                                                 std::string_view candidate_version, int window_days);
 
+/// PURE: cohort members with NO app-perf data for either version =
+/// `member_count - paired - baseline_only - candidate_only`, clamped to >= 0. The
+/// ONE place this derived count is computed so REST, MCP and the dashboard agree
+/// (it was otherwise re-derived inline at each surface). `member_count` comes from
+/// the provider (the group's resolved size), not the engine.
+[[nodiscard]] std::int64_t cohort_no_data(const PairedComparison& c, std::int64_t member_count);
+
 } // namespace yuzu::server
