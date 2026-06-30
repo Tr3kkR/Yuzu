@@ -600,8 +600,11 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     // window elapses; idle-out fires within [window - granularity, window] of the
     // last request). Sub-4s windows floor the granularity at 0 → touch every
     // request (test/degenerate windows; correctness preserved, no throttle gain).
+    // (std::min) is parenthesised to dodge the `min` function-like macro that
+    // <windows.h> leaks on MSVC (without it: C2589 "illegal token '(' on right
+    // side of '::'"). Portable; a no-op elsewhere.
     const auto touch_granularity =
-        idle_enabled ? std::min(session_inactivity_ / 4, std::chrono::seconds(30))
+        idle_enabled ? (std::min)(session_inactivity_ / 4, std::chrono::seconds(30))
                      : std::chrono::seconds(0);
     const bool need_touch = idle_enabled && !idle_expired &&
                             (now - it->second.last_activity_at >= touch_granularity);
@@ -666,9 +669,10 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
 
         // Snapshot-and-release: the AuthDB mirror write happens OUTSIDE mu_
         // (AuthDB invariant — never call a sibling subsystem under the lock).
-        // Best-effort: touch_session_activity is fail-silent.
+        // Best-effort: touch_session_activity is fail-silent — discard the
+        // [[nodiscard]] std::expected (MSVC /W4 C4834 otherwise).
         if (persist && auth_db_)
-            auth_db_->touch_session_activity(token);
+            (void)auth_db_->touch_session_activity(token);
     }
 
     return session_copy;
