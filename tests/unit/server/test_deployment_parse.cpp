@@ -62,12 +62,13 @@ TEST_CASE("config_valid enforces artifact constraints", "[deployment][parse]") {
         CHECK_FALSE(config_valid(c, &why));
         CHECK(why.find("URL") != std::string::npos);
     }
-    SECTION("filename with a path separator is rejected") {
+    SECTION("filename with a path separator or .. is rejected") {
         DeploymentConfig c = ok;
         c.filename = "../evil.msi";
         CHECK_FALSE(config_valid(c));
         CHECK_FALSE(is_valid_filename("a/b"));
         CHECK_FALSE(is_valid_filename("a\\b"));
+        CHECK_FALSE(is_valid_filename("..hidden.msi")); // ".." even without a separator
         CHECK(is_valid_filename("Pkg-4.2.0_x64.msi"));
     }
     SECTION("sha256 must be 64 hex") {
@@ -78,11 +79,16 @@ TEST_CASE("config_valid enforces artifact constraints", "[deployment][parse]") {
         CHECK_FALSE(is_valid_sha256(std::string(64, 'g'))); // non-hex
         CHECK(is_valid_sha256(std::string(64, 'A')));        // case-insensitive
     }
-    SECTION("args reject shell metacharacters") {
+    SECTION("args reject shell metacharacters but allow real Windows paths") {
         DeploymentConfig c = ok;
         c.args = "/qn & calc.exe";
         CHECK_FALSE(config_valid(c, &why));
         CHECK(why.find("args") != std::string::npos);
+        CHECK_FALSE(is_valid_args("/x $(whoami)")); // $ and ( ) blocked
+        CHECK_FALSE(is_valid_args("a | b"));        // pipe blocked
+        // not stricter than the agent: backslash / = : / space stay legal
+        CHECK(is_valid_args("/D C:\\Program Files\\App /qn"));
+        CHECK(is_valid_args("/log=C:\\temp\\install.log"));
         CHECK(is_valid_args("/qn /norestart"));
         CHECK(is_valid_args("")); // optional
     }

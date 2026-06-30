@@ -97,10 +97,12 @@ struct DeploymentConfig {
 
 // ── Server-side input validation (before ANY dispatch) ───────────────────────
 
-/// Mirrors content_dist's `is_safe_filename`: non-empty, alphanumeric + `.`/`-`/`_`
-/// only. We reject here too so a malformed name never reaches a frozen run.
+/// Mirrors content_dist's `is_safe_filename`: non-empty, no `..`, alphanumeric +
+/// `.`/`-`/`_` only. We reject here too so a malformed name never reaches a frozen run.
 inline bool is_valid_filename(std::string_view f) {
     if (f.empty() || f.size() > 255)
+        return false;
+    if (f.find("..") != std::string_view::npos)
         return false;
     for (char c : f) {
         const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -139,29 +141,40 @@ inline bool is_valid_url(std::string_view u) {
     return true;
 }
 
-/// execute_staged's args go through content_dist's `is_safe_arg` (shell-metachar
-/// reject) on the agent; we pre-reject control bytes + obvious metacharacters so a
-/// bad value is caught at config time, not after a frozen run is already running.
+/// execute_staged's args go through content_dist's `is_safe_arg` on the agent; we
+/// pre-reject the SAME set here so a bad value is caught at config time, not after a
+/// frozen run is running. Mirrors `is_safe_arg` EXACTLY (so the server is never
+/// stricter than the agent — backslash, `=`, `:`, `/`, space stay ALLOWED for real
+/// Windows path args like `/D C:\foo`) plus a NUL guard.
 inline bool is_valid_args(std::string_view a) {
     if (a.size() > 1024)
         return false;
     for (char c : a) {
-        if (static_cast<unsigned char>(c) < 0x20)
-            return false;
-        // mirror the agent's blocked shell metacharacters (defence-in-depth)
         switch (c) {
+        case ';':
         case '&':
         case '|':
-        case ';':
-        case '<':
-        case '>':
         case '`':
         case '$':
-        case '\\':
+        case '(':
+        case ')':
+        case '{':
+        case '}':
+        case '<':
+        case '>':
+        case '!':
+        case '~':
+        case '^':
         case '"':
         case '\'':
+        case '#':
+        case '*':
+        case '?':
+        case '[':
+        case ']':
         case '\n':
         case '\r':
+        case '\0':
             return false;
         default:
             break;
