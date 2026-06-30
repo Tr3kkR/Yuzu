@@ -1349,20 +1349,38 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
 // can't introspect the agent collectors, so the emitted set is pinned here; when
 // collectors are added or removed, update BOTH the collector and the set below in
 // the same change (that conscious edit is the point). ──
-TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
+TEST_CASE("dex coverage map matches the emitted signal set (Linux + macOS)",
           "[dex][coverage]") {
-    // What a Linux agent emits today: dex_linux_proc + dex_linux_storage polls and
-    // dex_linux_journal mappings. The expanded kmsg/sysfs set arrives with #1523.
+    // What a Linux agent emits today — dex_linux_collector drives all of these: poll_perf
+    // (the /proc CPU + memory + diskstats breach trio — perf.disk_latency_high is the
+    // /proc/diskstats await breach, as live as cpu/mem on ordinary disks) + statvfs
+    // storage (dex_linux_proc/storage), the sysfs throttle counter (dex_linux_sysfs), and
+    // the journald poll (dex_linux_journal), whose _TRANSPORT=kernel lines are classified
+    // by dex_linux_kmsg::classify_kernel_message. The server suite can't introspect the
+    // agent collectors, so this set is pinned by hand — keep it in lockstep.
     const std::set<std::string> kLinuxEmitted = {
-        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
-        "process.crashed",    "service.crashed",      "memory.exhausted"};
+        "perf.cpu_sustained", "perf.memory_pressure",  "perf.disk_latency_high", "storage.low",
+        "os.uptime_report",   "hw.cpu_throttled",      "process.crashed",        "service.crashed",
+        "service.hung",       "os.time_unsynced",      "memory.exhausted",       "os.bugcheck",
+        "os.dirty_shutdown",  "disk.error",            "fs.corruption",          "hw.error",
+        "process.hung"};
+    // What a macOS agent emits today — dex_macos_collector drives oslog + iokit +
+    // signals/uptime. NOTE: process.resource_limit is also emitted but is NOT yet in
+    // the catalogue taxonomy (it surfaces under "Other"); adding it to a family needs
+    // the catalogued⇒Windows assumption relaxed, so it is correctly absent here for now.
+    const std::set<std::string> kMacEmitted = {
+        "process.crashed",  "process.hung",       "os.bugcheck",       "memory.exhausted",
+        "os.uptime_report", "disk.smart_failure", "hw.error",          "storage.low",
+        "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
+        "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
 
     auto claims = [](const std::string& obs_type, const char* os) {
         const auto p = dex_obs_platforms(obs_type);
         return std::find(p.begin(), p.end(), os) != p.end();
     };
 
-    // Overclaim guard: every catalogued type the map marks "linux" must be emitted.
+    // Overclaim guard: every catalogued type the map marks for a platform must be in
+    // that platform's emitted set — never advertise a signal nothing collects.
     for (const auto& g : dex_signal_groups()) {
         for (const char* t : g.types) {
             if (claims(t, "linux")) {
@@ -1370,13 +1388,22 @@ TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
                      << t << "' but no Linux collector emits it (see dex_obs_platforms)");
                 CHECK(kLinuxEmitted.count(t) == 1);
             }
+            if (claims(t, "macos")) {
+                INFO("coverage map claims macOS collects '"
+                     << t << "' but no macOS collector emits it (see dex_obs_platforms)");
+                CHECK(kMacEmitted.count(t) == 1);
+            }
         }
     }
 
-    // Underclaim guard: every emitted Linux signal is actually advertised.
+    // Underclaim guard: every emitted signal is actually advertised by the map.
     for (const auto& t : kLinuxEmitted) {
         INFO("emitted Linux signal '" << t << "' is missing from the coverage map");
         CHECK(claims(t, "linux"));
+    }
+    for (const auto& t : kMacEmitted) {
+        INFO("emitted macOS signal '" << t << "' is missing from the coverage map");
+        CHECK(claims(t, "macos"));
     }
 
     // Windows is the whole EvtSubscribe catalogue — always present and first.
