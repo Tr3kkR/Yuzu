@@ -98,6 +98,57 @@ TEST_CASE("core_identity_unavailable: AND of manufacturer+model unknown", "[sync
     CHECK(core_identity_unavailable(r)); // both unknown → WMI/DMI wholesale down → skip
 }
 
+TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+    CiPluginOutputs o;
+    o.manufacturer = "manufacturer|Dell Inc.";
+    o.model = "model|Latitude 7420";
+    o.system = "serial|ABC123\nsystem_uuid|UUID-1";
+    o.bios = "bios_vendor|Dell Inc.\nbios_version|1.27.0\nbios_date|2024-03-15";
+    o.processors = "cpu|0|Intel i7|4|8|2800\ncpu|1|Intel i7|4|8|2800"; // two sockets → summed
+    o.memory = "dimm|DIMM0|8192|DDR4|3200\ndimm|DIMM1|8192|DDR4|3200"; // 16384 MB → bytes
+    o.disks = "disk|0|Samsung SSD|512|SSD|NVMe\n"
+              "disk|1|unknown|0|unknown|unknown"; // sentinel row skipped
+    o.device_name = "device_name|WS-001";
+    o.domain = "domain|corp.example";
+    o.ou = "ou|OU=Laptops";
+    o.os_name = "os_name|Windows 11 Pro";
+    o.os_version = "os_version|10.0.22631";
+    o.os_build = "os_build|22631";
+    o.os_arch = "os_arch|x86_64";
+    o.adapters = "adapter|eth0|aa:bb:cc:dd:ee:ff|1000|up\n"
+                 "adapter|eth1|00:11:22:33:44:55|1000|up\n"
+                 "adapter|eth2|aa:bb:cc:dd:ee:ff|0|down\n"  // duplicate MAC → deduped
+                 "adapter|lo|00:00:00:00:00:00|0|up";       // all-zero MAC → dropped
+
+    auto r = build_device_ci_record(o);
+    CHECK(r.manufacturer == "Dell Inc.");
+    CHECK(r.serial == "ABC123");
+    CHECK(r.system_uuid == "UUID-1");
+    CHECK(r.cpu_model == "Intel i7");
+    CHECK(r.cpu_cores == "8");                                    // 4 + 4
+    CHECK(r.cpu_threads == "16");                                 // 8 + 8
+    CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024)); // summed DIMMs → bytes
+    CHECK(r.disks_summary == "Samsung SSD 512 SSD");             // sentinel skipped
+    CHECK(r.nic_count == "2");                                    // dedup + zero-MAC dropped
+    CHECK(r.primary_mac == "00:11:22:33:44:55");                 // sorted first
+    CHECK(r.macs_summary == "00:11:22:33:44:55,aa:bb:cc:dd:ee:ff");
+    CHECK(r.os_name == "Windows 11 Pro");
+    CHECK(r.arch == "x86_64");
+    CHECK(!core_identity_unavailable(r)); // real manufacturer + model → not skipped
+
+    SECTION("wholesale identity outage → manufacturer+model 'unknown' → skip predicate fires") {
+        CiPluginOutputs down;
+        down.manufacturer = "manufacturer|unknown";
+        down.model = "model|unknown"; // other actions absent → scalar() yields ""
+        auto rr = build_device_ci_record(down);
+        CHECK(rr.manufacturer == "unknown");
+        CHECK(rr.model == "unknown");
+        CHECK(core_identity_unavailable(rr));
+    }
+}
+
 TEST_CASE("device_ci source idles when a required plugin is missing", "[sync][device_ci]") {
     SECTION("all descriptors null → collect returns nullopt (no partial CI record)") {
         auto src = make_device_ci_source(nullptr, nullptr, nullptr, nullptr);

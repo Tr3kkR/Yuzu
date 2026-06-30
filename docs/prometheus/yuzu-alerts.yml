@@ -446,20 +446,21 @@ groups:
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
-          sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason) > 0
+          sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Installed-software reads degrading ({{ $labels.reason }})"
+          summary: "Inventory reads degrading (source={{ $labels.source }}, {{ $labels.reason }})"
           description: >-
-            yuzu_inventory_read_degrade_total{reason="{{ $labels.reason }}"} is
-            non-zero: a fleet/agent software query returned a degrade (no data)
-            rather than a result. pool_acquire_timeout/query_error correlate with
-            yuzu_pg_* saturation or outage; store_not_open means the store failed to
-            open at boot. A fleet vulnerability query ("which devices run <CVE>")
-            reads as degraded, NOT "installed nowhere" — do not trust a zero-result
-            inventory answer while this fires.
+            yuzu_inventory_read_degrade_total{source="{{ $labels.source }}",
+            reason="{{ $labels.reason }}"} is non-zero: an authoritative inventory
+            read (source = installed_software or device_ci) returned a degrade (no
+            data) rather than a result. pool_acquire_timeout/query_error correlate
+            with yuzu_pg_* saturation or outage; store_not_open means the store
+            failed to open at boot. A fleet vulnerability query ("which devices run
+            <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
+            zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload

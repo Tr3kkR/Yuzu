@@ -268,8 +268,9 @@ whose ingest is failing. Four further series sharpen the picture:
   cheap hash-skip compare + `last_seen` bump — split so the steady-state
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
-- `yuzu_inventory_read_degrade_total{reason}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
+- `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
+  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci`) — an
+  **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
   otherwise invisible. The per-degrade WARN is sampled per site — the leading edge

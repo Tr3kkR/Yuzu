@@ -276,7 +276,9 @@ std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              DegradeSampler& s) {
     if (metrics)
-        metrics->counter("yuzu_inventory_read_degrade_total", {{"reason", reason}}).increment();
+        metrics->counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", reason}, {"source", "installed_software"}})
+            .increment();
     const std::int64_t now = now_secs();
     const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
     const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;

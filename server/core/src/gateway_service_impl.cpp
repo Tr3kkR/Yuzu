@@ -13,6 +13,7 @@
 #include "app_perf_daily_store.hpp"
 #include "app_perf_ingestion.hpp"
 #include "device_ci_ingestion.hpp"
+#include "typed_inventory_sources.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_ingestion.hpp"
@@ -522,16 +523,21 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
     }
 
     // Generic per-source blob persistence (sync-framework baseline; backs the
-    // kInventoryQuery scope source + the inventory eval engine). installed_software
-    // is the typed normalized source — skip it in the generic loop; it is
-    // persisted via the shared seam below (ADR-0016 coexistence).
+    // kInventoryQuery scope source + the inventory eval engine). The TYPED sources
+    // (installed_software / app_perf / device_ci) are persisted via their own
+    // normalized stores + shared seams below — skip them here, or they double-store
+    // into the generic InventoryStore. That generic store is read on
+    // Infrastructure:Read (query_inventory/get_agent_inventory), so a typed source
+    // leaking into it bypasses its own securable AND breaks direct/gateway parity
+    // (the direct ReportInventory path has no generic loop). is_typed_inventory_source
+    // is the single skip-list — a new typed source registers there (ADR-0016 §5).
     if (inventory_store_ && inventory_store_->is_open()) {
         int64_t collected_epoch = 0;
         if (request->has_collected_at()) {
             collected_epoch = request->collected_at().millis_epoch() / 1000;
         }
         for (const auto& [plugin_name, data_bytes] : request->plugin_data()) {
-            if (plugin_name == "installed_software" || plugin_name == "app_perf")
+            if (is_typed_inventory_source(plugin_name))
                 continue; // typed projections, handled by their seams below
             std::string json_str(data_bytes.begin(), data_bytes.end());
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);

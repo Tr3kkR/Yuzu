@@ -55,6 +55,35 @@ struct CiRecord {
     std::string arch;
 };
 
+/// The raw stdout of each plugin action the device_ci source invokes (pipe-delimited
+/// `key|...` lines). Grouped so the parse/aggregate step (`build_device_ci_record`)
+/// is a PURE function, testable without a live `LocalDispatcher` (gov L2).
+struct CiPluginOutputs {
+    std::string manufacturer; ///< hardware "manufacturer"
+    std::string model;        ///< hardware "model"
+    std::string system;       ///< hardware "system" (serial + system_uuid)
+    std::string bios;         ///< hardware "bios"
+    std::string processors;   ///< hardware "processors"
+    std::string memory;       ///< hardware "memory"
+    std::string disks;        ///< hardware "disks"
+    std::string device_name;  ///< device_identity "device_name"
+    std::string domain;       ///< device_identity "domain"
+    std::string ou;           ///< device_identity "ou"
+    std::string os_name;      ///< os_info "os_name"
+    std::string os_version;   ///< os_info "os_version"
+    std::string os_build;     ///< os_info "os_build"
+    std::string os_arch;      ///< os_info "os_arch"
+    std::string adapters;     ///< network_config "adapters"
+};
+
+/// Pure parse + aggregate: plugin action outputs → a `CiRecord` (cpu cores/threads
+/// summed across sockets, RAM summed to bytes, disks summarised + sorted, MACs
+/// deduped + sorted, primary = first sorted). No I/O — exercised directly by the unit
+/// tests (the live `collect()` path is otherwise only reachable with a loaded plugin).
+/// Numbers render as decimal strings. Does NOT apply the `core_identity_unavailable`
+/// skip — that is the caller's cycle decision.
+YUZU_EXPORT CiRecord build_device_ci_record(const CiPluginOutputs& out);
+
 /// Canonical wire blob (see `CiRecord` for the field order). Each field is
 /// UTF-8-scrubbed + length-clamped + separator-stripped identically to the server,
 /// then positionally joined. MUST be byte-identical to the server's reconstruction
@@ -65,8 +94,9 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 /// collection — Windows WMI down (every WMI-gated action returns the `"unknown"`
 /// sentinel at rc=0, so the per-action rc check does NOT catch it) or the Linux
 /// DMI tables unreadable. The tell is `manufacturer` AND `model` both `"unknown"`:
-/// both come from the SAME query behind ONE availability gate, so on a functioning
-/// machine — physical OR virtual — both are always real (a VM reports e.g.
+/// on Windows both come from one `Win32_ComputerSystem` query behind one
+/// `wmi.valid()` gate (Linux reads two separate `/sys/class/dmi/id` files), so on a
+/// functioning machine — physical OR virtual — both are always real (a VM reports e.g.
 /// "VMware, Inc."/"VMware7,1"). Using AND (not OR) avoids skipping a healthy host
 /// that reports a real manufacturer but an empty model forever. When true, the
 /// collect skips the cycle rather than persist a degraded record whose

@@ -33,6 +33,12 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // the agent's CiRecord). Extra fields in a (forward-version) blob are ignored;
 // missing trailing fields stay empty.
 constexpr std::size_t kFieldCount = 22;
+// Report-level source-count cap — defense-in-depth, mirrors inventory_ingestion.cpp.
+// device_ci does a single keyed find() (not a full-map iteration), so a huge map is
+// not an amplification vector for THIS seam, but enforcing the same cap on every
+// typed seam keeps the contract uniform (gov L1). (Shared-helper across seams is the
+// documented follow-up.)
+constexpr int kMaxSources = 64;
 
 // ── field clamp ─────────────────────────────────────────────────────────────
 // UTF-8 scrub via the shared server-side yuzu::server::sanitize_utf8_strict
@@ -121,6 +127,15 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
     };
     if (agent_id.empty())
         return;
+    if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
+        // Malformed/abusive report — skip device_ci (no need_full nack, mirrors the
+        // installed_software seam's whole-report reject).
+        spdlog::warn("device_ci: report from agent={} carries too many sources "
+                     "(hashes={}, blobs={}, cap={}) — skipping device_ci",
+                     agent_id, report.content_hashes_size(), report.plugin_data_size(), kMaxSources);
+        emit("rejected");
+        return;
+    }
 
     // Single keyed lookup — bounded regardless of how many sources the report
     // carries (no full-map iteration; a huge map costs only this one find()).

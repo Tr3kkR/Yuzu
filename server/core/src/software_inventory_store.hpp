@@ -124,7 +124,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the read-degrade counter
-    /// (`yuzu_inventory_read_degrade_total{reason}`, #1675) and any future
+    /// (`yuzu_inventory_read_degrade_total{reason, source="installed_software"}`, #1675) and any future
     /// store-internal metric. Set ONCE during single-threaded startup, before
     /// the gRPC/REST surfaces begin serving — the pointer is read without
     /// synchronisation on the serving threads, so a later swap would race. A

@@ -339,8 +339,9 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal",
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(installed_software/device_ci). /readyz stays green under pure pool "
+                          "saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "

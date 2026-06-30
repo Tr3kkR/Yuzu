@@ -197,10 +197,97 @@ std::string device_ci_canonical_blob(const CiRecord& rec) {
 }
 
 bool core_identity_unavailable(const CiRecord& rec) {
-    // manufacturer + model share one availability gate (Win32_ComputerSystem behind
-    // wmi.valid(); /sys/class/dmi/id behind the DMI read). Both "unknown" ⇒ the whole
-    // identity subsystem was down for this collection. AND, not OR (see the header).
+    // Both "unknown" ⇒ the identity subsystem was unavailable for this collection.
+    // Windows: manufacturer + model BOTH come from one Win32_ComputerSystem query
+    // behind one wmi.valid() gate, so a WMI outage drives both to "unknown" together.
+    // Linux: they are TWO separate /sys/class/dmi/id files (sys_vendor, product_name)
+    // — both "unknown" only if DMI itself is unreadable. macOS: manufacturer defaults
+    // to "Apple Inc.", so the AND effectively keys on model there. AND (not OR) so a
+    // host reporting a real manufacturer but an empty model is never skipped forever.
     return rec.manufacturer == "unknown" && rec.model == "unknown";
+}
+
+CiRecord build_device_ci_record(const CiPluginOutputs& out) {
+    CiRecord rec;
+    rec.manufacturer = scalar(out.manufacturer, "manufacturer");
+    rec.model = scalar(out.model, "model");
+    rec.serial = scalar(out.system, "serial");
+    rec.system_uuid = scalar(out.system, "system_uuid");
+    rec.hostname = scalar(out.device_name, "device_name");
+    rec.domain = scalar(out.domain, "domain");
+    rec.ou = scalar(out.ou, "ou");
+    rec.bios_vendor = scalar(out.bios, "bios_vendor");
+    rec.bios_version = scalar(out.bios, "bios_version");
+    rec.bios_date = scalar(out.bios, "bios_date");
+    rec.os_name = scalar(out.os_name, "os_name");
+    rec.os_version = scalar(out.os_version, "os_version");
+    rec.os_build = scalar(out.os_build, "os_build");
+    rec.arch = scalar(out.os_arch, "os_arch");
+
+    // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>` — model from the first
+    // CPU, cores/threads summed across sockets.
+    long long cores = 0;
+    long long threads = 0;
+    for (auto line : split_lines(out.processors)) {
+        auto t = split_pipe(line);
+        if (t.size() >= 5 && t[0] == "cpu") {
+            if (rec.cpu_model.empty() && !t[2].empty())
+                rec.cpu_model = std::string(t[2]);
+            cores += to_ll(t[3]);
+            threads += to_ll(t[4]);
+        }
+    }
+    rec.cpu_cores = std::to_string(cores);
+    rec.cpu_threads = std::to_string(threads);
+
+    // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>` — sum size_mb → bytes.
+    long long total_mb = 0;
+    for (auto line : split_lines(out.memory)) {
+        auto t = split_pipe(line);
+        if (t.size() >= 3 && t[0] == "dimm")
+            total_mb += to_ll(t[2]);
+    }
+    rec.ram_bytes = std::to_string(total_mb * 1024 * 1024);
+
+    // disks: `disk|<idx>|<model>|<size>|<type>|<interface>` — sorted human summary
+    // "<model> <size> <type>". (No numeric total: the size unit is not portable — GB
+    // int on Windows, "476.9G" on Linux.) Skip the empty sentinel.
+    std::vector<std::string> disk_strs;
+    for (auto line : split_lines(out.disks)) {
+        auto t = split_pipe(line);
+        if (t.size() >= 5 && t[0] == "disk") {
+            if (t[2] == "unknown" && t[3] == "0")
+                continue;
+            disk_strs.push_back(std::string(t[2]) + " " + std::string(t[3]) + " " +
+                                std::string(t[4]));
+        }
+    }
+    std::sort(disk_strs.begin(), disk_strs.end());
+    for (std::size_t i = 0; i < disk_strs.size(); ++i) {
+        if (i)
+            rec.disks_summary += "; ";
+        rec.disks_summary += disk_strs[i];
+    }
+
+    // adapters: `adapter|<name>|<mac>|<speed>|<status>` — collect meaningful MACs,
+    // dedup + sort (deterministic). primary = first sorted.
+    std::vector<std::string> macs;
+    for (auto line : split_lines(out.adapters)) {
+        auto t = split_pipe(line);
+        if (t.size() >= 3 && t[0] == "adapter" && meaningful_mac(t[2]))
+            macs.emplace_back(t[2]);
+    }
+    std::sort(macs.begin(), macs.end());
+    macs.erase(std::unique(macs.begin(), macs.end()), macs.end());
+    rec.nic_count = std::to_string(macs.size());
+    if (!macs.empty())
+        rec.primary_mac = macs.front();
+    for (std::size_t i = 0; i < macs.size(); ++i) {
+        if (i)
+            rec.macs_summary += ",";
+        rec.macs_summary += macs[i];
+    }
+    return rec;
 }
 
 SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
@@ -243,105 +330,29 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
             return std::move(r.captured);
         };
 
-        auto manufacturer = run(hardware, "manufacturer");
-        auto model = run(hardware, "model");
-        auto system_out = run(hardware, "system");
-        auto bios = run(hardware, "bios");
-        auto processors = run(hardware, "processors");
-        auto memory = run(hardware, "memory");
-        auto disks = run(hardware, "disks");
-        auto device_name = run(device_identity, "device_name");
-        auto domain = run(device_identity, "domain");
-        auto ou = run(device_identity, "ou");
-        auto os_name = run(os_info, "os_name");
-        auto os_version = run(os_info, "os_version");
-        auto os_build = run(os_info, "os_build");
-        auto os_arch = run(os_info, "os_arch");
-        auto adapters = run(network_config, "adapters");
-        if (!manufacturer || !model || !system_out || !bios || !processors || !memory || !disks ||
-            !device_name || !domain || !ou || !os_name || !os_version || !os_build || !os_arch ||
-            !adapters)
+        CiPluginOutputs o;
+        auto get = [&](const YuzuPluginDescriptor* d, const char* action,
+                       std::string& dst) -> bool {
+            auto r = run(d, action);
+            if (!r)
+                return false;
+            dst = std::move(*r);
+            return true;
+        };
+        // Any failed action aborts the cycle (|| short-circuits — a later action is
+        // not dispatched once one fails). Never sync a partial CI record.
+        if (!get(hardware, "manufacturer", o.manufacturer) || !get(hardware, "model", o.model) ||
+            !get(hardware, "system", o.system) || !get(hardware, "bios", o.bios) ||
+            !get(hardware, "processors", o.processors) || !get(hardware, "memory", o.memory) ||
+            !get(hardware, "disks", o.disks) ||
+            !get(device_identity, "device_name", o.device_name) ||
+            !get(device_identity, "domain", o.domain) || !get(device_identity, "ou", o.ou) ||
+            !get(os_info, "os_name", o.os_name) || !get(os_info, "os_version", o.os_version) ||
+            !get(os_info, "os_build", o.os_build) || !get(os_info, "os_arch", o.os_arch) ||
+            !get(network_config, "adapters", o.adapters))
             return std::nullopt; // a required action failed → skip the cycle
 
-        CiRecord rec;
-        rec.manufacturer = scalar(*manufacturer, "manufacturer");
-        rec.model = scalar(*model, "model");
-        rec.serial = scalar(*system_out, "serial");
-        rec.system_uuid = scalar(*system_out, "system_uuid");
-        rec.hostname = scalar(*device_name, "device_name");
-        rec.domain = scalar(*domain, "domain");
-        rec.ou = scalar(*ou, "ou");
-        rec.bios_vendor = scalar(*bios, "bios_vendor");
-        rec.bios_version = scalar(*bios, "bios_version");
-        rec.bios_date = scalar(*bios, "bios_date");
-        rec.os_name = scalar(*os_name, "os_name");
-        rec.os_version = scalar(*os_version, "os_version");
-        rec.os_build = scalar(*os_build, "os_build");
-        rec.arch = scalar(*os_arch, "os_arch");
-
-        // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>` — model from the
-        // first CPU, cores/threads summed across sockets.
-        long long cores = 0;
-        long long threads = 0;
-        for (auto line : split_lines(*processors)) {
-            auto t = split_pipe(line);
-            if (t.size() >= 5 && t[0] == "cpu") {
-                if (rec.cpu_model.empty() && !t[2].empty())
-                    rec.cpu_model = std::string(t[2]);
-                cores += to_ll(t[3]);
-                threads += to_ll(t[4]);
-            }
-        }
-        rec.cpu_cores = std::to_string(cores);
-        rec.cpu_threads = std::to_string(threads);
-
-        // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>` — sum size_mb → bytes.
-        long long total_mb = 0;
-        for (auto line : split_lines(*memory)) {
-            auto t = split_pipe(line);
-            if (t.size() >= 3 && t[0] == "dimm")
-                total_mb += to_ll(t[2]);
-        }
-        rec.ram_bytes = std::to_string(total_mb * 1024 * 1024);
-
-        // disks: `disk|<idx>|<model>|<size>|<type>|<interface>` — sorted human
-        // summary "<model> <size> <type>". (No numeric total: the size unit is not
-        // portable — GB int on Windows, "476.9G" on Linux.) Skip the empty sentinel.
-        std::vector<std::string> disk_strs;
-        for (auto line : split_lines(*disks)) {
-            auto t = split_pipe(line);
-            if (t.size() >= 5 && t[0] == "disk") {
-                if (t[2] == "unknown" && t[3] == "0")
-                    continue;
-                std::string s = std::string(t[2]) + " " + std::string(t[3]) + " " + std::string(t[4]);
-                disk_strs.push_back(std::move(s));
-            }
-        }
-        std::sort(disk_strs.begin(), disk_strs.end());
-        for (std::size_t i = 0; i < disk_strs.size(); ++i) {
-            if (i)
-                rec.disks_summary += "; ";
-            rec.disks_summary += disk_strs[i];
-        }
-
-        // adapters: `adapter|<name>|<mac>|<speed>|<status>` — collect meaningful
-        // MACs, dedup + sort (deterministic). primary = first sorted.
-        std::vector<std::string> macs;
-        for (auto line : split_lines(*adapters)) {
-            auto t = split_pipe(line);
-            if (t.size() >= 3 && t[0] == "adapter" && meaningful_mac(t[2]))
-                macs.emplace_back(t[2]);
-        }
-        std::sort(macs.begin(), macs.end());
-        macs.erase(std::unique(macs.begin(), macs.end()), macs.end());
-        rec.nic_count = std::to_string(macs.size());
-        if (!macs.empty())
-            rec.primary_mac = macs.front();
-        for (std::size_t i = 0; i < macs.size(); ++i) {
-            if (i)
-                rec.macs_summary += ",";
-            rec.macs_summary += macs[i];
-        }
+        CiRecord rec = build_device_ci_record(o);
 
         // UP-1: a transient WMI/DMI outage makes the identity actions emit the
         // "unknown" sentinel at rc=0 (the per-action rc check above can't see it).
