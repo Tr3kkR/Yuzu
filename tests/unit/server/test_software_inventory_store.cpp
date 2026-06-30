@@ -932,3 +932,67 @@ TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before 
     REQUIRE(cat2->size() == 1);
     CHECK((*cat2)[0].name == "Google Chrome");
 }
+
+TEST_CASE("SoftwareInventoryStore rollup tables carry the multi-instance unique constraints",
+          "[pg][software_inventory]") {
+    // Regression guard for the ARCH-1 BLOCKING fix (gov Gate-8 architect SHOULD). The
+    // UNIQUE constraints are the backstop that makes a racing duplicate INSERT fail; a
+    // future migration refactor that drops one would silently reopen the multi-instance
+    // duplicate-row bug. Assert both exist so that regression fails loudly here.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT count(*) FROM pg_constraint "
+        "WHERE conname IN ('catalog_rollup_name_key', 'version_rollup_nv_key') AND contype = 'u'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "2");
+}
+
+TEST_CASE("refresh_catalog_rollup skips (success, no recompute) when a peer holds the lock",
+          "[pg][software_inventory]") {
+    // Regression guard for the ARCH-1 advisory-lock skip path: when another instance holds
+    // the cluster-wide rollup lock, refresh must SKIP (return success) without recomputing,
+    // so only one instance recomputes the shared rollup at a time.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.apply_installed_software(
+                "lock-a1", "", std::vector<SoftwareEntry>{{"App", "1", "P", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // Hold the cluster-wide rollup advisory lock on a separate session connection (the "peer").
+    auto holder = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(holder);
+    pg::PgResult lk = pg::exec_params(
+        holder.get(), "SELECT pg_advisory_lock(hashtextextended('software_catalog_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(lk.status() == PGRES_TUPLES_OK);
+
+    // Lock held by the peer → refresh must skip (return true) and NOT recompute.
+    CHECK(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0); // skipped → still the building sentinel
+
+    // Release the lock → a refresh now actually recomputes.
+    pg::PgResult ul = pg::exec_params(
+        holder.get(), "SELECT pg_advisory_unlock(hashtextextended('software_catalog_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(ul.status() == PGRES_TUPLES_OK);
+    CHECK(store.refresh_catalog_rollup());
+    auto meta2 = store.catalog_rollup_meta();
+    REQUIRE(meta2.has_value());
+    CHECK(meta2->refreshed_at > 0);
+}
