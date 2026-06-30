@@ -3848,7 +3848,7 @@ void SettingsRoutes::register_routes(
                 try {
                     audit_emitted =
                         audit_store_->log({.principal = session->username,
-                                           .principal_role = auth::role_to_string(session->role),
+                                           .principal_role = auth::role_to_string(auth::effective_role(*session)),
                                            .action = "api_token.create",
                                            .target_type = "ApiToken",
                                            .target_id = name,
@@ -3892,7 +3892,7 @@ void SettingsRoutes::register_routes(
             // AuditStore::emit_failed_ counter still increments and
             // the operator-visible metric paths catch it.
             (void)audit_store_->log({.principal = session->username,
-                                     .principal_role = auth::role_to_string(session->role),
+                                     .principal_role = auth::role_to_string(auth::effective_role(*session)),
                                      .action = "api_token.create",
                                      .target_type = "ApiToken",
                                      .target_id = name,
@@ -3934,7 +3934,7 @@ void SettingsRoutes::register_routes(
                 // denied audit path already returns 404 so the persist
                 // failure is bookkeeping-only here. Cast to void.
                 (void)audit_store_->log({.principal = session->username,
-                                         .principal_role = auth::role_to_string(session->role),
+                                         .principal_role = auth::role_to_string(auth::effective_role(*session)),
                                          .action = "api_token.revoke",
                                          .target_type = "ApiToken",
                                          .target_id = token_id,
@@ -3967,7 +3967,7 @@ void SettingsRoutes::register_routes(
 
         if (audit_store_) {
             (void)audit_store_->log({.principal = session->username,
-                                     .principal_role = auth::role_to_string(session->role),
+                                     .principal_role = auth::role_to_string(auth::effective_role(*session)),
                                      .action = "api_token.revoke",
                                      .target_type = "ApiToken",
                                      .target_id = token_id,

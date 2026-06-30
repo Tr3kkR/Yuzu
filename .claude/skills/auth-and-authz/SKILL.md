@@ -203,7 +203,7 @@ matches the customer ask.
    duration_secs}` promotes the caller's **effective role** to admin for a
    bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
    Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
-   v4, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), distinct
+   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), distinct
    from standing admin and enumerable for access reviews. Gated on eligibility +
    **mandatory MFA enrollment** (unconditional — elevation is the privilege
    boundary) + a fresh MFA step-up; the grant audit is fail-closed, revoking

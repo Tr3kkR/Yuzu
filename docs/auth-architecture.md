@@ -142,7 +142,7 @@ admin **just-in-time** for a bounded, justified, MFA-gated window, then
 auto-reverts — so a compromised everyday session is not a standing admin session.
 
 - **Eligibility is a per-user flag** — `users.elevation_eligible` (auth.db
-  migration v4), distinct from holding standing admin and trivially enumerable
+  migration v5), distinct from holding standing admin and trivially enumerable
   for access reviews. Admin-managed (and MFA-step-up-gated) via
   `POST /api/v1/users/<name>/elevation-eligibility` `{"eligible": bool}`
   (`AuthDB::set_elevation_eligible`/`is_elevation_eligible`, parameterised,

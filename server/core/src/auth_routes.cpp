@@ -499,7 +499,10 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     // and every MCP tool call) would have an empty `principal`, breaking the audit trail.
     if (auto session = resolve_session(req)) {
         event.principal = session->username;
-        event.principal_role = auth::role_to_string(session->role);
+        // effective_role so an action taken under an active JIT elevation is
+        // audited as `admin` (the role it was AUTHORIZED as), not the base role —
+        // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
+        event.principal_role = auth::role_to_string(auth::effective_role(*session));
         event.session_id = extract_session_cookie(req);
     }
     return event;
@@ -573,7 +576,9 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 
     if (auto session = resolve_session(req)) {
         ae.principal = session->username;
-        ae.principal_role = auth::role_to_string(session->role);
+        // effective_role: an elevated session's analytics row reflects admin too
+        // (#1748 H1/L4). No-op when not elevated.
+        ae.principal_role = auth::role_to_string(auth::effective_role(*session));
         ae.session_id = extract_session_cookie(req);
     }
     analytics_store_->emit(std::move(ae));
@@ -1855,12 +1860,34 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                                                 httplib::Response& res) {
                   const auto cid = detail::make_correlation_id();
                   res.set_header("X-Correlation-Id", cid);
-                  if (!require_admin(req, res))
-                      return; // sets 401/403 + audits
+                  // Inline A4 admin gate (#1748 H3): a new REST route must carry the
+                  // A4 envelope on its denial path, not require_admin's legacy
+                  // {"error":{code,message}} body. Replicates require_admin's
+                  // token-type guards + role check, but gates on effective_role
+                  // (so an active elevation passes) and audits `auth.admin_required`.
                   auto session = resolve_session(req);
                   if (!session) {
                       res.status = 401;
                       res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      return;
+                  }
+                  if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
+                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
+                                "non-interactive token blocked from admin route");
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
+                                                                 "perform admin operations",
+                                                            cid),
+                                      "application/json");
+                      return;
+                  }
+                  if (auth::effective_role(*session) != auth::Role::admin) {
+                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "admin role required", cid,
+                                                            "elevate via POST /api/v1/elevate, or use "
+                                                            "an admin account"),
+                                      "application/json");
                       return;
                   }
                   if (!elevation_step_up(req, res, *session,
@@ -2041,8 +2068,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        if (justification.size() > kMaxJustificationLength)
+        if (justification.size() > kMaxJustificationLength) {
             justification.resize(kMaxJustificationLength);
+            // Back up to a UTF-8 code-point boundary so the audit detail never
+            // ends mid-sequence (#1748 L2). Walk back over continuation bytes
+            // (0x80-0xBF) to the lead byte; if the lead byte's declared length
+            // overruns the truncated end, drop that partial code point.
+            std::size_t i = justification.size();
+            while (i > 0 && (static_cast<unsigned char>(justification[i - 1]) & 0xC0) == 0x80)
+                --i;
+            if (i > 0) {
+                const unsigned char lead = static_cast<unsigned char>(justification[i - 1]);
+                const std::size_t seq_len =
+                    lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+                if (justification.size() - (i - 1) < seq_len)
+                    justification.resize(i - 1);
+            }
+        }
         // Read as int64 first: a JSON integer > INT_MAX passes is_number_integer()
         // but get<int>() would THROW (→ 500). Range-check in 64-bit, then narrow
         // (Hermes pass-1 #1).

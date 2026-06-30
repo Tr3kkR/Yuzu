@@ -228,6 +228,15 @@ struct JitHarness {
             q.principal = principal;
         return static_cast<int>(audit_store->query(q).size());
     }
+
+    // principal_role recorded on the most-recent matching audit row ("" if none).
+    std::string audit_role(const std::string& action, const std::string& principal) {
+        AuditQuery q;
+        q.action = action;
+        q.principal = principal;
+        auto rows = audit_store->query(q);
+        return rows.empty() ? std::string{} : rows.front().principal_role;
+    }
 };
 } // namespace
 
@@ -265,6 +274,19 @@ TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][route
     REQUIRE(after);
     CHECK(after->status == 200);
     CHECK(h.auth_db.is_elevation_eligible("bob").value() == false);
+}
+
+TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice"); // base role: user
+    REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
+    // An admin-gated action performed under the elevation must record the
+    // EFFECTIVE role (admin), not alice's base role — SOC 2 evidence-integrity.
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", token,
+                   R"({"eligible":false})")->status == 200);
+    CHECK(h.audit_role("user.elevation_eligibility.set", "alice") == "admin");
+    // The grant row itself is also admin (granted stamps the effective role).
+    CHECK(h.audit_role("role.elevation.granted", "alice") == "admin");
 }
 
 TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit][routes]") {

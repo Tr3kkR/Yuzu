@@ -23,7 +23,8 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
   uniform for the window.
 - **`POST /api/v1/elevate/revoke`** — manual step-down. **`--jit-max-elevation-secs`**
   (`YUZU_JIT_MAX_ELEVATION_SECS`).
-- **Eligibility** — `users.elevation_eligible` (auth.db migration v4), set via
+- **Eligibility** — `users.elevation_eligible` (auth.db migration v5; renumbered
+  from v4 at merge after break-glass #1735 took v4 on dev), set via
   `POST /api/v1/users/<name>/elevation-eligibility` (`AuthDB::set_elevation_eligible`/
   `is_elevation_eligible`, parameterised, `RETURNING`, fail-closed read).
 
@@ -77,6 +78,29 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
 - **Audit gap on step-up refusal.** A refused elevation step-up now also emits
   `role.elevation.denied` / `detail=mfa_step_up_refused`, completing the
   elevation-specific trail beside the shared `mfa.step_up` row.
+
+## Tr3kkR adversarial review (Codex vs Kimi) fixes — #1748
+
+- **H1 — audit `principal_role` understated the effective role.** `make_audit_event`
+  / `emit_event` (auth_routes) and the four `settings_routes` token-management rows
+  stamped `principal_role` from the **base** `session->role` while authorizing via
+  `effective_role` — so an action authorized as admin under an active elevation was
+  logged as `user`. All six now stamp `auth::role_to_string(auth::effective_role(*session))`
+  (a no-op for non-elevated sessions). Test: an elevated admin action records
+  `principal_role=admin`.
+- **H2 — migration-version collision.** Break-glass #1735 merged to `dev` first and
+  took `v4`; the JIT `elevation_eligible` migration is **renumbered to `v5`** and the
+  branch rebased on current `dev`, so the migrations are contiguous and the collision
+  can never silently skip.
+- **H3 — non-A4 admin-denial envelope.** `POST /api/v1/users/<name>/elevation-eligibility`
+  no longer borrows `require_admin`'s legacy `{error:{code,message}}` 403; it runs an
+  **inline A4 admin gate** (token-type guards + `effective_role`, `auth.admin_required`
+  audit) returning the A4 envelope with the route's `X-Correlation-Id`.
+- **M1 — discovery (A2).** The three routes (`/elevate`, `/elevate/revoke`,
+  `/users/{username}/elevation-eligibility`) are added to `openapi_spec()` with request
+  schemas + A4 error responses; a route-presence test guards them.
+- **L2 — UTF-8 truncation.** The 1 KiB justification cap now backs up to a code-point
+  boundary so the audit detail never ends mid-sequence.
 
 ## Threats considered (governance pipeline, 8 reviewers + Hermes ×2)
 
