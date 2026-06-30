@@ -285,10 +285,17 @@ F1 follow-up, same as the blast-radius detector's). A
 collector that reuses the same OS-neutral signal types and covers roughly ten
 of the eleven experience headings (crashes and hangs, resource pressure,
 service failures, boot/resume reports, storage pressure, battery health, and
-more). A **Linux** server collector ships too (`/proc` CPU + memory-commit pressure and
-`statvfs` storage), reusing the same signal types, so Linux servers appear in the
-Performance and Hardware/storage views; workstation-only headings (battery, Wi-Fi,
-display, GUI) are **N/A on headless servers**, not gaps. `storage.low` uses a fixed
+more). A **Linux** server collector ships too, reusing the same signal types across
+several mechanisms: a `/proc` performance poll (sustained CPU, memory-commit pressure,
+and `/proc/diskstats` disk-latency breaches — the same hysteresis as Windows), a
+`statvfs` storage poll, a `/sys` CPU-thermal-throttle poll, and a **journald** reader
+whose kernel-transport (`/dev/kmsg`) lines are classified into existing signal types
+(kernel panic, machine-check errors, filesystem corruption, disk errors, dirty
+shutdowns, hung tasks, the OOM-killer) alongside structured unit crash/hang and
+clock-unsync records. So Linux servers light not only the Performance and Hardware/
+storage views but also App reliability, Service health, System stability, and File
+system; workstation-only headings (battery, Wi-Fi, display, GUI) are **N/A on headless
+servers**, not gaps. `storage.low` uses a fixed
 5 GiB-free floor (small cloud/VM root volumes can read as low until the F1
 configurable thresholds land), and inside an unmodified container `/proc` reflects
 the *host*, so the collector targets host/VM deployment. Because the by-OS and cross-OS views

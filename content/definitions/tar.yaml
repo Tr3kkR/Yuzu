@@ -113,12 +113,13 @@ spec:
         displayName: Event Type Filter
         description: >
           Filter results by event type. Valid values: process, network,
-          service, user, arp, dns. arp/dns are opt-in device-state sources
-          (ADR-0015) reached only by an explicit filter — they are excluded
-          from the default (empty-filter) feed. Leave empty to return the
-          core process/network/service/user types.
+          service, user, software, arp, dns. software joins the default feed once
+          enabled (its collection is off by default — see software_enabled); arp/dns
+          are opt-in device-state sources (ADR-0015) reached only by an explicit
+          filter — they are excluded from the default (empty-filter) feed. Leave
+          empty to return the core process/network/service/user/software types.
         validation:
-          enum: [process, network, service, user, arp, dns, ""]
+          enum: [process, network, service, user, software, arp, dns, ""]
       limit:
         type: string
         displayName: Result Limit
@@ -249,7 +250,7 @@ spec:
       type:
         type: string
         displayName: Event Type Filter
-        description: Filter by event type (process, network, service, user, arp, dns).
+        description: Filter by event type (process, network, service, user, software, arp, dns).
       limit:
         type: string
         displayName: Result Limit
@@ -380,6 +381,83 @@ spec:
           agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
+      perf_enabled:
+        type: string
+        displayName: Performance Collector Enabled
+        description: >
+          Enable or disable the device performance sampler (CPU / memory / disk /
+          network rates → $Perf_*) on this agent. "true" (default) keeps it
+          active. Device-level perf carries no per-application identity. See
+          process_enabled for the disable semantics. Requires agent v0.12.0+;
+          older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      procperf_enabled:
+        type: string
+        displayName: Per-Application Performance Collector Enabled
+        description: >
+          Enable or disable the per-application top-N CPU/working-set sampler
+          (procperf source → $ProcPerf_*). **Off by default** — per-application
+          resource usage reveals which applications run on a device, which is
+          usage-class telemetry under the works-council posture; independent of
+          perf_enabled. Image names only — never command lines. Set to "true" to
+          opt in. Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      netqual_enabled:
+        type: string
+        displayName: Network-Quality Collector Enabled
+        description: >
+          Enable or disable the per-connection TCP-quality sampler (netqual
+          source → $NetQual_Live). **Off by default** — per-connection quality is
+          usage-class telemetry under the works-council posture; only a coarse
+          destination class (loopback/private/public) is stored, raw remote
+          addresses are dropped at the edge. Linux only; independent of
+          tcp_enabled. Set to "true" to opt in. Requires agent v0.12.0+; older
+          agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      module_enabled:
+        type: string
+        displayName: Module-Load Collector Enabled
+        description: >
+          Enable or disable the image-load / module-stream capture source (module
+          source → $Module_*). **Off by default** — module-load capture is
+          high-volume usage-class telemetry (every library and driver load per
+          process, with a code-signing verdict) under the works-council posture;
+          no command line is ever captured. No data is recorded until a collector
+          for the host's OS ships ($Module_* tables are queryable-empty until
+          then). Set to "true" to opt in. Requires agent v0.12.0+; older agents
+          silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      software_enabled:
+        type: string
+        displayName: Software Inventory Collector Enabled
+        description: >
+          Enable or disable the software install/uninstall source (software →
+          $Software_*) on this agent. **Off by default** — turn it on per host to
+          record machine-wide installed-software inventory (HKLM Uninstall), which
+          is device asset-management and vulnerability-relevance data and carries
+          NO user identity (machine scope only — no per-user / profile-name data).
+          Names, versions, and publisher only. See process_enabled for the disable
+          semantics (atomic, existing rows remain queryable, clean re-baseline on
+          re-enable). Requires agent v0.12.0+; older agents silently ignore. Valid:
+          "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      software_interval:
+        type: string
+        displayName: Software Collection Interval (seconds)
+        description: >
+          Interval in seconds for the software install/uninstall sampler
+          (tar.software trigger). "0" disables the trigger entirely; any other
+          value must be 300-86400 (5 minutes - 1 day). Default: 3600 (hourly).
+          Installs are rare, so this runs on its own slower trigger. Requires
+          agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
       arp_enabled:
         type: string
         displayName: ARP Collector Enabled

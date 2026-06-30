@@ -26,6 +26,7 @@
 namespace yuzu::server {
 
 class ResponseStore;
+class PreflightRunStore;
 
 namespace preflight {
 
@@ -59,6 +60,18 @@ std::vector<PreflightDeviceCheck> checks_from_json(const std::string& json);
 /// them without re-parsing the request.
 std::string config_to_json(const PreflightConfig& cfg);
 PreflightConfig config_from_json(const std::string& json);
+
+/// Persist a run's computed grid + summary counts, then complete the run IFF the
+/// grid persisted AND it is settled (`!any_pending`) or `past_deadline`. Shared by
+/// the background runner (called every tick) and the live result route (called on
+/// the settling poll) so a run completes the MOMENT its cohort settles — no
+/// up-to-60s runner lag before the result page reads "Complete" and stops polling —
+/// and both paths build/persist the grid identically. MUST NOT be
+/// called while holding a PreflightRunStore lease (it takes its own). Returns true
+/// iff the run was completed by this call.
+bool persist_and_maybe_complete(PreflightRunStore& store, const std::string& run_id,
+                                const std::vector<PreflightDeviceResult>& grid,
+                                std::int64_t now_ms, bool past_deadline, bool any_pending);
 
 } // namespace preflight
 } // namespace yuzu::server

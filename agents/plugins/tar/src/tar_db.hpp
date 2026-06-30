@@ -86,6 +86,22 @@ struct UserEvent {
     std::string session_id;
 };
 
+/// One software_live row — an install / uninstall / upgrade event derived by
+/// diffing the installed-software inventory (Phase 8 Wave 1). Machine scope only
+/// (HKLM Uninstall): a row is the host's software, never attributed to a Windows
+/// profile, so it carries no per-user identity (#1620). `prev_version` is
+/// populated only for 'upgraded'.
+struct SoftwareEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // installed, removed, upgraded
+    std::string name;
+    std::string version;
+    std::string prev_version;
+    std::string publisher;
+    std::string install_date;
+};
+
 /// One arp_live row (ADR-0015 — host ARP / neighbour table). One row per
 /// appeared/removed transition of an (interface, ip_address, mac_address)
 /// binding; `entry_type` is a value field, not part of the diff key.
@@ -283,6 +299,7 @@ public:
     bool insert_network_events(const std::vector<NetworkEvent>& events);
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
+    bool insert_software_events(const std::vector<SoftwareEvent>& events);
     bool insert_arp_events(const std::vector<ArpEvent>& events);
     bool insert_dns_events(const std::vector<DnsEvent>& events);
     bool insert_perf_sample(const PerfRow& row);

@@ -181,6 +181,81 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
 
+## Hardened mode (sso-only) + break-glass (SOC 2 CC6.3/CC6.6)
+
+`/auth-and-authz` skill gap matrix P0 #3. Closes Workstream B *"Disable
+local-password fallback in hardened mode (or tightly constrain break-glass
+account policy)"* — this ships **both** halves.
+
+- **`--auth-mode <standard|sso-only>`** (`YUZU_AUTH_MODE`, default `standard`).
+  Under `sso-only` the local-password login path is disabled fleet-wide — only
+  OIDC SSO (`/auth/callback`, untouched) mints a session. The rejection at
+  `POST /login` returns the **same generic 401** as a bad password (no
+  "disabled"/"sso-only" wording, no `Retry-After`) so the response BODY carries
+  no enumeration/mode/arm-state oracle, and `verify_password` (PBKDF2) is
+  skipped — same posture and accepted *timing* residue as the lockout pre-check.
+  The denial is recorded as a **metric, not a per-attempt audit row**
+  (`yuzu_auth_local_disabled_total{target=break_glass|other}`) — a credential
+  spray would otherwise grow `audit.db` without bound, the exact amplification
+  the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
+  banner + this counter (the `{target}` label, cardinality 2, flags probing of
+  the break-glass account itself for SIEM alerting).
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
+  **fully** configured — the guard requires both `--oidc-issuer` **and**
+  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
+  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
+  operator is locked out. The break-glass account is for an IdP **outage**, not
+  for never wiring SSO. The active posture is logged once at boot for CC6.3
+  evidence.
+- **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
+  designates the single local account exempt from `sso-only`, exempt **only
+  while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
+  future timestamp evaluated in SQL against `CURRENT_TIMESTAMP` exactly like
+  `locked_until`, so the exemption **auto-expires** (default 24h,
+  `--break-glass-window-secs` / `YUZU_BREAK_GLASS_WINDOW_SECS`, `86400`) and can
+  never be a permanent standing bypass. A non-exempt or un-armed attempt gets
+  the same generic 401 + `auth.local_disabled`.
+- **Mandatory MFA, enforced two ways.** (1) Boot **fails closed** if the
+  break-glass user doesn't exist or has no MFA enrolled
+  (`break_glass_account_problem` in `auth_db`, shared by the boot guard and the
+  arm one-shot; because `mfa_status` filters `is_active=1`, a soft-deleted user
+  also reads as un-enrolled and is rejected). (2) If MFA is cleared out-of-band
+  between boot and login, the login handler **hard-denies** the break-glass login
+  (`403` + `auth.breakglass.denied`, `Severity::kCritical`) — it does **not**
+  fall through to TOTP *enrollment*, because enrollment would hand a fresh secret
+  to whoever proved the password and let a password-only adversary self-enrol and
+  break the glass with no real second factor (governance UP-1). An enrolled
+  break-glass login that proceeds emits `auth.breakglass.login` (`result=ok`,
+  `kCritical` — `result=ok` means the *password* was accepted; the row's `detail`
+  is explicit that the mandatory TOTP challenge still runs before a session is
+  minted) + the metric `yuzu_auth_break_glass_login_total` + a `warn` log.
+- **Lockout-exempt under sso-only (availability).** The break-glass account is
+  exempt from failed-login lockout while `--auth-mode=sso-only`, so an attacker
+  who learns its username cannot spray wrong passwords to keep it locked and
+  render the escape hatch unreachable during an IdP outage (governance Hermes-F /
+  UP-13). Safe because the second factor is still mandatory and, while un-armed,
+  the password is never evaluated; wrong attempts are still audited
+  (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
+  standard mode.
+- **Arming is an out-of-band host operation, never a session route.** The IdP
+  being down is *why* you break the glass, so arming cannot depend on a login.
+  `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--data-dir`)
+  arms the account for the window and exits — mirroring the `--mfa-reset`
+  break-glass contract (#1226): it validates the account (exists + MFA),
+  verifies the audit store is **writable before** mutating, and writes
+  `auth.breakglass.armed` attributed to the **kernel-authoritative OS identity**
+  (`resolve_os_principal`, not the forgeable `USER` env var), `principal_role =
+  break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
+  audit row can't persist.
+
+Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
+pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
+`arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
+#1033); flags + boot guard + arm one-shot in `main.cpp`; `Config::auth_mode` /
+`break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
+`tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
+`test_auth_routes_hardened.cpp` (wire path).
+
 ## Granular RBAC (Phase 3)
 
 - 6 roles, 19 securable types, per-operation permissions, deny-override logic.

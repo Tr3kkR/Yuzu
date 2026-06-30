@@ -305,6 +305,7 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
     };
     const Case cases[] = {{"process", "process"}, {"tcp", "network"},
                           {"service", "service"}, {"user", "user"},
+                          {"software", "software"},
                           {"arp", "arp"},         {"dns", "dns"}}; // ADR-0015 snapshot-diff sources
 
     yuzu::test::TempDbFile tmp{std::string_view{"tar-538-parity-"}};
@@ -423,6 +424,7 @@ TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth", "[ta
     CHECK(diff_state_key("tcp") == "network"); // NOT "tcp"
     CHECK(diff_state_key("service") == "service");
     CHECK(diff_state_key("user") == "user");
+    CHECK(diff_state_key("software") == "software");
     CHECK(diff_state_key("arp") == "arp"); // ADR-0015
     CHECK(diff_state_key("dns") == "dns"); // ADR-0015
     // No snapshot-diff baseline: disabling these is a state no-op.
@@ -440,7 +442,7 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // a silent no-op and #538 silently regresses for the new source. Pin every
     // registered source to an explicit classification so a new one fails loudly.
     const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user",
-                                                      "arp", "dns"};
+                                                      "software", "arp", "dns"};
     // module is a stream-drained source (EventRing, like the process ETW/ES
     // stream) with no snapshot-diff baseline, so diff_state_key("module") is
     // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
@@ -652,6 +654,60 @@ TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'; blocked/seed/unloaded excluded
+}
+
+TEST_CASE("TAR rollup: $Software live→daily→monthly counts by action",
+          "[tar][software][rollup]") {
+    // The software source has no hourly tier (live → daily → monthly), proving
+    // the data-driven aggregator handles a non-uniform granularity set: daily
+    // rolls from live and monthly rolls from daily in one pass. Each action gets
+    // its own count column.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-software-rollup-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (day + month boundary)
+    auto insert_sw = [&](std::string_view action, std::string_view version,
+                         std::string_view prev_version) {
+        REQUIRE(db.execute_sql(std::format(
+            "INSERT INTO software_live "
+            "(ts,snapshot_id,action,name,version,prev_version,publisher,install_date) "
+            "VALUES ({}, 1, '{}', '7-Zip', '{}', '{}', 'Acme', '20250101')",
+            t0, action, version, prev_version)));
+    };
+    insert_sw("installed", "23.01", "");
+    insert_sw("installed", "23.01", "");
+    insert_sw("removed", "23.01", "");
+    insert_sw("upgraded", "24.00", "23.01");
+
+    REQUIRE(row_count(db, "software_live") == 4);
+    REQUIRE(row_count(db, "software_daily") == 0);
+    REQUIRE(row_count(db, "software_monthly") == 0);
+
+    // Aggregate from a point in the FOLLOWING month so both the daily window
+    // (covers t0's day) and the monthly window (covers t0's whole month) include
+    // the seeded events in a single pass.
+    run_aggregation(db, t0 + 45 * 86400); // ~2025-02-15
+
+    REQUIRE(row_count(db, "software_daily") == 1);
+    auto daily = db.execute_query(
+        "SELECT install_count, remove_count, upgrade_count FROM software_daily");
+    REQUIRE(daily.has_value());
+    REQUIRE(daily->rows.size() == 1);
+    CHECK(std::stoll(daily->rows[0][0]) == 2); // installed
+    CHECK(std::stoll(daily->rows[0][1]) == 1); // removed
+    CHECK(std::stoll(daily->rows[0][2]) == 1); // upgraded
+
+    REQUIRE(row_count(db, "software_monthly") == 1);
+    auto monthly = db.execute_query(
+        "SELECT install_count, remove_count, upgrade_count FROM software_monthly");
+    REQUIRE(monthly.has_value());
+    REQUIRE(monthly->rows.size() == 1);
+    CHECK(std::stoll(monthly->rows[0][0]) == 2);
+    CHECK(std::stoll(monthly->rows[0][1]) == 1);
+    CHECK(std::stoll(monthly->rows[0][2]) == 1);
 }
 
 // ── Default-off opt-in sources (review R1 — module/procperf/netqual) ─────────

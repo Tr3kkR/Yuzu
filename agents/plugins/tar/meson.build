@@ -53,6 +53,8 @@ shared_library(
     'src/tar_module_etw.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
+    'src/tar_software_collector.cpp',
+    'src/tar_software_core.cpp',
     'src/tar_fleet_snapshot.cpp',
   ),
   name_prefix: '',

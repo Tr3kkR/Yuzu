@@ -76,7 +76,8 @@ std::string render_auto_rail(const std::vector<std::pair<std::string, std::strin
 /// server-side, reopen from the rail to refresh).
 std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
-                                const std::string& repoll_url, bool run_complete);
+                                const std::string& repoll_url, bool run_complete,
+                                const std::string& run_id);
 
 /// PURE: an honest note body (no devices in scope, missing seam, etc.).
 std::string render_auto_note(const std::string& message);
