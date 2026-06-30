@@ -9091,9 +9091,10 @@ private:
             },
             audit_fn, preflight_run_store_.get());
 
-        // DeploymentRoutes — the /auto DEPLOY stage. From a completed pre-flight
-        // run, stages + executes an installer (content_dist) on the go-cohort,
-        // tracking the per-device stage→execute state machine. Reuses the scoped
+        // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
+        // a go-cohort (mid-run, no completion required), stages + executes an
+        // installer (content_dist) on the cleared-so-far devices, tracking the
+        // per-device stage→execute state machine. Reuses the scoped
         // device provider (devices_fn) for the live re-authorization the MUTATING
         // execute step requires, the SAME 6-param untracked dispatch (execution_id
         // "deployment-<id>-{stage,exec}" → skipped by notify_exec_tracker, like

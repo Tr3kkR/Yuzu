@@ -110,6 +110,15 @@ public:
     [[nodiscard]] std::optional<std::string> find_running_for_run(const std::string& source_run_id,
                                                                   const std::string& created_by);
 
+    /// Agents that already SUCCEEDED in ANY prior deployment of a source run,
+    /// owner-scoped. The create handler excludes these so a re-deploy (after an
+    /// earlier mid-run deploy completes) covers only NEW / FAILED / not-yet-deployed
+    /// devices and never re-runs the installer on a device a prior deployment already
+    /// installed — cross-deployment execute-once (#governance HIGH: mid-run deploy
+    /// double-install).
+    [[nodiscard]] std::vector<std::string>
+    succeeded_agents_for_run(const std::string& source_run_id, const std::string& created_by);
+
     /// The device grid (frozen identity + current step), ordered by hostname.
     [[nodiscard]] std::vector<DeploymentDeviceRow> get_devices(const std::string& deployment_id);
 

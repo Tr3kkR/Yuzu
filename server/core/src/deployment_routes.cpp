@@ -202,8 +202,11 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
         // to bucket go/warn, and a device only reaches go/warn once ALL its checks
         // have answered (a still-evaluating device is 'incomplete', never go/warn) —
         // so the cohort is always fully-evaluated, cleared devices, never a partial
-        // per-device verdict. The result route persists the live grid every poll, so
-        // get_devices below reads the current cohort even while the run is running.
+        // per-device verdict. get_devices reads the run's persisted grid: the
+        // background runner persists it every tick (≤~60s stale with no page open),
+        // and the result route additionally persists it on each self-poll (tightening
+        // staleness to ~1 poll while a page is open) — so a mid-run deploy sees the
+        // currently-cleared cohort.
         // RESUME guard (#governance security HIGH-1): if this owner already has a
         // RUNNING deployment for this source run, render IT instead of creating a
         // second — a second deployment mints a new id, runs an independent CAS, and
@@ -219,24 +222,34 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             return;
         }
 
-        // Cohort = the run's go+warn devices ∩ what the operator can CURRENTLY see.
+        // Cohort = the run's go+warn devices ∩ what the operator can CURRENTLY see,
+        // MINUS any device a PRIOR (completed) deployment of this run already
+        // installed. The exclusion is cross-deployment execute-once (#governance
+        // HIGH): after a mid-run deploy completes and more devices clear, a re-deploy
+        // covers only the new / failed devices and never re-runs the installer on an
+        // already-succeeded one. (The resume guard above handles the still-RUNNING
+        // case; this handles the after-it-completed re-deploy.)
         std::unordered_set<std::string> visible;
         if (devices_fn_)
             for (const auto& d : devices_fn_(session->username))
                 visible.insert(d.agent_id);
+        std::unordered_set<std::string> already_deployed;
+        for (const auto& a : deploy_store_->succeeded_agents_for_run(run_id, session->username))
+            already_deployed.insert(a);
         std::vector<preflight::PreflightTarget> cohort;
         for (const auto& pd : preflight_store_->get_devices(run_id)) {
             const auto b = preflight::bucket_from_token(pd.bucket);
             if ((b == preflight::Bucket::kPass || b == preflight::Bucket::kWarnOnly) &&
-                visible.count(pd.agent_id))
+                visible.count(pd.agent_id) && already_deployed.find(pd.agent_id) == already_deployed.end())
                 cohort.push_back({pd.agent_id, pd.hostname, pd.os});
         }
         if (cohort.empty()) {
             if (audit_fn_)
                 audit_fn_(req, "deployment.create", "no_devices", "SoftwareDeployment", run_id, "");
             res.set_content(
-                render_deploy_note("No deployable (go / warn-only) devices you can currently see in "
-                                   "that pre-flight run."),
+                render_deploy_note("No deployable devices: the go / warn-only devices you can "
+                                   "currently see in that pre-flight run were already deployed "
+                                   "successfully, or none are visible to you."),
                 "text/html; charset=utf-8");
             return;
         }

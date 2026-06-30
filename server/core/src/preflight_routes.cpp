@@ -7,8 +7,11 @@
 /// (per-check execution_id `preflight-<run>-<key>`), and renders live. The
 /// background PreflightRunner re-dispatches to reconnecting stragglers + persists
 /// the grid until the window closes. The result route renders a RUNNING run live
-/// (collect + compute) and a COMPLETE run from the stored grid; reads are
-/// OWNER-SCOPED (created_by) so one operator can't open another's run.
+/// (collect + compute) and a COMPLETE run from the stored grid; it ALSO persists the
+/// live grid on every self-poll (via the shared `persist_and_maybe_complete`) so the
+/// stored go-cohort stays current mid-run (the deploy stage reads it) and completion
+/// is event-driven on whichever path settles first. Reads are OWNER-SCOPED
+/// (created_by) so one operator can't open another's run.
 
 #include "preflight_routes.hpp"
 
@@ -432,9 +435,10 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
         // whichever path notices first, this poll or the runner tick. No
         // PreflightRunStore lease is held here (get_targets/collect already released);
         // the helper takes its own.
-        const bool past_deadline = now_ms() >= run.deadline_at_ms;
-        if (run_store_ && preflight::persist_and_maybe_complete(*run_store_, run.run_id, grid,
-                                                                now_ms(), past_deadline, any_pending))
+        const std::int64_t t = now_ms();
+        const bool past_deadline = t >= run.deadline_at_ms;
+        if (run_store_ && preflight::persist_and_maybe_complete(*run_store_, run.run_id, grid, t,
+                                                                past_deadline, any_pending))
             running = false; // settled/closed this pass → render Complete, stop polling
     } else {
         // Stored grid (durable revisit, survives ResponseStore pruning).

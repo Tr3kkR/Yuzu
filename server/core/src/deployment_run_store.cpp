@@ -263,6 +263,32 @@ DeploymentRunStore::find_running_for_run(const std::string& source_run_id,
     return std::string(PQgetvalue(res.get(), 0, 0));
 }
 
+std::vector<std::string>
+DeploymentRunStore::succeeded_agents_for_run(const std::string& source_run_id,
+                                             const std::string& created_by) {
+    std::vector<std::string> out;
+    if (!open_ || source_run_id.empty())
+        return out;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT DISTINCT d.agent_id "
+        "FROM deployment_run_store.deployment_device d "
+        "JOIN deployment_run_store.deployments dep ON d.deployment_id = dep.deployment_id "
+        "WHERE dep.source_run_id = $1 AND dep.created_by = $2 AND d.step = 'succeeded' "
+        "LIMIT $3::bigint",
+        std::vector<std::string>{source_run_id, created_by, std::to_string(kRowCap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
 std::vector<DeploymentDeviceRow> DeploymentRunStore::get_devices(const std::string& deployment_id) {
     std::vector<DeploymentDeviceRow> out;
     if (!open_ || deployment_id.empty())

@@ -65,8 +65,8 @@ PreflightConfig config_from_json(const std::string& json);
 /// grid persisted AND it is settled (`!any_pending`) or `past_deadline`. Shared by
 /// the background runner (called every tick) and the live result route (called on
 /// the settling poll) so a run completes the MOMENT its cohort settles — no
-/// up-to-60s runner lag before the result reads "Complete" (and, e.g., the deploy
-/// stage unlocks) — and both paths build/persist the grid identically. MUST NOT be
+/// up-to-60s runner lag before the result page reads "Complete" and stops polling —
+/// and both paths build/persist the grid identically. MUST NOT be
 /// called while holding a PreflightRunStore lease (it takes its own). Returns true
 /// iff the run was completed by this call.
 bool persist_and_maybe_complete(PreflightRunStore& store, const std::string& run_id,

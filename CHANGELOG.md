@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`/auto` deploy — stage + execute an upgrade on a pre-flight go-cohort.** The `/auto` page
-  gains an ACT stage after the ASSESS (pre-flight) stage: from a completed pre-flight run,
-  **Deploy go-cohort** stages an installer (download + SHA-256 verify) and then executes it on
-  exactly the devices that cleared (bucket go / warn-only), tracking a per-device
-  stage→execute state machine. Built on the existing `content_dist` plugin (`stage` /
+  gains an ACT stage after the ASSESS (pre-flight) stage: as soon as a pre-flight run has a
+  go-cohort (≥1 device in bucket go / warn-only — the run need not be complete; the button
+  appears with the first cleared device and the count grows mid-run), **Deploy go-cohort**
+  stages an installer (download + SHA-256 verify) and then executes it on the devices cleared
+  at click time, tracking a per-device stage→execute state machine. A re-deploy of the same run
+  excludes devices an earlier deployment already installed (cross-deployment execute-once).
+  Pre-flight completion is now event-driven (the result self-poll completes a run the moment its
+  cohort settles, not on the up-to-60s background-runner tick). Built on the existing `content_dist` plugin (`stage` /
   `execute_staged`); no new agent code. Born-on-Postgres `DeploymentRunStore` (schema
   `deployment_run_store`) persists the artifact spec, the frozen cohort, and each device's
   step. The result is **aggregate-first** (a KPI strip + progress bar headline the counts;

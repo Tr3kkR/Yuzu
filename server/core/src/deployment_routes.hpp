@@ -2,11 +2,14 @@
 
 /// @file deployment_routes.hpp
 /// The `/auto` DEPLOY stage — the ACT half that follows the pre-flight ASSESS
-/// stage on the SAME page. From a completed pre-flight run, "Deploy go-cohort"
-/// stages + executes an installer on the devices that cleared (bucket go/warn).
-/// Fragments live under `/fragments/auto/deploy*` so the whole lifecycle is one
-/// page; the deploy panel swaps into a `#auto-deploy` container beside the
-/// pre-flight result.
+/// stage on the SAME page. As soon as a pre-flight run has a go-cohort (≥1 device
+/// in bucket go/warn — the run need NOT be complete), "Deploy go-cohort" stages +
+/// executes an installer on the cleared-so-far devices; a re-deploy of the same run
+/// covers new/failed devices and skips already-installed ones. The cohort is only
+/// ever fully-evaluated cleared devices (a still-evaluating device is incomplete,
+/// never go/warn), so a mid-run deploy is safe. Fragments live under
+/// `/fragments/auto/deploy*` so the whole lifecycle is one page; the deploy panel
+/// swaps into a `#auto-deploy` container beside the pre-flight result.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only, htmx CORE attrs only (CSP
 /// blocks hx-on). Reuses the shared full-page shell + `.gp-*` CSS.

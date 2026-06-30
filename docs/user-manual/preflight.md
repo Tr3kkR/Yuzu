@@ -63,11 +63,13 @@ store error while the server is already running just degrades `/auto` to an
 ## Deploying to the go-cohort
 
 Pre-flight is the **assess** half of a change; the **act** half lives on the same
-page. When a run completes and has a go-cohort (devices in **Pass** or
-**Warn-only**), a **Deploy go-cohort** button appears on the result. It opens a
-deploy panel where you give an **artifact** — a download **URL**, a **filename**,
+page. As soon as a run has a go-cohort — at least one device in **Pass** or
+**Warn-only** — a **Deploy go-cohort** button appears on the result. **The run does
+not need to finish first**; the button's count grows as more devices clear. It opens
+a deploy panel where you give an **artifact** — a download **URL**, a **filename**,
 the expected **SHA-256**, and optional silent-install **arguments** — and confirm.
-The deployment then, on exactly the devices that cleared:
+The deployment targets the devices that had cleared **at the moment you clicked
+Deploy** (the cohort is frozen then). On those devices it:
 
 1. **Stages** the installer — the agent downloads it and verifies the SHA-256 (a
    hash mismatch fails the device; the file is never executed).
@@ -89,16 +91,24 @@ Two safety properties matter because executing an installer changes the endpoint
   device that has dropped out of your scope since the pre-flight run is **skipped**,
   not executed.
 
+**Deploying mid-run, and covering later devices.** Because you can deploy before
+the run finishes, a deployment only covers the devices that had cleared when you
+clicked. Devices that clear **afterward** are not added to the running deployment —
+clicking **Deploy go-cohort** again while it is still running just re-attaches to
+that same deployment. Once it **completes**, click **Deploy go-cohort** again to
+cover the newly-cleared (and any **Failed**) devices: the new deployment automatically
+**excludes devices an earlier deployment already installed successfully**, so the
+installer is never run twice on one device across the run.
+
 A deployment is driven by the open page today (there is no background runner in
 this slice). Closing the page — or the page reaching its automatic poll limit
 after roughly ten minutes — **pauses** the deployment: its state is durably saved,
 but it does not advance while no page is polling it. To **resume**, re-open the
 deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
 server detects the in-flight deployment and re-attaches to it rather than starting
-a second one (so the installer is never run twice). A device that is offline when
-its stage or execute step is dispatched is not retried in this slice; delete the
-deployment and re-deploy once it is back. The same engine is designed to be driven
-headless by an automation worker later.
+a second one. A device that is offline when its stage or execute step is dispatched
+is not retried in this slice; delete the deployment and re-deploy once it is back.
+The same engine is designed to be driven headless by an automation worker later.
 
 ## Permissions
 

@@ -219,6 +219,33 @@ TEST_CASE("DeploymentRunStore allows one running deployment per source run",
     CHECK(store.create_deployment(d3, {tgt("a3")}));
 }
 
+TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    auto d1 = make_dep("sd1", "alice", t);
+    d1.source_run_id = "runS";
+    REQUIRE(store.create_deployment(d1, {tgt("x1"), tgt("x2")}));
+    CHECK(store.succeeded_agents_for_run("runS", "alice").empty()); // none yet
+
+    // Drive x1 to succeeded; x2 stays pending.
+    store.claim_for_stage("sd1", {"x1"});
+    store.apply_results("sd1", {{"x1", "staging", "staged", 0, ""}});
+    store.claim_for_exec("sd1", {"x1"});
+    store.apply_results("sd1", {{"x1", "executing", "succeeded", 0, ""}});
+
+    auto s = store.succeeded_agents_for_run("runS", "alice");
+    REQUIRE(s.size() == 1);
+    CHECK(s[0] == "x1"); // only the succeeded device (a re-deploy would skip it, retry x2)
+    CHECK(store.succeeded_agents_for_run("runS", "bob").empty());  // owner-scoped
+    CHECK(store.succeeded_agents_for_run("other", "alice").empty()); // run-scoped
+}
+
 // ADR-0012 §1: construction must be fail-CLOSED — a reachable DB whose schema can't
 // migrate leaves the store !is_open() (server.cpp → startup_failed_).
 TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
