@@ -234,6 +234,14 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
          "aggregate carries its reporting population; click any card or cohort to open the "
          "devices behind it.</div></div></div>";
 
+    // ── Over-time entry (F2b) ── the retained per-app, per-version trend lives
+    // on its own fragment (Postgres-backed); the now-view links into it.
+    h += "<div class=\"gp-note\">Looking for performance <b>over time, by application &amp; "
+         "version</b>? " +
+         drill("/fragments/dex/perf/apps?window=" + w, "Open application performance over time "
+                                                       "&rarr;") +
+         " &mdash; the retained daily roll-up, per app and version, fleet-wide or by group.</div>";
+
     // ── Fleet now ──
     h += "<div class=\"gp-sech\">Fleet now (last rollup cycle)</div>";
     if (now.reporting == 0) {

@@ -37,6 +37,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "local_dispatcher.hpp"
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
+#include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -1513,11 +1514,13 @@ public:
                 // flap does not lose or duplicate a daily push.
                 {
                     const YuzuPluginDescriptor* ia_descriptor = nullptr;
+                    const YuzuPluginDescriptor* tar_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
-                        if (std::string_view{handle.descriptor()->name} == "installed_apps") {
+                        const std::string_view pname{handle.descriptor()->name};
+                        if (pname == "installed_apps")
                             ia_descriptor = handle.descriptor();
-                            break;
-                        }
+                        else if (pname == "tar")
+                            tar_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
@@ -1529,7 +1532,7 @@ public:
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, ia_descriptor,
+                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -1583,7 +1586,13 @@ public:
                         };
                         SyncScheduler scheduler(cfg_.agent_id, kv_get, kv_set, sender);
                         scheduler.add_source(make_installed_software_source(ia_descriptor));
-                        spdlog::info("Daily-sync thread started (sources=1: installed_software)");
+                        // DEX app-perf-over-time B1. Rides the same daily-sync thread +
+                        // transport; collection is further gated by procperf_enabled (an
+                        // empty rollup → the source skips the cycle) and the TAR plugin
+                        // being loaded (null descriptor → idle).
+                        scheduler.add_source(make_app_perf_source(tar_descriptor));
+                        spdlog::info("Daily-sync thread started (sources=2: installed_software, "
+                                     "app_perf)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())

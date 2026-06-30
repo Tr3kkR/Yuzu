@@ -22,6 +22,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -1347,20 +1349,44 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
 // can't introspect the agent collectors, so the emitted set is pinned here; when
 // collectors are added or removed, update BOTH the collector and the set below in
 // the same change (that conscious edit is the point). ──
-TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
+TEST_CASE("dex coverage map matches the emitted signal set (Linux + macOS)",
           "[dex][coverage]") {
-    // What a Linux agent emits today: dex_linux_proc + dex_linux_storage polls and
-    // dex_linux_journal mappings. The expanded kmsg/sysfs set arrives with #1523.
+    // What a Linux agent emits today — dex_linux_collector drives all of these: poll_perf
+    // (the /proc CPU + memory + diskstats breach trio — perf.disk_latency_high is the
+    // /proc/diskstats await breach, as live as cpu/mem on ordinary disks) + statvfs
+    // storage (dex_linux_proc/storage), the sysfs throttle counter (dex_linux_sysfs), and
+    // the journald poll (dex_linux_journal), whose _TRANSPORT=kernel lines are classified
+    // by dex_linux_kmsg::classify_kernel_message. The server suite can't introspect the
+    // agent collectors, so this set is pinned by hand — keep it in lockstep.
     const std::set<std::string> kLinuxEmitted = {
-        "perf.cpu_sustained", "perf.memory_pressure", "storage.low", "os.uptime_report",
-        "process.crashed",    "service.crashed",      "memory.exhausted"};
+        "perf.cpu_sustained", "perf.memory_pressure",  "perf.disk_latency_high", "storage.low",
+        "os.uptime_report",   "hw.cpu_throttled",      "process.crashed",        "service.crashed",
+        "service.hung",       "os.time_unsynced",      "memory.exhausted",       "os.bugcheck",
+        "os.dirty_shutdown",  "disk.error",            "fs.corruption",          "hw.error",
+        "process.hung"};
+    // What a macOS agent emits today — dex_macos_collector drives oslog + iokit +
+    // signals/uptime. NOTE: process.resource_limit is also emitted but is NOT yet in
+    // the catalogue taxonomy (it surfaces under "Other"); adding it to a family needs
+    // the catalogued⇒Windows assumption relaxed, so it is correctly absent here for now.
+    const std::set<std::string> kMacEmitted = {
+        "process.crashed",  "process.hung",       "os.bugcheck",       "memory.exhausted",
+        "os.uptime_report", "disk.smart_failure", "hw.error",          "storage.low",
+        "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
+        "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
+
+    // Size sentinels: the over/under-claim loops below skip a type absent from BOTH the
+    // map and the emitted set, so a simultaneous deletion from kLinux[] + kLinuxEmitted
+    // would pass silently. Pin the counts so accidental set-shrinkage fails loudly.
+    REQUIRE(kLinuxEmitted.size() == 17);
+    REQUIRE(kMacEmitted.size() == 16);
 
     auto claims = [](const std::string& obs_type, const char* os) {
         const auto p = dex_obs_platforms(obs_type);
         return std::find(p.begin(), p.end(), os) != p.end();
     };
 
-    // Overclaim guard: every catalogued type the map marks "linux" must be emitted.
+    // Overclaim guard: every catalogued type the map marks for a platform must be in
+    // that platform's emitted set — never advertise a signal nothing collects.
     for (const auto& g : dex_signal_groups()) {
         for (const char* t : g.types) {
             if (claims(t, "linux")) {
@@ -1368,17 +1394,146 @@ TEST_CASE("dex coverage map does not overclaim Linux beyond emitted signals",
                      << t << "' but no Linux collector emits it (see dex_obs_platforms)");
                 CHECK(kLinuxEmitted.count(t) == 1);
             }
+            if (claims(t, "macos")) {
+                INFO("coverage map claims macOS collects '"
+                     << t << "' but no macOS collector emits it (see dex_obs_platforms)");
+                CHECK(kMacEmitted.count(t) == 1);
+            }
         }
     }
 
-    // Underclaim guard: every emitted Linux signal is actually advertised.
+    // Underclaim guard: every emitted signal is actually advertised by the map.
     for (const auto& t : kLinuxEmitted) {
         INFO("emitted Linux signal '" << t << "' is missing from the coverage map");
         CHECK(claims(t, "linux"));
+    }
+    for (const auto& t : kMacEmitted) {
+        INFO("emitted macOS signal '" << t << "' is missing from the coverage map");
+        CHECK(claims(t, "macos"));
     }
 
     // Windows is the whole EvtSubscribe catalogue — always present and first.
     const auto win = dex_obs_platforms("process.crashed");
     REQUIRE_FALSE(win.empty());
     CHECK(win.front() == "windows");
+}
+
+TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states",
+          "[dex][app_perf][routes][rbac]") {
+    GuaranteedStateStore store(":memory:");
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto noPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return false; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string& ttype, const std::string& tid, const std::string&) -> bool {
+        audited = a + "|" + r + "|" + ttype + "|" + tid;
+        return true;
+    };
+
+    // B1 device provider: success rows, or a nullopt degrade when `degrade` is set.
+    bool degrade = false;
+    AppPerfProviders providers;
+    providers.device =
+        [&](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+        CHECK(agent_id == "WS-1"); // the route must thread the agent_id, not a constant
+        if (degrade)
+            return std::nullopt;
+        AppPerfDailyRow row;
+        row.app_name = "chrome.exe";
+        row.version = "125";
+        row.day = 1'700'000'000;
+        row.samples = 10;
+        row.instances_max = 8;
+        row.cpu_avg = 12.4;
+        row.cpu_max = 31.0;
+        row.ws_avg_bytes = 1'800'000'000;
+        row.ws_max_bytes = 2'400'000'000;
+        return std::vector<AppPerfDailyRow>{row};
+    };
+
+    SECTION("rows -> rendered table + dex.device.app_perf.view audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">125</span>") != std::string::npos); // the version, in its mono span
+        // Same usage-class verb as the REST drill, PascalCase target_type.
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
+    }
+
+    SECTION("store degrade (nullopt) -> 200 honest note (htmx drops 4xx/5xx), audit still fired") {
+        degrade = true;
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        // 200, NOT 503: the dashboard htmx config (swap:false for [45]..) would drop a
+        // 503 body, rendering nothing — the exact "fake empty" the note avoids.
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read") != std::string::npos);
+        // The access audit fires BEFORE the read, so a degrade still carries the row.
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
+    }
+
+    SECTION("no provider wired -> graceful note, audit suppressed (no read served)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit); // app_perf_providers={}
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->body.find("no app-perf store wired") != std::string::npos);
+        CHECK(audited.empty()); // provider-null checked before the audit — no PII-access row
+    }
+
+    SECTION("missing agent_id -> note at 200, no audit (guarded before the PII audit)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf"); // no agent_id query param
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing agent_id") != std::string::npos);
+        CHECK(audited.empty()); // rejected before the behavioural-PII audit
+    }
+
+    SECTION("scoped_perm_fn receives the device agent_id, not a constant (UP-6)") {
+        std::string scoped_seen;
+        auto scoped = [&](const httplib::Request&, httplib::Response&, const std::string& type,
+                          const std::string& op, const std::string& id) {
+            scoped_seen = type + ":" + op + ":" + id;
+            return true;
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scoped, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(scoped_seen == "GuaranteedState:Read:WS-1"); // the scope gate got the device id
+    }
+
+    SECTION("perm-denied -> gate runs BEFORE audit + read (no audit row, no PII)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, noPerm, &store, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(audited.empty()); // denied before the behavioural-PII audit fires
+        CHECK(r->body.find("chrome.exe") == std::string::npos);
+    }
 }

@@ -40,6 +40,7 @@ class WebhookStore;
 class OffloadTargetStore;
 class InventoryStore;
 class SoftwareInventoryStore;
+class AppPerfDailyStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -97,6 +98,9 @@ public:
     void set_software_inventory_store(SoftwareInventoryStore* store) {
         software_inventory_store_ = store;
     }
+    /// Typed per-device app-perf daily projection (DEX app-perf-over-time B1) —
+    /// receives the app_perf daily-sync source via ReportInventory.
+    void set_app_perf_daily_store(AppPerfDailyStore* store) { app_perf_daily_store_ = store; }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
     /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
@@ -337,6 +341,7 @@ private:
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
+    AppPerfDailyStore* app_perf_daily_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};

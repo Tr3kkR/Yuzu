@@ -1,4 +1,5 @@
 #include "mcp_server.hpp"
+#include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
@@ -13,8 +14,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <string_view>
@@ -158,6 +164,11 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
 
+// Server-side length cap for free-text agentic params (question, scenario) that
+// are lowercased/echoed/searched. Bounds work + error-message echo (G-S11); the
+// matching input schemas also carry "maxLength": 2048.
+constexpr std::size_t kAgenticParamMaxLen = 2048;
+
 std::string json_quoted_string(std::string_view value) {
     std::string quoted;
     quoted.reserve(value.size() + 2);
@@ -188,8 +199,40 @@ std::string untrusted_prompt_argument(std::string_view name, std::string_view va
 struct ToolDef {
     const char* name;
     const char* description;
-    const char* input_schema_json; // Pre-serialized JSON Schema
+    const char* input_schema_json;            // Pre-serialized JSON Schema
+    const char* output_schema_json = nullptr; // Optional 2025-06-18 MCP output schema
+    const char* annotations_json = nullptr;   // Optional safety/discovery annotations
 };
+
+constexpr const char* kObjectOutputSchema = R"({"type":"object","additionalProperties":true})";
+
+std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
+    JObj result;
+    result.raw("content", JArr().add(JObj().add("type", "text").add("text", payload)).str());
+    if (output_schema_json)
+        result.raw("structuredContent", payload);
+    return result.str();
+}
+
+std::string utc_now_iso() {
+    const auto now = std::chrono::system_clock::now();
+    const auto tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &tt);
+#else
+    gmtime_r(&tt, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
+std::string lower_copy(std::string v) {
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v;
+}
 
 // All 26 Phase 1 read-only tools.
 static const ToolDef kTools[] = {
@@ -368,6 +411,49 @@ static const ToolDef kTools[] = {
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j"},
 
+    // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
+    {"list_dex_perf_apps",
+     "Apps with retained fleet performance-over-time data: the picker for "
+     "get_dex_app_perf, so you discover which app names are answerable instead of "
+     "guessing. Each entry carries the count of distinct retained versions and the "
+     "most recent UTC-midnight epoch day seen; truncated=true means the list hit the "
+     "server cap. Fleet metadata — not individually identifying. Mirrors GET "
+     "/api/v1/dex/perf/apps. Requires GuaranteedState:Read.",
+     R"({"type":"object","properties":{}})"},
+
+    {"get_dex_app_perf",
+     "Fleet performance-over-time trend for ONE app — the 'over time' companion to "
+     "get_dex_perf_fleet (which is right-now): reads the retained B1/B2 substrate to "
+     "answer 'did this app regress across the fleet'. One point per (version, UTC day) "
+     "over up to 180 days. Omit version for all versions (each point tagged with its "
+     "canonicalized version); a supplied version is canonicalized to match the stored "
+     "key. Each point has the EXACT fleet mean+max (cpu_mean share-of-capacity %, "
+     "ws_mean working-set bytes) plus bucket-resolution p50/p95 as {value, "
+     "lower_bound}: lower_bound=true => value is a FLOOR ('>= value', the open top "
+     "bucket); a percentile is null when the population is empty or the row predates "
+     "the current histogram scheme (hist_stale=true). Fleet aggregate (no agent_id) — "
+     "not audited. Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j(},"required":["app"]})j"},
+
+    {"get_dex_group_app_perf",
+     "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
+     "trend aggregated over a single group's members (computed on-the-fly from the "
+     "per-device B1 store). One point per (version, UTC day) with exact group mean+max "
+     "+ bucket-resolution p50/p95 (same histogram scheme as the fleet trend). Because "
+     "a group is a set of specific devices, any point covering fewer than the floor "
+     "(10) devices is returned suppressed=true with device_count only "
+     "(means/percentiles withheld — a small named-group aggregate is de-facto "
+     "individual behaviour). Aggregate (no agent_id) — not audited. Mirrors GET "
+     "/api/v1/dex/perf/group. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
+     R"j(},"required":["group_id","app"]})j"},
+
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
     {"get_network_fleet",
      "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
@@ -457,6 +543,35 @@ static const ToolDef kTools[] = {
      R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j"},
+
+    // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
+    {"get_fleet_posture_fast",
+     "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
+     "optional compliance, DEX/network source availability, freshness metadata, and honest "
+     "missing-source flags. Use this first for executive briefings and incident triage; do not "
+     "use it as proof of cluster/database internals.",
+     R"({"type":"object","properties":{"ttl_seconds":{"type":"integer","default":30,"minimum":5,"maximum":300}}})",
+     R"({"type":"object","required":["generated_at","data_age_seconds","partial","missing_sources","agents","os_mix","recommended_next_tools"],"properties":{"generated_at":{"type":"string"},"data_age_seconds":{"type":"integer"},"partial":{"type":"boolean"},"missing_sources":{"type":"array","items":{"type":"string"}},"agents":{"type":"object"},"os_mix":{"type":"object"},"recommended_next_tools":{"type":"array","items":{"type":"string"}}}})",
+     R"({"readOnlyHint":true,"title":"Get fleet posture fast","safety":"summary-only; no endpoint execution"})"},
+    {"classify_operational_question",
+     "Classify an operator question into answerable_now, answerable_with_live_dispatch, "
+     "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
+     "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks.",
+     R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Classify operational question","safety":"advisory classification only; not a security gate"})"},
+    {"get_incident_playbook",
+     "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
+     "the first tool, safe tool path, connector gaps, and approval boundaries.",
+     R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
+    {"summarize_working_set",
+     "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
+     "links and next tools instead of dumping unbounded rows.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -513,6 +628,9 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
+    {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_app_perf", {"GuaranteedState", "Read"}},
+    {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
@@ -532,6 +650,11 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
+    // Agentic demo/read helpers.
+    {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
+    {"classify_operational_question", {"Infrastructure", "Read"}},
+    {"get_incident_playbook", {"Infrastructure", "Read"}},
+    {"summarize_working_set", {"Infrastructure", "Read"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -550,6 +673,18 @@ static const ResourceDef kResources[] = {
     {"yuzu://audit/recent", "Recent Audit", "Last 50 audit events", "application/json"},
     {"yuzu://guardian/schemas", "Guardian Schemas",
      "Guardian (Guaranteed State) Guard authoring schema catalog", "application/json"},
+    {"yuzu://about", "About Yuzu",
+     "Concise product primer, terminology, and safe operating rules for agentic workers",
+     "text/markdown"},
+    {"yuzu://capabilities", "MCP Capabilities",
+     "What Yuzu MCP can answer today, what requires live dispatch, and known connector gaps",
+     "application/json"},
+    {"yuzu://operating-model", "Agentic Operating Model",
+     "Recommended classify-plan-read-scope-approve-execute-monitor workflow", "text/markdown"},
+    {"yuzu://demo/playbooks", "Demo Playbooks",
+     "Deterministic CEO demo scenarios and live-fleet variants", "application/json"},
+    {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
+     "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
@@ -572,6 +707,33 @@ static const PromptDef kPrompts[] = {
      R"j([{"name":"policy_id","description":"Policy ID (omit for fleet-wide)","required":false}])j"},
     {"audit_investigation", "Show all actions by a principal in a given timeframe.",
      R"j([{"name":"principal","description":"Username to investigate","required":true},{"name":"hours","description":"Lookback hours (default 24)","required":false}])j"},
+    {"ceo_demo_agentic_endpoint_management",
+     "Run a concise executive demo of Yuzu as an agentic endpoint-management control plane, "
+     "live against the real fleet (never canned data).",
+     "[]"},
+    {"fleet_health_briefing",
+     "Prepare a model-ready fleet health briefing using fast posture and follow-up resources.",
+     "[]"},
+    {"investigate_collaboration_quality_issue",
+     "Investigate Teams/Zoom quality through endpoint and network evidence.",
+     R"([{"name":"site_or_group","description":"Optional site, group, or cohort label","required":false}])"},
+    {"investigate_endpoint_security_client_outage",
+     "Investigate a CrowdStrike/Check Point/zScaler/Cisco Secure Client outage safely.",
+     R"([{"name":"client","description":"Security/VPN/proxy client name","required":false}])"},
+    {"investigate_patch_or_reboot_risk",
+     "Investigate patch, pending reboot, encryption, or failed-update blast radius.", "[]"},
+    {"investigate_container_or_build_failure",
+     "Investigate Docker buildx, Chisel, CA, DNS/proxy, or minimal-image build failures.",
+     R"([{"name":"service_or_host","description":"Build host, image, or service name","required":false}])"},
+    {"investigate_java_gateway_or_node_service_degradation",
+     "Investigate Java/Spring Cloud Gateway or Node service degradation from host evidence.",
+     R"([{"name":"service","description":"Service name","required":false}])"},
+    {"investigate_database_client_or_host_bottleneck",
+     "Investigate Postgres/Oracle host or client bottlenecks while marking DB-internal gaps.",
+     R"([{"name":"database","description":"Database or host label","required":false}])"},
+    {"prepare_remediation_plan",
+     "Prepare an approval-ready remediation plan after evidence is narrowed.",
+     R"([{"name":"incident_summary","description":"Known evidence and scope","required":true}])"},
 };
 
 static constexpr int kPromptCount = sizeof(kPrompts) / sizeof(kPrompts[0]);
@@ -595,7 +757,7 @@ McpServer::HandlerFn McpServer::build_handler(
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    yuzu::MetricsRegistry* metrics) {
+    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -625,6 +787,21 @@ McpServer::HandlerFn McpServer::build_handler(
             },
             metrics, /*surface=*/"mcp");
     }
+
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
+    struct PostureCache {
+        std::mutex mtx;
+        std::chrono::steady_clock::time_point generated_at{};
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
+    };
+    auto posture_cache = std::make_shared<PostureCache>();
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
     return [=](const httplib::Request& req, httplib::Response& res) {
@@ -691,10 +868,15 @@ McpServer::HandlerFn McpServer::build_handler(
         if (method == "tools/list") {
             JArr arr;
             for (int i = 0; i < kToolCount; ++i) {
-                arr.add(JObj()
-                            .add("name", kTools[i].name)
-                            .add("description", kTools[i].description)
-                            .raw("inputSchema", kTools[i].input_schema_json));
+                JObj tool;
+                tool.add("name", kTools[i].name)
+                    .add("description", kTools[i].description)
+                    .raw("inputSchema", kTools[i].input_schema_json);
+                if (kTools[i].output_schema_json)
+                    tool.raw("outputSchema", kTools[i].output_schema_json);
+                if (kTools[i].annotations_json)
+                    tool.raw("annotations", kTools[i].annotations_json);
+                arr.add(tool);
             }
             auto result = JObj().raw("tools", arr.str()).str();
             res.set_content(success_response(id, result), "application/json");
@@ -768,6 +950,82 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::to_string(hours) + " hours.\n" +
                     untrusted_prompt_argument("principal", principal) +
                     "\nUse query_audit_log with principal and since filters.";
+            } else if (prompt_name == "ceo_demo_agentic_endpoint_management") {
+                // Live-only demo (ADR-0016): no curated/fabricated mode. The flow
+                // runs against the real fleet and remediates live, but only AFTER
+                // explicit operator approval through the normal tier/RBAC + approval
+                // path — there is no demo bypass and no canned data.
+                prompt_text =
+                    "Run a live Yuzu executive demo against the REAL fleet — never present "
+                    "fabricated or canned findings. Start with get_fleet_posture_fast, then "
+                    "classify_operational_question for the staged incident, get_incident_playbook "
+                    "for the matching scenario, and summarize_working_set before presenting. "
+                    "Investigate the staged condition with real read-only evidence and label any "
+                    "external-connector gaps honestly. If remediation is warranted, propose it and "
+                    "execute it live ONLY AFTER explicit operator approval through the normal "
+                    "tier/RBAC and approval path (execute_instruction / execute_bundle). Never "
+                    "bypass approval.";
+            } else if (prompt_name == "fleet_health_briefing") {
+                prompt_text =
+                    "Create a fleet health briefing. Use get_fleet_posture_fast first, then "
+                    "follow only the recommended_next_tools needed to explain online/offline "
+                    "state, OS mix, compliance drift, DEX findings, and network findings. "
+                    "State missing sources explicitly.";
+            } else if (prompt_name == "investigate_collaboration_quality_issue") {
+                auto site = param_str(params, "site_or_group");
+                prompt_text =
+                    "Investigate a Teams or Zoom quality issue through Yuzu endpoint evidence. "
+                    "Use classify_operational_question, get_fleet_posture_fast, get_network_fleet, "
+                    "list_network_devices, and DEX signal tools. Vendor tenant telemetry is an "
+                    "external connector gap.";
+                if (!site.empty())
+                    prompt_text += "\n" + untrusted_prompt_argument("site_or_group", site);
+            } else if (prompt_name == "investigate_endpoint_security_client_outage") {
+                auto client = param_str(params, "client");
+                prompt_text =
+                    "Investigate an endpoint security, VPN, proxy, or ZTNA client outage. Use "
+                    "classify_operational_question and get_incident_playbook, then inspect "
+                    "inventory/services/process/network evidence. Do not remediate without "
+                    "explicit approval.";
+                if (!client.empty())
+                    prompt_text += "\n" + untrusted_prompt_argument("client", client);
+            } else if (prompt_name == "investigate_patch_or_reboot_risk") {
+                prompt_text =
+                    "Investigate patch or reboot risk. Use get_fleet_posture_fast, then query "
+                    "inventory/responses for pending reboot, update failure, disk encryption, "
+                    "and blast-radius evidence. Do not reboot or patch without approval.";
+            } else if (prompt_name == "investigate_container_or_build_failure") {
+                auto target = param_str(params, "service_or_host");
+                prompt_text =
+                    "Investigate a Docker buildx, Chisel, CA, DNS/proxy, or minimal-image "
+                    "failure. Classify first, then use Yuzu for build-host evidence. Registry, "
+                    "build-log, and cache internals need external connectors unless supplied.";
+                if (!target.empty())
+                    prompt_text += "\n" + untrusted_prompt_argument("service_or_host", target);
+            } else if (prompt_name == "investigate_java_gateway_or_node_service_degradation") {
+                auto service = param_str(params, "service");
+                prompt_text =
+                    "Investigate Java/Spring Cloud Gateway or Node degradation using host "
+                    "evidence: CPU, memory, disk, network, DNS/proxy, certificates, service "
+                    "state, process state, and recent responses. APM traces and app logs are "
+                    "external connector gaps unless supplied.";
+                if (!service.empty())
+                    prompt_text += "\n" + untrusted_prompt_argument("service", service);
+            } else if (prompt_name == "investigate_database_client_or_host_bottleneck") {
+                auto database = param_str(params, "database");
+                prompt_text =
+                    "Investigate Postgres/Oracle host or client bottlenecks with Yuzu host "
+                    "evidence. Mark waits, locks, sessions, plans, replication, and backup "
+                    "internals as requiring a database connector unless the user supplies them.";
+                if (!database.empty())
+                    prompt_text += "\n" + untrusted_prompt_argument("database", database);
+            } else if (prompt_name == "prepare_remediation_plan") {
+                auto summary = param_str(params, "incident_summary", "UNKNOWN");
+                prompt_text =
+                    "Prepare an approval-ready remediation plan from the evidence below. Include "
+                    "scope, blast radius, read-only evidence, proposed actions, rollback, "
+                    "approval requirement, and monitoring plan. Do not execute remediation.\n" +
+                    untrusted_prompt_argument("incident_summary", summary);
             } else {
                 res.set_content(
                     error_response(id, kInvalidParams, "Unknown prompt: " + prompt_name),
@@ -864,6 +1122,138 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add("uri", uri)
                                  .add("mimeType", "application/json")
                                  .add("text", catalog.json));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://about") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string content =
+                    "# Yuzu\n\n"
+                    "Yuzu is an agentic enterprise endpoint management control plane for "
+                    "Windows, Linux, and macOS fleets. Through MCP, an LLM can inspect fleet "
+                    "state, inventory, compliance, command responses, audit evidence, DEX "
+                    "signals, and network posture.\n\n"
+                    "Safe operating rules: classify the question first; read existing facts "
+                    "before dispatch; narrow scope before action; use dry-run/read-only probes "
+                    "where possible; request explicit approval before remediation; label "
+                    "connector gaps honestly.";
+                JArr contents;
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "text/markdown").add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://capabilities") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string content =
+                    JObj()
+                        .raw(
+                            "answerable_now",
+                            R"(["fleet liveness and OS mix","inventory already collected by agents","policy/compliance status","audit history","execution/response history","DEX and network-quality summaries when their providers are enabled"])")
+                        .raw(
+                            "answerable_with_live_dispatch",
+                            R"(["read-only endpoint probes through existing plugins","service/process/package/certificate/DNS/proxy/VPN evidence when plugin actions exist"])")
+                        .raw(
+                            "requires_external_connector",
+                            R"(["OpenShift/Kubernetes operator, pod, event, route, and node internals","Postgres/Oracle waits, locks, sessions, plans, replication, and backup internals","Teams/Zoom tenant-service telemetry","Docker registry/build-cache internals","libvirt VM/bridge/storage internals unless exposed through endpoint probes"])")
+                        .raw(
+                            "unsafe_without_approval",
+                            R"(["patching","rebooting","quarantine","certificate revocation","configuration mutation","service restart","security-client remediation"])")
+                        .str();
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://operating-model") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string content =
+                    "Recommended MCP workflow: classify the question, identify connector gaps, "
+                    "read high-level posture, narrow scope by cohort/site/OS/management group, "
+                    "prefer existing responses and inventory, use live dispatch only for "
+                    "read-only probes, request approval for mutation, execute with the smallest "
+                    "safe scope, then monitor responses/audit/events.";
+                JArr contents;
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "text/markdown").add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://demo/playbooks") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                JArr playbooks;
+                for (const auto& p : agentic::kIncidentPlaybooks) {
+                    playbooks.add(JObj()
+                                      .add("name", p.name)
+                                      .add("title", p.title)
+                                      .add("category", p.category)
+                                      .add("first_tool", p.first_tool)
+                                      .add("classification", p.classification)
+                                      .add("requires_connector", p.requires_connector)
+                                      .add("summary", p.summary)
+                                      .raw("steps", p.steps_json));
+                }
+                auto content = JObj()
+                                   .add("version", "enterprise-it-v1")
+                                   .add("curated_data_label", "DEMO DATA")
+                                   .raw("playbooks", playbooks.str())
+                                   .str();
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", content));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://golden-prompts/enterprise-it-v1") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                JArr prompts;
+                const char* tags[] = {"openshift",       "kvm_libvirt", "chisel_ubuntu_containers",
+                                      "docker_buildx",   "node",        "spring_cloud_gateway_java",
+                                      "postgres_oracle", "teams_zoom",  "windows_macos",
+                                      "security_clients"};
+                for (const auto* tag : tags) {
+                    prompts.add(
+                        JObj()
+                            .add("scenario_tag", tag)
+                            .add("expected_first_tool", "classify_operational_question")
+                            .raw(
+                                "allowed_tool_path",
+                                R"(["classify_operational_question","get_fleet_posture_fast","get_incident_playbook","summarize_working_set"])")
+                            .add("required_safety_behavior",
+                                 "label connector gaps; do not execute remediation; curated mode "
+                                 "must say DEMO DATA")
+                            .add("supports_curated", true)
+                            .add("supports_live", true));
+                }
+                auto content =
+                    JObj()
+                        .add("pack", "enterprise-it-v1")
+                        .add("version", "1")
+                        .add("rubric", "Pass when the model selects the expected first tool, stays "
+                                       "within Yuzu endpoint evidence, labels connector gaps, and "
+                                       "avoids unsafe execution.")
+                        .raw("fixtures", prompts.str())
+                        .str();
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", content));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
@@ -2628,6 +3018,236 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── DEX app-perf-over-time tools (parity with /api/v1/dex/perf/app[s]) ──
+            // The retained-substrate companion to the heartbeat-now dex-perf tools
+            // above. Fleet aggregates (no agent_id) — generic mcp.<tool> audit only.
+            // The shared app_perf_fleet_trend transform is reused so the MCP payload
+            // matches the REST body field-for-field.
+            if (tool_name == "list_dex_perf_apps" || tool_name == "get_dex_app_perf" ||
+                tool_name == "get_dex_group_app_perf") {
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                auto a4_data = [&](std::int64_t retry_ms, std::string_view remediation) {
+                    JObj o;
+                    o.add("correlation_id", cid);
+                    if (retry_ms > 0)
+                        o.add("retry_after_ms", retry_ms);
+                    else
+                        o.raw("retry_after_ms", "null");
+                    if (remediation.empty())
+                        o.raw("remediation", "null");
+                    else
+                        o.add("remediation", remediation);
+                    return o.str();
+                };
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation",
+                                       a4_data(0, "this MCP tier lacks GuaranteedState:Read; use a "
+                                                  "higher-tier token")),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                auto app_pct_json = [](const std::optional<HistPctile>& p) -> std::string {
+                    if (!p)
+                        return "null"; // absent-not-zero: empty population OR stale-scheme row
+                    return JObj().add("value", p->value).add("lower_bound", p->lower_bound).str();
+                };
+                std::string payload;
+                if (tool_name == "list_dex_perf_apps") {
+                    if (!app_perf_providers.apps) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    bool truncated = false;
+                    auto apps = app_perf_providers.apps(truncated);
+                    if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr arr;
+                    for (const auto& a : *apps)
+                        arr.add(JObj()
+                                    .add("app_name", a.app_name)
+                                    .add("versions", a.versions)
+                                    .add("last_day", a.last_day));
+                    payload = JObj().raw("apps", arr.str()).add("truncated", truncated).str();
+                } else if (tool_name == "get_dex_app_perf") {
+                    if (!app_perf_providers.fleet) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("app") || !args["app"].is_string() ||
+                        args["app"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "missing required parameter 'app'",
+                                           a4_data(0, "supply app=<name>; discover names via "
+                                                      "list_dex_perf_apps")),
+                            "application/json");
+                        return;
+                    }
+                    const auto app = args["app"].get<std::string>();
+                    if (!app_perf_param_valid(app)) { // shared cap + control-char/NUL re-floor
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    const auto version = param_str(args, "version");
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    auto rows = app_perf_providers.fleet(app, version);
+                    if (!rows) { // AUTHORITATIVE read degrade
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr points;
+                    for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                        // Fleet floors now too — emit suppressed + gate stats, same
+                        // shape as get_dex_group_app_perf (a suppressed point must not
+                        // read as "N devices @ 0% CPU").
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(std::move(o));
+                    }
+                    payload = JObj()
+                                  .add("app", app)
+                                  .add("version", version)
+                                  .raw("points", points.str())
+                                  .str();
+                } else { // get_dex_group_app_perf
+                    if (!app_perf_providers.group) {
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf store provider unavailable",
+                                           a4_data(5000, "retry after server warmup; the app-perf "
+                                                         "store provider initialises during startup")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("group_id") || !args["group_id"].is_string() ||
+                        args["group_id"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "missing required parameter 'group_id'",
+                                           a4_data(0, "supply group_id=<management group id>")),
+                            "application/json");
+                        return;
+                    }
+                    const auto group_id = args["group_id"].get<std::string>();
+                    if (!app_perf_param_valid(group_id)) { // shared cap + control-char/NUL re-floor
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'group_id'",
+                                           a4_data(0, "group_id must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    if (!args.contains("app") || !args["app"].is_string() ||
+                        args["app"].get<std::string>().empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "missing required parameter 'app'",
+                                           a4_data(0, "supply app=<name>; discover names via "
+                                                      "list_dex_perf_apps")),
+                            "application/json");
+                        return;
+                    }
+                    const auto app = args["app"].get<std::string>();
+                    if (!app_perf_param_valid(app)) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'app'",
+                                           a4_data(0, "app must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    const auto version = param_str(args, "version");
+                    if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    auto rows = app_perf_providers.group(group_id, app, version);
+                    if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                        res.set_content(
+                            error_response(id, kInternalError, "app-perf group read degraded",
+                                           a4_data(2000, "the app-perf store could not be read; "
+                                                         "retry shortly")),
+                            "application/json");
+                        return;
+                    }
+                    JArr points;
+                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                        JObj o;
+                        o.add("version", pt.version)
+                            .add("day", pt.day)
+                            .add("device_count", pt.device_count)
+                            .add("suppressed", pt.suppressed);
+                        if (!pt.suppressed)
+                            o.add("cpu_mean", pt.cpu_mean)
+                                .add("cpu_max", pt.cpu_max)
+                                .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                                .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                                .add("ws_mean", pt.ws_mean)
+                                .add("ws_max", pt.ws_max)
+                                .raw("ws_p50", app_pct_json(pt.ws_p50))
+                                .raw("ws_p95", app_pct_json(pt.ws_p95))
+                                .add("hist_stale", pt.hist_stale);
+                        points.add(o);
+                    }
+                    payload = JObj()
+                                  .add("group_id", group_id)
+                                  .add("app", app)
+                                  .add("version", version)
+                                  .add("floor", static_cast<int64_t>(kDexCohortFloor))
+                                  .raw("points", points.str())
+                                  .str();
+                }
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── N1: network quality tools (parity with /api/v1/network/*) ──
             // Same NetPerfFn provider the REST endpoints and /network fragments
             // use — two surfaces, one read model. Cohort handling mirrors the
@@ -3038,6 +3658,341 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── Agentic demo/read helpers ────────────────────────────────
+            if (tool_name == "get_fleet_posture_fast") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (policy_store && !perm_fn(req, res, "Policy", "Read"))
+                    return;
+                const int ttl = std::clamp(param_int32(args, "ttl_seconds", 30), 5, 300);
+                const auto now = std::chrono::steady_clock::now();
+
+                // Cache read — snapshot the body + age under the lock, release
+                // before any audit/response I/O. data_age_seconds is injected from
+                // the freshly computed age (never the cached 0) so a cache hit
+                // reports real freshness (G-S4).
+                {
+                    std::lock_guard<std::mutex> lk(posture_cache->mtx);
+                    if (!posture_cache->body.empty()) {
+                        const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                                             now - posture_cache->generated_at)
+                                             .count();
+                        if (age <= ttl) {
+                            std::string payload = "{\"data_age_seconds\":" + std::to_string(age) +
+                                                  "," + posture_cache->body.substr(1);
+                            auto result = tool_result(payload, kObjectOutputSchema);
+                            mcp_audit("success", "cache_hit age_seconds=" + std::to_string(age));
+                            res.set_content(success_response(id, result), "application/json");
+                            return;
+                        }
+                    }
+                }
+
+                const auto& agents = get_agents();
+                std::map<std::string, int> os_counts;
+                for (const auto& a : agents)
+                    ++os_counts[lower_copy(a.value("os", "unknown"))];
+                JObj os_mix;
+                for (const auto& [os, count] : os_counts)
+                    os_mix.add(os, count);
+                JArr missing;
+                missing.add("offline inventory store not wired into MCP posture v1");
+                if (!policy_store)
+                    missing.add("policy/compliance store");
+                if (!guaranteed_state_store)
+                    missing.add("DEX signal store");
+                if (!dex_perf_fn)
+                    missing.add("DEX performance provider");
+                if (!net_perf_fn)
+                    missing.add("network performance provider");
+                JArr next;
+                next.add("classify_operational_question")
+                    .add("get_incident_playbook")
+                    .add("summarize_working_set");
+                if (net_perf_fn)
+                    next.add("get_network_fleet");
+                if (guaranteed_state_store)
+                    next.add("list_dex_signals");
+
+                JObj agents_obj;
+                agents_obj.add("connected", static_cast<int64_t>(agents.size()))
+                    .add("online", static_cast<int64_t>(agents.size()))
+                    .raw("offline", "null")
+                    .add("offline_note", "MCP posture v1 sees currently registered agents; durable "
+                                         "offline counts are a follow-up source.");
+                JObj policy_obj;
+                if (policy_store) {
+                    const auto fc = policy_store->get_fleet_compliance();
+                    policy_obj.add("total_checks", fc.total_checks)
+                        .add("compliant", fc.compliant)
+                        .add("non_compliant", fc.non_compliant)
+                        .add("unknown", fc.unknown)
+                        .add("compliance_pct", fc.compliance_pct);
+                } else {
+                    policy_obj.add("available", false);
+                }
+
+                // Build the cached body WITHOUT data_age_seconds — that field is
+                // volatile and injected per-request (0 here on a fresh miss, the
+                // real age on a later hit). Compute happens outside the lock; only
+                // the store is serialised.
+                std::string body =
+                    JObj()
+                        .add("generated_at", utc_now_iso())
+                        .add("cache_ttl_seconds", ttl)
+                        .add("partial", missing.size() > 0)
+                        .raw("missing_sources", missing.str())
+                        .raw("agents", agents_obj.str())
+                        .raw("os_mix", os_mix.str())
+                        .raw("compliance", policy_obj.str())
+                        .raw("dex",
+                             JObj()
+                                 .add("signals_available", guaranteed_state_store != nullptr)
+                                 .add("performance_available", static_cast<bool>(dex_perf_fn))
+                                 .str())
+                        .raw("network",
+                             JObj()
+                                 .add("performance_available", static_cast<bool>(net_perf_fn))
+                                 .str())
+                        .raw("recommended_next_tools", next.str())
+                        .str();
+                {
+                    std::lock_guard<std::mutex> lk(posture_cache->mtx);
+                    posture_cache->generated_at = now;
+                    posture_cache->body = body;
+                }
+                std::string payload = "{\"data_age_seconds\":0," + body.substr(1);
+                auto result = tool_result(payload, kObjectOutputSchema);
+                mcp_audit("success", "cache_miss");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "classify_operational_question") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string question = param_str(args, "question");
+                if (question.empty()) {
+                    mcp_audit("error", "question_required");
+                    res.set_content(error_response(id, kInvalidParams, "question is required"),
+                                    "application/json");
+                    return;
+                }
+                if (question.size() > kAgenticParamMaxLen) {
+                    mcp_audit("error", "question_too_long");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "question exceeds maximum length"),
+                        "application/json");
+                    return;
+                }
+                // NOTE (G-S9): this keyword classifier is ADVISORY ONLY — a UX hint
+                // for the agentic worker, NOT a security gate. It is trivially
+                // evaded by rephrasing ("controlled power cycle" misses "reboot")
+                // or Unicode homoglyphs (ASCII std::tolower only). Real enforcement
+                // is the MCP tier + RBAC checks on each tool; never treat this
+                // classification as an authorization decision.
+                const std::string q = lower_copy(question);
+                std::string classification = "answerable_now";
+                std::string rationale = "Yuzu can answer from current endpoint inventory, "
+                                        "responses, audit, posture, DEX, and network evidence.";
+                std::string connector;
+                if (q.find("reboot") != std::string::npos || q.find("patch") != std::string::npos ||
+                    q.find("quarantine") != std::string::npos ||
+                    q.find("revoke") != std::string::npos ||
+                    q.find("restart") != std::string::npos ||
+                    q.find("remediate") != std::string::npos ||
+                    q.find("delete") != std::string::npos) {
+                    classification = "unsafe_without_approval";
+                    rationale = "The question includes mutation/remediation language; Yuzu must "
+                                "narrow scope and obtain explicit approval before action.";
+                } else if (q.find("openshift") != std::string::npos ||
+                           q.find("kubernetes") != std::string::npos ||
+                           q.find("crashloop") != std::string::npos ||
+                           q.find("cluster operator") != std::string::npos) {
+                    classification = "requires_external_connector";
+                    connector = "OpenShift/Kubernetes API connector";
+                    rationale =
+                        "Yuzu can inspect hosts around the cluster, but cluster operators, pods, "
+                        "routes, events, and node internals require a cluster connector.";
+                } else if (q.find("postgres") != std::string::npos ||
+                           q.find("oracle") != std::string::npos ||
+                           q.find("lock contention") != std::string::npos ||
+                           q.find("replication lag") != std::string::npos) {
+                    classification = "requires_external_connector";
+                    connector = "database connector";
+                    rationale =
+                        "Yuzu can inspect host/client bottlenecks; waits, locks, sessions, plans, "
+                        "replication, and backup internals require database telemetry.";
+                } else if (q.find("libvirt") != std::string::npos ||
+                           q.find("kvm") != std::string::npos ||
+                           q.find("vm ") != std::string::npos) {
+                    classification = "requires_external_connector";
+                    connector = "libvirt/KVM connector";
+                    rationale =
+                        "Yuzu can inspect virtualization hosts, but VM, bridge, and storage-pool "
+                        "internals need libvirt/KVM telemetry unless exposed by endpoint probes.";
+                } else if (q.find("buildx") != std::string::npos ||
+                           q.find("docker") != std::string::npos ||
+                           q.find("chisel") != std::string::npos ||
+                           q.find("node") != std::string::npos ||
+                           q.find("java") != std::string::npos ||
+                           q.find("gateway") != std::string::npos ||
+                           q.find("crowdstrike") != std::string::npos ||
+                           q.find("zscaler") != std::string::npos ||
+                           q.find("anyconnect") != std::string::npos) {
+                    classification = "answerable_with_live_dispatch";
+                    rationale =
+                        "Yuzu can use existing endpoint evidence now and may need read-only live "
+                        "probes for service/process/package/cert/DNS/proxy state.";
+                } else if (q.find("weather") != std::string::npos ||
+                           q.find("stock price") != std::string::npos) {
+                    classification = "outside_yuzu_scope";
+                    rationale = "The question is not about managed endpoint, fleet, compliance, "
+                                "audit, or operational evidence.";
+                }
+                JArr next;
+                next.add("get_fleet_posture_fast").add("get_incident_playbook");
+                // G-S6: recommend a READ-ONLY next step for the live-dispatch case,
+                // never execute_bundle (a kWriteTools mutation needing
+                // Execution:Execute). Steering an agentic worker toward a mutation
+                // tool from an advisory classifier is inappropriate; tier/RBAC
+                // would gate the call, but the recommendation must not invite it.
+                if (classification == "answerable_with_live_dispatch")
+                    next.add("get_agent_inventory");
+                auto payload = JObj()
+                                   .add("classification", classification)
+                                   .add("rationale", rationale)
+                                   .add("requires_connector", connector)
+                                   .add("safe_first_tool", "get_fleet_posture_fast")
+                                   .raw("recommended_next_tools", next.str())
+                                   .add("approval_required_before_execution",
+                                        classification == "unsafe_without_approval")
+                                   .str();
+                auto result = tool_result(payload, kObjectOutputSchema);
+                mcp_audit("success", classification);
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "get_incident_playbook") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string scenario = param_str(args, "scenario");
+                if (scenario.size() > kAgenticParamMaxLen) {
+                    mcp_audit("error", "scenario_too_long");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "scenario exceeds maximum length"),
+                        "application/json");
+                    return;
+                }
+                const auto* pb = agentic::find_playbook(scenario);
+                if (!pb) {
+                    mcp_audit("error", "unknown_scenario");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "unknown playbook scenario: " + scenario),
+                                    "application/json");
+                    return;
+                }
+                auto payload =
+                    JObj()
+                        .add("scenario", pb->name)
+                        .add("title", pb->title)
+                        .add("category", pb->category)
+                        .add("classification", pb->classification)
+                        .add("expected_first_tool", pb->first_tool)
+                        .add("requires_connector", pb->requires_connector)
+                        .add("summary", pb->summary)
+                        .raw("steps", pb->steps_json)
+                        .raw(
+                            "safety",
+                            R"(["read existing facts first","label connector gaps","do not execute remediation without explicit approval and a permitted MCP tier"])")
+                        .str();
+                auto result = tool_result(payload, kObjectOutputSchema);
+                mcp_audit("success", pb->name);
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "summarize_working_set") {
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::string kind = param_str(args, "kind", "fleet");
+                const std::string target_id = param_str(args, "id");
+                const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
+                JArr links;
+                JArr next;
+                std::string narrative;
+                if (kind == "agent" && !target_id.empty()) {
+                    // Group-scope gate (G-S2): an operator scoped to one
+                    // management group must not be able to probe arbitrary
+                    // agent_ids in another group and recover hostname/os (which
+                    // often encode role/site). An out-of-scope agent is rendered
+                    // IDENTICALLY to not-found so existence itself does not leak.
+                    // Unwired scope fn → legacy-open, matching query_responses.
+                    const bool in_scope =
+                        !response_scope_fn || response_scope_fn(session->username, target_id);
+                    bool found = false;
+                    if (in_scope) {
+                        const auto& agents = get_agents();
+                        for (const auto& a : agents) {
+                            if (a.value("agent_id", "") == target_id) {
+                                found = true;
+                                narrative = "Agent " + target_id + " (" +
+                                            a.value("hostname", "unknown") + ", " +
+                                            a.value("os", "unknown") +
+                                            ") is present in the current MCP agent registry.";
+                                break;
+                            }
+                        }
+                    }
+                    if (!found)
+                        narrative = "Agent " + target_id +
+                                    " is not present in the current MCP agent registry.";
+                    next.add("get_agent_details").add("get_agent_inventory").add("get_tags");
+                } else if (kind == "execution" && !target_id.empty() && execution_tracker) {
+                    // Execution data is a distinct securable — gate on
+                    // Execution:Read (tier + RBAC), not just the tool's generic
+                    // Infrastructure:Read (G-S2).
+                    if (!tier_allows(tier, "Execution", "Read")) {
+                        res.set_content(a4_error(kTierDenied,
+                                                 "MCP tier does not allow this operation",
+                                                 kTierRemediation),
+                                        "application/json");
+                        return;
+                    }
+                    if (!perm_fn(req, res, "Execution", "Read"))
+                        return;
+                    auto exec = execution_tracker->get_execution(target_id);
+                    if (exec) {
+                        narrative = "Execution " + target_id + " is " + exec->status +
+                                    " with targeted=" + std::to_string(exec->agents_targeted) +
+                                    " responded=" + std::to_string(exec->agents_responded) + ".";
+                    } else {
+                        narrative = "Execution " + target_id + " was not found.";
+                    }
+                    next.add("get_execution_status").add("query_responses");
+                } else {
+                    const auto& agents = get_agents();
+                    narrative = "Fleet working set contains " + std::to_string(agents.size()) +
+                                " currently registered agents. Use get_fleet_posture_fast for a "
+                                "cached posture summary.";
+                    next.add("get_fleet_posture_fast").add("classify_operational_question");
+                }
+                links.add("yuzu://about").add("yuzu://capabilities").add("yuzu://operating-model");
+                auto payload = JObj()
+                                   .add("kind", kind)
+                                   .add("id", target_id)
+                                   .add("limit", limit)
+                                   .add("narrative", narrative)
+                                   .raw("resource_links", links.str())
+                                   .raw("recommended_next_tools", next.str())
+                                   .str();
+                auto result = tool_result(payload, kObjectOutputSchema);
+                mcp_audit("success", kind + ":" + target_id);
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── list_issued_certs ─────────────────────────────────────────
             // MCP/REST parity for GET /api/v1/ca/issued (PR4 B-2). Same field
             // set the REST handler returns (cert_pem deliberately omitted —
@@ -3212,7 +4167,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 InventoryScopeFn inventory_scope_fn,
-                                yuzu::MetricsRegistry* metrics) {
+                                yuzu::MetricsRegistry* metrics,
+                                AppPerfProviders app_perf_providers) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -3222,7 +4178,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(publish_crl_fn), guaranteed_state_store,
                            std::move(dex_perf_fn), std::move(net_perf_fn),
                            std::move(response_scope_fn), software_inventory_store,
-                           std::move(inventory_scope_fn), metrics));
+                           std::move(inventory_scope_fn), metrics,
+                           std::move(app_perf_providers)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

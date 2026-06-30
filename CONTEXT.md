@@ -81,6 +81,18 @@ The comparison population for fleet-relative performance benchmarking: the set o
 
 The denominator that travels with every fleet-aggregate performance statistic: how many devices actually contributed values in the current cycle. A fleet average over 12 devices is never presented as fleet-wide truth without its population; a metric nobody reported is absent, never a fabricated zero.
 
+## App-perf daily roll-up (B1)
+
+The centralized per-device daily summary of a device's **resource-significant app-versions**: one record per `(device, app, version, UTC day)` carrying sample-weighted CPU and working-set averages, their peaks, and a sample count, derived on the agent from the on-device `procperf_hourly` warehouse and shipped daily. It is the fleet-queryable layer ("which devices ran v124, and how did it perform") that complements the on-device, federated-on-demand drill — distinct from **installed software** inventory (a complete app-presence census; B1 is performance over the top-N consumers only).
+
+## App-perf fleet roll-up (B2)
+
+The fleet-aggregate trend layer over [[App-perf daily roll-up (B1)]]: one record per `(app, version, UTC day)` summarising how that app-version performed **across all devices** that ran it that day — device count, fleet CPU/working-set means and maxima, and a fixed-bucket histogram of the per-device daily values from which fleet percentiles are derived. It deliberately drops the device dimension (no `agent_id`) — it answers "did v125 run hotter than v124 across the fleet", not "on which device". Distinct from B1 (per-device, 31-day, the drill-down source) by retention (180 days) and grain (fleet, not device).
+
+## Resource-significant app-version
+
+An `(application, version)` pair that appeared among a device's top-N CPU- or working-set-consuming processes during sampling, and therefore the unit B1 measures. The qualifier is load-bearing: B1 deliberately does **not** record every app that ran — only those significant enough to surface in `procperf` — so "ran on this device" in a B1 context always means "ran among its top resource consumers."
+
 ## Asset value (Crown jewel)
 
 A risk-weighting of how much a node matters to defend — a *value* axis, **orthogonal** to tags, management groups, and scope (which are *targeting* axes). **Operator-declared**: the defender knows what matters and Yuzu does not guess it, though optional inference *hints* may suggest a value (never auto-apply it). Value is carried by the **service** — the process/listening unit where a vulnerability and an exposed port actually live — and may also be declared on an addressable instance (container, VM, bare-metal host). A host's **effective value is the maximum** of the values of the services/instances it carries: a box is as valuable a target as its most valuable tenant. A **crown jewel** is the high end of that axis — the service whose compromise is the attacker's objective and the defender's nightmare. New term; does not collide with any existing Yuzu concept.
@@ -100,3 +112,7 @@ A directed chain through the reachability graph from an **entry point** to a **c
 ## Chokepoint
 
 A node or edge lying on many high-value attack paths, such that removing it — patching/isolating the host, or closing the port/flow — severs the most at-risk value for the least defender effort. Ranked by **defender ROI**: the sum of `crown-jewel value × path probability` over the attack paths the removal would break, **not** by generic graph centrality. The minimum-effort set of removals that fully severs a trust zone from crown jewels it should not reach is a **segmentation recommendation** (a cost-weighted min-cut). Because the graph is observed-grounded, a chokepoint severs *observed* paths; policy-permitted-but-unobserved paths are out of scope until host-firewall potential-reachability enrichment lands.
+
+## Demo
+
+A demonstration of Yuzu run **live against a real fleet** — never against fabricated findings. Yuzu's cornerstone is that it never invents data ("a metric nobody reported is absent, never a fabricated zero"); that rule holds **in demos too**. Realism comes from constructing a real **environment** that genuinely exhibits a condition (a device with a real pending reboot, a really-degraded link, a really-crashing service), then **observing it live and remediating it live**. Remediation runs through the **real approval and tier/RBAC gates** — the agentic worker executes only **after a human approves**, via the same `execute_instruction`/`execute_bundle` path a customer uses; there is **no demo bypass** (a demo-only write path would violate agentic-first the same way a fabricated read does). "Take the risk" means accepting that a live run may not behave exactly like a canned script would — **not** relaxing any safety gate. A "demo" is therefore a *staged environment plus a live, fully-gated operator/agentic-worker flow over the real tools*, not a special data path: there is **no fabricated-finding mode**. Distinct from the **golden-prompt pack** (`enterprise-it-v1`), which is a prompt-evaluation fixture set, not demo output. Cuts against the retired curated/`DEMO DATA` mode (PR #1653).

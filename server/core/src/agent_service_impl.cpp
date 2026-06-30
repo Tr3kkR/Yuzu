@@ -14,6 +14,8 @@
 #include "grpc_audit_signal.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
+#include "app_perf_daily_store.hpp"
+#include "app_perf_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_ingestion.hpp"
@@ -680,32 +682,43 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     }
 
     response->set_received(true);
-    if (!software_inventory_store_ || !software_inventory_store_->is_open()) {
-        // PG store not wired / not open — ack so the agent does not wedge; the
-        // next sync + the weekly full-floor recover once the store is back.
-        return grpc::Status::OK;
-    }
 
-    // Normalized installed_software via the shared seam (ADR-0016 §5) — the same
-    // seam the gateway ProxyInventory path uses. Isolate ingest failures so a
-    // bad payload can't fail the RPC into a retry loop.
+    // Each typed source ingests through its own shared seam (ADR-0016 §5) — the SAME
+    // seam the gateway ProxyInventory path uses — independently guarded + isolated, so
+    // one store being down or one payload being bad can't fail the RPC into a retry
+    // loop. ack=received is already set, so a skipped ingest just defers to the next
+    // sync + the weekly full-floor.
     //
-    // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): unlike
-    // GatewayUpstreamServiceImpl::ProxyInventory, this direct path does NOT also
-    // upsert *generic* (non-typed) plugin_data keys into the generic InventoryStore.
-    // Latent + non-regressive in slice 1: the agent registers exactly one source
-    // (installed_software, routed through the typed seam on both paths), and
-    // installed_software was never a live generic-store key. When a second, generic
-    // sync source lands, fold the generic-blob upsert INTO ingest_inventory_report
-    // (pass the InventoryStore&) so both paths stay symmetric — do NOT add a parallel
-    // loop here. Tracked as the source-#2 blocker.
-    try {
-        ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response, &metrics_);
-    } catch (const std::exception& ex) {
-        spdlog::warn("ReportInventory: ingest threw for agent {} — acked: {}", agent_id, ex.what());
-    } catch (...) {
-        spdlog::warn("ReportInventory: ingest threw unknown exception for agent {} — acked",
-                     agent_id);
+    // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
+    // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
+    // Both live sources (installed_software, app_perf) are TYPED and routed through
+    // their typed seams on both paths, so the two paths stay symmetric; a future
+    // GENERIC source must fold its upsert into ingest_inventory_report (pass the
+    // InventoryStore&), not add a parallel loop here.
+    if (software_inventory_store_ && software_inventory_store_->is_open()) {
+        try {
+            ingest_inventory_report(*software_inventory_store_, agent_id, *request, *response,
+                                    &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: inventory ingest threw for agent {} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: inventory ingest threw unknown exception for agent {} "
+                         "— acked",
+                         agent_id);
+        }
+    }
+    if (app_perf_daily_store_ && app_perf_daily_store_->is_open()) {
+        try {
+            ingest_app_perf_report(*app_perf_daily_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: app_perf ingest threw for agent {} — acked: {}", agent_id,
+                         ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: app_perf ingest threw unknown exception for agent {} — "
+                         "acked",
+                         agent_id);
+        }
     }
     spdlog::debug("ReportInventory from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
@@ -1666,6 +1679,14 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // the PreflightRunStore is the run's completion authority, NOT the executions
     // drawer. Notifying here would publish phantom agent-transition events. Skip.
     if (execution_id.starts_with("preflight-"))
+        return;
+
+    // Deployment correlation ids ("deployment-<id>-stage" / "-exec", minted by the
+    // deployment engine) are the same case: the deployment re-reads stage/execute
+    // responses via query_by_execution; the DeploymentRunStore is the completion
+    // authority, not the executions drawer. Notifying here would publish phantom
+    // agent-transition events. Skip.
+    if (execution_id.starts_with("deployment-"))
         return;
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
