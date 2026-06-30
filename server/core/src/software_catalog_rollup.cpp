@@ -37,6 +37,13 @@ void SoftwareCatalogRollup::stop() {
 
 void SoftwareCatalogRollup::run() {
     spdlog::info("Software catalogue rollup thread started (interval={}s)", interval_.count());
+    // Seed the liveness gauge to 0 BEFORE the first refresh (gov UP-2): otherwise the
+    // series is created only on the first SUCCESS, so a server whose first recompute keeps
+    // failing has NO gauge at all and the staleness alert can't evaluate. Seeded at 0 the
+    // series always exists; the staleness alert guards `> 0` to skip the building window
+    // (the ongoing-failure case is covered by ..._rollup_total{outcome="error"}).
+    if (metrics_)
+        metrics_->gauge("yuzu_inventory_catalog_rollup_last_success_timestamp").set(0);
     bool first = true;
     while (!stop_.load(std::memory_order_acquire)) {
         if (!first) {

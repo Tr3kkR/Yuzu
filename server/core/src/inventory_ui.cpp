@@ -180,6 +180,13 @@ std::string render_inventory_software_fragment(
         (meta && meta->refreshed_at > 0) ? ("updated " + rel_time(now_secs, meta->refreshed_at))
         : building                       ? std::string("building…")
                                          : std::string("&mdash;");
+    // A keep-last-good rollup that hasn't refreshed in > 2× the cadence is visibly stale —
+    // flag it (warn style + "stale —" prefix) so an operator doesn't read a day-old
+    // catalogue as current (gov UP-3). 7200s = 2× the hourly cadence.
+    const bool rollup_stale =
+        meta && meta->refreshed_at > 0 && (now_secs - meta->refreshed_at) > 7200;
+    const char* cat_kpi_cls = rollup_stale ? "inv-kpi warn" : "inv-kpi";
+    const std::string as_of_disp = rollup_stale ? ("stale &mdash; " + as_of) : as_of;
     h += "<div class=\"inv-kpis\">"
          "<div class=\"inv-kpi\"><div class=\"h\">Titles</div><div class=\"big\">" +
          titles +
@@ -191,9 +198,11 @@ std::string render_inventory_software_fragment(
          "<div class=\"big\">" +
          stale +
          "</div><div class=\"s2\">last sync &gt; 48h ago · server time</div></div>"
-         "<div class=\"inv-kpi\"><div class=\"h\">Catalogue</div>"
+         "<div class=\"" +
+         std::string(cat_kpi_cls) +
+         "\"><div class=\"h\">Catalogue</div>"
          "<div class=\"big\" style=\"font-size:.95rem\">" +
-         as_of + "</div><div class=\"s2\">rollup refreshes hourly</div></div></div>";
+         as_of_disp + "</div><div class=\"s2\">rollup refreshes hourly</div></div></div>";
 
     h += scope_caveat();
     h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter titles…\" "

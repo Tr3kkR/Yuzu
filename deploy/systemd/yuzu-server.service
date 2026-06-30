@@ -43,6 +43,14 @@ ExecStart=/usr/local/bin/yuzu-server \
     --data-dir /var/lib/yuzu
 Restart=on-failure
 RestartSec=5
+# Graceful-stop budget. Two background rollup threads (app-perf B1->B2 and the
+# /inventory catalogue rollup) are joined sequentially during shutdown, and a join
+# cannot cancel an in-flight Postgres recompute — it waits for the statement to return
+# (bounded by each thread's SET LOCAL statement_timeout: app-perf 120s + catalogue 60s).
+# Stock systemd's 90s default would SIGKILL mid-recompute (data-safe — the txn rolls back
+# and keep-last-good holds — but it logs as a hard kill, which is operationally noisy).
+# 210s clears the worst-case sequential sum with margin. Raise if either rollup budget grows.
+TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably
 # exhausted on a busy fleet by SSE EventSource connections + agent gRPC

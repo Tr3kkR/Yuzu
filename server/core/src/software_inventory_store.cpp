@@ -47,14 +47,17 @@ constexpr int kFleetQueryRowCap = 100000;
 // `limit`. The catalogue is one row per distinct title; the drill is one per
 // distinct version of a title — both bounded sets.
 constexpr int kCatalogRowCap = 2000;
-// Execution bound for the BACKGROUND catalogue recompute (refresh_catalog_rollup) —
-// the single expensive full-table GROUP BY. Generous because it runs off the request
-// path on the SoftwareCatalogRollup thread (the page never waits on it); it overrides
-// the pool's 30s default for that one txn so a large fleet's recompute can complete.
-// KEEP-LAST-GOOD on a timeout: the txn rolls back, the prior rollup survives. The
-// page READS (software_catalog/software_versions) hit the small precomputed tables and
-// need no special bound.
-constexpr const char* kRollupStatementTimeout = "120s";
+// Execution BUDGET (not a guarantee) for the BACKGROUND catalogue recompute
+// (refresh_catalog_rollup) — the single expensive full-table GROUP BY. It runs off the
+// request path on the SoftwareCatalogRollup thread (the page never waits on it) and
+// overrides the pool's 30s default for that one txn. 60s bounds BOTH the worst-case
+// pooled-connection hold AND the shutdown-join stall (stop() can't cancel an in-flight
+// statement, so the join waits up to this long). KEEP-LAST-GOOD on a timeout: the txn
+// rolls back, the prior rollup + freshness stamp survive (the "as of" stamp ages, and
+// yuzu_inventory_catalog_rollup_total{outcome="error"} increments). If a genuine 400k
+// recompute ever exceeds 60s it stays "building"/stale until it fits — observable via the
+// metrics; raise this then. The page READS hit the small precomputed tables, no bound.
+constexpr const char* kRollupStatementTimeout = "60s";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -138,17 +141,28 @@ const std::vector<pg::PgMigration>& migrations() {
          //     ("building"), distinct from a refreshed-but-empty fleet.
          // IF NOT EXISTS / ON CONFLICT DO NOTHING — idempotent so a partial-migration
          // retry (or a white-box schema_meta rewind in tests) re-runs cleanly.
+         // UNIQUE(name) / UNIQUE(name,version): the rollup is keyed by title (and
+         // version) — one row each. The unique constraint is LOAD-BEARING for
+         // multi-instance safety (gov ARCH-1/UP-1): two server instances sharing one
+         // Postgres both run their hourly recompute; without a unique key a racing
+         // DELETE+INSERT under READ COMMITTED can leave DUPLICATE title rows (B's
+         // pre-A-commit snapshot doesn't see A's rows to delete, then inserts its own).
+         // The unique key makes the duplicate INSERT fail → that recompute rolls back →
+         // keep-last-good. (refresh_catalog_rollup also takes a cluster-wide advisory
+         // lock so the loser skips cleanly rather than churning a unique violation.)
          "CREATE TABLE IF NOT EXISTS catalog_rollup ("
          "  name          TEXT   NOT NULL,"
          "  publisher     TEXT   NOT NULL DEFAULT '',"
          "  device_count  BIGINT NOT NULL,"
-         "  version_count BIGINT NOT NULL);"
+         "  version_count BIGINT NOT NULL,"
+         "  CONSTRAINT catalog_rollup_name_key UNIQUE (name));"
          "CREATE INDEX IF NOT EXISTS catalog_rollup_rank_idx "
          "ON catalog_rollup (device_count DESC, name);"
          "CREATE TABLE IF NOT EXISTS version_rollup ("
          "  name          TEXT   NOT NULL,"
          "  version       TEXT   NOT NULL DEFAULT '',"
-         "  device_count  BIGINT NOT NULL);"
+         "  device_count  BIGINT NOT NULL,"
+         "  CONSTRAINT version_rollup_nv_key UNIQUE (name, version));"
          "CREATE INDEX IF NOT EXISTS version_rollup_name_idx "
          "ON version_rollup (name, device_count DESC);"
          "CREATE TABLE IF NOT EXISTS catalog_rollup_meta ("
@@ -711,6 +725,23 @@ bool SoftwareInventoryStore::refresh_catalog_rollup() {
                                          std::vector<std::string>{});
         if (t.status() != PGRES_COMMAND_OK)
             return false;
+        // Cluster-wide serialization (gov ARCH-1/UP-1): on a multi-instance shared-PG
+        // deploy, only one server recomputes the SHARED rollup at a time. try_ (not
+        // blocking): if a peer holds the lock it is already recomputing the shared table,
+        // so this instance SKIPS — not a failure (the rollup will be fresh via the peer),
+        // avoiding a redundant recompute AND the unique-violation churn two racing
+        // DELETE+INSERTs would otherwise produce. Transaction-scoped → auto-released at
+        // COMMIT/ROLLBACK and self-healing if the holder dies. The UNIQUE constraints on
+        // the rollup tables are the belt-and-braces correctness backstop behind this lock.
+        pg::PgResult lk =
+            pg::exec_params(c,
+                            "SELECT pg_try_advisory_xact_lock(hashtextextended('"
+                            "software_catalog_rollup', 0))",
+                            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
+        if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
+            return true; // a peer instance is refreshing the shared rollup — skip, success
         // catalog_rollup: one row per title (device_count, version_count). max(publisher)
         // picks a representative when a title carries >1 publisher across the fleet.
         if (pg::exec_params(c, "DELETE FROM software_inventory_store.catalog_rollup",

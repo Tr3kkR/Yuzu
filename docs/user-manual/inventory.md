@@ -176,7 +176,7 @@ same data, with three tabs:
   rolled up to its **install count** (number of devices carrying it) and its number of
   distinct **versions**, most-installed first. Click a title to drill into its
   **installs per version** (how many devices run each version). A title filter narrows
-  the list. **These counts are a fleet-wide Postgres aggregate**, gated on the global
+  the list. **These counts are fleet-wide totals**, gated on the global
   `Inventory:Read` — they are **not** management-group scoped (the same ADR-0017 caveat
   as the REST/MCP surfaces: confinement is inert under the global gate, so the counts
   span all groups; the UI says so inline). A freshness KPI shows the **stale** count
@@ -288,6 +288,25 @@ whose ingest is failing. Four further series sharpen the picture:
   be **frozen, not genuinely low** — the freeze-detector that travels with the
   gauge (the freshness count uses a tighter 250 ms budget than the read paths, so
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
+
+The **catalogue rollup** (the `/inventory` Software tab's precomputed counts, refreshed
+hourly by the background `SoftwareCatalogRollup` thread) emits three further series:
+
+- `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
+  — one per recompute attempt. A rising `error` count with a frozen
+  `…_last_success_timestamp` means recomputes are failing (PG outage / the 60s budget
+  exceeded at scale) and the catalogue is going stale; keep-last-good serves the prior
+  rollup meanwhile.
+- `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
+  wall-clock. A rising value approaching the 60s budget is the leading indicator to raise
+  the budget (or shard the rollup) before recomputes start timing out. (A gauge, not a
+  histogram: at one sample/hour percentiles add nothing.)
+- `yuzu_inventory_catalog_rollup_last_success_timestamp` (gauge, epoch seconds) — the
+  primary liveness signal; it is the source of the Software tab's "updated N ago" stamp.
+  **Seeded to `0` at startup** so the series always exists (a never-succeeded server is
+  still alertable). Alert on `time() - this > 7200` **guarded by `and this > 0`** — the
+  `> 0` guard skips the cold-boot "building" window (epoch 0); the never-succeeded /
+  ongoing-failure case is caught by `…_rollup_total{outcome="error"}` instead.
 
 Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
