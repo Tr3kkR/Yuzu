@@ -144,4 +144,42 @@ TEST_CASE("AppPerfCohortReader windows in SQL — most-recent N days per (agent,
     CHECK(rows->size() == 2);
     for (const auto& r : *rows)
         CHECK(r.day >= start + 3 * 86400); // the two newest days only
+
+    // Counter-case: a window covering all days returns all 5 (catches a hard-coded
+    // cap in the SQL window; gov NICE).
+    bool tr2 = false;
+    auto all = reader.get_cohort_rows({"wm"}, "WinApp.exe", "4.2.0.0", "9.9.9.9", /*window=*/7, tr2);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 5);
+}
+
+TEST_CASE("AppPerfCohortReader: the SQL window is PER-(agent,version) — staggered upgrade still pairs",
+          "[pg][app_perf]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfCohortReader reader{pool};
+    REQUIRE(b1.is_open());
+
+    // m1 ran baseline 4.2.0.0 on an EARLY block of days, then candidate 4.3.0.0 on a
+    // LATER block — a real staggered transition. The window must apply PER version
+    // (PARTITION BY agent_id, version), not globally, or the most-recent N days would
+    // be all-candidate and the machine would read as candidate_only.
+    const std::int64_t start = today_utc() - 14 * 86400;
+    for (int i = 0; i < 4; ++i)
+        seed(b1, "m1", "Acme.exe", "4.2.0.0", start + i * 86400, 2.0, 1000); // days 0..3
+    for (int i = 0; i < 4; ++i)
+        seed(b1, "m1", "Acme.exe", "4.3.0.0", start + (10 + i) * 86400, 5.0, 1500); // days 10..13
+
+    bool tr = false;
+    auto rows = reader.get_cohort_rows({"m1"}, "Acme.exe", "4.2.0.0", "4.3.0.0", /*window=*/2, tr);
+    REQUIRE(rows.has_value());
+    // 2 most-recent baseline days (2,3) + 2 most-recent candidate days (12,13) = 4.
+    CHECK(rows->size() == 4);
+    auto c = build_comparison(*rows, yuzu::util::canon_version("4.2.0.0"),
+                              yuzu::util::canon_version("4.3.0.0"), 2);
+    CHECK(c.paired == 1);        // BOTH versions present per the per-version window
+    CHECK(c.baseline_only == 0); // a global PARTITION BY agent_id would break this
+    CHECK(c.candidate_only == 0);
 }
