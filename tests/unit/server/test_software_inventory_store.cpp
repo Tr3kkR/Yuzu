@@ -811,3 +811,188 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     REQUIRE(other.has_value());
     CHECK(other->empty());
 }
+
+TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][software_inventory]") {
+    // Gov F1: the /inventory dashboard's fleet aggregates (software_catalog /
+    // software_versions) had no store-level coverage — the GROUP BY SQL, the
+    // most-installed ordering, the name filter, and the cap were stubbed at the route.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 3 devices: Google Chrome on all 3 (versions 126 ×2, 125 ×1); 7-Zip on 1.
+    using Rows = std::vector<SoftwareEntry>;
+    REQUIRE(store.apply_installed_software(
+                "cat-a1", "", Rows{{"Google Chrome", "126", "Google", ""}, {"7-Zip", "24", "Igor", ""}},
+                1) == InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "cat-a2", "", Rows{{"Google Chrome", "126", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "cat-a3", "", Rows{{"Google Chrome", "125", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // The catalogue/version reads are served from the PRECOMPUTED rollup — recompute it
+    // from the just-seeded rows before asserting.
+    REQUIRE(store.refresh_catalog_rollup());
+
+    SECTION("catalog_rollup_meta carries the freshness stamp + headline counts") {
+        auto meta = store.catalog_rollup_meta();
+        REQUIRE(meta.has_value());
+        CHECK(meta->refreshed_at > 0);  // refreshed → not the "building" sentinel
+        CHECK(meta->total_titles == 2); // Google Chrome + 7-Zip
+        CHECK(meta->total_devices == 3);
+    }
+
+    SECTION("catalogue rolls up device_count + version_count, most-installed first") {
+        auto cat = store.software_catalog({});
+        REQUIRE(cat.has_value());
+        REQUIRE_FALSE(cat->empty());
+        CHECK((*cat)[0].name == "Google Chrome"); // 3 devices → sorts first
+        CHECK((*cat)[0].device_count == 3);
+        CHECK((*cat)[0].version_count == 2);
+        bool found_7z = false;
+        for (const auto& r : *cat)
+            if (r.name == "7-Zip") {
+                found_7z = true;
+                CHECK(r.device_count == 1);
+                CHECK(r.version_count == 1);
+            }
+        CHECK(found_7z);
+    }
+    SECTION("name_filter is a case-insensitive substring") {
+        yuzu::server::SoftwareCatalogQuery q;
+        q.name_filter = "chrome";
+        auto cat = store.software_catalog(q);
+        REQUIRE(cat.has_value());
+        REQUIRE(cat->size() == 1);
+        CHECK((*cat)[0].name == "Google Chrome");
+    }
+    SECTION("limit caps the returned rows to the most-installed") {
+        yuzu::server::SoftwareCatalogQuery q;
+        q.limit = 1;
+        auto cat = store.software_catalog(q);
+        REQUIRE(cat.has_value());
+        CHECK(cat->size() == 1);
+        CHECK((*cat)[0].name == "Google Chrome");
+    }
+    SECTION("software_versions = installs per version, most-installed first") {
+        auto v = store.software_versions("Google Chrome", 100);
+        REQUIRE(v.has_value());
+        REQUIRE(v->size() == 2);
+        CHECK((*v)[0].version == "126");
+        CHECK((*v)[0].device_count == 2);
+        CHECK((*v)[1].version == "125");
+        CHECK((*v)[1].device_count == 1);
+    }
+    SECTION("software_versions empty name → empty value (precondition miss, not degrade)") {
+        auto v = store.software_versions("", 100);
+        REQUIRE(v.has_value());
+        CHECK(v->empty());
+    }
+    SECTION("software_versions unknown title → empty value, not degrade") {
+        auto v = store.software_versions("Nonexistent App", 100);
+        REQUIRE(v.has_value());
+        CHECK(v->empty());
+    }
+}
+
+TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before first refresh",
+          "[pg][software_inventory]") {
+    // Before any refresh_catalog_rollup(), the rollup tables are empty and the seeded meta
+    // row reports refreshed_at==0 ("building") — distinct from a refreshed-but-empty fleet.
+    // This is the state the dashboard shows as "catalogue building", not a false empty.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.apply_installed_software(
+                "pre-a1", "", std::vector<SoftwareEntry>{{"Google Chrome", "126", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // No refresh yet: meta is the building sentinel, reads are empty (NOT degraded/nullopt).
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0);
+    auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    CHECK(cat->empty());
+
+    // After a refresh the seeded row appears and the stamp advances.
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta2 = store.catalog_rollup_meta();
+    REQUIRE(meta2.has_value());
+    CHECK(meta2->refreshed_at > 0);
+    auto cat2 = store.software_catalog({});
+    REQUIRE(cat2.has_value());
+    REQUIRE(cat2->size() == 1);
+    CHECK((*cat2)[0].name == "Google Chrome");
+}
+
+TEST_CASE("SoftwareInventoryStore rollup tables carry the multi-instance unique constraints",
+          "[pg][software_inventory]") {
+    // Regression guard for the ARCH-1 BLOCKING fix (gov Gate-8 architect SHOULD). The
+    // UNIQUE constraints are the backstop that makes a racing duplicate INSERT fail; a
+    // future migration refactor that drops one would silently reopen the multi-instance
+    // duplicate-row bug. Assert both exist so that regression fails loudly here.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT count(*) FROM pg_constraint "
+        "WHERE conname IN ('catalog_rollup_name_key', 'version_rollup_nv_key') AND contype = 'u'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "2");
+}
+
+TEST_CASE("refresh_catalog_rollup skips (success, no recompute) when a peer holds the lock",
+          "[pg][software_inventory]") {
+    // Regression guard for the ARCH-1 advisory-lock skip path: when another instance holds
+    // the cluster-wide rollup lock, refresh must SKIP (return success) without recomputing,
+    // so only one instance recomputes the shared rollup at a time.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.apply_installed_software(
+                "lock-a1", "", std::vector<SoftwareEntry>{{"App", "1", "P", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // Hold the cluster-wide rollup advisory lock on a separate session connection (the "peer").
+    auto holder = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(holder);
+    pg::PgResult lk = pg::exec_params(
+        holder.get(), "SELECT pg_advisory_lock(hashtextextended('software_catalog_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(lk.status() == PGRES_TUPLES_OK);
+
+    // Lock held by the peer → refresh must skip (return true) and NOT recompute.
+    CHECK(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0); // skipped → still the building sentinel
+
+    // Release the lock → a refresh now actually recomputes.
+    pg::PgResult ul = pg::exec_params(
+        holder.get(), "SELECT pg_advisory_unlock(hashtextextended('software_catalog_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(ul.status() == PGRES_TUPLES_OK);
+    CHECK(store.refresh_catalog_rollup());
+    auto meta2 = store.catalog_rollup_meta();
+    REQUIRE(meta2.has_value());
+    CHECK(meta2->refreshed_at > 0);
+}
