@@ -328,6 +328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux agent. macOS coverage (16) was already correct and is unchanged. No agent change, no data
   change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
   platforms.
+- **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
   `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
   list carry a per-agent management-group drop filter that is **not yet effective** under the
   *global* `Inventory:Read` / `Infrastructure:Read` gate (a confined operator is denied at the gate;

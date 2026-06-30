@@ -1374,6 +1374,12 @@ TEST_CASE("dex coverage map matches the emitted signal set (Linux + macOS)",
         "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
         "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
 
+    // Size sentinels: the over/under-claim loops below skip a type absent from BOTH the
+    // map and the emitted set, so a simultaneous deletion from kLinux[] + kLinuxEmitted
+    // would pass silently. Pin the counts so accidental set-shrinkage fails loudly.
+    REQUIRE(kLinuxEmitted.size() == 17);
+    REQUIRE(kMacEmitted.size() == 16);
+
     auto claims = [](const std::string& obs_type, const char* os) {
         const auto p = dex_obs_platforms(obs_type);
         return std::find(p.begin(), p.end(), os) != p.end();
