@@ -76,11 +76,13 @@ struct MachineVersionScalar {
 /// PURE: reduce cohort B1 rows to one scalar per machine for `version`, using the
 /// per-machine-per-version window (the most recent `window_days` distinct days
 /// THIS machine ran `version` — see the file header on why this is not
-/// today-anchored). Sample-weighted mean (`Σ value·samples / Σ samples`); an
-/// all-zero-sample window falls back to the unweighted mean so a malformed-but-
-/// present row still shows an honest number. `version` is matched as supplied —
-/// the caller canonicalizes it (and the stored rows) so the keys agree. A machine
-/// with no in-window rows of `version` is omitted (→ unpaired in `compare`).
+/// today-anchored). Sample-weighted mean (`Σ value·samples / Σ samples`). A machine
+/// whose entire in-window history for the version has ZERO samples measured nothing,
+/// so it produces NO scalar and is EXCLUDED — it is NOT given an unweighted-fallback
+/// vote (without a cohort floor that would let one zero-sample canary swing the
+/// median; gov UP-3). `version` is matched as supplied — the caller canonicalizes it
+/// (and the stored rows) so the keys agree. A machine with no in-window rows of
+/// `version` (or only zero-sample rows) is omitted (→ unpaired in `compare`).
 /// `window_days <= 0` is treated as 1.
 [[nodiscard]] std::vector<MachineVersionScalar>
 reduce_version_window(const std::vector<AppPerfCohortRow>& rows, std::string_view version,

@@ -269,7 +269,7 @@ struct CohortRead {
 /// member_count 0 + empty rows (a precondition value, not a degrade).
 using AppPerfCohortFn = std::function<std::optional<CohortRead>(
     std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
-    std::string_view candidate_version)>;
+    std::string_view candidate_version, int window_days)>;
 
 struct AppPerfProviders {
     AppPerfFleetFn fleet;

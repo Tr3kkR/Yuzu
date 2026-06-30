@@ -12,6 +12,7 @@
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
@@ -6788,7 +6789,7 @@ void RestApiV1::register_routes(
             }
             window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
 
-            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate);
+            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate, window);
             if (!cohort) { // AUTHORITATIVE degrade (member resolution OR row read)
                 res.status = 503;
                 res.set_content(
@@ -6811,8 +6812,8 @@ void RestApiV1::register_routes(
             // `view=aggregate` matches the dashboard sibling + the documented contract.
             detail::emit_behavioral_audit(
                 audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
-                "app=" + app + " base=" + baseline + " cand=" + candidate +
-                    " cohort=" + std::to_string(cohort->member_count) +
+                "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
+                    audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
                     " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
             const std::string cpu = JObj()

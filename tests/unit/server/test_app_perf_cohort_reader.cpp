@@ -78,7 +78,7 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
 
     SECTION("member + app + two-version filter, agent_id preserved") {
         bool tr = false;
-        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
+        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", /*window=*/7, tr);
         REQUIRE(rows.has_value());
         CHECK_FALSE(tr); // 4 rows is far below the cap
         // a1×{4.2,4.3} + a2×{4.2,4.3} = 4 rows; a3 excluded (member filter); 4.1.0.0
@@ -94,7 +94,7 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
 
     SECTION("the read drives build_comparison end-to-end (real SQL → engine)") {
         bool tr = false;
-        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
+        auto rows = reader.get_cohort_rows({"a1", "a2"}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", /*window=*/7, tr);
         REQUIRE(rows.has_value());
         auto c = build_comparison(*rows, yuzu::util::canon_version("4.2.0.0"),
                                   yuzu::util::canon_version("4.3.0.0"), 7);
@@ -108,15 +108,40 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
 
     SECTION("empty member list is a precondition miss, not a degrade") {
         bool tr = false;
-        auto rows = reader.get_cohort_rows({}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", tr);
+        auto rows = reader.get_cohort_rows({}, "AcmeVPN.exe", "4.2.0.0", "4.3.0.0", /*window=*/7, tr);
         REQUIRE(rows.has_value()); // empty value, NOT nullopt
         CHECK(rows->empty());
     }
 
     SECTION("empty app is a precondition miss, not a degrade") {
         bool tr = false;
-        auto rows = reader.get_cohort_rows({"a1"}, "", "4.2.0.0", "4.3.0.0", tr);
+        auto rows = reader.get_cohort_rows({"a1"}, "", "4.2.0.0", "4.3.0.0", /*window=*/7, tr);
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
     }
+}
+
+TEST_CASE("AppPerfCohortReader windows in SQL — most-recent N days per (agent,version)",
+          "[pg][app_perf]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfCohortReader reader{pool};
+    REQUIRE(b1.is_open());
+
+    // 5 consecutive days of one version on one machine (all within 31d retention).
+    const std::int64_t start = today_utc() - 6 * 86400;
+    for (int i = 0; i < 5; ++i)
+        seed(b1, "wm", "WinApp.exe", "4.2.0.0", start + i * 86400, 2.0, 1000);
+
+    bool tr = false;
+    // window=2 → only the 2 most-recent days come back (the SQL ROW_NUMBER filter,
+    // not an in-memory trim). Candidate "9.9.9.9" is absent — proves the version
+    // filter too. (gov M1: a smaller window genuinely shrinks the read.)
+    auto rows = reader.get_cohort_rows({"wm"}, "WinApp.exe", "4.2.0.0", "9.9.9.9", /*window=*/2, tr);
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == 2);
+    for (const auto& r : *rows)
+        CHECK(r.day >= start + 3 * 86400); // the two newest days only
 }

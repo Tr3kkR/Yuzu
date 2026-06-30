@@ -47,8 +47,11 @@ void note_degrade(yuzu::MetricsRegistry* metrics, const char* reason) {
 std::optional<std::vector<AppPerfCohortRow>>
 AppPerfCohortReader::get_cohort_rows(const std::vector<std::string>& agent_ids,
                                      std::string_view app_name, std::string_view baseline_version,
-                                     std::string_view candidate_version, bool& truncated) {
+                                     std::string_view candidate_version, int window_days,
+                                     bool& truncated) {
     truncated = false;
+    if (window_days <= 0)
+        window_days = 1;
     std::vector<AppPerfCohortRow> out;
     if (agent_ids.empty() || app_name.empty())
         return out; // precondition miss, not a degrade
@@ -76,14 +79,22 @@ AppPerfCohortReader::get_cohort_rows(const std::vector<std::string>& agent_ids,
     const std::vector<std::string_view> version_views{base_canon, cand_canon};
 
     std::vector<std::string> params;
-    params.emplace_back(pg::to_text_array(member_views)); // $1
-    params.emplace_back(app_name);                        // $2
+    params.emplace_back(pg::to_text_array(member_views));  // $1
+    params.emplace_back(app_name);                         // $2
     params.emplace_back(pg::to_text_array(version_views)); // $3
+    params.emplace_back(std::to_string(window_days));      // $4
 
+    // Window IN SQL: keep only the most-recent `window_days` days of EACH version per
+    // machine (matching reduce_version_window), so the cap applies to the windowed set
+    // and a smaller window genuinely shrinks the read (gov M1). $4 is a server-built
+    // integer literal bound as a param.
     const std::string sql =
-        "SELECT agent_id, version, day, samples, cpu_avg, ws_avg_bytes "
-        "FROM app_perf_daily_store.app_perf_daily "
-        "WHERE agent_id = ANY($1::text[]) AND app_name = $2 AND version = ANY($3::text[]) "
+        "SELECT agent_id, version, day, samples, cpu_avg, ws_avg_bytes FROM ("
+        "  SELECT agent_id, version, day, samples, cpu_avg, ws_avg_bytes, "
+        "         ROW_NUMBER() OVER (PARTITION BY agent_id, version ORDER BY day DESC) AS rn "
+        "  FROM app_perf_daily_store.app_perf_daily "
+        "  WHERE agent_id = ANY($1::text[]) AND app_name = $2 AND version = ANY($3::text[])"
+        ") t WHERE rn <= $4::int "
         "ORDER BY agent_id, version, day LIMIT " +
         std::to_string(kQueryRowCap);
 

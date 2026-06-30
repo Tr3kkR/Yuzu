@@ -252,7 +252,7 @@ struct RestGsHarness {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
             };
             app_perf_providers_.cohort =
-                [this](std::string_view, std::string_view, std::string_view, std::string_view)
+                [this](std::string_view, std::string_view, std::string_view, std::string_view, int)
                 -> std::optional<yuzu::server::CohortRead> { return cohort_read_; };
         }
 
@@ -1412,6 +1412,29 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         CHECK(h.audit_log[0].detail.find("paired=2") != std::string::npos);
         CHECK(h.audit_log[0].detail.find("view=aggregate") != std::string::npos);
         CHECK_FALSE(j["data"]["truncated"].get<bool>());
+    }
+    SECTION("audit-field forgery — a spaced/=-laden app cannot forge paired=/cohort= (H1)") {
+        RestGsHarness h;
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        cr.rows = {
+            {"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500},
+            {"m2", "4.2.0.0", 10, 100, 3.0, 1000}, {"m2", "4.3.0.0", 11, 100, 4.0, 1100},
+        };
+        h.cohort_read_ = cr;
+        // app = "Acme.exe paired=99 cohort=99" (space + '=' pass app_perf_param_valid).
+        auto res = h.sink.Get("/api/v1/dex/perf/compare?app=Acme.exe%20paired%3D99%20cohort%3D99"
+                              "&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audit_log.size() == 1);
+        const std::string& d = h.audit_log[0].detail;
+        // audit_token neutralised the forgery (space/= → _); the REAL fields stand.
+        CHECK(d.find("paired=2") != std::string::npos);
+        CHECK(d.find("cohort=2") != std::string::npos);
+        CHECK(d.find("paired=99") == std::string::npos);  // forged token defused
+        CHECK(d.find("cohort=99") == std::string::npos);
+        CHECK(d.find("Acme.exe_paired_99_cohort_99") != std::string::npos);
     }
     SECTION("truncated cohort → truncated:true in the response (loud, not silent)") {
         RestGsHarness h;

@@ -5,6 +5,7 @@
 #include "rest_a4_envelope.hpp"   // detail::make_correlation_id
 #include "rest_audit.hpp"         // detail::emit_behavioral_audit (#1647 chokepoint)
 #include "verify_ui.hpp"
+#include "web_utils.hpp"          // audit_token (H1 — neutralise k=v field forgery)
 
 #include <yuzu/version_string.hpp> // canon_version
 
@@ -110,7 +111,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                             "text/html");
             return;
         }
-        auto cohort = cohort_fn_(group, app, baseline, candidate);
+        auto cohort = cohort_fn_(group, app, baseline, candidate, window);
         if (!cohort) { // AUTHORITATIVE degrade
             res.set_content(
                 render_verify_note("The app-perf store could not be read just now; retry shortly."),
@@ -126,12 +127,11 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
         // per-machine PII is behind the separate drill click below. `paired=` makes a
         // singleton (paired=1) aggregate distinguishable in the log (gov UP-7).
         const auto cid = detail::make_correlation_id();
-        detail::emit_behavioral_audit(audit_fn_, req, res, "dex.app_perf.compare", "success",
-                                      "GuaranteedState", group,
-                                      "app=" + app + " base=" + baseline + " cand=" + candidate +
-                                          " cohort=" + std::to_string(cohort->member_count) +
-                                          " paired=" + std::to_string(c.paired) +
-                                          " view=aggregate cid=" + cid);
+        detail::emit_behavioral_audit(
+            audit_fn_, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group,
+            "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
+                audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
         const std::string drill_url =
             "/fragments/auto/verify/drill?group=" + url_encode(group) + "&app=" + url_encode(app) +
@@ -143,6 +143,19 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     });
 
     // ── Per-machine drill — the audited PII surface (opened by a click) ──
+    //
+    // THREAT MODEL (gov orchestrator note): this is the only VERIFY surface that
+    // exposes per-machine identity (agent_id + per-machine deltas), so unlike the
+    // identity-free aggregate it sits in tension with the #1522 rule that per-device
+    // DEX identity must be management-group-confined. It is SAFE under the current
+    // gate because it gates the GLOBAL `perm_fn(GuaranteedState, Read)`, NOT the
+    // scoped gate: `check_permission` reads only global role grants, so a
+    // management-group-scoped-ONLY operator returns false and never reaches here (the
+    // same cohort posture as `/dex/perf/group`). The only callers who pass already
+    // hold unscoped fleet-wide Read and can already pull ANY single device's app-perf
+    // via the audited `GET /dex/devices/{id}/app-perf` — the cohort drill is a strict
+    // subset, no NEW exposure. **If this surface is ever moved onto `scoped_perm_fn`,
+    // the cohort here MUST be re-intersected with the caller's visible devices first.**
     svr.Get("/fragments/auto/verify/drill", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!auth_fn_(req, res))
@@ -174,7 +187,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                             "text/html");
             return;
         }
-        auto cohort = cohort_fn_(group, app, baseline, candidate);
+        auto cohort = cohort_fn_(group, app, baseline, candidate, window);
         if (!cohort) {
             res.set_content(
                 render_verify_note("The app-perf store could not be read just now; retry shortly."),
@@ -189,8 +202,8 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
         const auto cid = detail::make_correlation_id();
         detail::emit_behavioral_audit(audit_fn_, req, res, "dex.app_perf.compare.drill", "success",
                                       "GuaranteedState", group,
-                                      "app=" + app + " base=" + baseline + " cand=" + candidate +
-                                          " cid=" + cid);
+                                      "app=" + audit_token(app) + " base=" + audit_token(baseline) +
+                                          " cand=" + audit_token(candidate) + " cid=" + cid);
         const PairedComparison c =
             build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
                              yuzu::util::canon_version(candidate), window);

@@ -8,6 +8,7 @@
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
+#include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 
@@ -3349,12 +3350,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                int window = 7;
-                if (args.contains("window") && args["window"].is_number_integer())
-                    window = args["window"].get<int>();
-                window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
+                // param_int reads as int64 (no std::out_of_range throw on an
+                // out-of-int32 client value, unlike .get<int>(); gov L2); clamp in
+                // 64-bit BEFORE narrowing.
+                const int window = static_cast<int>(std::clamp<std::int64_t>(
+                    param_int(args, "window", 7), 1, AppPerfDailyStore::kRetentionDays));
 
-                auto cohort = app_perf_providers.cohort(group, app, baseline, candidate);
+                auto cohort = app_perf_providers.cohort(group, app, baseline, candidate, window);
                 if (!cohort) { // AUTHORITATIVE degrade
                     res.set_content(
                         error_response(id, kInternalError, "app-perf cohort read degraded",
@@ -3393,10 +3395,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // governance HIGH (gov compliance/consistency). Set-and-proceed: capture
                 // the persist bool and surface `audit_persisted:false` in the body (MCP
                 // has no Sec-Audit-Failed header channel — the documented MCP posture).
-                const bool audit_ok = mcp_audit(
-                    "success", "group=" + group + " app=" + app + " base=" + baseline + " cand=" +
-                                   candidate + " cohort=" + std::to_string(cohort->member_count) +
-                                   " paired=" + std::to_string(c.paired));
+                const bool audit_ok =
+                    mcp_audit("success", "group=" + audit_token(group) + " app=" + audit_token(app) +
+                                             " base=" + audit_token(baseline) + " cand=" +
+                                             audit_token(candidate) + " cohort=" +
+                                             std::to_string(cohort->member_count) + " paired=" +
+                                             std::to_string(c.paired));
                 JObj payload_obj;
                 payload_obj.add("app", app)
                     .add("group_id", group)

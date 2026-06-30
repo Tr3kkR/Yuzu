@@ -8783,7 +8783,7 @@ private:
         };
         app_perf_providers.cohort =
             [this](std::string_view group_id, std::string_view app, std::string_view baseline,
-                   std::string_view candidate) -> std::optional<CohortRead> {
+                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
             if (!app_perf_cohort_reader_ || !mgmt_group_store_)
                 return std::nullopt;
             // Resolve members (one bounded read, lease released), THEN read their raw
@@ -8799,8 +8799,8 @@ private:
             if (agent_ids.empty())
                 return out; // empty/unknown group → member_count 0, no rows (not a degrade)
             bool truncated = false;
-            auto rows =
-                app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate, truncated);
+            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
+                                                                 window_days, truncated);
             if (!rows)
                 return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
             out.rows = std::move(*rows);

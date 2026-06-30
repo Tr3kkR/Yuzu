@@ -55,9 +55,14 @@ public:
 
     /// Raw B1 rows for `agent_ids` × `app_name`, restricted to the two versions
     /// being compared (both canonicalized to match the stored key; a version may
-    /// be empty for the "" unknown bucket). Ordered `(agent_id, version, day)`,
-    /// `agent_id` preserved. AUTHORITATIVE: `std::nullopt` on a pool/query degrade;
-    /// empty value when `agent_ids`/`app_name` is empty or no rows match.
+    /// be empty for the "" unknown bucket) AND to the most-recent `window_days` days
+    /// of each version PER MACHINE (a `ROW_NUMBER() OVER (PARTITION BY agent_id,
+    /// version ORDER BY day DESC)` filter — the same per-machine-per-version window
+    /// `reduce_version_window` applies, pushed into SQL so the row cap bites on the
+    /// windowed set and "shorten the window" genuinely reduces the read; gov M1).
+    /// Ordered `(agent_id, version, day)`, `agent_id` preserved. AUTHORITATIVE:
+    /// `std::nullopt` on a pool/query degrade; empty value when `agent_ids`/`app_name`
+    /// is empty or no rows match. `window_days <= 0` is treated as 1.
     ///
     /// `truncated` (out-param) is set true when the result hit the hard row cap. The
     /// cap drops the alphabetically-last `agent_id`s mid-machine, so a truncated read
@@ -67,7 +72,7 @@ public:
     [[nodiscard]] std::optional<std::vector<AppPerfCohortRow>>
     get_cohort_rows(const std::vector<std::string>& agent_ids, std::string_view app_name,
                     std::string_view baseline_version, std::string_view candidate_version,
-                    bool& truncated);
+                    int window_days, bool& truncated);
 
 private:
     pg::PgPool& pool_;

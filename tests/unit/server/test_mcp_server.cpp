@@ -1407,7 +1407,7 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
           "[mcp][integration][dex][app_perf][verify]") {
     McpTestServer ts;
     ts.app_perf_providers_for_test.cohort =
-        [](std::string_view, std::string_view, std::string_view, std::string_view)
+        [](std::string_view, std::string_view, std::string_view, std::string_view, int)
         -> std::optional<yuzu::server::CohortRead> {
         yuzu::server::CohortRead cr;
         cr.member_count = 2;
@@ -1455,7 +1455,7 @@ TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInter
     SECTION("AUTHORITATIVE degrade (cohort read nullopt) → kInternalError") {
         McpTestServer ts;
         ts.app_perf_providers_for_test.cohort =
-            [](std::string_view, std::string_view, std::string_view, std::string_view)
+            [](std::string_view, std::string_view, std::string_view, std::string_view, int)
             -> std::optional<yuzu::server::CohortRead> { return std::nullopt; };
         ts.start("readonly");
         auto body = nlohmann::json::parse(ts.call(call)->body);
@@ -1465,7 +1465,7 @@ TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInter
     SECTION("truncated cohort surfaces truncated:true in the payload") {
         McpTestServer ts;
         ts.app_perf_providers_for_test.cohort =
-            [](std::string_view, std::string_view, std::string_view, std::string_view)
+            [](std::string_view, std::string_view, std::string_view, std::string_view, int)
             -> std::optional<yuzu::server::CohortRead> {
             yuzu::server::CohortRead cr;
             cr.member_count = 2;
