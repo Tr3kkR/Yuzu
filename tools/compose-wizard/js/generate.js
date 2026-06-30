@@ -619,7 +619,7 @@ ${c.tlsMode === 'plaintext'
   // local container is generated.
   if (c.pgBundled) {
     y += `\n  # ── PostgreSQL (server storage substrate, ADR-0006/0008) ─────────────\n`;
-    y += `  # Release-pinned yuzu-postgres image: PostgreSQL 16 + pgvector + a\n`;
+    y += `  # Release-pinned yuzu-postgres image: PostgreSQL 18 + pgvector + a\n`;
     y += `  # first-boot init that creates the app role/database. Per-store schemas\n`;
     y += `  # are created at runtime by the server's migration runner. Using an\n`;
     y += `  # external/managed Postgres instead is first-class — re-run the wizard\n`;
@@ -636,10 +636,18 @@ ${c.tlsMode === 'plaintext'
     y += `      - POSTGRES_PASSWORD=\${YUZU_POSTGRES_PASSWORD}\n`;
     y += `      - YUZU_DB_PASSWORD=\${YUZU_DB_PASSWORD}\n`;
     y += `    volumes:\n`;
+    // PG18 mount point is the PARENT /var/lib/postgresql, NOT .../data. The
+    // postgres:18 image keeps data in a version-pinned subdir
+    // ($PGDATA=/var/lib/postgresql/18/docker) and reads a volume at the legacy
+    // /data path as an un-migrated upgrade — the container refuses to boot
+    // (docker-library/postgres#1259). Leave PGDATA at the image default.
+    y += `      # PG18 stores data under \$PGDATA=/var/lib/postgresql/18/docker; mount\n`;
+    y += `      # the volume at the PARENT, not the legacy .../data path (which the\n`;
+    y += `      # postgres:18 entrypoint refuses to boot from). docker-library/postgres#1259.\n`;
     if (c.persistentVolumes) {
-      y += `      - postgres-data:/var/lib/postgresql/data\n`;
+      y += `      - postgres-data:/var/lib/postgresql\n`;
     } else {
-      y += `      - /var/lib/postgresql/data\n`;
+      y += `      - /var/lib/postgresql\n`;
     }
     y += `    healthcheck:\n`;
     // -h 127.0.0.1 forces a TCP probe (initdb's temporary server is socket-only
