@@ -409,7 +409,7 @@ TEST_CASE("route: version drill — deny, success+audit, degrade", "[inventory][
     }
 }
 
-TEST_CASE("route: devices list — deny vs success (offline-inclusive, list not audited)",
+TEST_CASE("route: devices list — deny vs success (offline-inclusive, audited)",
           "[inventory][route]") {
     {
         InvHarness h;
@@ -424,9 +424,13 @@ TEST_CASE("route: devices list — deny vs success (offline-inclusive, list not 
         auto res = h.sink.Get("/fragments/inventory/devices");
         REQUIRE(res);
         REQUIRE(contains(res->body, "WIN-1"));
-        // House convention: the list read is gate-only, not audited (parity with
-        // /fragments/devices/list); only the per-device drill audits.
-        REQUIRE(h.audits.empty());
+        // The identity-bearing roster read is audited (gov review #1759 — parity with the
+        // other inventory surfaces).
+        bool audited = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.devices|success")
+                audited = true;
+        REQUIRE(audited);
     }
 }
 

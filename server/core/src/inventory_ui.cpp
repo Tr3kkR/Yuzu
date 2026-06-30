@@ -401,13 +401,18 @@ std::string render_inventory_device_software_fragment(
 std::string render_inventory_find_fragment(const std::string& initial_name) {
     std::string h = page_head();
     h += inv_subnav("find");
-    // Find DOES narrow by management group (the per-row scope drop is effective here,
-    // unlike the catalogue aggregate) — so it gets its OWN note, NOT the shared
-    // catalogue caveat that says "does not narrow results today" (gov happy-SHOULD).
-    h += "<div class=\"inv-caveat\">Management-group confinement applies to these results: "
-         "devices outside your scope are filtered out below (and the count is shown). A short or "
-         "empty result under a narrow scope is <b>incomplete</b>, not proof the software is "
-         "absent fleet-wide.</div>";
+    // DOC HONESTY (gov review #1759 / ADR-0017): the per-row scope filter is a FOUNDATION,
+    // NOT effective list-confinement today. Under the global Inventory:Read gate a confined
+    // operator is denied at the gate and a global one sees all, so the filter does not
+    // actually narrow by management group yet (the admit-then-filter gate is #1716). Match
+    // the REST/MCP sibling wording EXACTLY so an admin can't wrongly delegate Find to a
+    // confined operator. The per-DEVICE drill IS management-group scoped.
+    h += "<div class=\"inv-caveat\">Scope: Find requires the global "
+         "<span class=\"inv-mono\">Inventory:Read</span> permission and returns "
+         "<b>fleet-wide</b> results — management-group confinement is <b>not yet effective</b> "
+         "on this list (ADR-0017); only the per-device drill is scoped. A short or empty result "
+         "under a narrow scope is <b>incomplete</b>, not proof the software is absent "
+         "fleet-wide.</div>";
     h += "<div class=\"inv-banner\">Find which devices run a software title. Exact name match; "
          "capped at 1000 rows (a short/zero result under a narrow scope is incomplete, not "
          "absent).</div>";

@@ -159,6 +159,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::vector<InventoryDeviceRow> rows;
                  if (devices_fn_)
                      rows = devices_fn_(session->username);
+                 // Audit the identity-bearing roster read (hostnames + agent_ids) for parity
+                 // with the other inventory surfaces (gov review #1759). Set-and-proceed via
+                 // the throw-safe kernel — scope-confined at devices_fn_, machine-scope data.
+                 (void)detail::try_persist_audit(audit_fn_, req, "inventory.devices", "success",
+                                                 "Inventory", "fleet",
+                                                 "devices=" + std::to_string(rows.size()));
                  send_html(res, render_inventory_devices_fragment(rows, "", "", ""));
              });
 

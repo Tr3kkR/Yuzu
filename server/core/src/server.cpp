@@ -9168,11 +9168,18 @@ private:
             inv_devices_fn,
             // FIND per-row Inventory:Read management-group scope predicate — the SAME
             // check_scoped_permission chokepoint the REST route + MCP tool use.
+            // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
+            // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
+            // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
+            // response_agent_in_scope (server.cpp); the REST/MCP siblings still carry the raw
+            // form pending the #1717 global-gate fix, but each new list-read takes the safe
+            // primitive now (ADR-0017 ship-now, decision-independent hardening).
             [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                    return true;
-                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
-                                                            mgmt_group_store_.get());
+                if (!rbac_enforcement_in_effect(rbac_store_.get()))
+                    return true; // loaded & explicitly disabled → legacy-open
+                return rbac_store_ && rbac_store_->check_scoped_permission(
+                                          username, "Inventory", "Read", agent_id,
+                                          mgmt_group_store_.get());
             },
             // Freshness KPI: current stale count (nullopt on degrade → "—" in the UI).
             // SAME 2-missed-cycles window as the metrics sweep.

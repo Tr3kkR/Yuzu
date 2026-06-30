@@ -191,9 +191,9 @@ same data, with three tabs:
 - **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
   status, and last-seen, sourced from the server's persisted endpoint state so a device
   appears here **even when it is offline** (joined to the live registry for the online
-  flag). The **list** is gated on the global `Inventory:Read` and filtered to the
-  operator's visible scope by the device provider (it carries no software content, so —
-  like the fleet `/devices` list — the list read itself is not audited). **Clicking a
+  flag). The **list** is gated on the global `Inventory:Read`, filtered to the
+  operator's visible scope by the device provider, and the roster read is audited
+  (`inventory.devices`). **Clicking a
   device** loads that device's installed software; that per-device drill is additionally
   gated by the management-group chokepoint (`Inventory:Read` for the device's group, so
   an operator only opens a device in their scope) **and is audited**
@@ -202,9 +202,12 @@ same data, with three tabs:
   the device-CI sync source (a follow-on). A large device list is rendered first-N with
   the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
-  versions. This applies the same per-row management-group drop filter and 1000-row cap
-  as the REST endpoint (a short/zero result under a narrow scope is *incomplete*, not
-  *absent*; the page flags a truncated page and the count of out-of-scope devices).
+  versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
+  and returns **fleet-wide** results: management-group confinement is **not yet effective**
+  on this list view (the per-row scope filter is a foundation for the ADR-0017
+  admit-then-filter gate, #1716, not effective list-confinement today — only the
+  per-device drill is scoped). 1000-row cap; a short/zero result under a narrow scope is
+  *incomplete*, not *absent* (keyset paging is the #1634 follow-up).
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an
