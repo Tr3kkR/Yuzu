@@ -16,6 +16,7 @@
 #include <format>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace yuzu::tar {
 
@@ -564,6 +565,46 @@ std::vector<UserEvent> compute_user_events(
     for (const auto& u : previous) {
         if (!curr_map.contains(make_key(u)))
             events.push_back({timestamp, snapshot_id, "logout", u.user, u.domain, u.logon_type, u.session_id});
+    }
+
+    return events;
+}
+
+std::vector<SoftwareEvent> compute_software_events(
+    const std::vector<SoftwareInfo>& previous,
+    const std::vector<SoftwareInfo>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<SoftwareEvent> events;
+
+    // Machine scope only: key on the application name. (An earlier design keyed on
+    // (scope, user, name) to track per-user installs independently; per-user scope
+    // was dropped, so name alone is the identity — #1620.)
+    auto make_key = [](const SoftwareInfo& s) -> std::string { return s.name; };
+
+    std::unordered_map<std::string, const SoftwareInfo*> prev_map;
+    for (const auto& s : previous) prev_map[make_key(s)] = &s;
+    std::unordered_map<std::string, const SoftwareInfo*> curr_map;
+    for (const auto& s : current) curr_map[make_key(s)] = &s;
+
+    for (const auto& s : current) {
+        auto it = prev_map.find(make_key(s));
+        if (it == prev_map.end()) {
+            events.push_back({timestamp, snapshot_id, "installed", s.name, s.version, "",
+                              s.publisher, s.install_date});
+        } else if (it->second->version != s.version) {
+            // Same identity, version changed → upgrade (or downgrade); carry the
+            // previous version. A bare reinstall at the same version emits nothing.
+            events.push_back({timestamp, snapshot_id, "upgraded", s.name, s.version,
+                              it->second->version, s.publisher, s.install_date});
+        }
+    }
+
+    for (const auto& s : previous) {
+        if (!curr_map.contains(make_key(s))) {
+            events.push_back({timestamp, snapshot_id, "removed", s.name, s.version, "",
+                              s.publisher, s.install_date});
+        }
     }
 
     return events;

@@ -235,30 +235,47 @@ def main() -> int:
     # std::vector<std::string>. Picking ")BCT(" as the raw-string
     # delimiter — chosen for impossibility in any sane content YAML.
     DELIM = "BCT"
+
+    # MSVC caps a single string-literal token at 16380 bytes (error C2026), so a
+    # large envelope (a verbose definition's yaml_source + parameter_schema) is
+    # split into several ADJACENT raw-string literals — the compiler concatenates
+    # them into one std::string element, transparently. Safe because the whole
+    # envelope is verified free of the `)BCT"` delimiter below, so no chunk can
+    # contain it and no chunk boundary can synthesise it (chunks are separate
+    # literals; only their VALUES are concatenated). Chunk well under the cap.
+    CHUNK = 12000
+
+    def emit_literal(j: str) -> bytes:
+        # Sanity check: rule out delimiter collision in the JSON envelope.
+        if f"){DELIM}\"" in j:
+            raise ValueError("JSON envelope contains raw-string delimiter")
+        parts = [j[i:i + CHUNK] for i in range(0, len(j), CHUNK)] or [""]
+        line = b"    "
+        for k, part in enumerate(parts):
+            if k:
+                line += b" "
+            line += b'R"' + DELIM.encode() + b"(" + part.encode("utf-8") + b")" + DELIM.encode() + b'"'
+        return line + b",\n"
+
     out = bytearray()
     out += f"// AUTO-GENERATED from {root.name}/ by embed_content.py — do not edit.\n".encode("utf-8")
     out += f"// Definitions: {len(defs_json)}, Sets: {len(sets_json)}.\n\n".encode("ascii")
     out += b"#include <string>\n#include <vector>\n\n"
     out += b"namespace yuzu::server {\n\n"
 
-    out += b"extern const std::vector<std::string> kBundledDefinitions = {\n"
-    for j in defs_json:
-        # Sanity check: rule out delimiter collision in the JSON.
-        if f"){DELIM}\"" in j:
-            print(f"ERROR: JSON envelope contains raw-string delimiter {DELIM}",
-                  file=sys.stderr)
-            return 1
-        out += b'    R"' + DELIM.encode() + b"(" + j.encode("utf-8") + b")" + DELIM.encode() + b'",\n'
-    out += b"};\n\n"
+    try:
+        out += b"extern const std::vector<std::string> kBundledDefinitions = {\n"
+        for j in defs_json:
+            out += emit_literal(j)
+        out += b"};\n\n"
 
-    out += b"extern const std::vector<std::string> kBundledSets = {\n"
-    for j in sets_json:
-        if f"){DELIM}\"" in j:
-            print(f"ERROR: JSON envelope contains raw-string delimiter {DELIM}",
-                  file=sys.stderr)
-            return 1
-        out += b'    R"' + DELIM.encode() + b"(" + j.encode("utf-8") + b")" + DELIM.encode() + b'",\n'
-    out += b"};\n\n"
+        out += b"extern const std::vector<std::string> kBundledSets = {\n"
+        for j in sets_json:
+            out += emit_literal(j)
+        out += b"};\n\n"
+    except ValueError as e:
+        print(f"ERROR: {e} {DELIM}", file=sys.stderr)
+        return 1
 
     out += b"}  // namespace yuzu::server\n"
 

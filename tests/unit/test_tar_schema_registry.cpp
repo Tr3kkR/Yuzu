@@ -234,8 +234,10 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // do_status(), apply_source_enabled_transition(), and run_retention() all
     // read. The high-volume usage-class sources (module ~100× process volume,
     // procperf per-app, netqual per-connection) are opt-in and must report
-    // disabled on a fresh agent; everything else is always-on.
-    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns"}) {
+    // disabled on a fresh agent; software is opt-in too (off by default — the
+    // cautious posture for a new capture source, #1620); everything else is
+    // always-on.
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }
@@ -250,5 +252,65 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     for (const auto& src : capture_sources()) {
         INFO("source=" << src.name);
         CHECK(source_default_enabled(src.name) == src.default_enabled);
+    }
+}
+
+TEST_CASE("TAR schema: software source is registered with three tiers + Windows support",
+          "[tar][schema][software]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "software"; });
+    REQUIRE(it != sources.end());
+    CHECK(it->dollar_name == "Software");
+    CHECK_FALSE(it->default_enabled); // opt-in (off by default) — cautious new-source posture (#1620)
+
+    // live + daily + monthly, in that declaration order (so run_aggregation rolls
+    // daily-from-live before monthly-from-daily within one tick).
+    REQUIRE(it->granularities.size() == 3);
+    CHECK(it->granularities[0].suffix == "live");
+    CHECK(it->granularities[1].suffix == "daily");
+    CHECK(it->granularities[2].suffix == "monthly");
+    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+
+    // Windows is fully supported; Linux/macOS are planned (queryable-empty).
+    for (const auto& os : it->os_support) {
+        if (os.os == "windows")
+            CHECK(os.status == OsSupportStatus::kSupported);
+        else
+            CHECK(os.status == OsSupportStatus::kPlanned);
+    }
+}
+
+TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns",
+          "[tar][schema][software]") {
+    CHECK(translate_dollar_name("$Software_Live") == "software_live");
+    CHECK(translate_dollar_name("$Software_Daily") == "software_daily");
+    CHECK(translate_dollar_name("$Software_Monthly") == "software_monthly");
+
+    // The warehouse tables are allowlisted for the read-only tar.sql sandbox.
+    CHECK(is_queryable_table("software_live"));
+    CHECK(is_queryable_table("software_daily"));
+
+    const auto ddl = generate_warehouse_ddl();
+    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS software_live") != std::string::npos);
+    CHECK(ddl.find("prev_version") != std::string::npos);
+
+    // live carries the full event columns (machine scope only — no scope/user);
+    // daily/monthly carry the count rollup.
+    auto live_cols = columns_for_table("software_live");
+    for (const auto* c : {"action", "name", "version", "prev_version", "publisher",
+                          "install_date"}) {
+        INFO("software_live column=" << c);
+        CHECK(std::find(live_cols.begin(), live_cols.end(), c) != live_cols.end());
+    }
+    // scope/user were dropped with per-user scope (#1620) — they must NOT exist.
+    for (const auto* c : {"scope", "user"}) {
+        INFO("software_live must NOT have column=" << c);
+        CHECK(std::find(live_cols.begin(), live_cols.end(), c) == live_cols.end());
+    }
+    auto daily_cols = columns_for_table("software_daily");
+    for (const auto* c : {"install_count", "remove_count", "upgrade_count"}) {
+        INFO("software_daily column=" << c);
+        CHECK(std::find(daily_cols.begin(), daily_cols.end(), c) != daily_cols.end());
     }
 }

@@ -1019,6 +1019,65 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
     return true;
 }
 
+bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& events) {
+    std::lock_guard lock(mu_);
+    if (!db_ || events.empty())
+        return events.empty();
+
+    char* err_msg = nullptr;
+    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc_begin != SQLITE_OK) {
+        spdlog::error("insert_software_events BEGIN: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    const char* sql = R"(
+        INSERT INTO software_live (ts, snapshot_id, action, name, version, prev_version,
+                                   publisher, install_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_software_events prepare: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    for (const auto& ev : events) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, ev.version.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 6, ev.prev_version.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 7, ev.publisher.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 8, ev.install_date.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("insert_software_events step: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+    }
+
+    err_msg = nullptr;
+    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::error("insert_software_events commit: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
 bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
     std::lock_guard lock(mu_);
     if (!db_ || events.empty())

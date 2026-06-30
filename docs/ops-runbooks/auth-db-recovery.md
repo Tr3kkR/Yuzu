@@ -388,6 +388,59 @@ manually record:
 Per SOC 2 CC6.6 the break-glass procedure is itself an auditable event
 and the manual record is the evidence chain.
 
+## Break-glass arm (IdP outage under `--auth-mode=sso-only`)
+
+When the server runs in hardened mode (`--auth-mode=sso-only`), local-password
+login is disabled fleet-wide and only OIDC SSO mints a session. If the IdP is
+**down**, the single configured `--break-glass-user` is the recovery path — but
+it is dormant until **armed**, and arming is an out-of-band host operation (it
+must NOT depend on a session, because the IdP being down is exactly why you need
+it). This is the analog of `--mfa-reset` and follows the same audited contract
+(#1226).
+
+```bash
+# On the server host, as the service account (Linux example):
+sudo -u _yuzu yuzu-server \
+  --config /etc/yuzu/yuzu-server.cfg \
+  --data-dir /var/lib/yuzu \
+  --break-glass-user alice \
+  --break-glass-arm
+# → arms `alice` for --break-glass-window-secs (default 24h, auto-expiring),
+#   prints {"status":"ok",...,"armed_until":"..."} and EXITS (does not serve).
+```
+
+Contract / safeguards:
+
+- **Prerequisite (enforced):** the break-glass account must exist and have **MFA
+  enrolled** — the arm refuses (exit non-zero) otherwise. A break-glass account
+  with no second factor is never allowed.
+- **Audited:** writes an `auth.breakglass.armed` audit row attributed to the
+  **kernel OS identity** that ran the CLI (not the forgeable `USER` env var),
+  `principal_role=break-glass`. The audit store is verified **writable before**
+  the arm mutates — if it isn't, the arm refuses, so the exemption is never
+  granted without a record.
+- **Login still needs MFA.** After arming, `alice` can log in locally under
+  sso-only, but the mandatory TOTP challenge still runs. There is **no metric**
+  for the arm itself — the `auth.breakglass.armed` audit row is the detective
+  signal; configure your SIEM to alert on it.
+- **Auto-expiry, no early-disarm command.** The window auto-expires (no
+  `--break-glass-disarm` yet — tracked follow-up). To close it early, you can
+  reduce exposure by restoring SSO; the exemption lapses on its own.
+
+> **Availability — the break-glass account is exempt from lockout under
+> sso-only.** To stop an attacker who learns the break-glass username from
+> spraying wrong passwords to keep the account locked (and the escape hatch
+> unreachable) during the very outage it exists for, the configured
+> `--break-glass-user` is **not** subject to failed-login lockout while
+> `--auth-mode=sso-only` (governance Hermes-F / UP-13). This is safe because the
+> account still requires its **second factor** (a guessed password alone grants
+> nothing), and while *un-armed* the password is never even evaluated. Every
+> wrong attempt is still audited as `auth.login_failed` and per-IP rate-limited,
+> so brute-force activity stays visible. In **standard** mode the same account
+> keeps normal lockout. (Pick a non-guessable break-glass username regardless,
+> and alert on `yuzu_auth_local_disabled_total{target=break_glass}` +
+> `auth.login_failed` for it.)
+
 ## Locked out by MFA enforcement misconfiguration (PR 3)
 
 `--mfa-enforcement=admin-only|required` (PR 3) can lock operators out in

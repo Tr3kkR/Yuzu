@@ -63,6 +63,18 @@ struct UserSession {
     std::string session_id;
 };
 
+/// One installed-software entry, as enumerated for the `software` source diff.
+/// Machine scope only: an entry is the host's installed software (HKLM
+/// Uninstall), never attributed to a Windows profile, so the capture carries no
+/// per-user identity (#1620). The diff key is `name`; a change in `version` for
+/// the same name is an 'upgraded' event.
+struct SoftwareInfo {
+    std::string name;
+    std::string version;
+    std::string publisher;
+    std::string install_date;
+};
+
 // One host ARP / neighbour-table entry (ADR-0015). Snapshot type for the `arp`
 // capture source; diffed into ArpEvent rows. Diff key = (interface, ip_address,
 // mac_address); entry_type is a value field. All fields agent-controlled.
@@ -119,6 +131,15 @@ std::vector<ServiceInfo> enumerate_services();
 std::vector<UserSession> enumerate_users();
 
 /**
+ * Installed-software enumeration for the `software` source: machine-wide only
+ * (HKLM Uninstall 64-bit + WOW6432Node 32-bit). Cheap — no hive mounts, no
+ * per-user identity. This is the sole enumeration entry point (cold-start and
+ * steady-state alike read the same machine scope). Empty off Windows (kPlanned;
+ * a fast-follow will reuse the installed_apps dpkg/rpm/pkgutil enumeration).
+ */
+void enumerate_machine_software(std::vector<SoftwareInfo>& out);
+
+/**
  * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
  * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
  * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
@@ -132,10 +153,17 @@ std::vector<ArpEntry> enumerate_arp();
  */
 std::vector<DnsEntry> enumerate_dns();
 
-/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector resizes to
-/// the cap and logs a truncation warning rather than growing unbounded.
+/// Per-cycle collection caps (ADR-0015 §"Memory bound"). The collector stops
+/// enumerating at the cap and logs a truncation warning rather than growing
+/// unbounded.
 inline constexpr std::size_t kArpEntryCap = 2048;
 inline constexpr std::size_t kDnsEntryCap = 4096;
+/// Per-cycle cap on installed-software entries (machine + all per-user hives in
+/// one tick). Sized to hold a bloated many-profile RDS/Citrix host's full
+/// inventory while bounding memory + tick duration on a corrupt/huge registry
+/// (#1620). A truncated tick warns once (rate-limited) — see
+/// tar_software_collector.cpp.
+inline constexpr std::size_t kSoftwareEntryCap = 8192;
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -249,6 +277,18 @@ std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>&
 std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previous,
                                            const std::vector<UserSession>& current,
                                            int64_t timestamp, int64_t snapshot_id);
+
+/**
+ * Compute software install/uninstall diff.
+ * Key: name (machine scope only — no per-user identity).
+ * Detects installs (present in current, not previous), removals (present in
+ * previous, not current), and upgrades (same name, different version — carries
+ * prev_version). The diff is name-keyed, so a version bump is one 'upgraded'
+ * event rather than a remove+install pair.
+ */
+std::vector<SoftwareEvent> compute_software_events(const std::vector<SoftwareInfo>& previous,
+                                                   const std::vector<SoftwareInfo>& current,
+                                                   int64_t timestamp, int64_t snapshot_id);
 
 /**
  * Compute ARP diff. Key: interface + ip_address + mac_address.

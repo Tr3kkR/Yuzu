@@ -161,6 +161,37 @@ admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
 re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
 
+## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
+
+**No operator action on upgrade.** Existing deployments default to
+`--auth-mode=standard` and behave exactly as before. This release adds the
+*option* to disable local-password login fleet-wide so only OIDC SSO can mint a
+session.
+
+If you intend to enable `sso-only`, do this **first** — the server **fails
+closed (non-zero exit, refuses to serve)** otherwise:
+
+1. Configure OIDC (`--oidc-issuer` + the related flags) and confirm SSO works in
+   `standard` mode. `sso-only` without `--oidc-issuer` refuses to start (it would
+   lock every operator out).
+2. (Recommended) Create a single break-glass local account and **enroll MFA on
+   it** (Settings → Multi-Factor Authentication). Point `--break-glass-user` at
+   it. `sso-only` refuses to start if the named break-glass user doesn't exist or
+   has no MFA enrolled — a break-glass account must carry a second factor.
+3. Restart with `--auth-mode=sso-only`. Local-password login is now rejected for
+   everyone except the break-glass account, and only **while armed**.
+
+**Breaking the glass (IdP outage).** The break-glass account is dormant until
+armed out-of-band on the server host: `yuzu-server --break-glass-arm
+--break-glass-user <name> --config … --data-dir …` arms it for
+`--break-glass-window-secs` (default 24 h, auto-expiring). It still requires the
+account's MFA at login. Full runbook: `docs/ops-runbooks/auth-db-recovery.md`
+§ Break-glass arm.
+
+**Migration.** AuthDB migration **v4** adds a nullable `break_glass_armed_until`
+column to `users` — automatic, additive, data-safe. **Rollback** below 0.x after
+v4 has run is data-safe (the column is simply ignored).
+
 ## ⚠️ Breaking: server generates default TLS certificates on first boot (v0.13.0)
 
 Before v0.13.0 the server **refused to start** without operator-provided certs

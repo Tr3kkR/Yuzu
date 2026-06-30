@@ -207,6 +207,12 @@ std::string_view diff_state_key(std::string_view source) {
         return "service";
     if (source == "user")
         return "user";
+    // software is a snapshot-diff source too: collect_software keeps an installed-
+    // inventory baseline under this exact key (get_state/set_state "software"), so
+    // the on-disable clear must reach it or a re-enable would emit ghost
+    // install/remove/upgrade events for everything that changed while paused (#538).
+    if (source == "software")
+        return "software";
     // ADR-0015 — arp/dns are snapshot-diff sources too: the collect legs keep a
     // baseline under these exact keys (get_state/set_state "arp"/"dns"), so the
     // on-disable clear must reach them or a re-enable would emit ghost

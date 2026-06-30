@@ -31,6 +31,7 @@
 #include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
 #include "tar_aggregator.hpp"
+#include "tar_software_core.hpp"
 #include "tar_sql_executor.hpp"
 
 #include <yuzu/agent/network_interfaces.hpp>
@@ -257,6 +258,10 @@ std::vector<yuzu::tar::UserSession> json_to_users(const std::string& s) {
     return result;
 }
 
+// Installed-software state (de)serialisation lives in tar_software_core.cpp
+// (software_state_to_json / software_state_from_json) so the orchestration that
+// uses it — software_collect_core — is unit-testable off-Windows.
+
 // ── Redaction pattern loading ────────────────────────────────────────────────
 
 std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
@@ -329,10 +334,11 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"status",    "query",        "snapshot",      "export",
-                                     "configure", "collect_fast", "collect_slow",  "collect_perf",
-                                     "rollup",    "sql",          "compatibility", "fleet_snapshot",
-                                     nullptr};
+        static const char* acts[] = {"status",         "query",         "snapshot",
+                                     "export",         "configure",     "collect_fast",
+                                     "collect_slow",   "collect_perf",  "collect_software",
+                                     "rollup",         "sql",           "compatibility",
+                                     "fleet_snapshot", nullptr};
         return acts;
     }
 
@@ -396,6 +402,21 @@ public:
                 R"({{"interval_seconds":{},"plugin":"tar","action":"collect_perf","parameters":{{}}}})",
                 perf_interval);
             ctx.register_trigger("tar.perf", "interval", perf_config);
+        }
+
+        // Software install/uninstall sampler: hourly default. Installs are rare,
+        // so this runs on its own slower trigger rather than the 60s/300s collectors.
+        // software_interval_seconds = 0 disables registration entirely; the
+        // per-source software_enabled config gates collection at run time.
+        int software_interval = 3600;
+        try {
+            software_interval = std::stoi(db_->get_config("software_interval_seconds", "3600"));
+        } catch (...) {}
+        if (software_interval > 0) {
+            auto software_config = std::format(
+                R"({{"interval_seconds":{},"plugin":"tar","action":"collect_software","parameters":{{}}}})",
+                software_interval);
+            ctx.register_trigger("tar.software", "interval", software_config);
         }
 
         // Register rollup trigger (15-minute aggregation cycle)
@@ -505,6 +526,13 @@ public:
         if (db_->get_config("module_enabled", "").empty()) {
             db_->set_config("module_enabled", "false");
         }
+        // #1620: seed the opt-in software_enabled key (the `software` source is
+        // default-off, like module) so the configure / retention /
+        // retention-paused-list machinery (which default a MISSING key to ENABLED
+        // via source_enabled) agrees with the collector's explicit default-off.
+        if (db_->get_config("software_enabled", "").empty()) {
+            db_->set_config("software_enabled", "false");
+        }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
         // LAZILY by collect_fast on the first tick where module_enabled is true (so
@@ -523,6 +551,7 @@ public:
         ctx.unregister_trigger("tar.fast");
         ctx.unregister_trigger("tar.slow");
         ctx.unregister_trigger("tar.perf");
+        ctx.unregister_trigger("tar.software");
         ctx.unregister_trigger("tar.rollup");
         // Take collect_mu_ around the collector teardown: a collect_fast tick may
         // still be draining proc_stream_ (reads impl_ via drain()/running()), and
@@ -560,6 +589,8 @@ public:
             return do_collect_slow(ctx);
         if (action == "collect_perf")
             return do_collect_perf(ctx);
+        if (action == "collect_software")
+            return do_collect_software(ctx);
         if (action == "status")
             return do_status(ctx);
         if (action == "query")
@@ -587,6 +618,13 @@ private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
+    // Separate mutex for the software source: its state read-diff-write touches
+    // only the "software" KV state (never prev_perf_/prev_proc_/proc_stream_), and
+    // the registry walk + JSON (de)serialise can be slow on many-profile hosts —
+    // putting it on collect_mu_ would stall collect_fast/slow/fleet_snapshot. A
+    // dedicated mutex serialises concurrent collect_software (manual vs trigger)
+    // without that cross-collector coupling.
+    std::mutex software_collect_mu_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
     // Per-app version cache, keyed by (pid, create_time): resolves each top-N
@@ -1209,6 +1247,89 @@ private:
         return collect_slow_impl(ctx);
     }
 
+    // ── collect_software: installed-software inventory diff ───────────────────
+    // Diffs the installed-software inventory and records install/remove/upgrade
+    // events. Runs on the dedicated tar.software trigger (hourly default).
+    //
+    // Scope: MACHINE-WIDE inventory only (HKLM Uninstall). The source carries no
+    // user identity — an event is the host's software, never a Windows profile's —
+    // so there is no per-user / NTUSER.DAT / hive-mount path (#1620). The source is
+    // opt-in (default off): an operator turns it on per host.
+    //
+    // The enumeration — which on Windows walks the registry — runs OUTSIDE
+    // collect_mu_ so a slow registry pass cannot stall collect_fast/slow/
+    // fleet_snapshot under that shared lock (gov UP-6, mirrors collect_perf). Only
+    // the state read-diff-write is locked.
+    //
+    // Cold start: the FIRST run on a host (no prior "software" state) seeds the
+    // baseline WITHOUT emitting events — an 'installed' event must mean "installed
+    // now", not "already present when the agent started watching". This is a
+    // deliberate divergence from the service/user cold-start burst and mirrors the
+    // process-stream fallback baseline seed.
+    int do_collect_software(yuzu::CommandContext& ctx) {
+        const auto ts = now_epoch_seconds();
+        // Heartbeat: record that the tick fired regardless of outcome, so an
+        // operator reading tar.status can tell "healthy but quiet" from "trigger
+        // never ran" / "every tick errors" (the agent has no /metrics endpoint).
+        db_->set_config("software_last_run_ts", std::to_string(ts));
+
+        if (!source_enabled(*db_, "software")) {
+            ctx.write_output("tar|collect_software|0|source_disabled");
+            return 0;
+        }
+
+        std::lock_guard lock(software_collect_mu_); // serialises concurrent collect_software only
+        // #538/#1620: the source_enabled gate above ran WITHOUT this lock; a
+        // `tar.configure software_enabled=false` (do_configure) takes this SAME
+        // lock to clear the baseline + flip the flag. Re-check under the lock so a
+        // disable racing a mid-flight tick can neither insert events from the
+        // paused window nor re-seed a baseline after the disable cleared it
+        // (mirrors the perf/procperf post-lock re-check).
+        if (!source_enabled(*db_, "software")) {
+            ctx.write_output("tar|collect_software|0|source_disabled");
+            return 0;
+        }
+
+        auto prev_json = db_->get_state("software");
+
+        // Enumerate THIS tick's machine-scope inventory (HKLM Uninstall, 64-bit +
+        // WOW6432Node). The enumeration runs OUTSIDE collect_mu_ (we hold only
+        // software_collect_mu_), so a slow registry pass cannot stall
+        // collect_fast/slow/fleet_snapshot.
+        std::vector<yuzu::tar::SoftwareInfo> enumerated;
+        yuzu::tar::enumerate_machine_software(enumerated);
+
+        // Pure classify + diff (cold-start seed / corrupt-skip / steady), unit-tested
+        // off-Windows in test_tar_software.cpp.
+        const auto snap_id = next_snapshot_id();
+        auto result = yuzu::tar::software_collect_core(prev_json, std::move(enumerated), ts, snap_id);
+        using Kind = yuzu::tar::SoftwareCollectResult::Kind;
+        switch (result.kind) {
+        case Kind::kCorruptSkip:
+            spdlog::error("TAR: software state is not a JSON array — skipping tick "
+                          "(baseline preserved, not re-seeded)");
+            ctx.write_output("tar|collect_software|0|state_unreadable");
+            return 0;
+        case Kind::kColdStartSeed:
+            db_->set_state("software", result.new_state_json);
+            ctx.write_output("tar|collect_software|0|baseline_seeded");
+            return 0;
+        case Kind::kSteady:
+            if (!result.events.empty()) {
+                if (!db_->insert_software_events(result.events)) {
+                    spdlog::error("TAR: failed to insert software events, skipping state save");
+                    ctx.write_output("error|software insert failed");
+                    return 1;
+                }
+            }
+            db_->set_state("software", result.new_state_json);
+            ctx.write_output(
+                std::format("tar|collect_software|{}|events_recorded", result.events.size()));
+            return 0;
+        }
+        return 0; // unreachable — switch is exhaustive over Kind
+    }
+
     // ── status action ─────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
@@ -1268,6 +1389,15 @@ private:
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+
+        // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
+        // of the last collect_software tick (0 if it has never run) — the operator's
+        // signal that the hourly trigger is alive even on a host with no software
+        // changes (where software_live_rows stays 0).
+        ctx.write_output(std::format("config|software_interval_seconds|{}",
+                                     db_->get_config("software_interval_seconds", "3600")));
+        ctx.write_output(std::format("config|software_last_run_ts|{}",
+                                     db_->get_config("software_last_run_ts", "0")));
 
         // Mechanism actually in force. Only polling is wired today regardless of
         // the configured method (kPlanned methods like etw / endpoint_security are
@@ -1408,6 +1538,10 @@ private:
             sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
                   "'' AS detail_json FROM user_live" +
                   where + tail;
+        } else if (type_filter == "software") {
+            sql = "SELECT ts, 'software' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM software_live" +
+                  where + tail;
         } else if (type_filter == "arp") {
             // ADR-0015. detail_json carries a human summary (ip @ mac [iface]); the
             // full row is available via tar.sql over $ARP_Live.
@@ -1436,6 +1570,9 @@ private:
                   where +
                   " UNION ALL "
                   "SELECT ts, 'user', action, snapshot_id, '' FROM user_live" +
+                  where +
+                  " UNION ALL "
+                  "SELECT ts, 'software', action, snapshot_id, '' FROM software_live" +
                   where + ")" + tail;
         }
 
@@ -1486,7 +1623,7 @@ private:
 
         // Pick the right live table (HP-5: handle empty filter and unknown types)
         //
-        // For the "no filter" case we have to UNION ALL four tables that do
+        // For the "no filter" case we have to UNION ALL five tables that do
         // not share a column count or schema. Project each branch to a
         // uniform shape (source, ts, snapshot_id, action, summary) so the
         // UNION is well-typed and the JSON envelope stays consistent for
@@ -1506,9 +1643,12 @@ private:
                               "  FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
                               "SELECT 'user', ts, snapshot_id, action, "
                               "       (user || '@' || COALESCE(domain,'')) AS summary "
-                              "  FROM user_live WHERE ts >= {} AND ts <= {}"
+                              "  FROM user_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                              "SELECT 'software', ts, snapshot_id, action, "
+                              "       (name || ' ' || COALESCE(version,'')) AS summary "
+                              "  FROM software_live WHERE ts >= {} AND ts <= {}"
                               ") ORDER BY ts ASC LIMIT {}",
-                              from, to, from, to, from, to, from, to, limit);
+                              from, to, from, to, from, to, from, to, from, to, limit);
         } else {
             std::string table;
             if (type_filter == "process")
@@ -1519,6 +1659,8 @@ private:
                 table = "service_live";
             else if (type_filter == "user")
                 table = "user_live";
+            else if (type_filter == "software")
+                table = "software_live";
             else if (type_filter == "arp") // ADR-0015
                 table = "arp_live";
             else if (type_filter == "dns") // ADR-0015
@@ -1572,9 +1714,17 @@ private:
             arp_pre.clear();
             dns_pre.clear();
         }
-        std::lock_guard lock(collect_mu_);
-        collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
-        collect_slow_impl(ctx);
+        {
+            std::lock_guard lock(collect_mu_);
+            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
+            collect_slow_impl(ctx);
+        }
+        // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
+        // so collect it as a SEPARATE step after the collect_mu_ scope closes —
+        // preserving the collect_mu_ ≺ software_collect_mu_ lock order. It self-gates
+        // on source_enabled("software"), so a disabled source is a no-op. The manual
+        // promises `snapshot` collects all enabled capture sources (#1620).
+        do_collect_software(ctx);
         ctx.write_output("tar|snapshot|complete");
         return 0;
     }
@@ -1670,12 +1820,17 @@ private:
         auto retention = params.get("retention_days");
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
+        auto software_interval = params.get("software_interval");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
         int fast_secs = 0;
         int slow_secs = 0;
         int days = 0;
+        // Software interval accepts 0 (disable the trigger) or 300–86400, so it
+        // needs a "was it provided" flag distinct from the 0 sentinel.
+        int software_secs = 0;
+        bool software_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -1718,6 +1873,23 @@ private:
             }
         }
 
+        if (!software_interval.empty()) {
+            software_provided = true;
+            bool parsed = false;
+            try {
+                software_secs = std::stoi(std::string{software_interval});
+                parsed = true;
+            } catch (...) {}
+            // 0 disables the trigger; otherwise 300–86400 (5 min – 1 day). A
+            // non-numeric value is rejected rather than silently treated as 0.
+            if (!parsed || software_secs < 0 ||
+                (software_secs > 0 && (software_secs < 300 || software_secs > 86400))) {
+                ctx.write_output("error|software_interval must be 0 (disable) or 300-86400 seconds");
+                return 1;
+            }
+        }
+
+        // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
             ctx.write_output("error|fast_interval must be less than slow_interval");
             return 1;
@@ -1868,6 +2040,11 @@ private:
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
             changed = true;
         }
+        if (software_provided) {
+            db_->set_config("software_interval_seconds", std::to_string(software_secs));
+            ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
+            changed = true;
+        }
         if (have_redaction) {
             db_->set_config("redaction_patterns", std::string{redaction});
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
@@ -1885,6 +2062,17 @@ private:
                 // "stopped" events on re-enable. No deadlock: do_configure runs
                 // without collect_mu_ held and the helper re-acquires nothing.
                 std::lock_guard lock(collect_mu_);
+                // `software` keeps its baseline read-diff-write under the dedicated
+                // software_collect_mu_, NOT collect_mu_ (its slow registry walk must
+                // not stall collect_fast under the shared lock — gov UP-6). So for the
+                // software transition also hold THAT lock, or the baseline clear +
+                // flag flip is not atomic w.r.t. an in-flight collect_software tick and
+                // the #538 ghost-event race reopens on the default-on software source
+                // (#1620). Lock order is always collect_mu_ ≺ software_collect_mu_
+                // (collect_software takes only the latter), so there is no inversion.
+                std::unique_lock<std::mutex> sw_lock;
+                if (src_name == "software")
+                    sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -1958,7 +2146,7 @@ private:
         }
 
         // Re-register triggers with new intervals if changed
-        if (fast_secs > 0 || slow_secs > 0) {
+        if (fast_secs > 0 || slow_secs > 0 || software_provided) {
             yuzu::PluginContext pctx{plugin_ctx_};
             if (fast_secs > 0) {
                 pctx.unregister_trigger("tar.fast");
@@ -1975,6 +2163,22 @@ private:
                     slow_secs);
                 pctx.register_trigger("tar.slow", "interval", cfg);
                 ctx.write_output(std::format("trigger|tar.slow|re-registered|{}s", slow_secs));
+            }
+            if (software_provided) {
+                // Always unregister first; re-register only when non-zero. An
+                // interval of 0 leaves the trigger absent (collection disabled
+                // until re-registered with a positive interval or agent restart).
+                pctx.unregister_trigger("tar.software");
+                if (software_secs > 0) {
+                    auto cfg = std::format(
+                        R"({{"interval_seconds":{},"plugin":"tar","action":"collect_software"}})",
+                        software_secs);
+                    pctx.register_trigger("tar.software", "interval", cfg);
+                    ctx.write_output(
+                        std::format("trigger|tar.software|re-registered|{}s", software_secs));
+                } else {
+                    ctx.write_output("trigger|tar.software|unregistered|0s");
+                }
             }
         }
 
