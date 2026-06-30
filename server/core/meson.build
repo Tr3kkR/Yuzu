@@ -347,6 +347,8 @@ yuzu_server_core_lib = static_library(
     'src/network_ui.cpp',
     'src/device_routes.cpp',
     'src/device_ui.cpp',
+    'src/inventory_routes.cpp',
+    'src/inventory_ui.cpp',
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',

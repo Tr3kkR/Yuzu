@@ -167,7 +167,41 @@ pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on
 the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
 filter, so your in-scope rows fit under the cap.
 
-A software dashboard / per-device drill-down view are planned follow-ons.
+### Dashboard (`/inventory`)
+
+The **Inventory** dashboard (top-nav **Inventory**) is the point-and-click view of the
+same data, with three tabs:
+
+- **Software** (default) — the fleet **software list**: each installed-software title
+  rolled up to its **install count** (number of devices carrying it) and its number of
+  distinct **versions**, most-installed first. Click a title to drill into its
+  **installs per version** (how many devices run each version). A title filter narrows
+  the list. **These counts are a fleet-wide Postgres aggregate**, gated on the global
+  `Inventory:Read` — they are **not** management-group scoped (the same ADR-0017 caveat
+  as the REST/MCP surfaces: confinement is inert under the global gate, so the counts
+  span all groups; the UI says so inline). A freshness KPI shows the **stale** count
+  (devices that have not synced within two daily cycles).
+- **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
+  status, and last-seen, sourced from the server's persisted endpoint state so a device
+  appears here **even when it is offline** (joined to the live registry for the online
+  flag). Click a device for its installed software (an offline device shows its *last
+  daily sync*, clearly labelled). This is gated **per device** on
+  `Inventory:Read` for that device's management group (so an operator only browses
+  devices in their scope) and the access is audited. The richer CI columns (serial,
+  model, CPU, RAM, MAC …) are greyed pending the device-CI sync source (a follow-on).
+- **Find software** — type an exact title to see **which devices run it** and at which
+  versions. This applies the same per-row management-group drop filter and 1000-row cap
+  as the REST endpoint (a short/zero result under a narrow scope is *incomplete*, not
+  *absent*; the page flags a truncated page and the count of out-of-scope devices).
+
+**On store degradation** every tab shows an explicit **"unavailable"** banner rather
+than an empty table — an empty table would read as "installed nowhere", the fail-open
+the authoritative-read contract (ADR-0016 §7) forbids.
+
+The full **device CI inventory** (offline-readable hardware/identity records — a
+ServiceNow-style CI record) is a planned follow-on: it adds a device-CI **daily-sync
+source** (the ADR-0016 framework's source #2) feeding a born-on-Postgres
+`DeviceInventoryStore`, at which point the greyed CI columns above become real.
 
 ## Access control
 

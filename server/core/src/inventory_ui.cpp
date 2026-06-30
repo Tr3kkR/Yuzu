@@ -1,0 +1,386 @@
+/// @file inventory_ui.cpp
+/// /inventory dashboard renderers — PURE functions over the inventory store result
+/// types. Split from inventory_routes.cpp (which registers the routes) to keep each
+/// TU small (same pattern as network_ui.cpp / dex_perf_ui.cpp).
+///
+/// Product UI: HTMX, server-rendered, dark-theme only, htmx core attrs only (CSP
+/// blocks hx-on). Honesty: a `std::nullopt` data argument is a STORE DEGRADE → an
+/// "unavailable" banner, NEVER an empty table (authoritative reads, ADR-0016 §7 — an
+/// empty table reads as "installed nowhere"). A non-null but empty value is a genuine
+/// "no rows" and renders an honest empty note. The component CSS is inlined per
+/// fragment (the `.inv-*` namespace) — the same self-contained-fragment-CSS precedent
+/// as device_routes' live snapshot (`.ls-*`).
+
+#include "inventory_routes.hpp"
+
+#include "web_utils.hpp"
+
+#include <string>
+#include <vector>
+
+namespace yuzu::server {
+
+namespace {
+
+std::string esc(const std::string& s) { return html_escape(s); }
+
+// Percent-encode a query-string value (RFC 3986 unreserved kept literal).
+std::string url_encode(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+            c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0f]);
+        }
+    }
+    return out;
+}
+
+std::string os_label(const std::string& os) {
+    if (os == "windows" || os == "win")
+        return "Windows";
+    if (os == "linux" || os == "lin")
+        return "Linux";
+    if (os == "darwin" || os == "macos" || os == "mac")
+        return "macOS";
+    return os.empty() ? "?" : esc(os);
+}
+const char* os_cls(const std::string& os) {
+    if (os == "windows" || os == "win")
+        return "win";
+    if (os == "linux" || os == "lin")
+        return "lin";
+    if (os == "darwin" || os == "macos" || os == "mac")
+        return "mac";
+    return "";
+}
+
+// Inlined component CSS — emitted once per top-level fragment so styling is present
+// on any tab entry point (duplicate <style> on a tab swap is idempotent/harmless).
+std::string inv_style() {
+    return R"css(<style>
+  .inv-wrap{max-width:1180px}
+  .inv-h1{font-size:1.35rem;margin:.2rem 0 0;color:var(--white,#fff);font-weight:700}
+  .inv-sub{color:var(--muted,#8fa3bd);font-size:.8rem;margin-top:.25rem}
+  .inv-subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.6rem;margin:.8rem 0}
+  .inv-subnav a{font-size:.78rem;color:var(--muted,#8fa3bd);border:1px solid transparent;border-radius:.35rem;padding:.22rem .7rem;cursor:pointer}
+  .inv-subnav a.on{color:var(--white,#fff);border-color:var(--accent,#00bceb)}
+  .inv-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.55rem;margin:.8rem 0}
+  .inv-kpi{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.5rem;padding:.55rem .8rem}
+  .inv-kpi .h{font-size:.6rem;color:var(--muted,#8fa3bd);text-transform:uppercase;letter-spacing:.05em}
+  .inv-kpi .big{font-size:1.3rem;font-weight:800;color:var(--white,#fff);margin-top:.1rem}
+  .inv-kpi.warn .big{color:var(--yellow,#ffcc00)}.inv-kpi .s2{font-size:.58rem;color:var(--muted,#8fa3bd)}
+  .inv-ctrls{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:.7rem 0}
+  .inv-ctrls .lab{font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted,#8fa3bd);font-weight:700}
+  .inv-search{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;color:var(--fg,#cfdbe8);padding:.32rem .6rem;font-size:.78rem;min-width:240px}
+  .inv-chips{display:flex;border:1px solid var(--border,#2d4068);border-radius:.4rem;overflow:hidden}
+  .inv-chips .gp-chip{background:var(--surface,#1a2940);color:var(--muted,#8fa3bd);border:0;border-right:1px solid var(--border,#2d4068);padding:.26rem .65rem;font-size:.72rem;cursor:pointer}
+  .inv-chips .gp-chip:last-child{border-right:0}.inv-chips .gp-chip.on{background:var(--accent,#00bceb);color:#062534;font-weight:600}
+  .inv-banner{font-size:.72rem;color:var(--lightblue,#a5d6ff);background:rgba(165,214,255,.06);border:1px solid rgba(165,214,255,.25);border-radius:.4rem;padding:.45rem .7rem;margin:.55rem 0}
+  .inv-degrade{font-size:.78rem;color:#ff8a94;background:rgba(255,87,101,.08);border:1px solid rgba(255,87,101,.4);border-radius:.5rem;padding:.7rem .9rem;margin:.7rem 0}
+  .inv-degrade b{color:var(--red,#ff5765)}
+  .inv-caveat{font-size:.67rem;color:var(--yellow,#ffcc00);background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .65rem;margin:.55rem 0}
+  table.inv-tbl{width:100%;border-collapse:collapse;font-size:.8rem}
+  table.inv-tbl th{text-align:left;padding:.42rem .6rem;border-bottom:2px solid var(--border,#2d4068);color:var(--muted,#8fa3bd);font-size:.58rem;text-transform:uppercase;letter-spacing:.05em}
+  table.inv-tbl td{padding:.44rem .6rem;border-bottom:1px solid var(--border,#2d4068);vertical-align:middle}
+  table.inv-tbl tr.click{cursor:pointer}table.inv-tbl tr.click:hover td{background:var(--surface,#1a2940)}
+  .inv-name{color:var(--white,#fff);font-weight:600}.inv-num{text-align:right;font-variant-numeric:tabular-nums}
+  .inv-mono{font-family:'JetBrains Mono',Consolas,monospace;font-size:.72rem;color:var(--muted,#8fa3bd)}
+  .inv-pub{color:var(--muted,#8fa3bd);font-size:.72rem}
+  .inv-pill{font-size:.57rem;border:1px solid var(--border,#2d4068);border-radius:.3rem;padding:.04rem .4rem;color:var(--lightblue,#a5d6ff)}
+  .inv-pill.win{color:#a5d6ff}.inv-pill.lin{color:#ffcc88}.inv-pill.mac{color:#c7b3ff}
+  .inv-pill.on{color:var(--green,#4ed27e);border-color:rgba(78,210,126,.4)}
+  .inv-pill.off{color:var(--slate,#6f86a6)}.inv-pill.stale{color:var(--yellow,#ffcc00);border-color:rgba(255,204,0,.4)}
+  .inv-pill.old{color:#ff8a94;border-color:rgba(255,87,101,.4)}
+  .inv-bar{display:flex;height:9px;border-radius:3px;overflow:hidden;background:var(--surface2,#243553);min-width:90px}.inv-bar>span{display:block;height:100%;background:var(--accent,#00bceb)}
+  .inv-empty{color:var(--muted,#8fa3bd);font-size:.78rem;padding:.8rem .2rem}
+  .inv-panel{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.6rem;margin-top:.8rem}
+  .inv-panelh{display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;border-bottom:1px solid var(--border,#2d4068)}
+  .inv-panelh .t{color:var(--white,#fff);font-weight:700;font-size:.88rem}
+  .inv-note{margin-top:1.2rem;font-size:.7rem;color:var(--muted,#8fa3bd);border-top:1px solid var(--border,#2d4068);padding-top:.6rem}.inv-note b{color:var(--lightblue,#a5d6ff)}
+  .inv-grey{color:var(--slate,#6f86a6)}
+</style>)css";
+}
+
+// The Software/Devices/Find tab bar. Each tab hx-gets its fragment into the shared
+// shell content container (#guardian-detail) — htmx core attrs only (CSP-safe).
+std::string inv_subnav(const std::string& active) {
+    auto tab = [&](const char* id, const char* href, const char* label) {
+        return std::string("<a class=\"") + (active == id ? "on" : "") + "\" hx-get=\"" + href +
+               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+    };
+    return std::string("<div class=\"inv-subnav\">") +
+           tab("software", "/fragments/inventory/software", "Software") +
+           tab("devices", "/fragments/inventory/devices", "Devices") +
+           tab("find", "/fragments/inventory/find", "Find software") + "</div>";
+}
+
+std::string degrade_banner(const std::string& what) {
+    return std::string("<div class=\"inv-degrade\"><b>") + esc(what) +
+           " unavailable.</b> The inventory store could not be read (Postgres pool/query degraded). "
+           "This is <b>not</b> \"nothing installed\" — reads here are authoritative, so this banner "
+           "is shown instead of an empty table. Retry shortly.</div>";
+}
+
+std::string scope_caveat() {
+    return "<div class=\"inv-caveat\">Scope (ADR-0017): management-group confinement is "
+           "<b>not yet effective</b> under the global <span class=\"inv-mono\">Inventory:Read</span> "
+           "gate, so these fleet-wide counts span all groups. A scope filter + access audit run on "
+           "every read but do not narrow results today. (The Devices tab + per-device drill are "
+           "scope-correct.)</div>";
+}
+
+std::string page_head() {
+    return inv_style() +
+           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Inventory</h1>"
+           "<div class=\"inv-sub\">Software &amp; device inventory, synced <b>daily</b> from every "
+           "endpoint (ADR-0016 daily-sync).</div>";
+}
+
+} // namespace
+
+std::string render_inventory_software_fragment(
+    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue, const std::string& name_filter,
+    std::optional<std::int64_t> stale_count, bool capped) {
+    std::string h = page_head();
+    h += inv_subnav("software");
+
+    // Freshness KPIs (cheap): titles shown + stale count. Devices-reporting / total-rows
+    // are deliberately omitted (each would be its own full-table scan — see the store).
+    const std::string titles = catalogue ? std::to_string(catalogue->size()) + (capped ? "+" : "")
+                                          : "&mdash;";
+    const std::string stale = stale_count ? std::to_string(*stale_count) : "&mdash;";
+    h += "<div class=\"inv-kpis\">"
+         "<div class=\"inv-kpi\"><div class=\"h\">Titles shown</div><div class=\"big\">" +
+         titles + "</div><div class=\"s2\">distinct installed-software names</div></div>"
+                  "<div class=\"inv-kpi warn\"><div class=\"h\">Stale (&gt;2 daily cycles)</div>"
+                  "<div class=\"big\">" +
+         stale + "</div><div class=\"s2\">last sync &gt; 48h ago · server time</div></div></div>";
+
+    h += scope_caveat();
+    h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter titles…\" "
+         "value=\"" +
+         esc(name_filter) +
+         "\" oninput=\"gpSearch(this)\" data-gpf=\"invsw\"></div>"
+         "<div class=\"inv-banner\">Installed-software list rolled up across the fleet. "
+         "<b>Installs</b> = devices carrying the title. Click a title for its "
+         "<b>installs per version</b>. Counts are a Postgres aggregate, not capped flat rows.</div>";
+
+    if (!catalogue) {
+        h += degrade_banner("Software catalogue");
+        h += "</div>";
+        return h;
+    }
+    if (catalogue->empty()) {
+        h += "<div class=\"inv-empty\">No installed-software inventory has been reported yet. "
+             "Agents sync once per ~24h (spread across the fleet); a freshly enrolled agent "
+             "populates within minutes.</div></div>";
+        return h;
+    }
+    if (capped)
+        h += "<div class=\"inv-banner\">Showing the most-installed titles (list capped). Use "
+             "<b>Find software</b> for an exact title not shown.</div>";
+
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Software</th><th>Publisher</th>"
+         "<th class=\"inv-num\">Installs</th><th class=\"inv-num\">Versions</th>"
+         "<th></th></tr></thead><tbody>";
+    for (const auto& r : catalogue.value()) {
+        const std::string enc = url_encode(r.name);
+        h += "<tr class=\"click\" data-gpf=\"invsw\" data-gpname=\"" + esc(r.name) +
+             "\" hx-get=\"/fragments/inventory/software/versions?name=" + enc +
+             "\" hx-target=\"#inv-drill\" hx-swap=\"innerHTML\">"
+             "<td class=\"inv-name\">" +
+             esc(r.name) + "</td><td class=\"inv-pub\">" + esc(r.publisher) +
+             "</td><td class=\"inv-num\">" + std::to_string(r.device_count) +
+             "</td><td class=\"inv-num\">" + std::to_string(r.version_count) +
+             "</td><td class=\"inv-mono\">installs per version &rsaquo;</td></tr>";
+    }
+    h += "</tbody></table><div id=\"inv-drill\"></div></div>";
+    return h;
+}
+
+std::string render_inventory_versions_fragment(
+    const std::string& name, const std::optional<std::vector<SoftwareVersionCount>>& versions) {
+    std::string h = "<div class=\"inv-panel\"><div class=\"inv-panelh\"><span class=\"t\">Installs "
+                    "per version &mdash; " +
+                    esc(name) +
+                    "</span><a style=\"margin-left:auto\" "
+                    "onclick=\"this.closest('#inv-drill').innerHTML=''\">close</a></div>"
+                    "<div style=\"padding:.7rem .9rem\">";
+    if (!versions) {
+        h += degrade_banner("Version breakdown");
+        h += "</div></div>";
+        return h;
+    }
+    if (versions->empty()) {
+        h += "<div class=\"inv-empty\">No version data for this title.</div></div></div>";
+        return h;
+    }
+    std::int64_t maxd = 0;
+    for (const auto& v : versions.value())
+        if (v.device_count > maxd)
+            maxd = v.device_count;
+    if (maxd <= 0)
+        maxd = 1;
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Version</th><th class=\"inv-num\">Installs</th>"
+         "<th>Share</th></tr></thead><tbody>";
+    for (const auto& v : versions.value()) {
+        const long pct = static_cast<long>(v.device_count * 100 / maxd);
+        h += "<tr><td class=\"inv-mono inv-name\">" + (v.version.empty() ? "(unknown)" : esc(v.version)) +
+             "</td><td class=\"inv-num\">" + std::to_string(v.device_count) +
+             "</td><td><div class=\"inv-bar\"><span style=\"width:" + std::to_string(pct) +
+             "%\"></span></div></td></tr>";
+    }
+    h += "</tbody></table></div></div>";
+    return h;
+}
+
+std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceRow>& rows,
+                                              const std::string& q, const std::string& /*os_token*/,
+                                              const std::string& /*status_token*/) {
+    std::string h = page_head();
+    h += inv_subnav("devices");
+    h += "<div class=\"inv-banner\"><b>Device CI inventory (thin).</b> Sourced from the persisted, "
+         "<b>offline-survivable</b> endpoint state (host / OS / last-seen) + the live registry's "
+         "online set — offline devices still appear. Click a device for its installed software. "
+         "The greyed columns (serial / model / CPU / RAM …) arrive with the device-CI sync "
+         "source.</div>";
+    h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter by hostname or "
+         "OS…\" value=\"" +
+         esc(q) + "\" oninput=\"gpSearch(this)\" data-gpf=\"invdev\"></div>";
+
+    if (rows.empty()) {
+        h += "<div class=\"inv-empty\">No devices have reported yet. Devices appear here once the "
+             "server has received a heartbeat from them.</div></div>";
+        return h;
+    }
+
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Device</th><th>OS</th><th>Status</th>"
+         "<th>Last seen</th><th class=\"inv-grey\">Serial</th><th class=\"inv-grey\">Model</th>"
+         "<th class=\"inv-grey\">CPU / RAM</th></tr></thead><tbody>";
+    for (const auto& d : rows) {
+        const std::string status = d.online ? "online" : (d.stale ? "stale" : "offline");
+        const std::string status_pill = d.online
+                                             ? "<span class=\"inv-pill on\">online</span>"
+                                             : (d.stale ? "<span class=\"inv-pill stale\">stale</span>"
+                                                        : "<span class=\"inv-pill off\">offline</span>");
+        // data-gpname carries hostname + OS so the one search box filters either. host +
+        // online travel in the drill URL so the per-device fragment can show them without
+        // a second lookup (the drill route only receives the id).
+        h += "<tr class=\"click\" data-gpf=\"invdev\" data-gpname=\"" + esc(d.hostname) + " " +
+             esc(os_label(d.os)) + "\" data-gpstate=\"" + status + "\" "
+             "hx-get=\"/fragments/inventory/device?id=" + url_encode(d.agent_id) +
+             "&host=" + url_encode(d.hostname) + "&online=" + (d.online ? "1" : "0") +
+             "\" hx-target=\"#inv-drill\" hx-swap=\"innerHTML\">"
+             "<td class=\"inv-name\">" +
+             esc(d.hostname.empty() ? d.agent_id : d.hostname) + "</td><td><span class=\"inv-pill " +
+             os_cls(d.os) + "\">" + os_label(d.os) + "</span></td><td>" + status_pill +
+             "</td><td class=\"inv-pub\">" + esc(d.last_seen.empty() ? "?" : d.last_seen) +
+             "</td><td class=\"inv-grey inv-mono\">&mdash;</td>"
+             "<td class=\"inv-grey inv-mono\">&mdash;</td>"
+             "<td class=\"inv-grey inv-mono\">&mdash;</td></tr>";
+    }
+    h += "</tbody></table><div id=\"inv-drill\"></div></div>";
+    return h;
+}
+
+std::string render_inventory_device_software_fragment(
+    const std::string& agent_id, const std::string& hostname,
+    const std::optional<std::vector<SoftwareEntry>>& software, bool online) {
+    const std::string title = hostname.empty() ? agent_id : hostname;
+    std::string h = "<div class=\"inv-panel\"><div class=\"inv-panelh\"><span class=\"t\">" +
+                    esc(title) + " &mdash; installed software</span>" +
+                    (online ? "<span class=\"inv-pill on\">online</span>"
+                            : "<span class=\"inv-pill off\">offline</span>") +
+                    "<a style=\"margin-left:auto\" "
+                    "onclick=\"this.closest('#inv-drill').innerHTML=''\">close</a></div>"
+                    "<div style=\"padding:.55rem .9rem\">"
+                    "<div class=\"inv-grey\" style=\"font-size:.7rem;margin-bottom:.4rem\">CI record "
+                    "(serial · model · CPU · RAM · MAC …) arrives with the device-CI sync source.</div>";
+    if (!software) {
+        h += degrade_banner("Device software");
+        h += "</div></div>";
+        return h;
+    }
+    if (!online)
+        h += "<div class=\"inv-banner\">Device is offline — showing its last daily sync, not a live "
+             "read.</div>";
+    if (software->empty()) {
+        h += "<div class=\"inv-empty\">No installed software recorded for this device.</div></div></div>";
+        return h;
+    }
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
+         "<th>Install date</th></tr></thead><tbody>";
+    for (const auto& e : software.value()) {
+        h += "<tr><td class=\"inv-name\">" + esc(e.name) + "</td><td class=\"inv-mono\">" +
+             (e.version.empty() ? "&mdash;" : esc(e.version)) + "</td><td class=\"inv-pub\">" +
+             (e.publisher.empty() ? "&mdash;" : esc(e.publisher)) + "</td><td class=\"inv-pub\">" +
+             (e.install_date.empty() ? "&mdash;" : esc(e.install_date)) + "</td></tr>";
+    }
+    h += "</tbody></table></div></div>";
+    return h;
+}
+
+std::string render_inventory_find_fragment(const std::string& initial_name) {
+    std::string h = page_head();
+    h += inv_subnav("find");
+    h += scope_caveat();
+    h += "<div class=\"inv-banner\">Find which devices run a software title. Exact name match; "
+         "capped at 1000 rows (a short/zero result under a narrow scope is incomplete, not "
+         "absent).</div>";
+    // The input carries name="name", so htmx includes its value as ?name= on trigger.
+    h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" name=\"name\" "
+         "placeholder=\"Exact software name, e.g. Google Chrome\" value=\"" +
+         esc(initial_name) +
+         "\" hx-get=\"/fragments/inventory/find/results\" "
+         "hx-target=\"#inv-find-results\" hx-swap=\"innerHTML\" "
+         "hx-trigger=\"keyup changed delay:400ms" +
+         (initial_name.empty() ? "" : ", load") + "\"></div>"
+         "<div id=\"inv-find-results\"></div></div>";
+    return h;
+}
+
+std::string render_inventory_find_results_fragment(
+    const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
+    std::size_t devices_omitted) {
+    if (name.empty())
+        return "<div class=\"inv-empty\">Type an exact software name above.</div>";
+    if (!rows)
+        return degrade_banner("Software search");
+
+    std::string h = "<div class=\"inv-sub\" style=\"margin:.5rem 0\">Devices running <b>" +
+                    esc(name) + "</b> &mdash; " + std::to_string(rows->size()) + " row(s)";
+    if (hit_cap)
+        h += " <span class=\"inv-pill old\">truncated at cap</span>";
+    if (devices_omitted > 0)
+        h += " <span class=\"inv-pill\">" + std::to_string(devices_omitted) +
+             " device(s) outside your scope</span>";
+    h += "</div>";
+
+    if (rows->empty()) {
+        h += "<div class=\"inv-empty\">No devices in your scope run \"" + esc(name) + "\"";
+        if (hit_cap)
+            h += " in this page (result was capped — narrow the query)";
+        h += ".</div>";
+        return h;
+    }
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Device</th><th>Version</th><th>Publisher</th>"
+         "<th>Install date</th></tr></thead><tbody>";
+    for (const auto& r : rows.value()) {
+        h += "<tr><td class=\"inv-name\">" + esc(r.agent_id) + "</td><td class=\"inv-mono\">" +
+             (r.entry.version.empty() ? "&mdash;" : esc(r.entry.version)) + "</td><td class=\"inv-pub\">" +
+             (r.entry.publisher.empty() ? "&mdash;" : esc(r.entry.publisher)) +
+             "</td><td class=\"inv-pub\">" +
+             (r.entry.install_date.empty() ? "&mdash;" : esc(r.entry.install_date)) + "</td></tr>";
+    }
+    h += "</tbody></table>";
+    return h;
+}
+
+} // namespace yuzu::server

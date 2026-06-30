@@ -43,6 +43,15 @@ constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 // Hard ceiling on rows a single fleet query will materialise, independent of the
 // caller's `limit`, so the store can never allocate an unbounded result set.
 constexpr int kFleetQueryRowCap = 100000;
+// Hard ceiling on catalogue / version-drill rows, independent of the caller's
+// `limit`. The catalogue is one row per distinct title; the drill is one per
+// distinct version of a title — both bounded sets.
+constexpr int kCatalogRowCap = 2000;
+// Tight execution bound for the catalogue aggregate (a full-table GROUP BY). Well
+// under the pool's 30s statement_timeout so a heavy scan degrades to nullopt (the
+// "catalogue unavailable" banner) instead of holding a pooled connection — the
+// materialised-rollup follow-up removes the full scan for 400k-scale fleets.
+constexpr const char* kCatalogStatementTimeout = "3000ms";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -199,6 +208,16 @@ struct DegradeLog {
 // every Nth within one. The count/timestamp updates are two independent atomics,
 // so under concurrent degrades at one site a benign duplicate leading-edge WARN
 // is possible — acceptable for a log breadcrumb; the counter stays exact.
+// Parse a Postgres text-format integer cell into int64 (count(*) etc. are text on
+// the wire). Mirrors the count_stale_agents from_chars pattern.
+std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
+    const char* txt = PQgetvalue(res.get(), row, col);
+    const auto len = static_cast<std::size_t>(PQgetlength(res.get(), row, col));
+    std::int64_t v = 0;
+    std::from_chars(txt, txt + len, v); // leaves v=0 on parse failure (count cells never fail)
+    return v;
+}
+
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              DegradeSampler& s) {
     if (metrics)
@@ -519,6 +538,144 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         row.entry.publisher = PQgetvalue(res.get(), i, 3);
         row.entry.install_date = PQgetvalue(res.get(), i, 4);
         out.push_back(std::move(row));
+    }
+    return out;
+}
+
+std::optional<std::vector<SoftwareCatalogRow>>
+SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
+    // AUTHORITATIVE read (ADR-0016 §7): nullopt on a degrade, never a silent empty.
+    // FLEET-WIDE aggregate (NOT mgmt-group scoped — see the header): the caller gates
+    // GLOBAL Inventory:Read + caveats the counts.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    int limit = q.limit > 0 ? q.limit : 200;
+    if (limit > kCatalogRowCap)
+        limit = kCatalogRowCap;
+
+    std::optional<std::vector<SoftwareCatalogRow>> result;
+    // Run inside a txn so SET LOCAL statement_timeout bounds the aggregate's EXECUTION
+    // (the acquire timeout bounds only the wait). `entered` distinguishes an acquire
+    // failure (pool timeout, lambda never ran) from a query error, so the degrade
+    // counter carries the right reason.
+    bool entered = false;
+    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        entered = true;
+        pg::PgResult t =
+            pg::exec_params(c, std::string("SET LOCAL statement_timeout = '")
+                                       .append(kCatalogStatementTimeout)
+                                       .append("'")
+                                       .c_str(),
+                            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        // GROUP BY title → (distinct devices, distinct versions). max(publisher) picks a
+        // representative when a title carries more than one publisher string across the
+        // fleet. ILIKE '%'||$n||'%' is an optional case-insensitive substring filter; it
+        // does not change the cost class (the GROUP BY scans regardless).
+        std::string sql =
+            "SELECT name, max(publisher) AS publisher, "
+            "count(DISTINCT agent_id) AS devices, count(DISTINCT version) AS versions "
+            "FROM software_inventory_store.installed_software ";
+        std::vector<std::string> params;
+        int p = 0;
+        if (!q.name_filter.empty()) {
+            sql += "WHERE name ILIKE '%' || $" + std::to_string(++p) + " || '%' ";
+            params.push_back(q.name_filter);
+        }
+        sql += "GROUP BY name ORDER BY devices DESC, name LIMIT $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(limit));
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        std::vector<SoftwareCatalogRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareCatalogRow r;
+            r.name = PQgetvalue(res.get(), i, 0);
+            r.publisher = PQgetvalue(res.get(), i, 1);
+            r.device_count = result_i64(res, i, 2);
+            r.version_count = result_i64(res, i, 3);
+            out.push_back(std::move(r));
+        }
+        result = std::move(out);
+        return true;
+    });
+    if (!entered) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    if (!ok || !result) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_catalog degraded — aggregate failed or "
+                         "timed out (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<std::vector<SoftwareVersionCount>>
+SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
+    // AUTHORITATIVE read. Title-scoped (uses the name index) → cheap, so a plain bounded
+    // acquire + single statement suffices (no tight aggregate timeout needed). An empty
+    // name is a precondition miss → empty value, not a degrade.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<SoftwareVersionCount> out;
+    if (name.empty())
+        return out;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    int lim = limit > 0 ? limit : 200;
+    if (lim > kCatalogRowCap)
+        lim = kCatalogRowCap;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT version, count(DISTINCT agent_id) AS devices "
+        "FROM software_inventory_store.installed_software "
+        "WHERE name = $1 GROUP BY version ORDER BY devices DESC, version LIMIT $2::bigint",
+        std::vector<std::string>{std::string(name), std::to_string(lim)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        SoftwareVersionCount v;
+        v.version = PQgetvalue(res.get(), i, 0);
+        v.device_count = result_i64(res, i, 1);
+        out.push_back(std::move(v));
     }
     return out;
 }

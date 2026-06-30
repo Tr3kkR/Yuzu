@@ -70,6 +70,35 @@ struct SoftwareFleetRow {
     SoftwareEntry entry;
 };
 
+/// One fleet-catalogue row — a software title rolled up across the WHOLE fleet
+/// (`software_catalog`). **FLEET-WIDE aggregate, NOT management-group scoped:** the
+/// GROUP BY runs in Postgres and cannot apply the per-agent C++ scope predicate the
+/// flat-row reads use, so `device_count` spans every management group. Under the
+/// GLOBAL `Inventory:Read` gate this matches today's behaviour (ADR-0017 confinement
+/// is inert — a confined operator is denied at the gate, a global one sees all), but
+/// the day list-view confinement lands this aggregate MUST become scope-aware or stay
+/// global-gated. Callers caveat the counts, exactly like the `query_software` route.
+struct SoftwareCatalogRow {
+    std::string name;
+    std::string publisher;         ///< representative publisher (max over the group); may vary
+    std::int64_t device_count{0};  ///< COUNT(DISTINCT agent_id) carrying the title
+    std::int64_t version_count{0}; ///< COUNT(DISTINCT version) of the title
+};
+
+/// One version's install count for a title — the "installs per version" drill.
+struct SoftwareVersionCount {
+    std::string version;
+    std::int64_t device_count{0}; ///< COUNT(DISTINCT agent_id) on this version
+};
+
+/// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
+/// titles; empty matches all. `limit` caps the returned rows (ordered by install
+/// count); the store also enforces a hard ceiling independent of `limit`.
+struct SoftwareCatalogQuery {
+    std::string name_filter;
+    int limit{200};
+};
+
 /// Fleet-wide software query. Empty filters match all; results are capped.
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
@@ -141,6 +170,27 @@ public:
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
     query_software(const SoftwareFleetQuery& q);
+
+    /// Fleet software catalogue — every title rolled up to (device_count,
+    /// version_count), most-installed first (the `/inventory` Software list). **FLEET-WIDE
+    /// aggregate** (see `SoftwareCatalogRow`): the GROUP BY is computed in Postgres so it
+    /// is NOT management-group scoped — the caller MUST gate on the GLOBAL `Inventory:Read`
+    /// permission and caveat the counts (ADR-0017 confinement inert under the global gate).
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade (incl. the
+    /// per-statement timeout), NEVER a silent empty. The aggregate runs under a tight
+    /// `SET LOCAL statement_timeout` so a heavy full-table scan degrades (→ nullopt → the
+    /// route's "catalogue unavailable" banner) rather than holding a pooled connection to
+    /// the pool's 30s ceiling; a materialised rollup is the 400k-scale follow-up (the live
+    /// GROUP BY is O(table) — fine for the current/pilot fleet, not 400k).
+    [[nodiscard]] std::optional<std::vector<SoftwareCatalogRow>>
+    software_catalog(const SoftwareCatalogQuery& q);
+
+    /// Installs-per-version for ONE title (the catalogue drill), most-installed first.
+    /// FLEET-WIDE (same scope caveat as `software_catalog`). Title-scoped → cheap (uses
+    /// the name index). AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade.
+    /// An empty `name` is a precondition miss → empty value (not a degrade).
+    [[nodiscard]] std::optional<std::vector<SoftwareVersionCount>>
+    software_versions(std::string_view name, int limit);
 
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
