@@ -323,6 +323,13 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit
     CHECK(h.post("/api/v1/elevate", token,
                  R"({"justification":"x","duration_secs":-5})")->status == 400);
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+    // A duration > INT_MAX passes is_number_integer() but must not throw → 500
+    // (Hermes pass-1 #1): it clamps to the cap, granting a bounded window.
+    auto huge = h.post("/api/v1/elevate", token,
+                       R"({"justification":"x","duration_secs":9999999999999999})");
+    REQUIRE(huge);
+    CHECK(huge->status == 200);
+    CHECK(nlohmann::json::parse(huge->body).value("expires_in", 0) == h.cfg.jit_max_elevation_secs);
 }
 
 TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]") {

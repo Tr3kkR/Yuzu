@@ -59,6 +59,25 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
   elevation (fail-safe; nothing in auth.db resurrects it). It cannot outlive the
   session's absolute expiry (`validate_session` rejects past `expires_at`).
 
+## Hermes pre-submission pass-1 fixes
+
+- **`duration_secs` > INT_MAX → 500.** A JSON integer above `INT_MAX` passed
+  `is_number_integer()` but `get<int>()` threw → 500. Now read as `int64_t`,
+  range-checked, then narrowed (over-cap clamps to the window).
+- **TOCTOU: eligibility revoked during the step-up delay.** Eligibility is
+  re-checked immediately before `elevate_session` (the human-time MFA step-up sits
+  between the first check and the grant), so an admin who revokes mid-step-up wins
+  the race — `role.elevation.denied` / `detail=eligibility revoked during step-up`.
+- **Step-up escape hatch on the privilege boundary.** The elevation step-up floors
+  the window to 300 s when the operator has globally disabled step-up
+  (`--mfa-step-up-window-secs <= 0`), so elevation ALWAYS requires a fresh proof
+  even when the gate is disabled elsewhere. (For a local enrolled user
+  `require_mfa_step_up` already runs the freshness check regardless of
+  `--mfa-enforcement`; the floor closes the one remaining global-disable path.)
+- **Audit gap on step-up refusal.** A refused elevation step-up now also emits
+  `role.elevation.denied` / `detail=mfa_step_up_refused`, completing the
+  elevation-specific trail beside the shared `mfa.step_up` row.
+
 ## Threats considered (governance pipeline, 8 reviewers + Hermes ×2)
 
 - **Privilege escalation without eligibility / without MFA.** No path: eligibility

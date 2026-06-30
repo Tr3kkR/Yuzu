@@ -1656,25 +1656,34 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // Shared step-up gate: elevating to admin and granting eligibility are both
     // high-risk and require a fresh MFA proof (reuses require_mfa_step_up).
+    // window_secs lets the elevation path force a positive step-up window even
+    // when the operator has globally disabled step-up (--mfa-step-up-window-secs
+    // <= 0): elevation is the privilege boundary, so it ALWAYS requires a fresh
+    // proof, never honouring that escape hatch (Hermes pass-1 #3).
     auto elevation_step_up = [this](const httplib::Request& req, httplib::Response& res,
-                                    const auth::Session& session,
-                                    const std::string& label) -> bool {
+                                    const auth::Session& session, const std::string& label,
+                                    int window_secs) -> bool {
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db)
             return true; // legacy config-file-only: step-up needs auth.db (fail-open, as elsewhere)
         return require_mfa_step_up(
-            req, res, session, *db, cfg_.mfa_step_up_window_secs,
+            req, res, session, *db, window_secs,
             [this](const httplib::Request& r, const std::string& a, const std::string& rs,
                    const std::string& tt, const std::string& ti, const std::string& d) {
                 return audit_log(r, a, rs, tt, ti, d);
             },
             label, cfg_.mfa_enforcement);
     };
+    // Default step-up window for the elevation surfaces; floored to 300 s when the
+    // global gate is disabled so the privilege boundary keeps a fresh-proof check.
+    const int kElevationStepUpWindow =
+        cfg_.mfa_step_up_window_secs > 0 ? cfg_.mfa_step_up_window_secs : 300;
 
     // POST /api/v1/users/<name>/elevation-eligibility — admin grants/revokes who
     // may elevate. Body: {"eligible": <bool>}. Admin + step-up gated.
     sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)",
-              [this, elevation_step_up](const httplib::Request& req, httplib::Response& res) {
+              [this, elevation_step_up, kElevationStepUpWindow](const httplib::Request& req,
+                                                                httplib::Response& res) {
                   const auto cid = detail::make_correlation_id();
                   res.set_header("X-Correlation-Id", cid);
                   if (!require_admin(req, res))
@@ -1686,7 +1695,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   if (!elevation_step_up(req, res, *session,
-                                         "POST /api/v1/users/{name}/elevation-eligibility"))
+                                         "POST /api/v1/users/{name}/elevation-eligibility",
+                                         kElevationStepUpWindow))
                       return;
                   auto* db = auth_mgr_.auth_db_ptr();
                   if (!db) {
@@ -1759,7 +1769,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // POST /api/v1/elevate — activate a time-boxed admin elevation on THIS cookie
     // session. Body: {"justification": <str, required>, "duration_secs": <int>}.
-    sink.Post("/api/v1/elevate", [this, elevation_step_up](const httplib::Request& req,
+    sink.Post("/api/v1/elevate", [this, elevation_step_up,
+                                   kElevationStepUpWindow](const httplib::Request& req,
                                                            httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
@@ -1819,8 +1830,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
         // High-risk: require a fresh MFA proof (step-up) before granting admin.
-        if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate"))
+        // window floored to kElevationStepUpWindow so a globally-disabled gate
+        // can't skip the proof for the privilege boundary.
+        if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate",
+                               kElevationStepUpWindow)) {
+            // The shared gate set the 401 challenge + audited mfa.step_up; add the
+            // elevation-specific denial so the role.elevation.* trail is complete
+            // (Hermes pass-1 #4).
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "mfa_step_up_refused");
             return;
+        }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         // Type-guard the fields: a present-but-wrong-type value would otherwise
         // throw nlohmann type_error.302 → httplib 500 (review UP-2/cpp-safety).
@@ -1853,19 +1874,33 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         if (justification.size() > kMaxJustificationLength)
             justification.resize(kMaxJustificationLength);
-        int duration = body.is_object() ? body.value("duration_secs", 0) : 0;
+        // Read as int64 first: a JSON integer > INT_MAX passes is_number_integer()
+        // but get<int>() would THROW (→ 500). Range-check in 64-bit, then narrow
+        // (Hermes pass-1 #1).
+        std::int64_t raw_duration = body.is_object() ? body.value("duration_secs", std::int64_t{0})
+                                                     : std::int64_t{0};
         // An explicit NEGATIVE duration is a client error, not "give me the max"
         // (review UP-5 least-privilege). Absent or 0 defaults to the cap.
-        if (duration < 0) {
+        if (raw_duration < 0) {
             res.status = 400;
             res.set_content(detail::error_json_a4(400, "duration_secs must be positive", cid),
                             "application/json");
             return;
         }
-        if (duration == 0)
-            duration = cfg_.jit_max_elevation_secs; // unspecified → the full cap
-        if (duration > cfg_.jit_max_elevation_secs)
-            duration = cfg_.jit_max_elevation_secs; // clamp
+        int duration = (raw_duration == 0 || raw_duration > cfg_.jit_max_elevation_secs)
+                           ? cfg_.jit_max_elevation_secs // unspecified → cap; over-cap → clamp
+                           : static_cast<int>(raw_duration);
+        // TOCTOU re-check (Hermes pass-1 #2 / unhappy-path UP-1): eligibility was
+        // read before the human-time MFA step-up. Re-verify it immediately before
+        // granting so an admin who revoked eligibility mid-step-up wins the race.
+        if (auto re = db->is_elevation_eligible(session->username); !re || !*re) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "eligibility revoked during step-up");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
+            return;
+        }
         auto until = auth_mgr_.elevate_session(token, std::chrono::seconds(duration));
         if (!until) {
             res.status = 401; // session vanished between validate and elevate
