@@ -61,7 +61,9 @@ WHAT THIS SCRIPT DOES
                                   (event log files, registry hives,
                                    filesystem.read with system paths)
         SeRestorePrivilege      — paired with SeBackupPrivilege; restore
-                                  semantics for the same paths
+                                  semantics for the same paths, and required by
+                                  RegLoadKeyA/RegUnLoadKeyA (TAR `software`
+                                  per-user scope mounts logged-off NTUSER.DAT)
         SeSecurityPrivilege     — read Security event log, manage SACLs
         SeIncreaseQuotaPrivilege — adjust process quotas (some WMI
                                   queries require this on hardened

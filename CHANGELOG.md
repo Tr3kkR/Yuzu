@@ -288,6 +288,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **TAR `tar.configure` now advertises every per-source enable toggle and the software
+  tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
+  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
+  were already accepted by the agent but missing from the
+  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
+  discover or tune them (notably the enable toggle for the opt-in, off-by-default
+  `software` source). No runtime behaviour change — the params were always honoured; they
+  are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
+  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
+  perf collection at runtime.)
 - **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
   Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
   leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
@@ -372,8 +382,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
   now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
   (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
-  round-trip intact. Affects all three registry read paths (`list`, `query`, `list_per_user`,
-  including the per-user `NTUSER.DAT` hive-load path). The ingest seam's UTF-8 scrub remains as
+  round-trip intact. Affects both machine-scope registry read paths (`list`, `query`). The ingest seam's UTF-8 scrub remains as
   defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
   unknown). No proto/wire change.
 
@@ -425,6 +434,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR — software install/uninstall capture source (`$Software`).** A new TAR
+  warehouse source records application **installed / removed / upgraded** events over
+  time by diffing the installed-software inventory on a dedicated hourly trigger
+  (`tar.software`; tune the cadence via `software_interval`, `0`–86400 s). On Windows it
+  captures **machine-scope only** (HKLM Uninstall 64-bit + WOW6432Node) installs — no
+  per-user enumeration, no Windows profile names, and **no user identity / no PII**.
+  Tiers: `$Software_Live` (5000 rows) →
+  `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`name`
+  install/remove/upgrade counts. **The source is off by default** (opt-in) — an operator
+  enables it per host with `tar.configure software_enabled=true`. Even though the
+  machine-scope data carries no user identity (device asset-management /
+  vulnerability-relevance data, like Services and User sessions), a brand-new capture
+  source ships disabled out of caution so a host only collects it once the operator has
+  decided to; enabling or disabling re-baselines the source so neither emits a spurious
+  install/remove storm. Names, versions, and publisher only
+  — no command lines or usage data. The first
+  scan on a host **seeds the baseline silently** so an `installed` event always means
+  "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
+  `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
+  `software_last_run_ts` lines
+  — update any field-count parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
+  `$Software_*` tables are queryable but empty there until then. Disabling the source
+  (`software_enabled=false`) is **atomic with the collector** — it holds the same
+  `software_collect_mu_` the collector takes and the collector re-checks the flag under
+  that lock, so a disable racing an in-flight scan can never insert events from the paused
+  window or leave a stale baseline (no ghost install/remove/upgrade events on re-enable;
+  same #538 contract as the other snapshot-diff sources). `SystemComponent` entries are
+  read as `REG_DWORD` (their canonical type) so system components/patches are correctly
+  excluded, and `software` rows are reachable from the legacy `tar.query`/`tar.export`
+  typed paths as well as `tar.sql`. Enumeration is bounded by a per-cycle entry cap
+  (`kSoftwareEntryCap`, warns once on truncation) so a bloated/corrupt registry cannot grow
+  the tick unbounded, and same-name dedup compares versions **numerically** (so `10.0`
+  outranks `9.0` — a lexicographic compare previously suppressed real upgrades). `tar.snapshot`
+  now collects the source too. See `docs/user-manual/tar.md` and the data-handling
+  classification in `docs/enterprise-readiness-soc2-first-customer.md`.
 - **DEX: wave-4 reliability signals — power, driver, and service health (Windows).**
   Seven new signal types (Windows event catalogue 103→110, server display catalogue
   107→114), all real-record-pinned from a live HP ZBook Firefly 14 G8:
