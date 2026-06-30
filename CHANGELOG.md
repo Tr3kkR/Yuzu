@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **JIT (just-in-time) admin elevation (`POST /api/v1/elevate`, SOC 2 CC6.3/CC6.6).** Reduces standing
+  privilege: a pre-authorized operator (the new per-user `users.elevation_eligible` flag, auth.db
+  migration v4, admin-managed via `POST /api/v1/users/<name>/elevation-eligibility`) holds a non-admin
+  base role day-to-day and **activates** admin just-in-time for a bounded, justified, MFA-step-up-gated
+  window, then auto-reverts. The session's `effective_role()` is admin only while elevated; `require_admin`
+  and the permission gates honour it. Window capped by `--jit-max-elevation-secs` (`YUZU_JIT_MAX_ELEVATION_SECS`,
+  default 3600, max 86400). `POST /api/v1/elevate/revoke` for manual step-down. Audit:
+  `role.elevation.{granted,denied,revoked}` + `user.elevation_eligibility.set`. Elevation is in-memory
+  per cookie session (a restart/logout drops it) and **cookie-sessions-only** — API and MCP tokens can
+  never be elevated. Closes `/auth-and-authz` gap-matrix P1 #9. See `docs/auth-architecture.md`
+  "JIT admin elevation".
+
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the

@@ -547,6 +547,18 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
             ALTER TABLE users ADD COLUMN last_failed_login_at DATETIME;
             ALTER TABLE users ADD COLUMN locked_until DATETIME;
         )"},
+        // v4: JIT admin elevation eligibility (SOC 2 CC6.3 least-privilege /
+        // CC6.6 privileged access). `/auth-and-authz` skill gap matrix P1 #9. A
+        // single boolean per user marking who is PRE-AUTHORIZED to activate a
+        // time-boxed admin elevation via POST /api/v1/elevate — distinct from
+        // holding standing admin. Defaulted 0 (not eligible) so existing rows
+        // survive without backfill and nobody gains elevation rights silently.
+        // Set by an admin via POST /api/v1/users/<name>/elevation-eligibility;
+        // enumerable for access reviews. NOTE: if the break-glass PR (#1735, also
+        // migration v4 on its branch) lands first, renumber this to v5 at merge.
+        {4, R"(
+            ALTER TABLE users ADD COLUMN elevation_eligible INTEGER NOT NULL DEFAULT 0;
+        )"},
     };
 
     if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
@@ -2016,7 +2028,66 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
     return {};
 }
 
-// ── Pending Agent Operations ────────────────────────────────────────────────
+std::expected<void, AuthDBError> AuthDB::set_elevation_eligible(const std::string& username,
+                                                               bool eligible) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Single UPDATE ... RETURNING (no sqlite3_changes() — #1033). The RETURNING
+    // row confirms a live row matched (UserNotFound otherwise). Touches ONLY the
+    // eligibility column — never credentials or role.
+    static const char* sql = R"(
+        UPDATE users SET elevation_eligible = ?1, updated_at = CURRENT_TIMESTAMP
+        WHERE username = ?2 AND is_active = 1
+        RETURNING elevation_eligible
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare set_elevation_eligible statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_int(stmt, 1, eligible ? 1 : 0);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        return {};
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::error("set_elevation_eligible failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
+}
+
+std::expected<bool, AuthDBError> AuthDB::is_elevation_eligible(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    static const char* sql = R"(
+        SELECT elevation_eligible FROM users WHERE username = ? AND is_active = 1
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare is_elevation_eligible statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+    bool eligible = false;
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        eligible = sqlite3_column_int(stmt, 0) != 0;
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        spdlog::error("is_elevation_eligible query failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::QueryFailed);
+    }
+    // rc == SQLITE_DONE → no active row → fail-closed (not eligible).
+    sqlite3_finalize(stmt);
+    return eligible;
+}
 
 // ── Pending Agent Operations ────────────────────────────────────────────────
 

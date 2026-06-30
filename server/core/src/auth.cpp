@@ -559,6 +559,31 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
     return true;
 }
 
+std::optional<std::chrono::steady_clock::time_point>
+AuthManager::elevate_session(const std::string& token, std::chrono::seconds duration) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return std::nullopt;
+    const auto until = std::chrono::steady_clock::now() + duration;
+    it->second.elevated_until = until;
+    return until;
+}
+
+bool AuthManager::revoke_elevation(const std::string& token) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return false;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return false;
+    const bool was_elevated = is_elevated(it->second);
+    it->second.elevated_until = {}; // clear → effective role reverts to base
+    return was_elevated;
+}
+
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
     // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
     // This check intentionally fires BEFORE the mutex acquire below — rejecting

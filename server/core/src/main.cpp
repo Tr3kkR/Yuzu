@@ -301,6 +301,16 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
+    // JIT admin elevation — SOC 2 CC6.3/CC6.6. See docs/auth-architecture.md.
+    app.add_option("--jit-max-elevation-secs", cfg.jit_max_elevation_secs,
+                   "Maximum lifetime (seconds) of a time-boxed admin elevation granted via "
+                   "POST /api/v1/elevate (default: 3600 = 1h, max 86400 = 24h). A request asking "
+                   "for longer is clamped. Eligibility is the per-user users.elevation_eligible "
+                   "flag; elevation is in-memory per-session and auto-reverts on lapse.")
+        ->default_val(3600)
+        ->check(CLI::Range(1, 86400))
+        ->envname("YUZU_JIT_MAX_ELEVATION_SECS");
+
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })

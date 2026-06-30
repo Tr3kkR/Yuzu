@@ -61,6 +61,13 @@ struct Config {
         90}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
+    // JIT admin elevation (SOC 2 CC6.3/CC6.6) — `/auth-and-authz` gap P1 #9.
+    // Maximum lifetime (seconds) of a time-boxed admin elevation granted via
+    // POST /api/v1/elevate; a request asking for longer is clamped to this. The
+    // elevation is in-memory per-session and auto-reverts on lapse. Default
+    // 3600 (1h). Wired via --jit-max-elevation-secs / YUZU_JIT_MAX_ELEVATION_SECS.
+    int jit_max_elevation_secs{3600};
+
     // Authentication
     std::filesystem::path auth_config_path; // yuzu-server.cfg path
 

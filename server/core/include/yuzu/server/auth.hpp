@@ -49,7 +49,30 @@ struct Session {
     /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
     /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
     std::chrono::steady_clock::time_point mfa_verified_at{};
+
+    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `steady_clock::now() <
+    /// elevated_until`, this session's EFFECTIVE role is `admin` regardless of
+    /// the base `role` — a time-boxed, justified, MFA-gated activation set by
+    /// `POST /api/v1/elevate` (eligibility = `users.elevation_eligible`). The
+    /// default-constructed sentinel (epoch) means "not elevated" — fail-closed,
+    /// monotonic (an NTP step can't extend it). Per-session + in-memory: a
+    /// restart or logout drops the elevation. See `effective_role()` and
+    /// docs/auth-architecture.md "JIT admin elevation".
+    std::chrono::steady_clock::time_point elevated_until{};
 };
+
+/// True iff `s` currently holds an unexpired JIT admin elevation.
+inline bool is_elevated(const Session& s) {
+    return s.elevated_until.time_since_epoch().count() != 0 &&
+           std::chrono::steady_clock::now() < s.elevated_until;
+}
+
+/// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
+/// otherwise the base `role`. THE authorization functions
+/// (`require_admin`/`require_permission`/`require_scoped_permission`) must gate
+/// on this, never the raw `role`, so an elevated session is treated as admin for
+/// the window and auto-reverts when it lapses.
+inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::admin : s.role; }
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
@@ -186,6 +209,21 @@ public:
     /// /login/mfa/stepup route (PR 2) to mark an already-issued session
     /// as freshly MFA-verified.
     bool mark_session_mfa_verified(const std::string& token);
+
+    /// JIT admin elevation: set `elevated_until = now + duration` on the named
+    /// session, so its effective role is admin for the window (SOC 2 CC6.3/
+    /// CC6.6). The CALLER is responsible for the eligibility + MFA-step-up gates;
+    /// this only mutates the in-memory session. Returns the absolute expiry
+    /// `steady_clock::time_point` on success (so the route can report it),
+    /// nullopt if the session does not exist. `duration` is assumed already
+    /// clamped to the configured cap by the caller.
+    std::optional<std::chrono::steady_clock::time_point>
+    elevate_session(const std::string& token, std::chrono::seconds duration);
+
+    /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
+    /// on the named session. Returns true if the session existed and was
+    /// elevated (so the route can distinguish a real revoke from a no-op).
+    bool revoke_elevation(const std::string& token);
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;

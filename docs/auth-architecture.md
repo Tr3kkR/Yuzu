@@ -134,6 +134,48 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
 
+## JIT admin elevation (SOC 2 CC6.3/CC6.6)
+
+`/auth-and-authz` skill gap matrix P1 #9. Reduce **standing** privilege: a
+pre-authorized operator holds a non-admin base role day-to-day and **activates**
+admin **just-in-time** for a bounded, justified, MFA-gated window, then
+auto-reverts — so a compromised everyday session is not a standing admin session.
+
+- **Eligibility is a per-user flag** — `users.elevation_eligible` (auth.db
+  migration v4), distinct from holding standing admin and trivially enumerable
+  for access reviews. Admin-managed (and MFA-step-up-gated) via
+  `POST /api/v1/users/<name>/elevation-eligibility` `{"eligible": bool}`
+  (`AuthDB::set_elevation_eligible`/`is_elevation_eligible`, parameterised,
+  `RETURNING` — no `sqlite3_changes()`, #1033). Default 0 (not eligible) — nobody
+  gains elevation rights silently.
+- **Activation** — `POST /api/v1/elevate`
+  `{"justification": <required>, "duration_secs": <int>}`. Requires the caller to
+  be eligible **and** pass a fresh MFA step-up (`require_mfa_step_up`, reused).
+  Sets `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
+  (default cap 1h, max 24h). The justification is sanitised (control bytes →
+  space) and capped (1 KiB) into the audit detail. Audits
+  `role.elevation.granted` (justification + duration); `role.elevation.denied`
+  for an ineligible/failed-eligibility caller.
+- **Effective role** — `auth::effective_role(session)` returns `admin` while
+  `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
+  functions gate on it: `require_admin` checks `effective_role`, and
+  `require_permission`/`require_scoped_permission` **short-circuit to allow** an
+  elevated session (full admin for the window). `elevated_until` is monotonic
+  `steady_clock` (an NTP step can't extend it) and **per-session in-memory** — a
+  restart or logout drops the elevation (fail-safe).
+- **Scope: interactive cookie sessions only.** `/api/v1/elevate` reads the
+  session cookie and `elevate_session` keys on the cookie token; API and MCP
+  tokens resolve through `synthesize_token_session` (no cookie, no
+  `elevated_until`), so a long-lived automation credential can **never** be
+  elevated.
+- **Step-down** — `POST /api/v1/elevate/revoke` clears the window
+  (`role.elevation.revoked`). Passive expiry on lapse is implicit from the
+  `granted` row + its `duration_secs` (no separate `role.elevation.expired` event
+  in v1 — there is no natural hook for a passive timer; a lazy/reaper-emitted
+  expiry row is a tracked follow-up). Implementation: `Session::elevated_until` +
+  `AuthManager::elevate_session`/`revoke_elevation` (auth.cpp); the three
+  endpoints in `auth_routes.cpp`; `Config::jit_max_elevation_secs`.
+
 ## Granular RBAC (Phase 3)
 
 - 6 roles, 19 securable types, per-operation permissions, deny-override logic.
