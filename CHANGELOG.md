@@ -322,16 +322,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   un-migrated upgrade, so the container exited 1 in a restart loop and the `server` service
   (which `depends_on` the postgres healthcheck) never started (docker-library/postgres#1259).
   The volume is now mounted at the PG18-recommended parent `/var/lib/postgresql` across all
-  nine affected composes (including the base `docker-compose.yml` the original report missed),
-  and the two reference composes' non-working `PGDATA: /var/lib/postgresql/data` override has
-  been removed (PGDATA is left at the image default). Unreleased — postgres is a `dev`-only
-  feature with no `Dockerfile.postgres` at v0.12.0, so no shipped release is affected.
+  eight affected composes (including the base `docker-compose.yml` the original report missed),
+  the two reference composes' non-working `PGDATA: /var/lib/postgresql/data` override has been
+  removed (PGDATA is left at the image default), and the Compose Wizard generator
+  (`tools/compose-wizard/`, a packaged release asset) now emits the parent mount and the
+  correct "PostgreSQL 18" label. Unreleased — postgres is a `dev`-only feature with no
+  `Dockerfile.postgres` at v0.12.0, so no shipped release is affected.
   **Dev/UAT upgrade note:** an operator who already ran one of these stacks before this fix
   has a pre-18 cluster at the volume root that PG18 cannot read in place; on first boot under
   the new mount PostgreSQL silently re-initialises an empty cluster at `…/18/docker` and the
   old data is orphaned (not destroyed) inside the same volume. Since the substrate carries no
-  production data yet, run `docker compose down -v` to discard the stale volume before the
-  first PG18 boot.
+  production data yet, discard just the stale Postgres volume before the first PG18 boot —
+  `docker compose down` then `docker volume rm <project>_postgres-data` (or
+  `<project>_postgres-uat-data` for full-UAT). **Do not** use `docker compose down -v`: it
+  also removes `server-data` and the reference compose's `certs` volume (the per-install CA +
+  leaf certs), which would force the entire fleet to re-enroll.
 - **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
   `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
   list carry a per-agent management-group drop filter that is **not yet effective** under the
