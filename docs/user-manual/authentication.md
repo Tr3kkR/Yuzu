@@ -439,6 +439,32 @@ Returns `200 OK` with:
 
 Returns `404` if the token ID is not found. Returns `503 service unavailable` if the server's token store database failed to open at startup — a storage outage is never reported as `404` (see the API Tokens section of the [REST API reference](rest-api.md)).
 
+## JIT Admin Elevation
+
+To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
+
+**1. An admin grants eligibility** (one-time, per operator):
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  https://yuzu.example.com/api/v1/users/alice/elevation-eligibility
+```
+
+Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
+
+**2. The eligible operator elevates** when they need admin. The operator must have **MFA enrolled** (a second factor is mandatory to elevate, regardless of `--mfa-enforcement`) and will be challenged for a fresh TOTP code:
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"justification":"prod incident #42","duration_secs":600}' \
+  https://yuzu.example.com/api/v1/elevate
+# -> {"status":"ok","expires_in":600}
+```
+
+The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`, `user.elevation_eligibility.set`) is audited. Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+
 ## MCP Tokens
 
 MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier` field that controls what the token holder can do through the MCP endpoint (`POST /mcp/v1/`). MCP tokens enable AI models and automation tools to interact with Yuzu's fleet management capabilities via JSON-RPC 2.0.

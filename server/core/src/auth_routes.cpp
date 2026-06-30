@@ -1705,6 +1705,21 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                       "application/json");
                       return;
                   }
+                  // Block self-grant (review UP-6 / security-LOW): an operator —
+                  // including one acting under an active elevation — must not set
+                  // their OWN eligibility, which would let a temporary admin
+                  // window manufacture a durable self-elevation right. Eligibility
+                  // is always granted by another admin.
+                  if (target == session->username) {
+                      audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                                "self_grant_blocked");
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
+                                                                 "eligibility",
+                                                            cid, "another administrator must set it"),
+                                      "application/json");
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (!body.is_object() || !body.contains("eligible") ||
                       !body["eligible"].is_boolean()) {
@@ -1728,8 +1743,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                       "application/json");
                       return;
                   }
+                  // Revoking eligibility must terminate any in-flight elevation
+                  // immediately (governance UP-1) — symmetric with the session
+                  // wipe on demote/delete, so an incident-response "revoke now"
+                  // actually drops the operator's admin access rather than
+                  // leaving it standing for up to the window.
+                  int cleared = 0;
+                  if (!eligible)
+                      cleared = auth_mgr_.revoke_user_elevations(target);
                   audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
-                            eligible ? "eligible=true" : "eligible=false");
+                            std::string(eligible ? "eligible=true" : "eligible=false") +
+                                (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
                   res.set_content(R"({"status":"ok"})", "application/json");
               });
 
@@ -1777,16 +1801,46 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        // High-risk: require a fresh MFA proof before granting admin.
+        // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the
+        // privilege-crossing boundary (non-admin → full admin), so — UNLIKE the
+        // other step-up sites where the actor is already admin — a second factor
+        // is required unconditionally, NOT gated on --mfa-enforcement. An eligible
+        // operator with no TOTP enrolled is refused here (require_mfa_step_up
+        // would otherwise pass them through under the default optional mode).
+        if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "no MFA enrolled (a second factor is required to elevate)");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
+                                                  cid, "enroll MFA (Settings -> Multi-Factor "
+                                                       "Authentication) before you can elevate"),
+                            "application/json");
+            return;
+        }
+        // High-risk: require a fresh MFA proof (step-up) before granting admin.
         if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate"))
             return;
         auto body = nlohmann::json::parse(req.body, nullptr, false);
+        // Type-guard the fields: a present-but-wrong-type value would otherwise
+        // throw nlohmann type_error.302 → httplib 500 (review UP-2/cpp-safety).
+        if (body.is_object() &&
+            ((body.contains("justification") && !body["justification"].is_string()) ||
+             (body.contains("duration_secs") && !body["duration_secs"].is_number_integer()))) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "justification must be a string and "
+                                                       "duration_secs an integer",
+                                                  cid),
+                            "application/json");
+            return;
+        }
         std::string justification =
             body.is_object() ? body.value("justification", std::string{}) : std::string{};
         // Justification is mandatory (the auditable reason). Sanitise control
-        // bytes (anti log-injection) and cap length (anti audit-row bloat).
+        // bytes incl. DEL (anti log-injection) and cap length (anti audit-row
+        // bloat).
         for (char& c : justification)
-            if (static_cast<unsigned char>(c) < 0x20)
+            if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
                 c = ' ';
         // trim surrounding whitespace for the empty-check
         auto first = justification.find_first_not_of(' ');
@@ -1800,7 +1854,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (justification.size() > kMaxJustificationLength)
             justification.resize(kMaxJustificationLength);
         int duration = body.is_object() ? body.value("duration_secs", 0) : 0;
-        if (duration <= 0)
+        // An explicit NEGATIVE duration is a client error, not "give me the max"
+        // (review UP-5 least-privilege). Absent or 0 defaults to the cap.
+        if (duration < 0) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "duration_secs must be positive", cid),
+                            "application/json");
+            return;
+        }
+        if (duration == 0)
             duration = cfg_.jit_max_elevation_secs; // unspecified → the full cap
         if (duration > cfg_.jit_max_elevation_secs)
             duration = cfg_.jit_max_elevation_secs; // clamp
@@ -1810,10 +1872,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
-        audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
-                                "User", session->username,
-                                "duration_secs=" + std::to_string(duration) +
-                                    " justification=" + justification);
+        // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
+        // activation must never stand without a durable record. If the audit row
+        // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
+        // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
+        // a silent admin window.
+        if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
+                                     "User", session->username,
+                                     "duration_secs=" + std::to_string(duration) +
+                                         " justification=" + justification)) {
+            auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
+                          session->username);
+            res.status = 500;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(detail::error_json_a4(500, "could not record the elevation; not granted",
+                                                  cid, "retry; if it persists, check the audit store"),
+                            "application/json");
+            return;
+        }
         emit_event("role.elevation.granted", req,
                    {{"username", session->username}, {"duration_secs", std::to_string(duration)}}, {},
                    Severity::kWarn);

@@ -147,15 +147,31 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   `POST /api/v1/users/<name>/elevation-eligibility` `{"eligible": bool}`
   (`AuthDB::set_elevation_eligible`/`is_elevation_eligible`, parameterised,
   `RETURNING` — no `sqlite3_changes()`, #1033). Default 0 (not eligible) — nobody
-  gains elevation rights silently.
+  gains elevation rights silently. **Self-grant is blocked** (an operator — even
+  one acting under an active elevation — cannot set their own eligibility, so a
+  temporary admin window can't manufacture a durable self-elevation right).
+  **Revoking eligibility immediately terminates any in-flight elevation** for
+  that user (`AuthManager::revoke_user_elevations`, symmetric with the session
+  wipe on demote/delete) — an incident-response "revoke now" drops admin access
+  rather than leaving it standing for the window.
 - **Activation** — `POST /api/v1/elevate`
   `{"justification": <required>, "duration_secs": <int>}`. Requires the caller to
-  be eligible **and** pass a fresh MFA step-up (`require_mfa_step_up`, reused).
-  Sets `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
-  (default cap 1h, max 24h). The justification is sanitised (control bytes →
-  space) and capped (1 KiB) into the audit detail. Audits
-  `role.elevation.granted` (justification + duration); `role.elevation.denied`
-  for an ineligible/failed-eligibility caller.
+  be eligible **and** have **MFA enrolled** **and** pass a fresh MFA step-up.
+  MFA enrollment is mandatory **unconditionally** here, NOT gated on
+  `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
+  full admin), so — unlike the other step-up sites where the actor is already
+  admin — an eligible operator with no enrolled second factor is refused (403,
+  `role.elevation.denied`). Sets
+  `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
+  (default cap 1h, max 24h; an absent/0 `duration_secs` defaults to the cap, a
+  negative one is a 400, a present-but-wrong-typed field is a 400). The
+  justification is sanitised (control bytes incl. DEL → space) and capped (1 KiB)
+  into the audit detail. The `role.elevation.granted` audit is **fail-closed**:
+  if it can't persist, the elevation is rolled back (compensating
+  `revoke_elevation`) and the call 500s with `Sec-Audit-Failed` — a privileged
+  activation never stands without a record. Audits `role.elevation.granted`
+  (justification + duration); `role.elevation.denied` for an ineligible /
+  failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
   `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
   functions gate on it: `require_admin` checks `effective_role`, and

@@ -2409,7 +2409,9 @@ void SettingsRoutes::register_routes(
         if (!session)
             return;
         // Non-admins see only their own tokens (Gate 4 finding C1).
-        std::string filter = session->role == auth::Role::admin ? std::string{} : session->username;
+        std::string filter = auth::effective_role(*session) == auth::Role::admin
+                                 ? std::string{}
+                                 : session->username; // JIT elevation → admin view
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -3900,7 +3902,9 @@ void SettingsRoutes::register_routes(
 
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"API token created","level":"success"}})");
-        std::string filter = session->role == auth::Role::admin ? std::string{} : session->username;
+        std::string filter = auth::effective_role(*session) == auth::Role::admin
+                                 ? std::string{}
+                                 : session->username; // JIT elevation → admin view
         res.set_content(render_api_tokens_fragment(result.value(), filter),
                         "text/html; charset=utf-8");
     });
@@ -3922,7 +3926,7 @@ void SettingsRoutes::register_routes(
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
         bool denied = existing && existing->principal_id != session->username &&
-                      session->role != auth::Role::admin;
+                      auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
         if (!existing || denied) {
             if (denied && audit_store_) {
                 // [[nodiscard]] on AuditStore::log is the SOC 2 CC6.6
@@ -3974,7 +3978,9 @@ void SettingsRoutes::register_routes(
 
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"API token revoked","level":"success"}})");
-        std::string filter = session->role == auth::Role::admin ? std::string{} : session->username;
+        std::string filter = auth::effective_role(*session) == auth::Role::admin
+                                 ? std::string{}
+                                 : session->username; // JIT elevation → admin view
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 

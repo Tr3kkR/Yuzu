@@ -1150,7 +1150,8 @@ void RestApiV1::register_routes(
                  }
                  auto session = auth_fn(req, res);
                  const std::string principal = session ? session->username : std::string{};
-                 const bool is_admin = session && session->role == auth::Role::admin;
+                 const bool is_admin =
+                     session && auth::effective_role(*session) == auth::Role::admin; // JIT elevation
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
@@ -1789,7 +1790,7 @@ void RestApiV1::register_routes(
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
         bool denied = existing && existing->principal_id != session->username &&
-                      session->role != auth::Role::admin;
+                      auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
         if (!existing || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,

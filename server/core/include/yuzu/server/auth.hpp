@@ -225,6 +225,13 @@ public:
     /// elevated (so the route can distinguish a real revoke from a no-op).
     bool revoke_elevation(const std::string& token);
 
+    /// Clear any active JIT elevation on EVERY session of `username` (all
+    /// devices). Called when an admin removes a user's elevation eligibility so
+    /// an in-flight elevation is terminated immediately — symmetric with the
+    /// session wipe on demote/delete (governance UP-1). Returns the number of
+    /// sessions whose elevation was cleared.
+    int revoke_user_elevations(const std::string& username);
+
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
 

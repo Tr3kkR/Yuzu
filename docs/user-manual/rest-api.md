@@ -834,6 +834,30 @@ curl -s -X POST \
 
 ---
 
+#### `POST /api/v1/users/{username}/elevation-eligibility`
+
+Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activate a time-boxed admin elevation via `POST /api/v1/elevate` (SOC 2 CC6.3/CC6.6). This is the per-user `users.elevation_eligible` flag, distinct from holding standing admin and enumerable for access reviews. See [JIT Admin Elevation](#jit-admin-elevation) below and `docs/auth-architecture.md` "JIT admin elevation".
+
+**Permission:** admin (or an active elevation) **+ MFA step-up**. **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must).
+
+**Body:** `{"eligible": <bool>}`.
+
+**Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
+```
+
+**Response (200):** `{"status":"ok"}`.
+
+**Errors:** `400` — invalid username or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found; `503` — no `auth.db` (`--data-dir` unset).
+
+**Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
+
+---
+
 ### Quarantine
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
@@ -5280,6 +5304,35 @@ Envelope shape:
 ```
 
 `meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` tells the client where to re-prove — `/login/mfa/stepup` for local sessions, `/auth/oidc/start` for OIDC sessions. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
+
+### JIT Admin Elevation
+
+Activate a time-boxed admin elevation (SOC 2 CC6.3/CC6.6) — see `docs/auth-architecture.md` "JIT admin elevation". Eligibility is granted separately by an admin via [`POST /api/v1/users/{username}/elevation-eligibility`](#post-apiv1usersusernameelevation-eligibility).
+
+#### `POST /api/v1/elevate`
+
+Promote the **current cookie session** to admin for a bounded window. The session's effective role becomes `admin` until the window lapses, then auto-reverts.
+
+**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible`; **MFA must be enrolled** (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up is required.
+
+**Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
+
+```bash
+curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"justification":"prod incident #42","duration_secs":600}' \
+  "https://yuzu.example.com/api/v1/elevate"
+```
+
+**Response (200):** `{"status":"ok","expires_in":<effective_secs>}`.
+
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), or the session dissolved mid-request; `403` — not eligible, eligibility read failed (fail-closed), **or no MFA enrolled**; the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> justification=<sanitised>`) on success; `role.elevation.denied` on a `403`.
+
+#### `POST /api/v1/elevate/revoke`
+
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Always `200 {"status":"ok"}`; whether a window was actually active is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body.
 
 #### `POST /logout`
 

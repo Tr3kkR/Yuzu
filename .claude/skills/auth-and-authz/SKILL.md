@@ -186,7 +186,10 @@ matches the customer ask.
    Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
    v4, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), distinct
    from standing admin and enumerable for access reviews. Gated on eligibility +
-   a fresh MFA step-up. `auth::effective_role(session)` (admin while
+   **mandatory MFA enrollment** (unconditional — elevation is the privilege
+   boundary) + a fresh MFA step-up; the grant audit is fail-closed, revoking
+   eligibility ends active elevations, and self-grant is blocked.
+   `auth::effective_role(session)` (admin while
    `now < elevated_until`) is honoured by `require_admin` + the permission gates;
    the window is monotonic `steady_clock`, in-memory per **cookie** session
    (restart/logout drops it; API/MCP tokens can never elevate). Audits

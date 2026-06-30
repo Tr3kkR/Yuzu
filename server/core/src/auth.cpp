@@ -584,6 +584,18 @@ bool AuthManager::revoke_elevation(const std::string& token) {
     return was_elevated;
 }
 
+int AuthManager::revoke_user_elevations(const std::string& username) {
+    std::unique_lock lock(mu_);
+    int cleared = 0;
+    for (auto& [token, s] : sessions_) {
+        if (s.username == username && is_elevated(s)) {
+            s.elevated_until = {};
+            ++cleared;
+        }
+    }
+    return cleared;
+}
+
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
     // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
     // This check intentionally fires BEFORE the mutex acquire below — rejecting
