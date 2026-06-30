@@ -38,6 +38,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
+#include "sync_source_device_ci.hpp"          // ADR-0016 device-CI inventory source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -1515,12 +1516,26 @@ public:
                 {
                     const YuzuPluginDescriptor* ia_descriptor = nullptr;
                     const YuzuPluginDescriptor* tar_descriptor = nullptr;
+                    // device_ci source plugins (ADR-0016): hardware / device_identity /
+                    // os_info / network_config, reused in-process via LocalDispatcher.
+                    const YuzuPluginDescriptor* hw_descriptor = nullptr;
+                    const YuzuPluginDescriptor* devid_descriptor = nullptr;
+                    const YuzuPluginDescriptor* osinfo_descriptor = nullptr;
+                    const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         if (pname == "installed_apps")
                             ia_descriptor = handle.descriptor();
                         else if (pname == "tar")
                             tar_descriptor = handle.descriptor();
+                        else if (pname == "hardware")
+                            hw_descriptor = handle.descriptor();
+                        else if (pname == "device_identity")
+                            devid_descriptor = handle.descriptor();
+                        else if (pname == "os_info")
+                            osinfo_descriptor = handle.descriptor();
+                        else if (pname == "network_config")
+                            netcfg_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
@@ -1532,7 +1547,9 @@ public:
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor,
+                    sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
+                                                devid_descriptor, osinfo_descriptor,
+                                                netcfg_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -1591,8 +1608,13 @@ public:
                         // empty rollup → the source skips the cycle) and the TAR plugin
                         // being loaded (null descriptor → idle).
                         scheduler.add_source(make_app_perf_source(tar_descriptor));
-                        spdlog::info("Daily-sync thread started (sources=2: installed_software, "
-                                     "app_perf)");
+                        // ADR-0016 device-CI inventory: stable hardware/OS identity (CMDB
+                        // CI record). Idles unless all four source plugins are loaded.
+                        scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
+                                                                   osinfo_descriptor,
+                                                                   netcfg_descriptor));
+                        spdlog::info("Daily-sync thread started (sources=3: installed_software, "
+                                     "app_perf, device_ci)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())

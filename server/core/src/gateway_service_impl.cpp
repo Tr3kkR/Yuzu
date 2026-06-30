@@ -12,6 +12,7 @@
 #include "guaranteed_state_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_ingestion.hpp"
+#include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_ingestion.hpp"
@@ -564,6 +565,21 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
                          agent_id, ex.what());
         } catch (...) {
             spdlog::warn("[gateway] ProxyInventory: app_perf ingest threw (unknown) for agent={} "
+                         "— acked",
+                         agent_id);
+        }
+    }
+    // Typed device_ci via its shared seam (ADR-0016) — byte-identical to the direct
+    // ReportInventory path, independently guarded + isolated.
+    if (device_inventory_store_ && device_inventory_store_->is_open()) {
+        try {
+            ingest_device_ci_report(*device_inventory_store_, agent_id, *request, *response,
+                                    metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: device_ci ingest threw for agent={} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: device_ci ingest threw (unknown) for agent={} "
                          "— acked",
                          agent_id);
         }

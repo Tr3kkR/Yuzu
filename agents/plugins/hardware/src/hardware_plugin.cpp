@@ -8,6 +8,7 @@
  *   "processors"   — Lists installed CPUs with model, cores, threads, clock.
  *   "memory"       — Lists installed memory modules.
  *   "disks"        — Lists physical disk drives.
+ *   "system"       — Serial number + system UUID (CMDB correlation key).
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value   (for scalar actions)
@@ -308,6 +309,53 @@ int do_bios(yuzu::CommandContext& ctx) {
     ctx.write_output("bios_vendor|unknown");
     ctx.write_output("bios_version|unknown");
     ctx.write_output("bios_date|unknown");
+#endif
+    return 0;
+}
+
+// ── system action (serial number + system UUID) ────────────────────────────
+//
+// The hardware serial + SMBIOS/firmware UUID are the device's stable CMDB
+// primary correlation key (e.g. for ServiceNow reconciliation). Both are
+// machine-scope identifiers, no per-user data. Empty → the stable "unknown"
+// sentinel so the daily-sync canonical hash does not flap when a value is
+// genuinely absent (e.g. a VM with no SMBIOS serial).
+
+int do_system(yuzu::CommandContext& ctx) {
+#ifdef __linux__
+    // /sys/class/dmi/id/product_serial and product_uuid are root-readable only.
+    // The agent runs as a service account / root (docs/agent-privilege-model.md),
+    // so this succeeds in production; a non-privileged run yields "unknown".
+    auto serial = read_dmi_file("/sys/class/dmi/id/product_serial");
+    auto uuid = read_dmi_file("/sys/class/dmi/id/product_uuid");
+    ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));
+    ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
+
+#elif defined(__APPLE__)
+    auto serial = run_command("ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | "
+                              "awk -F'\"' '/IOPlatformSerialNumber/{print $4}'");
+    auto uuid = run_command("ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | "
+                            "awk -F'\"' '/IOPlatformUUID/{print $4}'");
+    ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));
+    ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
+
+#elif defined(_WIN32)
+    WmiQuery wmi;
+    std::string serial;
+    std::string uuid;
+    if (wmi.valid()) {
+        wmi.query(L"SELECT SerialNumber FROM Win32_BIOS", [&](IWbemClassObject* obj) {
+            serial = WmiQuery::get_string(obj, L"SerialNumber");
+        });
+        wmi.query(L"SELECT UUID FROM Win32_ComputerSystemProduct",
+                  [&](IWbemClassObject* obj) { uuid = WmiQuery::get_string(obj, L"UUID"); });
+    }
+    ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));
+    ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
+
+#else
+    ctx.write_output("serial|unknown");
+    ctx.write_output("system_uuid|unknown");
 #endif
     return 0;
 }
@@ -721,8 +769,8 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"manufacturer", "model", "bios",    "processors",
-                                     "memory",       "disks", "drivers", nullptr};
+        static const char* acts[] = {"manufacturer", "model",   "bios",   "processors", "memory",
+                                     "disks",        "drivers", "system", nullptr};
         return acts;
     }
 
@@ -746,6 +794,8 @@ public:
             return do_disks(ctx);
         if (action == "drivers")
             return do_drivers(ctx);
+        if (action == "system")
+            return do_system(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
