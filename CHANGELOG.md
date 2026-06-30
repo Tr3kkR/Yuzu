@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Elevation is in-memory per cookie session (a restart/logout drops it) and **cookie-sessions-only** — API
   and MCP tokens can never be elevated. Closes `/auth-and-authz` gap-matrix P1 #9. See
   `docs/auth-architecture.md` "JIT admin elevation".
+- **Idle (inactivity) session timeout (`--session-inactivity-secs`, SOC 2 CC6.3).** Operator dashboard
+  cookie sessions can now be invalidated after a configurable period of inactivity — a **sliding**
+  window that resets on each authenticated request, *under* the existing absolute 8h session lifetime.
+  Wires the previously-reserved `sessions.last_activity_at` column end-to-end (enforced in
+  `AuthManager::validate_session`; best-effort throttled `auth.db` mirror via
+  `AuthDB::touch_session_activity`). **Default 0 = disabled** (opt-in; existing deployments unaffected;
+  recommended `900` = 15 min). Scope is cookie sessions only — **API tokens and MCP tokens are never
+  idle-timed-out**, and OIDC users re-authenticate via SSO. `YUZU_SESSION_INACTIVITY_SECS`. Closes
+  `/auth-and-authz` gap-matrix P1 #8. See `docs/auth-architecture.md` "Inactivity session timeout".
 
 - **Hardened authentication mode (`--auth-mode=sso-only`) + break-glass account (SOC 2 CC6.3/CC6.6).**
   Local-password login can be disabled fleet-wide so only OIDC SSO mints a session
@@ -67,6 +76,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SoftwareDeployment:Read` opens the config; the result poll needs `Read`+`Execute` (it advances
   the engine); create needs `Infrastructure:Read`+`Execute`; delete needs `Execute`; owner-scoped;
   operational `deployment.{create,advance,delete}` audit. URL-only on `/auto` (not a new nav tab).
+- **Inventory dashboard (`/inventory`).** A point-and-click view over the daily-sync
+  installed-software data (ADR-0016). Three tabs: **Software** (the fleet software list —
+  title, publisher, install count, distinct versions, with an installs-per-version drill),
+  **Devices** (a thin, offline-survivable device list sourced from the persisted endpoint
+  state + the live registry; click a device for its installed software), and **Find software**
+  (which devices run a given title). The catalogue/version counts are served from a
+  **precomputed rollup** (`catalog_rollup` / `version_rollup` / `catalog_rollup_meta`,
+  refreshed hourly by a background `SoftwareCatalogRollup` thread, keep-last-good on
+  failure) so page reads never run a full-table `GROUP BY` — the underlying data changes
+  only on the daily sync. The KPI strip shows an "updated N ago" stamp and a "building"
+  state before the first refresh. Gated on the existing `Inventory:Read` (per-device
+  reads use the management-group-scoped gate); fleet-wide catalogue/find counts are not yet
+  management-group scoped (ADR-0017 confinement inert under the global gate — caveated in the
+  UI). On store degradation the authoritative reads (Software/Find/per-device-software) show an
+  "unavailable" banner, never an empty table (ADR-0016 §7); the fail-soft device roster may show an
+  empty list during a database incident (its empty-state copy says so). New audit verbs
+  `inventory.software.{catalog,versions}`, `inventory.device.software`, and `inventory.devices` (the
+  Devices roster read — set-and-proceed); `inventory.software.query` (pre-existing on the REST
+  endpoint) is now also emitted by the dashboard Find tab and documented.
+  New nav item + command-palette entry.
 - **DEX app-performance over time — per-device drill dashboard UI.** The per-device app-perf
   history (REST `GET /api/v1/dex/devices/{id}/app-perf`, shipped in slice 2) now has a dashboard
   surface: an "Application performance over time" panel on the `/device` DEX drill, beside the

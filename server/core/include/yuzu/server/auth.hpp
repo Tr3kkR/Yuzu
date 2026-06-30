@@ -59,6 +59,28 @@ struct Session {
     /// restart or logout drops the elevation. See `effective_role()` and
     /// docs/auth-architecture.md "JIT admin elevation".
     std::chrono::steady_clock::time_point elevated_until{};
+
+    /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
+    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
+    /// throttled to once per touch-granularity; `validate_session` rejects the
+    /// session once `now - last_activity_at` exceeds the window — a sliding
+    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
+    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
+    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
+    /// most one write per session per kActivityPersistGranularity, keeping the
+    /// hot path off a per-request SQL write.
+    ///
+    /// Both are STAMPED at each of the three session-creation sites
+    /// (authenticate / create_local_session / create_oidc_session). The `{}`
+    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
+    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any future path that inserts a Session into
+    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
+    /// work) MUST stamp `last_activity_at`, or the restored session is
+    /// idle-evicted on its first validate when the feature is on.
+    std::chrono::steady_clock::time_point last_activity_at{};
+    std::chrono::steady_clock::time_point last_activity_persisted_at{};
 };
 
 /// True iff `s` currently holds an unexpired JIT admin elevation.
@@ -174,6 +196,12 @@ class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
     static constexpr int kPbkdf2Iterations = 100'000;
+    /// Minimum spacing between best-effort AuthDB `last_activity_at` mirror
+    /// writes for one session, so the per-request idle-timeout touch does not
+    /// become a per-request SQL write. The in-memory `Session::last_activity_at`
+    /// is always fresh; only the durable mirror is throttled. 60 s matches the
+    /// AuthDB cleanup-thread cadence.
+    static constexpr auto kActivityPersistGranularity = std::chrono::seconds(60);
 
     /// Load users from config file. Returns false if file missing/corrupt.
     bool load_config(const std::filesystem::path& cfg_path);
@@ -287,6 +315,13 @@ public:
     /// If set, user operations go through the DB instead of config file.
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
+    /// `validate_session` rejects a cookie session idle longer than `window` and
+    /// bumps `last_activity_at` on each authenticated touch. 0 (default)
+    /// disables the feature — only the absolute `kSessionDuration` applies.
+    /// Wired from Config::session_inactivity_secs at startup.
+    void set_session_inactivity(std::chrono::seconds window) { session_inactivity_ = window; }
 
     /// Non-owning AuthDB pointer (or nullptr if not configured). Exposed
     /// for the MFA-aware login flow at AuthRoutes::POST /login, which
@@ -487,6 +522,11 @@ private:
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
+    /// Read on the validate_session hot path; set once at startup before any
+    /// request is served, so a plain member (no extra lock) is sufficient.
+    std::chrono::seconds session_inactivity_{0};
 
     // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
     yuzu::MetricsRegistry* metrics_ = nullptr;
