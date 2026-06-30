@@ -10,6 +10,7 @@
 #include "inventory_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_audit.hpp" // detail::try_persist_audit — throw-safe set-and-proceed audit kernel (#1647)
 
 #include <algorithm>
 #include <cstdint>
@@ -110,10 +111,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::optional<std::int64_t> stale;
                  if (stale_fn_)
                      stale = stale_fn_();
-                 if (audit_fn_)
-                     (void)audit_fn_(req, "inventory.software.catalog", cat ? "success" : "failure",
-                                     "Inventory", q.name_filter.empty() ? "fleet" : ("q=" + q.name_filter),
-                                     cat ? ("titles=" + std::to_string(cat->size())) : "store degraded");
+                 // Set-and-proceed audit via the #1647 throw-safe kernel (a throwing
+                 // audit sink → false, never an httplib 500): parity with the REST sibling.
+                 (void)detail::try_persist_audit(
+                     audit_fn_, req, "inventory.software.catalog", cat ? "success" : "failure",
+                     "Inventory", q.name_filter.empty() ? "fleet" : ("q=" + q.name_filter),
+                     cat ? ("titles=" + std::to_string(cat->size())) : "store degraded");
                  send_html(res, render_inventory_software_fragment(cat, q.name_filter, stale, capped));
              });
 
@@ -126,11 +129,11 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::optional<std::vector<SoftwareVersionCount>> vers;
                  if (versions_fn_ && !name.empty())
                      vers = versions_fn_(name, 500);
-                 if (audit_fn_ && !name.empty())
-                     (void)audit_fn_(req, "inventory.software.versions",
-                                     vers ? "success" : "failure", "Inventory", "name=" + name,
-                                     vers ? ("versions=" + std::to_string(vers->size()))
-                                          : "store degraded");
+                 if (!name.empty())
+                     (void)detail::try_persist_audit(
+                         audit_fn_, req, "inventory.software.versions", vers ? "success" : "failure",
+                         "Inventory", "name=" + name,
+                         vers ? ("versions=" + std::to_string(vers->size())) : "store degraded");
                  send_html(res, render_inventory_versions_fragment(name, vers));
              });
 
@@ -166,11 +169,12 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::optional<std::vector<SoftwareEntry>> sw;
                  if (agent_sw_fn_)
                      sw = agent_sw_fn_(id);
-                 // Set-and-proceed audit (machine-scope data; HTML surface still renders).
-                 if (audit_fn_)
-                     (void)audit_fn_(req, "inventory.device.software", sw ? "success" : "failure",
-                                     "Inventory", "agent=" + id,
-                                     sw ? ("rows=" + std::to_string(sw->size())) : "store degraded");
+                 // Set-and-proceed audit (machine-scope data; HTML surface still renders)
+                 // via the #1647 throw-safe kernel.
+                 (void)detail::try_persist_audit(
+                     audit_fn_, req, "inventory.device.software", sw ? "success" : "failure",
+                     "Inventory", "agent=" + id,
+                     sw ? ("rows=" + std::to_string(sw->size())) : "store degraded");
                  send_html(res, render_inventory_device_software_fragment(id, host, sw, online));
              });
 
@@ -200,13 +204,14 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      rows_opt = fleet_fn_(q);
 
                  if (name.empty()) {
+                     // No name → no data read → nothing to audit (the renderer prompts for input).
                      send_html(res, render_inventory_find_results_fragment(name, std::nullopt, false, 0));
                      return;
                  }
                  if (!rows_opt) {
-                     if (audit_fn_)
-                         (void)audit_fn_(req, "inventory.software.query", "failure", "Inventory",
-                                         "name=" + name, "store degraded");
+                     (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.query",
+                                                     "failure", "Inventory", "name=" + name,
+                                                     "store degraded");
                      send_html(res,
                                render_inventory_find_results_fragment(name, std::nullopt, false, 0));
                      return;
@@ -233,15 +238,18 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      }
                      rows.swap(visible);
                  }
-                 if (audit_fn_) {
-                     if (dropped > 0)
-                         (void)audit_fn_(req, "inventory.software.query", "denied", "Inventory",
-                                         "name=" + name,
-                                         "scope: filtered " + std::to_string(dropped) +
-                                             " out-of-management-group device(s)");
-                     (void)audit_fn_(req, "inventory.software.query", "success", "Inventory",
-                                     "name=" + name, "rows=" + std::to_string(rows.size()));
-                 }
+                 // Set-and-proceed via the throw-safe kernel. A scope drop emits BOTH a
+                 // `denied` row (the dropped count, for cross-operator isolation evidence)
+                 // AND the `success` row for the visible rows — mirrors the REST sibling.
+                 if (dropped > 0)
+                     (void)detail::try_persist_audit(
+                         audit_fn_, req, "inventory.software.query", "denied", "Inventory",
+                         "name=" + name,
+                         "scope: filtered " + std::to_string(dropped) +
+                             " out-of-management-group device(s)");
+                 (void)detail::try_persist_audit(audit_fn_, req, "inventory.software.query", "success",
+                                                 "Inventory", "name=" + name,
+                                                 "rows=" + std::to_string(rows.size()));
                  send_html(res,
                            render_inventory_find_results_fragment(name, rows_opt, hit_cap, dropped));
              });

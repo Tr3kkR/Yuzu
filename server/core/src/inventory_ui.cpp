@@ -207,6 +207,12 @@ std::string render_inventory_software_fragment(
 
 std::string render_inventory_versions_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareVersionCount>>& versions) {
+    // No title is a precondition miss, not a store degrade — don't render the
+    // "unavailable" (store-failed) banner for it (gov happy-NICE). Unreachable from the
+    // UI (drill links always carry ?name=); guards a direct fetch.
+    if (name.empty())
+        return "<div class=\"inv-empty\">Select a title from the Software list to see its installs "
+               "per version.</div>";
     std::string h = "<div class=\"inv-panel\"><div class=\"inv-panelh\"><span class=\"t\">Installs "
                     "per version &mdash; " +
                     esc(name) +
@@ -256,15 +262,32 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
          esc(q) + "\" oninput=\"gpSearch(this)\" data-gpf=\"invdev\"></div>";
 
     if (rows.empty()) {
-        h += "<div class=\"inv-empty\">No devices have reported yet. Devices appear here once the "
-             "server has received a heartbeat from them.</div></div>";
+        // The device roster is sourced from the fail-soft endpoint-state store (not an
+        // authoritative read), so an empty result CAN mean "store temporarily
+        // unavailable" — don't assert fleet-emptiness as fact (gov UP-1 / architect-S1).
+        h += "<div class=\"inv-empty\">No devices in the recent-activity window. If this is "
+             "unexpected, device state may be temporarily unavailable (this roster is best-effort; "
+             "the Software tab's reads are authoritative).</div></div>";
         return h;
     }
+
+    // Bound the rendered rows so a large fleet can't emit a 100k-row HTML fragment
+    // (gov UP-8 / perf-S3). The full set is filterable client-side via gpSearch; true
+    // keyset pagination is the follow-up. Honest signal: show "first N of M", never a
+    // silent cap.
+    constexpr std::size_t kDeviceRenderCap = 1000;
+    const std::size_t total = rows.size();
+    const std::size_t shown = total > kDeviceRenderCap ? kDeviceRenderCap : total;
+    if (total > kDeviceRenderCap)
+        h += "<div class=\"inv-banner\">Showing the first " + std::to_string(shown) + " of " +
+             std::to_string(total) +
+             " devices — refine with the filter (full per-page paging is a follow-up).</div>";
 
     h += "<table class=\"inv-tbl\"><thead><tr><th>Device</th><th>OS</th><th>Status</th>"
          "<th>Last seen</th><th class=\"inv-grey\">Serial</th><th class=\"inv-grey\">Model</th>"
          "<th class=\"inv-grey\">CPU / RAM</th></tr></thead><tbody>";
-    for (const auto& d : rows) {
+    for (std::size_t i = 0; i < shown; ++i) {
+        const auto& d = rows[i];
         const std::string status = d.online ? "online" : (d.stale ? "stale" : "offline");
         const std::string status_pill = d.online
                                              ? "<span class=\"inv-pill on\">online</span>"
@@ -330,7 +353,13 @@ std::string render_inventory_device_software_fragment(
 std::string render_inventory_find_fragment(const std::string& initial_name) {
     std::string h = page_head();
     h += inv_subnav("find");
-    h += scope_caveat();
+    // Find DOES narrow by management group (the per-row scope drop is effective here,
+    // unlike the catalogue aggregate) — so it gets its OWN note, NOT the shared
+    // catalogue caveat that says "does not narrow results today" (gov happy-SHOULD).
+    h += "<div class=\"inv-caveat\">Management-group confinement applies to these results: "
+         "devices outside your scope are filtered out below (and the count is shown). A short or "
+         "empty result under a narrow scope is <b>incomplete</b>, not proof the software is "
+         "absent fleet-wide.</div>";
     h += "<div class=\"inv-banner\">Find which devices run a software title. Exact name match; "
          "capped at 1000 rows (a short/zero result under a narrow scope is incomplete, not "
          "absent).</div>";

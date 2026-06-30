@@ -9084,9 +9084,12 @@ private:
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
             auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
-            std::set<std::string> online; // currently-connected agents (live registry)
-            for (const auto& a : registry_.to_json_obj())
-                online.insert(a.value("agent_id", ""));
+            // currently-connected agents (live registry). all_ids() copies only the ids
+            // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
+            // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
+            // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
+            auto online_ids = registry_.all_ids();
+            std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
             const auto visible = visible_set_fn(username); // nullopt = sees all (global read)
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())

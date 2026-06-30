@@ -84,8 +84,20 @@ TEST_CASE("software fragment: capped marks the title count with a '+'", "[invent
     REQUIRE(contains(html, "list capped"));
 }
 
-TEST_CASE("versions fragment: degrade banner vs share bars", "[inventory][ui]") {
+TEST_CASE("versions fragment: degrade banner vs empty vs share bars", "[inventory][ui]") {
+    // nullopt = store degrade → banner.
     REQUIRE(contains(render_inventory_versions_fragment("Chrome", std::nullopt), "unavailable"));
+
+    // Empty-non-null (a title since fully uninstalled) = honest empty, NOT a degrade (gov F2).
+    const std::string empty = render_inventory_versions_fragment(
+        "Chrome", std::optional<std::vector<SoftwareVersionCount>>(std::vector<SoftwareVersionCount>{}));
+    REQUIRE(contains(empty, "No version data"));
+    REQUIRE_FALSE(contains(empty, "unavailable"));
+
+    // Empty name = precondition miss → "select a title" note, NOT the store-failed banner (gov happy-NICE).
+    const std::string noname = render_inventory_versions_fragment("", std::nullopt);
+    REQUIRE(contains(noname, "Select a title"));
+    REQUIRE_FALSE(contains(noname, "unavailable"));
 
     std::vector<SoftwareVersionCount> vers{{"126.0", 742}, {"125.0", 301}};
     const std::string html = render_inventory_versions_fragment("Chrome", vers);
@@ -171,6 +183,7 @@ struct InvHarness {
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
     std::vector<std::string> audits;          // "action|result"
+    std::vector<std::string> audit_full;      // "action|result|target_type|target_id" (parity check)
 
     InvHarness() {
         auto auth = [](const httplib::Request&, httplib::Response&) {
@@ -232,8 +245,9 @@ struct InvHarness {
             return degrade ? std::nullopt : std::optional<std::int64_t>(7);
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string&, const std::string&, const std::string&) {
+                            const std::string& tt, const std::string& tid, const std::string&) {
             audits.push_back(a + "|" + r);
+            audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             return true;
         };
         routes.register_routes(sink, auth, perm, scoped, catalog, versions, fleet, agent_sw, devices,
@@ -262,6 +276,13 @@ TEST_CASE("route: software fragment renders catalogue + audits", "[inventory][ro
         if (a == "inventory.software.catalog|success")
             audited = true;
     REQUIRE(audited);
+    // Securable + target_id parity with audit-log.md (gov consistency NICE-1): a rename of
+    // the securable or the target shape away from the doc must fail a test.
+    bool target_ok = false;
+    for (const auto& a : h.audit_full)
+        if (a == "inventory.software.catalog|success|Inventory|fleet")
+            target_ok = true;
+    REQUIRE(target_ok);
 }
 
 TEST_CASE("route: software fragment degrade → banner, audited failure", "[inventory][route]") {
@@ -293,13 +314,15 @@ TEST_CASE("route: per-device drill is scope-gated", "[inventory][route]") {
 
 TEST_CASE("route: find results apply the per-row management-group drop filter", "[inventory][route]") {
     InvHarness h;
-    h.fleet_rows = {fleet_row("a1", "Chrome", "1.0"), fleet_row("a2", "Chrome", "2.0")};
-    h.in_scope_agents = {"a1"}; // a2 is out of the operator's scope
+    // Unambiguous IDs (gov F5): a short literal like "a2" risks incidental HTML matches.
+    h.fleet_rows = {fleet_row("agent-alpha", "Chrome", "1.0"),
+                    fleet_row("agent-bravo", "Chrome", "2.0")};
+    h.in_scope_agents = {"agent-alpha"}; // agent-bravo is out of the operator's scope
 
     auto res = h.sink.Get("/fragments/inventory/find/results?name=Chrome");
     REQUIRE(res);
-    REQUIRE(contains(res->body, "a1"));
-    REQUIRE_FALSE(contains(res->body, "a2"));            // dropped, not leaked
+    REQUIRE(contains(res->body, "agent-alpha"));
+    REQUIRE_FALSE(contains(res->body, "agent-bravo"));   // dropped, not leaked
     REQUIRE(contains(res->body, "1 device(s) outside")); // omission surfaced
     bool denied = false, ok = false;
     for (const auto& a : h.audits) {
@@ -315,4 +338,81 @@ TEST_CASE("route: find results empty name short-circuits (no store read)", "[inv
     auto res = h.sink.Get("/fragments/inventory/find/results?name=");
     REQUIRE(res);
     REQUIRE(contains(res->body, "Type an exact software name"));
+    // No data read → no audit row (gov compliance NICE / F4 boundary).
+    REQUIRE(h.audits.empty());
+}
+
+TEST_CASE("route: find results degrade → banner + audited failure", "[inventory][route]") {
+    InvHarness h;
+    h.degrade = true; // fleet_fn_ returns nullopt for a non-empty name
+    auto res = h.sink.Get("/fragments/inventory/find/results?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "unavailable"));
+    bool failed = false;
+    for (const auto& a : h.audits)
+        if (a == "inventory.software.query|failure")
+            failed = true;
+    REQUIRE(failed);
+}
+
+TEST_CASE("route: version drill — deny, success+audit, degrade", "[inventory][route]") {
+    {
+        InvHarness h;
+        h.allow_perm = false;
+        auto res = h.sink.Get("/fragments/inventory/software/versions?name=Chrome");
+        REQUIRE(res);
+        REQUIRE(res->status == 403);
+    }
+    {
+        InvHarness h;
+        auto res = h.sink.Get("/fragments/inventory/software/versions?name=Chrome");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "Installs per version"));
+        bool ok = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.software.versions|success")
+                ok = true;
+        REQUIRE(ok);
+    }
+    {
+        InvHarness h;
+        h.degrade = true;
+        auto res = h.sink.Get("/fragments/inventory/software/versions?name=Chrome");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "unavailable"));
+        bool failed = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.software.versions|failure")
+                failed = true;
+        REQUIRE(failed);
+    }
+}
+
+TEST_CASE("route: devices list — deny vs success (offline-inclusive, list not audited)",
+          "[inventory][route]") {
+    {
+        InvHarness h;
+        h.allow_perm = false;
+        auto res = h.sink.Get("/fragments/inventory/devices");
+        REQUIRE(res);
+        REQUIRE(res->status == 403);
+        REQUIRE_FALSE(contains(res->body, "WIN-1"));
+    }
+    {
+        InvHarness h;
+        auto res = h.sink.Get("/fragments/inventory/devices");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "WIN-1"));
+        // House convention: the list read is gate-only, not audited (parity with
+        // /fragments/devices/list); only the per-device drill audits.
+        REQUIRE(h.audits.empty());
+    }
+}
+
+TEST_CASE("route: find shell gates on Inventory:Read", "[inventory][route]") {
+    InvHarness h;
+    h.allow_perm = false;
+    auto res = h.sink.Get("/fragments/inventory/find");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
 }

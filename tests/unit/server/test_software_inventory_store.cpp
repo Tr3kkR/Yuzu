@@ -811,3 +811,78 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     REQUIRE(other.has_value());
     CHECK(other->empty());
 }
+
+TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][software_inventory]") {
+    // Gov F1: the /inventory dashboard's fleet aggregates (software_catalog /
+    // software_versions) had no store-level coverage — the GROUP BY SQL, the
+    // most-installed ordering, the name filter, and the cap were stubbed at the route.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 3 devices: Google Chrome on all 3 (versions 126 ×2, 125 ×1); 7-Zip on 1.
+    using Rows = std::vector<SoftwareEntry>;
+    REQUIRE(store.apply_installed_software(
+                "cat-a1", "", Rows{{"Google Chrome", "126", "Google", ""}, {"7-Zip", "24", "Igor", ""}},
+                1) == InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "cat-a2", "", Rows{{"Google Chrome", "126", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "cat-a3", "", Rows{{"Google Chrome", "125", "Google", ""}}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    SECTION("catalogue rolls up device_count + version_count, most-installed first") {
+        auto cat = store.software_catalog({});
+        REQUIRE(cat.has_value());
+        REQUIRE_FALSE(cat->empty());
+        CHECK((*cat)[0].name == "Google Chrome"); // 3 devices → sorts first
+        CHECK((*cat)[0].device_count == 3);
+        CHECK((*cat)[0].version_count == 2);
+        bool found_7z = false;
+        for (const auto& r : *cat)
+            if (r.name == "7-Zip") {
+                found_7z = true;
+                CHECK(r.device_count == 1);
+                CHECK(r.version_count == 1);
+            }
+        CHECK(found_7z);
+    }
+    SECTION("name_filter is a case-insensitive substring") {
+        yuzu::server::SoftwareCatalogQuery q;
+        q.name_filter = "chrome";
+        auto cat = store.software_catalog(q);
+        REQUIRE(cat.has_value());
+        REQUIRE(cat->size() == 1);
+        CHECK((*cat)[0].name == "Google Chrome");
+    }
+    SECTION("limit caps the returned rows to the most-installed") {
+        yuzu::server::SoftwareCatalogQuery q;
+        q.limit = 1;
+        auto cat = store.software_catalog(q);
+        REQUIRE(cat.has_value());
+        CHECK(cat->size() == 1);
+        CHECK((*cat)[0].name == "Google Chrome");
+    }
+    SECTION("software_versions = installs per version, most-installed first") {
+        auto v = store.software_versions("Google Chrome", 100);
+        REQUIRE(v.has_value());
+        REQUIRE(v->size() == 2);
+        CHECK((*v)[0].version == "126");
+        CHECK((*v)[0].device_count == 2);
+        CHECK((*v)[1].version == "125");
+        CHECK((*v)[1].device_count == 1);
+    }
+    SECTION("software_versions empty name → empty value (precondition miss, not degrade)") {
+        auto v = store.software_versions("", 100);
+        REQUIRE(v.has_value());
+        CHECK(v->empty());
+    }
+    SECTION("software_versions unknown title → empty value, not degrade") {
+        auto v = store.software_versions("Nonexistent App", 100);
+        REQUIRE(v.has_value());
+        CHECK(v->empty());
+    }
+}

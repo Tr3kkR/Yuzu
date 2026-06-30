@@ -214,6 +214,20 @@ gate.
 - **Inventory** — `query_installed_software` (MCP, `mcp_server.cpp:1377`),
   `GET /api/v1/inventory/software` (`rest_api_v1.cpp:3026+`) — #1713 / #1676 (needs its own UAT to
   settle effective-vs-inert; the born-on-PG `SoftwareInventoryStore` path may differ).
+  - **`/inventory` dashboard FIND** (`InventoryRoutes`, `inventory_routes.cpp` find/results) shares
+    the SAME per-row drop filter + omission audit as the REST/MCP siblings above — it converts the
+    same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
+    present).
+  - **⚠ `SoftwareInventoryStore::software_catalog` / `software_versions`** (the `/inventory`
+    Software-tab fleet aggregates) are a DIFFERENT shape: they are `GROUP BY count(DISTINCT
+    agent_id)` aggregates that **cannot** take a per-row admit-then-filter (a row filter applied
+    after the aggregate is meaningless — the counts already span all groups). They are safe **only**
+    while the `Inventory:Read` gate stays global (a confined operator is denied at the gate). When
+    PR-D below flips Inventory to admit-then-filter, these two methods **MUST** either (a) filter
+    **before** the aggregate (`WHERE agent_id IN (visible_set)` inside the GROUP BY) or (b) stay
+    pinned to a global-only permission — they **MUST NOT** be left on the flipped gate, or they
+    become an INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows
+    only to operators who already hold global read); this ADR entry is.
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)

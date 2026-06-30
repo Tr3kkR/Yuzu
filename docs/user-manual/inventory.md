@@ -180,23 +180,36 @@ same data, with three tabs:
   `Inventory:Read` — they are **not** management-group scoped (the same ADR-0017 caveat
   as the REST/MCP surfaces: confinement is inert under the global gate, so the counts
   span all groups; the UI says so inline). A freshness KPI shows the **stale** count
-  (devices that have not synced within two daily cycles).
+  (devices that have not synced within two daily cycles). **Scale note:** the catalogue
+  is a live `GROUP BY` over the whole installed-software table, bounded by a ~3-second
+  execution budget; on a very large fleet it may exceed that budget and degrade to the
+  "unavailable" banner. That is intended fail-safe behaviour, not a defect — a
+  materialised rollup that removes the ceiling is a tracked follow-on.
 - **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
   status, and last-seen, sourced from the server's persisted endpoint state so a device
   appears here **even when it is offline** (joined to the live registry for the online
-  flag). Click a device for its installed software (an offline device shows its *last
-  daily sync*, clearly labelled). This is gated **per device** on
-  `Inventory:Read` for that device's management group (so an operator only browses
-  devices in their scope) and the access is audited. The richer CI columns (serial,
-  model, CPU, RAM, MAC …) are greyed pending the device-CI sync source (a follow-on).
+  flag). The **list** is gated on the global `Inventory:Read` and filtered to the
+  operator's visible scope by the device provider (it carries no software content, so —
+  like the fleet `/devices` list — the list read itself is not audited). **Clicking a
+  device** loads that device's installed software; that per-device drill is additionally
+  gated by the management-group chokepoint (`Inventory:Read` for the device's group, so
+  an operator only opens a device in their scope) **and is audited**
+  (`inventory.device.software`). An offline device shows its *last daily sync*, clearly
+  labelled. The richer CI columns (serial, model, CPU, RAM, MAC …) are greyed pending
+  the device-CI sync source (a follow-on). A large device list is rendered first-N with
+  the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
   versions. This applies the same per-row management-group drop filter and 1000-row cap
   as the REST endpoint (a short/zero result under a narrow scope is *incomplete*, not
   *absent*; the page flags a truncated page and the count of out-of-scope devices).
 
-**On store degradation** every tab shows an explicit **"unavailable"** banner rather
-than an empty table — an empty table would read as "installed nowhere", the fail-open
-the authoritative-read contract (ADR-0016 §7) forbids.
+**On store degradation** the **Software**, **Find**, and **per-device-software** views —
+the *authoritative* reads — show an explicit **"unavailable"** banner rather than an
+empty table, because an empty table would read as "installed nowhere", the fail-open the
+authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** is sourced from
+the deliberately *fail-soft* endpoint-state store (durability-on-top, not authoritative),
+so during a database incident it may render an empty/short roster rather than a banner;
+its empty-state copy says so and points you to the authoritative Software tab.
 
 The full **device CI inventory** (offline-readable hardware/identity records — a
 ServiceNow-style CI record) is a planned follow-on: it adds a device-CI **daily-sync

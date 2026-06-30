@@ -179,6 +179,12 @@ void normalize(std::vector<SoftwareEntry>& entries) {
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// The catalogue/version aggregates run under a tight per-statement timeout; at fleet
+// scale the timeout trip is the DOMINANT degrade cause, so it carries its own label —
+// otherwise a slow-fleet-normal is indistinguishable from a broken store on the
+// shared yuzu_inventory_read_degrade_total{reason} series (gov sre-1). A genuine
+// (non-timeout) SQL error on the bounded aggregate is rare and still shows in the log.
+constexpr const char* kReasonStatementTimeout = "statement_timeout";
 // Sample the per-site WARN: log a new outage episode's leading edge then every
 // Nth within it. Under a sustained read outage at agentic fan-out (10k queries)
 // an unsampled per-read WARN floods the log; the counter is the authoritative
@@ -203,11 +209,6 @@ struct DegradeLog {
     std::uint64_t occurrence;
 };
 
-// Bump the read-degrade counter (always), advance the sampler, and decide whether
-// this degrade should emit a sampled WARN: the leading edge of a new episode, or
-// every Nth within one. The count/timestamp updates are two independent atomics,
-// so under concurrent degrades at one site a benign duplicate leading-edge WARN
-// is possible — acceptable for a log breadcrumb; the counter stays exact.
 // Parse a Postgres text-format integer cell into int64 (count(*) etc. are text on
 // the wire). Mirrors the count_stale_agents from_chars pattern.
 std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
@@ -218,6 +219,11 @@ std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
     return v;
 }
 
+// Bump the read-degrade counter (always), advance the sampler, and decide whether
+// this degrade should emit a sampled WARN: the leading edge of a new episode, or
+// every Nth within one. The count/timestamp updates are two independent atomics,
+// so under concurrent degrades at one site a benign duplicate leading-edge WARN
+// is possible — acceptable for a log breadcrumb; the counter stays exact.
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              DegradeSampler& s) {
     if (metrics)
@@ -618,7 +624,11 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
     }
     if (!ok || !result) {
         static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+        // The bounded aggregate's dominant degrade cause is the SET LOCAL
+        // statement_timeout trip → label it distinctly (gov sre-1) so a slow-fleet
+        // normal is distinguishable from a broken store on the shared series.
+        if (const auto d = note_read_degrade(metrics_, kReasonStatementTimeout, sampler);
+            d.should_log)
             spdlog::warn("SoftwareInventoryStore: software_catalog degraded — aggregate failed or "
                          "timed out (occurrence {})",
                          d.occurrence);
@@ -629,9 +639,13 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
 
 std::optional<std::vector<SoftwareVersionCount>>
 SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
-    // AUTHORITATIVE read. Title-scoped (uses the name index) → cheap, so a plain bounded
-    // acquire + single statement suffices (no tight aggregate timeout needed). An empty
-    // name is a precondition miss → empty value, not a degrade.
+    // AUTHORITATIVE read. Title-scoped (uses the name index for the equality), but the
+    // GROUP BY version + count(DISTINCT agent_id) heap-fetches version, so for a
+    // ubiquitous title (e.g. a browser on a large fleet) it is a many-row aggregate —
+    // it MUST carry the same tight SET LOCAL statement_timeout as software_catalog
+    // (gov perf-S1). The connection is from the SHARED pool, so an unbounded drill would
+    // degrade EVERY pg store, not just /inventory. An empty name is a precondition miss →
+    // empty value, not a degrade.
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -640,11 +654,46 @@ SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
                          d.occurrence);
         return std::nullopt;
     }
-    std::vector<SoftwareVersionCount> out;
     if (name.empty())
-        return out;
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
+        return std::vector<SoftwareVersionCount>{};
+    int lim = limit > 0 ? limit : 200;
+    if (lim > kCatalogRowCap)
+        lim = kCatalogRowCap;
+    const std::string name_s{name};
+
+    std::optional<std::vector<SoftwareVersionCount>> result;
+    bool entered = false;
+    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        entered = true;
+        pg::PgResult t =
+            pg::exec_params(c, std::string("SET LOCAL statement_timeout = '")
+                                       .append(kCatalogStatementTimeout)
+                                       .append("'")
+                                       .c_str(),
+                            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT version, count(DISTINCT agent_id) AS devices "
+            "FROM software_inventory_store.installed_software "
+            "WHERE name = $1 GROUP BY version ORDER BY devices DESC, version LIMIT $2::bigint",
+            std::vector<std::string>{name_s, std::to_string(lim)});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        std::vector<SoftwareVersionCount> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareVersionCount v;
+            v.version = PQgetvalue(res.get(), i, 0);
+            v.device_count = result_i64(res, i, 1);
+            out.push_back(std::move(v));
+        }
+        result = std::move(out);
+        return true;
+    });
+    if (!entered) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("SoftwareInventoryStore: software_versions degraded — no connection ({}) "
@@ -652,32 +701,16 @@ SoftwareInventoryStore::software_versions(std::string_view name, int limit) {
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    int lim = limit > 0 ? limit : 200;
-    if (lim > kCatalogRowCap)
-        lim = kCatalogRowCap;
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT version, count(DISTINCT agent_id) AS devices "
-        "FROM software_inventory_store.installed_software "
-        "WHERE name = $1 GROUP BY version ORDER BY devices DESC, version LIMIT $2::bigint",
-        std::vector<std::string>{std::string(name), std::to_string(lim)});
-    if (res.status() != PGRES_TUPLES_OK) {
+    if (!ok || !result) {
         static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_versions degraded — query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
+        if (const auto d = note_read_degrade(metrics_, kReasonStatementTimeout, sampler);
+            d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_versions degraded — aggregate failed or "
+                         "timed out (occurrence {})",
+                         d.occurrence);
         return std::nullopt;
     }
-    const int n = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-        SoftwareVersionCount v;
-        v.version = PQgetvalue(res.get(), i, 0);
-        v.device_count = result_i64(res, i, 1);
-        out.push_back(std::move(v));
-    }
-    return out;
+    return result;
 }
 
 void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
