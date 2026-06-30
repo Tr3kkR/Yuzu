@@ -217,6 +217,16 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     h += "<script>window.pfCollapseCfg=function(){var c=document.getElementById('auto-cfg');"
          "if(c)c.classList.add('af-hide');var t=document.querySelector('.af-cfg-hd');"
          "if(t)t.classList.add('af-collapsed');};</script>";
+
+    // ── Stage 3 · VERIFY — before/after app-perf evidence ──
+    // A placeholder that loads the VERIFY config fragment on render. All VERIFY
+    // logic lives in verify_routes/verify_ui; the /auto page only hosts it (one
+    // fragment URL, no code coupling). The lifecycle after ASSESS (pre-flight) and
+    // ACT (deploy): did the upgrade change how the same machines perform?
+    h += "<div class=\"af-cfg-hd\" style=\"margin-top:1.6rem\">"
+         "<span class=\"chev\">&#9660;</span> Verify &mdash; before / after performance</div>";
+    h += "<div id=\"auto-verify\" hx-get=\"/fragments/auto/verify\" hx-trigger=\"load\" "
+         "hx-swap=\"innerHTML\"><div class=\"gp-placeholder\">Loading verify&hellip;</div></div>";
     return h;
 }
 

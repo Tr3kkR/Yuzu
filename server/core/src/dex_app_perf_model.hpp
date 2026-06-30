@@ -23,6 +23,7 @@
 ///     carried alongside the bucket-resolution percentiles for callers that need
 ///     a precise number.
 
+#include "app_perf_compare.hpp"     // AppPerfCohortRow (the VERIFY compare input shape)
 #include "app_perf_daily_store.hpp" // AppPerfDailyRow (per-device drill)
 #include "app_perf_fleet_store.hpp" // AppPerfFleetRow, AppPerfAppSummary
 #include "app_perf_hist.hpp"        // bucket scheme + kAppPerfHistVersion
@@ -244,11 +245,34 @@ using AppPerfDeviceFn =
 using AppPerfGroupFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
     std::string_view group_id, std::string_view app_name, std::string_view version)>;
 
+/// What the `/auto` VERIFY cohort provider returns: the group's resolved member
+/// count (so the surface reports cohort_size vs paired vs no-data) PLUS the raw B1
+/// rows (`agent_id` preserved) for those members × app × the two compared
+/// versions — the input the pure `build_comparison` engine pairs. A non-empty
+/// `member_count` with empty `rows` = the cohort has members but no app-perf data
+/// for those versions (→ the compare reads "insufficient", not a degrade).
+struct CohortRead {
+    std::int64_t member_count{0};
+    std::vector<AppPerfCohortRow> rows;
+};
+
+/// VERIFY: resolve `group_id`'s members, then read their raw B1 rows for
+/// `app_name` restricted to the two versions. Composes `ManagementGroupStore::
+/// get_members` and `AppPerfCohortReader` as two bounded single-store leases,
+/// never one held across the other (ADR-0012 §1). The provider canonicalizes the
+/// versions (so the SQL filter and the engine pairing share one key). nullopt =
+/// degrade (member resolution OR the row read failed); empty member list →
+/// member_count 0 + empty rows (a precondition value, not a degrade).
+using AppPerfCohortFn = std::function<std::optional<CohortRead>(
+    std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
+    std::string_view candidate_version)>;
+
 struct AppPerfProviders {
     AppPerfFleetFn fleet;
     AppPerfAppListFn apps;
     AppPerfDeviceFn device;
     AppPerfGroupFn group;
+    AppPerfCohortFn cohort; ///< VERIFY before/after compare (cohort-paired)
 };
 
 } // namespace yuzu::server

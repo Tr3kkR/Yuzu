@@ -26,6 +26,7 @@
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
@@ -127,6 +128,12 @@ struct RestGsHarness {
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
+
+    // What the wired VERIFY cohort provider returns (default = present-but-empty
+    // CohortRead → the compare reads "insufficient"). A test sets member_count +
+    // rows to drive the paired-compare path, or sets it to nullopt to prove the
+    // AUTHORITATIVE degrade → 503 branch.
+    std::optional<yuzu::server::CohortRead> cohort_read_{yuzu::server::CohortRead{}};
 
     // live_deps=false leaves the live substrate (response_store + command_dispatch_fn)
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
@@ -244,6 +251,9 @@ struct RestGsHarness {
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
             };
+            app_perf_providers_.cohort =
+                [this](std::string_view, std::string_view, std::string_view, std::string_view)
+                -> std::optional<yuzu::server::CohortRead> { return cohort_read_; };
         }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -1337,6 +1347,64 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+    }
+}
+
+TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
+          "[rest][dex][app_perf][verify][route]") {
+    SECTION("missing baseline/candidate → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("baseline == candidate → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.2.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, /*wire_app_perf=*/false);
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("AUTHORITATIVE degrade (cohort read nullopt) → 503") {
+        RestGsHarness h;
+        h.cohort_read_ = std::nullopt;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("paired cohort → 200 with the measured shift (no verdict field)") {
+        RestGsHarness h;
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        // Two machines, each ran both versions; both heavier on the candidate.
+        cr.rows = {
+            {"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500},
+            {"m2", "4.2.0.0", 10, 100, 3.0, 1000}, {"m2", "4.3.0.0", 11, 100, 4.0, 1100},
+        };
+        h.cohort_read_ = cr;
+        auto res = h.sink.Get(
+            "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["paired"].get<int64_t>() == 2);
+        CHECK(j["data"]["cohort_size"].get<int64_t>() == 2);
+        CHECK(j["data"]["small_cohort"].get<bool>() == true); // 2 < kDexCohortFloor
+        CHECK(j["data"]["insufficient"].get<bool>() == false);
+        CHECK(j["data"]["cpu"]["before_mean"].get<double>() == Catch::Approx(2.5));
+        CHECK(j["data"]["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
+        CHECK(j["data"]["distribution"]["up"].get<int64_t>() == 2);
+        // EVIDENTIAL — there must be NO verdict/pass/fail field.
+        CHECK_FALSE(j["data"].contains("verdict"));
+        CHECK_FALSE(j["data"].contains("pass"));
     }
 }
 
