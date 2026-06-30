@@ -9,6 +9,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
@@ -77,6 +78,20 @@ std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// Coarse cross-thread rate-limit for the persist-failure warn. persist_grid is now
+// called per result-poll (the route) as well as per runner tick, so a Postgres
+// outage would otherwise flood the log at poll frequency × open pages (#governance
+// sre MEDIUM). Allow at most ~1 warn / 5s across all callers; the CAS makes exactly
+// one thread log per window.
+bool persist_warn_allowed() {
+    static std::atomic<std::int64_t> last{0};
+    const std::int64_t nw = now_ms();
+    std::int64_t prev = last.load(std::memory_order_relaxed);
+    if (nw - prev < 5000)
+        return false;
+    return last.compare_exchange_strong(prev, nw, std::memory_order_relaxed);
 }
 
 PreflightRunRow read_run(PGresult* res, int i) {
@@ -350,20 +365,25 @@ bool PreflightRunStore::persist_grid(const std::string& run_id,
                                          pg::to_text_array(oses), pg::to_text_array(buckets),
                                          pg::to_text_array(jsons), ts_s});
             if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
-                spdlog::warn("PreflightRunStore: grid upsert failed (run={}): {}", run_id,
-                             PQerrorMessage(conn));
+                if (persist_warn_allowed())
+                    spdlog::warn("PreflightRunStore: grid upsert failed (run={}): {} "
+                                 "(rate-limited)",
+                                 run_id, PQerrorMessage(conn));
                 return false;
             }
         }
         pg::PgResult rs = pg::exec_params(
             conn,
             "UPDATE preflight_run_store.runs SET total=$2::int, go=$3::int, warn=$4::int, "
-            "nogo=$5::int, incomplete=$6::int WHERE run_id=$1 RETURNING run_id",
+            "nogo=$5::int, incomplete=$6::int WHERE run_id=$1 AND status='running' RETURNING run_id",
             std::vector<std::string>{run_id, std::to_string(total), std::to_string(go),
                                      std::to_string(warn), std::to_string(nogo),
                                      std::to_string(inc)});
-        // RETURNING 0 rows ⇒ the run was deleted mid-tick (UP-14): roll back, the
-        // runner won't complete it.
+        // RETURNING 0 rows ⇒ the run was deleted OR already completed mid-tick: roll
+        // back (the whole txn, incl. the device upsert above). The status guard makes
+        // a COMPLETE run's grid IMMUTABLE — a slow route-persist (now a second writer
+        // alongside the runner) can't land after completion and overwrite the final
+        // grid with a stale snapshot (#governance architect/consistency MEDIUM).
         return rs.status() == PGRES_TUPLES_OK && PQntuples(rs.get()) > 0;
     });
 }
