@@ -2050,9 +2050,26 @@ jobs:
           OWNER="${{ github.repository_owner }}"
           TAG="${GITHUB_REF_NAME}"
 
-          # Start with changelog content if available
+          # Start with changelog content if available. GitHub caps release
+          # bodies at 125000 characters; a release that aggregates a large dev
+          # line (v0.13.0's [0.13.0] section is ~217 KB / 2800+ lines) blows
+          # past that and `gh release create` returns
+          # "HTTP 422: body is too long (maximum is 125000 characters)".
+          # Cap the embedded changelog (cut at a line boundary) and link to the
+          # full CHANGELOG.md when truncated; the static footer below is small,
+          # so 100000 leaves ample headroom under the 125000 limit.
+          CHANGELOG_LIMIT=100000
           if [ "$HAS_CHANGELOG" = "true" ]; then
-            cat changelog_section.md > release-notes.md
+            if [ "$(wc -c < changelog_section.md)" -gt "$CHANGELOG_LIMIT" ]; then
+              head -c "$CHANGELOG_LIMIT" changelog_section.md | sed '$d' > release-notes.md
+              {
+                echo ""
+                echo "_… changelog truncated — this release's changelog exceeds GitHub's 125,000-character release body limit._"
+                echo "_See [CHANGELOG.md](https://github.com/${OWNER}/Yuzu/blob/${TAG}/CHANGELOG.md) for the full list of changes._"
+              } >> release-notes.md
+            else
+              cat changelog_section.md > release-notes.md
+            fi
             echo "" >> release-notes.md
           else
             echo "_See commit history for changes in this release._" > release-notes.md
