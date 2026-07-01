@@ -1151,6 +1151,109 @@ void RestApiV1::register_routes(
                                   "application/json");
               });
 
+    // POST /api/v1/tar/retention-paused/purge — A1 structured surface for the
+    // DESTRUCTIVE TAR source purge (dashboard parity with the HTML fragment
+    // /fragments/tar/retention-paused/purge). Per-device gated on
+    // Infrastructure:Delete + management-group scope via scoped_perm_fn (fail-closed),
+    // audited fail-closed (no dispatch without durable evidence), async: returns the
+    // command_id. rows_deleted and the agent-side source_not_paused refusal live in
+    // the command's response record (the dispatch is fire-and-forget). Governance
+    // HIGH #3/#4.
+    sink.Post(
+        "/api/v1/tar/retention-paused/purge",
+        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry](
+            const httplib::Request& req, httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            auto bump = [&](const char* result) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_tar_source_purge_total", {{"result", result}})
+                        .increment();
+            };
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(400, "body must be a JSON object", cid),
+                                "application/json");
+                return;
+            }
+            const std::string device_id = body.value("device_id", "");
+            const std::string source = body.value("source", "");
+            if (device_id.empty() || source.empty()) {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(400, "device_id and source are required", cid),
+                                "application/json");
+                return;
+            }
+            if (source != "process" && source != "tcp" && source != "service" && source != "user") {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(
+                                    400, "unknown source — must be one of process, tcp, service, user",
+                                    cid),
+                                "application/json");
+                return;
+            }
+            // Per-device scope gate: Infrastructure:Delete + management-group scope,
+            // fail-closed if unwired (never widen to a global gate). Emits its own
+            // 403/404 + A4 envelope on denial; we only tally the metric.
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                bump("denied");
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
+                bump("denied");
+                return;
+            }
+            if (!command_dispatch_fn) {
+                res.status = 503;
+                bump("denied");
+                res.set_content(
+                    detail::error_json_a4(503, "command dispatch unavailable", cid, 5000, ""),
+                    "application/json");
+                return;
+            }
+            // Audit BEFORE the side-effect, fail-closed (parity with /live): a
+            // destructive dispatch must not proceed if the evidence row is known lost.
+            if (audit_fn && !audit_fn(req, "tar.source.purge", "requested", "command", device_id,
+                                      "REST purge source=" + source + " cid=" + cid)) {
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                bump("denied");
+                res.set_content(
+                    detail::error_json_a4(503,
+                                          "audit subsystem unavailable; refusing to dispatch "
+                                          "without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                return;
+            }
+            const auto [command_id, sent] = command_dispatch_fn(
+                "tar", "purge_source", {device_id}, "", {{"source", source}}, /*execution_id=*/"");
+            if (sent == 0) {
+                res.status = 404;
+                bump("agent_not_connected");
+                res.set_content(
+                    detail::error_json_a4(404, "device offline or not reachable", cid, 5000, ""),
+                    "application/json");
+                return;
+            }
+            bump("success");
+            res.status = 202; // accepted — poll the command response for rows_deleted
+            res.set_content(ok_json(JObj()
+                                        .add("command_id", command_id)
+                                        .add("device_id", device_id)
+                                        .add("source", source)
+                                        .add("agents_reached", static_cast<int64_t>(sent))
+                                        .str()),
+                            "application/json");
+        });
+
     // GET /api/v1/bundles/{id} — collate (poll). Server-grouped result.
     sink.Get(R"(/api/v1/bundles/(bundle-[a-f0-9]+))",
              [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
