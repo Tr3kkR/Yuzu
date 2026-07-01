@@ -1834,6 +1834,20 @@ private:
             ctx.write_output(std::format("error|unknown source: {}", source));
             return 1;
         }
+        // Hold the collect-side lock(s) across BOTH the enabled-check AND the purge
+        // so the guard is atomic w.r.t. do_configure's enable transition (which also
+        // holds collect_mu_ [+software_collect_mu_] around apply_source_enabled_
+        // transition). Without this the check and the delete are two separate mu_
+        // critical sections and a concurrent `<src>_enabled=true` could commit
+        // between them — purging an actively-collecting source (the scan→purge TOCTOU
+        // the guard exists to close). Lock order matches do_configure exactly
+        // (collect_mu_ ≺ software_collect_mu_ ≺ TarDatabase::mu_); source_enabled and
+        // purge_source take only mu_, which is not held here, so no deadlock/recursion.
+        std::lock_guard collect_lock(collect_mu_);
+        std::unique_lock<std::mutex> sw_lock;
+        if (source == "software")
+            sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
+
         if (source_enabled(*db_, source)) {
             ctx.write_output(std::format(
                 "error|source_not_paused: {} is enabled; disable it before purging", source));

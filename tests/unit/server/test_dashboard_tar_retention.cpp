@@ -49,8 +49,9 @@ struct DashboardTarRetentionTestAccess {
     void set_scan(const std::string& user, const std::string& cmd_id, int count, int64_t at) {
         routes.tar_scans_by_user_[user] = DashboardRoutes::TarScanState{cmd_id, count, at};
     }
-    std::string render(const std::string& user) const {
-        return routes.render_tar_retention_paused(user);
+    std::string render(const std::string& user, bool can_execute = true,
+                       bool can_delete = true) const {
+        return routes.render_tar_retention_paused(user, can_execute, can_delete);
     }
 };
 
@@ -295,6 +296,41 @@ TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (
     CHECK(contains(html, "data-host=\"agent-A\""));    // typed-confirm target (hostname)
     // Re-enable stays alongside it.
     CHECK(contains(html, "Re-enable"));
+}
+
+TEST_CASE("render_tar_retention_paused: row actions gate on effective permission (15.A LOW)",
+          "[server][tar][retention-render]") {
+    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-perm-rs-"}};
+    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-perm-mg-"}};
+    ResponseStore rs{rs_db.path};
+    ManagementGroupStore mg{mg_db.path};
+    grant_visibility(mg, {"agent-A"});
+    rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 1, 1);
+
+    // Execute but NOT Delete: Re-enable renders, Purge is withheld (the POST route
+    // stays authoritative; this only removes a button the operator can't use).
+    {
+        const std::string html = acc.render(kUser, /*can_execute=*/true, /*can_delete=*/false);
+        CHECK(contains(html, "Re-enable"));
+        CHECK_FALSE(contains(html, "Purge data"));
+        CHECK_FALSE(contains(html, "btn-danger"));
+    }
+    // Delete but not Execute: Purge renders, Re-enable withheld.
+    {
+        const std::string html = acc.render(kUser, /*can_execute=*/false, /*can_delete=*/true);
+        CHECK(contains(html, "Purge data"));
+        CHECK_FALSE(contains(html, "Re-enable"));
+    }
+    // Neither: no destructive controls at all.
+    {
+        const std::string html = acc.render(kUser, /*can_execute=*/false, /*can_delete=*/false);
+        CHECK_FALSE(contains(html, "Purge data"));
+        CHECK_FALSE(contains(html, "Re-enable"));
+    }
 }
 
 TEST_CASE("render_tar_retention_paused: no scan yet renders the placeholder",

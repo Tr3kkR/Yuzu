@@ -5728,6 +5728,64 @@ private:
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
 
+            // Per-action securable elevation + scope confinement for DESTRUCTIVE
+            // generic-dispatch actions (governance HIGH #2). /api/command otherwise
+            // base-gates only Execution:Execute and applies NO per-device visibility to
+            // explicit agent_ids — a systemic property of this escape hatch tracked
+            // separately (Tr3kkR/Yuzu#1788). An irreversible action (e.g.
+            // tar.purge_source) must NOT inherit that: require its real securable AND
+            // confine the targets to the operator's visible agents, refusing untargeted
+            // broadcast/scope fan-out. The dedicated POST /api/v1/tar/retention-paused/
+            // purge is the first-class structured surface; this keeps the generic path
+            // from being a weaker one on AUTHZ. (Observability is still weaker here: a
+            // purge via /api/command audits under the generic `command.dispatch` verb +
+            // yuzu_commands_dispatched_total, not tar.source.purge / the domain metric —
+            // domain-verb emission on this path is tracked in Tr3kkR/Yuzu#1787.)
+            {
+                static const std::unordered_map<std::string,
+                                                std::pair<std::string, std::string>>
+                    kDestructiveActionSecurable = {
+                        {"tar.purge_source", {"Infrastructure", "Delete"}},
+                    };
+                std::string dkey = plugin + "." + action;
+                std::transform(dkey.begin(), dkey.end(), dkey.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (auto it = kDestructiveActionSecurable.find(dkey);
+                    it != kDestructiveActionSecurable.end()) {
+                    if (!require_permission(req, res, it->second.first, it->second.second))
+                        return;
+                    // Destructive dispatch must be explicitly targeted + in scope.
+                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                        res.status = 400;
+                        res.set_content(
+                            R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    // Confine to the operator's visible agents (fail-closed: an absent
+                    // mgmt-group store filters to empty → 404, same posture as the
+                    // dashboard fragment). Out-of-scope ids are silently dropped.
+                    std::vector<std::string> filtered;
+                    if (mgmt_group_store_) {
+                        auto s = require_auth(req, res);
+                        if (!s) return;
+                        auto vis = mgmt_group_store_->get_visible_agents(s->username);
+                        std::unordered_set<std::string> visible(vis.begin(), vis.end());
+                        for (const auto& aid : agent_ids)
+                            if (visible.count(aid))
+                                filtered.push_back(aid);
+                    }
+                    agent_ids = std::move(filtered);
+                    if (agent_ids.empty()) {
+                        res.status = 404;
+                        res.set_content(
+                            R"({"error":{"code":404,"message":"no reachable in-scope agent"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                }
+            }
+
             if (!registry_.has_any()) {
                 res.status = 503;
                 res.set_content(

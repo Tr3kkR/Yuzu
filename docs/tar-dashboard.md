@@ -1,6 +1,6 @@
 # TAR Dashboard — Operator Page Design
 
-**Status:** Design + partial ship (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; purge action and persistence deferred. **PR-H shipped 2026-06-18: process tree viewer, as-built §5 — local-TAR-data-only.** See `docs/roadmap.md` Phase 15.)
+**Status:** Design + partial ship (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; **typed-confirmation Purge shipped 2026-07-01** — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`, §3.4; persistence still deferred. **PR-H shipped 2026-06-18: process tree viewer, as-built §5 — local-TAR-data-only.** See `docs/roadmap.md` Phase 15.)
 **Audience:** Server engineers, dashboard UI engineers, TAR plugin maintainers
 **Owners:** `architect` (page architecture), `plugin-developer` (TAR action surface), `security-guardian` (SQL execution surface), `docs-writer` (DSL + REST docs)
 **Related:** `docs/scope-walking-design.md` (the cross-cutting result-set primitive this page consumes), `docs/yuzu-guardian-design-v1.1.md` (the agent tamper-resistance pillar that the process tree viewer's data quality depends on), `agents/plugins/tar/` (the data plane).
@@ -130,6 +130,8 @@ The "Purge data" button on a row is more dangerous than re-enable — it tells t
 Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: tar.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
 
 > **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/tar/retention-paused/purge`; audit verb `tar.source.purge` (matching the `tar.source.reenable` sibling); metric `yuzu_tar_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `tar.purge_source` refuses (`source_not_paused`) if the source is currently enabled, which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
+>
+> **A1 REST parity + generic-dispatch hardening (2026-07-01).** Automation/MCP callers use the structured `POST /api/v1/tar/retention-paused/purge` (JSON body `{device_id, source}`, `Infrastructure:Delete` per-device-scoped, A4 error envelope, `202` + `command_id`; audited fail-closed — no dispatch without a durable audit row). Both the fragment and the REST route confirm the guard is agent-side authoritative. The generic `POST /api/command` escape hatch now also elevates destructive actions: `tar.purge_source` there additionally requires `Infrastructure:Delete` and is confined to the caller's visible agents with untargeted broadcast/scope fan-out refused, so it can't be a weaker path than the dedicated route. The atomic agent-side guard (check + delete under one lock) closes the agent-local check→delete race in addition to the scan→purge TOCTOU.
 
 ### 3.5 Permissions and safety
 
@@ -319,12 +321,12 @@ Per `docs/observability-conventions.md`:
 |---|---|---|---|
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
 | `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
-| `yuzu_tar_purge_total` | counter | `source`, `result` | planned (purge deferred) |
+| `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
 | `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` | **planned — not yet emitted** (SRE follow-up) |
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 
-Audit actions: `tar.status.scan` (Scan fleet — PR-A.A), `tar.source.reenable` (Re-enable a row — PR-A.A), `tar.source.purge` (purge — Phase 15.A.next, deferred), `tar.process_tree.read` (PR-H — emitted at dispatch **and** on a successful reconstruction; the device is `target_id`, never in `detail`; see `docs/user-manual/audit-log.md`). The seed-based `tar.process_tree.reseed` verb is removed (no seed).
+Audit actions: `tar.status.scan` (Scan fleet — PR-A.A), `tar.source.reenable` (Re-enable a row — PR-A.A), `tar.source.purge` (purge — **shipped** Phase 15.A; also `csrf.denied`-style cross-origin refusals are audited under `tar.source.purge`/`reenable` with `detail=csrf_cross_origin`), `tar.process_tree.read` (PR-H — emitted at dispatch **and** on a successful reconstruction; the device is `target_id`, never in `detail`; see `docs/user-manual/audit-log.md`). The seed-based `tar.process_tree.reseed` verb is removed (no seed).
 
 ## 8. Cross-references
 

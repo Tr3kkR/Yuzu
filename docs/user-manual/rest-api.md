@@ -4981,6 +4981,28 @@ Dispatch a single-device `tar.purge_source` that **permanently drops every wareh
 
 **Agent version:** requires an agent that implements the `tar.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
 
+#### `POST /api/v1/tar/retention-paused/purge`
+
+The **agentic-first (A1) structured surface** for the same destructive purge — for automation / MCP workers / scripted callers that need a JSON contract and a `command_id` rather than the HTML fragment above. Same effect: permanently drop a paused source's warehouse rows on one device, leaving the collector paused. **Irreversible.**
+
+**Permission:** `Infrastructure:Delete`, enforced **per-device and management-group-scoped** (the scoped gate; an out-of-scope or unauthorized device is refused, not enumerated). Fail-closed if the scope gate is unwired.
+
+**Request body (JSON):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The target agent. Must be within the caller's management scope. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
+
+**Responses:**
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
+- **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
+- **404** — dispatch reached zero agents (device offline).
+- **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
+
+**Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+
 #### `GET /fragments/tar/capture-sources`
 
 Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
