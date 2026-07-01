@@ -27,6 +27,11 @@ namespace yuzu::server {
 
 namespace {
 
+// Max stored length of a JIT-elevation justification (anti audit-row bloat). The
+// operator-supplied reason is sanitised (control bytes → space) and truncated to
+// this before it reaches the audit detail.
+constexpr std::size_t kMaxJustificationLength = 1024;
+
 // A4 denial envelope for the scoped-permission gate (#1549 review MEDIUM). The
 // shared require_scoped_permission gate is the denial chokepoint for the agentic
 // per-device routes, so its 401/403 bodies must carry the A4 fields — a
@@ -205,7 +210,12 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         return false;
     }
 
-    if (session->role != auth::Role::admin) {
+    // effective_role(), not the raw role, so an active JIT admin elevation
+    // (POST /api/v1/elevate) is treated as admin for its window and auto-reverts.
+    // Only interactive cookie sessions can be elevated — the MCP/service-token
+    // guards above already rejected those credentials, and elevate_session never
+    // runs for them.
+    if (auth::effective_role(*session) != auth::Role::admin) {
         // SOC 2 CC7.2: every privileged-endpoint denial must surface in
         // the audit chain, not just the request log. Emitting here closes
         // the gap for every caller in one place rather than threading an
@@ -226,6 +236,16 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     auto session = require_auth(req, res);
     if (!session)
         return false;
+
+    // JIT admin elevation: an active elevation grants full admin for its window,
+    // so it satisfies any securable:operation (mirrors require_admin gating on
+    // effective_role). Only interactive cookie sessions can be elevated —
+    // elevate_session never runs for MCP/service-scoped tokens (which are
+    // synthesized per-request and carry no elevated_until), so this short-circuit
+    // cannot be reached by them. Auditing is on the elevation lifecycle
+    // (role.elevation.granted/expired), not per privileged action.
+    if (auth::is_elevated(*session))
+        return true;
 
     // MCP-tier tokens: enforce the tier policy (readonly/operator/supervised) then
     // fall through to the standard RBAC/role check using the creator's actual role.
@@ -315,8 +335,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         return true;
     }
 
-    // Legacy fallback: write/delete/execute/approve require admin
-    if (operation != "Read" && session->role != auth::Role::admin) {
+    // Legacy fallback: write/delete/execute/approve require admin (effective_role
+    // so an elevation still satisfies it as defense-in-depth, though the
+    // is_elevated short-circuit above already returned for elevated sessions).
+    if (operation != "Read" && auth::effective_role(*session) != auth::Role::admin) {
         audit_log(req, "auth.permission_required", "denied", "", "",
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
@@ -336,6 +358,11 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     auto session = require_auth(req, res);
     if (!session)
         return false;
+
+    // JIT admin elevation grants full admin (across all management groups) for
+    // its window — cookie-session-only, so unreachable by MCP/service tokens.
+    if (auth::is_elevated(*session))
+        return true;
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
     // RBAC/role check using the creator's actual role. Approval-gated operations
@@ -436,8 +463,10 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         return true;
     }
 
-    // Legacy fallback: write/delete/execute/approve require admin
-    if (operation != "Read" && session->role != auth::Role::admin) {
+    // Legacy fallback: write/delete/execute/approve require admin (effective_role
+    // — defense-in-depth; the is_elevated short-circuit above already returned for
+    // elevated sessions).
+    if (operation != "Read" && auth::effective_role(*session) != auth::Role::admin) {
         audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
@@ -470,7 +499,10 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     // and every MCP tool call) would have an empty `principal`, breaking the audit trail.
     if (auto session = resolve_session(req)) {
         event.principal = session->username;
-        event.principal_role = auth::role_to_string(session->role);
+        // effective_role so an action taken under an active JIT elevation is
+        // audited as `admin` (the role it was AUTHORIZED as), not the base role —
+        // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
+        event.principal_role = auth::role_to_string(auth::effective_role(*session));
         event.session_id = extract_session_cookie(req);
     }
     return event;
@@ -544,7 +576,9 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 
     if (auto session = resolve_session(req)) {
         ae.principal = session->username;
-        ae.principal_role = auth::role_to_string(session->role);
+        // effective_role: an elevated session's analytics row reflects admin too
+        // (#1748 H1/L4). No-op when not elevated.
+        ae.principal_role = auth::role_to_string(auth::effective_role(*session));
         ae.session_id = extract_session_cookie(req);
     }
     analytics_store_->emit(std::move(ae));
@@ -1787,6 +1821,352 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         res.set_redirect("/");
     });
+
+    // ── JIT admin elevation (SOC 2 CC6.3/CC6.6) — /auth-and-authz P1 #9 ───────
+    // A pre-authorized (users.elevation_eligible) operator activates a
+    // time-boxed, justified, MFA-gated admin elevation on their COOKIE session;
+    // effective_role() then treats the session as admin for the window and it
+    // auto-reverts. See docs/auth-architecture.md "JIT admin elevation".
+
+    // Shared step-up gate: elevating to admin and granting eligibility are both
+    // high-risk and require a fresh MFA proof (reuses require_mfa_step_up).
+    // window_secs lets the elevation path force a positive step-up window even
+    // when the operator has globally disabled step-up (--mfa-step-up-window-secs
+    // <= 0): elevation is the privilege boundary, so it ALWAYS requires a fresh
+    // proof, never honouring that escape hatch (Hermes pass-1 #3).
+    auto elevation_step_up = [this](const httplib::Request& req, httplib::Response& res,
+                                    const auth::Session& session, const std::string& label,
+                                    int window_secs) -> bool {
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db)
+            return true; // legacy config-file-only: step-up needs auth.db (fail-open, as elsewhere)
+        return require_mfa_step_up(
+            req, res, session, *db, window_secs,
+            [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                   const std::string& tt, const std::string& ti, const std::string& d) {
+                return audit_log(r, a, rs, tt, ti, d);
+            },
+            label, cfg_.mfa_enforcement);
+    };
+    // Default step-up window for the elevation surfaces; floored to 300 s when the
+    // global gate is disabled so the privilege boundary keeps a fresh-proof check.
+    const int kElevationStepUpWindow =
+        cfg_.mfa_step_up_window_secs > 0 ? cfg_.mfa_step_up_window_secs : 300;
+
+    // POST /api/v1/users/<name>/elevation-eligibility — admin grants/revokes who
+    // may elevate. Body: {"eligible": <bool>}. Admin + step-up gated.
+    sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)",
+              [this, elevation_step_up, kElevationStepUpWindow](const httplib::Request& req,
+                                                                httplib::Response& res) {
+                  const auto cid = detail::make_correlation_id();
+                  res.set_header("X-Correlation-Id", cid);
+                  // Inline A4 admin gate (#1748 H3): a new REST route must carry the
+                  // A4 envelope on its denial path, not require_admin's legacy
+                  // {"error":{code,message}} body. Replicates require_admin's
+                  // token-type guards + role check, but gates on effective_role
+                  // (so an active elevation passes) and audits `auth.admin_required`.
+                  auto session = resolve_session(req);
+                  if (!session) {
+                      res.status = 401;
+                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      return;
+                  }
+                  if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
+                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
+                                "non-interactive token blocked from admin route");
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
+                                                                 "perform admin operations",
+                                                            cid),
+                                      "application/json");
+                      return;
+                  }
+                  if (auth::effective_role(*session) != auth::Role::admin) {
+                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "admin role required", cid,
+                                                            "elevate via POST /api/v1/elevate, or use "
+                                                            "an admin account"),
+                                      "application/json");
+                      return;
+                  }
+                  if (!elevation_step_up(req, res, *session,
+                                         "POST /api/v1/users/{name}/elevation-eligibility",
+                                         kElevationStepUpWindow))
+                      return;
+                  auto* db = auth_mgr_.auth_db_ptr();
+                  if (!db) {
+                      res.status = 503;
+                      res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
+                                                                 "persistent auth store",
+                                                            cid, "start the server with --data-dir"),
+                                      "application/json");
+                      return;
+                  }
+                  const auto target = req.matches[1].str();
+                  if (target.empty() || !is_valid_username(target)) {
+                      res.status = 400;
+                      res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                            "username must match the allowed format"),
+                                      "application/json");
+                      return;
+                  }
+                  // Block self-grant (review UP-6 / security-LOW): an operator —
+                  // including one acting under an active elevation — must not set
+                  // their OWN eligibility, which would let a temporary admin
+                  // window manufacture a durable self-elevation right. Eligibility
+                  // is always granted by another admin.
+                  if (target == session->username) {
+                      audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                                "self_grant_blocked");
+                      res.status = 403;
+                      res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
+                                                                 "eligibility",
+                                                            cid, "another administrator must set it"),
+                                      "application/json");
+                      return;
+                  }
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (!body.is_object() || !body.contains("eligible") ||
+                      !body["eligible"].is_boolean()) {
+                      res.status = 400;
+                      res.set_content(detail::error_json_a4(400, "body must be {\"eligible\": bool}",
+                                                            cid),
+                                      "application/json");
+                      return;
+                  }
+                  const bool eligible = body["eligible"].get<bool>();
+                  if (auto r = db->set_elevation_eligible(target, eligible); !r) {
+                      const auto err = r.error();
+                      const int code = err == AuthDBError::UserNotFound ? 404 : 500;
+                      audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
+                                "store error");
+                      res.status = code;
+                      res.set_content(detail::error_json_a4(code,
+                                                            code == 404 ? "user not found"
+                                                                        : "failed to update",
+                                                            cid),
+                                      "application/json");
+                      return;
+                  }
+                  // Revoking eligibility must terminate any in-flight elevation
+                  // immediately (governance UP-1) — symmetric with the session
+                  // wipe on demote/delete, so an incident-response "revoke now"
+                  // actually drops the operator's admin access rather than
+                  // leaving it standing for up to the window.
+                  int cleared = 0;
+                  if (!eligible)
+                      cleared = auth_mgr_.revoke_user_elevations(target);
+                  audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
+                            std::string(eligible ? "eligible=true" : "eligible=false") +
+                                (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
+                  res.set_content(R"({"status":"ok"})", "application/json");
+              });
+
+    // POST /api/v1/elevate — activate a time-boxed admin elevation on THIS cookie
+    // session. Body: {"justification": <str, required>, "duration_secs": <int>}.
+    sink.Post("/api/v1/elevate", [this, elevation_step_up,
+                                   kElevationStepUpWindow](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        // Elevation is COOKIE-session only — an API/MCP token cannot elevate
+        // (it carries no cookie, and elevate_session keys on the cookie token).
+        auto token = extract_session_cookie(req);
+        if (token.empty()) {
+            res.status = 401;
+            res.set_content(detail::error_json_a4(401, "elevation requires an interactive session",
+                                                  cid, "sign in to the dashboard, then elevate"),
+                            "application/json");
+            return;
+        }
+        auto session = auth_mgr_.validate_session(token);
+        if (!session) {
+            res.status = 401;
+            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            return;
+        }
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent auth "
+                                                       "store",
+                                                  cid, "start the server with --data-dir"),
+                            "application/json");
+            return;
+        }
+        // Eligibility (fail-closed): a store read error denies.
+        auto elig = db->is_elevation_eligible(session->username);
+        if (!elig || !*elig) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    elig ? "not eligible" : "eligibility read failed");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid,
+                                                  "ask an administrator to grant you elevation "
+                                                  "eligibility"),
+                            "application/json");
+            return;
+        }
+        // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the
+        // privilege-crossing boundary (non-admin → full admin), so — UNLIKE the
+        // other step-up sites where the actor is already admin — a second factor
+        // is required unconditionally, NOT gated on --mfa-enforcement. An eligible
+        // operator with no TOTP enrolled is refused here (require_mfa_step_up
+        // would otherwise pass them through under the default optional mode).
+        if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "no MFA enrolled (a second factor is required to elevate)");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
+                                                  cid, "enroll MFA (Settings -> Multi-Factor "
+                                                       "Authentication) before you can elevate"),
+                            "application/json");
+            return;
+        }
+        // High-risk: require a fresh MFA proof (step-up) before granting admin.
+        // window floored to kElevationStepUpWindow so a globally-disabled gate
+        // can't skip the proof for the privilege boundary.
+        if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate",
+                               kElevationStepUpWindow)) {
+            // The shared gate set the 401 challenge + audited mfa.step_up; add the
+            // elevation-specific denial so the role.elevation.* trail is complete
+            // (Hermes pass-1 #4).
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "mfa_step_up_refused");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        // Type-guard the fields: a present-but-wrong-type value would otherwise
+        // throw nlohmann type_error.302 → httplib 500 (review UP-2/cpp-safety).
+        if (body.is_object() &&
+            ((body.contains("justification") && !body["justification"].is_string()) ||
+             (body.contains("duration_secs") && !body["duration_secs"].is_number_integer()))) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "justification must be a string and "
+                                                       "duration_secs an integer",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        std::string justification =
+            body.is_object() ? body.value("justification", std::string{}) : std::string{};
+        // Justification is mandatory (the auditable reason). Sanitise control
+        // bytes incl. DEL (anti log-injection) and cap length (anti audit-row
+        // bloat).
+        for (char& c : justification)
+            if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+                c = ' ';
+        // trim surrounding whitespace for the empty-check
+        auto first = justification.find_first_not_of(' ');
+        if (first == std::string::npos) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "justification is required", cid,
+                                                  "include a non-empty \"justification\""),
+                            "application/json");
+            return;
+        }
+        if (justification.size() > kMaxJustificationLength) {
+            justification.resize(kMaxJustificationLength);
+            // Back up to a UTF-8 code-point boundary so the audit detail never
+            // ends mid-sequence (#1748 L2). Walk back over continuation bytes
+            // (0x80-0xBF) to the lead byte; if the lead byte's declared length
+            // overruns the truncated end, drop that partial code point.
+            std::size_t i = justification.size();
+            while (i > 0 && (static_cast<unsigned char>(justification[i - 1]) & 0xC0) == 0x80)
+                --i;
+            if (i > 0) {
+                const unsigned char lead = static_cast<unsigned char>(justification[i - 1]);
+                const std::size_t seq_len =
+                    lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+                if (justification.size() - (i - 1) < seq_len)
+                    justification.resize(i - 1);
+            }
+        }
+        // Read as int64 first: a JSON integer > INT_MAX passes is_number_integer()
+        // but get<int>() would THROW (→ 500). Range-check in 64-bit, then narrow
+        // (Hermes pass-1 #1).
+        std::int64_t raw_duration = body.is_object() ? body.value("duration_secs", std::int64_t{0})
+                                                     : std::int64_t{0};
+        // An explicit NEGATIVE duration is a client error, not "give me the max"
+        // (review UP-5 least-privilege). Absent or 0 defaults to the cap.
+        if (raw_duration < 0) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "duration_secs must be positive", cid),
+                            "application/json");
+            return;
+        }
+        int duration = (raw_duration == 0 || raw_duration > cfg_.jit_max_elevation_secs)
+                           ? cfg_.jit_max_elevation_secs // unspecified → cap; over-cap → clamp
+                           : static_cast<int>(raw_duration);
+        // TOCTOU re-check (Hermes pass-1 #2 / unhappy-path UP-1): eligibility was
+        // read before the human-time MFA step-up. Re-verify it immediately before
+        // granting so an admin who revoked eligibility mid-step-up wins the race.
+        if (auto re = db->is_elevation_eligible(session->username); !re || !*re) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "eligibility revoked during step-up");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
+            return;
+        }
+        auto until = auth_mgr_.elevate_session(token, std::chrono::seconds(duration));
+        if (!until) {
+            res.status = 401; // session vanished between validate and elevate
+            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            return;
+        }
+        // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
+        // activation must never stand without a durable record. If the audit row
+        // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
+        // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
+        // a silent admin window.
+        if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
+                                     "User", session->username,
+                                     "duration_secs=" + std::to_string(duration) +
+                                         " justification=" + justification)) {
+            auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
+                          session->username);
+            res.status = 500;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(detail::error_json_a4(500, "could not record the elevation; not granted",
+                                                  cid, "retry; if it persists, check the audit store"),
+                            "application/json");
+            return;
+        }
+        emit_event("role.elevation.granted", req,
+                   {{"username", session->username}, {"duration_secs", std::to_string(duration)}}, {},
+                   Severity::kWarn);
+        nlohmann::json out = {{"status", "ok"}, {"expires_in", duration}};
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // POST /api/v1/elevate/revoke — manual step-down (clear an active elevation).
+    sink.Post("/api/v1/elevate/revoke",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  res.set_header("X-Correlation-Id", detail::make_correlation_id());
+                  auto token = extract_session_cookie(req);
+                  if (token.empty()) {
+                      res.status = 401;
+                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      return;
+                  }
+                  auto session = auth_mgr_.validate_session(token);
+                  if (!session) {
+                      res.status = 401;
+                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      return;
+                  }
+                  const bool was_elevated = auth_mgr_.revoke_elevation(token);
+                  audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
+                                          auth::role_to_string(session->role), "User",
+                                          session->username,
+                                          was_elevated ? "was_elevated=true" : "was_elevated=false");
+                  res.set_content(R"({"status":"ok"})", "application/json");
+              });
 }
 
 } // namespace yuzu::server

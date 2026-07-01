@@ -28,6 +28,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`,
   `yuzu_inventory_read_degrade_total{source="device_ci"}`; the store joins `/readyz` +
   `/healthz`. The operator-facing read surface (the `/inventory` Devices tab) ships in PR2.
+- **`/auto` VERIFY — before/after application-performance evidence (UAT non-functional).** A third
+  stage on the `/auto` page (after ASSESS pre-flight and ACT deploy): did upgrading an app from one
+  version to the next change how the **same machines** perform? The shift is computed **per machine,
+  paired** — each device's own baseline-version window vs its own candidate-version window (read from
+  the shipped per-device B1 store, the window anchored to that machine's transition, **not** to
+  "today" — so a staggered rollout still pairs), then the per-machine deltas are aggregated. A fleet
+  baseline-vs-candidate diff would be confounded by different populations; pairing on the machine
+  holds it fixed. A machine that ran only one version in-window is **excluded and counted**, never
+  imputed. **Evidential only — there is no verdict, no threshold, no pass/fail**: the tool reports the
+  measured shift (CPU/working-set before→after means, the median per-machine delta, p95 across
+  machines) and the up/flat/down split; the operator (or an AI colleague over MCP) judges. There is
+  **no cohort floor** — real canaries are 2–3 devices, so a floor would gut the feature; a sub-floor
+  paired set is flagged *indicative*, never suppressed, and the read is **audited**
+  (`dex.app_perf.compare`, operational) — accountability standing in for the suppression a floor
+  would give. Surfaces (all `GuaranteedState:Read`): REST `GET /api/v1/dex/perf/compare`, MCP
+  `compare_app_perf_versions`, and the `/auto` dashboard VERIFY stage (aggregate cards + distribution
+  + an audited per-machine drill). Pure engine `app_perf_compare` (reducer + `compare` split so a
+  later *live* candidate plugs the same slot); B1 cohort read `app_perf_cohort_reader` (agent_id
+  preserved). The per-machine pairs are a **dashboard-only** audited drill
+  (`dex.app_perf.compare.drill`); REST/MCP expose only the identity-free aggregate.
+  Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
+  central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
+  deploy→verify cohort auto-fill.
+
+## [0.13.0] - 2026-07-01
+
+### Added
+
+- **JIT (just-in-time) admin elevation (`POST /api/v1/elevate`, SOC 2 CC6.3/CC6.6).** Reduces standing
+  privilege: a pre-authorized operator (the new per-user `users.elevation_eligible` flag, auth.db
+  migration v5, admin-managed via `POST /api/v1/users/<name>/elevation-eligibility`) holds a non-admin
+  base role day-to-day and **activates** admin just-in-time for a bounded, justified window, then
+  auto-reverts. The session's `effective_role()` is admin only while elevated; `require_admin` and the
+  permission gates honour it. Elevating requires the operator to be **MFA-enrolled** (mandatory regardless
+  of `--mfa-enforcement` — elevation is the privilege boundary) **and** pass a fresh MFA step-up. Window
+  capped by `--jit-max-elevation-secs` (`YUZU_JIT_MAX_ELEVATION_SECS`, default 3600, max 86400).
+  `POST /api/v1/elevate/revoke` for manual step-down. The grant audit is fail-closed (an unrecordable grant
+  is rolled back, not granted); revoking eligibility immediately ends active elevations; self-grant of
+  eligibility is blocked. Audit: `role.elevation.{granted,denied,revoked}` + `user.elevation_eligibility.set`.
+  Elevation is in-memory per cookie session (a restart/logout drops it) and **cookie-sessions-only** — API
+  and MCP tokens can never be elevated. Closes `/auth-and-authz` gap-matrix P1 #9. See
+  `docs/auth-architecture.md` "JIT admin elevation".
 - **Idle (inactivity) session timeout (`--session-inactivity-secs`, SOC 2 CC6.3).** Operator dashboard
   cookie sessions can now be invalidated after a configurable period of inactivity — a **sliding**
   window that resets on each authenticated request, *under* the existing absolute 8h session lifetime.

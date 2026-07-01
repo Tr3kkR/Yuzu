@@ -39,6 +39,7 @@
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
+#include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
 #include "dex_app_perf_model.hpp"
@@ -84,6 +85,7 @@
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
 #include "preflight_routes.hpp"
+#include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
@@ -404,6 +406,14 @@ public:
         metrics_.describe("yuzu_app_perf_group_read_degrade_total",
                           "Management-group app-perf trend reads that returned a degrade rather than "
                           "a result, by reason",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_degrade_total",
+                          "/auto VERIFY cohort B1 reads that returned a degrade rather than a "
+                          "result, by reason (pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_cap_hit_total",
+                          "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
+                          "comparison is incomplete and may mis-pair machines)",
                           "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
@@ -2145,6 +2155,13 @@ public:
                 // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
                 app_perf_group_reader_ = std::make_unique<AppPerfGroupReader>(*pg_pool_);
                 app_perf_group_reader_->set_metrics(&metrics_);
+
+                // Cohort reader (/auto VERIFY): raw B1 rows for a member set ×
+                // app × two versions, agent_id PRESERVED so the compare engine
+                // pairs each machine. Borrows the pool, reads B1's schema, no
+                // fail-closed gate — degrades to nullopt.
+                app_perf_cohort_reader_ = std::make_unique<AppPerfCohortReader>(*pg_pool_);
+                app_perf_cohort_reader_->set_metrics(&metrics_);
             }
         }
 
@@ -3104,6 +3121,7 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
         app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
+        app_perf_cohort_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_daily_store_.reset();
         // Device-CI store: same discipline — null the borrowed pointers in both ingest
         // services, then drop the store, BEFORE the pool.
@@ -7738,7 +7756,9 @@ private:
                 // PlatformEngineer or Administrator can author definitions.
                 // When RBAC enforcement is fully wired, this will check the
                 // PlatformEngineer role via RbacStore::check_permission().
-                bool can_author = (session->role == auth::Role::admin);
+                // effective_role so an active JIT elevation also reveals the
+                // authoring UI (the POST already gates on effective_role).
+                bool can_author = (auth::effective_role(*session) == auth::Role::admin);
 
                 std::string html;
                 // Toolbar with New button for Platform Engineers
@@ -8797,6 +8817,36 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
+        app_perf_providers.cohort =
+            [this](std::string_view group_id, std::string_view app, std::string_view baseline,
+                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
+            if (!app_perf_cohort_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN read their raw
+            // B1 rows (a second bounded read) — never a lease held across the other
+            // (ADR-0012 §1). The /auto VERIFY compare engine pairs these per machine.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            CohortRead out;
+            out.member_count = static_cast<std::int64_t>(agent_ids.size());
+            if (agent_ids.empty())
+                return out; // empty/unknown group → member_count 0, no rows (not a degrade)
+            bool truncated = false;
+            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
+                                                                 window_days, truncated);
+            if (!rows)
+                return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
+            out.rows = std::move(*rows);
+            out.truncated = truncated;
+            return out;
+        };
+        // COPY the cohort provider (std::function is copyable) so the /auto VERIFY
+        // routes keep a live seam even after app_perf_providers is moved into the
+        // REST + MCP registrars below.
+        AppPerfCohortFn verify_cohort_fn = app_perf_providers.cohort;
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -9271,6 +9321,26 @@ private:
                 return preflight::collect_check_responses(*response_store_, run_id, applicable);
             },
             audit_fn, preflight_run_store_.get());
+
+        // VerifyRoutes — /auto Stage 3 VERIFY: the cohort-paired before/after
+        // app-perf evidence (UAT non-functional). Reads the shipped B1 store via the
+        // COPIED cohort provider; the pure compare engine pairs each machine. The
+        // aggregate read is an operational `dex.app_perf.compare` audit (set-and-
+        // proceed — the accountability that stands in for the absent floor); the
+        // per-machine drill is the audited PII surface. EVIDENTIAL only — no verdict,
+        // NO cohort floor (real canaries are 2-3 devices). Shares the /auto auth +
+        // group list with PreflightRoutes.
+        verify_routes_ = std::make_unique<VerifyRoutes>();
+        verify_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            std::move(verify_cohort_fn), audit_fn);
 
         // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
         // a go-cohort (mid-run, no completion required), stages + executes an
@@ -10271,6 +10341,7 @@ private:
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
+    std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
@@ -10355,6 +10426,7 @@ private:
     std::unique_ptr<AppPerfRollup> app_perf_rollup_;
     // Slice-2 group-trend reader (reads B1 by member list; borrows the pool).
     std::unique_ptr<AppPerfGroupReader> app_perf_group_reader_;
+    std::unique_ptr<AppPerfCohortReader> app_perf_cohort_reader_; // /auto VERIFY compare
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
