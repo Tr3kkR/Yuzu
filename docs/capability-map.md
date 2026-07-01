@@ -32,7 +32,7 @@ Advanced     [================================]  101/101 done (100%)
 Future       [=====================-----------]  33/50 done  (66%)
 New (Ph 8-16)[=---------------------------]     2/44 done   (5%) (5 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 + 28.7 fleet-viz in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   172/228 done (75%)
+Overall      [======================---------]   173/228 done (76%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -66,9 +66,9 @@ Overall      [======================---------]   172/228 done (75%)
 | 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
 | 28. Response Visualization | 9 | 0 | 3 | 6 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
-| 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
+| 30. Scope Walking & Result Sets | 4 | 4 | 0 | 0 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **228** | **172** | **6** | **50** |
+| **TOTAL** | **228** | **173** | **5** | **50** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1146,9 +1146,9 @@ Shipped 2026-05-31 (Phase 15.C; `68427bba`, hardening `4f10a69b`). The Scope Eng
 
 Shipped 2026-05-31 (Phase 15.E; `e6361a3a`). Instruction/instruction-set paths done; **Policy `fromResultSet:` deferred to PR-E2** (result-set TTL vs. continuous policy evaluation). The `scope:` block in `InstructionDefinition`, `InstructionSet`, and `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: `fromResultSet + assignment.managementGroups` rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); `fromResultSet` requires `assignment.mode = static` (the whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it). Resolution at instruction *invocation* time, not YAML load time, so a definition carrying `fromResultSet:` is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row. Design: `docs/scope-walking-design.md` §7.
 
-### 30.4 Result Set Operational Hardening :large_orange_diamond: `T2`
+### 30.4 Result Set Operational Hardening :white_check_mark: `T2`
 
-Largely shipped (Phase 15.G). Shipped: live re-eval (sibling result set), background GC sweep (`ResultSetStore::gc_sweep()` wired in `server.cpp`), per-operator quota/pin caps (`429`/`409`), and Prometheus `yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` / `yuzu_result_set_quota_rejected`. Remaining: the `yuzu_result_set_resolve_seconds` histogram and a final audit-polish pass. Live re-evaluation produces a *new* result set ID rooted at the original's parent (sibling, not child) — operators can refresh a stale set against current estate state without breaking lineage. Background GC sweep every 5 minutes removes unpinned sets past TTL, cascading to member rows. Per-operator quotas enforced with `429 RESULT_SET_QUOTA` and `409 PIN_LIMIT`. Prometheus metrics — `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram by cardinality bucket, GC counter, quota-rejection counter — surface health and runaway-script detection. Audit polish on every state transition. Design: `docs/scope-walking-design.md` §3.3, §9.
+Shipped (Phase 15.G): live re-eval (sibling result set), background GC sweep (`ResultSetStore::gc_sweep()` via the shared `run_result_set_gc` helper), per-operator quota/pin caps (`429`/`409`), the full Prometheus set (`yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` / `yuzu_result_set_quota_rejected` / `yuzu_result_set_resolve_seconds` histogram by cardinality tier, all `describe()`d), and audit rows for every state transition incl. `result_set.live_reeval` + the aggregate `result_set.gc_sweep`. Live re-evaluation produces a *new* result set ID rooted at the original's parent (sibling, not child) — operators can refresh a stale set against current estate state without breaking lineage. Background GC sweep every 5 minutes removes unpinned sets past TTL, cascading to member rows. Per-operator quotas enforced with `429 RESULT_SET_QUOTA` and `409 PIN_LIMIT`. Prometheus metrics — `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram by cardinality bucket, GC counter, quota-rejection counter — surface health and runaway-script detection. Audit polish on every state transition. Design: `docs/scope-walking-design.md` §3.3, §9.
 
 ---
 

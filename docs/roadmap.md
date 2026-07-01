@@ -1538,12 +1538,12 @@ Drives the §10 walkthrough (inventory-ground → TAR-query narrow → instructi
 **Files:** `tests/unit/server/test_chrome_ir_chain.cpp`, `tests/meson.build`. Design: `docs/scope-walking-design.md` §10.
 
 ### Issue 15.G: Operational Hardening — Live Re-Eval, GC Sweep, Prometheus + Audit Polish
-**Capability:** new | **Scope:** Server | **Status:** **Largely shipped** (2026-05-31 ladder) — remaining items tracked below.
+**Capability:** new | **Scope:** Server | **Status:** **Shipped** — 15.B ladder (2026-05-31) + resolve-latency histogram & audit polish (2026-07-01).
 **Depends on:** 15.B
 
 Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep every 5 min; per-operator 10K result-set quota + 50 pin cap with `429 RESULT_SET_QUOTA` / `409 PIN_LIMIT`; Prometheus metrics (`yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram, GC counter, quota-rejection counter); audit polish on every state transition.
 
-**Shipped:** re-eval endpoint; background GC-sweep thread wired in `server.cpp` (`ResultSetStore::gc_sweep()`); Prometheus `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_gc_total`, and `yuzu_result_set_quota_rejected`; quota (`kMaxPerOwner=10000` → `429`) and pin cap (`kMaxPinsPerOwner=50` → `409`) enforced in the store. **Still open:** the `yuzu_result_set_resolve_seconds` histogram and a final audit-polish pass. Recommend narrowing 15.G to just these remainders.
+**As shipped:** re-eval endpoint; background GC-sweep thread (`ResultSetStore::gc_sweep()` via the shared, unit-tested `run_result_set_gc` helper in `result_set_maintenance.{hpp,cpp}`); the full Prometheus set (`yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_gc_total`, `yuzu_result_set_quota_rejected`, and the `yuzu_result_set_resolve_seconds` histogram bucketed by cardinality tier, observed in `AgentRegistry::evaluate_scope`), all with `describe()` HELP/TYPE; quota (`kMaxPerOwner=10000` → `429`) + pin cap (`kMaxPinsPerOwner=50` → `409`); and audit rows for every transition incl. the new `result_set.live_reeval` (links the sibling to the original) and the aggregate system-principal `result_set.gc_sweep`. **Known limitation:** `device_count_delta` on `live_reeval` is omitted — the sibling lands `pending` and materialises asynchronously.
 
 **Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
 

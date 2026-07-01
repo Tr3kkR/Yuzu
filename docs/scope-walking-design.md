@@ -261,7 +261,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | Action | Result | Notes |
 |---|---|---|
 | `result_set.create` | `success` / `failure` | Includes source_kind, parent_id, device_count |
-| `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
+| `result_set.live_reeval` | `success` | **As shipped:** `target_id` = the original set; `detail` = `new_id=<rs> source_kind=<kind>`. (`device_count_delta` is omitted — the sibling lands `pending` and materialises asynchronously, so the delta is not known at re-eval time.) |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
 | `result_set.gc_sweep` | `success` | Aggregate row, written once per sweep with the count |
@@ -335,7 +335,7 @@ This walkthrough is the reference test for end-to-end correctness. A regression 
 | PR-D | TAR SQL frame consumes / produces result sets via §6 routes | First end-to-end loop in the dashboard |
 | PR-E | DSL `fromResultSet:` (§7) + definition/policy validation + DSL spec amendment | **Shipped** — instruction-side validation + `selector:` lowering + dispatch alias resolution + `scope_resolution_failed` audit. **Policy `fromResultSet:` deferred to PR-E2** (owner field + `PolicyEvaluator` wiring + pinned-set rule). |
 | PR-F | Reference walkthrough integration test (§10) | Regression net |
-| PR-G | Live re-eval, pin storm guards, GC sweep, Prometheus + audit polish | Operational hardening |
+| PR-G | Live re-eval, pin storm guards, GC sweep, Prometheus + audit polish — **Shipped** (2026-05-31 ladder + `yuzu_result_set_resolve_seconds` histogram, `result_set.live_reeval` + `result_set.gc_sweep` audit, 2026-07-01) | Operational hardening |
 | PR-H | Process tree viewer (separate slice — see `docs/tar-dashboard.md` §6) | Builds on PR-D's frame pattern |
 
 PR-A is in scope **for the current session** — it ships the page and the retention list against the existing scope grammar. Everything else is sequenced after.

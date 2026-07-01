@@ -89,6 +89,11 @@ required.
 | `rbac.role_revoke` | Principal | A role is revoked from a principal |
 | `management_group.create` | ManagementGroup | A management group is created |
 | `management_group.delete` | ManagementGroup | A management group is deleted |
+| `result_set.create` | ResultSet | A result set (composable scope, "scope walking") is created via `POST /api/v1/result-sets` or a `from-inventory-query` / `from-tar-query` / `from-instruction-result` producer. `target_id` is the new `rs_<id>`; `detail` carries `source_kind=<inventory_query\|tar_query\|instruction_result\|manual_curate>` (async producers also carry `execution_id=` + `agents=`). |
+| `result_set.live_reeval` | ResultSet | A result set was re-evaluated via `POST /api/v1/result-sets/{id}/re-eval`, producing a sibling rooted at the original's parent. `target_id` is the **original** set; `detail` carries `new_id=<rs> source_kind=<kind>`. (`device_count_delta` is omitted — the sibling lands `pending` and materialises asynchronously.) |
+| `result_set.pin` / `result_set.unpin` | ResultSet | An operator pinned (TTL → never GC'd, for the duration of an investigation) or unpinned a result set. |
+| `result_set.delete` | ResultSet | A result set is deleted via `DELETE /api/v1/result-sets/{id}`. A **pinned** set must be unpinned first — a pinned delete returns `409` and is not logged as a delete. |
+| `result_set.gc_sweep` | ResultSet | The background GC sweep removed expired unpinned result sets. **System-initiated** (`principal=__system__`, no session/IP), emitted once per sweep and only when ≥1 set was removed; `detail` carries `count=<n>`. |
 | `management_group.add_member` | ManagementGroup | An agent is added to a management group |
 | `management_group.remove_member` | ManagementGroup | An agent is removed from a management group |
 | `management_group.assign_role` | ManagementGroup | A role is assigned to a principal on a management group |

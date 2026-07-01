@@ -4232,7 +4232,7 @@ void RestApiV1::register_routes(
         // dispatch and land a new pending row; sync sources are deferred to
         // PR-G (their re-eval needs the inventory evaluator on this path).
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
-                  [auth_fn, rs_err, load_owned, run_async, instruction_store](
+                  [auth_fn, audit_fn, rs_err, load_owned, run_async, instruction_store](
                       const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
@@ -4287,6 +4287,21 @@ void RestApiV1::register_routes(
                           rs_err(res, 400,
                                  "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
                                  "lands in PR-G");
+                      }
+                      // Forensic edge (design §9): run_async already audited the
+                      // sibling's result_set.create; this row links the sibling back
+                      // to the original so a lineage walk shows the refresh.
+                      // device_count_delta is not yet known — the sibling lands
+                      // `pending` and materialises asynchronously.
+                      if (res.status == 202) {
+                          auto rebody = nlohmann::json::parse(res.body, nullptr, false);
+                          const std::string new_id =
+                              (rebody.is_object() && rebody.contains("data") &&
+                               rebody["data"].is_object())
+                                  ? rebody["data"].value("id", "")
+                                  : "";
+                          audit_fn(req, "result_set.live_reeval", "success", "ResultSet", orig->id,
+                                   "new_id=" + new_id + " source_kind=" + orig->source_kind);
                       }
                   });
 
