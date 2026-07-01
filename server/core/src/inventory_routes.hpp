@@ -185,8 +185,8 @@ public:
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         AgentCiFn agent_ci_fn, ScopeFn scope_fn = {}, StaleFn stale_fn = {},
-                         AuditFn audit_fn = {});
+                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
+                         AgentCiFn agent_ci_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
@@ -194,8 +194,8 @@ public:
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         AgentCiFn agent_ci_fn, ScopeFn scope_fn = {}, StaleFn stale_fn = {},
-                         AuditFn audit_fn = {});
+                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
+                         AgentCiFn agent_ci_fn = {});
 
 private:
     AuthFn auth_fn_;

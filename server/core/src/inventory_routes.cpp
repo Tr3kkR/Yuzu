@@ -50,22 +50,22 @@ void InventoryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
-                                      DevicesFn devices_fn, AgentCiFn agent_ci_fn, ScopeFn scope_fn,
-                                      StaleFn stale_fn, AuditFn audit_fn) {
+                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
+                                      AuditFn audit_fn, AgentCiFn agent_ci_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
                     std::move(catalog_fn), std::move(catalog_meta_fn), std::move(versions_fn),
                     std::move(fleet_fn), std::move(agent_sw_fn), std::move(devices_fn),
-                    std::move(agent_ci_fn), std::move(scope_fn), std::move(stale_fn),
-                    std::move(audit_fn));
+                    std::move(scope_fn), std::move(stale_fn), std::move(audit_fn),
+                    std::move(agent_ci_fn));
 }
 
 void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
-                                      DevicesFn devices_fn, AgentCiFn agent_ci_fn, ScopeFn scope_fn,
-                                      StaleFn stale_fn, AuditFn audit_fn) {
+                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
+                                      AuditFn audit_fn, AgentCiFn agent_ci_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);

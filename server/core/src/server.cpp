@@ -9169,21 +9169,37 @@ private:
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
                 out.push_back(std::move(r));
             }
-            // Device-CI enrichment (PR2): one list_device_ci(0) read (symmetric with the
-            // full offline_endpoint_store_ materialize above), joined by agent_id via the
-            // pure attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
+            // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
+            // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
+            // limit-clamp contract, not "zero rows" — (symmetric with the full
+            // offline_endpoint_store_ materialize above), joined by agent_id via the pure
+            // attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
             // visible-confined roster (the loop above already dropped out-of-scope
             // agents) — attach_device_ci only ever looks up by an agent_id already in
             // `out`, so a CI row for an out-of-scope agent riding along in the same read
             // is never attached, never rendered. A degrade (nullopt) leaves CI columns
             // blank — the roster itself is still shown (this list is best-effort, unlike
             // the Software tab's authoritative reads; see the existing empty-roster note).
+            // KNOWN FOLLOW-UP (gov Gate 3 performance + architect review): this reads the
+            // WHOLE fleet's CI on every render regardless of how few devices are visible,
+            // unlike the Software tab's hourly rollup (software_catalog_rollup.cpp) which
+            // exists specifically to avoid this read-cadence-vs-write-cadence mismatch for
+            // daily-synced data. Deferred rather than fixed here to keep this PR scoped to
+            // dashboard-read enrichment; track a scoped list_device_ci_for(agent_ids) or a
+            // rollup-style cache as a follow-up issue.
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
                 if (ci_list) {
                     std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
                     ci_by_agent.reserve(ci_list->size());
                     for (auto& rec : *ci_list)
+                        // Safe: pair's members initialize in declaration order (`first`
+                        // before `second`), so the key copies from `rec.agent_id` before
+                        // `std::move(rec)` constructs `second` and leaves `rec` (incl. its
+                        // own .agent_id member) moved-from. Don't read the map VALUE's own
+                        // .agent_id after this, though — it's redundant with (and no longer
+                        // matches) the key; attach_device_ci never does (gov Gate 3
+                        // cpp-expert review).
                         ci_by_agent.emplace(rec.agent_id, std::move(rec));
                     attach_device_ci(out, ci_by_agent);
                 }
@@ -9221,16 +9237,6 @@ private:
                 return software_inventory_store_->get_agent_software(id);
             },
             inv_devices_fn,
-            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
-            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
-            // closure is always wired when device_inventory_store_ exists, and returns a
-            // live kDegraded when it doesn't (the store itself failed to construct/open).
-            [this](const std::string& id)
-                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
-                if (!device_inventory_store_)
-                    return std::unexpected(CiReadError::kDegraded);
-                return device_inventory_store_->get_device_ci(id);
-            },
             // FIND per-row Inventory:Read management-group scope predicate — the SAME
             // check_scoped_permission chokepoint the REST route + MCP tool use.
             // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
@@ -9258,7 +9264,20 @@ private:
                                             kWin;
                 return software_inventory_store_->count_stale_agents(cutoff);
             },
-            audit_fn);
+            audit_fn,
+            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
+            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
+            // closure is always wired when device_inventory_store_ exists, and returns a
+            // live kDegraded when it doesn't (the store itself failed to construct/open).
+            // Appended after audit_fn (rather than inserted mid-signature) to match the
+            // DeviceRoutes/DexRoutes convention of growing register_routes by appending
+            // new closures with a `= {}` default (gov Gate 3 architect review).
+            [this](const std::string& id)
+                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
+                if (!device_inventory_store_)
+                    return std::unexpected(CiReadError::kDegraded);
+                return device_inventory_store_->get_device_ci(id);
+            });
 
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /

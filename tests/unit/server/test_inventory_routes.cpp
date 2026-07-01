@@ -355,7 +355,7 @@ struct InvHarness {
             return !audit_should_fail;
         };
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
-                               agent_sw, devices, ci_fn, scope, stale, audit);
+                               agent_sw, devices, scope, stale, audit, ci_fn);
     }
 };
 
@@ -473,17 +473,30 @@ TEST_CASE("route: per-device drill renders the CI panel + audits inventory.devic
         REQUIRE(ok);
     }
     {
-        // Degrade -> "failure" audit + a degrade banner (distinct from "absent").
+        // Degrade -> "failure" audit + a degrade banner (distinct from "absent"). Note:
+        // InvHarness's single `degrade` flag ALSO degrades agent_sw_fn_ in this same
+        // request (gov Gate 3 quality-engineer finding — this is the first route-level
+        // exercise of the software-degrade path on THIS endpoint, so assert on it too
+        // rather than leaving it silently unchecked).
         InvHarness h;
         h.degrade = true;
         auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
         REQUIRE(res);
         REQUIRE(contains(res->body, "CI record unavailable"));
-        bool failed = false;
+        bool ci_failed = false;
         for (const auto& a : h.audits)
             if (a == "inventory.device.ci|failure")
-                failed = true;
-        REQUIRE(failed);
+                ci_failed = true;
+        REQUIRE(ci_failed);
+        // The sibling software read is ALSO degraded by the same flag in this request —
+        // assert its banner + audit too, so this test's coverage of the combined-degrade
+        // path is actually cashed in, not just incidentally exercised.
+        REQUIRE(contains(res->body, "Device software unavailable"));
+        bool sw_failed = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.software|failure")
+                sw_failed = true;
+        REQUIRE(sw_failed);
     }
 }
 
