@@ -271,6 +271,7 @@ struct InvHarness {
     bool allow_perm = true;          // global Inventory:Read
     bool allow_scoped = true;        // per-device scoped Inventory:Read
     bool degrade = false;            // make every store provider return nullopt
+    bool audit_should_fail = false;  // simulate an audit-persist failure (Sec-Audit-Failed)
     std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
@@ -351,7 +352,7 @@ struct InvHarness {
                             const std::string& tt, const std::string& tid, const std::string&) {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
-            return true;
+            return !audit_should_fail;
         };
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
                                agent_sw, devices, ci_fn, scope, stale, audit);
@@ -413,6 +414,32 @@ TEST_CASE("route: per-device drill is scope-gated", "[inventory][route]") {
     auto ok = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
     REQUIRE(ok);
     REQUIRE(contains(ok->body, "Slack"));
+}
+
+TEST_CASE("route: inventory.devices + inventory.device.ci are the behavioural-PII audit "
+          "tier (Sec-Audit-Failed on a persist failure)",
+          "[inventory][route]") {
+    // gov Gate 2 finding: both verbs carry a device-persistent identifier (serial) now,
+    // so both were promoted from try_persist_audit to emit_behavioral_audit. Prove the
+    // header actually appears on a persist failure — not just that the detail string
+    // looks right (the prior tests already cover content; this locks in the tier).
+    {
+        InvHarness h;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/fragments/inventory/devices");
+        REQUIRE(res);
+        REQUIRE(res->status != 403);
+        REQUIRE(res->has_header("Sec-Audit-Failed"));
+        // Set-and-proceed: the HTML fragment still renders despite the audit failure.
+        REQUIRE(contains(res->body, "WIN-1"));
+    }
+    {
+        InvHarness h;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(res->has_header("Sec-Audit-Failed"));
+    }
 }
 
 TEST_CASE("route: per-device drill renders the CI panel + audits inventory.device.ci",

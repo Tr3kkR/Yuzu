@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
+  columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
+  the per-device drill grows a full CI-record panel (manufacturer, model, serial,
+  system UUID, domain/OU, BIOS, CPU, memory, MAC addresses, NIC count, OS
+  name/version/build, architecture, first/last-synced) above the installed-software
+  list. Disk capacity and owner/location are deliberately withheld (a macOS
+  disk-collection fix and operator-set CMDB fields, respectively, are unbuilt
+  follow-ups). List enrichment happens after the existing management-group
+  confinement, so an out-of-scope device's CI is never attached or disclosed. New
+  audit verb `inventory.device.ci` (per-device drill) and an extended
+  `inventory.devices` (fleet list) both use the behavioural-PII audit tier, since
+  serial/system UUID/MAC are device-persistent identifiers (GDPR personal data per
+  ADR-0016).
 - **Device-identity daily-sync source + CMDB store (`device_ci`, ADR-0016 source #3).**
   The agent now syncs stable hardware/OS identity to central Postgres daily, on the same
   hash-skip framework as `installed_software`. The `device_ci` source fans out to the
@@ -27,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yuzu_inventory_ingest_total{source="device_ci"}`,
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`,
   `yuzu_inventory_read_degrade_total{source="device_ci"}`; the store joins `/readyz` +
-  `/healthz`. The operator-facing read surface (the `/inventory` Devices tab) ships in PR2.
+  `/healthz`. The operator-facing read surface is the `/inventory` Devices tab bullet
+  above.
 - **Idle (inactivity) session timeout (`--session-inactivity-secs`, SOC 2 CC6.3).** Operator dashboard
   cookie sessions can now be invalidated after a configurable period of inactivity — a **sliding**
   window that resets on each authenticated request, *under* the existing absolute 8h session lifetime.

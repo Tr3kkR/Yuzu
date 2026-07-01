@@ -90,11 +90,21 @@ std::string ci_disp(const std::string& s) {
 }
 
 // "8c/16t" from decimal-string cores/threads; "" (caller falls back to a placeholder)
-// when both are unknown/empty. Output is digits + literal ASCII suffixes only — safe
-// to emit unescaped.
+// when both are unknown/empty/non-numeric. Output is digits + literal ASCII suffixes
+// only, and the numeric check (mirroring ci_ram_gb's std::from_chars validation) makes
+// that true BY CONSTRUCTION rather than by relying on the caller's BIGINT-column
+// provenance — gov Gate 2 review: don't let "safe to emit unescaped" rest on an
+// implicit cross-file trust chain the function itself doesn't enforce.
 std::string ci_cores_threads(const std::string& cores, const std::string& threads) {
-    const bool has_cores = !cores.empty() && cores != "unknown";
-    const bool has_threads = !threads.empty() && threads != "unknown";
+    auto is_numeric = [](const std::string& s) {
+        if (s.empty() || s == "unknown")
+            return false;
+        unsigned long long v = 0;
+        const auto res = std::from_chars(s.data(), s.data() + s.size(), v);
+        return res.ec == std::errc{} && res.ptr == s.data() + s.size();
+    };
+    const bool has_cores = is_numeric(cores);
+    const bool has_threads = is_numeric(threads);
     if (!has_cores && !has_threads)
         return "";
     std::string s;

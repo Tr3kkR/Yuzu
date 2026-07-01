@@ -162,16 +162,19 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::vector<InventoryDeviceRow> rows;
                  if (devices_fn_)
                      rows = devices_fn_(session->username);
-                 // Audit the identity-bearing roster read (hostnames + agent_ids + PR2's
-                 // device-CI columns, incl. serial) for parity with the other inventory
-                 // surfaces (gov review #1759). Set-and-proceed via the throw-safe kernel —
-                 // scope-confined at devices_fn_, machine-scope data. The detail string
-                 // records that CI identifiers ride this bulk read (vs the per-device drill's
-                 // own inventory.device.ci verb) so the disclosure is visible in the log.
-                 (void)detail::try_persist_audit(audit_fn_, req, "inventory.devices", "success",
-                                                 "Inventory", "fleet",
-                                                 "devices=" + std::to_string(rows.size()) +
-                                                     " (incl. CI columns: serial/model/cpu/ram)");
+                 // Audit the identity-bearing roster read. PR2's device-CI columns (incl.
+                 // serial — a device-persistent identifier, ADR-0016 §"personal data under
+                 // GDPR") now ride this bulk read, so this is promoted to the
+                 // emit_behavioral_audit tier (Sec-Audit-Failed on a persist failure) —
+                 // gov Gate 2 review: ADR-0016 explicitly classifies serial/system_uuid/
+                 // primary_mac as GDPR personal data, so the lighter machine-scope-data
+                 // posture the OTHER inventory.* verbs use (host/OS/software titles — not
+                 // device-persistent identifiers) does not transfer to this route now that
+                 // it carries CI. Set-and-proceed: the HTML surface still renders.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "inventory.devices", "success", "Inventory", "fleet",
+                     "devices=" + std::to_string(rows.size()) +
+                         " (incl. CI columns: serial/model/cpu/ram)");
                  send_html(res, render_inventory_devices_fragment(rows, "", "", ""));
              });
 
@@ -207,14 +210,20 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      std::unexpected(CiReadError::kDegraded);
                  if (agent_ci_fn_)
                      ci = agent_ci_fn_(id);
-                 // Separate, distinctly-countable audit verb (serial/UUID/MAC are
-                 // device-identifying) — parity with the tar.dns.read + tar.arp.read
-                 // pair. Reading OK even when the record is genuinely absent (a value
-                 // holding std::nullopt) is "success", not "failure" — only the
-                 // kDegraded store-failure case is a failure.
-                 (void)detail::try_persist_audit(
-                     audit_fn_, req, "inventory.device.ci", ci.has_value() ? "success" : "failure",
-                     "Inventory", "agent=" + id,
+                 // Separate, distinctly-countable audit verb — serial/system_uuid/primary_mac
+                 // are device-persistent identifiers (GDPR personal data per ADR-0016), so
+                 // this uses emit_behavioral_audit (Sec-Audit-Failed on a persist failure),
+                 // the SAME tier as the tar.dns.read + tar.arp.read pair and DEX/Guardian
+                 // per-device lenses — gov Gate 2 review corrected an earlier draft that
+                 // used the lighter try_persist_audit tier (the installed-software drill's
+                 // tier), which ADR-0016 doesn't support for CI data specifically. Reading
+                 // OK even when the record is genuinely absent (a value holding
+                 // std::nullopt) is "success", not "failure" — only the kDegraded
+                 // store-failure case is a failure. Set-and-proceed: the HTML surface
+                 // still renders even on a persist failure.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "inventory.device.ci",
+                     ci.has_value() ? "success" : "failure", "Inventory", "agent=" + id,
                      !ci.has_value()   ? "store degraded"
                      : ci->has_value() ? "found"
                                        : "absent");

@@ -309,21 +309,26 @@ per-user data. The collection is still **machine-scope** (no username/SID/user
 path). The existing **`--inventory-disable`** flag is the collection toggle and
 covers `device_ci` at the same gate as the other sources (it gates the whole
 daily-sync thread). A DPIA / Workstream-E data-inventory entry for centralizing
-serial/UUID/MAC is a pre-PR2 assurance item.
+serial/UUID/MAC is a pre-correlation-PR assurance item.
 
-**Binding PR2 requirement — do NOT correlate on `"unknown"`.** When the platform
-identity subsystem is unavailable, or a host genuinely has no SMBIOS serial (many
-VMs; Linux without the capability), `serial`/`system_uuid` are the literal
-`"unknown"`. The PR1 collect skips a cycle only when manufacturer AND model are
-both `"unknown"` (a wholesale WMI/DMI outage — `core_identity_unavailable`),
-which prevents a transient blip from overwriting a good row and flapping the hash;
-but a serial-less VM with real manufacturer/model is persisted with
-`serial="unknown"` by design. **PR2's CMDB correlation/merge logic MUST treat
-`serial=="unknown"` / `system_uuid=="unknown"` as ABSENT and never merge distinct
-devices on it** (otherwise every WMI-down or serial-less host collapses into one
-CI). The store keys on `agent_id`, so there is no PR1 collision — this is purely a
-PR2 correlation concern. Also note **macOS `IOPlatformUUID` ≠ the SMBIOS UUID**
-reported on Windows/Linux, so cross-OS correlation by UUID will miss.
+**Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
+correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
+Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
+purely on `agent_id` and does not implement CMDB correlation/merge, so this
+requirement does not apply to it and remains open for whichever future PR adds
+cross-device correlation.) When the platform identity subsystem is unavailable, or
+a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),
+`serial`/`system_uuid` are the literal `"unknown"`. The PR1 collect skips a cycle
+only when manufacturer AND model are both `"unknown"` (a wholesale WMI/DMI outage —
+`core_identity_unavailable`), which prevents a transient blip from overwriting a
+good row and flapping the hash; but a serial-less VM with real manufacturer/model
+is persisted with `serial="unknown"` by design. **A future CMDB correlation/merge
+feature MUST treat `serial=="unknown"` / `system_uuid=="unknown"` as ABSENT and
+never merge distinct devices on it** (otherwise every WMI-down or serial-less host
+collapses into one CI). The store keys on `agent_id`, so there is no PR1
+collision — this is purely a future correlation-feature concern. Also note
+**macOS `IOPlatformUUID` ≠ the SMBIOS UUID** reported on Windows/Linux, so
+cross-OS correlation by UUID will miss.
 
 **Known inherited property (forward).** The content hash covers the field *set*,
 so a mixed-version rollout (an agent that adds/removes a field vs an older server)
