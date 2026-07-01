@@ -7722,7 +7722,9 @@ private:
                 // PlatformEngineer or Administrator can author definitions.
                 // When RBAC enforcement is fully wired, this will check the
                 // PlatformEngineer role via RbacStore::check_permission().
-                bool can_author = (session->role == auth::Role::admin);
+                // effective_role so an active JIT elevation also reveals the
+                // authoring UI (the POST already gates on effective_role).
+                bool can_author = (auth::effective_role(*session) == auth::Role::admin);
 
                 std::string html;
                 // Toolbar with New button for Platform Engineers

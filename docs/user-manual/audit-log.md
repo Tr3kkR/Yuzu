@@ -60,6 +60,10 @@ required.
 | Action | Target type | When |
 |---|---|---|
 | `auth.login` | Session | Operator logs in via the dashboard or API |
+| `role.elevation.granted` | User | A pre-authorized operator activated a JIT admin elevation via `POST /api/v1/elevate` (SOC 2 CC6.3/CC6.6). `principal`=the operator, `principal_role=admin` (the effective role for the window), `result=ok`, `detail=duration_secs=<N> justification=<sanitised, ≤1KiB>`. The grant was MFA-step-up-gated. |
+| `role.elevation.denied` | User | `POST /api/v1/elevate` was refused because the caller is not eligible (`users.elevation_eligible=0`), the eligibility read failed (fail-closed), or **no MFA is enrolled** (a second factor is mandatory to elevate). `result=denied`, `detail` names the reason. |
+| `role.elevation.revoked` | User | An operator stepped their elevation down early via `POST /api/v1/elevate/revoke`. `result=ok`, `detail=was_elevated=<bool>`. (Passive expiry on window lapse is implicit from the `granted` row's `duration_secs` — no separate `role.elevation.expired` event in v1.) |
+| `user.elevation_eligibility.set` | User | An admin set/cleared a user's JIT-elevation eligibility via `POST /api/v1/users/<name>/elevation-eligibility` (admin + MFA-step-up gated). `result=ok`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when revoking dropped active windows); `result=denied`/`detail=self_grant_blocked` on a self-grant attempt; `result=error` on a store failure. |
 | `audit.auth_sample.exported` | AuditLog | A caller pulled a pseudo-random authentication-surface evidence sample via `GET /api/v1/audit/auth-sample` (SOC 2 CC7.2). `target_id=auth-sample`; `detail=from=<epoch-or-0> to=<epoch-or-0> limit=<N> returned=<N>` so the window + sample size are on the chain. `result=success`. Permission gate: `AuditLog:Read`. Store-unavailable is a 503 (not an audited failure). If the audit-store write itself fails, the response carries `Sec-Audit-Failed: true` (the export still returns). |
 | `auth.logout` | Session | Operator logs out |
 | `auth.login_failed` | Session | Failed login attempt |
