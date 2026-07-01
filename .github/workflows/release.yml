@@ -77,6 +77,27 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24'
 
+      - name: Install Python build deps (meson + PyYAML for content embed)
+        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+        # configure-time dependency for the bundled-content embed
+        # (server/core/scripts/embed_content.py). meson setup fails
+        # with error() if `import yaml` returns non-zero. Without an
+        # explicit install step, this self-hosted runner relied on
+        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
+        # ~/.local on the same runner). A runner re-bake would break
+        # release. Install explicitly and hash-pinned.
+        #
+        # Runs BEFORE "Verify build dependencies": meson is pip-installed
+        # here into ~/.local/bin, NOT pre-provisioned on the Big Tam
+        # (yuzu-bigtam-linux) runner. The `echo … >> $GITHUB_PATH` puts
+        # ~/.local/bin on PATH for every later step — the verify check AND
+        # the `meson setup` below — mirroring ci.yml lines 269-270. Without
+        # both the reorder and the PATH export, verify fails with
+        # "Missing tools: meson" even though the pip install succeeds.
+        run: |
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Verify build dependencies
         run: |
           MISSING=""
@@ -98,18 +119,6 @@ jobs:
             echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on self-hosted runner — sudo apt-get install -y libsystemd-dev"
             exit 1
           fi
-
-      - name: Install Python build deps (PyYAML for content embed)
-        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
-        # configure-time dependency for the bundled-content embed
-        # (server/core/scripts/embed_content.py). meson setup fails
-        # with error() if `import yaml` returns non-zero. Without an
-        # explicit install step, this self-hosted runner relied on
-        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
-        # ~/.local on the same runner). A runner re-bake would break
-        # release. Install explicitly and hash-pinned.
-        run: |
-          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
 
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux
@@ -478,7 +487,17 @@ jobs:
       - name: Install Meson and ccache
         run: |
           pip install --require-hashes -r requirements-ci.txt
-          choco install ccache --yes --no-progress
+          # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
+          # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
+          # installed there, so the old `choco install ccache` aborted the
+          # step with "'choco' is not recognized". Fall back to winget only
+          # if ccache is genuinely absent (e.g. a freshly re-baked runner);
+          # on Wee Tam this branch is skipped.
+          if (-not (Get-Command ccache -ErrorAction SilentlyContinue)) {
+            winget install --id Ccache.Ccache --silent --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "ccache already present: $((Get-Command ccache).Source)"
+          }
 
       # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
       # persist on the self-hosted Windows runner between jobs. The
