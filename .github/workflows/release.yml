@@ -1353,11 +1353,8 @@ jobs:
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      # QEMU + docker-container driver for the multi-arch (amd64+arm64)
-      # manifest-list push — same rationale as docker-publish-chisel.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. See
+      # docker-publish-chisel for the same rationale.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
@@ -1398,7 +1395,8 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile.postgres
-          platforms: linux/amd64,linux/arm64
+          # amd64-only (linux/arm64 dropped — not needed yet).
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -1471,7 +1469,7 @@ jobs:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "## Published \`yuzu-postgres\` image (multi-arch)"
+            echo "## Published \`yuzu-postgres\` image (linux/amd64)"
             echo ""
             echo '```'
             echo "$META_TAGS"
@@ -1479,7 +1477,7 @@ jobs:
             echo ""
             echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
-            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Platforms: \`linux/amd64\`."
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1559,20 +1557,13 @@ jobs:
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      # QEMU registers binf_misc handlers so buildx can build the
-      # linux/arm64 leg on this amd64 runner. Required for the multi-arch
-      # build below; see the INTERIM STRATEGY note on timeout-minutes.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU-emulated) dropped — not needed yet, and
+      # the emulated leg was slow + flaky. Re-add QEMU + arm64 when a native
+      # arm64 runner exists. docker-container driver retained for the local
+      # layer-cache export (cache-to type=local) below.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
-          # Force the docker-container driver. Multi-platform push needs a
-          # builder that can produce an OCI manifest list; the ambient
-          # `docker` driver on the self-hosted runner cannot do
-          # cross-arch / manifest-list builds and a leftover docker-driver
-          # builder would make the linux/amd64,linux/arm64 push fail.
           driver: docker-container
 
       - name: Log in to GHCR
@@ -1617,9 +1608,8 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          # Multi-arch is the whole point of this job. The arm64 leg runs
-          # under QEMU emulation on the amd64 runner (see timeout note).
-          platforms: linux/amd64,linux/arm64
+          # amd64-only (linux/arm64 dropped — not needed yet).
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -1707,7 +1697,7 @@ jobs:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (multi-arch)"
+            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (linux/amd64)"
             echo ""
             echo '```'
             echo "$META_TAGS"
@@ -1715,7 +1705,7 @@ jobs:
             echo ""
             echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
-            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Platforms: \`linux/amd64\`."
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1757,9 +1747,8 @@ jobs:
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-agent-bundle-chisel" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. The bundle
+      # script builds the host-arch (amd64) image when --multiarch is omitted.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
@@ -1783,15 +1772,16 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       # Reuse the maintainer script (download release artifacts -> verify by
-      # sha256 -> lay out -> buildx multi-arch -> push). GH_TOKEN lets its
-      # `gh release download` authenticate against this just-published release.
-      - name: Build + push multi-arch agent bundle
+      # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
+      # lets its `gh release download` authenticate against this just-published
+      # release. linux/arm64 dropped — pass --push without --multiarch.
+      - name: Build + push agent bundle (amd64)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
-            --multiarch --push
+            --push
 
       - name: Resolve pushed image digest
         id: digest
@@ -1853,7 +1843,7 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.value }}
         run: |
           {
-            echo "## Published \`yuzu-agent-bundle-chisel\` delivery image (multi-arch)"
+            echo "## Published \`yuzu-agent-bundle-chisel\` delivery image (linux/amd64)"
             echo ""
             echo "**Tag:** \`${IMAGE}:${VERSION}\`  **Digest:** \`${DIGEST}\`"
             echo ""
