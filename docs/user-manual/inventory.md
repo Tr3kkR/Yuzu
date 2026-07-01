@@ -268,8 +268,9 @@ whose ingest is failing. Four further series sharpen the picture:
   cheap hash-skip compare + `last_seen` bump — split so the steady-state
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
-- `yuzu_inventory_read_degrade_total{reason}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`) — an **authoritative read** that returned
+- `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
+  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci`) — an
+  **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
   otherwise invisible. The per-degrade WARN is sampled per site — the leading edge
@@ -339,6 +340,40 @@ explicit `on()/group_left()` matching with a denominator caveat. **Enable it** o
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled".
+
+## Device-identity inventory (`device_ci`)
+
+A second daily-sync source, **`device_ci`** (ADR-0016 source #3), is live on the
+agent and server. It collects the machine's stable hardware/OS identity — a
+ServiceNow-CMDB-style configuration item — and persists one row per device in the
+Postgres schema **`device_inventory_store`** (table `device_ci`): manufacturer,
+model, **serial number**, **system UUID**, BIOS vendor/version/date, CPU
+model/cores/threads, RAM, a disk summary, **primary MAC** + MAC summary + NIC
+count, OS name/version/build, and architecture. Serial number and system UUID are
+the CMDB correlation key.
+
+It is collected via the existing `hardware` (incl. a new `system` action for
+serial + UUID), `device_identity`, `os_info`, and `network_config` plugins. It
+**excludes volatile telemetry** — free disk space, uptime, IP addresses —
+deliberately: those change between cycles and would flip the content hash every
+sync, defeating the hash-skip protocol.
+
+- **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
+  are device-persistent identifiers — treat as potentially personal data where a
+  device is person-assigned. The same **`--inventory-disable`** flag suppresses
+  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+- **Observability.** Ingest shares
+  `yuzu_inventory_ingest_total{source="device_ci"}` +
+  `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
+  `yuzu_inventory_read_degrade_total{source="device_ci"}`. The store joins
+  `/readyz` + `/healthz`.
+- **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
+  `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
+  (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+
+The operator-facing read surface — the `/inventory` **Devices** tab CI columns and
+the per-device CI panel — ships in **PR2**; until then the data is in Postgres but
+not yet surfaced in the dashboard.
 
 ## See also
 

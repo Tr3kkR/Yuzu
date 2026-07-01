@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Device-identity daily-sync source + CMDB store (`device_ci`, ADR-0016 source #3).**
+  The agent now syncs stable hardware/OS identity to central Postgres daily, on the same
+  hash-skip framework as `installed_software`. The `device_ci` source fans out to the
+  `hardware`, `device_identity`, `os_info`, and `network_config` plugins in-process
+  (`LocalDispatcher`) and emits a canonical CI record: manufacturer, model, serial number,
+  system UUID, BIOS details, CPU/RAM/disk summary, primary MAC, NIC count, OS
+  name/version/build, and architecture. Volatile telemetry (free disk space, uptime, IP
+  addresses) is deliberately excluded so the content hash is stable and steady-state
+  traffic is suppressed. A new `hardware` plugin `system` action collects serial + system
+  UUID (Windows WMI / Linux sysfs-DMI via `cap_dac_read_search` / macOS `ioreg`); it is
+  also dispatchable on-demand via the audited instruction path. Server:
+  `DeviceInventoryStore` (born-on-PG, schema `device_inventory_store`, one row per agent;
+  ingest via `device_ci_ingestion.*` on both the direct `ReportInventory` and gateway
+  `ProxyInventory` paths). `last_seen`/`first_seen` are the server receipt time (#1685).
+  Suppressed by `--inventory-disable` along with the other sources. Observability:
+  `yuzu_inventory_ingest_total{source="device_ci"}`,
+  `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`,
+  `yuzu_inventory_read_degrade_total{source="device_ci"}`; the store joins `/readyz` +
+  `/healthz`. The operator-facing read surface (the `/inventory` Devices tab) ships in PR2.
 - **`/auto` VERIFY — before/after application-performance evidence (UAT non-functional).** A third
   stage on the `/auto` page (after ASSESS pre-flight and ACT deploy): did upgrading an app from one
   version to the next change how the **same machines** perform? The shift is computed **per machine,

@@ -45,6 +45,7 @@
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
@@ -340,8 +341,9 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal",
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(installed_software/device_ci). /readyz stays green under pure pool "
+                          "saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -2111,6 +2113,25 @@ public:
             }
         }
 
+        // Typed device-CI projection — born-on-Postgres (ADR-0016 device_ci source).
+        // Stable hardware/OS identity (a CMDB CI record), 1:1 per agent. Independent
+        // of the stores above (its own schema, its own fail-closed). Wires BOTH server
+        // entry points (direct ReportInventory + gateway ProxyInventory).
+        if (pg_pool_ && !startup_failed_) {
+            device_inventory_store_ = std::make_unique<DeviceInventoryStore>(*pg_pool_);
+            if (!device_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: device inventory store migration/open failed "
+                              "(database reachable but the device_inventory_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                device_inventory_store_->set_metrics(&metrics_);
+                agent_service_.set_device_inventory_store(device_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_device_inventory_store(device_inventory_store_.get());
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -3102,6 +3123,12 @@ public:
         app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_cohort_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_daily_store_.reset();
+        // Device-CI store: same discipline — null the borrowed pointers in both ingest
+        // services, then drop the store, BEFORE the pool.
+        agent_service_.set_device_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_device_inventory_store(nullptr);
+        device_inventory_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -4605,12 +4632,14 @@ private:
                 software_inventory_store_ && software_inventory_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
+            bool device_inventory_ok =
+                device_inventory_store_ && device_inventory_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok;
+                                 app_perf_fleet_ok && device_inventory_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4629,7 +4658,8 @@ private:
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
-                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"}}},
+                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
+                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4794,6 +4824,10 @@ private:
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
                  app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
+                // ADR-0016 device-CI born-on-Pg store — same rationale as the
+                // software_inventory_store row above (silent no-ingest ack if dead).
+                {"device_inventory_store",
+                 device_inventory_store_ && device_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -10385,6 +10419,7 @@ private:
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
+    std::unique_ptr<DeviceInventoryStore> device_inventory_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;

@@ -82,6 +82,8 @@ This table is the source of truth for what each plugin requires. When you add a 
 | `os_info.*` | default | default | default |
 | `network_config.*` | default | default | default |
 | `installed_apps.*`, `msi_packages.*` | default | default | default |
+| `hardware.*` (manufacturer/model/bios/cpu/memory/disks) | default | default | default |
+| `hardware.system` (serial + system UUID) | default (`ioreg`) | `cap_dac_read_search` — `/sys/class/dmi/id/product_serial` + `product_uuid` are `0400`; the agent binary already carries this cap (set for `tar.*` /proc reads). Without it (`--no-setcap`) the values read back as the literal `"unknown"`. | default (WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`) |
 | `event_logs.*` | default | `systemd-journal` group | `Event Log Readers` group; `Security` log additionally needs `SeSecurityPrivilege` |
 | DEX journald collector (`dex_linux_journal.cpp` + `dex_linux_kmsg.cpp`, built-in — not a plugin) | n/a | `systemd-journal` group (one `journalctl --after-cursor -o json` shell-out serving unit-health, coredump, OOM, **kernel ring-buffer** (panic/disk/fs/MCE/hung-task), and **chrony time-sync** signals; no elevated capability). `/proc` + `/sys` polls (perf, disk latency via `/proc/diskstats`, thermal throttle via `/sys`) read world-readable files — no group required. | n/a |
 | `services.list`, `services.running` | default | default | default |
