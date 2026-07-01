@@ -285,6 +285,7 @@ if build_server
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
+      'unit/server/test_result_set_maintenance.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
       'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',

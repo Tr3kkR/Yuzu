@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <unordered_map>
@@ -20,6 +21,23 @@ namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
+
+// Coarse cardinality tier for the yuzu_result_set_resolve_seconds histogram
+// label (design docs/scope-walking-design.md §9). Bounded to six values so the
+// label never explodes Prometheus series cardinality.
+static const char* cardinality_bucket(std::size_t n) {
+    if (n <= 1)
+        return "1";
+    if (n <= 10)
+        return "10";
+    if (n <= 100)
+        return "100";
+    if (n <= 1000)
+        return "1k";
+    if (n <= 10000)
+        return "10k";
+    return "100k+";
+}
 
 // -- AgentRegistry ------------------------------------------------------------
 
@@ -1136,7 +1154,19 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         for (const auto& rsid : refs) {
             if (rs_members.contains(rsid))
                 continue;
+            const auto resolve_t0 = std::chrono::steady_clock::now();
             auto mem = rs_store->member_set_owned(rsid, owner);
+            // Resolve latency by cardinality tier (design §9, 15.G). The
+            // owner-checked member fetch is the real "resolve a result set to its
+            // device set" cost; the cheap alias->id lookup upstream is not timed.
+            const double resolve_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - resolve_t0)
+                    .count();
+            metrics_
+                .histogram("yuzu_result_set_resolve_seconds",
+                           {{"cardinality_bucket", cardinality_bucket(mem.size())}},
+                           yuzu::Histogram::default_buckets())
+                .observe(resolve_s);
             // Touch only sets we actually own (non-empty owned membership): keeps
             // a set actively used as scope from being GC'd mid-investigation
             // (review finding I), and never extends another operator's set TTL.

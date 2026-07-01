@@ -60,6 +60,7 @@
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_maintenance.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
@@ -325,6 +326,24 @@ public:
         // hot per-acquire observe path uses the cheap name-only lookup and never
         // allocates a throwaway bucket vector per acquire.
         metrics_.histogram("yuzu_pg_acquire_wait_seconds", yuzu::Histogram::seconds_buckets_60s());
+        // Scope-walking result-set observability (Phase 15.G).
+        metrics_.describe("yuzu_result_sets_total",
+                          "Result sets created, by source_kind and result "
+                          "(materialized/pending/materialize_failed)",
+                          "counter");
+        metrics_.describe("yuzu_result_sets_alive",
+                          "Live result sets currently held, by pinned state", "gauge");
+        metrics_.describe("yuzu_result_set_gc_total",
+                          "Expired unpinned result sets removed by the background GC sweep",
+                          "counter");
+        metrics_.describe("yuzu_result_set_quota_rejected",
+                          "Result-set create/pin requests rejected for exceeding a per-operator "
+                          "quota (RESULT_SET_QUOTA / PIN_LIMIT)",
+                          "counter");
+        metrics_.describe("yuzu_result_set_resolve_seconds",
+                          "Latency to resolve a from_result_set: scope to its owner-checked device "
+                          "set, by cardinality tier",
+                          "histogram");
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
@@ -8509,14 +8528,15 @@ private:
                             }
                         }
 
-                        // 2) GC sweep on the slow cadence.
+                        // 2) GC sweep on the slow cadence (Phase 15.G): remove expired
+                        //    unpinned sets, bump yuzu_result_set_gc_total, and write the
+                        //    aggregate result_set.gc_sweep audit row (shared helper so a
+                        //    unit test drives the same path).
                         if (++tick % kGcEveryNTicks == 0) {
-                            int swept = result_set_store_->gc_sweep();
-                            if (swept > 0) {
-                                metrics_.counter("yuzu_result_set_gc_total")
-                                    .increment(static_cast<double>(swept));
+                            int swept =
+                                run_result_set_gc(*result_set_store_, audit_store_.get(), metrics_);
+                            if (swept > 0)
                                 spdlog::info("result-set GC swept {} expired set(s)", swept);
-                            }
                         }
 
                         // 3) Refresh alive gauges.

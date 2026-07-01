@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Scope-walking result-set operational hardening complete (Phase 15.G).** Added the
+  `yuzu_result_set_resolve_seconds` Prometheus histogram (resolve latency bucketed by result-set
+  cardinality tier, observed in `AgentRegistry::evaluate_scope`) and `describe()` HELP/TYPE for all
+  result-set metrics. Completed the audit trail: `result_set.live_reeval` (links a re-eval sibling
+  back to the original) and an aggregate system-principal `result_set.gc_sweep` row emitted by the
+  background GC sweep. The GC sweep now runs through a shared, unit-tested `run_result_set_gc` helper
+  (`result_set_maintenance.{hpp,cpp}`). See `docs/scope-walking-design.md` §9.
+
 ## [0.13.0] - 2026-07-01
 
 ### Added

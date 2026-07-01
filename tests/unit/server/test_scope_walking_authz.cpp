@@ -99,6 +99,43 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
     }
 }
 
+// ── Resolve-latency histogram (Phase 15.G) ───────────────────────────────────
+
+TEST_CASE("evaluate_scope: records yuzu_result_set_resolve_seconds by cardinality tier",
+          "[scope][result_set][metrics]") {
+    yuzu::test::TempDbFile rs_db{std::string_view{"scope-hist-rs-"}};
+    ResultSetStore store(rs_db.path);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.name = "alice-suspects";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"}); // cardinality 1 → bucket "1"
+    REQUIRE(set.has_value());
+
+    auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+    REQUIRE(expr.has_value());
+
+    // Nothing observed into the "1" cardinality bucket before the resolve.
+    CHECK(metrics.histogram("yuzu_result_set_resolve_seconds", {{"cardinality_bucket", "1"}})
+              .snapshot()
+              .count == 0);
+
+    registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+
+    // The owner-checked member resolve was timed into the "1" bucket exactly once.
+    CHECK(metrics.histogram("yuzu_result_set_resolve_seconds", {{"cardinality_bucket", "1"}})
+              .snapshot()
+              .count == 1);
+}
+
 // ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
 
 TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners",

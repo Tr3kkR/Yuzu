@@ -47,6 +47,10 @@ struct DispatchCall {
     std::string execution_id;
 };
 
+struct AuditRow {
+    std::string action, result, target_id, detail;
+};
+
 struct SqliteHandleGuard {
     sqlite3* db{nullptr};
     ~SqliteHandleGuard() {
@@ -68,6 +72,7 @@ struct AsyncHarness {
 
     // Fake-dispatch knobs / recording.
     std::vector<DispatchCall> calls;
+    std::vector<AuditRow> audit_log;
     int dispatch_sent{2};   // agents "reached" by each dispatch
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
@@ -92,8 +97,10 @@ struct AsyncHarness {
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audit_log.push_back({action, result, target_id, detail});
             return true;
         };
 
@@ -333,6 +340,15 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     auto row = h.store->get(new_id);
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == grandparent);
+
+    // Audit polish (Phase 15.G): a result_set.live_reeval row links the sibling
+    // back to the original (target_id = original, detail carries new_id).
+    bool linked = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "result_set.live_reeval" && a.target_id == orig_id &&
+            a.detail.find("new_id=" + new_id) != std::string::npos)
+            linked = true;
+    CHECK(linked);
 }
 
 TEST_CASE("re-eval: unsupported source_kind is 400", "[result_set][async][reeval]") {
