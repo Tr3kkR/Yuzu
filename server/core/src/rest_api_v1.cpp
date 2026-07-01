@@ -12,12 +12,14 @@
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
 #include <yuzu/server/auth_db.hpp> // is_valid_username
+#include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -755,6 +757,9 @@ const std::string& openapi_spec() {
     },
     "/dex/perf/group": {
       "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id) — NOT audited. Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped principal does not pass the global check and cannot use this endpoint, so the only callers who reach it already have unscoped fleet-wide read — no cross-operator exposure. Scoped operators are excluded by design, not by an unfinished control.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
+    },
+    "/dex/perf/compare": {
+      "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): a sub-floor paired set carries small_cohort=true (render 'indicative'), never suppression; insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
     },
     "/network/fleet": {
       "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
@@ -6713,6 +6718,153 @@ void RestApiV1::register_routes(
                                         .add("version", version)
                                         .add("floor", static_cast<int64_t>(kDexCohortFloor))
                                         .raw("points", points.str())
+                                        .str()),
+                            "application/json");
+        });
+
+    // GET /dex/perf/compare?app=&group=&baseline=&candidate=&window= — the /auto
+    // VERIFY before/after: the cohort-PAIRED app-perf comparison. For each machine
+    // in `group` that ran BOTH versions in-window, a per-machine delta is computed
+    // then aggregated (population held fixed — see app_perf_compare.hpp). EVIDENTIAL
+    // only: measured shift + the up/flat/down split, NO verdict, NO threshold.
+    //
+    // NO cohort floor: real canaries are 2-3 devices, so a floor would gut the
+    // feature; a sub-kDexCohortFloor paired set carries small_cohort=true so the
+    // caller marks it "indicative". The aggregate carries NO per-machine row (that
+    // PII is the audited dashboard drill only) — but an unfloored small-cohort
+    // aggregate is near-individual, so the read IS audited: dex.app_perf.compare,
+    // OPERATIONAL set-and-proceed (records who compared whose canary — the
+    // works-council accountability that REPLACES the floor's suppression; grilled
+    // 2026-06-30, the audit is load-bearing precisely because there is no floor).
+    //
+    // Authz: GLOBAL perm_fn (Read), exactly like /dex/perf/group (see that handler
+    // for why scoped-only principals never reach it — the cohort posture).
+    sink.Get(
+        "/api/v1/dex/perf/compare",
+        [perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+                                                httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!app_perf_providers.cohort) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            // group, app, baseline, candidate — all required + shared-cap valid.
+            auto require_param = [&](const char* name, std::string& out) -> bool {
+                out = req.has_param(name) ? req.get_param_value(name) : "";
+                if (out.empty()) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, std::string("missing required parameter '") + name + "'",
+                                        cid),
+                                    "application/json");
+                    return false;
+                }
+                if (!app_perf_param_valid(out)) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, std::string("invalid parameter '") + name + "'", cid,
+                                        "must be <= 512 bytes with no control characters"),
+                                    "application/json");
+                    return false;
+                }
+                return true;
+            };
+            std::string group_id, app, baseline, candidate;
+            if (!require_param("group", group_id) || !require_param("app", app) ||
+                !require_param("baseline", baseline) || !require_param("candidate", candidate))
+                return;
+            if (yuzu::util::canon_version(baseline) == yuzu::util::canon_version(candidate)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(
+                                    400, "baseline and candidate must differ", cid,
+                                    "a before/after compare needs two distinct versions"),
+                                "application/json");
+                return;
+            }
+            int window = 7; // days each side
+            if (req.has_param("window")) {
+                char* end = nullptr;
+                const std::string w = req.get_param_value("window");
+                const long v = std::strtol(w.c_str(), &end, 10);
+                if (end != w.c_str() && *end == '\0')
+                    window = static_cast<int>(v);
+            }
+            window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
+
+            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate, window);
+            if (!cohort) { // AUTHORITATIVE degrade (member resolution OR row read)
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf cohort read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            const PairedComparison c =
+                build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
+                                 yuzu::util::canon_version(candidate), window);
+            const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+
+            // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
+            // aggregate, the per-machine drill is the fail-closed surface). Records
+            // who compared whose canary; the header flags a lost evidence row. The
+            // detail carries `paired=` so a singleton (paired=1) aggregate — which IS
+            // individual data — is distinguishable in the audit log (gov UP-7), and
+            // `view=aggregate` matches the dashboard sibling + the documented contract.
+            detail::emit_behavioral_audit(
+                audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
+                "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
+                    audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                    " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
+
+            const std::string cpu = JObj()
+                                        .add("before_mean", c.cpu_before_mean)
+                                        .add("after_mean", c.cpu_after_mean)
+                                        .add("delta_median", c.cpu_delta_median)
+                                        .add("before_p95", c.cpu_before_p95)
+                                        .add("after_p95", c.cpu_after_p95)
+                                        .str();
+            const std::string ws = JObj()
+                                       .add("before_mean", c.ws_before_mean)
+                                       .add("after_mean", c.ws_after_mean)
+                                       .add("delta_median", c.ws_delta_median)
+                                       .add("before_p95", c.ws_before_p95)
+                                       .add("after_p95", c.ws_after_p95)
+                                       .str();
+            const std::string dist = JObj()
+                                         .add("up", c.moved_up)
+                                         .add("flat", c.moved_flat)
+                                         .add("down", c.moved_down)
+                                         .str();
+            res.set_content(ok_json(JObj()
+                                        .add("app", app)
+                                        .add("group_id", group_id)
+                                        .add("baseline_version", baseline)
+                                        .add("candidate_version", candidate)
+                                        .add("window_days", static_cast<int64_t>(window))
+                                        .add("cohort_size", cohort->member_count)
+                                        .add("paired", c.paired)
+                                        .add("baseline_only", c.baseline_only)
+                                        .add("candidate_only", c.candidate_only)
+                                        .add("no_data", no_data)
+                                        .add("small_cohort", c.small_cohort)
+                                        .add("insufficient", c.insufficient)
+                                        // truncated=true → the cohort exceeded the read
+                                        // cap; the counts above are UNRELIABLE (a machine
+                                        // that ran both may be mis-read as baseline_only).
+                                        .add("truncated", cohort->truncated)
+                                        .raw("cpu", cpu)
+                                        .raw("ws", ws)
+                                        .raw("distribution", dist)
                                         .str()),
                             "application/json");
         });

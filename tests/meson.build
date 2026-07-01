@@ -307,6 +307,7 @@ if build_server
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_dex_alert_router.cpp',
@@ -370,6 +371,7 @@ if build_server
       'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_app_perf_rollup.cpp',
       'unit/server/test_app_perf_group_reader.cpp',
+      'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
     ),
     include_directories: [

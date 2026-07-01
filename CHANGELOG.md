@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/auto` VERIFY — before/after application-performance evidence (UAT non-functional).** A third
+  stage on the `/auto` page (after ASSESS pre-flight and ACT deploy): did upgrading an app from one
+  version to the next change how the **same machines** perform? The shift is computed **per machine,
+  paired** — each device's own baseline-version window vs its own candidate-version window (read from
+  the shipped per-device B1 store, the window anchored to that machine's transition, **not** to
+  "today" — so a staggered rollout still pairs), then the per-machine deltas are aggregated. A fleet
+  baseline-vs-candidate diff would be confounded by different populations; pairing on the machine
+  holds it fixed. A machine that ran only one version in-window is **excluded and counted**, never
+  imputed. **Evidential only — there is no verdict, no threshold, no pass/fail**: the tool reports the
+  measured shift (CPU/working-set before→after means, the median per-machine delta, p95 across
+  machines) and the up/flat/down split; the operator (or an AI colleague over MCP) judges. There is
+  **no cohort floor** — real canaries are 2–3 devices, so a floor would gut the feature; a sub-floor
+  paired set is flagged *indicative*, never suppressed, and the read is **audited**
+  (`dex.app_perf.compare`, operational) — accountability standing in for the suppression a floor
+  would give. Surfaces (all `GuaranteedState:Read`): REST `GET /api/v1/dex/perf/compare`, MCP
+  `compare_app_perf_versions`, and the `/auto` dashboard VERIFY stage (aggregate cards + distribution
+  + an audited per-machine drill). Pure engine `app_perf_compare` (reducer + `compare` split so a
+  later *live* candidate plugs the same slot); B1 cohort read `app_perf_cohort_reader` (agent_id
+  preserved). The per-machine pairs are a **dashboard-only** audited drill
+  (`dex.app_perf.compare.drill`); REST/MCP expose only the identity-free aggregate.
+  Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
+  central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
+  deploy→verify cohort auto-fill.
+
 ## [0.13.0] - 2026-07-01
 
 ### Added
