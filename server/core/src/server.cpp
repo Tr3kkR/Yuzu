@@ -9180,13 +9180,12 @@ private:
             // is never attached, never rendered. A degrade (nullopt) leaves CI columns
             // blank — the roster itself is still shown (this list is best-effort, unlike
             // the Software tab's authoritative reads; see the existing empty-roster note).
-            // KNOWN FOLLOW-UP (gov Gate 3 performance + architect review): this reads the
-            // WHOLE fleet's CI on every render regardless of how few devices are visible,
-            // unlike the Software tab's hourly rollup (software_catalog_rollup.cpp) which
-            // exists specifically to avoid this read-cadence-vs-write-cadence mismatch for
-            // daily-synced data. Deferred rather than fixed here to keep this PR scoped to
-            // dashboard-read enrichment; track a scoped list_device_ci_for(agent_ids) or a
-            // rollup-style cache as a follow-up issue.
+            // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
+            // review): this reads the WHOLE fleet's CI on every render regardless of how
+            // few devices are visible, unlike the Software tab's hourly rollup
+            // (software_catalog_rollup.cpp) which exists specifically to avoid this
+            // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
+            // than fixed here to keep this PR scoped to dashboard-read enrichment.
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
                 if (ci_list) {

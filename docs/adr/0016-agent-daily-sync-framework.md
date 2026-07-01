@@ -308,8 +308,24 @@ user) over time triggers EU works-council co-determination review regardless of
 per-user data. The collection is still **machine-scope** (no username/SID/user
 path). The existing **`--inventory-disable`** flag is the collection toggle and
 covers `device_ci` at the same gate as the other sources (it gates the whole
-daily-sync thread). A DPIA / Workstream-E data-inventory entry for centralizing
-serial/UUID/MAC is a pre-correlation-PR assurance item.
+daily-sync thread).
+
+**DPIA status update (gov Gate 6 compliance-officer, PR2).** The line above
+originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
+item" — written when this data was store-only (central Postgres, no operator
+surface). That framing is now stale: the `/inventory` Devices tab CI columns +
+per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+**operator-visible** for the first time, which is a co-determination trigger
+point distinct from mere central storage (works-council review is about
+monitoring *capability becoming exercised*, not just data existing in a DB).
+The interim posture — already-permissioned operators, management-group scoped,
+audited via the behavioural-PII tier (`emit_behavioral_audit`) — is a
+defensible control pending the DPIA, not a reason to withhold the read surface.
+But the DPIA / Workstream-E data-inventory entry for centralizing
+serial/UUID/MAC is now an **outstanding item that applies to a live,
+operator-visible surface**, not a future-tense placeholder — track it as a
+dated, owned issue (see the SOC2 Workstream E data-inventory doc) rather than
+leaving it as prose here.
 
 **Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
 correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
