@@ -131,13 +131,26 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Setup vcpkg
+        # Mirror ci.yml (Setup vcpkg) and the Windows/macOS release jobs: clone
+        # vcpkg into the workspace at the pinned VCPKG_COMMIT and invoke it by
+        # full path below. The Linux release job previously ran a bare `vcpkg`,
+        # which relied on a runner-global vcpkg on PATH — true on the retired
+        # Shulgi runner, but the Big Tam (yuzu-bigtam-linux) pool has no `vcpkg`
+        # on the non-login GHA PATH, so the install died with
+        # "vcpkg: command not found" (exit 127).
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
       - name: vcpkg sentinel (x64-linux-static)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-static
 
       - name: Install vcpkg packages (static linkage)
         run: |
-          vcpkg install --triplet x64-linux-static \
+          ${{ github.workspace }}/vcpkg/vcpkg install --triplet x64-linux-static \
             --overlay-triplets=${{ github.workspace }}/triplets \
             --x-manifest-root=${{ github.workspace }}
 
