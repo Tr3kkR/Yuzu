@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -49,21 +50,22 @@ void InventoryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
-                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
-                                      AuditFn audit_fn) {
+                                      DevicesFn devices_fn, AgentCiFn agent_ci_fn, ScopeFn scope_fn,
+                                      StaleFn stale_fn, AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
                     std::move(catalog_fn), std::move(catalog_meta_fn), std::move(versions_fn),
                     std::move(fleet_fn), std::move(agent_sw_fn), std::move(devices_fn),
-                    std::move(scope_fn), std::move(stale_fn), std::move(audit_fn));
+                    std::move(agent_ci_fn), std::move(scope_fn), std::move(stale_fn),
+                    std::move(audit_fn));
 }
 
 void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
-                                      DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
-                                      AuditFn audit_fn) {
+                                      DevicesFn devices_fn, AgentCiFn agent_ci_fn, ScopeFn scope_fn,
+                                      StaleFn stale_fn, AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -73,6 +75,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     fleet_fn_ = std::move(fleet_fn);
     agent_sw_fn_ = std::move(agent_sw_fn);
     devices_fn_ = std::move(devices_fn);
+    agent_ci_fn_ = std::move(agent_ci_fn);
     scope_fn_ = std::move(scope_fn);
     stale_fn_ = std::move(stale_fn);
     audit_fn_ = std::move(audit_fn);
@@ -159,12 +162,16 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  std::vector<InventoryDeviceRow> rows;
                  if (devices_fn_)
                      rows = devices_fn_(session->username);
-                 // Audit the identity-bearing roster read (hostnames + agent_ids) for parity
-                 // with the other inventory surfaces (gov review #1759). Set-and-proceed via
-                 // the throw-safe kernel — scope-confined at devices_fn_, machine-scope data.
+                 // Audit the identity-bearing roster read (hostnames + agent_ids + PR2's
+                 // device-CI columns, incl. serial) for parity with the other inventory
+                 // surfaces (gov review #1759). Set-and-proceed via the throw-safe kernel —
+                 // scope-confined at devices_fn_, machine-scope data. The detail string
+                 // records that CI identifiers ride this bulk read (vs the per-device drill's
+                 // own inventory.device.ci verb) so the disclosure is visible in the log.
                  (void)detail::try_persist_audit(audit_fn_, req, "inventory.devices", "success",
                                                  "Inventory", "fleet",
-                                                 "devices=" + std::to_string(rows.size()));
+                                                 "devices=" + std::to_string(rows.size()) +
+                                                     " (incl. CI columns: serial/model/cpu/ram)");
                  send_html(res, render_inventory_devices_fragment(rows, "", "", ""));
              });
 
@@ -192,7 +199,30 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      audit_fn_, req, "inventory.device.software", sw ? "success" : "failure",
                      "Inventory", "agent=" + id,
                      sw ? ("rows=" + std::to_string(sw->size())) : "store degraded");
-                 send_html(res, render_inventory_device_software_fragment(id, host, sw, online));
+
+                 // CI record (PR2). An unwired closure is treated the same as a live
+                 // store failure (mirrors agent_sw_fn_ unwired -> nullopt -> degrade
+                 // banner) — a real deployment always wires this.
+                 std::expected<std::optional<DeviceCiRecord>, CiReadError> ci =
+                     std::unexpected(CiReadError::kDegraded);
+                 if (agent_ci_fn_)
+                     ci = agent_ci_fn_(id);
+                 // Separate, distinctly-countable audit verb (serial/UUID/MAC are
+                 // device-identifying) — parity with the tar.dns.read + tar.arp.read
+                 // pair. Reading OK even when the record is genuinely absent (a value
+                 // holding std::nullopt) is "success", not "failure" — only the
+                 // kDegraded store-failure case is a failure.
+                 (void)detail::try_persist_audit(
+                     audit_fn_, req, "inventory.device.ci", ci.has_value() ? "success" : "failure",
+                     "Inventory", "agent=" + id,
+                     !ci.has_value()   ? "store degraded"
+                     : ci->has_value() ? "found"
+                                       : "absent");
+                 const std::int64_t now_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                                    std::chrono::system_clock::now().time_since_epoch())
+                                                    .count();
+                 send_html(res, render_inventory_device_software_fragment(id, host, sw, online, ci,
+                                                                          now_secs));
              });
 
     // -- FIND shell (search box + empty results container) --

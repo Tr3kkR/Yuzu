@@ -77,6 +77,7 @@
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
@@ -167,6 +168,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -9167,6 +9169,25 @@ private:
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
                 out.push_back(std::move(r));
             }
+            // Device-CI enrichment (PR2): one list_device_ci(0) read (symmetric with the
+            // full offline_endpoint_store_ materialize above), joined by agent_id via the
+            // pure attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
+            // visible-confined roster (the loop above already dropped out-of-scope
+            // agents) — attach_device_ci only ever looks up by an agent_id already in
+            // `out`, so a CI row for an out-of-scope agent riding along in the same read
+            // is never attached, never rendered. A degrade (nullopt) leaves CI columns
+            // blank — the roster itself is still shown (this list is best-effort, unlike
+            // the Software tab's authoritative reads; see the existing empty-roster note).
+            if (device_inventory_store_) {
+                auto ci_list = device_inventory_store_->list_device_ci(0);
+                if (ci_list) {
+                    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
+                    ci_by_agent.reserve(ci_list->size());
+                    for (auto& rec : *ci_list)
+                        ci_by_agent.emplace(rec.agent_id, std::move(rec));
+                    attach_device_ci(out, ci_by_agent);
+                }
+            }
             return out;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
@@ -9200,6 +9221,16 @@ private:
                 return software_inventory_store_->get_agent_software(id);
             },
             inv_devices_fn,
+            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
+            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
+            // closure is always wired when device_inventory_store_ exists, and returns a
+            // live kDegraded when it doesn't (the store itself failed to construct/open).
+            [this](const std::string& id)
+                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
+                if (!device_inventory_store_)
+                    return std::unexpected(CiReadError::kDegraded);
+                return device_inventory_store_->get_device_ci(id);
+            },
             // FIND per-row Inventory:Read management-group scope predicate — the SAME
             // check_scoped_permission chokepoint the REST route + MCP tool use.
             // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on

@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -124,11 +125,16 @@ TEST_CASE("versions fragment: degrade banner vs empty vs share bars", "[inventor
 }
 
 TEST_CASE("device-software fragment: degrade vs empty vs rows; offline note", "[inventory][ui]") {
-    REQUIRE(contains(render_inventory_device_software_fragment("a1", "HOST", std::nullopt, true),
+    // Absent (a value holding std::nullopt) — CI is orthogonal to these assertions.
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> ci_absent{std::nullopt};
+
+    REQUIRE(contains(render_inventory_device_software_fragment("a1", "HOST", std::nullopt, true,
+                                                               ci_absent, 2000),
                      "unavailable"));
 
     const std::string empty = render_inventory_device_software_fragment(
-        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true);
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        ci_absent, 2000);
     REQUIRE(contains(empty, "No installed software recorded"));
     REQUIRE_FALSE(contains(empty, "unavailable"));
 
@@ -137,12 +143,65 @@ TEST_CASE("device-software fragment: degrade vs empty vs rows; offline note", "[
     e.version = "4.38";
     const std::string offline = render_inventory_device_software_fragment(
         "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{e}),
-        /*online=*/false);
+        /*online=*/false, ci_absent, 2000);
     REQUIRE(contains(offline, "Slack"));
     REQUIRE(contains(offline, "offline")); // the "last daily sync, not live" note
 }
 
-TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory][ui]") {
+TEST_CASE("device-CI panel: degrade vs absent vs found; sentinel + humanized fields",
+          "[inventory][ui]") {
+    // std::unexpected(kDegraded) -> a degrade banner, distinct wording from "no CI record"
+    // (ADR-0016 §7 authoritative-read honesty — never conflate the two).
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> degraded =
+        std::unexpected(CiReadError::kDegraded);
+    const std::string deg = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        degraded, 2000);
+    REQUIRE(contains(deg, "CI record unavailable"));
+    REQUIRE_FALSE(contains(deg, "No CI record synced"));
+
+    // A value holding std::nullopt -> genuinely not synced yet, NOT a degrade.
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> absent{std::nullopt};
+    const std::string abs = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        absent, 2000);
+    REQUIRE(contains(abs, "No CI record synced"));
+    REQUIRE_FALSE(contains(abs, "unavailable"));
+
+    // A found record renders the grid; humanized CPU/RAM; the "unknown" sentinel (a
+    // genuinely serial-less VM) renders as a placeholder, never the raw word.
+    DeviceCiRecord rec;
+    rec.manufacturer = "Dell Inc.";
+    rec.model = "OptiPlex 7090";
+    rec.serial = "unknown";
+    rec.system_uuid = "ABC-123";
+    rec.cpu_model = "Intel Core i7";
+    rec.cpu_cores = "8";
+    rec.cpu_threads = "16";
+    rec.ram_bytes = "17179869184"; // 16 GiB
+    rec.primary_mac = "AA:BB:CC:DD:EE:FF";
+    rec.os_name = "Windows";
+    rec.os_version = "11";
+    rec.os_build = "22631";
+    rec.arch = "x86_64";
+    rec.first_seen = 1000;
+    rec.last_seen = 1900;
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> found{
+        std::optional<DeviceCiRecord>(rec)};
+    const std::string html = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        found, 2000);
+    REQUIRE(contains(html, "Dell Inc."));
+    REQUIRE(contains(html, "OptiPlex 7090"));
+    REQUIRE(contains(html, "ABC-123"));
+    REQUIRE(contains(html, "8c/16t"));
+    REQUIRE(contains(html, "16.0 GB"));
+    REQUIRE(contains(html, "AA:BB:CC:DD:EE:FF"));
+    REQUIRE(contains(html, "&mdash;"));      // the "unknown" serial's placeholder
+    REQUIRE_FALSE(contains(html, ">unknown<")); // never rendered as raw text
+}
+
+TEST_CASE("devices fragment: real CI columns + offline-inclusive rows", "[inventory][ui]") {
     std::vector<InventoryDeviceRow> rows;
     InventoryDeviceRow on;
     on.agent_id = "a1";
@@ -150,6 +209,12 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     on.os = "windows";
     on.online = true;
     on.last_seen = "now";
+    // Device-CI enrichment (PR2) — as attach_device_ci would fill it in.
+    on.ci_serial = "SN12345";
+    on.ci_model = "OptiPlex 7090";
+    on.ci_cpu_cores = "8";
+    on.ci_cpu_threads = "16";
+    on.ci_ram_bytes = "17179869184"; // 16 GiB
     InventoryDeviceRow off;
     off.agent_id = "a2";
     off.hostname = "UB-2";
@@ -157,6 +222,7 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     off.online = false;
     off.stale = true;
     off.last_seen = "3d ago";
+    // off's ci_* fields are left default-empty — no CI synced yet for this agent.
     rows.push_back(on);
     rows.push_back(off);
     const std::string html = render_inventory_devices_fragment(rows, "", "", "");
@@ -166,6 +232,13 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     REQUIRE(contains(html, "stale"));
     // The per-device drill carries host + online into the URL.
     REQUIRE(contains(html, "/fragments/inventory/device?id=a1&host=WIN-1&online=1"));
+    // Real CI columns for the enriched row.
+    REQUIRE(contains(html, "SN12345"));
+    REQUIRE(contains(html, "OptiPlex 7090"));
+    REQUIRE(contains(html, "8c/16t"));
+    REQUIRE(contains(html, "16.0 GB"));
+    // The un-synced row's CI cells fall back to the placeholder, not a blank/garbage cell.
+    REQUIRE(contains(html, "&mdash;"));
 }
 
 TEST_CASE("find results: truncated + omitted signals; degrade vs empty", "[inventory][ui]") {
@@ -198,6 +271,7 @@ struct InvHarness {
     bool allow_perm = true;          // global Inventory:Read
     bool allow_scoped = true;        // per-device scoped Inventory:Read
     bool degrade = false;            // make every store provider return nullopt
+    std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
     std::vector<std::string> audits;          // "action|result"
@@ -258,6 +332,12 @@ struct InvHarness {
             r.last_seen = "now";
             return std::vector<InventoryDeviceRow>{r};
         };
+        auto ci_fn = [this](const std::string&)
+            -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
+            if (degrade)
+                return std::unexpected(CiReadError::kDegraded);
+            return ci_record; // nullopt (default) = absent; set to a record = found
+        };
         auto scope = [this](const std::string&, const std::string& agent_id) {
             for (const auto& a : in_scope_agents)
                 if (a == agent_id)
@@ -274,7 +354,7 @@ struct InvHarness {
             return true;
         };
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
-                               agent_sw, devices, scope, stale, audit);
+                               agent_sw, devices, ci_fn, scope, stale, audit);
     }
 };
 
@@ -333,6 +413,51 @@ TEST_CASE("route: per-device drill is scope-gated", "[inventory][route]") {
     auto ok = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
     REQUIRE(ok);
     REQUIRE(contains(ok->body, "Slack"));
+}
+
+TEST_CASE("route: per-device drill renders the CI panel + audits inventory.device.ci",
+          "[inventory][route]") {
+    {
+        // Default ci_record (nullopt) = absent, not yet synced -> "success" audit (a
+        // genuine absent read is not a failure), honest empty note in the body.
+        InvHarness h;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "No CI record synced"));
+        bool ok = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|success")
+                ok = true;
+        REQUIRE(ok);
+    }
+    {
+        // A found record -> the CI grid renders; audit is still "success".
+        InvHarness h;
+        DeviceCiRecord rec;
+        rec.serial = "SN-ROUTE-1";
+        h.ci_record = rec;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "SN-ROUTE-1"));
+        bool ok = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|success")
+                ok = true;
+        REQUIRE(ok);
+    }
+    {
+        // Degrade -> "failure" audit + a degrade banner (distinct from "absent").
+        InvHarness h;
+        h.degrade = true;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "CI record unavailable"));
+        bool failed = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|failure")
+                failed = true;
+        REQUIRE(failed);
+    }
 }
 
 TEST_CASE("route: find results apply the per-row management-group drop filter", "[inventory][route]") {

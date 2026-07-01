@@ -15,6 +15,7 @@
 
 #include "web_utils.hpp"
 
+#include <charconv>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,118 @@ std::string rel_time(std::int64_t now_secs, std::int64_t then_secs) {
     return std::to_string(d / 86400) + "d ago";
 }
 
+// Device-CI sentinel display (PR2): an empty string OR the literal "unknown" sentinel
+// (a serial-less VM / an agent that hasn't synced its CI record yet legitimately
+// persists "unknown" — device_inventory_store.hpp) both render as a muted placeholder,
+// never as raw text. Everything else escapes normally.
+std::string ci_disp(const std::string& s) {
+    if (s.empty() || s == "unknown")
+        return "<span class=\"inv-grey\">&mdash;</span>";
+    return esc(s);
+}
+
+// "8c/16t" from decimal-string cores/threads; "" (caller falls back to a placeholder)
+// when both are unknown/empty. Output is digits + literal ASCII suffixes only — safe
+// to emit unescaped.
+std::string ci_cores_threads(const std::string& cores, const std::string& threads) {
+    const bool has_cores = !cores.empty() && cores != "unknown";
+    const bool has_threads = !threads.empty() && threads != "unknown";
+    if (!has_cores && !has_threads)
+        return "";
+    std::string s;
+    if (has_cores)
+        s += cores + "c";
+    if (has_threads) {
+        if (!s.empty())
+            s += "/";
+        s += threads + "t";
+    }
+    return s;
+}
+
+// Humanize a decimal-string byte count into "N.N GB". Tolerant of "unknown" / empty /
+// unparsable input -> "" (caller falls back to a placeholder) rather than risking a
+// misleading number from a partially-garbled value.
+std::string ci_ram_gb(const std::string& bytes_dec) {
+    if (bytes_dec.empty() || bytes_dec == "unknown")
+        return "";
+    unsigned long long v = 0;
+    const auto res = std::from_chars(bytes_dec.data(), bytes_dec.data() + bytes_dec.size(), v);
+    if (res.ec != std::errc{} || res.ptr != bytes_dec.data() + bytes_dec.size())
+        return "";
+    constexpr unsigned long long kGiB = 1024ULL * 1024 * 1024;
+    const unsigned long long tenths_gb = (v * 10) / kGiB;
+    return std::to_string(tenths_gb / 10) + "." + std::to_string(tenths_gb % 10) + " GB";
+}
+
+// Compact "CPU / RAM" list-cell content from the roster row's raw CI fields (never
+// escaped further — built only from digits + fixed ASCII literals via the helpers
+// above, or the pre-escaped ci_disp() placeholder).
+std::string ci_cpu_ram_cell(const InventoryDeviceRow& d) {
+    const std::string ct = ci_cores_threads(d.ci_cpu_cores, d.ci_cpu_threads);
+    const std::string ram = ci_ram_gb(d.ci_ram_bytes);
+    if (ct.empty() && ram.empty())
+        return "<span class=\"inv-grey\">&mdash;</span>";
+    std::string s;
+    if (!ct.empty())
+        s += ct;
+    if (!ram.empty()) {
+        if (!s.empty())
+            s += " &middot; ";
+        s += ram;
+    }
+    return s;
+}
+
+// The per-device CI record panel (PR2). Mirrors DeviceInventoryStore::get_device_ci's
+// three-state authoritative-read contract exactly: !ci.has_value() is a store/pool/
+// query degrade (banner, never mistaken for "no CI"); ci holding std::nullopt is a
+// genuine "not synced yet" (honest empty note); ci holding a record renders the grid.
+// Omits disks_summary (macOS do_disks positional-shape bug — deferred, see #1767
+// follow-ups) and owner/location (not agent-collected; future operator-set fields).
+std::string ci_panel(const std::expected<std::optional<DeviceCiRecord>, CiReadError>& ci,
+                     std::int64_t now_secs) {
+    if (!ci.has_value()) {
+        return "<div class=\"inv-degrade\"><b>CI record unavailable.</b> The device-CI store "
+               "could not be read (Postgres pool/query degraded). This is <b>not</b> \"no CI "
+               "record\" — reads here are authoritative, so this banner is shown instead of an "
+               "absent-record note. Retry shortly.</div>";
+    }
+    if (!ci->has_value()) {
+        return "<div class=\"inv-empty\">No CI record synced yet for this device (device-CI "
+               "daily sync, ADR-0016 — a freshly enrolled agent populates within ~24h).</div>";
+    }
+    const DeviceCiRecord& r = **ci;
+    auto field = [](const char* label, const std::string& val) {
+        return std::string("<div><span class=\"ci-lab\">") + label + ": </span>" + ci_disp(val) +
+               "</div>";
+    };
+    std::string h = "<div class=\"ci-grid\">";
+    h += field("Manufacturer", r.manufacturer);
+    h += field("Model", r.model);
+    h += field("Serial", r.serial);
+    h += field("System UUID", r.system_uuid);
+    h += field("Domain", r.domain);
+    h += field("OU", r.ou);
+    h += field("BIOS vendor", r.bios_vendor);
+    h += field("BIOS version", r.bios_version);
+    h += field("BIOS date", r.bios_date);
+    h += field("CPU", r.cpu_model);
+    h += field("Cores / threads", ci_cores_threads(r.cpu_cores, r.cpu_threads));
+    h += field("Memory", ci_ram_gb(r.ram_bytes));
+    h += field("Primary MAC", r.primary_mac);
+    h += field("All MACs", r.macs_summary);
+    h += field("NIC count", r.nic_count);
+    h += field("OS", r.os_name);
+    h += field("OS version", r.os_version);
+    h += field("OS build", r.os_build);
+    h += field("Architecture", r.arch);
+    h += field("First synced", rel_time(now_secs, r.first_seen));
+    h += field("Last synced", rel_time(now_secs, r.last_seen));
+    h += "</div>";
+    return h;
+}
+
 // Inlined component CSS — emitted once per top-level fragment so styling is present
 // on any tab entry point (duplicate <style> on a tab swap is idempotent/harmless).
 std::string inv_style() {
@@ -122,6 +235,8 @@ std::string inv_style() {
   .inv-panelh .t{color:var(--white,#fff);font-weight:700;font-size:.88rem}
   .inv-note{margin-top:1.2rem;font-size:.7rem;color:var(--muted,#8fa3bd);border-top:1px solid var(--border,#2d4068);padding-top:.6rem}.inv-note b{color:var(--lightblue,#a5d6ff)}
   .inv-grey{color:var(--slate,#6f86a6)}
+  .ci-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.3rem .9rem;font-size:.74rem;margin-bottom:.7rem}
+  .ci-grid .ci-lab{color:var(--muted,#8fa3bd);font-size:.62rem;text-transform:uppercase;letter-spacing:.03em}
 </style>)css";
 }
 
@@ -190,7 +305,8 @@ std::string render_inventory_software_fragment(
     h += "<div class=\"inv-kpis\">"
          "<div class=\"inv-kpi\"><div class=\"h\">Titles</div><div class=\"big\">" +
          titles +
-         "</div><div class=\"s2\">distinct installed-software names</div></div>"
+         "</div><div class=\"s2\">distinct installed-software names, fleet-wide (the search box "
+         "below filters the table only)</div></div>"
          "<div class=\"inv-kpi\"><div class=\"h\">Devices reporting</div><div class=\"big\">" +
          devices +
          "</div><div class=\"s2\">in the inventory</div></div>"
@@ -300,11 +416,12 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
                                               const std::string& /*status_token*/) {
     std::string h = page_head();
     h += inv_subnav("devices");
-    h += "<div class=\"inv-banner\"><b>Device CI inventory (thin).</b> Sourced from the persisted, "
-         "<b>offline-survivable</b> endpoint state (host / OS / last-seen) + the live registry's "
-         "online set — offline devices still appear. Click a device for its installed software. "
-         "The greyed columns (serial / model / CPU / RAM …) arrive with the device-CI sync "
-         "source.</div>";
+    h += "<div class=\"inv-banner\"><b>Device CI inventory.</b> Host / OS / last-seen are sourced "
+         "from the persisted, <b>offline-survivable</b> endpoint state + the live registry's "
+         "online set — offline devices still appear. Serial / model / CPU &amp; RAM come from the "
+         "daily device-CI sync (ADR-0016) and read <span class=\"inv-grey\">&mdash;</span> until a "
+         "device's first sync lands. Click a device for its full CI record + installed "
+         "software.</div>";
     h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter by hostname or "
          "OS…\" value=\"" +
          esc(q) + "\" oninput=\"gpSearch(this)\" data-gpf=\"invdev\"></div>";
@@ -332,8 +449,7 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
              " devices — refine with the filter (full per-page paging is a follow-up).</div>";
 
     h += "<table class=\"inv-tbl\"><thead><tr><th>Device</th><th>OS</th><th>Status</th>"
-         "<th>Last seen</th><th class=\"inv-grey\">Serial</th><th class=\"inv-grey\">Model</th>"
-         "<th class=\"inv-grey\">CPU / RAM</th></tr></thead><tbody>";
+         "<th>Last seen</th><th>Serial</th><th>Model</th><th>CPU / RAM</th></tr></thead><tbody>";
     for (std::size_t i = 0; i < shown; ++i) {
         const auto& d = rows[i];
         const std::string status = d.online ? "online" : (d.stale ? "stale" : "offline");
@@ -353,9 +469,9 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
              esc(d.hostname.empty() ? d.agent_id : d.hostname) + "</td><td><span class=\"inv-pill " +
              os_cls(d.os) + "\">" + os_label(d.os) + "</span></td><td>" + status_pill +
              "</td><td class=\"inv-pub\">" + esc(d.last_seen.empty() ? "?" : d.last_seen) +
-             "</td><td class=\"inv-grey inv-mono\">&mdash;</td>"
-             "<td class=\"inv-grey inv-mono\">&mdash;</td>"
-             "<td class=\"inv-grey inv-mono\">&mdash;</td></tr>";
+             "</td><td class=\"inv-mono\">" + ci_disp(d.ci_serial) + "</td>"
+             "<td class=\"inv-mono\">" + ci_disp(d.ci_model) + "</td>"
+             "<td class=\"inv-mono\">" + ci_cpu_ram_cell(d) + "</td></tr>";
     }
     h += "</tbody></table><div id=\"inv-drill\"></div></div>";
     return h;
@@ -363,17 +479,21 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
 
 std::string render_inventory_device_software_fragment(
     const std::string& agent_id, const std::string& hostname,
-    const std::optional<std::vector<SoftwareEntry>>& software, bool online) {
+    const std::optional<std::vector<SoftwareEntry>>& software, bool online,
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError>& ci, std::int64_t now_secs) {
     const std::string title = hostname.empty() ? agent_id : hostname;
     std::string h = "<div class=\"inv-panel\"><div class=\"inv-panelh\"><span class=\"t\">" +
-                    esc(title) + " &mdash; installed software</span>" +
+                    esc(title) + " &mdash; device record</span>" +
                     (online ? "<span class=\"inv-pill on\">online</span>"
                             : "<span class=\"inv-pill off\">offline</span>") +
                     "<a style=\"margin-left:auto\" "
                     "onclick=\"this.closest('#inv-drill').innerHTML=''\">close</a></div>"
-                    "<div style=\"padding:.55rem .9rem\">"
-                    "<div class=\"inv-grey\" style=\"font-size:.7rem;margin-bottom:.4rem\">CI record "
-                    "(serial · model · CPU · RAM · MAC …) arrives with the device-CI sync source.</div>";
+                    "<div style=\"padding:.55rem .9rem\">";
+    h += "<div class=\"inv-sub\" style=\"font-size:.62rem;text-transform:uppercase;"
+         "letter-spacing:.05em;margin:.1rem 0 .4rem\">CI record</div>";
+    h += ci_panel(ci, now_secs);
+    h += "<div class=\"inv-sub\" style=\"font-size:.62rem;text-transform:uppercase;"
+         "letter-spacing:.05em;margin:.9rem 0 .4rem\">Installed software</div>";
     if (!software) {
         h += degrade_banner("Device software");
         h += "</div></div>";

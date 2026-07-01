@@ -3,15 +3,16 @@
 /// @file inventory_routes.hpp
 /// Dedicated /inventory dashboard — the SOFTWARE inventory lens (installed-software
 /// list: title -> installs -> versions -> installs-per-version, daily-synced,
-/// ADR-0016) plus a THIN device-CI inventory tab (host / OS / online / last-seen,
+/// ADR-0016) plus a device-CI inventory tab (host / OS / online / last-seen,
 /// sourced from the persisted, offline-survivable endpoint_state store so offline
 /// devices still appear) and a fleet "find software" tab (which devices run X).
 ///
-/// The device tab is deliberately thin in round 1: it enriches into a full
-/// ServiceNow-style CI record (serial / model / CPU / RAM / MAC / owner ...) once a
-/// device-CI daily-sync SOURCE + DeviceInventoryStore land (the same ADR-0016
-/// framework installed_software is source #1 of). Clicking a device shows that
-/// device's installed software (get_agent_software).
+/// The device tab's CI columns (serial / model / CPU / RAM) and the per-device CI
+/// panel are real (PR2) — sourced from `DeviceInventoryStore` (the `device_ci`
+/// daily-sync source, ADR-0016 source #3). Disk and owner/location are deliberately
+/// NOT shown yet: disk is deferred pending a macOS `do_disks` collection fix;
+/// owner/location are not agent-collected (future operator-set CMDB enrichment).
+/// Clicking a device shows its CI record + installed software (get_agent_software).
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only, htmx core attrs only (CSP
 /// blocks hx-on — onclick/oninput helpers instead). Reuses the shared full-page
@@ -32,11 +33,13 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "device_inventory_store.hpp"    // DeviceCiRecord / CiReadError (device-CI panel, PR2)
 #include "software_inventory_store.hpp" // SoftwareCatalogRow / SoftwareVersionCount / SoftwareEntry / SoftwareFleetRow / *Query
 
 #include <httplib.h>
 
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -46,10 +49,13 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 
-/// One row of the THIN device-CI inventory list. Round-1 fields only — sourced from
-/// the persisted endpoint_state store (+ the live registry's online set). The CI
-/// columns (serial / model / CPU / RAM / MAC ...) arrive with the device-CI sync
-/// source; until then they render greyed/placeholder.
+/// One row of the device-CI inventory list — host/OS/online/last-seen sourced from
+/// the persisted endpoint_state store (+ the live registry's online set), PLUS the
+/// device-CI enrichment (PR2, `DeviceInventoryStore`-backed, attached by
+/// `attach_device_ci` in `inventory_ci_join.cpp`). A `ci_*` field is an empty string
+/// OR the literal `"unknown"` sentinel when the agent hasn't synced yet / doesn't
+/// know it (e.g. a serial-less VM) — render via the shared `ci_disp()` helper
+/// (inventory_ui.cpp), never raw.
 struct InventoryDeviceRow {
     std::string agent_id;
     std::string hostname;
@@ -57,6 +63,12 @@ struct InventoryDeviceRow {
     bool online = false;   ///< has a live Subscribe stream right now (registry)
     std::string last_seen; ///< human-ish ("now", "12m ago", "3d ago"); "" if unknown
     bool stale = false;    ///< last heartbeat older than the staleness window
+
+    std::string ci_serial;
+    std::string ci_model;
+    std::string ci_cpu_cores;   ///< decimal string
+    std::string ci_cpu_threads; ///< decimal string
+    std::string ci_ram_bytes;   ///< decimal string (bytes)
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────
@@ -87,11 +99,17 @@ std::string render_inventory_devices_fragment(const std::vector<InventoryDeviceR
                                               const std::string& q, const std::string& os_token,
                                               const std::string& status_token);
 
-/// PER-DEVICE drill: one device's installed software (get_agent_software). `online`
-/// drives the "live vs last daily sync" note for an offline device.
+/// PER-DEVICE drill: the CI record panel + installed software (get_agent_software).
+/// `online` drives the "live vs last daily sync" note for an offline device. `ci`
+/// mirrors `DeviceInventoryStore::get_device_ci`'s three-state authoritative read: a
+/// value holding a record renders the CI panel; a value holding `std::nullopt` renders
+/// an honest "no CI record yet"; `std::unexpected(kDegraded)` renders a degrade
+/// banner. `now_secs` lets the pure renderer format first/last-synced relative time
+/// without calling the clock itself (mirrors the software rollup's `now_secs`).
 std::string render_inventory_device_software_fragment(
     const std::string& agent_id, const std::string& hostname,
-    const std::optional<std::vector<SoftwareEntry>>& software, bool online);
+    const std::optional<std::vector<SoftwareEntry>>& software, bool online,
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError>& ci, std::int64_t now_secs);
 
 /// FIND tab shell: the search box (hx-get -> the results endpoint) + an empty results
 /// container. No data read here (the shell is just chrome under Inventory:Read).
@@ -134,9 +152,20 @@ public:
     using AgentSoftwareFn =
         std::function<std::optional<std::vector<SoftwareEntry>>(const std::string& agent_id)>;
 
-    /// The THIN device-CI list, scoped to `username` (offline-inclusive; assembled in
-    /// server.cpp from endpoint_state + the registry online set + the visible-agent set).
+    /// The device-CI roster, scoped to `username` (offline-inclusive; assembled in
+    /// server.cpp from endpoint_state + the registry online set + the visible-agent
+    /// set + the device-CI enrichment join, `attach_device_ci`).
     using DevicesFn = std::function<std::vector<InventoryDeviceRow>(const std::string& username)>;
+
+    /// One device's CI record (per-device drill's CI panel, post-authz — the
+    /// `scoped_perm_fn(Inventory,Read,id)` gate already ran). Mirrors
+    /// `DeviceInventoryStore::get_device_ci`'s three-state contract exactly: a value
+    /// holding a record = found; a value holding `std::nullopt` = absent (no CI
+    /// synced yet); `std::unexpected(kDegraded)` = store/pool/query failure —
+    /// including an unwired closure, which the route treats the same as a live
+    /// failure (mirrors `AgentSoftwareFn` unwired -> nullopt -> degrade banner).
+    using AgentCiFn = std::function<std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+        const std::string& agent_id)>;
 
     /// Per-(operator, agent) management-group predicate for the FIND per-row scope drop
     /// (the same Inventory:Read scope predicate the REST route uses). Empty = no filter.
@@ -156,7 +185,8 @@ public:
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {});
+                         AgentCiFn agent_ci_fn, ScopeFn scope_fn = {}, StaleFn stale_fn = {},
+                         AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
@@ -164,7 +194,8 @@ public:
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
-                         ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {});
+                         AgentCiFn agent_ci_fn, ScopeFn scope_fn = {}, StaleFn stale_fn = {},
+                         AuditFn audit_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -176,6 +207,7 @@ private:
     FleetSoftwareFn fleet_fn_;
     AgentSoftwareFn agent_sw_fn_;
     DevicesFn devices_fn_;
+    AgentCiFn agent_ci_fn_;
     ScopeFn scope_fn_;
     StaleFn stale_fn_;
     AuditFn audit_fn_;
