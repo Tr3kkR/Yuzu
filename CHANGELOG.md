@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-01
+
 ### Added
 
 - **JIT (just-in-time) admin elevation (`POST /api/v1/elevate`, SOC 2 CC6.3/CC6.6).** Reduces standing
