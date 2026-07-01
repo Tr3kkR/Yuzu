@@ -30,7 +30,7 @@ ARG TRIPLET=
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex \
+    bison flex autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
