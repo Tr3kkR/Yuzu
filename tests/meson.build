@@ -274,6 +274,8 @@ if build_server
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_saml_provider.cpp',
+      'unit/server/test_saml_routes.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',

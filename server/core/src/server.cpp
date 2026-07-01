@@ -59,6 +59,7 @@
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
+#include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
@@ -946,6 +947,91 @@ public:
 
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
+
+        // Initialize SAML 2.0 SP provider if configured.
+        // SAML is not supported on Windows (N4 — xmlsec1 is not available on the
+        // Windows build): log an ERROR if any SAML flag is set so operators learn
+        // immediately that the feature is disabled (fail-closed, never silently half-on).
+#ifdef _WIN32
+        if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+            !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty()) {
+            spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
+                          " — fail-closed");
+        }
+        // saml_provider_ stays null on Windows — routes 404 via is_enabled() check.
+#else
+        {
+            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
+                                              !cfg_.saml_idp_cert.empty() &&
+                                              !cfg_.saml_sp_entity_id.empty() &&
+                                              !cfg_.saml_sp_acs_url.empty() &&
+                                              !cfg_.saml_idp_entity_id.empty();
+            if (saml_config_complete) {
+                // HTTPS gate: SAML ACS is delivered over the browser's back-channel
+                // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
+                // attribute (baked into the cookie string) which browsers only send
+                // on HTTPS.  Running SAML over plain HTTP would silently strip the
+                // binding cookie on every ACS POST, making the CSRF guard inert —
+                // effectively leaving the server open to forced-login attacks.
+                // Fail-closed: if HTTPS is not enabled, leave saml_provider_ null.
+                if (!cfg_.https_enabled) {
+                    spdlog::error("SAML requires HTTPS (--https-cert / --https-key must be "
+                                  "configured) — SAML login disabled (fail-closed). The "
+                                  "browser-binding cookie is Secure-only and would be "
+                                  "silently dropped over plain HTTP.");
+                } else {
+                // Read the IdP signing cert PEM from disk. Fail closed: if the file
+                // is unreadable or oversized the provider is not constructed (routes 404).
+                // Cap at 64 KiB — a PEM-encoded X.509 cert is at most ~8 KiB; 64 KiB
+                // gives generous headroom while preventing a misconfigured path from
+                // reading an unbounded file into memory at startup.
+                static constexpr std::streamsize kSamlCertMaxBytes = 65536;
+                std::ifstream cert_file(cfg_.saml_idp_cert);
+                if (!cert_file.is_open()) {
+                    spdlog::error("SAML: cannot read IdP cert PEM from '{}' — SAML login"
+                                  " disabled (fail-closed)", cfg_.saml_idp_cert);
+                } else {
+                    // Read one extra byte to detect files that exceed the cap.
+                    std::string cert_pem(static_cast<std::size_t>(kSamlCertMaxBytes) + 1, '\0');
+                    cert_file.read(cert_pem.data(), kSamlCertMaxBytes + 1);
+                    if (!cert_file.eof()) {
+                        spdlog::error("SAML: IdP cert PEM '{}' exceeds {} bytes — SAML login"
+                                      " disabled (fail-closed)",
+                                      cfg_.saml_idp_cert, kSamlCertMaxBytes);
+                    } else {
+                        cert_pem.resize(static_cast<std::size_t>(cert_file.gcount()));
+                        saml::SamlConfig saml_cfg;
+                        saml_cfg.idp_entity_id  = cfg_.saml_idp_entity_id;
+                        saml_cfg.idp_sso_url    = cfg_.saml_idp_sso_url;
+                        saml_cfg.sp_entity_id   = cfg_.saml_sp_entity_id;
+                        saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
+                        saml_cfg.idp_cert_pem   = std::move(cert_pem);
+                        saml_cfg.enabled        = true;
+                        // Construct in the single-threaded startup phase — xmlsec global init
+                        // is not thread-safe; the std::call_once guard in saml_provider.cpp
+                        // makes repeated construction safe thereafter.
+                        saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
+                        if (saml_provider_ && saml_provider_->is_enabled()) {
+                            spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={})",
+                                         cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id);
+                        } else {
+                            spdlog::error("SAML: provider constructed but is_enabled() returned "
+                                          "false — SAML login disabled (fail-closed)");
+                            saml_provider_.reset();
+                        }
+                    }
+                } // end cert_file.is_open() else
+                } // end cfg_.https_enabled else
+            } else if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
+                       !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
+                       !cfg_.saml_idp_entity_id.empty()) {
+                // Partial config — warn so the operator knows which flags are missing.
+                spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
+                             "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
+                             "--saml-idp-entity-id) — SAML login disabled");
+            }
+        }
+#endif
 
         // Setup file logger.
         //
@@ -2534,7 +2620,7 @@ public:
         auth_routes_ = std::make_unique<AuthRoutes>(
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
             mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
-            oidc_provider_);
+            oidc_provider_, saml_provider_.get());
 
         start_web_server();
 
@@ -4381,10 +4467,20 @@ private:
             // code against a provisional TOTP secret during enforced
             // enrollment, so it is the same online-guessing surface and
             // must not fall through to the looser bucket.
+            // SAML 2.0 SSO start (GET /auth/saml/start) is the auth-flow entry
+            // point: flooding it fills pending_requests_ (cap 1000, oldest
+            // evicted), which lets an attacker evict legitimate users' in-flight
+            // login requests.  Apply the tighter login bucket — same reasoning
+            // as POST /login (H-C, Hermes round-2 2026-07-01).
+            // POST /saml/acs is also an auth-completion endpoint; include it
+            // for consistency so a flood of fake assertions is rate-limited too.
             bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
                              req.path == "/login/mfa/stepup" ||
                              req.path == "/login/mfa/enroll") &&
                             req.method == "POST";
+            is_login = is_login ||
+                       (req.path == "/auth/saml/start" && req.method == "GET") ||
+                       (req.path == "/saml/acs"        && req.method == "POST");
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -4415,10 +4511,15 @@ private:
             // an enforced login for an un-enrolled user who has only the
             // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
             // is deliberately NOT here — it requires an existing session.)
+            // SAML 2.0 auth-flow routes are pre-session by design (identical
+            // rationale to /auth/oidc/start + /auth/callback).  Without these
+            // exemptions, a non-authenticated user trying to start SSO would be
+            // redirected to /login before the SAML flow handler runs.
             if (req.path == "/login" || req.path == "/login/mfa" ||
                 req.path == "/login/mfa/enroll" || req.path == "/health" ||
                 req.path == "/api/health" || req.path == "/auth/oidc/start" ||
                 req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
                 // PKI PR4: the CA root cert + CRL are public by design — clients
                 // and browsers need them to establish trust / check revocation
                 // before they have any session. Exact-match only; /api/v1/ca/issued
@@ -10123,6 +10224,11 @@ private:
     // OIDC SSO — protected by oidc_mu_ for thread-safe reinit from Settings UI
     mutable std::shared_mutex oidc_mu_;
     std::unique_ptr<oidc::OidcProvider> oidc_provider_;
+
+    // SAML 2.0 SP — constructed once at startup (xmlsec global init is not
+    // thread-safe); never mutated after construction, so no mutex is needed.
+    // Null when SAML is not configured or on Windows (fail-closed).
+    std::unique_ptr<saml::SamlProvider> saml_provider_;
 
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;

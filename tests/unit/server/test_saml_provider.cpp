@@ -1,0 +1,1687 @@
+/**
+ * test_saml_provider.cpp — Unit tests for yuzu::server::saml::SamlProvider
+ *
+ * Coverage (tag [saml]):
+ *   - Valid signed assertion + correct pinned cert             → accepted
+ *   - Tampered assertion body (post-sign edit)                 → rejected
+ *   - Signature-wrapping (XSW): second Assertion injected      → rejected
+ *   - Expired NotOnOrAfter                                     → rejected
+ *   - Wrong Audience                                           → rejected
+ *   - Missing / wrong InResponseTo (replay, unsolicited)       → rejected
+ *   - No Signature element present                             → rejected
+ *   - Signed by a different cert (not the pinned one)          → rejected
+ *   - Provider not enabled                                     → rejected early
+ *   - build_authn_request: URL well-formed + relay_state wired → accepted
+ *   - cleanup_expired_states removes stale entries             → accepted
+ *
+ * Fixture generation:
+ *   SamlTestFixture generates a fresh RSA-2048 key pair + 100-year
+ *   self-signed X.509 cert at construction (OpenSSL C API).  make_response()
+ *   builds a SAML Response XML template and signs it with the private key via
+ *   xmlsec1's xmlSecDSigCtxSign, returning the base64-encoded signed response.
+ *   Test assertions about rejection use this same infrastructure with
+ *   controlled mutations.
+ *
+ *   xmlsec1 requires global init before any operation — the first
+ *   SamlProvider construction triggers it via std::call_once in
+ *   saml_provider.cpp. The fixture triggers that init by constructing a
+ *   disabled SamlProvider before calling any xmlsec function directly.
+ */
+
+#include "../test_helpers.hpp"
+#include "saml_provider.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <chrono>
+#include <string>
+
+// On Windows the SAML provider is a stub — skip all tests that need real XML-DSig.
+#if !defined(_WIN32)
+
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <xmlsec/xmlsec.h>
+#include <xmlsec/xmldsig.h>
+#include <xmlsec/openssl/app.h>
+#include <xmlsec/openssl/crypto.h>
+
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <zlib.h>
+
+#include <cstring>
+#include <ctime>
+#include <memory>
+#include <sstream>
+
+using namespace yuzu::server::saml;
+
+// ── SAML XML namespace constants (for template construction) ──────────────────
+static constexpr const char* kAssertionNs = "urn:oasis:names:tc:SAML:2.0:assertion";
+static constexpr const char* kProtocolNs  = "urn:oasis:names:tc:SAML:2.0:protocol";
+static constexpr const char* kDSigNs      = "http://www.w3.org/2000/09/xmldsig#";
+
+// ── SamlTestFixture ───────────────────────────────────────────────────────────
+
+struct SamlTestFixture {
+    std::string cert_pem;     ///< PEM-encoded self-signed X.509 cert (public key)
+    std::string priv_key_pem; ///< PEM-encoded RSA-2048 private key (for signing)
+    std::string cert_pem_b;   ///< Second key pair for "wrong cert" tests
+    std::string priv_key_pem_b;
+
+    const std::string sp_entity_id = "https://sp.yuzu.test/saml/metadata";
+    const std::string sp_acs_url   = "https://sp.yuzu.test/saml/acs";
+    const std::string idp_entity_id = "https://idp.yuzu.test/saml/metadata";
+    const std::string idp_sso_url   = "https://idp.yuzu.test/sso";
+
+    SamlTestFixture() {
+        // Trigger xmlsec global init via a disabled SamlProvider.
+        { SamlProvider p{SamlConfig{}}; (void)p; }
+
+        generate_key_pair(cert_pem, priv_key_pem);
+        generate_key_pair(cert_pem_b, priv_key_pem_b);
+    }
+
+    SamlConfig make_config() const {
+        SamlConfig cfg;
+        cfg.idp_entity_id = idp_entity_id;
+        cfg.idp_sso_url   = idp_sso_url;
+        cfg.sp_entity_id  = sp_entity_id;
+        cfg.sp_acs_url    = sp_acs_url;
+        cfg.idp_cert_pem  = cert_pem; // pinned cert
+        cfg.enabled       = true;
+        return cfg;
+    }
+
+    /// Build a complete SAML Response XML, sign the embedded Assertion,
+    /// and return the base64-encoded signed response.
+    ///
+    /// @param request_id        Value to put in SubjectConfirmationData.InResponseTo
+    /// @param name_id           NameID value
+    /// @param nooa_seconds_from_now  Assertion expiry (negative = already expired)
+    /// @param audience          Audience value (should match sp_entity_id for happy path)
+    /// @param recipient         Recipient URL (should match sp_acs_url for happy path)
+    /// @param inject_extra_assertion  If true, inserts a second unsigned Assertion (XSW test)
+    /// @param signing_priv_key  Which private key to sign with (default: priv_key_pem)
+    std::string make_response(
+        const std::string& request_id,
+        const std::string& name_id        = "user@example.com",
+        int64_t nooa_seconds_from_now     = 3600,
+        const std::string& audience       = {},
+        const std::string& recipient      = {},
+        bool inject_extra_assertion       = false,
+        const std::string* signing_priv_key = nullptr) const
+    {
+        const auto& aud = audience.empty()  ? sp_entity_id : audience;
+        const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
+        const auto& key = signing_priv_key ? *signing_priv_key : priv_key_pem;
+
+        // Time stamps
+        auto now_epoch = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        auto fmt_epoch = [](int64_t epoch) {
+            time_t t = static_cast<time_t>(epoch);
+            struct tm utc{};
+            gmtime_r(&t, &utc);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+            return std::string(buf);
+        };
+
+        const auto issue_instant = fmt_epoch(now_epoch);
+        const auto nb_str        = fmt_epoch(now_epoch - 5);
+        const auto nooa_str      = fmt_epoch(now_epoch + nooa_seconds_from_now);
+
+        const std::string assertion_id  = "_test_assertion_001";
+        const std::string response_id   = "_test_response_001";
+
+        // The assertion XML: Signature template (empty DigestValue / SignatureValue)
+        // follows the Issuer element per SAML Core 5.4.1.
+        // clang-format off
+        std::string assertion_xml =
+            "<saml:Assertion"
+              " xmlns:saml=\"" + std::string(kAssertionNs) + "\""
+              " ID=\"" + assertion_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\">"
+              "<saml:Issuer>" + idp_entity_id + "</saml:Issuer>"
+              "<ds:Signature xmlns:ds=\"" + std::string(kDSigNs) + "\">"
+                "<ds:SignedInfo>"
+                  "<ds:CanonicalizationMethod"
+                    " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                  "<ds:SignatureMethod"
+                    " Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>"
+                  "<ds:Reference URI=\"#" + assertion_id + "\">"
+                    "<ds:Transforms>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                    "</ds:Transforms>"
+                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+                    "<ds:DigestValue/>"
+                  "</ds:Reference>"
+                "</ds:SignedInfo>"
+                "<ds:SignatureValue/>"
+              "</ds:Signature>"
+              "<saml:Subject>"
+                "<saml:NameID"
+                  " Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">"
+                  + name_id +
+                "</saml:NameID>"
+                "<saml:SubjectConfirmation"
+                  " Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                  "<saml:SubjectConfirmationData"
+                    " NotOnOrAfter=\"" + nooa_str + "\""
+                    " Recipient=\"" + rec + "\""
+                    " InResponseTo=\"" + request_id + "\"/>"
+                "</saml:SubjectConfirmation>"
+              "</saml:Subject>"
+              "<saml:Conditions"
+                " NotBefore=\"" + nb_str + "\""
+                " NotOnOrAfter=\"" + nooa_str + "\">"
+                "<saml:AudienceRestriction>"
+                  "<saml:Audience>" + aud + "</saml:Audience>"
+                "</saml:AudienceRestriction>"
+              "</saml:Conditions>"
+            "</saml:Assertion>";
+        // clang-format on
+
+        // Optional second (unsigned) Assertion for XSW test
+        std::string evil_assertion_xml;
+        if (inject_extra_assertion) {
+            // clang-format off
+            evil_assertion_xml =
+                "<saml:Assertion"
+                  " xmlns:saml=\"" + std::string(kAssertionNs) + "\""
+                  " ID=\"_evil_assertion_002\""
+                  " Version=\"2.0\""
+                  " IssueInstant=\"" + issue_instant + "\">"
+                  "<saml:Issuer>" + idp_entity_id + "</saml:Issuer>"
+                  "<saml:Subject>"
+                    "<saml:NameID>attacker@evil.com</saml:NameID>"
+                    "<saml:SubjectConfirmation"
+                      " Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                      "<saml:SubjectConfirmationData"
+                        " NotOnOrAfter=\"" + nooa_str + "\""
+                        " Recipient=\"" + rec + "\""
+                        " InResponseTo=\"" + request_id + "\"/>"
+                    "</saml:SubjectConfirmation>"
+                  "</saml:Subject>"
+                "</saml:Assertion>";
+            // clang-format on
+        }
+
+        // Full Response wrapper
+        // clang-format off
+        std::string response_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<samlp:Response"
+              " xmlns:samlp=\"" + std::string(kProtocolNs) + "\""
+              " ID=\"" + response_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\""
+              " InResponseTo=\"" + request_id + "\""
+              " Destination=\"" + sp_acs_url + "\">"
+              "<samlp:Status>"
+                "<samlp:StatusCode"
+                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+              "</samlp:Status>"
+              + assertion_xml
+              + evil_assertion_xml +
+            "</samlp:Response>";
+        // clang-format on
+
+        // Sign the assertion using xmlsec1
+        const std::string signed_xml = sign_assertion(response_xml, assertion_id, key);
+
+        // Base64-encode the final signed response
+        return b64_encode(
+            reinterpret_cast<const unsigned char*>(signed_xml.data()),
+            signed_xml.size());
+    }
+
+    /// Produce a response without any ds:Signature element in the Assertion.
+    std::string make_unsigned_response(
+        const std::string& request_id,
+        const std::string& name_id = "user@example.com") const
+    {
+        auto now_epoch = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto fmt_epoch = [](int64_t epoch) {
+            time_t t = static_cast<time_t>(epoch);
+            struct tm utc{};
+            gmtime_r(&t, &utc);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+            return std::string(buf);
+        };
+        const auto issue_instant = fmt_epoch(now_epoch);
+        const auto nooa_str      = fmt_epoch(now_epoch + 3600);
+        const auto nb_str        = fmt_epoch(now_epoch - 5);
+        // clang-format off
+        std::string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<samlp:Response"
+              " xmlns:samlp=\"" + std::string(kProtocolNs) + "\""
+              " ID=\"_resp\" Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\""
+              " InResponseTo=\"" + request_id + "\""
+              " Destination=\"" + sp_acs_url + "\">"
+              "<samlp:Status>"
+                "<samlp:StatusCode"
+                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+              "</samlp:Status>"
+              "<saml:Assertion"
+                " xmlns:saml=\"" + std::string(kAssertionNs) + "\""
+                " ID=\"_asr\" Version=\"2.0\""
+                " IssueInstant=\"" + issue_instant + "\">"
+                "<saml:Issuer>idp</saml:Issuer>"
+                "<saml:Subject>"
+                  "<saml:NameID>" + name_id + "</saml:NameID>"
+                  "<saml:SubjectConfirmation"
+                    " Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                    "<saml:SubjectConfirmationData"
+                      " NotOnOrAfter=\"" + nooa_str + "\""
+                      " Recipient=\"" + sp_acs_url + "\""
+                      " InResponseTo=\"" + request_id + "\"/>"
+                  "</saml:SubjectConfirmation>"
+                "</saml:Subject>"
+                "<saml:Conditions NotBefore=\"" + nb_str + "\" NotOnOrAfter=\"" + nooa_str + "\">"
+                  "<saml:AudienceRestriction>"
+                    "<saml:Audience>" + sp_entity_id + "</saml:Audience>"
+                  "</saml:AudienceRestriction>"
+                "</saml:Conditions>"
+              "</saml:Assertion>"
+            "</samlp:Response>";
+        // clang-format on
+        return b64_encode(reinterpret_cast<const unsigned char*>(xml.data()), xml.size());
+    }
+
+    // ── Helpers for negative-test variants (mandatory-element tests) ─────────────
+
+    /// Build a signed response whose Assertion carries an incorrect Issuer value.
+    std::string make_response_wrong_issuer(const std::string& request_id) const {
+        return make_signed_with_body(request_id,
+            "wrong-entity-not-" + idp_entity_id, // issuer
+            true,  // include_aud_restriction
+            true,  // include_scd_recipient
+            true); // include_scd_nooa
+    }
+
+    /// Build a signed response whose Assertion has no <saml:Issuer> element.
+    std::string make_response_no_issuer(const std::string& request_id) const {
+        return make_signed_with_body(request_id,
+            {},    // empty → omit Issuer element
+            true, true, true);
+    }
+
+    /// Build a signed response whose Assertion has no <saml:Conditions> element.
+    std::string make_response_no_conditions(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            true, true, true, /*include_conditions=*/false);
+    }
+
+    /// Build a signed response whose Conditions has no <AudienceRestriction>.
+    std::string make_response_no_audience_restriction(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            /*include_aud_restriction=*/false, true, true);
+    }
+
+    /// Build a signed response whose SubjectConfirmation has no SCD element.
+    std::string make_response_no_scd(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            true, true, true, true, /*include_scd=*/false);
+    }
+
+    /// Build a signed response whose SCD element has no Recipient attribute.
+    std::string make_response_scd_no_recipient(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            true, /*include_scd_recipient=*/false, true);
+    }
+
+    /// Build a signed response whose SCD element has no NotOnOrAfter attribute.
+    std::string make_response_scd_no_nooa(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            true, true, /*include_scd_nooa=*/false);
+    }
+
+    /// Build a signed response whose Conditions element is present but has NO
+    /// NotOnOrAfter attribute (F4 regression test: WebSSO profile requires it).
+    std::string make_response_conditions_no_nooa(const std::string& request_id) const {
+        return make_signed_with_body(request_id, idp_entity_id,
+            true, true, true, /*include_conditions=*/true,
+            /*include_scd=*/true, /*include_conditions_nooa=*/false);
+    }
+
+    /// Build a base64-encoded response XML that contains a DOCTYPE declaration.
+    /// This does NOT need to be signed — DOCTYPE rejection happens before signature
+    /// verification (step 2.5 in validate_response).
+    std::string make_doctype_response(const std::string& request_id) const {
+        auto now_epoch = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto issue_instant = fmt_epoch_fn(now_epoch);
+        // clang-format off
+        std::string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<!DOCTYPE samlp:Response ["
+              "<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"
+            "]>"
+            "<samlp:Response"
+              " xmlns:samlp=\"" + std::string(kProtocolNs) + "\""
+              " ID=\"_resp_dtd\" Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\""
+              " InResponseTo=\"" + request_id + "\""
+              " Destination=\"" + sp_acs_url + "\">"
+              "<samlp:Status>"
+                "<samlp:StatusCode"
+                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+              "</samlp:Status>"
+            "</samlp:Response>";
+        // clang-format on
+        return b64_encode(reinterpret_cast<const unsigned char*>(xml.data()), xml.size());
+    }
+
+    // ── H-E: make_response_with_duplicate_id ─────────────────────────────────
+    // Build a signed response that contains a non-Assertion element carrying
+    // the same ID value as the signed Assertion.  The attack vector is:
+    //
+    //   <samlp:Response>
+    //     <samlp:Extensions xml:id="_test_assertion_001"/> ← DECOY with same ID
+    //     <saml:Assertion ID="_test_assertion_001">       ← signed assertion
+    //       <ds:Signature …/>
+    //       …
+    //     </saml:Assertion>
+    //   </samlp:Response>
+    //
+    // validate_response must reject this document via the duplicate-ID scan.
+    // The "xml:id" attribute is used on the decoy element to test that the scan
+    // covers both "ID" and "xml:id" attributes (H-E requirement).
+    std::string make_response_with_duplicate_id(const std::string& request_id) const {
+        auto now_epoch = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto issue_instant = fmt_epoch_fn(now_epoch);
+        const auto nb_str        = fmt_epoch_fn(now_epoch - 5);
+        const auto nooa_str      = fmt_epoch_fn(now_epoch + 3600);
+
+        const std::string assertion_id = "_test_assertion_001";
+        const std::string response_id  = "_test_dup_id_resp_001";
+
+        // clang-format off
+        const std::string assertion_xml =
+            "<saml:Assertion"
+              " xmlns:saml=\"" + std::string(kAssertionNs) + "\""
+              " ID=\"" + assertion_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\">"
+              "<saml:Issuer>" + idp_entity_id + "</saml:Issuer>"
+              "<ds:Signature xmlns:ds=\"" + std::string(kDSigNs) + "\">"
+                "<ds:SignedInfo>"
+                  "<ds:CanonicalizationMethod"
+                    " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                  "<ds:SignatureMethod"
+                    " Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>"
+                  "<ds:Reference URI=\"#" + assertion_id + "\">"
+                    "<ds:Transforms>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                    "</ds:Transforms>"
+                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+                    "<ds:DigestValue/>"
+                  "</ds:Reference>"
+                "</ds:SignedInfo>"
+                "<ds:SignatureValue/>"
+              "</ds:Signature>"
+              "<saml:Subject>"
+                "<saml:NameID"
+                  " Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">"
+                  "user@example.com"
+                "</saml:NameID>"
+                "<saml:SubjectConfirmation"
+                  " Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                  "<saml:SubjectConfirmationData"
+                    " NotOnOrAfter=\"" + nooa_str + "\""
+                    " Recipient=\"" + sp_acs_url + "\""
+                    " InResponseTo=\"" + request_id + "\"/>"
+                "</saml:SubjectConfirmation>"
+              "</saml:Subject>"
+              "<saml:Conditions"
+                " NotBefore=\"" + nb_str + "\""
+                " NotOnOrAfter=\"" + nooa_str + "\">"
+                "<saml:AudienceRestriction>"
+                  "<saml:Audience>" + sp_entity_id + "</saml:Audience>"
+                "</saml:AudienceRestriction>"
+              "</saml:Conditions>"
+            "</saml:Assertion>";
+
+        // The decoy element uses xml:id (not plain "ID") so the test exercises
+        // the xml:id branch of the duplicate-ID scan.
+        const std::string decoy_xml =
+            "<samlp:Extensions"
+              " xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\""
+              " xml:id=\"" + assertion_id + "\""
+            "/>";
+
+        const std::string response_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<samlp:Response"
+              " xmlns:samlp=\"" + std::string(kProtocolNs) + "\""
+              " ID=\"" + response_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\""
+              " InResponseTo=\"" + request_id + "\""
+              " Destination=\"" + sp_acs_url + "\">"
+              "<samlp:Status>"
+                "<samlp:StatusCode"
+                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+              "</samlp:Status>"
+              + decoy_xml        // decoy with duplicate xml:id before the Assertion
+              + assertion_xml +  // signed Assertion
+            "</samlp:Response>";
+        // clang-format on
+
+        const std::string signed_xml = sign_assertion(response_xml, assertion_id, priv_key_pem);
+        return b64_encode(
+            reinterpret_cast<const unsigned char*>(signed_xml.data()), signed_xml.size());
+    }
+
+private:
+    // ── OpenSSL: generate RSA-2048 key + 100-year self-signed cert ────────────
+
+    static void generate_key_pair(std::string& out_cert_pem, std::string& out_key_pem) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        // Generate RSA 2048 key pair.
+        // All raw pointers are immediately wrapped in scope guards (same RAII
+        // idiom as the production DocGuard/DsigGuard) so a failing REQUIRE cannot
+        // leak OpenSSL handles on unwind.
+        RSA* rsa = RSA_generate_key(2048, RSA_F4, nullptr, nullptr);
+        REQUIRE(rsa != nullptr);
+        // rsa guard: released once pkey takes ownership via EVP_PKEY_assign_RSA.
+        struct RsaGuard { RSA* r; ~RsaGuard() { if (r) RSA_free(r); } } rsg{rsa};
+
+        EVP_PKEY* pkey = EVP_PKEY_new();
+        REQUIRE(pkey != nullptr);
+        struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pkg{pkey};
+
+        REQUIRE(EVP_PKEY_assign_RSA(pkey, rsa) == 1);
+        rsg.r = nullptr; // pkey now owns rsa; disarm the RSA guard
+#pragma GCC diagnostic pop
+
+        // Build self-signed X.509 cert valid for 100 years.
+        X509* cert = X509_new();
+        REQUIRE(cert != nullptr);
+        struct CertGuard { X509* c; ~CertGuard() { if (c) X509_free(c); } } cg{cert};
+
+        X509_set_version(cert, 2); // X509v3
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+
+        // Valid for 100 years from now
+        X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+        X509_gmtime_adj(X509_getm_notAfter(cert), 60LL * 60 * 24 * 365 * 100);
+
+        X509_set_pubkey(cert, pkey);
+
+        X509_NAME* name = X509_get_subject_name(cert);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>("Test IdP"),
+                                   -1, -1, 0);
+        X509_set_issuer_name(cert, name);
+        REQUIRE(X509_sign(cert, pkey, EVP_sha256()) > 0);
+
+        // Export cert PEM — nested scope so BIO is freed before any throw.
+        {
+            BIO* bio = BIO_new(BIO_s_mem());
+            REQUIRE(bio != nullptr);
+            struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+            REQUIRE(PEM_write_bio_X509(bio, cert) == 1);
+            BUF_MEM* bptr = nullptr;
+            BIO_get_mem_ptr(bio, &bptr);
+            out_cert_pem.assign(bptr->data, bptr->length);
+        }
+
+        // Export private key PEM.
+        {
+            BIO* bio = BIO_new(BIO_s_mem());
+            REQUIRE(bio != nullptr);
+            struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+            REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+            BUF_MEM* bptr = nullptr;
+            BIO_get_mem_ptr(bio, &bptr);
+            out_key_pem.assign(bptr->data, bptr->length);
+        }
+        // CertGuard and PkeyGuard clean up on scope exit.
+    }
+
+    // ── xmlsec1: sign the XML template's <ds:Signature> in the Assertion ─────
+
+    static std::string sign_assertion(
+        const std::string& response_xml,
+        const std::string& assertion_id,
+        const std::string& private_key_pem)
+    {
+        // Parse the template
+        xmlDocPtr doc = xmlReadMemory(
+            response_xml.data(), static_cast<int>(response_xml.size()),
+            "sign_tmpl.xml", nullptr,
+            XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+        REQUIRE(doc != nullptr);
+
+        struct DocGuard { xmlDocPtr d; ~DocGuard() { if (d) xmlFreeDoc(d); } } dg{doc};
+
+        xmlNodePtr root = xmlDocGetRootElement(doc);
+        REQUIRE(root != nullptr);
+
+        // Find the Assertion element and register its ID so xmlsec can resolve
+        // the Reference URI="#assertion_id" fragment reference.
+        xmlNodePtr assertion_node = nullptr;
+        for (xmlNodePtr n = xmlFirstElementChild(root); n; n = xmlNextElementSibling(n)) {
+            if (n->type == XML_ELEMENT_NODE &&
+                n->name && xmlStrEqual(n->name, BAD_CAST "Assertion") &&
+                n->ns && n->ns->href &&
+                xmlStrEqual(n->ns->href, BAD_CAST kAssertionNs)) {
+                const std::string id = [n]() -> std::string {
+                    xmlChar* v = xmlGetProp(n, BAD_CAST "ID");
+                    if (!v) return {};
+                    std::string s(reinterpret_cast<const char*>(v));
+                    xmlFree(v);
+                    return s;
+                }();
+                if (id == assertion_id) {
+                    assertion_node = n;
+                    // Register as XML ID
+                    xmlAttrPtr id_attr = xmlHasProp(n, BAD_CAST "ID");
+                    if (id_attr) xmlAddID(nullptr, doc, BAD_CAST id.c_str(), id_attr);
+                    break;
+                }
+            }
+        }
+        REQUIRE(assertion_node != nullptr);
+
+        // Find the <ds:Signature> node (direct child of Assertion)
+        xmlNodePtr sig_node = nullptr;
+        for (xmlNodePtr n = xmlFirstElementChild(assertion_node); n;
+             n = xmlNextElementSibling(n)) {
+            if (n->type == XML_ELEMENT_NODE &&
+                n->name && xmlStrEqual(n->name, BAD_CAST "Signature") &&
+                n->ns && n->ns->href && xmlStrEqual(n->ns->href, BAD_CAST kDSigNs)) {
+                sig_node = n;
+                break;
+            }
+        }
+        REQUIRE(sig_node != nullptr);
+
+        // Load the private key for signing (xmlSecKeyDataFormatPem = PEM private key).
+        // Wrap in a scope guard so a failing REQUIRE cannot leak the key handle.
+        xmlSecKeyPtr sign_key = xmlSecOpenSSLAppKeyLoadMemory(
+            reinterpret_cast<const xmlSecByte*>(private_key_pem.data()),
+            static_cast<xmlSecSize>(private_key_pem.size()),
+            xmlSecKeyDataFormatPem,
+            nullptr, nullptr, nullptr);
+        REQUIRE(sign_key != nullptr);
+        struct KeyGuard {
+            xmlSecKeyPtr k;
+            ~KeyGuard() { if (k) xmlSecKeyDestroy(k); }
+        } kg{sign_key};
+
+        // Create DSig context — wrap in a guard before transferring key ownership.
+        xmlSecDSigCtxPtr ctx = xmlSecDSigCtxCreate(nullptr);
+        REQUIRE(ctx != nullptr);
+        struct CtxGuard {
+            xmlSecDSigCtxPtr c;
+            ~CtxGuard() { if (c) xmlSecDSigCtxDestroy(c); }
+        } cg{ctx};
+
+        ctx->signKey = sign_key; // ctx takes ownership of sign_key
+        kg.k = nullptr;          // disarm key guard — ctx destructor will free it
+
+        const int sign_ret = xmlSecDSigCtxSign(ctx, sig_node);
+        // CtxGuard destructs the context whether or not the REQUIRE below throws,
+        // so we do not manually call xmlSecDSigCtxDestroy here.
+        REQUIRE(sign_ret == 0);
+
+        // Serialize the signed document back to XML string.
+        xmlChar* xml_out = nullptr;
+        int xml_out_size = 0;
+        xmlDocDumpMemory(doc, &xml_out, &xml_out_size);
+        REQUIRE(xml_out != nullptr);
+        struct XmlStrGuard {
+            xmlChar* s;
+            ~XmlStrGuard() { if (s) xmlFree(s); }
+        } xsg{xml_out};
+
+        return std::string(reinterpret_cast<const char*>(xml_out),
+                           static_cast<std::size_t>(xml_out_size));
+    }
+
+    // ── fmt_epoch_fn helper (shared by response builders) ─────────────────────
+
+    static std::string fmt_epoch_fn(int64_t epoch) {
+        time_t t = static_cast<time_t>(epoch);
+        struct tm utc{};
+        gmtime_r(&t, &utc);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+        return std::string(buf);
+    }
+
+    // ── Generic signed-response builder for negative-test variants ─────────────
+    // Builds a response XML with the specified optional elements, signs the
+    // assertion, and returns the base64-encoded signed response.
+    //
+    // @param issuer_text              Assertion Issuer text; empty string → omit element.
+    // @param include_aud_restriction  Include AudienceRestriction in Conditions.
+    // @param include_scd_recipient    Include Recipient attribute in SCD.
+    // @param include_scd_nooa         Include NotOnOrAfter attribute in SCD.
+    // @param include_conditions       Include <saml:Conditions> element at all.
+    // @param include_scd              Include <saml:SubjectConfirmationData>.
+    // @param include_conditions_nooa  Include NotOnOrAfter attribute in Conditions.
+    std::string make_signed_with_body(
+        const std::string& request_id,
+        const std::string& issuer_text,         // "" → omit the Issuer element
+        bool include_aud_restriction  = true,
+        bool include_scd_recipient    = true,
+        bool include_scd_nooa         = true,
+        bool include_conditions       = true,
+        bool include_scd              = true,
+        bool include_conditions_nooa  = true) const
+    {
+        const auto now_epoch = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto issue_instant = fmt_epoch_fn(now_epoch);
+        const auto nb_str        = fmt_epoch_fn(now_epoch - 5);
+        const auto nooa_str      = fmt_epoch_fn(now_epoch + 3600);
+
+        const std::string assertion_id = "_test_neg_assertion_001";
+        const std::string response_id  = "_test_neg_response_001";
+
+        // Optional elements
+        const std::string issuer_elem = issuer_text.empty() ? std::string{}
+            : ("<saml:Issuer>" + issuer_text + "</saml:Issuer>");
+
+        const std::string recipient_attr = include_scd_recipient
+            ? (" Recipient=\"" + sp_acs_url + "\"") : std::string{};
+        const std::string nooa_attr = include_scd_nooa
+            ? (" NotOnOrAfter=\"" + nooa_str + "\"") : std::string{};
+
+        const std::string scd_elem = include_scd
+            ? ("<saml:SubjectConfirmationData"
+               + nooa_attr + recipient_attr +
+               " InResponseTo=\"" + request_id + "\"/>")
+            : std::string{};
+
+        const std::string aud_restr_elem = include_aud_restriction
+            ? ("<saml:AudienceRestriction>"
+               "<saml:Audience>" + sp_entity_id + "</saml:Audience>"
+               "</saml:AudienceRestriction>")
+            : std::string{};
+
+        const std::string conditions_nooa_attr = include_conditions_nooa
+            ? (" NotOnOrAfter=\"" + nooa_str + "\"") : std::string{};
+        const std::string conditions_elem = include_conditions
+            ? ("<saml:Conditions NotBefore=\"" + nb_str + "\"" + conditions_nooa_attr + ">"
+               + aud_restr_elem +
+               "</saml:Conditions>")
+            : std::string{};
+
+        // clang-format off
+        const std::string assertion_xml =
+            "<saml:Assertion"
+              " xmlns:saml=\"" + std::string(kAssertionNs) + "\""
+              " ID=\"" + assertion_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\">"
+              + issuer_elem +
+              "<ds:Signature xmlns:ds=\"" + std::string(kDSigNs) + "\">"
+                "<ds:SignedInfo>"
+                  "<ds:CanonicalizationMethod"
+                    " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                  "<ds:SignatureMethod"
+                    " Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>"
+                  "<ds:Reference URI=\"#" + assertion_id + "\">"
+                    "<ds:Transforms>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>"
+                      "<ds:Transform"
+                        " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
+                    "</ds:Transforms>"
+                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+                    "<ds:DigestValue/>"
+                  "</ds:Reference>"
+                "</ds:SignedInfo>"
+                "<ds:SignatureValue/>"
+              "</ds:Signature>"
+              "<saml:Subject>"
+                "<saml:NameID>user@example.com</saml:NameID>"
+                "<saml:SubjectConfirmation"
+                  " Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">"
+                  + scd_elem +
+                "</saml:SubjectConfirmation>"
+              "</saml:Subject>"
+              + conditions_elem +
+            "</saml:Assertion>";
+
+        const std::string response_xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<samlp:Response"
+              " xmlns:samlp=\"" + std::string(kProtocolNs) + "\""
+              " ID=\"" + response_id + "\""
+              " Version=\"2.0\""
+              " IssueInstant=\"" + issue_instant + "\""
+              " InResponseTo=\"" + request_id + "\""
+              " Destination=\"" + sp_acs_url + "\">"
+              "<samlp:Status>"
+                "<samlp:StatusCode"
+                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+              "</samlp:Status>"
+              + assertion_xml +
+            "</samlp:Response>";
+        // clang-format on
+
+        const std::string signed_xml = sign_assertion(response_xml, assertion_id, priv_key_pem);
+        return b64_encode(
+            reinterpret_cast<const unsigned char*>(signed_xml.data()), signed_xml.size());
+    }
+
+    // ── Standard base64 encode (for response wrapper) ─────────────────────────
+
+    static std::string b64_encode(const unsigned char* data, std::size_t len) {
+        static constexpr char kA[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((len + 2) / 3) * 4);
+        for (std::size_t i = 0; i < len; i += 3) {
+            auto n = static_cast<uint32_t>(data[i]) << 16;
+            if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+            if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
+            out += kA[(n >> 18) & 0x3F];
+            out += kA[(n >> 12) & 0x3F];
+            out += (i + 1 < len) ? kA[(n >> 6) & 0x3F] : '=';
+            out += (i + 2 < len) ? kA[n & 0x3F] : '=';
+        }
+        return out;
+    }
+};
+
+// ── Shared fixture (key generation is expensive; done once per binary run) ────
+// Catch2 does not share state between TEST_CASE and TEST_CASE_METHOD for
+// non-fixture tests. Use a file-scope singleton seeded on first access.
+
+static const SamlTestFixture& fixture() {
+    static const SamlTestFixture f;
+    return f;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: extract request ID from the AuthnRequest URL
+// Reverses: URL-decode → base64-decode → inflate (raw DEFLATE) → parse ID attr
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string extract_request_id_from_url(const std::string& url) {
+    // Extract SAMLRequest= parameter
+    const auto pos = url.find("SAMLRequest=");
+    if (pos == std::string::npos) return {};
+    auto val_start = pos + 12;
+    auto val_end   = url.find('&', val_start);
+    std::string encoded = url.substr(val_start, val_end - val_start);
+
+    // URL-decode
+    std::string b64;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        if (encoded[i] == '%' && i + 2 < encoded.size()) {
+            char hex[3] = {encoded[i + 1], encoded[i + 2], 0};
+            b64 += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+        } else if (encoded[i] == '+') {
+            b64 += ' ';
+        } else {
+            b64 += encoded[i];
+        }
+    }
+
+    // Standard base64 decode
+    static constexpr unsigned char kT[256] = {
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64, 64,64,64,62,64,64,64,63,
+        52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+        64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+        // 128-255: 64
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,
+    };
+    std::string compressed;
+    unsigned int val = 0;
+    int bits = -8;
+    for (unsigned char c : b64) {
+        if (kT[c] == 64) continue;
+        val = (val << 6) | kT[c];
+        bits += 6;
+        if (bits >= 0) {
+            compressed += static_cast<char>((val >> bits) & 0xFF);
+            bits -= 8;
+        }
+    }
+
+    // Raw-DEFLATE inflate (windowBits = -15)
+    z_stream zs{};
+    if (inflateInit2(&zs, -15) != Z_OK) return {};
+    zs.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+    zs.avail_in = static_cast<uInt>(compressed.size());
+    std::string xml(8192, '\0');
+    zs.next_out  = reinterpret_cast<Bytef*>(xml.data());
+    zs.avail_out = static_cast<uInt>(xml.size());
+    inflate(&zs, Z_FINISH);
+    inflateEnd(&zs);
+    xml.resize(zs.total_out);
+
+    // Parse ID="..." from the XML
+    const auto id_pos = xml.find("ID=\"");
+    if (id_pos == std::string::npos) return {};
+    auto id_start = id_pos + 4;
+    auto id_end   = xml.find('"', id_start);
+    if (id_end == std::string::npos) return {};
+    return xml.substr(id_start, id_end - id_start);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST CASES
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("SAML: provider not enabled returns false", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = false;
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML: provider enabled but empty cert returns false", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled       = true;
+    cfg.idp_cert_pem  = {}; // no cert
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML: validate_response on disabled provider returns error", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = false;
+    SamlProvider p{cfg};
+    auto result = p.validate_response("bm90YWJhc2U2NA==", ""); // valid b64
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("not enabled") != std::string::npos);
+}
+
+TEST_CASE("SAML: build_authn_request when disabled returns empty string", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = false;
+    SamlProvider p{cfg};
+    CHECK(p.build_authn_request("relay").url.empty());
+}
+
+TEST_CASE("SAML: build_authn_request generates valid redirect URL", "[saml]") {
+    const auto& f    = fixture();
+    auto cfg         = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request("myrelay");
+    const auto& url  = authn.url;
+
+    // Must be a URL to the IdP SSO endpoint
+    CHECK(url.starts_with(f.idp_sso_url + "?SAMLRequest="));
+    CHECK(url.find("RelayState=") != std::string::npos);
+    CHECK(url.find("myrelay") != std::string::npos);
+
+    // Must contain SAMLRequest= parameter
+    CHECK(url.find("SAMLRequest=") != std::string::npos);
+
+    // The binding cookie secret must be a 64-char hex string (32 bytes CSPRNG).
+    CHECK(authn.cookie_secret.size() == 64);
+    CHECK(authn.cookie_secret.find_first_not_of("0123456789abcdef") == std::string::npos);
+
+    // Extract and decode the SAMLRequest — must contain our SP entity ID
+    const auto request_id = extract_request_id_from_url(url);
+    CHECK_FALSE(request_id.empty());
+    // Request ID must start with '_' (required for valid XML ID production)
+    CHECK(request_id[0] == '_');
+}
+
+TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // Generate a real AuthnRequest to register the pending ID
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "user@example.com");
+}
+
+TEST_CASE("SAML: tampered assertion body after signing is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Build a valid signed response
+    auto response_b64 = f.make_response(request_id);
+
+    // Decode, tamper with the NameID, re-encode
+    std::string xml_bytes;
+    // b64 decode helper
+    static constexpr unsigned char kT2[256] = {
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64, 64,64,64,62,64,64,64,63,
+        52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+        64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,
+    };
+    {
+        unsigned int val = 0;
+        int bits = -8;
+        for (unsigned char c : response_b64) {
+            if (kT2[c] == 64) continue;
+            val = (val << 6) | kT2[c];
+            bits += 6;
+            if (bits >= 0) {
+                xml_bytes += static_cast<char>((val >> bits) & 0xFF);
+                bits -= 8;
+            }
+        }
+    }
+
+    // Tamper: change the NameID value after signing
+    auto pos = xml_bytes.find("user@example.com");
+    REQUIRE(pos != std::string::npos);
+    xml_bytes.replace(pos, 16, "evil@attacker.com");
+
+    // Re-base64-encode the tampered XML
+    const auto tampered_b64 = [&]() {
+        static constexpr char kA[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const auto* d = reinterpret_cast<const unsigned char*>(xml_bytes.data());
+        const auto  n = xml_bytes.size();
+        std::string out;
+        out.reserve(((n + 2) / 3) * 4);
+        for (std::size_t i = 0; i < n; i += 3) {
+            auto v = static_cast<uint32_t>(d[i]) << 16;
+            if (i + 1 < n) v |= static_cast<uint32_t>(d[i + 1]) << 8;
+            if (i + 2 < n) v |= static_cast<uint32_t>(d[i + 2]);
+            out += kA[(v >> 18) & 0x3F];
+            out += kA[(v >> 12) & 0x3F];
+            out += (i + 1 < n) ? kA[(v >> 6) & 0x3F] : '=';
+            out += (i + 2 < n) ? kA[v & 0x3F] : '=';
+        }
+        return out;
+    }();
+
+    // Need a fresh request ID since we already consumed the first one
+    const auto authn_result2 = p.build_authn_request("relay");
+    (void)authn_result2; // Not needed — verification fails before InResponseTo
+
+    const auto result = p.validate_response(tampered_b64, cookie_secret);
+    CHECK_FALSE(result.has_value());
+    // Must mention signature failure (not a successful accept)
+    const auto& err = result.error();
+    CHECK((err.find("signature") != std::string::npos ||
+           err.find("verify")    != std::string::npos ||
+           err.find("failed")    != std::string::npos));
+}
+
+TEST_CASE("SAML: XSW — second injected Assertion is rejected (exactly-1 rule)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // inject_extra_assertion = true → second unsigned Assertion in the document
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, /*inject_extra_assertion=*/true);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("XSW") != std::string::npos);
+    CHECK(result.error().find("2") != std::string::npos); // reported count
+}
+
+TEST_CASE("SAML: expired assertion (NotOnOrAfter in past) is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // nooa_seconds_from_now = -3600 → already expired by 1h (well past the 5m skew)
+    const auto response_b64 = f.make_response(request_id, "user@example.com", -3600);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("expired") != std::string::npos ||
+           result.error().find("NotOnOrAfter") != std::string::npos));
+}
+
+TEST_CASE("SAML: wrong Audience is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, "https://wrong.sp.example.com/");
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Audience") != std::string::npos ||
+           result.error().find("audience") != std::string::npos));
+}
+
+TEST_CASE("SAML: wrong Recipient in SubjectConfirmationData is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {},
+        "https://wrong-acs.example.com/saml");
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Recipient") != std::string::npos ||
+           result.error().find("recipient") != std::string::npos ||
+           result.error().find("mismatch")  != std::string::npos));
+}
+
+TEST_CASE("SAML: missing InResponseTo (unsolicited response) is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // Do NOT call build_authn_request — we pass empty request_id to make_response,
+    // which leaves SubjectConfirmationData.InResponseTo absent or empty.
+    // "make_response" sets the value from request_id; empty → the attribute
+    // value is present but empty, which our parser treats as missing.
+    // Build a response with InResponseTo="" (will be in the XML).
+    const auto response_b64 = f.make_response("");
+
+    const auto result = p.validate_response(response_b64, "");
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("InResponseTo") != std::string::npos ||
+           result.error().find("unsolicited")  != std::string::npos ||
+           result.error().find("missing")      != std::string::npos));
+}
+
+TEST_CASE("SAML: replayed InResponseTo is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(request_id);
+
+    // First submission → should succeed
+    const auto result1 = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result1.has_value());
+
+    // Second submission with the same response → InResponseTo already consumed
+    const auto result2 = p.validate_response(response_b64, cookie_secret);
+    REQUIRE_FALSE(result2.has_value());
+    CHECK((result2.error().find("replayed")     != std::string::npos ||
+           result2.error().find("unsolicited")  != std::string::npos ||
+           result2.error().find("InResponseTo") != std::string::npos));
+}
+
+TEST_CASE("SAML: unknown InResponseTo (never issued) is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // Pass a fabricated request_id that we never called build_authn_request for
+    const auto response_b64 = f.make_response("_neverissuedid1234567890abcdef");
+
+    const auto result = p.validate_response(response_b64, "");
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("replayed")     != std::string::npos ||
+           result.error().find("unsolicited")  != std::string::npos ||
+           result.error().find("InResponseTo") != std::string::npos));
+}
+
+TEST_CASE("SAML: response with no Signature element is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // make_unsigned_response constructs an Assertion with no <ds:Signature>
+    const auto response_b64 = f.make_unsigned_response(request_id);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Signature") != std::string::npos ||
+           result.error().find("signature") != std::string::npos));
+}
+
+TEST_CASE("SAML: signed by a different cert (not pinned) is rejected", "[saml]") {
+    const auto& f  = fixture();
+
+    // Provider is configured with cert_pem (key pair A)
+    auto cfg      = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Response signed with key pair B (the "attacker's" key)
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false,
+        &f.priv_key_pem_b); // different private key
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    // Must fail signature verification — not a content-level error
+    const auto& err = result.error();
+    CHECK((err.find("signature") != std::string::npos ||
+           err.find("verify")    != std::string::npos ||
+           err.find("failed")    != std::string::npos));
+}
+
+TEST_CASE("SAML: cleanup_expired_states removes expired entries", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // Issue a request
+    p.build_authn_request("relay");
+
+    // Calling cleanup on a freshly-issued (not expired) entry should leave it
+    p.cleanup_expired_states();
+
+    // A second request with a fabricated ID should still fail (ID never issued)
+    const auto response_b64 = f.make_response("_notregistered99");
+    const auto result       = p.validate_response(response_b64, "");
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("SAML: malformed base64 input is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto result = p.validate_response("!!!notbase64!!!", "");
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("SAML: non-XML payload (valid base64) is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // base64("this is not xml")
+    const auto result = p.validate_response("dGhpcyBpcyBub3QgeG1s", "");
+    CHECK_FALSE(result.has_value());
+}
+
+// ── Fix 3: Assertion Issuer validation ────────────────────────────────────────
+
+TEST_CASE("SAML: assertion with wrong Issuer is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_wrong_issuer(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Issuer") != std::string::npos ||
+           result.error().find("issuer") != std::string::npos ||
+           result.error().find("mismatch") != std::string::npos));
+}
+
+TEST_CASE("SAML: assertion with no Issuer element is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_no_issuer(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Issuer") != std::string::npos ||
+           result.error().find("issuer") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+// ── Fix 4: Mandatory Conditions / AudienceRestriction / SCD ──────────────────
+
+TEST_CASE("SAML: assertion missing <Conditions> is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_no_conditions(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Conditions") != std::string::npos ||
+           result.error().find("conditions") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+TEST_CASE("SAML: assertion missing <AudienceRestriction> is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_no_audience_restriction(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("AudienceRestriction") != std::string::npos ||
+           result.error().find("audience") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+TEST_CASE("SAML: assertion missing <SubjectConfirmationData> is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_no_scd(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("SubjectConfirmationData") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+TEST_CASE("SAML: SCD missing Recipient attribute is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_scd_no_recipient(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("Recipient") != std::string::npos ||
+           result.error().find("recipient") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+TEST_CASE("SAML: SCD missing NotOnOrAfter attribute is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_scd_no_nooa(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("NotOnOrAfter") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+// ── F4: Conditions NotOnOrAfter is mandatory ──────────────────────────────────
+
+TEST_CASE("SAML: Conditions missing NotOnOrAfter attribute is rejected (F4)", "[saml]") {
+    // SAML WebSSO profile §4.1.4.2 requires Conditions/NotOnOrAfter.
+    // An absent NotOnOrAfter allows indefinite replay of an assertion.
+    // Before F4 this was only validated when present (optional); it is now
+    // mandatory, matching the existing SubjectConfirmationData enforcement.
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response_conditions_no_nooa(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("NotOnOrAfter") != std::string::npos ||
+           result.error().find("Conditions") != std::string::npos ||
+           result.error().find("missing") != std::string::npos));
+}
+
+// ── Fix 6: DOCTYPE/DTD rejection ─────────────────────────────────────────────
+
+TEST_CASE("SAML: response with DOCTYPE declaration is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // DOCTYPE rejection happens before signature verification (step 2.5), so we
+    // do not need a real request_id in the pending set.
+    const auto response_b64 = f.make_doctype_response("_unused_req_id");
+    const auto result       = p.validate_response(response_b64, "");
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("DOCTYPE") != std::string::npos ||
+           result.error().find("DTD")     != std::string::npos ||
+           result.error().find("rejected") != std::string::npos));
+}
+
+// ── Fix 1: Oversized body is rejected at provider level ───────────────────────
+
+TEST_CASE("SAML: oversized response (>1 MiB decoded) is rejected", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    // Construct a base64-encoded string whose decoded size is just over 1 MiB.
+    // A decoded run of 1048577 bytes (1 MiB + 1) is enough to trigger the guard.
+    const std::string big_xml(1048577, 'A'); // 1 MiB + 1 byte of junk
+    // b64_encode directly using the static helper
+    const auto big_b64 = [&]() {
+        static constexpr char kA[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const auto* d = reinterpret_cast<const unsigned char*>(big_xml.data());
+        const auto  n = big_xml.size();
+        std::string out;
+        out.reserve(((n + 2) / 3) * 4);
+        for (std::size_t i = 0; i < n; i += 3) {
+            auto v = static_cast<uint32_t>(d[i]) << 16;
+            if (i + 1 < n) v |= static_cast<uint32_t>(d[i + 1]) << 8;
+            if (i + 2 < n) v |= static_cast<uint32_t>(d[i + 2]);
+            out += kA[(v >> 18) & 0x3F];
+            out += kA[(v >> 12) & 0x3F];
+            out += (i + 1 < n) ? kA[(v >> 6) & 0x3F] : '=';
+            out += (i + 2 < n) ? kA[v & 0x3F] : '=';
+        }
+        return out;
+    }();
+
+    const auto result = p.validate_response(big_b64, "");
+    CHECK_FALSE(result.has_value());
+    CHECK((result.error().find("size") != std::string::npos ||
+           result.error().find("MiB")  != std::string::npos ||
+           result.error().find("maximum") != std::string::npos));
+}
+
+// ── Browser-binding cookie tests ─────────────────────────────────────────────
+
+TEST_CASE("SAML: validate_response rejected when binding cookie is empty", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result = p.build_authn_request("relay");
+    const auto request_id   = extract_request_id_from_url(authn_result.url);
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(request_id);
+
+    // Pass empty string as cookie_secret → binding check must reject
+    const auto result = p.validate_response(response_b64, "");
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("binding") != std::string::npos ||
+           result.error().find("cookie")  != std::string::npos ||
+           result.error().find("mismatch") != std::string::npos));
+}
+
+TEST_CASE("SAML: validate_response rejected when binding cookie has wrong value", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result = p.build_authn_request("relay");
+    const auto request_id   = extract_request_id_from_url(authn_result.url);
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(request_id);
+
+    // Pass a wrong (but non-empty) cookie_secret
+    const auto result = p.validate_response(response_b64,
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+    REQUIRE_FALSE(result.has_value());
+    CHECK((result.error().find("binding") != std::string::npos ||
+           result.error().find("cookie")  != std::string::npos ||
+           result.error().find("mismatch") != std::string::npos));
+}
+
+TEST_CASE("SAML: binding cookie mismatch consumes InResponseTo (single-use)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(request_id);
+
+    // First attempt with wrong cookie — entry must be consumed to prevent probing
+    const auto bad = p.validate_response(response_b64,
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+    REQUIRE_FALSE(bad.has_value());
+
+    // Second attempt with the CORRECT cookie — must also be rejected (already consumed)
+    const auto good = p.validate_response(response_b64, cookie_secret);
+    REQUIRE_FALSE(good.has_value());
+    CHECK((good.error().find("replayed")     != std::string::npos ||
+           good.error().find("unsolicited")  != std::string::npos ||
+           good.error().find("InResponseTo") != std::string::npos));
+}
+
+// ---------------------------------------------------------------------------
+// H-E: XSW duplicate-ID injection is rejected
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SAML: XSW — duplicate xml:id in Extensions element is rejected (H-E)", "[saml]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Build a response where a <samlp:Extensions xml:id="<assertionID>"> decoy
+    // appears alongside the correctly-signed Assertion with the same ID.
+    const auto response_b64 = f.make_response_with_duplicate_id(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    // Error must mention the XSW/duplicate-ID rejection
+    const auto& err = result.error();
+    INFO("error: " << err);
+    CHECK((err.find("XSW")       != std::string::npos ||
+           err.find("duplicate") != std::string::npos ||
+           err.find("duplicate") != std::string::npos));
+}
+
+// ---------------------------------------------------------------------------
+// H-F: is_enabled() requires non-empty entity IDs
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SAML: is_enabled returns false when idp_entity_id is empty (H-F)", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled      = true;
+    cfg.idp_cert_pem = "fake-cert-pem"; // non-empty cert
+    cfg.sp_entity_id = "https://sp.test";
+    cfg.sp_acs_url   = "https://sp.test/acs";
+    cfg.idp_sso_url  = "https://idp.test/sso";
+    // idp_entity_id intentionally left empty
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML: is_enabled returns false when sp_entity_id is empty (H-F)", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled       = true;
+    cfg.idp_cert_pem  = "fake-cert-pem";
+    cfg.idp_entity_id = "https://idp.test";
+    cfg.sp_acs_url    = "https://sp.test/acs";
+    cfg.idp_sso_url   = "https://idp.test/sso";
+    // sp_entity_id intentionally left empty
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML: is_enabled returns false when sp_acs_url is empty (H-F)", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled       = true;
+    cfg.idp_cert_pem  = "fake-cert-pem";
+    cfg.idp_entity_id = "https://idp.test";
+    cfg.sp_entity_id  = "https://sp.test";
+    cfg.idp_sso_url   = "https://idp.test/sso";
+    // sp_acs_url intentionally left empty
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML: is_enabled returns false when idp_sso_url is empty (H-F)", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled       = true;
+    cfg.idp_cert_pem  = "fake-cert-pem";
+    cfg.idp_entity_id = "https://idp.test";
+    cfg.sp_entity_id  = "https://sp.test";
+    cfg.sp_acs_url    = "https://sp.test/acs";
+    // idp_sso_url intentionally left empty
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+#else // _WIN32 ─────────────────────────────────────────────────────────────────
+
+// Windows stubs — verify N4 invariants compile and behave correctly.
+
+using namespace yuzu::server::saml;
+
+TEST_CASE("SAML (Windows): is_enabled returns false", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = true;
+    cfg.idp_cert_pem = "fake-pem";
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.is_enabled());
+}
+
+TEST_CASE("SAML (Windows): validate_response returns error (never success)", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = true;
+    SamlProvider p{cfg};
+    auto result = p.validate_response("dGVzdA==", "");
+    REQUIRE_FALSE(result.has_value());
+    // Must not be empty (error message explains the failure)
+    CHECK_FALSE(result.error().empty());
+}
+
+TEST_CASE("SAML (Windows): build_authn_request returns empty string", "[saml]") {
+    SamlConfig cfg;
+    cfg.enabled = true;
+    SamlProvider p{cfg};
+    CHECK(p.build_authn_request("relay").url.empty());
+}
+
+#endif // !_WIN32

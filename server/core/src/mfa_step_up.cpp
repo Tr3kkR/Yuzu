@@ -29,6 +29,43 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         return true;
     }
 
+    // SAML sessions carry no local `users` row (create_saml_session never
+    // writes one) and no MFA attestation in this release. The gate stays
+    // CLOSED — SAML sessions may NOT bypass step-up — but we return an
+    // honest denial rather than falling through to mfa_status() which
+    // would fail (UserNotFound) and emit a confusing "auth_db unavailable"
+    // message. Do NOT add an exemption here; SAML MFA attestation is
+    // deferred to a follow-up slice.
+    if (session.auth_source == "saml") {
+        const auto cid = detail::make_correlation_id();
+        nlohmann::json envelope = {
+            {"error",
+             {{"code", 403},
+              {"message", "MFA step-up is not available for SAML sessions in this release"},
+              {"correlation_id", cid},
+              {"remediation",
+               "Re-authenticate via SAML at /auth/saml/start to obtain a fresh session; "
+               "MFA attestation for SAML is deferred to a future release"}}},
+            {"meta",
+             {{"api_version", "v1"},
+              {"mfa_step_up_required", false}}}};
+        res.status = 403;
+        res.set_content(envelope.dump(), "application/json");
+        if (audit_fn) {
+            try {
+                (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint",
+                               action_label,
+                               "user=" + session.username +
+                                   " reason=saml_session_no_mfa_this_release");
+            } catch (const std::exception& ex) {
+                spdlog::warn("mfa_step_up: audit emission threw: {}", ex.what());
+            } catch (...) {
+                spdlog::warn("mfa_step_up: audit emission threw non-std exception");
+            }
+        }
+        return false;
+    }
+
     // OIDC/SSO sessions (PR3) carry no local `users` row, so the
     // enrollment lookup below would return `UserNotFound` and — were we
     // to run it — fail closed and lock every SSO operator out of the
