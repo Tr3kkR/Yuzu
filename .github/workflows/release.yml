@@ -650,9 +650,15 @@ jobs:
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
-          # Install InnoSetup 6
-          choco install innosetup -y --no-progress
+          # Install InnoSetup 6 if absent. Wee Tam (yuzu-weetam-windows) has no
+          # Chocolatey, so the old `choco install innosetup` aborted with
+          # "'choco' is not recognized". Use winget, and only when ISCC is
+          # missing — a runner that already has Inno Setup 6 skips the install.
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup 6 not found — installing via winget"
+            winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+          }
           if (-not (Test-Path $iscc)) {
             Write-Error "ISCC.exe not found after InnoSetup install"
             exit 1
