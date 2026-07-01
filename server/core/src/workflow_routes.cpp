@@ -1138,7 +1138,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     if (step_def->approval_mode == "always") {
                         blocked = true;
                     } else if (step_def->approval_mode == "role-gated") {
-                        blocked = (session->role != auth::Role::admin);
+                        // effective_role so an active JIT admin elevation bypasses
+                        // role-gated approval, consistent with require_admin.
+                        blocked = (auth::effective_role(*session) != auth::Role::admin);
                     } else {
                         blocked = true; // unknown mode — fail closed
                     }
@@ -1362,8 +1364,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (def->approval_mode == "always") {
                 needs_approval = true;
             } else if (def->approval_mode == "role-gated") {
-                // role-gated: admins bypass, all others need approval
-                needs_approval = (session->role != auth::Role::admin);
+                // role-gated: admins (incl. an active JIT elevation) bypass, all
+                // others need approval — effective_role for elevation consistency.
+                needs_approval = (auth::effective_role(*session) != auth::Role::admin);
             } else {
                 // Unknown mode — fail closed (require approval)
                 spdlog::warn("instruction '{}' has unrecognized approval_mode '{}' "

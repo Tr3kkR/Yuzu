@@ -634,6 +634,15 @@ const std::string& openapi_spec() {
     "/users/{username}/unlock": {
       "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
     },
+    "/users/{username}/elevation-eligibility": {
+      "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Not admin, MFA step-up refused, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "No auth.db (--data-dir unset)"}}}
+    },
+    "/elevate": {
+      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), or session dissolved mid-request"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
+    },
+    "/elevate/revoke": {
+      "post": {"summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}"}, "401": {"description": "Not authenticated"}}}
+    },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
     },)json"
@@ -1150,7 +1159,8 @@ void RestApiV1::register_routes(
                  }
                  auto session = auth_fn(req, res);
                  const std::string principal = session ? session->username : std::string{};
-                 const bool is_admin = session && session->role == auth::Role::admin;
+                 const bool is_admin =
+                     session && auth::effective_role(*session) == auth::Role::admin; // JIT elevation
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
@@ -1789,7 +1799,7 @@ void RestApiV1::register_routes(
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
         bool denied = existing && existing->principal_id != session->username &&
-                      session->role != auth::Role::admin;
+                      auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
         if (!existing || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
