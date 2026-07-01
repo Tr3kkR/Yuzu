@@ -650,19 +650,36 @@ jobs:
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
-          # Install InnoSetup 6 if absent. Wee Tam (yuzu-weetam-windows) has no
-          # Chocolatey, so the old `choco install innosetup` aborted with
-          # "'choco' is not recognized". Use winget, and only when ISCC is
-          # missing — a runner that already has Inno Setup 6 skips the install.
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
+          # Locate the Inno Setup compiler (ISCC.exe). Wee Tam
+          # (yuzu-weetam-windows) has no Chocolatey, so the old
+          # `choco install innosetup` aborted with "'choco' is not recognized".
+          # Install via winget when absent — but winget may place Inno Setup
+          # machine- OR user-scoped (rc3 installed 6.7.3 somewhere other than
+          # the hardcoded C:\Program Files (x86)\Inno Setup 6), so DISCOVER
+          # ISCC.exe rather than assuming a fixed path.
+          function Find-Iscc {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($p in $candidates) { if ($p -and (Test-Path $p)) { return $p } }
+            Get-ChildItem -Path @("${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA\Programs") `
+              -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          $iscc = Find-Iscc
+          if (-not $iscc) {
             Write-Host "Inno Setup 6 not found — installing via winget"
             winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+            $iscc = Find-Iscc
           }
-          if (-not (Test-Path $iscc)) {
+          if (-not $iscc) {
             Write-Error "ISCC.exe not found after InnoSetup install"
             exit 1
           }
+          Write-Host "Using ISCC: $iscc"
 
           # Build agent installer
           Write-Host "=== Building Agent Installer ==="
