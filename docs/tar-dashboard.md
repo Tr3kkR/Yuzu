@@ -81,7 +81,7 @@ URL structure:
 
 ## 3. PR-A — Retention-paused source list
 
-**Goal:** every device × source pair where `<source>_enabled=false`, surfaced in a sortable, filterable, exportable table, with one-click re-enable and an explicit "purge data" action gated behind a confirmation modal.
+**Goal:** every device × source pair where `<source>_enabled=false`, surfaced in a sortable, filterable, exportable table, with one-click re-enable and an explicit "purge data" action gated behind a typed-hostname confirmation.
 
 ### 3.1 Data flow
 
@@ -127,14 +127,16 @@ Per-source independence (the #539 invariant) means re-enabling one source on a d
 
 The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from `<source>_live`, `<source>_hourly`, `<source>_daily`, `<source>_monthly` for that source, *without* re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."
 
-Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`. The action is gated behind a typed-confirmation modal ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: tar.purge_source, principal: <session>, result: success|failure, detail_json: {device_id, source, rows_deleted}`.
+Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: tar.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
+
+> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/tar/retention-paused/purge`; audit verb `tar.source.purge` (matching the `tar.source.reenable` sibling); metric `yuzu_tar_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `tar.purge_source` refuses (`source_not_paused`) if the source is currently enabled, which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
 
 ### 3.5 Permissions and safety
 
 - View-only access requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command — same tier as `run-instruction` and `tar-execute` siblings).
 - **Re-enable** requires `Execution:Execute` and the operator's RBAC visibility on the target device. Out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side.
-- Purge requires `Infrastructure:Delete` on the target device, **and** the device must currently report `<source>_enabled=false` (rejected at the server with `400 SOURCE_NOT_PAUSED` if the live status disagrees — prevents a stale row from triggering accidental purge of an actively-collecting source).
+- Purge requires `Infrastructure:Delete` on the target device (a higher tier than re-enable's `Execution:Execute`), plus the operator's RBAC visibility on the device (same 404-collapse as re-enable). The paused-state guard is **agent-side and authoritative**: `tar.purge_source` refuses (`source_not_paused`) unless the source currently reports disabled, which closes the scan→purge TOCTOU and prevents purging an actively-collecting source. The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused frame is an ephemeral live scan with no persisted paused-state to check, so the authoritative guard lives on the agent that owns the data (see §3.4). The agent action validates `source` against the full capture-source registry; the server route additionally restricts it to the four retention-frame sources `{process, tcp, service, user}`.
 
 ### 3.6 Tests
 
@@ -303,7 +305,7 @@ The dashboard rendered the seed timestamp prominently (`Tree as observed since �
 | Retention-paused list view | `Infrastructure:Read` | |
 | Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `tar.status` fleet-wide; same tier as run-instruction/tar-execute |
 | Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
-| Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
+| Purge | `Infrastructure:Delete` | Per-device RBAC visibility check + typed-hostname confirmation (native `prompt()`, CSP-safe). Agent-side `source_not_paused` guard is authoritative (no server-side `SOURCE_NOT_PAUSED` check) |
 | TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
 | Process tree view (frame only) | `Infrastructure:Read` | Frame, host picker, filter bar |
@@ -339,7 +341,7 @@ Audit actions: `tar.status.scan` (Scan fleet — PR-A.A), `tar.source.reenable` 
 
 | PR | Scope | Status |
 |---|---|---|
-| PR-A | Page shell + retention-paused list (this doc §3) | **Shipped** PR-A.A (paused_at extension + dashboard page + retention-paused list). Purge action (§3.4) deferred. |
+| PR-A | Page shell + retention-paused list (this doc §3) | **Shipped** — PR-A.A (paused_at extension + dashboard page + retention-paused list) + typed-confirmation Purge action (§3.4, 2026-07-01). |
 | PR-B | Result-set store + REST API (`scope-walking-design.md` PR-B) | Pending |
 | PR-C | Scope chip + sidebar + breadcrumb (`scope-walking-design.md` PR-C) | Pending |
 | PR-D | TAR SQL frame migrated and scope-walking-aware (this doc §4) | Pending |

@@ -51,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
   central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
   deploy→verify cohort auto-fill.
+- **TAR retention-paused source purge (Phase 15.A).** The `/tar` retention-paused frame gains a
+  **Purge data** action: for a source an operator deliberately paused (to preserve forensic data),
+  permanently drop its accumulated warehouse rows (`<source>_{live,hourly,daily,monthly}`) **without**
+  re-enabling collection. New agent action `tar.purge_source` (refuses unless the source is paused —
+  the authoritative TOCTOU guard), server route `POST /fragments/tar/retention-paused/purge` gated on
+  `Infrastructure:Delete`, a typed-hostname confirmation (native `prompt()`, CSP-safe), audit verb
+  `tar.source.purge`, and metric `yuzu_tar_source_purge_total{result}`. The purge also forces a
+  `wal_checkpoint(TRUNCATE)` so the erasure is complete on disk (no WAL residue) and disk is reclaimed
+  at return. Completes 15.A. See `docs/tar-dashboard.md` §3.4.
+  **Upgrade note:** the `tar.purge_source` action requires an agent at this release or later; an older
+  agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
+  fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
 ## [0.13.0] - 2026-07-01
 

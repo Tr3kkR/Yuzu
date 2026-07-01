@@ -195,6 +195,13 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
             "Operator-triggered TAR source re-enable attempts by result "
             "(success / scope_violation / agent_not_connected / denied / invalid_input).",
             "counter");
+        metrics_->describe(
+            "yuzu_tar_source_purge_total",
+            "Operator-triggered TAR retention-paused source purge (destructive) attempts by "
+            "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
+            "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
+            "the command response record.",
+            "counter");
     }
 
     // -- GET /fragments/results -----------------------------------------------
@@ -1223,6 +1230,130 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  res.set_content("", "text/html; charset=utf-8");
              });
 
+    // POST /fragments/tar/retention-paused/purge — Phase 15.A destructive purge.
+    // Mirrors /reenable but (a) gates on Infrastructure:Delete (higher tier than
+    // re-enable's Execution:Execute), (b) dispatches tar.purge_source, and (c)
+    // leaves the source PAUSED (purge drops data without re-enabling collection).
+    // The agent refuses if the source is still enabled — that is the authoritative
+    // TOCTOU guard. Dispatch is fire-and-forget, so rows_deleted is computed
+    // agent-side (returned in the response record) and is NOT in this audit row.
+    svr.Post("/fragments/tar/retention-paused/purge",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                     audit_fn_(req, "tar.source.purge", "denied", "command", "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "denied"}})
+                             .increment();
+                     }
+                     return;
+                 }
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<span class=\"tar-row-error\">Dispatch unavailable.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 auto device_id = req.has_param("device_id") ? req.get_param_value("device_id")
+                                                             : extract_form_value(req.body, "device_id");
+                 auto source = req.has_param("source") ? req.get_param_value("source")
+                                                       : extract_form_value(req.body, "source");
+
+                 if (device_id.empty() || source.empty()) {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "device_id and source are required.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                             .increment();
+                     }
+                     return;
+                 }
+                 // Same source scope as the frame (the four core diff sources); a
+                 // forged form value is rejected rather than dispatched.
+                 if (source != "process" && source != "tcp" && source != "service" &&
+                     source != "user") {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Unknown source — must be one of "
+                                     "process, tcp, service, user.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 // Per-device RBAC visibility (same 404-collapse as reenable so the
+                 // response cannot enumerate device existence; real reason audited).
+                 bool visible = false;
+                 if (mgmt_group_store_) {
+                     auto visible_ids = mgmt_group_store_->get_visible_agents(session->username);
+                     for (const auto& vid : visible_ids) {
+                         if (vid == device_id) {
+                             visible = true;
+                             break;
+                         }
+                     }
+                 }
+                 if (!visible) {
+                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                              std::format("scope_violation source={}", source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total",
+                                           {{"result", "scope_violation"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 params["source"] = source;
+                 auto [command_id, sent] =
+                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params);
+
+                 if (sent == 0) {
+                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                              std::format("agent_not_connected source={}", source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total",
+                                           {{"result", "agent_not_connected"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 audit_fn_(req, "tar.source.purge", "success", "command", command_id,
+                          std::format("device={} source={}", device_id, source));
+                 if (metrics_) {
+                     metrics_->counter("yuzu_tar_source_purge_total", {{"result", "success"}})
+                         .increment();
+                 }
+
+                 res.set_header("HX-Trigger",
+                                std::format("{{\"showToast\":{{\"message\":\"Purging {} data on "
+                                            "{}\",\"level\":\"success\"}}}}",
+                                            source, html_escape(std::string{device_id})));
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
+                 // The source stays paused (purge does not re-enable), so the row
+                 // remains — replace the action buttons with a dispatched note; a
+                 // Scan reconciles the (now-zero) counts.
+                 res.set_content("<span class=\"tar-row-note\">Purge dispatched — Scan to "
+                                 "refresh.</span>",
+                                 "text/html; charset=utf-8");
+             });
+
     spdlog::info("DashboardRoutes: registered fragment endpoints");
 }
 
@@ -2151,7 +2282,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // sec-M3 finding — a malicious agent registering with a `device_id`
         // containing `"` could close the JSON string and inject keys.
         html += std::format(
-            "<td style=\"text-align:right\">"
+            "<td style=\"text-align:right;white-space:nowrap\">"
             "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
             "font-size:0.75rem\" "
             "hx-post=\"/fragments/tar/retention-paused/reenable\" "
@@ -2159,11 +2290,22 @@ std::string DashboardRoutes::render_tar_retention_paused(
             "hx-target=\"closest tr\" hx-swap=\"delete\" "
             "hx-confirm=\"Re-enable {} collector on {}?\">"
             "Re-enable"
+            "</button> "
+            // Purge is destructive: a typed-hostname confirm (tarPurgeConfirm, a
+            // native prompt) gates it — no hx-confirm. Data via HTML-escaped
+            // data-* attrs (read by the JS), never interpolated into script.
+            "<button class=\"btn-danger\" style=\"padding:0.2rem 0.6rem;"
+            "font-size:0.75rem\" "
+            "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
+            "onclick=\"tarPurgeConfirm(this)\" "
+            "title=\"Permanently delete this source's stored data (source stays "
+            "paused)\">"
+            "Purge data"
             "</button>"
             "</td>",
-            html_escape(json_escape(r.agent_id)),
-            html_escape(json_escape(r.source)),
-            html_escape(r.source), html_escape(r.agent_display));
+            html_escape(json_escape(r.agent_id)), html_escape(json_escape(r.source)),
+            html_escape(r.source), html_escape(r.agent_display), html_escape(r.agent_id),
+            html_escape(r.agent_display), html_escape(r.source));
         html += "</tr>";
     }
     html += "</tbody></table>";

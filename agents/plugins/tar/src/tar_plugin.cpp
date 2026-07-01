@@ -288,23 +288,13 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
     return yuzu::tar::ensure_redaction_defaults(std::move(result));
 }
 
-// Per-source enable/disable (issue #59). The default for a source with no
-// config row yet comes from CaptureSourceDef::default_enabled (true for
-// always-on sources, false for opt-in module/procperf/netqual), so a fresh
-// agent agrees with tar.status / retention / the paused_at transition.
-//
-// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
-// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
-// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
-// such value as enabled, so a source an operator paused for forensics whose
-// `_enabled` value was corrupted or tampered kept collecting — and disagreed
-// with the tri-state `status` reports. run_retention() shares the same canonical
-// gate so an "errored" source's rows are preserved, not pruned.
-bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
-    const char* def = yuzu::tar::source_default_enabled(source) ? "true" : "false";
-    return yuzu::tar::canonical_source_enabled(
-               db.get_config(std::format("{}_enabled", source), def)) == "true";
-}
+// Per-source enable/disable (issue #59). The collect-time / purge-time gate
+// `source_enabled` now lives in tar_aggregator (beside canonical_source_enabled,
+// the #560 tri-state authority it wraps) so the guard predicate — including the
+// Phase 15.A destructive-purge guard — is directly unit-testable. Pull it into
+// this TU's unqualified lookup so the many bare `source_enabled(*db_, ...)` call
+// sites below are unchanged.
+using yuzu::tar::source_enabled;
 
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
 std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& db) {
@@ -338,7 +328,7 @@ public:
                                      "export",         "configure",     "collect_fast",
                                      "collect_slow",   "collect_perf",  "collect_software",
                                      "rollup",         "sql",           "compatibility",
-                                     "fleet_snapshot", nullptr};
+                                     "fleet_snapshot", "purge_source",  nullptr};
         return acts;
     }
 
@@ -601,6 +591,8 @@ public:
             return do_snapshot(ctx);
         if (action == "configure")
             return do_configure(ctx, params);
+        if (action == "purge_source")
+            return do_purge_source(ctx, params);
         if (action == "rollup")
             return do_rollup(ctx);
         if (action == "sql")
@@ -1815,6 +1807,47 @@ private:
     }
 
     // ── configure action ──────────────────────────────────────────────────────
+
+    // Phase 15.A retention-paused purge: drop ALL warehouse rows for a source
+    // the operator deliberately paused, WITHOUT re-enabling collection. Refuses
+    // unless the source is currently disabled — this is the authoritative safety
+    // guard (closes the scan→purge TOCTOU: the server frame lists paused sources,
+    // but one could have been re-enabled between the operator's scan and purge).
+    // No baseline (tar_state) reset is needed: purge touches only the warehouse
+    // event tables, not the diff snapshot, and the disable transition already
+    // cleared the baseline when the source was paused — so a later re-enable
+    // starts fresh regardless.
+    int do_purge_source(yuzu::CommandContext& ctx, yuzu::Params params) {
+        const std::string source{params.get("source")};
+        if (source.empty()) {
+            ctx.write_output("error|source is required");
+            return 1;
+        }
+        bool known = false;
+        for (const auto& s : yuzu::tar::capture_sources()) {
+            if (s.name == source) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            ctx.write_output(std::format("error|unknown source: {}", source));
+            return 1;
+        }
+        if (source_enabled(*db_, source)) {
+            ctx.write_output(std::format(
+                "error|source_not_paused: {} is enabled; disable it before purging", source));
+            return 1;
+        }
+        auto res = db_->purge_source(source);
+        if (!res) {
+            ctx.write_output(std::format("error|{}", res.error()));
+            return 1;
+        }
+        ctx.write_output(
+            std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged"}})", source, *res));
+        return 0;
+    }
 
     int do_configure(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto retention = params.get("retention_days");

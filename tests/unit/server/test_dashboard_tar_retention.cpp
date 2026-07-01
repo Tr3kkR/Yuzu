@@ -269,6 +269,34 @@ TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean e
     CHECK_FALSE(contains(html, "<table>"));
 }
 
+TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (15.A)",
+          "[server][tar][retention-render]") {
+    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-purge-rs-"}};
+    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-purge-mg-"}};
+    ResponseStore rs{rs_db.path};
+    ManagementGroupStore mg{mg_db.path};
+    grant_visibility(mg, {"agent-A"});
+
+    rs.store(mk_resp("agent-A", 10,
+                     "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 1, 1);
+    const std::string html = acc.render(kUser);
+
+    // The destructive Purge button uses a typed-hostname confirm (tarPurgeConfirm,
+    // a native prompt — CSP-safe) with data-* attributes, not hx-confirm.
+    CHECK(contains(html, "Purge data"));
+    CHECK(contains(html, "btn-danger"));
+    CHECK(contains(html, "onclick=\"tarPurgeConfirm(this)\""));
+    CHECK(contains(html, "data-source=\"process\""));
+    CHECK(contains(html, "data-device=\"agent-A\"")); // POST device_id
+    CHECK(contains(html, "data-host=\"agent-A\""));    // typed-confirm target (hostname)
+    // Re-enable stays alongside it.
+    CHECK(contains(html, "Re-enable"));
+}
+
 TEST_CASE("render_tar_retention_paused: no scan yet renders the placeholder",
           "[server][tar][retention-render]") {
     DashboardTarRetentionTestAccess acc;

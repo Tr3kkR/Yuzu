@@ -123,7 +123,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
-| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **In progress — PR-A.A shipped** (paused_at + status extension + dashboard page + Scan + Re-enable; purge action + persistence pending) |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **Shipped** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
 | | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | Open |
 | | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
 | | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
@@ -1488,9 +1488,11 @@ Active-passive failover for server resilience:
 > **Status correction (2026-07-01).** The bulk of this phase shipped on 2026-05-31 but the item statuses below were never updated from "Open". Corrected here: **15.A–15.E and 15.H are shipped**; **15.G is largely shipped** (GC-sweep thread, quota/pin caps, re-eval, GC/alive gauges); **15.F (this item) is the only substantially-open piece** and is in progress on `feat/tar-15f-chrome-ir-e2e`.
 
 ### Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List
-**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** **Shipped** 2026-05-31 — `/tar` page shell + retention-paused source list (scan / one-click re-enable) are live (`tar_page_ui.cpp`, `dashboard_routes.cpp`). Typed-confirmation purge + persistence are a tracked follow-up.
+**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** **Shipped** — `/tar` page shell + retention-paused source list (scan / one-click re-enable) live 2026-05-31; typed-confirmation purge completed the frame 2026-07-01 (`tar_page_ui.cpp`, `dashboard_routes.cpp`). Persistence remains a tracked follow-up.
 
 New `/tar` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `tar.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
+
+**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `tar.purge_source` (drops all warehouse tiers for a source, leaving it paused), a `POST /fragments/tar/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`tar.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `tar.source.purge`; metric `yuzu_tar_source_purge_total{result}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
 
 **Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/tar/src/tar_plugin.cpp`, new `tests/unit/server/test_tar_dashboard_*`. Design: `docs/tar-dashboard.md` §3.
 
