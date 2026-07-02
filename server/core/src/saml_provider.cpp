@@ -686,6 +686,20 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     //
     // RSA-SHA1, plain SHA1, MD5, HMAC-*, and DSA-* are deliberately excluded.
     {
+        // Mandatory floor. Transform ids are GetKlass() results that resolve to
+        // NULL when the algorithm is not compiled into this xmlsec/OpenSSL build.
+        // We skip a NULL optional id below (a build without ECDSA simply does not
+        // allow ECDSA) — but an EMPTY enabled-transform list means allow-all in
+        // xmlsec, so we fail closed if the always-required floor (RSA-SHA256 +
+        // SHA-256 digest + ExclC14N) is itself absent, guaranteeing the list can
+        // never degenerate to allow-all.
+        if (xmlSecTransformExclC14NId == nullptr ||
+            xmlSecOpenSSLTransformRsaSha256Id == nullptr ||
+            xmlSecOpenSSLTransformSha256Id == nullptr) {
+            return std::unexpected(
+                "xmlsec build lacks a required transform (ExclC14N / RSA-SHA256 / SHA-256)");
+        }
+
         const xmlSecTransformId kAllowedSignatureTransforms[] = {
             // Canonicalization methods (SignedInfo-level).
             xmlSecTransformInclC14NId,
@@ -701,6 +715,7 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
             xmlSecOpenSSLTransformEcdsaSha512Id,
         };
         for (xmlSecTransformId id : kAllowedSignatureTransforms) {
+            if (id == nullptr) continue;  // algorithm not built into this xmlsec — not allowed
             if (xmlSecDSigCtxEnableSignatureTransform(dsig_ctx, id) < 0) {
                 return std::unexpected("failed to configure signature algorithm allowlist");
             }
@@ -720,6 +735,7 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
             xmlSecOpenSSLTransformSha512Id,
         };
         for (xmlSecTransformId id : kAllowedReferenceTransforms) {
+            if (id == nullptr) continue;  // algorithm not built into this xmlsec — not allowed
             if (xmlSecDSigCtxEnableReferenceTransform(dsig_ctx, id) < 0) {
                 return std::unexpected("failed to configure digest algorithm allowlist");
             }

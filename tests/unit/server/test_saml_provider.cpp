@@ -111,6 +111,9 @@ struct SamlTestFixture {
     /// @param use_sha1_algorithms  If true, the SignedInfo template requests
     ///        rsa-sha1 / sha1 instead of rsa-sha256 / sha256 — used to prove the
     ///        algorithm allowlist rejects a legitimately-pinned-key SHA-1 signature.
+    /// @param use_sha1_digest_only  If true, the SignatureMethod stays rsa-sha256
+    ///        but the Reference DigestMethod is sha1 — isolates the Reference-digest
+    ///        allowlist (proves the digest is restricted, not just the SignatureMethod).
     std::string make_response(
         const std::string& request_id,
         const std::string& name_id        = "user@example.com",
@@ -119,7 +122,8 @@ struct SamlTestFixture {
         const std::string& recipient      = {},
         bool inject_extra_assertion       = false,
         const std::string* signing_priv_key = nullptr,
-        bool use_sha1_algorithms           = false) const
+        bool use_sha1_algorithms           = false,
+        bool use_sha1_digest_only          = false) const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -127,7 +131,7 @@ struct SamlTestFixture {
         const std::string sig_method_uri = use_sha1_algorithms
             ? "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
             : "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-        const std::string digest_method_uri = use_sha1_algorithms
+        const std::string digest_method_uri = (use_sha1_algorithms || use_sha1_digest_only)
             ? "http://www.w3.org/2000/09/xmldsig#sha1"
             : "http://www.w3.org/2001/04/xmlenc#sha256";
 
@@ -1298,6 +1302,40 @@ TEST_CASE("SAML: assertion signed with RSA-SHA1 under the correct pinned key "
     // enabledReferenceTransforms allowlist, which surfaces here as a plain
     // signature verification failure (xmlsec cannot even construct the
     // transform, so xmlSecDSigCtxVerify returns < 0 or a failed status).
+    const auto& err = result.error();
+    CHECK((err.find("signature") != std::string::npos ||
+           err.find("verify")    != std::string::npos ||
+           err.find("internal")  != std::string::npos ||
+           err.find("failed")    != std::string::npos));
+}
+
+TEST_CASE("SAML: assertion with an RSA-SHA256 signature but a SHA-1 Reference "
+          "digest is rejected (digest allowlist isolated)", "[saml]") {
+    const auto& f = fixture();
+
+    // This isolates the *Reference-digest* half of the allowlist: the
+    // SignatureMethod is the accepted rsa-sha256, only the DigestMethod is the
+    // weak sha1. If only the SignatureMethod were restricted (and the digest
+    // left to xmlsec defaults) this would slip through — so it locks the
+    // enabledReferenceTransforms restriction against future regressions.
+    auto cfg = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {},
+        /*inject_extra_assertion=*/false,
+        /*signing_priv_key=*/nullptr,       // the correct pinned key
+        /*use_sha1_algorithms=*/false,      // SignatureMethod stays rsa-sha256
+        /*use_sha1_digest_only=*/true);     // but the Reference digest is sha1
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
     const auto& err = result.error();
     CHECK((err.find("signature") != std::string::npos ||
            err.find("verify")    != std::string::npos ||
