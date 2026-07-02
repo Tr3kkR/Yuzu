@@ -213,6 +213,40 @@ TEST_CASE("TAR paused_at: recovering an errored source via =true clears the time
     CHECK(db.get_config("process_paused_at", "0") == "0");
 }
 
+TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.A)",
+          "[tar][source-enabled][purge]") {
+    // source_enabled is the authoritative guard for tar.purge_source: the action
+    // refuses unless this returns false (source is paused). Pin the exact predicate
+    // the plugin branches on so a regression that mis-reads the enabled-state — and
+    // would let a purge hit an actively-collecting source, or wrongly refuse a
+    // paused one — is caught here even though do_purge_source itself lives in the
+    // (test-unlinked) plugin TU. Governance B1.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-15a-guard-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // Never configured: a purge-whitelisted source defaults ENABLED → guard refuses
+    // (you cannot purge a source you never deliberately paused).
+    REQUIRE(source_default_enabled("process"));
+    CHECK(source_enabled(db, "process")); // → tar.purge_source REFUSES
+
+    // Paused: enabled=false → guard allows the purge.
+    db.set_config("process_enabled", "false");
+    CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED
+
+    // Re-enabled between scan and purge (the TOCTOU the guard closes): true → refuse.
+    db.set_config("process_enabled", "true");
+    CHECK(source_enabled(db, "process")); // → tar.purge_source REFUSES
+
+    // #560 fail-closed: a tampered/corrupt flag canonicalises to "errored", which
+    // is NOT "true", so the source reads disabled — a purge is allowed (operator-
+    // targeted, and the flag is already invalid), never wrongly treated as enabled.
+    db.set_config("process_enabled", "maybe");
+    CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED (fail-closed)
+}
+
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
           "[tar][paused_at][pr-a]") {
     // If the operator submits configure with the same value the source

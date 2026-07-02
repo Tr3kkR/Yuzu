@@ -23,6 +23,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   group→role mapping, AuthnRequest signing, hardening) is tracked in #1789. See
   `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
   and the security review `docs/security-reviews/saml-sp-2026-07-01.md`.
+- **Device-identity daily-sync source + CMDB store (`device_ci`, ADR-0016 source #3).**
+  The agent now syncs stable hardware/OS identity to central Postgres daily, on the same
+  hash-skip framework as `installed_software`. The `device_ci` source fans out to the
+  `hardware`, `device_identity`, `os_info`, and `network_config` plugins in-process
+  (`LocalDispatcher`) and emits a canonical CI record: manufacturer, model, serial number,
+  system UUID, BIOS details, CPU/RAM/disk summary, primary MAC, NIC count, OS
+  name/version/build, and architecture. Volatile telemetry (free disk space, uptime, IP
+  addresses) is deliberately excluded so the content hash is stable and steady-state
+  traffic is suppressed. A new `hardware` plugin `system` action collects serial + system
+  UUID (Windows WMI / Linux sysfs-DMI via `cap_dac_read_search` / macOS `ioreg`); it is
+  also dispatchable on-demand via the audited instruction path. Server:
+  `DeviceInventoryStore` (born-on-PG, schema `device_inventory_store`, one row per agent;
+  ingest via `device_ci_ingestion.*` on both the direct `ReportInventory` and gateway
+  `ProxyInventory` paths). `last_seen`/`first_seen` are the server receipt time (#1685).
+  Suppressed by `--inventory-disable` along with the other sources. Observability:
+  `yuzu_inventory_ingest_total{source="device_ci"}`,
+  `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`,
+  `yuzu_inventory_read_degrade_total{source="device_ci"}`; the store joins `/readyz` +
+  `/healthz`. The operator-facing read surface (the `/inventory` Devices tab) ships in PR2.
+- **`/auto` VERIFY — before/after application-performance evidence (UAT non-functional).** A third
+  stage on the `/auto` page (after ASSESS pre-flight and ACT deploy): did upgrading an app from one
+  version to the next change how the **same machines** perform? The shift is computed **per machine,
+  paired** — each device's own baseline-version window vs its own candidate-version window (read from
+  the shipped per-device B1 store, the window anchored to that machine's transition, **not** to
+  "today" — so a staggered rollout still pairs), then the per-machine deltas are aggregated. A fleet
+  baseline-vs-candidate diff would be confounded by different populations; pairing on the machine
+  holds it fixed. A machine that ran only one version in-window is **excluded and counted**, never
+  imputed. **Evidential only — there is no verdict, no threshold, no pass/fail**: the tool reports the
+  measured shift (CPU/working-set before→after means, the median per-machine delta, p95 across
+  machines) and the up/flat/down split; the operator (or an AI colleague over MCP) judges. There is
+  **no cohort floor** — real canaries are 2–3 devices, so a floor would gut the feature; a sub-floor
+  paired set is flagged *indicative*, never suppressed, and the read is **audited**
+  (`dex.app_perf.compare`, operational) — accountability standing in for the suppression a floor
+  would give. Surfaces (all `GuaranteedState:Read`): REST `GET /api/v1/dex/perf/compare`, MCP
+  `compare_app_perf_versions`, and the `/auto` dashboard VERIFY stage (aggregate cards + distribution
+  + an audited per-machine drill). Pure engine `app_perf_compare` (reducer + `compare` split so a
+  later *live* candidate plugs the same slot); B1 cohort read `app_perf_cohort_reader` (agent_id
+  preserved). The per-machine pairs are a **dashboard-only** audited drill
+  (`dex.app_perf.compare.drill`); REST/MCP expose only the identity-free aggregate.
+  Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
+  central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
+  deploy→verify cohort auto-fill.
+- **TAR retention-paused source purge (Phase 15.A).** The `/tar` retention-paused frame gains a
+  **Purge data** action: for a source an operator deliberately paused (to preserve forensic data),
+  permanently drop its accumulated warehouse rows (`<source>_{live,hourly,daily,monthly}`) **without**
+  re-enabling collection. New agent action `tar.purge_source` (refuses unless the source is paused —
+  the authoritative TOCTOU guard, held atomically with the delete under the collector lock), dashboard
+  fragment `POST /fragments/tar/retention-paused/purge` and an agentic-first REST endpoint
+  `POST /api/v1/tar/retention-paused/purge` — both gated on `Infrastructure:Delete` (per-device scoped),
+  a typed-hostname confirmation (native `prompt()`, CSP-safe) + CSRF same-site gate on the fragment,
+  audit verb `tar.source.purge`, and metric `yuzu_tar_source_purge_total{result}`. The generic
+  `POST /api/command` path also elevates `tar.purge_source` to `Infrastructure:Delete` + visible-agent
+  confinement so it can't be a weaker route. The purge also forces a `wal_checkpoint(TRUNCATE)` so the
+  erasure is complete on disk (no WAL residue) and disk is reclaimed at return. Completes 15.A. See
+  `docs/tar-dashboard.md` §3.4.
+  **Upgrade note:** the `tar.purge_source` action requires an agent at this release or later; an older
+  agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
+  fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
 ## [0.13.0] - 2026-07-01
 

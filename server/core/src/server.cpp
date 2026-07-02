@@ -39,11 +39,13 @@
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
+#include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
@@ -84,6 +86,7 @@
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
 #include "preflight_routes.hpp"
+#include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
@@ -339,8 +342,9 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error). /readyz stays green "
-                          "under pure pool saturation, so this is the read-path degrade signal",
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(installed_software/device_ci). /readyz stays green under pure pool "
+                          "saturation, so this is the read-path degrade signal",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -403,6 +407,14 @@ public:
         metrics_.describe("yuzu_app_perf_group_read_degrade_total",
                           "Management-group app-perf trend reads that returned a degrade rather than "
                           "a result, by reason",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_degrade_total",
+                          "/auto VERIFY cohort B1 reads that returned a degrade rather than a "
+                          "result, by reason (pool_acquire_timeout/query_error)",
+                          "counter");
+        metrics_.describe("yuzu_app_perf_cohort_read_cap_hit_total",
+                          "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
+                          "comparison is incomplete and may mis-pair machines)",
                           "counter");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
@@ -2187,6 +2199,25 @@ public:
             }
         }
 
+        // Typed device-CI projection — born-on-Postgres (ADR-0016 device_ci source).
+        // Stable hardware/OS identity (a CMDB CI record), 1:1 per agent. Independent
+        // of the stores above (its own schema, its own fail-closed). Wires BOTH server
+        // entry points (direct ReportInventory + gateway ProxyInventory).
+        if (pg_pool_ && !startup_failed_) {
+            device_inventory_store_ = std::make_unique<DeviceInventoryStore>(*pg_pool_);
+            if (!device_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: device inventory store migration/open failed "
+                              "(database reachable but the device_inventory_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                device_inventory_store_->set_metrics(&metrics_);
+                agent_service_.set_device_inventory_store(device_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_device_inventory_store(device_inventory_store_.get());
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -2210,6 +2241,13 @@ public:
                 // own (reads B1's), so no fail-closed gate — it degrades to nullopt.
                 app_perf_group_reader_ = std::make_unique<AppPerfGroupReader>(*pg_pool_);
                 app_perf_group_reader_->set_metrics(&metrics_);
+
+                // Cohort reader (/auto VERIFY): raw B1 rows for a member set ×
+                // app × two versions, agent_id PRESERVED so the compare engine
+                // pairs each machine. Borrows the pool, reads B1's schema, no
+                // fail-closed gate — degrades to nullopt.
+                app_perf_cohort_reader_ = std::make_unique<AppPerfCohortReader>(*pg_pool_);
+                app_perf_cohort_reader_->set_metrics(&metrics_);
             }
         }
 
@@ -3169,7 +3207,14 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
         app_perf_group_reader_.reset(); // reads B1; before the daily store + pool
+        app_perf_cohort_reader_.reset(); // reads B1; before the daily store + pool
         app_perf_daily_store_.reset();
+        // Device-CI store: same discipline — null the borrowed pointers in both ingest
+        // services, then drop the store, BEFORE the pool.
+        agent_service_.set_device_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_device_inventory_store(nullptr);
+        device_inventory_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -4688,12 +4733,14 @@ private:
                 software_inventory_store_ && software_inventory_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
+            bool device_inventory_ok =
+                device_inventory_store_ && device_inventory_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok;
+                                 app_perf_fleet_ok && device_inventory_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4712,7 +4759,8 @@ private:
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
-                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"}}},
+                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
+                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -4877,6 +4925,10 @@ private:
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
                  app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
+                // ADR-0016 device-CI born-on-Pg store — same rationale as the
+                // software_inventory_store row above (silent no-ingest ack if dead).
+                {"device_inventory_store",
+                 device_inventory_store_ && device_inventory_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -5776,6 +5828,64 @@ private:
             // All commands require Execution:Execute permission
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+
+            // Per-action securable elevation + scope confinement for DESTRUCTIVE
+            // generic-dispatch actions (governance HIGH #2). /api/command otherwise
+            // base-gates only Execution:Execute and applies NO per-device visibility to
+            // explicit agent_ids — a systemic property of this escape hatch tracked
+            // separately (Tr3kkR/Yuzu#1788). An irreversible action (e.g.
+            // tar.purge_source) must NOT inherit that: require its real securable AND
+            // confine the targets to the operator's visible agents, refusing untargeted
+            // broadcast/scope fan-out. The dedicated POST /api/v1/tar/retention-paused/
+            // purge is the first-class structured surface; this keeps the generic path
+            // from being a weaker one on AUTHZ. (Observability is still weaker here: a
+            // purge via /api/command audits under the generic `command.dispatch` verb +
+            // yuzu_commands_dispatched_total, not tar.source.purge / the domain metric —
+            // domain-verb emission on this path is tracked in Tr3kkR/Yuzu#1787.)
+            {
+                static const std::unordered_map<std::string,
+                                                std::pair<std::string, std::string>>
+                    kDestructiveActionSecurable = {
+                        {"tar.purge_source", {"Infrastructure", "Delete"}},
+                    };
+                std::string dkey = plugin + "." + action;
+                std::transform(dkey.begin(), dkey.end(), dkey.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (auto it = kDestructiveActionSecurable.find(dkey);
+                    it != kDestructiveActionSecurable.end()) {
+                    if (!require_permission(req, res, it->second.first, it->second.second))
+                        return;
+                    // Destructive dispatch must be explicitly targeted + in scope.
+                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                        res.status = 400;
+                        res.set_content(
+                            R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    // Confine to the operator's visible agents (fail-closed: an absent
+                    // mgmt-group store filters to empty → 404, same posture as the
+                    // dashboard fragment). Out-of-scope ids are silently dropped.
+                    std::vector<std::string> filtered;
+                    if (mgmt_group_store_) {
+                        auto s = require_auth(req, res);
+                        if (!s) return;
+                        auto vis = mgmt_group_store_->get_visible_agents(s->username);
+                        std::unordered_set<std::string> visible(vis.begin(), vis.end());
+                        for (const auto& aid : agent_ids)
+                            if (visible.count(aid))
+                                filtered.push_back(aid);
+                    }
+                    agent_ids = std::move(filtered);
+                    if (agent_ids.empty()) {
+                        res.status = 404;
+                        res.set_content(
+                            R"({"error":{"code":404,"message":"no reachable in-scope agent"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                }
+            }
 
             if (!registry_.has_any()) {
                 res.status = 503;
@@ -8866,6 +8976,36 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
+        app_perf_providers.cohort =
+            [this](std::string_view group_id, std::string_view app, std::string_view baseline,
+                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
+            if (!app_perf_cohort_reader_ || !mgmt_group_store_)
+                return std::nullopt;
+            // Resolve members (one bounded read, lease released), THEN read their raw
+            // B1 rows (a second bounded read) — never a lease held across the other
+            // (ADR-0012 §1). The /auto VERIFY compare engine pairs these per machine.
+            const auto members = mgmt_group_store_->get_members(std::string(group_id));
+            std::vector<std::string> agent_ids;
+            agent_ids.reserve(members.size());
+            for (const auto& m : members)
+                agent_ids.push_back(m.agent_id);
+            CohortRead out;
+            out.member_count = static_cast<std::int64_t>(agent_ids.size());
+            if (agent_ids.empty())
+                return out; // empty/unknown group → member_count 0, no rows (not a degrade)
+            bool truncated = false;
+            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
+                                                                 window_days, truncated);
+            if (!rows)
+                return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
+            out.rows = std::move(*rows);
+            out.truncated = truncated;
+            return out;
+        };
+        // COPY the cohort provider (std::function is copyable) so the /auto VERIFY
+        // routes keep a live seam even after app_perf_providers is moved into the
+        // REST + MCP registrars below.
+        AppPerfCohortFn verify_cohort_fn = app_perf_providers.cohort;
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -9340,6 +9480,26 @@ private:
                 return preflight::collect_check_responses(*response_store_, run_id, applicable);
             },
             audit_fn, preflight_run_store_.get());
+
+        // VerifyRoutes — /auto Stage 3 VERIFY: the cohort-paired before/after
+        // app-perf evidence (UAT non-functional). Reads the shipped B1 store via the
+        // COPIED cohort provider; the pure compare engine pairs each machine. The
+        // aggregate read is an operational `dex.app_perf.compare` audit (set-and-
+        // proceed — the accountability that stands in for the absent floor); the
+        // per-machine drill is the audited PII surface. EVIDENTIAL only — no verdict,
+        // NO cohort floor (real canaries are 2-3 devices). Shares the /auto auth +
+        // group list with PreflightRoutes.
+        verify_routes_ = std::make_unique<VerifyRoutes>();
+        verify_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn,
+            [this]() -> std::vector<std::pair<std::string, std::string>> {
+                std::vector<std::pair<std::string, std::string>> out;
+                if (mgmt_group_store_)
+                    for (const auto& g : mgmt_group_store_->list_groups())
+                        out.emplace_back(g.id, g.name);
+                return out;
+            },
+            std::move(verify_cohort_fn), audit_fn);
 
         // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
         // a go-cohort (mid-run, no completion required), stages + executes an
@@ -10345,6 +10505,7 @@ private:
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
+    std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
@@ -10422,12 +10583,14 @@ private:
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
+    std::unique_ptr<DeviceInventoryStore> device_inventory_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
     std::unique_ptr<AppPerfRollup> app_perf_rollup_;
     // Slice-2 group-trend reader (reads B1 by member list; borrows the pool).
     std::unique_ptr<AppPerfGroupReader> app_perf_group_reader_;
+    std::unique_ptr<AppPerfCohortReader> app_perf_cohort_reader_; // /auto VERIFY compare
 
     // Phase 7: Directory Sync (AD/Entra) & Patch Manager
     std::unique_ptr<DirectorySync> directory_sync_;
