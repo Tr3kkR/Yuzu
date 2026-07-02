@@ -3,6 +3,9 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
@@ -655,6 +658,40 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
      kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
+
+    // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
+    // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
+    // builder functions (discover_routes.hpp) so REST and MCP can't drift. Appended
+    // at the VERY END of kTools[] (governance note: minimizes rebase conflict with
+    // any concurrent PR inserting WRITE tools earlier in this array).
+    {"discover_permissions",
+     "RBAC permission catalog: every securable_type x operation pair the RBAC store "
+     "recognizes, plus the full role -> allowed-operations grid.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover RBAC permissions","safety":"catalog read only"})"},
+    {"discover_instructions",
+     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
+     "commands this worker may dispatch via execute_instruction.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover instruction definitions","safety":"catalog read only"})"},
+    {"discover_routes",
+     "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
+     "serves. Hand-maintained source, so it can under-report an undocumented route "
+     "(the response carries a caveat field).",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover REST routes","safety":"catalog read only"})"},
+    {"discover_scope_kinds",
+     "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
+     "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
+     "syntax and examples for building a `scope` expression.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover scope DSL","safety":"catalog read only, static"})"},
+    {"discover_plugins",
+     "Plugin/action catalog observed across currently-connected agents. NOT a "
+     "build-time manifest; per-action parameter schemas are not available here "
+     "(see discover_instructions for actions that also have a published definition).",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -741,6 +778,12 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"classify_operational_question", {"Infrastructure", "Read"}},
     {"get_incident_playbook", {"Infrastructure", "Read"}},
     {"summarize_working_set", {"Infrastructure", "Read"}},
+    // A2 discovery tools (mirrors of GET /api/v1/discover/*).
+    {"discover_permissions", {"Infrastructure", "Read"}},
+    {"discover_instructions", {"InstructionDefinition", "Read"}},
+    {"discover_routes", {"Infrastructure", "Read"}},
+    {"discover_scope_kinds", {"Infrastructure", "Read"}},
+    {"discover_plugins", {"Infrastructure", "Read"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -844,7 +887,8 @@ McpServer::HandlerFn McpServer::build_handler(
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
-    QuarantineStore* quarantine_store, TagPushFn tag_push_fn) {
+    QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+    yuzu::server::detail::AgentRegistry* agent_registry) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -4694,6 +4738,110 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────
+            // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME
+            // builder function in discover_routes.hpp — REST and MCP read the
+            // identical catalog, so they cannot drift from each other by
+            // construction (A2: "no side-channel doc fetch").
+
+            if (tool_name == "discover_permissions") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_instructions") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_routes") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same "answers even when
+                // everything else is down" property as the REST sibling.
+                auto doc = yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json());
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_scope_kinds") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const auto& doc = yuzu::server::scope_kinds_catalog();
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_plugins") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!agent_registry) {
+                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_plugins_catalog(*agent_registry);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── Unknown tool ──────────────────────────────────────────────
             mcp_audit("failure", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
@@ -4726,7 +4874,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 InventoryScopeFn inventory_scope_fn,
                                 yuzu::MetricsRegistry* metrics,
                                 AppPerfProviders app_perf_providers,
-                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn) {
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -4738,7 +4887,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(response_scope_fn), software_inventory_store,
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn)));
+                           std::move(tag_push_fn), agent_registry));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

@@ -65,4 +65,15 @@ bool evaluate(const Expression& expr, const AttributeResolver& resolver);
 /// Check if an expression is syntactically valid (convenience).
 std::expected<void, std::string> validate(std::string_view input);
 
+/// Canonical wire token for a comparison operator, e.g. `CompOp::Eq` -> `"=="`.
+/// Single source for the `GET /api/v1/discover/scope-kinds` operator catalog
+/// (`discover_routes.cpp`) so the published list can never silently diverge from
+/// the evaluator. The switch backing this function (`scope_engine.cpp`) has NO
+/// `default` case — mirroring `eval_condition`'s own exhaustive switch — so
+/// adding a `CompOp` enumerator without updating both switches produces a
+/// `-Wswitch` warning at build (warning_level=3 project-wide; see CLAUDE.md
+/// Build). A CROSS-CHECK unit test (`test_discovery_routes.cpp`) also asserts
+/// the discovery catalog covers every currently-declared value.
+std::string_view operator_token(CompOp op);
+
 } // namespace yuzu::scope

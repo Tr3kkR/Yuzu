@@ -32,18 +32,18 @@ Every new `/fragments/*` route ships with either (a) a parallel JSON variant via
 
 Every MCP tool, REST route, plugin action, scope kind, RBAC permission, and instruction definition is enumerable through a documented, authenticated discovery endpoint. An agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch.
 
-**Today.** MCP `tools/list` enumerates 23 MCP tools with input schemas. `/api/v1/openapi.json` (`rest_api_v1.cpp:165`) enumerates the REST surface. Both are read-only and partial: there is no introspection for plugin actions, scope kinds, RBAC permission catalog, or live instruction definitions.
+**Shipped (roadmap Issue 17.1).** The `GET /api/v1/discover/*` family exists, gated `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead — it matches the existing definitions RBAC surface more closely than the generic `Infrastructure` type):
+- `GET /api/v1/discover/permissions` — RBAC securable_type × operation catalog + the full role → allowed-operations grid (`RbacStore::list_securable_types`/`list_operations`/`list_roles`/`get_role_permissions`, a cheap pass-through).
+- `GET /api/v1/discover/instructions` — published (`enabled_only=true`) `InstructionDefinition` subset `{id, name, plugin, action, description, parameter_schema, platforms, approval_mode}`; `parameter_schema` is a nested JSON Schema object when the stored value parses, else `null` (unreachable through the normal authoring path today — `InstructionStore::create_definition` defaults an empty schema to `"{}"` — but kept as a defensive branch for a future direct-write path).
+- `GET /api/v1/discover/routes` — subsets the SAME hand-maintained OpenAPI document `GET /api/v1/openapi.json` serves (via the newly-exposed `yuzu::server::openapi_spec_json()`, `server/core/src/openapi_spec_access.hpp`), so the two can never disagree. Carries `"source":"openapi"` plus an explicit caveat: it is NOT generated from the live route table and can under-report an undocumented route. Per-route RBAC requirement is embedded in each entry's free-text `description` (no structured field yet).
+- `GET /api/v1/discover/scope-kinds` — fully static (answers even when every store is down, like `/guaranteed-state/schemas`): the two GROUND kinds (`__all__`, `group:<name>`) that short-circuit per-device evaluation, every ATTRIBUTE kind `AgentRegistry::evaluate_scope`'s resolver answers (from `yuzu::server::detail::scope_kind_catalog()`, colocated with the resolver in `agent_registry.hpp`/`.cpp` — a DRIFT CONTRACT comment on the resolver lambda requires any new branch to get a matching catalog entry), the `CompOp` comparison operators (via `yuzu::scope::operator_token`, an exhaustive `switch` with no `default` case so a missed enum value is a `-Wswitch` build-log signal), and the `EXISTS`/`LEN(...)`/`STARTSWITH(...)` extended forms.
+- `GET /api/v1/discover/plugins` — wraps `AgentRegistry::help_json()` (deduplicated plugin/action metadata observed across currently-connected agents) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load. The response explicitly documents that per-action PARAMETER schemas are unavailable here (agents report bare action names only) — pair with `/discover/instructions` for the subset of actions that also have a published `InstructionDefinition`.
 
-**Future.** A `/api/v1/discover/*` family will expose:
-- `/api/v1/discover/routes` — REST + dashboard route catalog with method, scope, RBAC requirement
-- `/api/v1/discover/plugins` — every plugin loaded across the fleet with action surface and parameter schemas
-- `/api/v1/discover/scope-kinds` — every scope DSL kind, syntax, examples
-- `/api/v1/discover/permissions` — RBAC permission catalog (securable_type × operation)
-- `/api/v1/discover/instructions` — published `InstructionDefinition` set with parameter and result schemas
+All five follow the `/guaranteed-state/schemas` precedent's caching contract: a content-derived `ETag` + `Cache-Control: public, max-age=300` + `If-None-Match` → `304`.
 
-Each is mirrored as an MCP tool (`discover_routes`, `discover_plugins`, etc.) so the LLM-native flow does not require an out-of-band fetch.
+Each is mirrored as a **read-only MCP tool** (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`, appended at the end of `kTools[]` in `mcp_server.cpp`) sharing the SAME builder functions as their REST siblings — REST and MCP cannot drift from each other by construction. Implementation: `server/core/src/discover_routes.{hpp,cpp}` (module named `DiscoverRoutes`/`discover_routes.*`, singular, to avoid colliding with the pre-existing unrelated `DiscoveryRoutes`/`discovery_routes.*` — directory sync / patch / deployment / network-discovery routes at `/api/directory/*`, `/api/patches/*`, `/api/deployments/*`, `/api/discovery/*`).
 
-**Enforced by.** `architect` and `consistency-auditor` on any new MCP tool, REST route, plugin action, or scope kind — the change is incomplete until the relevant `/discover/*` is updated.
+**Enforced by.** `architect` and `consistency-auditor` on any new MCP tool, REST route, plugin action, or scope kind — the change is incomplete until the relevant `/discover/*` is updated. This is now an enforceable claim: the five endpoints exist, so a reviewer can actually check a new surface landed in the right catalog instead of only citing this doc's intent.
 
 ## A3 — Observability
 

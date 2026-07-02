@@ -13,19 +13,28 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "agent_registry.hpp"
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "ca_store.hpp"
+#include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
+#include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "quarantine_store.hpp"
+#include "openapi_spec_access.hpp" // openapi_spec_json()
+#include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
 
 #include <sqlite3.h>
 
@@ -626,6 +635,15 @@ struct McpTestServer {
     /// Records (agent_id,key) pairs pushed via the tag-push closure (D4), so a
     /// set_tag test can assert the agent push fired.
     std::vector<std::pair<std::string, std::string>> tag_pushes;
+    /// A2 discovery tools (roadmap Issue 17.1): optionally wire a real RbacStore /
+    /// InstructionStore / AgentRegistry so discover_permissions / discover_instructions
+    /// / discover_plugins can be exercised end-to-end instead of only hitting their
+    /// "store unavailable" 503 path (which is also covered, by leaving these null —
+    /// the default, matching every other *_for_test pointer above). discover_routes
+    /// and discover_scope_kinds need none of these (compiled-in / self-contained).
+    yuzu::server::RbacStore* rbac_store_for_test{nullptr};
+    yuzu::server::InstructionStore* instruction_store_for_test{nullptr};
+    yuzu::server::detail::AgentRegistry* agent_registry_for_test{nullptr};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -728,8 +746,8 @@ private:
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
-            /*rbac_store=*/nullptr,
-            /*instruction_store=*/nullptr,
+            /*rbac_store=*/rbac_store_for_test,
+            /*instruction_store=*/instruction_store_for_test,
             /*execution_tracker=*/execution_tracker_for_test,
             /*response_store=*/response_store_for_test,
             /*audit_store=*/nullptr,
@@ -759,7 +777,8 @@ private:
             /*tag_push_fn=*/
             [this](const std::string& agent_id, const std::string& key) {
                 tag_pushes.emplace_back(agent_id, key);
-            });
+            },
+            /*agent_registry=*/agent_registry_for_test);
     }
 };
 
@@ -961,6 +980,181 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────
+// Each mirrors its GET /api/v1/discover/* REST sibling via the SAME builder
+// function (discover_routes.hpp) — this suite proves that parity directly by
+// comparing the tool's returned JSON against an independently-built catalog,
+// exactly like the get_guardian_schemas test above does for the Guardian
+// discovery surface.
+
+TEST_CASE("MCP Integration: discover_scope_kinds matches the static catalog",
+          "[mcp][integration][discovery]") {
+    McpTestServer ts;
+    ts.start("readonly"); // Infrastructure:Read is allowed on every MCP tier
+
+    const auto expected = nlohmann::json::parse(yuzu::server::scope_kinds_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"discover_scope_kinds"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto got = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(got == expected);
+    CHECK(ts.audit_log.back() == "mcp.discover_scope_kinds|success");
+}
+
+TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog",
+          "[mcp][integration][discovery]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(
+        yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json()).json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto got =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(got == expected);
+    CHECK(got.value("source", "") == "openapi");
+}
+
+TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integration][discovery]") {
+    yuzu::server::RbacStore rbac(":memory:");
+    REQUIRE(rbac.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac).json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"discover_permissions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto got =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(got == expected);
+    CHECK_FALSE(got["securable_types"].empty());
+
+    // Unwired (RbacStore left null, the McpTestServer default) — a JSON-RPC
+    // tool error, not a 5xx: MCP has no HTTP-status channel for a store-503
+    // equivalent, so the error is surfaced in the JSON-RPC envelope.
+    McpTestServer ts_unwired;
+    ts_unwired.start("readonly");
+    auto res2 = ts_unwired.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":23,"params":{"name":"discover_permissions"}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    CHECK(body2.contains("error"));
+}
+
+TEST_CASE("MCP Integration: discover_instructions wired vs unwired",
+          "[mcp][integration][discovery]") {
+    yuzu::server::InstructionStore instr(":memory:");
+    REQUIRE(instr.is_open());
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get Hostname";
+    def.version = "1.0";
+    def.plugin = "system_info";
+    def.action = "query";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    REQUIRE(instr.create_definition(def).has_value());
+
+    McpTestServer ts;
+    ts.instruction_store_for_test = &instr;
+    ts.start("readonly");
+
+    const auto expected =
+        nlohmann::json::parse(yuzu::server::build_instructions_catalog(instr).json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":24,"params":{"name":"discover_instructions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto got =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(got == expected);
+    REQUIRE_FALSE(got["instructions"].empty());
+
+    // Unwired — JSON-RPC tool error (InstructionStore left null).
+    McpTestServer ts_unwired;
+    ts_unwired.start("readonly");
+    auto res2 = ts_unwired.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":25,"params":{"name":"discover_instructions"}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    CHECK(body2.contains("error"));
+}
+
+TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integration][discovery]") {
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    yuzu::agent::v1::AgentInfo info;
+    info.set_agent_id("agent-1");
+    info.set_hostname("WIN-TESTBOX");
+    auto* p = info.add_plugins();
+    p->set_name("processes");
+    p->set_version("1.0");
+    p->set_description("Process enumeration");
+    p->add_capabilities("list");
+    registry.register_agent(info);
+
+    McpTestServer ts;
+    ts.agent_registry_for_test = &registry;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::build_plugins_catalog(registry).json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":26,"params":{"name":"discover_plugins"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto got =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(got == expected);
+    REQUIRE(got.contains("limitation"));
+
+    // Unwired (AgentRegistry left null) — JSON-RPC tool error.
+    McpTestServer ts_unwired;
+    ts_unwired.start("readonly");
+    auto res2 = ts_unwired.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":27,"params":{"name":"discover_plugins"}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    CHECK(body2.contains("error"));
+}
+
+TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
+          "[mcp][integration][discovery]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":28})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> names;
+    for (const auto& t : body["result"]["tools"])
+        names.insert(t["name"].get<std::string>());
+    for (const char* n : {"discover_permissions", "discover_instructions", "discover_routes",
+                          "discover_scope_kinds", "discover_plugins"})
+        CHECK(names.count(n) == 1);
 }
 
 // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ───────────────────────
