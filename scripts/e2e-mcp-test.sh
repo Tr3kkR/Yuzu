@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # e2e-mcp-test.sh — Comprehensive MCP (Model Context Protocol) test suite
 #
-# Tests every MCP protocol method, all 23 tools, 3 resources,
-# 4 prompts, error handling, read-only enforcement, and kill switch.
+# Tests every MCP protocol method, the tool surface (read + write tools,
+# including the #289 write tools + approval-ticket flow), resources,
+# prompts, error handling, read-only enforcement, and kill switch.
 #
 # Usage:
 #   ./scripts/e2e-mcp-test.sh                                   # default: http://127.0.0.1:8080
@@ -788,18 +789,42 @@ fi
 log ""
 
 # ══════════════════════════════════════════════════════════════════════
-# 12. WRITE TOOL REJECTION (Phase 2 tools not yet implemented)
+# 12. WRITE TOOLS ARE DISPATCHED + GATED (#289 / Issue 13.5)
 # ══════════════════════════════════════════════════════════════════════
+# The five write tools are now advertised in tools/list and have dispatch
+# handlers. This test session authenticates as an admin via a SESSION cookie
+# (no MCP tier), so the MCP tier gate is a no-op and the handlers run. With
+# empty arguments each returns a VALIDATION error (missing required field),
+# NOT the "unknown tool" method-not-found (-32601) they returned before they
+# were wired — proving they are now recognised and gated rather than invisible.
+#
+# NOTE: under `--mcp-read-only` these same five (all in kWriteTools) are instead
+# rejected with kTierDenied (-32004) "MCP is in read-only mode" before any
+# handler runs. That path needs a server started with the flag, so it is covered
+# by the read-only-mode section / unit tests rather than re-flipped here.
 log "═══════════════════════════════════════════"
-log "  12. Phase 2 Write Tool Guards"
+log "  12. Write Tools Dispatched + Gated (#289)"
 log "═══════════════════════════════════════════"
 
 WRITE_TOOLS=("set_tag" "delete_tag" "execute_instruction" "approve_request" "reject_request" "quarantine_device")
 
+# 12a. All five new write tools are advertised in tools/list.
+mcp_call "tools/list" "{}"
+for wt in "set_tag" "delete_tag" "approve_request" "reject_request" "quarantine_device"; do
+    assert_contains "Write tool $wt is advertised in tools/list" "\"$wt\"" "$MCP_BODY"
+done
+
+# 12b. Each write tool is dispatched + gated (validation error, not method-not-found).
 for wt in "${WRITE_TOOLS[@]}"; do
     mcp_call "tools/call" "{\"name\":\"$wt\",\"arguments\":{}}"
     HAS_ERR=$(has_error)
-    assert_eq "Phase 2 tool $wt is guarded" "yes" "$HAS_ERR"
+    assert_eq "Write tool $wt is dispatched + gated (returns an error)" "yes" "$HAS_ERR"
+    ERR_CODE=$(error_code)
+    if [[ "$ERR_CODE" != "-32601" ]]; then
+        pass "Write tool $wt is a recognised tool (not method-not-found)"
+    else
+        fail "Write tool $wt returned -32601 (unknown tool) — dispatch handler missing"
+    fi
 done
 
 log ""

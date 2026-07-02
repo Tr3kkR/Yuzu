@@ -70,7 +70,7 @@ Every failure response — REST, MCP, gRPC error — includes:
 Two specialisations:
 
 - On `kPermissionDenied` (-32003 / HTTP 403), the envelope names the missing permission as `securable_type:operation` (e.g. `Tag:Write`).
-- On `kApprovalRequired` (-32006 / HTTP 202) — **Phase 2 target** — the envelope returns `approval_id` and `status_url` so the agent can poll the approval workflow rather than re-issuing the same request. Until approval re-dispatch ships, an approval-gated MCP operation is denied with `kTierDenied` (-32004) carrying a remediation hint (a `-32006` with no pollable approval would violate this very contract); see `docs/mcp-server.md`.
+- On `kApprovalRequired` (-32006 / HTTP 202) — **shipped (#289)** — the envelope returns `approval_id` and `status_url` so the agent can poll the approval workflow, then re-issue the same call with the `approval_id` (ticket-then-recall) rather than blindly retrying. An approval-gated MCP operation now emits `-32006`; the `kTierDenied` (-32004) fallback applies only to the degraded case where the server has no `ApprovalManager` and cannot mint a pollable approval (a `-32006` with no pollable approval would violate this very contract); see `docs/mcp-server.md`.
 
 **Why this matters.** Today errors give a code and message; nothing else. An agentic worker hitting `Permission denied` cannot tell which permission, who can grant it, or whether to retry. A4 closes that loop and makes self-recovery feasible.
 

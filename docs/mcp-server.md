@@ -29,13 +29,41 @@ JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy
 { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null, "remediation": "use a higher-tier MCP token, or the REST API / dashboard" }
 ```
 
-> **Supervised-tier / approval-gated operations.** An operation that requires
-> approval is **denied** with `kTierDenied` (-32004), not `kApprovalRequired`
-> (-32006). Approval re-dispatch is Phase 2 (below): there is no pollable
-> approval to return, and the A4 contract reserves `kApprovalRequired` for the
-> case where the envelope can carry `approval_id` + `status_url`. The denial's
-> `remediation` points the caller at the REST API / dashboard, where the
-> supervised tier's approval workflow is wired.
+> **Supervised-tier / approval-gated operations — ticket-then-recall (#289).**
+> An operation for which `requires_approval(tier, type, op)` is true is answered
+> with `kApprovalRequired` (-32006). Its `error.data` extends the A4 envelope
+> with two extra fields:
+>
+> ```json
+> { "correlation_id": "req-<hex-ms>-<hex-seq>", "retry_after_ms": null,
+>   "remediation": "an admin must approve this approval_id (see status_url), then re-call this tool with the approval_id argument to execute",
+>   "approval_id": "<32-hex>", "status_url": "/api/v1/approvals/<32-hex>" }
+> ```
+>
+> The **first** call mints an `ApprovalManager` approval (`definition_id =
+> "mcp.<tool>"`, `submitted_by` = the caller, `scope_expression` = the
+> canonical JSON of the tool arguments) and returns the envelope above. An admin
+> approves it (Settings UI / REST `POST /api/approvals/{id}/approve`; reviewer ≠
+> submitter is store-enforced, so self-approval is impossible). The caller then
+> **re-calls the same tool** passing the returned `approval_id` as an argument;
+> the server verifies the approval is (a) approved, (b) for this exact tool
+> (`definition_id`), (c) for these exact arguments (canonical-args match,
+> `approval_id` excluded from the comparison), and (d) not yet consumed, then
+> **atomically consumes it** (one-time; a replay of a consumed ticket, or a
+> concurrent second recall, is rejected — the mutating op runs at most once) and
+> lets the call through to the handler. A recall against a still-**pending**
+> ticket returns the same `kApprovalRequired` envelope (keep polling
+> `status_url`); a rejected/expired/mismatched/consumed ticket returns
+> `kPermissionDenied` (-32003). This generic gate governs every approval-gated
+> tool — the supervised tier's `execute_instruction` / `revoke_certificate` /
+> `execute_bundle`, plus `delete_tag` (operator + supervised) and
+> `quarantine_device` (supervised). **Degraded path:** if the server has no
+> `ApprovalManager` (a stripped deploy / test harness), it cannot mint a pollable
+> ticket, so it falls back to a `kTierDenied` (-32004) with no `approval_id`.
+> **Note:** the per-tool RBAC check (`perm_fn`) runs on the *recall*, after the
+> ticket is consumed, so a token that passes the MCP tier check but fails RBAC
+> can mint→approve→then 403 (burning the ticket) — a rare consequence of the
+> deliberate tier-then-RBAC two-gate split.
 
 `correlation_id` is a per-error token (`req-<hex-ms>-<hex-seq>`, the same format as the REST `X-Correlation-Id` header) returned to the caller in the error body, so a client can cite a stable handle when reporting a failure. **It is not persisted to the audit log today** — the audit row for a denied call (`mcp.<tool>`) is written separately and does not carry the token — so server-side correlation relies on any `spdlog` line the handler emits at that moment, not on `audit.db`. `retry_after_ms` is `null` on tier/approval-denial errors (the denial is not retryable as-is); `remediation` carries an actionable hint — escalate to a higher-tier token, or use the REST API / dashboard. Per-tool validation errors (e.g. the dex-perf tools) populate `correlation_id`, a `null` `retry_after_ms`, and a field-specific `remediation`. Parse `error.code` for the error class and `error.data.correlation_id` for client-side traceability.
 
@@ -44,7 +72,8 @@ JSON-RPC error responses from the tier-denied paths (read-only mode, tier policy
 - Read-only tools (the **authoritative, complete table** is `docs/user-manual/mcp.md` — this list is illustrative, not a count): `list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `query_installed_software`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`, `get_guardian_schemas`, `list_dex_signals`, `get_dex_signal_scope`, `get_dex_signal_detail`, the DEX-perf + network tools, and `list_issued_certs`
   - **`query_installed_software`** is the typed daily-sync software-inventory read (ADR-0016), gated on `Inventory:Read` (with a per-agent management-group drop filter that is **not yet verified effective under the global gate — see ADR-0017 / #1716**) — distinct from the generic `query_inventory`/`get_agent_inventory` (generic blob store, `Infrastructure:Read`).
   - **DEX read tools (`list_dex_signals` / `get_dex_signal_scope` / `get_dex_signal_detail`)** are the MCP parity for the `/api/v1/dex/*` REST surface — same `GuaranteedStateStore` aggregations, gated on `GuaranteedState:Read`, with a `window` of `24h`/`7d`/`30d`/`all`. The audit boundary mirrors REST: the rollup and per-OS scope are fleet aggregates (only the generic `mcp.<tool>` tool-call audit), while `get_dex_signal_detail` returns a most-affected **devices** list (behavioral) and additionally emits a **`dex.signal.view`** audit (`target_type=ObsType`) so one SIEM filter catches the dashboard, REST and MCP behavioral-access surfaces alike. `obs_type` is validated against `[A-Za-z0-9._-]{1,64}` (malformed → `kInvalidParams`). When the `dex.signal.view` audit row cannot persist, `get_dex_signal_detail` **set-and-proceeds** and carries `audit_persisted:false` in the result (absent on success — consumers key on absence), matching the `query_responses` / `revoke_certificate` convention; JSON-RPC has no header channel, so this is the MCP equivalent of the REST `Sec-Audit-Failed` header (#1647). The REST `dex.signal.view` sibling instead fails closed — different surface, different posture.
-- 2 write/execute tools: `execute_instruction` — dispatches plugin commands to agents (auto-approved for `operator` tier; `supervised` tier returns "not implemented"; if neither `scope` nor `agent_ids` is provided, targets all agents) — and `execute_bundle` (below).
+- Write/execute tools (the authoritative table is `docs/user-manual/mcp.md`): `execute_instruction` — dispatches plugin commands to agents (auto-approved for `operator` tier; `supervised` tier is approval-gated via the ticket-then-recall flow; if neither `scope` nor `agent_ids` is provided, targets all agents) — `execute_bundle` (below), `revoke_certificate`, and the five Issue-13.5 write tools `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device` (#289).
+  - **The five write tools (#289 / Issue 13.5)** are the last-mile agentic write surface: `set_tag` (`Tag:Write`, fires the agent tag-push), `delete_tag` (`Tag:Delete`, approval-gated on operator + supervised), `approve_request` / `reject_request` (`Approval:Approve`, supervised tier — reviewer ≠ submitter store-enforced), and `quarantine_device` (`Security:Execute`, supervised, approval-gated — records the quarantine *and* dispatches the live quarantine-plugin isolation). The approval-gated members flow through the ticket-then-recall mechanism documented under **Error envelope** above.
 - **Live-query bundle tools (`execute_bundle` / `get_bundle_result`)** — MCP parity for the `POST`/`GET /api/v1/bundles` REST surface (ADR-0011). `execute_bundle` (write/execute, `Execution:Execute`) fans one instruction into 1–32 plugin actions on **one** device via server-side async fan-out and returns `{execution_id, expected}` immediately; `get_bundle_result` (`Response:Read`) collates to `{complete, received, expected, steps[]}` in request order. Use instead of N `execute_instruction` calls when refreshing a device (N round-trips → 1). The agent is unchanged — each step is an ordinary command under one `bundle-…` correlation id; per-step `bundle.<plugin>.<action>` audit (`target_type=Agent`) mirrors REST, and collate enforces an ownership (IDOR) guard. Bundles are caller-polled, **not** in the executions drawer; v1 manifests are per-surface + in-memory (durable Postgres store is a committed follow-up — ADR-0011).
 - 3 resources: `yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`
 - 4 prompts: `fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`
@@ -81,8 +110,12 @@ Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_age
 
 `enterprise-it-v1` covers enterprise incident topics: OpenShift, KVM/libvirt, Chisel/Ubuntu containers, Docker buildx, Node, Spring Cloud Gateway/Java, Postgres/Oracle, Teams/Zoom, Windows/macOS endpoint operations, and security clients such as CrowdStrike, Check Point, zScaler, and Cisco Secure Client. Each fixture records the expected first tool, allowed tool path, pass/fail rubric, safety behavior, and curated/live support.
 
-## Phase 2 (Planned)
+## Phase 2 (Implemented — #289 / Issue 13.5)
 
-- 5 remaining write tools: `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device`
-- Approval workflow re-dispatch (supervised tier execution after admin approval)
-- SSE streaming for execution progress
+- **5 write tools shipped:** `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device` (dispatch handlers + `tools/list` entries + RBAC/tier mapping).
+- **Approval workflow re-dispatch shipped** — supervised-tier (and operator-tier `delete_tag`) execution after admin approval, via the ticket-then-recall flow (`kApprovalRequired` → approve → recall with `approval_id`; one-time consumption). Documented under **Error envelope** above.
+- **SSE streaming for execution progress** is already satisfied by the shipped `GET /api/v1/events` endpoint (sprint W5.1) — an agentic worker bridges `execute_instruction`'s returned `execution_id` to that SSE stream (see the `execute_instruction` row in `docs/user-manual/mcp.md`). No MCP-specific streaming transport is planned.
+
+## Phase 3 (Planned)
+
+- Cross-surface / durable approval-ticket state (today the ticket lives in the shared `ApprovalManager` store, which is durable, but the MCP recall is stateless — no per-worker session).
