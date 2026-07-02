@@ -151,7 +151,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  send_html(res, render_inventory_versions_fragment(name, vers));
              });
 
-    // -- DEVICES (thin CI list; global Inventory:Read, scoped provider) --
+    // -- DEVICES (CI-enriched list; global Inventory:Read, scoped provider) --
     sink.Get("/fragments/inventory/devices",
              [this](const httplib::Request& req, httplib::Response& res) {
                  auto session = auth_fn_(req, res);
@@ -159,9 +159,11 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      return;
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
-                 std::vector<InventoryDeviceRow> rows;
+                 InventoryDevicesResult result;
                  if (devices_fn_)
-                     rows = devices_fn_(session->username);
+                     result = devices_fn_(session->username);
+                 else
+                     result.ci_degraded = true; // unwired closure: no CI enrichment possible
                  // Audit the identity-bearing roster read. PR2's device-CI columns (incl.
                  // serial — a device-persistent identifier, ADR-0016 §"personal data under
                  // GDPR") now ride this bulk read, so this is promoted to the
@@ -171,18 +173,19 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // posture the OTHER inventory.* verbs use (host/OS/software titles — not
                  // device-persistent identifiers) does not transfer to this route now that
                  // it carries CI. Set-and-proceed: the HTML surface still renders.
-                 // KNOWN FOLLOW-UP (#1784 — gov Gate 4/5): "success" is hardcoded regardless
-                 // of whether devices_fn_'s internal CI-enrichment join actually succeeded
-                 // (DevicesFn's plain-vector return has no channel to carry a degrade
-                 // signal, unlike AgentCiFn's std::expected below). The roster read itself
-                 // genuinely does succeed either way — CI enrichment degrading blanks the
-                 // CI columns, never the whole list — so this is an audit-fidelity gap, not
-                 // a correctness one; see #1784 for the DevicesFn signature change needed.
+                 // `result.ci_degraded` (#1785 review HIGH-1) discriminates "roster read
+                 // fine, CI enrichment also fine" from "roster read fine, CI columns blank
+                 // because the enrichment join failed" — the roster itself is offline-
+                 // survivable and never fails on a CI-store outage (see InventoryDevicesResult),
+                 // so this is "failure" only for the CI-enrichment half, never a 5xx.
                  (void)detail::emit_behavioral_audit(
-                     audit_fn_, req, res, "inventory.devices", "success", "Inventory", "fleet",
-                     "devices=" + std::to_string(rows.size()) +
-                         " (incl. CI columns: serial/model/cpu/ram)");
-                 send_html(res, render_inventory_devices_fragment(rows, "", "", ""));
+                     audit_fn_, req, res, "inventory.devices",
+                     result.ci_degraded ? "failure" : "success", "Inventory", "fleet",
+                     "devices=" + std::to_string(result.rows.size()) +
+                         (result.ci_degraded
+                              ? " (CI store degraded; roster rendered without CI columns)"
+                              : " (incl. CI columns: serial/model/cpu/ram)"));
+                 send_html(res, render_inventory_devices_fragment(result.rows, "", "", ""));
              });
 
     // -- PER-DEVICE software drill (scoped per-device; audited) --

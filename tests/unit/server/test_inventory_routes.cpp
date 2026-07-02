@@ -324,14 +324,20 @@ struct InvHarness {
             e.name = "Slack";
             return std::vector<SoftwareEntry>{e};
         };
-        auto devices = [](const std::string&) {
+        auto devices = [this](const std::string&) -> InventoryDevicesResult {
             InventoryDeviceRow r;
             r.agent_id = "a1";
             r.hostname = "WIN-1";
             r.os = "windows";
             r.online = true;
             r.last_seen = "now";
-            return std::vector<InventoryDeviceRow>{r};
+            // Mirrors the real provider's contract: a CI-store degrade never blanks the
+            // roster, it only means the CI columns (unmodeled in this harness fixture)
+            // would be blank — `degrade` toggles JUST the ci_degraded signal here.
+            InventoryDevicesResult result;
+            result.rows = {r};
+            result.ci_degraded = degrade;
+            return result;
         };
         auto ci_fn = [this](const std::string&)
             -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
@@ -599,6 +605,26 @@ TEST_CASE("route: devices list — deny vs success (offline-inclusive, audited)"
                 audited = true;
         REQUIRE(audited);
     }
+}
+
+TEST_CASE("route: devices list — CI enrichment degrade audits failure, roster still renders",
+          "[inventory][route]") {
+    // #1785 review HIGH-1: a CI-store degrade must never masquerade as "success" in the
+    // audit trail, even though the roster itself (offline-survivable, independent of the
+    // CI-enrichment join) still renders — set-and-proceed for the HTML, honest for audit.
+    InvHarness h;
+    h.degrade = true;
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status != 403);
+    REQUIRE(contains(res->body, "WIN-1")); // roster unaffected by the CI-join degrade
+    bool failed = false, succeeded = false;
+    for (const auto& a : h.audits) {
+        failed = failed || a == "inventory.devices|failure";
+        succeeded = succeeded || a == "inventory.devices|success";
+    }
+    REQUIRE(failed);
+    REQUIRE_FALSE(succeeded);
 }
 
 TEST_CASE("route: find shell gates on Inventory:Read", "[inventory][route]") {

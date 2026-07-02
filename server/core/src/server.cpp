@@ -9138,10 +9138,13 @@ private:
         };
         auto inv_devices_fn = [this, visible_set_fn,
                                inv_human_age](const std::string& username)
-            -> std::vector<InventoryDeviceRow> {
-            std::vector<InventoryDeviceRow> out;
-            if (!offline_endpoint_store_)
-                return out;
+            -> InventoryDevicesResult {
+            InventoryDevicesResult result;
+            auto& out = result.rows;
+            if (!offline_endpoint_store_) {
+                result.ci_degraded = true; // no roster → no CI enrichment attempted either
+                return result;
+            }
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
@@ -9186,6 +9189,11 @@ private:
             // (software_catalog_rollup.cpp) which exists specifically to avoid this
             // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
             // than fixed here to keep this PR scoped to dashboard-read enrichment.
+            //
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's audit whether
+            // the CI columns above are genuinely enriched or blank because this join
+            // failed/was unwired — an unwired store is treated the same as a live failure
+            // (mirrors AgentCiFn's documented contract for the per-device drill).
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
                 if (ci_list) {
@@ -9201,9 +9209,13 @@ private:
                         // cpp-expert review).
                         ci_by_agent.emplace(rec.agent_id, std::move(rec));
                     attach_device_ci(out, ci_by_agent);
+                } else {
+                    result.ci_degraded = true;
                 }
+            } else {
+                result.ci_degraded = true;
             }
-            return out;
+            return result;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(

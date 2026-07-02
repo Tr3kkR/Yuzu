@@ -71,6 +71,18 @@ struct InventoryDeviceRow {
     std::string ci_ram_bytes;   ///< decimal string (bytes)
 };
 
+/// Result of the device-CI roster read. `rows` is the roster and is ALWAYS populated
+/// on the happy path — a CI-store failure never blanks the whole list, only the CI
+/// columns on the affected rows (the endpoint_state roster and the device-CI
+/// enrichment are two independent reads; see `attach_device_ci`). `ci_degraded` is
+/// true when the CI-enrichment read itself failed (or was never wired), so any CI
+/// columns on `rows` are blank rather than genuinely absent — the audit layer needs
+/// this bit to avoid recording "success" over a partial read (#1785 review HIGH-1).
+struct InventoryDevicesResult {
+    std::vector<InventoryDeviceRow> rows;
+    bool ci_degraded = false;
+};
+
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────
 // Each returns a self-contained fragment: the inventory sub-nav + the active tab's
 // content. A `std::nullopt` data argument is a STORE DEGRADE → an honest
@@ -155,7 +167,7 @@ public:
     /// The device-CI roster, scoped to `username` (offline-inclusive; assembled in
     /// server.cpp from endpoint_state + the registry online set + the visible-agent
     /// set + the device-CI enrichment join, `attach_device_ci`).
-    using DevicesFn = std::function<std::vector<InventoryDeviceRow>(const std::string& username)>;
+    using DevicesFn = std::function<InventoryDevicesResult(const std::string& username)>;
 
     /// One device's CI record (per-device drill's CI panel, post-authz — the
     /// `scoped_perm_fn(Inventory,Read,id)` gate already ran). Mirrors
