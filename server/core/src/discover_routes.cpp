@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -266,24 +267,63 @@ const DiscoveryDoc& scope_kinds_catalog() {
 
 // ── /discover/plugins ───────────────────────────────────────────────────────
 
-DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry) {
+DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry,
+                                   InstructionStore* instruction_store) {
     auto help = json::parse(agent_registry.help_json(), nullptr, /*allow_exceptions=*/false);
     bool help_ok = !help.is_discarded() && help.is_object();
     json plugins = help_ok ? help.value("plugins", json::array()) : json::array();
     json commands = help_ok ? help.value("commands", json::array()) : json::array();
 
+    // Join published InstructionDefinitions by "pluginaction" so each action
+    // that has one is enriched with its parameter_schema inline (the model learns
+    // HOW to call an action, not just that it exists — the #1 anti-bumble fix).
+    int enriched = 0;
+    if (instruction_store) {
+        std::unordered_map<std::string, json> schema_by_action;
+        InstructionQuery q;
+        q.enabled_only = true;
+        q.limit = 5000;
+        for (const auto& d : instruction_store->query_definitions(q)) {
+            if (d.plugin.empty() || d.action.empty())
+                continue;
+            auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
+            if (!parsed.is_discarded())
+                schema_by_action.emplace(d.plugin + "\x01" + d.action, std::move(parsed));
+        }
+        if (plugins.is_array()) {
+            for (auto& p : plugins) {
+                if (!p.is_object() || !p.contains("actions") || !p["actions"].is_array())
+                    continue;
+                const std::string pname = p.value("name", "");
+                for (auto& a : p["actions"]) {
+                    if (!a.is_object())
+                        continue;
+                    auto it = schema_by_action.find(pname + "\x01" + a.value("name", ""));
+                    if (it != schema_by_action.end()) {
+                        a["parameter_schema"] = it->second;
+                        ++enriched;
+                    }
+                }
+            }
+        }
+    }
+
     json body = {
-        {"version", 1},
+        {"version", 2},
         {"description",
          "Plugin/action catalog observed across currently-connected agents "
          "(deduplicated by plugin name; the richest reported action list wins). "
          "NOT a build-time manifest — a plugin no currently-connected agent "
-         "reports is absent from this list."},
+         "reports is absent from this list. To dispatch an action, call "
+         "execute_instruction / POST /api/v1/instructions/execute with its "
+         "plugin+action; supply the params from parameter_schema where present."},
         {"limitation",
-         "Action PARAMETER schemas are NOT available here: agents report bare "
-         "action names + a human description only, no per-action JSON Schema. "
-         "See GET /discover/instructions for the subset of actions that also "
-         "have a published InstructionDefinition with parameter_schema."},
+         "An action carries an inline parameter_schema ONLY when it has a "
+         "published InstructionDefinition (matched on plugin+action). Actions "
+         "without one report name+description only — no per-action JSON Schema "
+         "(agents report bare action names). GET /discover/instructions is the "
+         "full schema-bearing catalog."},
+        {"actions_enriched_with_schema", enriched},
         {"plugins", std::move(plugins)},
         {"commands", std::move(commands)},
     };
@@ -362,7 +402,8 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
              });
 
     sink.Get("/api/v1/discover/plugins",
-             [perm_fn, agent_registry](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, agent_registry,
+              instruction_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  if (!agent_registry) {
@@ -370,7 +411,7 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
                      return;
                  }
                  try {
-                     serve_doc(req, res, build_plugins_catalog(*agent_registry));
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry, instruction_store));
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }

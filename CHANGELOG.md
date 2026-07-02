@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
   scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
   degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **Agentic-worker self-orientation (R2 follow-up).** `discover_plugins` (REST + MCP,
+  now catalog `version: 2`) enriches each action with its `parameter_schema` inline
+  when the action has a published InstructionDefinition (joined on plugin+action), and
+  reports `actions_enriched_with_schema` — so a worker learns *how* to call an action,
+  not just that it exists, from one request. The `execute_instruction` and
+  `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
+  point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
+  driving the fleet with no hand-fed action list made zero blind parameter guesses.
+
+### Fixed
+
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400 rather than a silent privilege surprise.
 - **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
   `status_url` target); the `auth_routes` denial shapes are unified into one A4
   envelope carrying `correlation_id` and the missing `securable_type:operation`; the

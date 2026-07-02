@@ -514,9 +514,14 @@ static const ToolDef kTools[] = {
 
     // Phase 2 write tool
     {"execute_instruction",
-     "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
-     "agents_reached, plugin, and action. Poll results with query_responses or subscribe to "
-     "live JSON events via GET /api/v1/events?execution_id=<id>. "
+     "Execute a plugin action on one or more agents. ASYNC: returns immediately with command_id "
+     "+ execution_id + agents_reached; the agents run the action and report back separately. To "
+     "get results, poll query_responses with the returned execution_id — an EMPTY result means "
+     "the run is still in flight, so wait ~2-5s and retry a few times (or call "
+     "get_execution_status to confirm a terminal state), or subscribe to live JSON events via GET "
+     "/api/v1/events?execution_id=<id>. Find valid plugin/action names AND their parameters via "
+     "discover_plugins (parameter_schema is inline for actions with a published definition) or "
+     "discover_instructions — do not guess action names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      R"j({"type":"object","properties":{)j"
@@ -687,9 +692,12 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})", kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Discover scope DSL","safety":"catalog read only, static"})"},
     {"discover_plugins",
-     "Plugin/action catalog observed across currently-connected agents. NOT a "
-     "build-time manifest; per-action parameter schemas are not available here "
-     "(see discover_instructions for actions that also have a published definition).",
+     "Plugin/action catalog observed across currently-connected agents. Each action carries an "
+     "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
+     "call it, not just that it exists); actions without one are name+description only — "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
+     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "before acting.",
      R"({"type":"object","properties":{}})", kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
 };
@@ -4944,7 +4952,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_plugins_catalog(*agent_registry);
+                auto doc = yuzu::server::build_plugins_catalog(*agent_registry, instruction_store);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

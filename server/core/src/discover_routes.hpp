@@ -115,10 +115,13 @@ const std::array<CompOpEntry, 11>& comp_op_catalog();
 
 /// `/discover/plugins`. Wraps `AgentRegistry::help_json()` (deduplicated
 /// plugin/action metadata across currently-connected agents) with a
-/// discovery envelope documenting that per-action PARAMETER schemas are NOT
-/// available (agents report bare action names only). `agent_registry` must
-/// be non-null.
-DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry);
+/// discovery envelope. When `instruction_store` is non-null, each action that
+/// has a published InstructionDefinition (matched on plugin+action) is enriched
+/// with its `parameter_schema` inline — so an agentic worker learns how to CALL
+/// an action, not just that it exists, from one request. Actions with no
+/// definition carry name+description only. `agent_registry` must be non-null.
+DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry,
+                                   InstructionStore* instruction_store = nullptr);
 
 /// A2 discovery REST surface. See file header.
 class DiscoverRoutes {

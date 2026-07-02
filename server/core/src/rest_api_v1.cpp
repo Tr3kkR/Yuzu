@@ -1803,6 +1803,21 @@ void RestApiV1::register_routes(
         auto name = body.value("name", "");
         auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
+        // MCP tier (#289 follow-up): create_token already accepts this — the
+        // handler had silently dropped it, so a documented `mcp_tier` in the body
+        // produced an empty-tier (RBAC-defer) token, defeating self-service MCP
+        // provisioning. Honor it, validating against the closed tier set so a
+        // typo can't mint an unrecognised tier (which tier_allows would treat as
+        // "defer to RBAC" — a silent privilege surprise).
+        auto mcp_tier = body.value("mcp_tier", "");
+        if (mcp_tier != "" && mcp_tier != "readonly" && mcp_tier != "operator" &&
+            mcp_tier != "supervised") {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid mcp_tier: must be one of readonly, "
+                                                  "operator, supervised (or omitted)"),
+                            "application/json");
+            return;
+        }
 
         // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
         // length BEFORE any audit emission. An unbounded `name` would be
@@ -1859,7 +1874,8 @@ void RestApiV1::register_routes(
             }
         }
 
-        auto result = token_store->create_token(name, session->username, expires_at, scope_service);
+        auto result =
+            token_store->create_token(name, session->username, expires_at, scope_service, mcp_tier);
         if (!result) {
             // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure so
             // on-call has a paging surface short of grepping audit logs.
