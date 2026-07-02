@@ -871,33 +871,52 @@ std::string make_correlation_id() {
 }
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
-                          std::string_view remediation) {
-    // A4 (docs/agentic-first-principle.md) lists retry_after_ms as a REQUIRED,
-    // nullable envelope field. This no-retry overload emits it as null so every
-    // REST A4 error body carries the full field set (matching the MCP a4_data
-    // sibling); the second overload below supplies a concrete value. #1470.
+                          const A4ErrorOpts& opts) {
+    // The ONE unified A4 envelope builder (folds the old auth_routes.cpp
+    // a4_denial into a single wire shape). A4 (docs/agentic-first-principle.md)
+    // lists retry_after_ms as a REQUIRED, nullable field, so it is ALWAYS a
+    // key: `null` unless opts.retry_after_ms is set. remediation is omitted
+    // when empty (absence == "no recovery hint" per §A4). permission is the
+    // kPermissionDenied specialisation ("<securable_type>:<operation>");
+    // approval_id + status_url are the kApprovalRequired specialisation. #1470.
     auto err = JObj()
                    .add("code", code)
                    .add("message", message)
-                   .add("correlation_id", correlation_id)
-                   .raw("retry_after_ms", "null");
-    if (!remediation.empty()) {
-        err.add("remediation", remediation);
+                   .add("correlation_id", correlation_id);
+    if (opts.retry_after_ms.has_value()) {
+        err.add("retry_after_ms", *opts.retry_after_ms);
+    } else {
+        err.raw("retry_after_ms", "null");
+    }
+    if (!opts.remediation.empty()) {
+        err.add("remediation", opts.remediation);
+    }
+    if (!opts.permission.empty()) {
+        err.add("permission", opts.permission);
+    }
+    if (!opts.approval_id.empty()) {
+        err.add("approval_id", opts.approval_id);
+    }
+    if (!opts.status_url.empty()) {
+        err.add("status_url", opts.status_url);
     }
     return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
 }
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
+                          std::string_view remediation) {
+    // Backward-compatible no-retry overload — delegates to the unified builder
+    // so the wire shape stays byte-identical (retry_after_ms:null, remediation
+    // omitted when empty).
+    return error_json_a4(code, message, correlation_id, A4ErrorOpts{.remediation = remediation});
+}
+
+std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::int64_t retry_after_ms, std::string_view remediation) {
-    auto err = JObj()
-                   .add("code", code)
-                   .add("message", message)
-                   .add("correlation_id", correlation_id)
-                   .add("retry_after_ms", retry_after_ms);
-    if (!remediation.empty()) {
-        err.add("remediation", remediation);
-    }
-    return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
+    // Backward-compatible concrete-retry overload. Passes the value through
+    // even when 0 — this overload's contract is "always a concrete number".
+    return error_json_a4(code, message, correlation_id,
+                         A4ErrorOpts{.retry_after_ms = retry_after_ms, .remediation = remediation});
 }
 
 /// Payload size cap on `ev.data` before raw-embed into the envelope.
