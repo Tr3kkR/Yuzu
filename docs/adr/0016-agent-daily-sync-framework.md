@@ -266,3 +266,97 @@ agent cannot re-stamp itself), so **migration v3** clamps any pre-fix row whose
 staleness window. Options weighed and rejected: a `min(collected_at, now)`
 *clamp* (kills only future-skew, not past-skew) and a *separate server-stamped
 column* (correct but an unnecessary migration given the absent display consumer).
+
+### 2026-06-30 — source #3 `device_ci` (device hardware/OS identity, CMDB CI record)
+
+A third sync source, **`device_ci`**, collects the machine's stable
+hardware/OS identity by invoking the existing `hardware`, `device_identity`,
+`os_info`, and `network_config` plugins in-process (`LocalDispatcher`) and
+rendering them into a canonical CI record: manufacturer, model, **serial
+number**, **system UUID**, BIOS vendor/version/date, CPU model/cores/threads,
+RAM bytes, a disks summary, **primary MAC** + a MAC summary + NIC count, OS
+name/version/build, and architecture. A new `hardware` plugin `system` action
+collects serial + UUID (Windows WMI, Linux `/sys/class/dmi/id` via
+`cap_dac_read_search`, macOS `ioreg`). **Volatile telemetry — disk free space,
+uptime, IP addresses — is deliberately excluded** so the content hash is stable
+and hash-skip suppresses steady-state traffic (an IP that churns on DHCP renewal
+would flap the hash and force a daily full resend).
+
+**No proto change and no gateway gpb regen.** A new source is a new KEY in the
+existing `plugin_data`/`content_hashes` maps, not a new proto FIELD — §6's regen
+requirement is about new fields (`content_hashes`/`need_full` themselves), which
+already shipped. `app_perf` (source #2) established this precedent; `device_ci`
+confirms it. The Erlang gateway decodes/re-encodes only the existing map fields
+and never inspects opaque map values, so a new key survives the hop unchanged.
+
+**Store.** Born-on-PG `DeviceInventoryStore` (schema `device_inventory_store`,
+table `device_ci`) — **1:1 per agent** (one identity per machine, the
+`OfflineEndpointStore` shape), not the 1:N parent+child of §7 (that is for the
+N-row `installed_software`). Ingest via the shared `device_ci_ingestion.*` seam
+on **both** `ReportInventory` and gateway `ProxyInventory` (§5 parity). Failure
+posture per §7: ingest fail-soft, reads authoritative (`std::expected` /
+`std::nullopt`, never silent-empty). `last_seen`/`first_seen` are the server
+receipt time from day one (#1685).
+
+**Data classification + co-determination (supersedes the borrowed §8 citation).**
+§8's "no PII / no co-determination trigger" argument was constructed for
+`installed_software` (HKLM app names) and does **not** transfer unchanged:
+`serial`, `system_uuid`, and `primary_mac` are **stable device-persistent
+identifiers**, which are personal data under GDPR when a device is
+person-assigned, and the *capability* to track a device (and by association its
+user) over time triggers EU works-council co-determination review regardless of
+per-user data. The collection is still **machine-scope** (no username/SID/user
+path). The existing **`--inventory-disable`** flag is the collection toggle and
+covers `device_ci` at the same gate as the other sources (it gates the whole
+daily-sync thread).
+
+**DPIA status update (gov Gate 6 compliance-officer, PR2).** The line above
+originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
+item" — written when this data was store-only (central Postgres, no operator
+surface). That framing is now stale: the `/inventory` Devices tab CI columns +
+per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+**operator-visible** for the first time, which is a co-determination trigger
+point distinct from mere central storage (works-council review is about
+monitoring *capability becoming exercised*, not just data existing in a DB).
+The interim posture — already-permissioned operators, management-group scoped,
+audited via the behavioural-PII tier (`emit_behavioral_audit`) — is a
+defensible control pending the DPIA, not a reason to withhold the read surface.
+But the DPIA / Workstream-E data-inventory entry for centralizing
+serial/UUID/MAC is now an **outstanding item that applies to a live,
+operator-visible surface**, not a future-tense placeholder — track it as a
+dated, owned issue (see the SOC2 Workstream E data-inventory doc) rather than
+leaving it as prose here.
+
+**Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
+correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
+Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
+purely on `agent_id` and does not implement CMDB correlation/merge, so this
+requirement does not apply to it and remains open for whichever future PR adds
+cross-device correlation.) When the platform identity subsystem is unavailable, or
+a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),
+`serial`/`system_uuid` are the literal `"unknown"`. The PR1 collect skips a cycle
+only when manufacturer AND model are both `"unknown"` (a wholesale WMI/DMI outage —
+`core_identity_unavailable`), which prevents a transient blip from overwriting a
+good row and flapping the hash; but a serial-less VM with real manufacturer/model
+is persisted with `serial="unknown"` by design. **A future CMDB correlation/merge
+feature MUST treat `serial=="unknown"` / `system_uuid=="unknown"` as ABSENT and
+never merge distinct devices on it** (otherwise every WMI-down or serial-less host
+collapses into one CI). The store keys on `agent_id`, so there is no PR1
+collision — this is purely a future correlation-feature concern. Also note
+**macOS `IOPlatformUUID` ≠ the SMBIOS UUID** reported on Windows/Linux, so
+cross-OS correlation by UUID will miss.
+
+**Known inherited property (forward).** The content hash covers the field *set*,
+so a mixed-version rollout (an agent that adds/removes a field vs an older server)
+round-trips to a different hash → continuous `need_full` until both sides match.
+This is identical to `installed_software` and is a **framework-wide** trait;
+hashing the raw received blob bytes instead of the re-serialized record would
+neutralize it (and the multi-copy scrub/clamp drift surface) but must be done for
+**all** sources together, not `device_ci` alone — tracked as a follow-up. The
+agent↔server scrub/clamp byte-equality is locked by a clean **and dirty** cross-pin
+test today. A 1-byte blob format-version prefix is the other future-proofing option.
+
+The `yuzu_inventory_stale_agents` freshness gauge is **not** yet extended to
+`device_ci` (it reads `SoftwareInventoryStore::count_stale_agents` only); the
+#1685 server-stamped `last_seen` is in place but its gauge consumer is a deferred
+follow-up (same as `app_perf`).

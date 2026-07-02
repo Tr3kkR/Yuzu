@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -124,11 +125,16 @@ TEST_CASE("versions fragment: degrade banner vs empty vs share bars", "[inventor
 }
 
 TEST_CASE("device-software fragment: degrade vs empty vs rows; offline note", "[inventory][ui]") {
-    REQUIRE(contains(render_inventory_device_software_fragment("a1", "HOST", std::nullopt, true),
+    // Absent (a value holding std::nullopt) — CI is orthogonal to these assertions.
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> ci_absent{std::nullopt};
+
+    REQUIRE(contains(render_inventory_device_software_fragment("a1", "HOST", std::nullopt, true,
+                                                               ci_absent, 2000),
                      "unavailable"));
 
     const std::string empty = render_inventory_device_software_fragment(
-        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true);
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        ci_absent, 2000);
     REQUIRE(contains(empty, "No installed software recorded"));
     REQUIRE_FALSE(contains(empty, "unavailable"));
 
@@ -137,12 +143,65 @@ TEST_CASE("device-software fragment: degrade vs empty vs rows; offline note", "[
     e.version = "4.38";
     const std::string offline = render_inventory_device_software_fragment(
         "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{e}),
-        /*online=*/false);
+        /*online=*/false, ci_absent, 2000);
     REQUIRE(contains(offline, "Slack"));
     REQUIRE(contains(offline, "offline")); // the "last daily sync, not live" note
 }
 
-TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory][ui]") {
+TEST_CASE("device-CI panel: degrade vs absent vs found; sentinel + humanized fields",
+          "[inventory][ui]") {
+    // std::unexpected(kDegraded) -> a degrade banner, distinct wording from "no CI record"
+    // (ADR-0016 §7 authoritative-read honesty — never conflate the two).
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> degraded =
+        std::unexpected(CiReadError::kDegraded);
+    const std::string deg = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        degraded, 2000);
+    REQUIRE(contains(deg, "CI record unavailable"));
+    REQUIRE_FALSE(contains(deg, "No CI record synced"));
+
+    // A value holding std::nullopt -> genuinely not synced yet, NOT a degrade.
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> absent{std::nullopt};
+    const std::string abs = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        absent, 2000);
+    REQUIRE(contains(abs, "No CI record synced"));
+    REQUIRE_FALSE(contains(abs, "unavailable"));
+
+    // A found record renders the grid; humanized CPU/RAM; the "unknown" sentinel (a
+    // genuinely serial-less VM) renders as a placeholder, never the raw word.
+    DeviceCiRecord rec;
+    rec.manufacturer = "Dell Inc.";
+    rec.model = "OptiPlex 7090";
+    rec.serial = "unknown";
+    rec.system_uuid = "ABC-123";
+    rec.cpu_model = "Intel Core i7";
+    rec.cpu_cores = "8";
+    rec.cpu_threads = "16";
+    rec.ram_bytes = "17179869184"; // 16 GiB
+    rec.primary_mac = "AA:BB:CC:DD:EE:FF";
+    rec.os_name = "Windows";
+    rec.os_version = "11";
+    rec.os_build = "22631";
+    rec.arch = "x86_64";
+    rec.first_seen = 1000;
+    rec.last_seen = 1900;
+    const std::expected<std::optional<DeviceCiRecord>, CiReadError> found{
+        std::optional<DeviceCiRecord>(rec)};
+    const std::string html = render_inventory_device_software_fragment(
+        "a1", "HOST", std::optional<std::vector<SoftwareEntry>>(std::vector<SoftwareEntry>{}), true,
+        found, 2000);
+    REQUIRE(contains(html, "Dell Inc."));
+    REQUIRE(contains(html, "OptiPlex 7090"));
+    REQUIRE(contains(html, "ABC-123"));
+    REQUIRE(contains(html, "8c/16t"));
+    REQUIRE(contains(html, "16.0 GB"));
+    REQUIRE(contains(html, "AA:BB:CC:DD:EE:FF"));
+    REQUIRE(contains(html, "&mdash;"));      // the "unknown" serial's placeholder
+    REQUIRE_FALSE(contains(html, ">unknown<")); // never rendered as raw text
+}
+
+TEST_CASE("devices fragment: real CI columns + offline-inclusive rows", "[inventory][ui]") {
     std::vector<InventoryDeviceRow> rows;
     InventoryDeviceRow on;
     on.agent_id = "a1";
@@ -150,6 +209,12 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     on.os = "windows";
     on.online = true;
     on.last_seen = "now";
+    // Device-CI enrichment (PR2) — as attach_device_ci would fill it in.
+    on.ci_serial = "SN12345";
+    on.ci_model = "OptiPlex 7090";
+    on.ci_cpu_cores = "8";
+    on.ci_cpu_threads = "16";
+    on.ci_ram_bytes = "17179869184"; // 16 GiB
     InventoryDeviceRow off;
     off.agent_id = "a2";
     off.hostname = "UB-2";
@@ -157,6 +222,7 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     off.online = false;
     off.stale = true;
     off.last_seen = "3d ago";
+    // off's ci_* fields are left default-empty — no CI synced yet for this agent.
     rows.push_back(on);
     rows.push_back(off);
     const std::string html = render_inventory_devices_fragment(rows, "", "", "");
@@ -166,6 +232,13 @@ TEST_CASE("devices fragment: thin CI list + offline-inclusive rows", "[inventory
     REQUIRE(contains(html, "stale"));
     // The per-device drill carries host + online into the URL.
     REQUIRE(contains(html, "/fragments/inventory/device?id=a1&host=WIN-1&online=1"));
+    // Real CI columns for the enriched row.
+    REQUIRE(contains(html, "SN12345"));
+    REQUIRE(contains(html, "OptiPlex 7090"));
+    REQUIRE(contains(html, "8c/16t"));
+    REQUIRE(contains(html, "16.0 GB"));
+    // The un-synced row's CI cells fall back to the placeholder, not a blank/garbage cell.
+    REQUIRE(contains(html, "&mdash;"));
 }
 
 TEST_CASE("find results: truncated + omitted signals; degrade vs empty", "[inventory][ui]") {
@@ -198,12 +271,19 @@ struct InvHarness {
     bool allow_perm = true;          // global Inventory:Read
     bool allow_scoped = true;        // per-device scoped Inventory:Read
     bool degrade = false;            // make every store provider return nullopt
+    bool audit_should_fail = false;  // simulate an audit-persist failure (Sec-Audit-Failed)
+    bool unwire_devices = false;     // register with an empty DevicesFn{} (unwired closure)
+    std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
     std::vector<std::string> audits;          // "action|result"
     std::vector<std::string> audit_full;      // "action|result|target_type|target_id" (parity check)
+    std::vector<std::string> audit_details;   // detail strings, parallel to `audits`
 
-    InvHarness() {
+    // `unwire_devices_` must be a constructor param, not a post-construction field write —
+    // `register_routes` (below) runs once, here, so the DevicesFn choice is baked in at
+    // construction time (unlike `degrade`, which every provider lambda re-checks per-call).
+    explicit InvHarness(bool unwire_devices_ = false) : unwire_devices(unwire_devices_) {
         auto auth = [](const httplib::Request&, httplib::Response&) {
             return std::optional<auth::Session>(auth::Session{});
         };
@@ -249,14 +329,26 @@ struct InvHarness {
             e.name = "Slack";
             return std::vector<SoftwareEntry>{e};
         };
-        auto devices = [](const std::string&) {
+        auto devices = [this](const std::string&) -> InventoryDevicesResult {
             InventoryDeviceRow r;
             r.agent_id = "a1";
             r.hostname = "WIN-1";
             r.os = "windows";
             r.online = true;
             r.last_seen = "now";
-            return std::vector<InventoryDeviceRow>{r};
+            // Mirrors the real provider's contract: a CI-store degrade never blanks the
+            // roster, it only means the CI columns (unmodeled in this harness fixture)
+            // would be blank — `degrade` toggles JUST the ci_degraded signal here.
+            InventoryDevicesResult result;
+            result.rows = {r};
+            result.ci_degraded = degrade;
+            return result;
+        };
+        auto ci_fn = [this](const std::string&)
+            -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
+            if (degrade)
+                return std::unexpected(CiReadError::kDegraded);
+            return ci_record; // nullopt (default) = absent; set to a record = found
         };
         auto scope = [this](const std::string&, const std::string& agent_id) {
             for (const auto& a : in_scope_agents)
@@ -268,13 +360,18 @@ struct InvHarness {
             return degrade ? std::nullopt : std::optional<std::int64_t>(7);
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string& tt, const std::string& tid, const std::string&) {
+                            const std::string& tt, const std::string& tid,
+                            const std::string& detail) {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
-            return true;
+            audit_details.push_back(detail);
+            return !audit_should_fail;
         };
+        InventoryRoutes::DevicesFn devices_fn = devices;
+        if (unwire_devices)
+            devices_fn = InventoryRoutes::DevicesFn{}; // empty closure — route treats as degraded
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
-                               agent_sw, devices, scope, stale, audit);
+                               agent_sw, devices_fn, scope, stale, audit, ci_fn);
     }
 };
 
@@ -333,6 +430,90 @@ TEST_CASE("route: per-device drill is scope-gated", "[inventory][route]") {
     auto ok = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
     REQUIRE(ok);
     REQUIRE(contains(ok->body, "Slack"));
+}
+
+TEST_CASE("route: inventory.devices + inventory.device.ci are the behavioural-PII audit "
+          "tier (Sec-Audit-Failed on a persist failure)",
+          "[inventory][route]") {
+    // gov Gate 2 finding: both verbs carry a device-persistent identifier (serial) now,
+    // so both were promoted from try_persist_audit to emit_behavioral_audit. Prove the
+    // header actually appears on a persist failure — not just that the detail string
+    // looks right (the prior tests already cover content; this locks in the tier).
+    {
+        InvHarness h;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/fragments/inventory/devices");
+        REQUIRE(res);
+        REQUIRE(res->status != 403);
+        REQUIRE(res->has_header("Sec-Audit-Failed"));
+        // Set-and-proceed: the HTML fragment still renders despite the audit failure.
+        REQUIRE(contains(res->body, "WIN-1"));
+    }
+    {
+        InvHarness h;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(res->has_header("Sec-Audit-Failed"));
+    }
+}
+
+TEST_CASE("route: per-device drill renders the CI panel + audits inventory.device.ci",
+          "[inventory][route]") {
+    {
+        // Default ci_record (nullopt) = absent, not yet synced -> "success" audit (a
+        // genuine absent read is not a failure), honest empty note in the body.
+        InvHarness h;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "No CI record synced"));
+        bool ok = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|success")
+                ok = true;
+        REQUIRE(ok);
+    }
+    {
+        // A found record -> the CI grid renders; audit is still "success".
+        InvHarness h;
+        DeviceCiRecord rec;
+        rec.serial = "SN-ROUTE-1";
+        h.ci_record = rec;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "SN-ROUTE-1"));
+        bool ok = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|success")
+                ok = true;
+        REQUIRE(ok);
+    }
+    {
+        // Degrade -> "failure" audit + a degrade banner (distinct from "absent"). Note:
+        // InvHarness's single `degrade` flag ALSO degrades agent_sw_fn_ in this same
+        // request (gov Gate 3 quality-engineer finding — this is the first route-level
+        // exercise of the software-degrade path on THIS endpoint, so assert on it too
+        // rather than leaving it silently unchecked).
+        InvHarness h;
+        h.degrade = true;
+        auto res = h.sink.Get("/fragments/inventory/device?id=a1&host=WIN-1&online=1");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "CI record unavailable"));
+        bool ci_failed = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.ci|failure")
+                ci_failed = true;
+        REQUIRE(ci_failed);
+        // The sibling software read is ALSO degraded by the same flag in this request —
+        // assert its banner + audit too, so this test's coverage of the combined-degrade
+        // path is actually cashed in, not just incidentally exercised.
+        REQUIRE(contains(res->body, "Device software unavailable"));
+        bool sw_failed = false;
+        for (const auto& a : h.audits)
+            if (a == "inventory.device.software|failure")
+                sw_failed = true;
+        REQUIRE(sw_failed);
+    }
 }
 
 TEST_CASE("route: find results apply the per-row management-group drop filter", "[inventory][route]") {
@@ -434,6 +615,50 @@ TEST_CASE("route: devices list — deny vs success (offline-inclusive, audited)"
                 audited = true;
         REQUIRE(audited);
     }
+}
+
+TEST_CASE("route: devices list — CI enrichment degrade audits failure, roster still renders",
+          "[inventory][route]") {
+    // #1785 review HIGH-1: a CI-store degrade must never masquerade as "success" in the
+    // audit trail, even though the roster itself (offline-survivable, independent of the
+    // CI-enrichment join) still renders — set-and-proceed for the HTML, honest for audit.
+    InvHarness h;
+    h.degrade = true;
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status != 403);
+    REQUIRE(contains(res->body, "WIN-1")); // roster unaffected by the CI-join degrade
+    bool failed = false, succeeded = false;
+    for (const auto& a : h.audits) {
+        failed = failed || a == "inventory.devices|failure";
+        succeeded = succeeded || a == "inventory.devices|success";
+    }
+    REQUIRE(failed);
+    REQUIRE_FALSE(succeeded);
+}
+
+TEST_CASE("route: devices list — unwired DevicesFn audits failure on an empty roster",
+          "[inventory][route]") {
+    // gov Gate 3 quality-engineer finding: the route's `else result.ci_degraded = true;`
+    // branch (an unwired devices_fn_, production-unreachable but defensively handled —
+    // mirrors agent_ci_fn_/agent_sw_fn_ elsewhere in this file) had no direct coverage.
+    InvHarness h{/*unwire_devices_=*/true};
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status != 403);
+    bool failed = false, succeeded = false;
+    for (const auto& a : h.audits) {
+        failed = failed || a == "inventory.devices|failure";
+        succeeded = succeeded || a == "inventory.devices|success";
+    }
+    REQUIRE(failed);
+    REQUIRE_FALSE(succeeded);
+    // The empty-roster wording is distinct from the populated-roster degrade wording.
+    bool honest_empty_detail = false;
+    for (const auto& d : h.audit_details)
+        if (contains(d, "device roster or CI store unavailable"))
+            honest_empty_detail = true;
+    REQUIRE(honest_empty_detail);
 }
 
 TEST_CASE("route: find shell gates on Inventory:Read", "[inventory][route]") {

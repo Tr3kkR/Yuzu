@@ -16,6 +16,7 @@
 #include "guaranteed_state_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_ingestion.hpp"
+#include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_ingestion.hpp"
@@ -691,9 +692,9 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     //
     // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
     // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
-    // Both live sources (installed_software, app_perf) are TYPED and routed through
-    // their typed seams on both paths, so the two paths stay symmetric; a future
-    // GENERIC source must fold its upsert into ingest_inventory_report (pass the
+    // The three live sources (installed_software, app_perf, device_ci) are TYPED and
+    // routed through their typed seams on both paths, so the two paths stay symmetric;
+    // a future GENERIC source must fold its upsert into ingest_inventory_report (pass the
     // InventoryStore&), not add a parallel loop here.
     if (software_inventory_store_ && software_inventory_store_->is_open()) {
         try {
@@ -716,6 +717,19 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
                          ex.what());
         } catch (...) {
             spdlog::warn("ReportInventory: app_perf ingest threw unknown exception for agent {} — "
+                         "acked",
+                         agent_id);
+        }
+    }
+    if (device_inventory_store_ && device_inventory_store_->is_open()) {
+        try {
+            ingest_device_ci_report(*device_inventory_store_, agent_id, *request, *response,
+                                    &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: device_ci ingest threw for agent {} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: device_ci ingest threw unknown exception for agent {} — "
                          "acked",
                          agent_id);
         }

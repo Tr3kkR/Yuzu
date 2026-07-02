@@ -132,7 +132,8 @@ private:
     /// output for `<source>_enabled=false` rows, and renders an HTML table
     /// body fragment. The username + visibility filter close the
     /// Gate 2 cross-operator data-leak finding.
-    std::string render_tar_retention_paused(const std::string& username) const;
+    std::string render_tar_retention_paused(const std::string& username, bool can_execute,
+                                            bool can_delete) const;
 
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,

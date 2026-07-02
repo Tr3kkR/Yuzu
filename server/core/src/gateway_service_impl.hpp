@@ -30,6 +30,7 @@ class ManagementGroupStore;
 class InventoryStore;
 class SoftwareInventoryStore;
 class AppPerfDailyStore;
+class DeviceInventoryStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -57,6 +58,9 @@ public:
         software_inventory_store_ = store;
     }
     void set_app_perf_daily_store(AppPerfDailyStore* store) { app_perf_daily_store_ = store; }
+    void set_device_inventory_store(DeviceInventoryStore* store) {
+        device_inventory_store_ = store;
+    }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
     // topology store so BatchHeartbeat ingests pushes from agents that
@@ -144,6 +148,7 @@ private:
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
+    DeviceInventoryStore* device_inventory_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};

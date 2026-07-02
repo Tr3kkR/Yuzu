@@ -41,6 +41,7 @@ class OffloadTargetStore;
 class InventoryStore;
 class SoftwareInventoryStore;
 class AppPerfDailyStore;
+class DeviceInventoryStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -101,6 +102,11 @@ public:
     /// Typed per-device app-perf daily projection (DEX app-perf-over-time B1) —
     /// receives the app_perf daily-sync source via ReportInventory.
     void set_app_perf_daily_store(AppPerfDailyStore* store) { app_perf_daily_store_ = store; }
+    /// Typed device-CI projection (ADR-0016) — receives the device_ci daily-sync
+    /// source via ReportInventory.
+    void set_device_inventory_store(DeviceInventoryStore* store) {
+        device_inventory_store_ = store;
+    }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
     /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
@@ -342,6 +348,7 @@ private:
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
+    DeviceInventoryStore* device_inventory_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};

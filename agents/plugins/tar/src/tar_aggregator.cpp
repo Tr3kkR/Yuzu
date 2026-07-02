@@ -310,6 +310,20 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
     return "errored"; // anything else was written outside the plugin
 }
 
+// #560 — gate on the canonical tri-state, not `!= "false"`. A value the plugin
+// never writes ("maybe", "1", "", a bit-flip) maps to "errored", which is NOT
+// "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
+// such value as enabled, so a source an operator paused for forensics whose
+// `_enabled` value was corrupted or tampered kept collecting — and disagreed
+// with the tri-state `status` reports. run_retention() shares the same canonical
+// gate so an "errored" source's rows are preserved, not pruned. Also the
+// authoritative paused-guard for the Phase 15.A `tar.purge_source` action.
+bool source_enabled(TarDatabase& db, std::string_view source) {
+    const char* def = source_default_enabled(source) ? "true" : "false";
+    return canonical_source_enabled(db.get_config(std::format("{}_enabled", source), def)) ==
+           "true";
+}
+
 void run_retention(TarDatabase& db, int64_t now_epoch) {
     // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
     db.execute_sql("BEGIN TRANSACTION");

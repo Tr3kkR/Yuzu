@@ -162,4 +162,18 @@ void run_retention(TarDatabase& db, int64_t now_epoch);
  */
 [[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
 
+/**
+ * The collect-time (and purge-time) gate: is a capture source actively enabled?
+ * Reads `<source>_enabled` (defaulting to the source's declared default) and
+ * gates on the strict tri-state (#560) — anything the plugin never wrote maps to
+ * "errored", which is NOT "true", so the source reads as disabled (fail closed).
+ * A never-configured source returns its `source_default_enabled()` default.
+ *
+ * This is the authoritative paused-guard for the Phase 15.A destructive purge:
+ * `tar.purge_source` refuses unless this returns false. It lives here (beside
+ * `canonical_source_enabled`, the tri-state authority it wraps) rather than in
+ * the plugin so the guard predicate is directly testable.
+ */
+[[nodiscard]] bool source_enabled(TarDatabase& db, std::string_view source);
+
 } // namespace yuzu::tar

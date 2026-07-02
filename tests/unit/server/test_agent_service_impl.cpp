@@ -38,6 +38,7 @@
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_service_impl.hpp"
+#include "inventory_store.hpp"
 #include "peer_ip.hpp"
 #include "response_store.hpp"
 #include <yuzu/metrics.hpp>
@@ -933,6 +934,44 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
     CHECK(seen_src == yuzu::server::CertIssuanceSource::GatewayProxy);
     CHECK(resp.issued_certificate() == "LEAF-PEM-for-agent-gw-1");
     CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
+}
+
+TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic InventoryStore "
+          "(H1 — gateway parity + Inventory:Read boundary)",
+          "[agent_service][gateway][inventory][device_ci]") {
+    // Regression for the round-2 H1: the gateway generic-blob loop must skip every
+    // TYPED source (is_typed_inventory_source) — else device_ci's serial/UUID/MAC
+    // lands in the generic InventoryStore, which is read on Infrastructure:Read,
+    // bypassing the new Inventory:Read securable (and breaking direct/gateway parity,
+    // since the direct path has no generic loop).
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    InventoryStore inv{":memory:"}; // the generic blob store (read on Infrastructure:Read)
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+
+    // Register a gateway session so ProxyInventory resolves the agent_id.
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-inv", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+    const std::string session_id = rresp.session_id();
+    REQUIRE_FALSE(session_id.empty());
+
+    // A report carrying BOTH a typed source (device_ci) and a generic source.
+    apb::InventoryReport rpt;
+    rpt.set_session_id(session_id);
+    (*rpt.mutable_plugin_data())["device_ci"] = "raw-canonical-blob"; // typed → must be skipped
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";      // generic → must be stored
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+
+    CHECK_FALSE(inv.get("agent-gw-inv", "device_ci").has_value()); // H1: not in the generic store
+    CHECK(inv.get("agent-gw-inv", "custom_source").has_value());   // generic source still works
 }
 
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",

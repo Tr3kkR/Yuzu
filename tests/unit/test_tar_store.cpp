@@ -72,6 +72,81 @@ TEST_CASE("TarDatabase: warehouse tables created on open", "[tar][store][lifecyc
     CHECK(t.db.insert_process_events({ev}));
 }
 
+TEST_CASE("TarDatabase: purge_source drops ALL tiers for one source, leaves others",
+          "[tar][store][purge]") {
+    auto t = make_test_db();
+
+    // Seed EVERY process tier (live/hourly/daily/monthly) — not just live — so a
+    // regression that purges only granularities[0] fails, and so the returned
+    // rows_deleted proves the cross-tier sum (governance B2). live via the typed
+    // insert; the rollup tiers via direct INSERT (schema per tar_schema_registry).
+    ProcessEvent p1;
+    p1.ts = 1000;
+    p1.snapshot_id = 1;
+    p1.action = "started";
+    p1.pid = 1;
+    p1.name = "a.exe";
+    ProcessEvent p2 = p1;
+    p2.pid = 2;
+    p2.name = "b.exe";
+    REQUIRE(t.db.insert_process_events({p1, p2})); // process_live: 2
+    REQUIRE(t.db.execute_sql("INSERT INTO process_hourly "
+                             "(hour_ts,name,user,start_count,stop_count) VALUES "
+                             "(3600,'a.exe','SYSTEM',1,1),(7200,'b.exe','SYSTEM',1,1),"
+                             "(10800,'c.exe','SYSTEM',1,1)")); // process_hourly: 3
+    REQUIRE(t.db.execute_sql("INSERT INTO process_daily "
+                             "(day_ts,name,user,start_count,stop_count) VALUES "
+                             "(86400,'a.exe','SYSTEM',1,1)")); // process_daily: 1
+    REQUIRE(t.db.execute_sql("INSERT INTO process_monthly "
+                             "(month_ts,name,user,start_count,stop_count) VALUES "
+                             "(2592000,'a.exe','SYSTEM',1,1)")); // process_monthly: 1
+
+    // A different source, seeded across TWO tiers, must be entirely untouched.
+    NetworkEvent n1;
+    n1.ts = 1000;
+    n1.snapshot_id = 1;
+    n1.action = "connected";
+    n1.proto = "tcp";
+    n1.local_addr = "127.0.0.1";
+    n1.local_port = 5;
+    n1.remote_addr = "1.1.1.1";
+    n1.remote_port = 53;
+    REQUIRE(t.db.insert_network_events({n1})); // tcp_live: 1
+    REQUIRE(t.db.execute_sql("INSERT INTO tcp_hourly "
+                             "(hour_ts,remote_addr,remote_port,proto,process_name,"
+                             "connect_count,disconnect_count) VALUES "
+                             "(3600,'1.1.1.1',53,'tcp','sshd',1,1)")); // tcp_hourly: 1
+
+    auto count = [&](const std::string& table) {
+        auto r = t.db.execute_query("SELECT COUNT(*) FROM " + table);
+        REQUIRE(r.has_value());
+        REQUIRE(!r->rows.empty());
+        return std::stoi(r->rows[0][0]);
+    };
+    REQUIRE(count("process_live") == 2);
+    REQUIRE(count("process_hourly") == 3);
+    REQUIRE(count("process_daily") == 1);
+    REQUIRE(count("process_monthly") == 1);
+    REQUIRE(count("tcp_live") == 1);
+    REQUIRE(count("tcp_hourly") == 1);
+
+    auto res = t.db.purge_source("process");
+    REQUIRE(res.has_value());
+    CHECK(*res == 7); // 2 + 3 + 1 + 1 across all four tiers — the cross-tier sum
+    CHECK(count("process_live") == 0);
+    CHECK(count("process_hourly") == 0);
+    CHECK(count("process_daily") == 0);
+    CHECK(count("process_monthly") == 0);
+    CHECK(count("tcp_live") == 1);   // a different source is untouched...
+    CHECK(count("tcp_hourly") == 1); // ...across all of its tiers
+}
+
+TEST_CASE("TarDatabase: purge_source rejects an unknown source", "[tar][store][purge]") {
+    auto t = make_test_db();
+    auto res = t.db.purge_source("not_a_source");
+    CHECK_FALSE(res.has_value());
+}
+
 // =============================================================================
 // Typed inserts and SQL queries
 // =============================================================================

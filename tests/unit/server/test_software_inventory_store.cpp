@@ -489,7 +489,9 @@ TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675
     q.name = "Chrome";
     CHECK_FALSE(store.query_software(q).has_value()); // degraded → nullopt
     CHECK_FALSE(store.get_agent_software("agent-a").has_value());
-    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}})
+    CHECK(metrics
+              .counter("yuzu_inventory_read_degrade_total",
+                       {{"reason", "query_error"}, {"source", "installed_software"}})
               .value() == 2.0);
 }
 
@@ -624,7 +626,9 @@ TEST_CASE("read-degrade store_not_open reason fires when the store failed to ope
     q.name = "Chrome";
     CHECK_FALSE(store.query_software(q).has_value());
     CHECK_FALSE(store.get_agent_software("agent-a").has_value());
-    CHECK(metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "store_not_open"}})
+    CHECK(metrics
+              .counter("yuzu_inventory_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "installed_software"}})
               .value() == 2.0);
 }
 
@@ -730,8 +734,10 @@ TEST_CASE("read-degrade sampler is data-race-free under concurrent degraded read
         th.join();
     // The counter is exact regardless of WARN sampling: every degraded read bumped it
     // exactly once, two reads per iteration.
-    const double total =
-        metrics.counter("yuzu_inventory_read_degrade_total", {{"reason", "query_error"}}).value();
+    const double total = metrics
+                             .counter("yuzu_inventory_read_degrade_total",
+                                      {{"reason", "query_error"}, {"source", "installed_software"}})
+                             .value();
     CHECK(total == static_cast<double>(kThreads * kPerThread * 2));
 }
 

@@ -591,3 +591,19 @@ TEST_CASE("render_duration_bar_html: negative duration clamped to zero",
     auto html = render_duration_bar_html(-100, 1000, "succeeded");
     REQUIRE(html.find("aria-label=\"0 ms\"") != std::string::npos);
 }
+
+TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
+          "[web_utils][audit]") {
+    // ASCII-clean values pass through verbatim.
+    CHECK(audit_token("Acme.exe") == "Acme.exe");
+    CHECK(audit_token("4.3.0.0") == "4.3.0.0");
+    CHECK(audit_token("") == "");
+    // The field-confusion characters (space, '=', ',') become '_' so a value cannot
+    // forge an adjacent k=v field — the H1 fix the VERIFY audit details rely on.
+    CHECK(audit_token("a paired=99 cohort=99") == "a_paired_99_cohort_99");
+    CHECK(audit_token("x,y") == "x_y");
+    // Line-splitting control bytes (CR/LF, < 0x20) and DEL (0x7F) are neutralised too.
+    CHECK(audit_token(std::string("a\r\nb")) == "a__b");
+    CHECK(audit_token(std::string("a\x7F" "b")) == "a_b");
+    CHECK(audit_token(std::string("a\tb")) == "a_b");
+}

@@ -363,6 +363,17 @@ public:
      */
     bool execute_sql_range(const std::string& sql, int64_t from, int64_t to);
 
+    /**
+     * Purge ALL rows for a capture source across every warehouse tier
+     * (`<source>_live/_hourly/_daily/_monthly`), with the tier tables resolved
+     * from the schema registry (never hardcoded). Backs the `tar.purge_source`
+     * action (retention-paused frame, Phase 15.A): it drops a deliberately
+     * paused source's accumulated forensic data WITHOUT re-enabling collection.
+     * All tiers are deleted in one transaction (all or none).
+     * @return total rows deleted, or an error string (unknown source / SQL error).
+     */
+    std::expected<int, std::string> purge_source(const std::string& source);
+
 private:
     explicit TarDatabase(sqlite3* db);
 

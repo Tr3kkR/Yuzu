@@ -1544,6 +1544,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `device.identity` | `device_identity` | Y | Y | Y | Verified |
 | `hardware.inventory` | `hardware` | Y | Y | Y | Verified |
 | `device.hardware.drivers` | `hardware` | Y | Y | - | Verified |
+| `device.hardware.system` | `hardware` | Y | Y | Y | Verified |
 | `device.tags.get` | `tags` | Y | Y | Y | Verified |
 | `device.tags.set` | `tags` | Y | Y | Y | Verified |
 | `device.asset_tags.sync` | `asset_tags` | Y | Y | Y | Verified |

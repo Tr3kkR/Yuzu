@@ -31,6 +31,8 @@
 ///     result. Staleness is acceptable (return the last projection); failure-as-empty
 ///     is not.
 
+#include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -54,14 +56,6 @@ struct SoftwareEntry {
     std::string version;
     std::string publisher;
     std::string install_date;
-};
-
-/// Outcome of a hash-skip ingest for one source (ADR-0016 §4).
-enum class InventoryIngestOutcome {
-    kStored,   ///< full payload accepted; the agent's rows were replaced
-    kTouched,  ///< claimed hash matched the stored hash; last_seen bumped only
-    kNeedFull, ///< cold cache / mismatch with no rows — server asks for a resend
-    kError,    ///< pool/SQL failure (transient; the agent retries next cycle)
 };
 
 /// One fleet-query row: which agent carries which entry.
@@ -130,7 +124,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the read-degrade counter
-    /// (`yuzu_inventory_read_degrade_total{reason}`, #1675) and any future
+    /// (`yuzu_inventory_read_degrade_total{reason, source="installed_software"}`, #1675) and any future
     /// store-internal metric. Set ONCE during single-threaded startup, before
     /// the gRPC/REST surfaces begin serving — the pointer is read without
     /// synchronisation on the serving threads, so a later swap would race. A

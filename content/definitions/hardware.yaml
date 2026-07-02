@@ -395,3 +395,61 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
+  id: device.hardware.system
+  displayName: System Identity (Serial + UUID)
+  version: 1.0.0
+  description: >
+    Returns the machine's hardware serial number and system (SMBIOS / firmware)
+    UUID — the stable CMDB correlation key (e.g. for ServiceNow reconciliation).
+    Windows reads Win32_BIOS.SerialNumber and Win32_ComputerSystemProduct.UUID via
+    WMI; Linux reads /sys/class/dmi/id/product_serial and product_uuid (0400, via
+    the agent's cap_dac_read_search capability); macOS reads IOPlatformSerialNumber
+    and IOPlatformUUID from ioreg. An absent value (e.g. a VM with no SMBIOS serial)
+    returns the literal "unknown". This is the building block the device_ci
+    daily-sync source (ADR-0016) collects in-process.
+  tags: [hardware, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: system
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: serial
+        type: string
+      - name: system_uuid
+        type: string
+
+  readablePayload: "Get the device serial number and system UUID"
+
+  gather:
+    ttlSeconds: 86400
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active

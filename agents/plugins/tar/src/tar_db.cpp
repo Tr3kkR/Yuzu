@@ -724,6 +724,73 @@ bool TarDatabase::create_warehouse_tables() {
     return true;
 }
 
+std::expected<int, std::string> TarDatabase::purge_source(const std::string& source) {
+    // Resolve the source's tier tables from the schema registry — never hardcode.
+    // Table names are <name>_<suffix> (same construction as stats()/DDL).
+    const CaptureSourceDef* def = nullptr;
+    for (const auto& s : capture_sources()) {
+        if (s.name == source) {
+            def = &s;
+            break;
+        }
+    }
+    if (!def)
+        return std::unexpected("unknown source: " + source);
+
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected(std::string("database not open"));
+
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::string e = err_msg ? err_msg : "unknown";
+        sqlite3_free(err_msg);
+        return std::unexpected("BEGIN failed: " + e);
+    }
+
+    int total = 0;
+    for (const auto& g : def->granularities) {
+        const std::string table = std::string(def->name) + "_" + std::string(g.suffix);
+        const std::string sql = "DELETE FROM " + table;
+        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+            std::string e = err_msg ? err_msg : "unknown";
+            sqlite3_free(err_msg);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return std::unexpected("purge failed on " + table + ": " + e);
+        }
+        // Safe under mu_: it serialises every access to db_, so no concurrent
+        // step() can race this changes() read (the #1033 hazard needs a shared,
+        // concurrently-used handle). O(1) vs stepping RETURNING rows on a bulk
+        // delete.
+        total += sqlite3_changes(db_);
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::string e = err_msg ? err_msg : "unknown";
+        sqlite3_free(err_msg);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return std::unexpected("COMMIT failed: " + e);
+    }
+
+    // Forensic-erasure completion: secure_delete=ON (open path) zeroes the
+    // deleted rows in the MAIN-db pages, but under journal_mode=WAL the pre-delete
+    // page images (still bearing the purged data) linger in the -wal file until a
+    // checkpoint truncates it. For a "permanent / cannot be undone" purge that is
+    // a real residue window — and the operator often purges to reclaim disk, which
+    // a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint here so
+    // the erasure is complete and the WAL is reclaimed at return. Best-effort: the
+    // DELETE already committed, so a checkpoint that can't fully complete (e.g. a
+    // lingering reader) is logged, not fatal — the residue clears at the next one.
+    if (int wrc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr,
+                                            nullptr);
+        wrc != SQLITE_OK) {
+        spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) returned {} — purged data may "
+                     "persist in the WAL until the next checkpoint",
+                     source, wrc);
+    }
+    return total;
+}
+
 // ── Typed inserts ───────────────────────────────────────────────────────────
 
 bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events) {
