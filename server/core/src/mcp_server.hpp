@@ -15,6 +15,7 @@
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "policy_store.hpp"
+#include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "schedule_engine.hpp"
@@ -55,6 +56,13 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using AgentsJsonFn = std::function<nlohmann::json()>;
+
+    /// Push a structured tag change to the agent (mirrors RestApiV1::TagPushFn).
+    /// Fired by the `set_tag` write tool (#289 / D4) after a successful tag
+    /// write so a category change (role/environment/location/service) reaches
+    /// the endpoint exactly as the REST PUT /api/v1/tags path does. Unset (`= {}`)
+    /// is a no-op (test harness / RBAC-off).
+    using TagPushFn = std::function<void(const std::string& agent_id, const std::string& key)>;
 
     /// Per-agent response-scope predicate (#1550 HIGH-1 / #1634). Returns true iff
     /// the principal `username` may read responses for `agent_id`. Production wires
@@ -166,7 +174,9 @@ public:
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             InventoryScopeFn inventory_scope_fn = {},
                             yuzu::MetricsRegistry* metrics = nullptr,
-                            AppPerfProviders app_perf_providers = {});
+                            AppPerfProviders app_perf_providers = {},
+                            QuarantineStore* quarantine_store = nullptr,
+                            TagPushFn tag_push_fn = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -186,7 +196,9 @@ public:
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          InventoryScopeFn inventory_scope_fn = {},
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {});
+                         AppPerfProviders app_perf_providers = {},
+                         QuarantineStore* quarantine_store = nullptr,
+                         TagPushFn tag_push_fn = {});
 };
 
 } // namespace yuzu::server::mcp

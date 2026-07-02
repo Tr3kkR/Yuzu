@@ -10129,7 +10129,24 @@ private:
                 &metrics_,
                 // DEX app-perf-over-time read providers (slice 2) — same bundle the
                 // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers);
+                app_perf_providers,
+                // #289 / Issue 13.5: the quarantine store backs the
+                // quarantine_device write tool (record + real isolate), and the
+                // tag-push closure fires the agent tag-push after set_tag exactly
+                // like the REST PUT /api/v1/tags path (D4). Same closure body as
+                // the REST registration above.
+                quarantine_store_.get(),
+                [this](const std::string& agent_id, const std::string& key) {
+                    std::string lower_key = key;
+                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    for (auto cat_key : kCategoryKeys) {
+                        if (cat_key == lower_key) {
+                            push_asset_tags_to_agent(agent_id);
+                            break;
+                        }
+                    }
+                });
         }
 
         // -- Listen -----------------------------------------------------------
