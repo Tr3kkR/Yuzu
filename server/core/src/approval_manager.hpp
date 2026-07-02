@@ -21,6 +21,11 @@ struct Approval {
     int64_t reviewed_at{0};
     std::string review_comment;
     std::string scope_expression;
+    // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
+    // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
+    // 0 while unconsumed. Additive column (migration v2) — keeps the eventual
+    // Postgres port trivial.
+    int64_t consumed_at{0};
 };
 
 struct ApprovalQuery {
@@ -44,11 +49,13 @@ public:
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
-    /// Single-approval lookup by id (read-only). Backs the versioned
-    /// GET /api/v1/approvals/{id} status_url target — query() cannot serve it
-    /// (its LIMIT 100 would false-404 an id that has aged past the top window).
-    /// Returns std::nullopt when no row matches. Does NOT touch the approval
-    /// lifecycle (submit/approve/reject/consumption are elsewhere).
+    /// Single-approval lookup by id (read-only). Two callers: the versioned
+    /// GET /api/v1/approvals/{id} status_url target (query()'s LIMIT 100 would
+    /// false-404 an id that has aged past the top window), and the MCP
+    /// approval-ticket recall path (#289), which reads
+    /// status/definition_id/scope_expression/consumed_at to validate a ticket
+    /// before consuming it. Returns std::nullopt when no row matches; does NOT
+    /// touch the lifecycle (submit/approve/reject/consume are elsewhere).
     std::optional<Approval> get(const std::string& id) const;
 
     int pending_count() const;
@@ -58,6 +65,17 @@ public:
 
     std::expected<void, std::string> reject(const std::string& id, const std::string& reviewer,
                                             const std::string& comment);
+
+    /// Atomically consume an APPROVED, not-yet-consumed approval as a one-time
+    /// MCP ticket (#289). Returns ok() iff THIS call transitioned consumed_at
+    /// 0→now — the CAS (`WHERE status='approved' AND consumed_at=0 RETURNING 1`)
+    /// carries the match signal in the step return code, so there is no
+    /// `sqlite3_changes()` race on the shared FULLMUTEX connection (#1033). A
+    /// replay of an already-consumed ticket, or an absent/non-approved id,
+    /// returns unexpected. The caller validates definition_id + args BEFORE
+    /// calling; this method guards the double-consume (concurrent-recall) race so
+    /// a mutating tool executes at most once per ticket.
+    std::expected<void, std::string> consume_ticket(const std::string& id);
 
 private:
     std::expected<void, std::string> set_review_status(const std::string& id,

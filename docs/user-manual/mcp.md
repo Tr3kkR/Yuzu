@@ -289,20 +289,40 @@ for the tool to execute.
 | 39 | `get_dex_app_perf` | Fleet CPU/working-set trend for one application, by version, over the retained window. Mirrors `GET /api/v1/dex/perf/app`. | `GuaranteedState:Read` |
 | 40 | `get_dex_group_app_perf` | One management group's app-performance trend (sub-floor-suppressed below 10 devices). Mirrors `GET /api/v1/dex/perf/group`. | `GuaranteedState:Read` |
 | 41 | `compare_app_perf_versions` | Cohort-paired **before/after** comparison (the `/auto` VERIFY stage): did upgrading `app` from `baseline` to `candidate` change how the same machines in `group` perform? Per-machine paired delta, aggregated; EVIDENTIAL (no verdict). Identity-free aggregate; carries `truncated`/`small_cohort`/`insufficient` honesty flags. Recorded under the generic `mcp.compare_app_perf_versions` tool-call audit (subject in detail); `audit_persisted:false` in the body on a dropped row. Mirrors `GET /api/v1/dex/perf/compare`. | `GuaranteedState:Read` |
+| 42 | `set_tag` | Set a device tag (structured category or free-form) on `agent_id`. Structured-category keys (`role`/`environment`/`location`/`service`) are case-normalised and validated against their allowed set; a category change fires the agent tag-push. Returns `{set, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row). Mirrors `PUT /api/v1/tags`. Requires the **operator** or **supervised** tier. | `Tag:Write` |
+| 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"). Mirrors `DELETE /api/v1/tags/{agent_id}/{key}`. | `Tag:Delete` |
+| 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed. Returns `{approved, approval_id}`. Mirrors `POST /api/approvals/{id}/approve`. Requires the **supervised** tier. | `Approval:Approve` |
+| 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}`. Mirrors `POST /api/approvals/{id}/reject`. Requires the **supervised** tier. | `Approval:Approve` |
+| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists). Not an executions-drawer producer. | `Security:Execute` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
-> tiers are blocked, and `supervised` routes it through the approval workflow
-> (not yet re-dispatchable from MCP; use the REST API / dashboard CA panel for the
-> actual revoke until the approval re-dispatch path is built). `list_issued_certs`
-> is read-only (`Security:Read`) and works on **every** tier including `readonly`
-> (the `readonly` tier permits all Read operations). Exposing both keeps MCP at
-> parity with the dashboard/REST CA surface (agentic-first principle A1).
+> tiers are blocked, and `supervised` routes it through the **ticket-then-recall
+> approval flow** (#289): the first call returns `kApprovalRequired` with
+> `approval_id` + `status_url`, and after an admin approves, a re-call with the
+> `approval_id` argument performs the revoke. `list_issued_certs` is read-only
+> (`Security:Read`) and works on **every** tier including `readonly` (the
+> `readonly` tier permits all Read operations). Exposing both keeps MCP at parity
+> with the dashboard/REST CA surface (agentic-first principle A1).
+
+> **Approval-gated tools — ticket-then-recall (#289):** `delete_tag` (operator +
+> supervised), `quarantine_device` (supervised), and every destructive op on the
+> supervised tier (`execute_instruction`, `execute_bundle`, `revoke_certificate`)
+> return `kApprovalRequired` (-32006) on the first call, carrying `error.data`
+> with `approval_id` and `status_url` (`/api/v1/approvals/{id}`). Flow: (1) call
+> the tool → get a ticket; (2) an admin approves the `approval_id` (Settings UI /
+> `POST /api/approvals/{id}/approve` — reviewer ≠ submitter, so an agentic worker
+> cannot approve its own request); (3) re-call the **same tool with the same
+> arguments** plus the `approval_id` → the server validates + atomically consumes
+> the ticket (one-time; a replay or a mismatched tool/args returns
+> `kPermissionDenied` -32003) and executes. A recall against a still-pending
+> ticket returns the same `kApprovalRequired` envelope (keep polling
+> `status_url`).
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.
 > - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
-> - `supervised` tier: not yet implemented (returns an error). Use the REST API or dashboard for supervised-tier execution until the approval re-dispatch path is built.
+> - `supervised` tier: **approval-gated via the ticket-then-recall flow** (see the note above) — the first call returns `kApprovalRequired`, and after an admin approves, a re-call with the `approval_id` argument dispatches.
 
 > **`execute_instruction` response — agentic-first bridging (#1088):**
 > The response includes BOTH `command_id` (legacy correlation token for `query_responses`) and `execution_id` (the per-run identifier required by the REST `GET /api/v1/events` SSE endpoint and the `get_execution_status` / `list_executions` MCP tools). An agentic worker that dispatches via `execute_instruction` and wants to observe progress in real time:
@@ -318,7 +338,7 @@ for the tool to execute.
 > `execute_bundle` is the **single-device** companion to `execute_instruction`. Instead of N round-trips to refresh one device, fan one instruction out into several plugin actions on that device. The server dispatches each step as an ordinary command under one `bundle-…` correlation id (the agent is unchanged — it never sees a "bundle") and returns immediately. It is **async**: a slow plugin step does not withhold the others; collate when you need the current state.
 > - **Two-call shape:** `execute_bundle` → `{bundle_id, agent_id, expected}` (HTTP 202 on the REST sibling); then poll `get_bundle_result` with that `bundle_id` until `complete` is `true`. `bundle_id` is **not** an `execution_id` — it is not a tracked execution, so don't feed it to `get_execution_status` / `/api/v1/events` (they'd 404). Each step is reported in request order with its `state` (`pending`/`responded`/`dispatch_failed`), so duplicate or same-plugin steps stay unambiguous; a step that reached no agent is `dispatch_failed` (terminal — it does not hold the bundle open).
 > - **`complete` ≠ success:** an all-offline bundle completes with `received=0`, `succeeded=0`, every step `dispatch_failed`. Check `succeeded == expected`, never `complete` alone.
-> - **Tier behavior** mirrors `execute_instruction` (`readonly` blocked; `operator` immediate; `supervised` returns the approval-not-implemented error).
+> - **Tier behavior** mirrors `execute_instruction` (`readonly` blocked; `operator` immediate; `supervised` is approval-gated via the ticket-then-recall flow — #289).
 > - **Audit:** each step emits its own `bundle.<plugin>.<action>` audit (`target_type=Agent`) — the works-council device-access lens — so a bundle is exactly as auditable as the N separate executions it replaces.
 > - **Ownership guard:** `get_bundle_result` returns the same not-found error for a bundle the caller did not dispatch (and is not admin) as for an unknown id — no enumeration oracle.
 > - **Not in the executions drawer:** bundles are caller-polled, not tracker executions. v1 bundle state is per-surface and in-memory (a bundle dispatched over MCP is collated over MCP); a durable Postgres manifest for HA + cross-surface collation is a committed follow-up (ADR-0011).
@@ -467,28 +487,34 @@ proposes.
 
 ### How it works
 
-> **Current behaviour (Phase 1).** Approval **re-dispatch** — resuming an
-> approved operation through MCP — is Phase 2 and not yet implemented. Until it
-> lands, an approval-gated MCP call is **denied** with JSON-RPC code `-32004`
-> (`TierDenied`), **not** `-32006` (`ApprovalRequired`). The A4 error contract
-> reserves `-32006` for a response that can carry a pollable `approval_id` +
-> `status_url`; with no re-dispatch path there is nothing to poll, so returning
-> `-32006` would be a contract lie. The `error.data.remediation` hint points the
-> caller at the REST API or dashboard, where the supervised-tier approval
-> workflow is fully wired. The numbered flow below describes the **Phase 2
-> target**.
+> **Current behaviour (#289 / Issue 13.5 — shipped).** Approval **re-dispatch**
+> through MCP is implemented as a **ticket-then-recall** flow: an approval-gated
+> call returns JSON-RPC code `-32006` (`ApprovalRequired`) carrying a pollable
+> `approval_id` + `status_url`, and once an admin approves it, the caller
+> re-issues the same call with the `approval_id` to execute. The `-32004`
+> (`TierDenied`) fallback now applies only to the degraded case where the server
+> has no `ApprovalManager` (a stripped deploy) and therefore cannot mint a
+> pollable ticket.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
-   instruction on the `supervised` tier).
-2. The MCP server **will** create an **approval request** with status `pending`.
-3. The server **will** return a JSON-RPC error with code `-32006`
-   (`ApprovalRequired`) carrying the approval ID and a `status_url` to poll.
-   *(Today this path returns `-32004` — see the callout above.)*
-4. The AI assistant can inform the operator that approval is needed.
+   instruction on the `supervised` tier, or `delete_tag` on `operator`).
+2. The MCP server creates an **approval request** with status `pending`
+   (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
+   canonical scope expression).
+3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
+   carrying `error.data.approval_id` and `error.data.status_url`
+   (`/api/v1/approvals/{id}`).
+4. The AI assistant informs the operator that approval is needed (and may poll
+   `status_url`).
 5. An administrator reviews the request via the dashboard or REST API
    (`GET /api/approvals`, `POST /api/approvals/{id}/approve`,
-   `POST /api/approvals/{id}/reject`).
-6. Once approved, the operation **will** be retriable.
+   `POST /api/approvals/{id}/reject`). The reviewer cannot be the submitter, so
+   an agentic worker cannot approve its own request.
+6. Once approved, the AI assistant **re-calls the same tool with the same
+   arguments plus the `approval_id`**. The server validates (approved, matching
+   tool + arguments, not yet consumed) and **atomically consumes** the ticket
+   (one-time — a replay, or a mismatched tool/args, returns `-32003`
+   `PermissionDenied`), then executes.
 
 ### What requires approval
 
@@ -649,40 +675,53 @@ example, a `readonly` token attempting to execute an instruction.
 **Fix**: Create a new token with a higher tier (`operator` or `supervised`),
 or use a different tool that is within the current tier's permissions.
 
-### -32004: Tier denied (including approval-gated operations)
+### -32004: Tier denied
 
 **Symptom**: A tool call returns error code `-32004` with an `error.data` object
 carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 
-**Cause**: Either the token's MCP tier does not permit the requested operation,
-or — for a `supervised`-tier token on a destructive operation — the operation is
-approval-gated and Phase 2 re-dispatch is not yet implemented. The A4 contract
-reserves `-32006` (`ApprovalRequired`) for a response that can carry a pollable
-`approval_id` + `status_url`; until that is wired, the denial is returned as
-`-32004` with a remediation hint instead. (`operator`-tier executions are
+**Cause**: The token's MCP tier does not permit the requested operation (e.g. a
+`readonly` token attempting a write). It is also the **degraded** response for an
+approval-gated operation when the server has no `ApprovalManager` and therefore
+cannot mint a pollable ticket (a stripped deploy); normally an approval-gated
+operation returns `-32006` (below), not `-32004`. (`operator`-tier executions are
 auto-approved and do not hit this path.)
 
-**Fix**: For a tier restriction — create a new token with a higher tier
-(`operator` or `supervised`). For an approval-gated `supervised` operation —
-perform it via the REST API or dashboard, where the approval workflow is wired.
+**Fix**: Create a new token with a higher tier (`operator` or `supervised`), or
+use a tool within the current tier's permissions.
 
-### -32006: Approval required (Phase 2 target — not yet emitted)
+### -32006: Approval required (ticket-then-recall, #289)
 
-**Symptom**: Reserved. The MCP server does **not** currently emit `-32006`;
-approval-gated operations return `-32004` (above) until approval re-dispatch
-ships (Phase 2). Documented here so client error handling can be written
-forward-compatibly.
+**Symptom**: A tool call returns error code `-32006` with an `error.data` object
+carrying `approval_id`, `status_url`, `correlation_id`, `retry_after_ms: null`,
+and a `remediation` hint.
+
+**Cause**: The operation is approval-gated (a destructive op on the `supervised`
+tier, or `delete_tag` on `operator`). The server has minted a pending approval;
+it must be approved by an admin (reviewer ≠ submitter) before the operation can
+run.
+
+**Fix**: Have an administrator approve the `approval_id` (dashboard Settings /
+`POST /api/approvals/{id}/approve`, or the MCP `approve_request` tool from a
+supervised token held by a *different* principal), then **re-call the same tool
+with the same arguments plus the `approval_id`**. A recall against a still-pending
+ticket returns `-32006` again (keep polling `status_url`); a consumed, rejected,
+expired, or mismatched ticket returns `-32003` (below).
 
 ### -32003: Permission denied (RBAC)
 
 **Symptom**: A tool call returns error code `-32003`.
 
-**Cause**: The token passes the MCP tier check but fails the RBAC permission
-check. The user who created the token does not have the required RBAC
-permission for the securable type.
+**Cause**: Either the token passes the MCP tier check but fails the RBAC
+permission check (the token creator lacks the required RBAC permission for the
+securable type), **or** an approval-ticket recall supplied an `approval_id` that
+is no longer usable — already consumed (one-time ticket / replay), rejected,
+expired, or for a different tool/arguments than the current call (#289).
 
-**Fix**: Grant the appropriate RBAC permission to the token creator's
-principal, or create a new token from an account with the required permissions.
+**Fix**: For an RBAC denial — grant the permission to the token creator's
+principal, or use an account with the required permissions. For a ticket recall —
+submit the call **without** `approval_id` to obtain a fresh approval ticket, then
+recall once it is approved.
 
 ### -32602: Invalid params
 
