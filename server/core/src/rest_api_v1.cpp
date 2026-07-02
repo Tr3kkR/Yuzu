@@ -511,10 +511,28 @@ const std::string& openapi_spec() {
               "message": {"type": "string", "description": "One-sentence human-readable summary."},
               "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
               "retry_after_ms": {"type": ["integer", "null"], "format": "int64", "description": "Always present in an A4 error body; null unless the condition is retryable, in which case it advises the worker to back off this many milliseconds before retrying (e.g. 503 warmup)."},
-              "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
+              "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."},
+              "permission": {"type": "string", "description": "kPermissionDenied specialisation (§A4): on a 403 permission denial, the missing grant as `<securable_type>:<operation>` (e.g. Tag:Write). Absent when the denial is not permission-specific (e.g. a whole-route admin gate)."},
+              "approval_id": {"type": "string", "description": "kApprovalRequired specialisation (§A4): the id of the approval a worker must poll instead of re-issuing the request. Present only once approval re-dispatch ships (Phase 2)."},
+              "status_url": {"type": "string", "description": "kApprovalRequired specialisation (§A4): the GET /api/v1/approvals/{id} URL to poll for approval_id's status. Paired with approval_id."}
             }
           },
           "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}
+        }
+      },
+      "Approval": {
+        "type": "object",
+        "description": "A queued instruction-approval request. Returned by GET /api/v1/approvals/{id} (the A4 status_url target).",
+        "properties": {
+          "id": {"type": "string"},
+          "definition_id": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "approved", "rejected", "expired"]},
+          "submitted_by": {"type": "string"},
+          "submitted_at": {"type": "integer", "format": "int64", "description": "Unix epoch seconds."},
+          "reviewed_by": {"type": "string", "description": "Empty until reviewed."},
+          "reviewed_at": {"type": "integer", "format": "int64", "description": "Unix epoch seconds; 0 until reviewed."},
+          "review_comment": {"type": "string"},
+          "scope_expression": {"type": "string"}
         }
       }
     }
@@ -713,6 +731,11 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}": {
       "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
+        R"json(,
+    "/approvals/{id}": {
+      "get": {"summary": "Fetch a single approval by id", "tags": ["Approvals"], "description": "The versioned single-approval status endpoint, and the target of an A4 error envelope's status_url (the kApprovalRequired specialisation): a worker told its request needs approval polls this for the current status rather than re-issuing the gated request. Read-only — it never mutates the approval lifecycle (submit/approve/reject live on the legacy /api/approvals/* routes). Requires Approval:Read. 404 (A4 envelope) when no approval matches the id. Response always includes X-Correlation-Id.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Approval object", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/Approval"}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "404": {"description": "Approval not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Approval store not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
@@ -3614,6 +3637,61 @@ void RestApiV1::register_routes(
                             .add("parent_id", e.parent_id)
                             .add("rerun_of", e.rerun_of)
                             .add("last_error_detail", e.last_error_detail)
+                            .str();
+            res.set_content(ok_json(data), "application/json");
+        });
+
+    // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──
+    //
+    // The versioned single-fetch approval endpoint. This is the `status_url`
+    // target an approval-required A4 envelope points at (the kApprovalRequired
+    // specialisation): a worker that is told "your request needs approval
+    // approval_id=X, poll status_url" GETs this to learn the current status
+    // rather than re-issuing the gated request. READ-ONLY — it never touches
+    // the approval lifecycle (submit/approve/reject live on the legacy
+    // /api/approvals/* routes). Gated on Approval:Read (parity with the
+    // legacy GET /api/approvals list). 404 is A4-shaped. Uses the store's
+    // single-fetch get() (NOT query()+filter, whose LIMIT 100 would false-404
+    // an aged id).
+    sink.Get(
+        R"(/api/v1/approvals/([A-Za-z0-9_-]{1,128}))",
+        [auth_fn, perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+            const auto id = req.matches[1].str();
+            auto approval = approval_manager->get(id);
+            if (!approval) {
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "approval not found", cid),
+                                "application/json");
+                return;
+            }
+            const auto& a = *approval;
+            auto data = JObj()
+                            .add("id", a.id)
+                            .add("definition_id", a.definition_id)
+                            .add("status", a.status)
+                            .add("submitted_by", a.submitted_by)
+                            .add("submitted_at", static_cast<int64_t>(a.submitted_at))
+                            .add("reviewed_by", a.reviewed_by)
+                            .add("reviewed_at", static_cast<int64_t>(a.reviewed_at))
+                            .add("review_comment", a.review_comment)
+                            .add("scope_expression", a.scope_expression)
                             .str();
             res.set_content(ok_json(data), "application/json");
         });

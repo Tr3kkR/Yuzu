@@ -201,6 +201,34 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
 }
 
 // ---------------------------------------------------------------------------
+// Single lookup by id (read-only status_url target)
+// ---------------------------------------------------------------------------
+
+std::optional<Approval> ApprovalManager::get(const std::string& id) const {
+    if (!db_ || id.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(mtx_);
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT id, definition_id, status, submitted_by, submitted_at, "
+                           "reviewed_by, reviewed_at, review_comment, scope_expression "
+                           "FROM approvals WHERE id = ?",
+                           -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<Approval> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        result = row_to_approval(stmt);
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Pending count
 // ---------------------------------------------------------------------------
 
