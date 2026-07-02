@@ -446,3 +446,56 @@ TEST_CASE("AuthRoutes::require_auth — oversized X-Yuzu-Token is rejected (DoS 
     CHECK_FALSE(session.has_value());
     CHECK(res.status == 401);
 }
+
+// ---------------------------------------------------------------------------
+// AuthRoutes::url_decode — malformed percent-sequence safety (H-A)
+//
+// Prior to this fix, AuthRoutes::url_decode called std::stoul on any two
+// characters that followed a '%', throwing std::invalid_argument for non-hex
+// sequences such as "%GH" or a bare "%" and causing a 500 on form-encoded
+// POST handlers (login, MFA, SAML ACS).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::url_decode — valid percent-encoded sequences decode correctly",
+          "[auth_routes][url_decode]") {
+    CHECK(AuthRoutes::url_decode("hello%20world") == "hello world");
+    CHECK(AuthRoutes::url_decode("%26")            == "&");
+    CHECK(AuthRoutes::url_decode("%3D")            == "=");
+    CHECK(AuthRoutes::url_decode("%41")            == "A"); // 0x41 = 'A'
+    CHECK(AuthRoutes::url_decode("key%3Dvalue")    == "key=value");
+}
+
+TEST_CASE("AuthRoutes::url_decode — plus sign decoded to space", "[auth_routes][url_decode]") {
+    CHECK(AuthRoutes::url_decode("hello+world") == "hello world");
+}
+
+TEST_CASE("AuthRoutes::url_decode — bare percent passed through literally (H-A)",
+          "[auth_routes][url_decode]") {
+    // A bare '%' at end of string — no two chars follow → emit literally.
+    CHECK(AuthRoutes::url_decode("%")        == "%");
+    CHECK(AuthRoutes::url_decode("test%")    == "test%");
+}
+
+TEST_CASE("AuthRoutes::url_decode — single hex digit after percent passed through (H-A)",
+          "[auth_routes][url_decode]") {
+    // '%' followed by exactly one char (truncated) → emit literally.
+    CHECK(AuthRoutes::url_decode("%2")       == "%2");
+    CHECK(AuthRoutes::url_decode("abc%2")    == "abc%2");
+}
+
+TEST_CASE("AuthRoutes::url_decode — non-hex chars after percent passed through (H-A)",
+          "[auth_routes][url_decode]") {
+    // '%GH' — 'G' is not a hex digit in the first nibble → emit '%' literally.
+    CHECK(AuthRoutes::url_decode("%GH")      == "%GH");
+    // '%1G' — second nibble non-hex.
+    CHECK(AuthRoutes::url_decode("%1G")      == "%1G");
+    // Mid-string malformed, rest is plain text.
+    CHECK(AuthRoutes::url_decode("a%GHb")    == "a%GHb");
+}
+
+TEST_CASE("AuthRoutes::url_decode — mixed valid and malformed sequences (H-A)",
+          "[auth_routes][url_decode]") {
+    // The malformed '%GH' is passed through; the valid '%41' decodes to 'A'.
+    CHECK(AuthRoutes::url_decode("%GH%41")   == "%GHA");
+    CHECK(AuthRoutes::url_decode("ok%41")    == "okA");
+}

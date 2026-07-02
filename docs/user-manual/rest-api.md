@@ -5410,6 +5410,14 @@ Begin the OIDC SSO login flow. Redirects to the configured identity provider.
 
 OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
 
+#### `GET /auth/saml/start`
+
+Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and redirects the browser to the configured IdP via HTTP-Redirect binding. Available only when all five `--saml-*` flags are set and the server is running on Linux or macOS.
+
+#### `POST /saml/acs`
+
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+
 ---
 
 ## Health

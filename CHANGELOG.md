@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SAML 2.0 SP — thin first slice.** SP-initiated login against a single, statically-pinned IdP.
+  HTTP-Redirect binding for the `AuthnRequest`; HTTP-POST binding at the Assertion Consumer Service
+  (`POST /saml/acs`). Assertion signature is validated against the pinned IdP cert (in-document
+  `<KeyInfo>` ignored); XML signature-wrapping attacks are defended; audience, recipient, and
+  expiry are validated; `InResponseTo` is solicited-only and single-use (replay-protected). Sessions
+  are ephemeral (`auth_source="saml"`, `role=user`). **Linux and macOS only** — Windows fails closed
+  at startup. Five new flags / env vars: `--saml-idp-entity-id` (`YUZU_SAML_IDP_ENTITY_ID`),
+  `--saml-idp-sso-url` (`YUZU_SAML_IDP_SSO_URL`), `--saml-idp-cert` (`YUZU_SAML_IDP_CERT`),
+  `--saml-sp-entity-id` (`YUZU_SAML_SP_ENTITY_ID`), `--saml-sp-acs-url` (`YUZU_SAML_SP_ACS_URL`).
+  Audit: `auth.saml_login` (result=ok) / `auth.saml_login_failed` (result=error). Partially closes
+  `/auth-and-authz` gap-matrix P1 #6. Fast-follow work (observability, proxy-TLS/HA, IdP metadata,
+  group→role mapping, AuthnRequest signing, hardening) is tracked in #1789. See
+  `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
+  and the security review `docs/security-reviews/saml-sp-2026-07-01.md`.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

@@ -156,6 +156,17 @@ struct Config {
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
 
+    // SAML 2.0 SSO
+    // Enabled when idp_sso_url + idp_cert + sp_entity_id + sp_acs_url are all non-empty
+    // (mirrors OIDC's "gated on issuer && client_id" pattern).
+    // Not supported on Windows builds — is_enabled() returns false (N4), and a startup
+    // ERROR is logged if any flag is set.
+    std::string saml_idp_entity_id; // IdP entityID (must match Issuer in assertions)
+    std::string saml_idp_sso_url;   // IdP SSO URL (HTTP-Redirect binding endpoint)
+    std::string saml_idp_cert;      // Filesystem path to IdP signing cert PEM (pinned key)
+    std::string saml_sp_entity_id;  // SP entityID (used as AudienceRestriction)
+    std::string saml_sp_acs_url;    // SP Assertion Consumer Service URL (POST binding)
+
     // Response persistence
     int response_retention_days{90};
 

@@ -17,13 +17,14 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 9. [RBAC Management](#rbac-management)
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
-12. [Data Storage and Encryption](#data-storage-and-encryption)
-13. [PostgreSQL Substrate](#postgresql-substrate)
-14. [Retention Settings](#retention-settings)
-15. [Settings API Reference](#settings-api-reference)
-16. [Deployment](#deployment)
-17. [Windows Service Installation](#windows-service-installation)
-18. [Planned Features](#planned-features)
+12. [SAML 2.0 SP Configuration](#saml-20-sp-configuration)
+13. [Data Storage and Encryption](#data-storage-and-encryption)
+14. [PostgreSQL Substrate](#postgresql-substrate)
+15. [Retention Settings](#retention-settings)
+16. [Settings API Reference](#settings-api-reference)
+17. [Deployment](#deployment)
+18. [Windows Service Installation](#windows-service-installation)
+19. [Planned Features](#planned-features)
 
 ---
 
@@ -60,12 +61,17 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
 | `--csp-extra-sources` | *(none)* | Extra Content-Security-Policy source-list entries appended to `script-src`, `style-src`, `connect-src`, and `img-src`. Space-separated string of host/scheme expressions or whitelisted CSP keywords (`'self'`, `'none'`, `'sha256-...'`, `'sha384-...'`, `'sha512-...'`, `'nonce-...'`). The server **refuses to start** if the value contains control bytes, semicolons, commas, or unsafe CSP keywords like `'unsafe-eval'`. Use to whitelist customer CDNs, monitoring beacons, or analytics endpoints. See [HTTP Security Response Headers](security-hardening.md#http-security-response-headers). Env: `YUZU_CSP_EXTRA_SOURCES`. |
-| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). |
-| `--oidc-client-id` | *(none)* | OIDC application (client) ID. |
-| `--oidc-client-secret` | *(none)* | OIDC client secret. |
-| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. |
-| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. |
+| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
+| `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
+| `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
+| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
+| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
+| `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
+| `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
+| `--saml-sp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI this SP advertises to the IdP in the AuthnRequest. Env: `YUZU_SAML_SP_ENTITY_ID`. |
+| `--saml-sp-acs-url` | *(none)* | **SAML 2.0 SP.** Full public URL of the Assertion Consumer Service (`https://<host>/saml/acs`). The IdP must be configured to POST the response to this URL. Env: `YUZU_SAML_SP_ACS_URL`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
@@ -792,6 +798,53 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 ### User Mapping
 
 OIDC-authenticated users are mapped to Yuzu roles based on claims or group membership. The mapping configuration depends on your identity provider and is set in the OIDC section of the Settings page.
+
+---
+
+## SAML 2.0 SP Configuration
+
+Yuzu supports SAML 2.0 SP-initiated single sign-on as an alternative to OIDC for enterprises whose identity infrastructure requires SAML. **Linux and macOS only — SAML is not supported on Windows builds.**
+
+> **HTTPS is required.** The `__Host-yuzu_saml_bind` binding cookie is `Secure`-only and is silently dropped by browsers over plain HTTP. If `--https-cert`/`--https-key` are not configured the server logs an error at startup and leaves SAML disabled (fail-closed).
+
+> **Windows note:** On Windows builds, any SAML flag is logged as an error at startup and SAML is not enabled.
+
+### Configuration
+
+All five flags must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set.
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (must match what the IdP uses in assertions). |
+| `--saml-idp-sso-url` | `YUZU_SAML_IDP_SSO_URL` | IdP's HTTP-Redirect SSO endpoint URL. |
+| `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Filesystem path to the IdP's assertion-signing certificate (PEM). The cert at this path is the sole trusted authority; in-document `<KeyInfo>` values are ignored. |
+| `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP in the AuthnRequest. |
+| `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full public URL of the Assertion Consumer Service (`https://<host>/saml/acs`). |
+
+Example startup:
+
+```bash
+./yuzu-server \
+  --https-cert         /etc/yuzu/server.crt \
+  --https-key          /etc/yuzu/server.key \
+  --saml-idp-entity-id "https://idp.example.com/saml" \
+  --saml-idp-sso-url   "https://idp.example.com/saml/sso" \
+  --saml-idp-cert      /etc/yuzu/idp-signing.pem \
+  --saml-sp-entity-id  "https://yuzu.example.com" \
+  --saml-sp-acs-url    "https://yuzu.example.com/saml/acs"
+```
+
+### Known limitations in this release
+
+- **Role:** All SAML users are permanently `role=user`. JIT elevation is non-functional for SAML users (no local `users` row in auth.db). For admin access, use OIDC or a local account.
+- **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
+- **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
+- **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
+- **AuthnRequest signing:** The SP does not sign AuthnRequests. The IdP must accept unsigned requests. If your IdP requires signed AuthnRequests, use OIDC.
+- **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
+- **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
+
+See `docs/user-manual/authentication.md` "SAML 2.0 SSO" for the full login flow, capability table, and `docs/auth-architecture.md` "SAML 2.0 SP" for the implementation reference.
 
 ---
 

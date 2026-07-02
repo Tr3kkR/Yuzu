@@ -30,7 +30,13 @@
     {
       "name": "catch2",
       "platform": "x64 | arm64"
-    }
+    },
+    {
+      "name": "libxml2",
+      "default-features": false
+    },
+    "xmlsec",
+    "zlib"
   ],
   "overrides": []
 }

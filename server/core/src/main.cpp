@@ -502,6 +502,23 @@ int main(int argc, char* argv[]) {
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
 
+    // SAML 2.0 SSO options (not supported on Windows — fail-closed)
+    app.add_option("--saml-idp-entity-id", cfg.saml_idp_entity_id,
+                   "SAML IdP entityID (must match Issuer element in assertions)")
+        ->envname("YUZU_SAML_IDP_ENTITY_ID");
+    app.add_option("--saml-idp-sso-url", cfg.saml_idp_sso_url,
+                   "SAML IdP SSO URL (HTTP-Redirect binding endpoint)")
+        ->envname("YUZU_SAML_IDP_SSO_URL");
+    app.add_option("--saml-idp-cert", cfg.saml_idp_cert,
+                   "Filesystem path to IdP signing certificate PEM (pinned key)")
+        ->envname("YUZU_SAML_IDP_CERT");
+    app.add_option("--saml-sp-entity-id", cfg.saml_sp_entity_id,
+                   "SAML SP entityID (used as AudienceRestriction in assertions)")
+        ->envname("YUZU_SAML_SP_ENTITY_ID");
+    app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
+                   "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
+        ->envname("YUZU_SAML_SP_ACS_URL");
+
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
                    "Response retention period in days (default: 90)")
