@@ -22,12 +22,15 @@
 #include "audit_store.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
+#include <yuzu/metrics.hpp>
 
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <filesystem>
@@ -70,6 +73,7 @@ namespace {
 struct SamlRoutesFixture {
     yuzu::test::TempDir tmp;
     Config                                  cfg{};
+    yuzu::MetricsRegistry                   metrics; // wired so yuzu_auth_saml_login_total fires
     auth::AuthManager                       auth_mgr{};
     std::unique_ptr<ApiTokenStore>          api_tokens;
     std::unique_ptr<AuditStore>             audit_store;
@@ -84,6 +88,7 @@ struct SamlRoutesFixture {
         // Create it before opening any SQLite stores (mirrors the JIT-elevation
         // fixture's comma-operator trick, but explicit is clearer here).
         fs::create_directories(tmp.path);
+        auth_mgr.set_metrics_registry(&metrics);
         api_tokens  = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
@@ -109,6 +114,14 @@ struct SamlRoutesFixture {
         AuditQuery q;
         q.limit = static_cast<int>(limit);
         return audit_store->query(q);
+    }
+
+    /// Read a metric counter value. The label set must match the production
+    /// emission exactly, or counter(name, labels) returns a fresh 0-valued
+    /// series (mirrors the HardenedHarness helper in test_auth_routes_hardened.cpp).
+    double counter(const std::string& name, const yuzu::Labels& labels = {}) {
+        return labels.empty() ? metrics.counter(name).value()
+                              : metrics.counter(name, labels).value();
     }
 };
 
@@ -549,6 +562,37 @@ static std::string extract_authn_request_id(const std::string& url) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// AuthRoutes::extract_form_value — field-name boundary check (review LOW)
+//
+// body.find(key + "=") with no boundary check would let a field name that
+// merely ENDS in the target key shadow the genuine field, e.g. an
+// attacker-supplied "fooSAMLResponse=attacker" preceding the real
+// "SAMLResponse=real". A match is only valid at the start of the body or
+// immediately after an '&' separator.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("extract_form_value — shadow field name does not shadow the real field",
+          "[saml][auth_routes]") {
+    CHECK(AuthRoutes::extract_form_value(
+              "fooSAMLResponse=attacker&SAMLResponse=real", "SAMLResponse") == "real");
+}
+
+TEST_CASE("extract_form_value — leading field still matches", "[saml][auth_routes]") {
+    CHECK(AuthRoutes::extract_form_value(
+              "SAMLResponse=real&RelayState=%2F", "SAMLResponse") == "real");
+}
+
+TEST_CASE("extract_form_value — field after a genuine '&' boundary still matches",
+          "[saml][auth_routes]") {
+    CHECK(AuthRoutes::extract_form_value(
+              "RelayState=%2F&SAMLResponse=real", "SAMLResponse") == "real");
+}
+
+TEST_CASE("extract_form_value — key absent returns empty", "[saml][auth_routes]") {
+    CHECK(AuthRoutes::extract_form_value("RelayState=%2F", "SAMLResponse").empty());
+}
+
+// ---------------------------------------------------------------------------
 // GET /auth/saml/start — provider not configured (null pointer)
 // ---------------------------------------------------------------------------
 
@@ -558,6 +602,21 @@ TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_route
     REQUIRE(res != nullptr);
     CHECK(res->status == 404);
     CHECK(res->body.find("SAML not configured") != std::string::npos);
+
+    // A4 envelope shape (review finding MEDIUM): error.code, error.message,
+    // error.correlation_id, meta.api_version, and the X-Correlation-Id
+    // response header must all be present and mutually consistent.
+    auto cid_header = res->get_header_value("X-Correlation-Id");
+    CHECK(!cid_header.empty());
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(!body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == 404);
+    CHECK(body["error"]["message"] == "SAML not configured");
+    REQUIRE(body["error"].contains("correlation_id"));
+    CHECK(body["error"]["correlation_id"].get<std::string>() == cid_header);
+    REQUIRE(body.contains("meta"));
+    CHECK(body["meta"]["api_version"] == "v1");
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +631,22 @@ TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]
     REQUIRE(res != nullptr);
     CHECK(res->status == 404);
     CHECK(res->body.find("SAML not configured") != std::string::npos);
+
+    // A4 envelope shape + X-Correlation-Id header (review finding MEDIUM).
+    auto cid_header = res->get_header_value("X-Correlation-Id");
+    CHECK(!cid_header.empty());
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(!body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == 404);
+    REQUIRE(body["error"].contains("correlation_id"));
+    CHECK(body["error"]["correlation_id"].get<std::string>() == cid_header);
+    REQUIRE(body.contains("meta"));
+    CHECK(body["meta"]["api_version"] == "v1");
+
+    // Prometheus counter (review finding LOW): every ACS outcome, including
+    // the not-configured 404 early-return, increments yuzu_auth_saml_login_total.
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}}) == 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -884,6 +959,9 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().action == "auth.saml_login");
     CHECK(events.front().result == "ok");
+
+    // ── Step 9: Verify the Prometheus counter (review finding LOW) ───────────
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}}) == 1.0);
 #endif
 }
 

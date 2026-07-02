@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at startup. Five new flags / env vars: `--saml-idp-entity-id` (`YUZU_SAML_IDP_ENTITY_ID`),
   `--saml-idp-sso-url` (`YUZU_SAML_IDP_SSO_URL`), `--saml-idp-cert` (`YUZU_SAML_IDP_CERT`),
   `--saml-sp-entity-id` (`YUZU_SAML_SP_ENTITY_ID`), `--saml-sp-acs-url` (`YUZU_SAML_SP_ACS_URL`).
-  Audit: `auth.saml_login` (success) / `auth.saml_login_failed` (failure). Partially closes
+  Audit: `auth.saml_login` (result=ok) / `auth.saml_login_failed` (result=error). Partially closes
   `/auth-and-authz` gap-matrix P1 #6. Fast-follow work (observability, proxy-TLS/HA, IdP metadata,
   group→role mapping, AuthnRequest signing, hardening) is tracked in #1789. See
   `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",

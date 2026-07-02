@@ -108,6 +108,9 @@ struct SamlTestFixture {
     /// @param recipient         Recipient URL (should match sp_acs_url for happy path)
     /// @param inject_extra_assertion  If true, inserts a second unsigned Assertion (XSW test)
     /// @param signing_priv_key  Which private key to sign with (default: priv_key_pem)
+    /// @param use_sha1_algorithms  If true, the SignedInfo template requests
+    ///        rsa-sha1 / sha1 instead of rsa-sha256 / sha256 — used to prove the
+    ///        algorithm allowlist rejects a legitimately-pinned-key SHA-1 signature.
     std::string make_response(
         const std::string& request_id,
         const std::string& name_id        = "user@example.com",
@@ -115,11 +118,18 @@ struct SamlTestFixture {
         const std::string& audience       = {},
         const std::string& recipient      = {},
         bool inject_extra_assertion       = false,
-        const std::string* signing_priv_key = nullptr) const
+        const std::string* signing_priv_key = nullptr,
+        bool use_sha1_algorithms           = false) const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
         const auto& key = signing_priv_key ? *signing_priv_key : priv_key_pem;
+        const std::string sig_method_uri = use_sha1_algorithms
+            ? "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+            : "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        const std::string digest_method_uri = use_sha1_algorithms
+            ? "http://www.w3.org/2000/09/xmldsig#sha1"
+            : "http://www.w3.org/2001/04/xmlenc#sha256";
 
         // Time stamps
         auto now_epoch = static_cast<int64_t>(
@@ -157,7 +167,7 @@ struct SamlTestFixture {
                   "<ds:CanonicalizationMethod"
                     " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
                   "<ds:SignatureMethod"
-                    " Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>"
+                    " Algorithm=\"" + sig_method_uri + "\"/>"
                   "<ds:Reference URI=\"#" + assertion_id + "\">"
                     "<ds:Transforms>"
                       "<ds:Transform"
@@ -165,7 +175,7 @@ struct SamlTestFixture {
                       "<ds:Transform"
                         " Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>"
                     "</ds:Transforms>"
-                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>"
+                    "<ds:DigestMethod Algorithm=\"" + digest_method_uri + "\"/>"
                     "<ds:DigestValue/>"
                   "</ds:Reference>"
                 "</ds:SignedInfo>"
@@ -1253,6 +1263,45 @@ TEST_CASE("SAML: signed by a different cert (not pinned) is rejected", "[saml]")
     const auto& err = result.error();
     CHECK((err.find("signature") != std::string::npos ||
            err.find("verify")    != std::string::npos ||
+           err.find("failed")    != std::string::npos));
+}
+
+TEST_CASE("SAML: assertion signed with RSA-SHA1 under the correct pinned key "
+          "is rejected (algorithm downgrade)", "[saml]") {
+    const auto& f  = fixture();
+
+    // Provider is configured with the CORRECT pinned cert (key pair A) — N1's
+    // key-pinning offers no protection here, since the key is the right one.
+    // Only the algorithm allowlist can catch this.
+    auto cfg      = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Response signed with the pinned private key, but the SignedInfo
+    // template requests rsa-sha1 / sha1 instead of rsa-sha256 / sha256.
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {},
+        /*inject_extra_assertion=*/false,
+        /*signing_priv_key=*/nullptr, // the correct pinned key
+        /*use_sha1_algorithms=*/true);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE_FALSE(result.has_value());
+    // Must be rejected for the algorithm being disabled, not some other
+    // reason — xmlsec1 raises "transform disabled" (XMLSEC_ERRORS_R_TRANSFORM_DISABLED)
+    // when a SignatureMethod/DigestMethod is outside the enabledTransforms /
+    // enabledReferenceTransforms allowlist, which surfaces here as a plain
+    // signature verification failure (xmlsec cannot even construct the
+    // transform, so xmlSecDSigCtxVerify returns < 0 or a failed status).
+    const auto& err = result.error();
+    CHECK((err.find("signature") != std::string::npos ||
+           err.find("verify")    != std::string::npos ||
+           err.find("internal")  != std::string::npos ||
            err.find("failed")    != std::string::npos));
 }
 

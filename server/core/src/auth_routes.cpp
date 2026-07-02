@@ -151,13 +151,24 @@ std::string AuthRoutes::url_decode(const std::string& s) {
 
 std::string AuthRoutes::extract_form_value(const std::string& body, const std::string& key) {
     auto needle = key + "=";
-    auto pos = body.find(needle);
-    if (pos == std::string::npos)
-        return {};
-    pos += needle.size();
-    auto end = body.find('&', pos);
-    auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
-    return url_decode(raw);
+    std::size_t search_from = 0;
+    for (;;) {
+        auto pos = body.find(needle, search_from);
+        if (pos == std::string::npos)
+            return {};
+        // Boundary check: only accept a match at the very start of the body
+        // or immediately after an '&' field separator. Without this, a
+        // field name that merely ENDS in `key` (e.g. an attacker-supplied
+        // "fooSAMLResponse=attacker&SAMLResponse=real") would shadow the
+        // genuine field.
+        if (pos == 0 || body[pos - 1] == '&') {
+            pos += needle.size();
+            auto end = body.find('&', pos);
+            auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
+            return url_decode(raw);
+        }
+        search_from = pos + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,11 +1898,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // accepted (starts with '/' but NOT '//').  All other values fall back to '/'.
 
     sink.Get("/auth/saml/start", [this](const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
         if (!saml_provider_ || !saml_provider_->is_enabled()) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"SAML not configured"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
             return;
         }
 
@@ -1902,9 +1914,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto authn       = saml_provider_->build_authn_request(relay_state);
         if (authn.url.empty()) {
             res.status = 500;
-            res.set_content(
-                R"({"error":{"code":500,"message":"Failed to build SAML AuthnRequest"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
             spdlog::error("SAML /auth/saml/start: build_authn_request returned empty URL");
             return;
         }
@@ -1924,9 +1935,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     sink.Post("/saml/acs", [this](const httplib::Request& req, httplib::Response& res) {
         if (!saml_provider_ || !saml_provider_->is_enabled()) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"SAML not configured"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            res.set_content(detail::error_json_a4(404, "SAML not configured", cid),
+                            "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
             return;
         }
 
@@ -1957,6 +1972,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {{"source_ip", req.remote_addr},
                         {"error", "missing binding cookie"}}, {},
                        Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
             // Clear any stale binding cookie (belt-and-suspenders: may be absent,
             // but Max-Age=0 on a non-existent cookie is a harmless no-op per RFC 6265).
             res.set_header("Set-Cookie", kBindCookieClear);
@@ -1975,6 +1993,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             emit_event("auth.saml_login_failed", req,
                        {{"source_ip", req.remote_addr}, {"error", "oversize"}}, {},
                        Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
             return;
@@ -1989,6 +2010,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             emit_event("auth.saml_login_failed", req,
                        {{"source_ip", req.remote_addr}, {"error", "missing SAMLResponse"}}, {},
                        Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
             return;
@@ -2003,6 +2027,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             emit_event("auth.saml_login_failed", req,
                        {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
                        Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+            }
             res.set_header("Set-Cookie", kBindCookieClear);
             res.set_redirect("/login?error=saml");
             return;
@@ -2024,6 +2051,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                    {{"source_ip", req.remote_addr},
                     {"username", assertion.name_id},
                     {"auth_method", "saml"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_saml_login_total", {{"result", "ok"}}).increment();
+        }
 
         // RelayState open-redirect safety: only accept same-origin relative paths.
         // Reject:

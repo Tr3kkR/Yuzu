@@ -663,8 +663,8 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
 | `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
-| `auth.saml_login` | `success` | Successful SAML 2.0 SSO login |
-| `auth.saml_login_failed` | `failure` | Failed SAML login attempt (signature, audience, expiry, or replay validation failure) |
+| `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
+| `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 
 All `denied` results include a `detail` field explaining the reason. Examples per action:
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`

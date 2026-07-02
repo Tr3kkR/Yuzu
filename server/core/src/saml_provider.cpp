@@ -50,6 +50,7 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <xmlsec/openssl/app.h>
 #include <xmlsec/openssl/crypto.h>
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -236,6 +237,17 @@ static std::string sha256_hex(const std::string& input) {
         hex.append(buf, 2);
     }
     return hex;
+}
+
+/// Constant-time comparison of two SHA-256 hex strings. Length is compared
+/// first (not secret — both operands are always fixed-length 64-char hex
+/// digests in this file's callers), then OpenSSL's CRYPTO_memcmp compares
+/// the equal-length byte ranges without early-exit-on-mismatch, so branch
+/// timing does not leak how many leading bytes matched.
+static bool constant_time_hex_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    if (a.empty()) return true; // both empty — nothing to compare
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 /// Generate a 256-bit (32-byte) CSPRNG secret encoded as 64 lowercase hex chars.
@@ -530,14 +542,38 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         return std::unexpected("root element is not samlp:Response");
     }
 
-    // ── 4. Check Status == Success ────────────────────────────────────────────
-    const xmlNodePtr status_node = find_child_ns(root, "Status", kSamlProtocolNs);
-    if (!status_node) return std::unexpected("missing samlp:Status");
-    const xmlNodePtr status_code = find_child_ns(status_node, "StatusCode", kSamlProtocolNs);
-    if (!status_code) return std::unexpected("missing samlp:StatusCode");
-    const auto status_value = get_attr(status_code, "Value");
-    if (status_value != kSamlSuccessCode) {
-        return std::unexpected("SAML status is not Success: " + status_value);
+    // ── 4. Extract samlp:Status — a DEFERRED, advisory-only gate ─────────────
+    // samlp:Status/StatusCode live on the samlp:Response wrapper, which is
+    // NOT signature-covered: only the nested <saml:Assertion> is enveloped
+    // by the ds:Signature verified below (steps 8-11). An attacker able to
+    // tamper with the wire (or a malicious intermediary) can therefore
+    // rewrite or strip this element at will WITHOUT invalidating the
+    // assertion's signature. Because of that:
+    //   - No trusted identity data is ever read from Status — every claim
+    //     this function returns comes from the signed assertion.
+    //   - Rejecting on a bad/missing Status is deferred until AFTER the
+    //     InResponseTo single-use token (step 13) has been consumed from the
+    //     verified assertion, so an attacker cannot flip an otherwise-valid
+    //     response's Status to leave InResponseTo un-consumed (and thus
+    //     replayable later by resubmitting the untampered original).
+    //   - The real security gate for this response is the signed assertion;
+    //     Status is advisory. See the deferred check at step 13.5.
+    std::string status_reject_reason;
+    {
+        const xmlNodePtr status_node = find_child_ns(root, "Status", kSamlProtocolNs);
+        if (!status_node) {
+            status_reject_reason = "missing samlp:Status";
+        } else {
+            const xmlNodePtr status_code = find_child_ns(status_node, "StatusCode", kSamlProtocolNs);
+            if (!status_code) {
+                status_reject_reason = "missing samlp:StatusCode";
+            } else {
+                const auto status_value = get_attr(status_code, "Value");
+                if (status_value != kSamlSuccessCode) {
+                    status_reject_reason = "SAML status is not Success: " + status_value;
+                }
+            }
+        }
     }
 
     // ── 5. Collect ALL Assertions at any depth — must be exactly 1 ───────────
@@ -625,6 +661,81 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     // Restrict allowed Reference URIs to same-document fragment references (#ID).
     // This rejects detached signatures (empty URI "") and external-URI references.
     dsig_ctx->enabledReferenceUris = xmlSecTransformUriTypeSameDocument;
+
+    // ── 10.5. Algorithm allowlist — reject signature/digest downgrade ────────
+    // N1 (signKey pinning above) controls WHICH key signs; it does NOT restrict
+    // WHICH algorithm is used to sign. Without an explicit allowlist, xmlsec1's
+    // defaults accept legacy SHA-1 digests and RSA-SHA1/HMAC/DSA signatures, so
+    // an attacker who can get the pinned IdP key to (re-)sign — or who can find
+    // any SHA-1 collision/weakness — could forge or otherwise downgrade a
+    // signature that this verifier would still accept. Constrain to modern,
+    // strong algorithms only, at every layer xmlsec consults:
+    //
+    //  - SignedInfo-level (C14N method + SignatureMethod): gated via
+    //    dsigCtx->transformCtx.enabledTransforms, populated by
+    //    xmlSecDSigCtxEnableSignatureTransform(). Empty list == allow-all, so
+    //    this call MUST run before xmlSecDSigCtxVerify.
+    //  - Per-Reference (enveloped-signature transform, any Reference-level
+    //    C14N transform, and DigestMethod): gated via
+    //    dsigCtx->enabledReferenceTransforms, populated by
+    //    xmlSecDSigCtxEnableReferenceTransform(). Copied into each Reference's
+    //    own transform context at verify time.
+    //  - KeyInfo key data: gated via keyInfoReadCtx.enabledKeyData. N1 already
+    //    bypasses <ds:KeyInfo> entirely (signKey is set directly), so this is
+    //    defence-in-depth only, in case that bypass is ever weakened.
+    //
+    // RSA-SHA1, plain SHA1, MD5, HMAC-*, and DSA-* are deliberately excluded.
+    {
+        const xmlSecTransformId kAllowedSignatureTransforms[] = {
+            // Canonicalization methods (SignedInfo-level).
+            xmlSecTransformInclC14NId,
+            xmlSecTransformInclC14NWithCommentsId,
+            xmlSecTransformExclC14NId,
+            xmlSecTransformExclC14NWithCommentsId,
+            // Signature methods — RSA and ECDSA, SHA-256 and stronger only.
+            xmlSecOpenSSLTransformRsaSha256Id,
+            xmlSecOpenSSLTransformRsaSha384Id,
+            xmlSecOpenSSLTransformRsaSha512Id,
+            xmlSecOpenSSLTransformEcdsaSha256Id,
+            xmlSecOpenSSLTransformEcdsaSha384Id,
+            xmlSecOpenSSLTransformEcdsaSha512Id,
+        };
+        for (xmlSecTransformId id : kAllowedSignatureTransforms) {
+            if (xmlSecDSigCtxEnableSignatureTransform(dsig_ctx, id) < 0) {
+                return std::unexpected("failed to configure signature algorithm allowlist");
+            }
+        }
+
+        const xmlSecTransformId kAllowedReferenceTransforms[] = {
+            // Enveloped-signature transform (standard for enveloped ds:Signature).
+            xmlSecTransformEnvelopedId,
+            // Canonicalization methods, in case a Reference also specifies C14N.
+            xmlSecTransformInclC14NId,
+            xmlSecTransformInclC14NWithCommentsId,
+            xmlSecTransformExclC14NId,
+            xmlSecTransformExclC14NWithCommentsId,
+            // Digest methods — SHA-256 and stronger only.
+            xmlSecOpenSSLTransformSha256Id,
+            xmlSecOpenSSLTransformSha384Id,
+            xmlSecOpenSSLTransformSha512Id,
+        };
+        for (xmlSecTransformId id : kAllowedReferenceTransforms) {
+            if (xmlSecDSigCtxEnableReferenceTransform(dsig_ctx, id) < 0) {
+                return std::unexpected("failed to configure digest algorithm allowlist");
+            }
+        }
+
+        // Defence-in-depth: restrict KeyInfo key data to RSA/EC (no HMAC/DSA),
+        // even though N1's signKey bypass above means KeyInfo is never consulted.
+        // xmlSecKeyDataId is `const struct _xmlSecKeyDataKlass*`; xmlSecPtrListAdd
+        // takes a non-const xmlSecPtr (void*), hence the const_cast.
+        if (xmlSecPtrListAdd(&dsig_ctx->keyInfoReadCtx.enabledKeyData,
+                              const_cast<void*>(static_cast<const void*>(xmlSecOpenSSLKeyDataRsaId))) < 0 ||
+            xmlSecPtrListAdd(&dsig_ctx->keyInfoReadCtx.enabledKeyData,
+                              const_cast<void*>(static_cast<const void*>(xmlSecOpenSSLKeyDataEcId))) < 0) {
+            return std::unexpected("failed to configure key-data allowlist");
+        }
+    }
 
     if (xmlSecDSigCtxVerify(dsig_ctx, sig_node) < 0) {
         return std::unexpected("xmlSecDSigCtxVerify returned internal error");
@@ -861,7 +972,7 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         // An empty cookie_secret cannot match any real binding_hash (which is
         // SHA-256 of a 32-byte random secret and thus a non-trivial hex string).
         const auto provided_hash = sha256_hex(cookie_secret);
-        if (provided_hash != it->second.binding_hash) {
+        if (!constant_time_hex_equal(provided_hash, it->second.binding_hash)) {
             // Consume the entry to prevent an attacker from probing with
             // different cookie values (forced-login becomes a single-shot attempt).
             pending_requests_.erase(it);
@@ -875,6 +986,14 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
                 "AuthnRequest has expired: InResponseTo=" + in_response_to);
         }
         pending_requests_.erase(it); // Consume — prevents replay
+    }
+
+    // ── 13.5. Enforce the deferred Status check (see step 4) ─────────────────
+    // InResponseTo has now been consumed from the verified, signed assertion,
+    // so replay protection holds regardless of what the unsigned Status
+    // wrapper said. Only now do we act on Status.
+    if (!status_reject_reason.empty()) {
+        return std::unexpected(status_reject_reason);
     }
 
     // ── 14. Extract NameID (all reads from the verified 'assertion' node) ─────

@@ -67,7 +67,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
-| `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required for correct operation; not validated at startup — omitting it causes every ACS assertion to fail IdP audience validation at login time. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
+| `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
 | `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
 | `--saml-sp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI this SP advertises to the IdP in the AuthnRequest. Env: `YUZU_SAML_SP_ENTITY_ID`. |
@@ -811,11 +811,11 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on as an alternative to OIDC for
 
 ### Configuration
 
-All five flags must be supplied for correct operation. Four of them (`--saml-idp-sso-url`, `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`) are validated at startup — a partial set produces a startup warning and SAML is disabled. `--saml-idp-entity-id` is not currently validated at startup but is required: omitting it causes every ACS assertion to fail IdP audience validation at login time.
+All five flags must be supplied for correct operation, and all five are validated at startup — a partial set leaves SAML disabled (fail-closed) until every flag is set.
 
 | Flag | Env var | Description |
 |---|---|---|
-| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (must match what the IdP uses in assertions). Not validated at startup — required for correct operation. |
+| `--saml-idp-entity-id` | `YUZU_SAML_IDP_ENTITY_ID` | Entity ID URI of the IdP (must match what the IdP uses in assertions). |
 | `--saml-idp-sso-url` | `YUZU_SAML_IDP_SSO_URL` | IdP's HTTP-Redirect SSO endpoint URL. |
 | `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Filesystem path to the IdP's assertion-signing certificate (PEM). The cert at this path is the sole trusted authority; in-document `<KeyInfo>` values are ignored. |
 | `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP in the AuthnRequest. |
