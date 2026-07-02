@@ -2171,9 +2171,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
         // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
         // a silent admin window.
+        // duration_secs is the TRUE post-clamp window (remaining.count()), NOT the
+        // requested/capped `duration` — so the audit row, the analytics event, and
+        // the JSON response all agree on the enforced window even when the window
+        // was clamped to the session's own absolute expiry (evidence integrity,
+        // docs/auth-architecture.md:238-240).
         if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
                                      "User", session->username,
-                                     "duration_secs=" + std::to_string(duration) +
+                                     "duration_secs=" + std::to_string(remaining.count()) +
                                          " justification=" + justification +
                                          " expires_at=" + expires_at_str)) {
             auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant

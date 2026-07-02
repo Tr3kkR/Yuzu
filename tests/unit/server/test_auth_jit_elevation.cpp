@@ -432,6 +432,51 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
     CHECK(auth::effective_role(*s) == Role::admin);
 }
 
+// When the elevation window is clamped to the session's own absolute lifetime,
+// the role.elevation.granted audit detail's duration_secs MUST equal the
+// response's post-clamp expires_in — the "all three channels agree" contract
+// (docs/auth-architecture.md:238-240). Ships green without the fix only because
+// no other test forces a clamp at the REST layer.
+TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
+          "duration_secs in sync with the response expires_in",
+          "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+
+    // Shrink the cookie session to ~120s of remaining lifetime so a full-cap
+    // (3600s) elevation request is clamped to the session's own expiry.
+    h.auth_mgr.expire_session_for_test(token, std::chrono::seconds(8 * 3600 - 120));
+
+    auto res = h.post("/api/v1/elevate", token,
+                      R"({"justification":"clamp-proof","duration_secs":3600})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    int expires_in = body.value("expires_in", -1);
+    // The window WAS clamped: far below the requested/capped 3600s.
+    CHECK(expires_in > 0);
+    CHECK(expires_in <= 130);
+
+    // Parse duration_secs out of the granted audit detail
+    // ("duration_secs=<n> justification=... expires_at=...").
+    AuditQuery q;
+    q.action = "role.elevation.granted";
+    q.principal = "alice";
+    auto rows = h.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    const std::string& detail = rows.front().detail;
+    auto pos = detail.find("duration_secs=");
+    REQUIRE(pos != std::string::npos);
+    pos += std::string("duration_secs=").size();
+    auto endp = detail.find(' ', pos);
+    int audit_duration = std::stoi(detail.substr(pos, endp - pos));
+
+    INFO("audit detail: " << detail);
+    INFO("expires_in=" << expires_in << "  audit_duration=" << audit_duration);
+    // THE contract: audit row and JSON response agree on the effective window.
+    CHECK(audit_duration == expires_in);
+}
+
 TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
