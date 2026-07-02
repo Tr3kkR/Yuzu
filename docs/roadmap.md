@@ -1611,11 +1611,11 @@ macOS equivalents using Apple's Endpoint Security (ES) framework — *requires t
 *Implements the four agentic-first invariants from `docs/agentic-first-principle.md` (A1 dashboard parity, A2 discovery, A3 observability, A4 error envelope). Source: `docs/capability-agentic-audit-2026-05.md` §7 P1. Every operation a human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface.*
 
 ### Issue 17.1: Introspection Endpoints (`/api/v1/discover/*`)
-**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Done (tracker #1794)
 
-`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**.
+`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**. See `docs/agentic-first-principle.md` §A2 for the shipped shape of each endpoint.
 
-**Files:** new `server/core/src/discovery_routes.{cpp,hpp}`, `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
+**Files:** `server/core/src/discover_routes.{cpp,hpp}` (module named `discover_routes.*`/`DiscoverRoutes`, singular — the filename originally planned here, `discovery_routes.{cpp,hpp}`, was already taken by an unrelated pre-existing module: directory sync / patch management / deployment / network-discovery routes at `/api/directory/*`, `/api/patches/*`, `/api/deployments/*`, `/api/discovery/*`), `server/core/src/openapi_spec_access.hpp` (exposes `openapi_spec()` for external linkage), `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
 
 ### Issue 17.2: Dashboard JSON Content Negotiation
 **Capability:** new | **Scope:** Server (dashboard) | **Status:** Proposed
