@@ -209,15 +209,35 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   full admin), so — unlike the other step-up sites where the actor is already
   admin — an eligible operator with no enrolled second factor is refused (403,
   `role.elevation.denied`). Sets
-  `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
+  `Session::elevated_until = min(now + min(duration, --jit-max-elevation-secs), session.expires_at)`
   (default cap 1h, max 24h; an absent/0 `duration_secs` defaults to the cap, a
-  negative one is a 400, a present-but-wrong-typed field is a 400). The
-  justification is sanitised (control bytes incl. DEL → space) and capped (1 KiB)
-  into the audit detail. The `role.elevation.granted` audit is **fail-closed**:
-  if it can't persist, the elevation is rolled back (compensating
-  `revoke_elevation`) and the call 500s with `Sec-Audit-Failed` — a privileged
-  activation never stands without a record. Audits `role.elevation.granted`
-  (justification + duration); `role.elevation.denied` for an ineligible /
+  negative one is a 400, a present-but-wrong-typed field is a 400). **The window
+  is also clamped to the session's own absolute `expires_at`** (follow-up B,
+  shipped) — an elevation can never outlive the cookie session that carries it,
+  even when the requested/capped duration would otherwise extend past it.
+  **A session already AT or PAST its own `expires_at` — e.g. one that crosses
+  its absolute lifetime in the window between `validate_session` and
+  `elevate_session` — is REJECTED (401), not granted a zero-or-negative-length
+  window** (governance hardening round, UP-1/UP-4 dead-window guard): a `200
+  ok` response with `expires_in:0` would mislead a scripted caller into
+  believing it holds admin, and the lapsed window would later mint a spurious
+  `role.elevation.expired` for privilege that was never actually conferred.
+  `AuthManager::elevate_session` computes this and leaves the session
+  unmutated when it applies; the handler's existing nullopt→401 path (already
+  used for "session vanished between validate and elevate") covers it, no
+  separate branch needed. The response reports the TRUE remaining time as
+  `expires_in` (seconds, computed after any clamp — always `<=` the
+  requested/capped duration) alongside an absolute `expires_at` (RFC3339 UTC —
+  a `system_clock` projection of the `steady_clock`-tracked remaining
+  duration, since `elevated_until` itself has no wall-clock meaning
+  off-process). The justification is sanitised (control bytes incl. DEL →
+  space) and capped (1 KiB) into the audit detail. The `role.elevation.granted`
+  audit is **fail-closed**: if it can't persist, the elevation is rolled back
+  (compensating `revoke_elevation`) and the call 500s with `Sec-Audit-Failed`
+  — a privileged activation never stands without a record. Audits
+  `role.elevation.granted` (justification + the true post-clamp duration +
+  `expires_at` — kept in sync across the audit row, the JSON response, and the
+  analytics event); `role.elevation.denied` for an ineligible /
   failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
   `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
@@ -238,11 +258,36 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   gated on the OIDC `amr` MFA assertion (so an IdP-MFA'd SSO operator can elevate
   without a local TOTP) is a tracked follow-up.
 - **Step-down** — `POST /api/v1/elevate/revoke` clears the window
-  (`role.elevation.revoked`). Passive expiry on lapse is implicit from the
-  `granted` row + its `duration_secs` (no separate `role.elevation.expired` event
-  in v1 — there is no natural hook for a passive timer; a lazy/reaper-emitted
-  expiry row is a tracked follow-up). Implementation: `Session::elevated_until` +
-  `AuthManager::elevate_session`/`revoke_elevation` (auth.cpp); the three
+  (`role.elevation.revoked`). **Passive expiry on lapse is now audited too
+  (follow-up A, shipped)** — `role.elevation.expired` — but LAZILY, not via a
+  background reaper thread: there is no standing timer, so the row is emitted
+  by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
+  cookie chokepoint, on the FIRST authenticated request the operator makes
+  *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
+  that first observing call, so emission is exactly-once — a request that finds
+  the sentinel already cleared (a prior reap, or a manual
+  `revoke_elevation`/`revoke_user_elevations`, which clear to the same
+  sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort
+  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  cleared to the sentinel BEFORE the audit call, so a store failure loses only
+  the confirmatory `expired` row, never the reap itself (the session still
+  correctly reverts to base role) — and the window's end remains
+  reconstructible from the earlier, fail-closed `role.elevation.granted` row's
+  `duration_secs`/`expires_at`. **Boundary: an operator who elevates and never
+  issues another authenticated request before abandoning the session (closing
+  the browser, letting the tab idle) never triggers the lazy reap** — there is
+  no event for that lapse, only the deterministic `granted` row + its
+  `duration_secs`/`expires_at`, from which the window's end is still
+  computable for audit reconstruction. **The same boundary applies to idle
+  (inactivity) eviction** — see "Inactivity session timeout" below: if the
+  idle reaper evicts the session (erases it from `sessions_`) before the
+  operator's next request, that request never reaches `resolve_session`'s
+  cookie-found branch at all, so the lazy reap likewise never fires; the
+  window's end is, again, reconstructible from the `granted` row rather than
+  from a live `expired` event. Implementation: `Session::elevated_until` +
+  `AuthManager::elevate_session`/`revoke_elevation`/`reap_expired_elevation`
+  (auth.cpp); the three
   endpoints in `auth_routes.cpp`; `Config::jit_max_elevation_secs`.
 
 ## Hardened mode (sso-only) + break-glass (SOC 2 CC6.3/CC6.6)

@@ -5324,11 +5324,11 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/elevate"
 ```
 
-**Response (200):** `{"status":"ok","expires_in":<effective_secs>}`.
+**Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), or the session dissolved mid-request; `403` — not eligible, eligibility read failed (fail-closed), **or no MFA enrolled**; the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **or no MFA enrolled**; the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> justification=<sanitised>`) on success; `role.elevation.denied` on a `403`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> justification=<sanitised> expires_at=<RFC3339 UTC>`) on success; `role.elevation.denied` on a `403`. A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
 #### `POST /api/v1/elevate/revoke`
 

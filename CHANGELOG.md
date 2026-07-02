@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **JIT admin elevation follow-ups: passive-lapse audit + absolute `expires_at` (SOC 2
+  CC6.3/CC6.6).** Closes the two residual risks tracked in
+  `docs/security-reviews/jit-elevation-2026-06-30.md`. (A) A JIT elevation window that
+  lapses PASSIVELY (no manual `POST /api/v1/elevate/revoke`) is now audited as
+  `role.elevation.expired` — emitted LAZILY (no new background thread) by
+  `AuthManager::reap_expired_elevation`, called from the `AuthRoutes::resolve_session`
+  cookie chokepoint on the operator's first authenticated request after the window
+  elapses; exactly-once, and a manual revoke never also produces a spurious `expired`
+  row. (B) `POST /api/v1/elevate`'s window is now clamped to the session's own absolute
+  expiry (`AuthManager::elevate_session`), so an elevation can never outlive its cookie
+  session; the response reports the TRUE remaining time as `expires_in` plus a new
+  wall-clock `expires_at` (RFC3339 UTC), and the `role.elevation.granted` audit detail
+  carries `expires_at` too.
+
 - **JIT (just-in-time) admin elevation (`POST /api/v1/elevate`, SOC 2 CC6.3/CC6.6).** Reduces standing
   privilege: a pre-authorized operator (the new per-user `users.elevation_eligible` flag, auth.db
   migration v5, admin-managed via `POST /api/v1/users/<name>/elevation-eligibility`) holds a non-admin
@@ -219,6 +233,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
+
+### Changed
+
+- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
+  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
+  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
+  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
+  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
+  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
+  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
+  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
 
 ### Security
 

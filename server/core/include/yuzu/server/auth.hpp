@@ -238,13 +238,23 @@ public:
     /// as freshly MFA-verified.
     bool mark_session_mfa_verified(const std::string& token);
 
-    /// JIT admin elevation: set `elevated_until = now + duration` on the named
-    /// session, so its effective role is admin for the window (SOC 2 CC6.3/
-    /// CC6.6). The CALLER is responsible for the eligibility + MFA-step-up gates;
-    /// this only mutates the in-memory session. Returns the absolute expiry
-    /// `steady_clock::time_point` on success (so the route can report it),
-    /// nullopt if the session does not exist. `duration` is assumed already
-    /// clamped to the configured cap by the caller.
+    /// JIT admin elevation: set `elevated_until = min(now + duration,
+    /// session.expires_at)` on the named session, so its effective role is admin
+    /// for the window (SOC 2 CC6.3/CC6.6). The window is clamped to the
+    /// session's own absolute lifetime — an elevation can never outlive the
+    /// cookie session that carries it (residual-risk follow-up B, security
+    /// review 2026-06-30). The CALLER is responsible for the eligibility +
+    /// MFA-step-up gates; this only mutates the in-memory session. Returns the
+    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// (so the route can report it), nullopt if the session does not exist OR
+    /// is already at/past its own `expires_at` (a dead-window guard, governance
+    /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
+    /// between validate_session and this call is REJECTED rather than granted a
+    /// zero-or-negative-length window — the session is left unmutated, so no
+    /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
+    /// caller's nullopt→401 path already covers this. `duration` is assumed
+    /// already clamped to the configured `--jit-max-elevation-secs` cap by the
+    /// caller.
     std::optional<std::chrono::steady_clock::time_point>
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
@@ -259,6 +269,32 @@ public:
     /// session wipe on demote/delete (governance UP-1). Returns the number of
     /// sessions whose elevation was cleared.
     int revoke_user_elevations(const std::string& username);
+
+    /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
+    /// security review 2026-06-30): if `token`'s session holds an elevation
+    /// whose window has elapsed (`elevated_until` set and `now >=
+    /// elevated_until`), clears it to the sentinel and returns the session's
+    /// username so the caller can emit `role.elevation.expired`. Returns
+    /// nullopt when the session does not exist, is oversized, is not elevated,
+    /// or its elevation is still live — including when `elevated_until` is
+    /// already the sentinel (never-elevated OR already reaped OR manually
+    /// revoked via `revoke_elevation`/`revoke_user_elevations`, both of which
+    /// also clear to the sentinel — so a manual step-down never ALSO reports a
+    /// passive expiry). Clearing on the FIRST observing call makes emission
+    /// exactly-once: a second call on the same lapsed window returns nullopt.
+    /// Called from `AuthRoutes::resolve_session` (the cookie chokepoint) on
+    /// every authenticated request — there is no background reaper thread.
+    std::optional<std::string> reap_expired_elevation(const std::string& token);
+
+    /// TEST-ONLY: push `token`'s absolute `expires_at` backward by `offset`
+    /// (a positive offset moves it into the past) without sleeping. Governance
+    /// hardening round — exercises `elevate_session`'s dead-window guard
+    /// (UP-1/UP-4: a session already at/past its own lifetime must be
+    /// REJECTED, not granted a zero-or-negative-length elevation). Mirrors
+    /// `AgentRegistry::expire_trusted_gateway_for_test`. Production code MUST
+    /// NOT call this — no caller in `server/core/src/**` references it. A
+    /// no-op if `token` is not a live session.
+    void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
