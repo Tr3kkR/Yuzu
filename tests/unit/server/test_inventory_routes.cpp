@@ -272,13 +272,18 @@ struct InvHarness {
     bool allow_scoped = true;        // per-device scoped Inventory:Read
     bool degrade = false;            // make every store provider return nullopt
     bool audit_should_fail = false;  // simulate an audit-persist failure (Sec-Audit-Failed)
+    bool unwire_devices = false;     // register with an empty DevicesFn{} (unwired closure)
     std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
     std::vector<std::string> audits;          // "action|result"
     std::vector<std::string> audit_full;      // "action|result|target_type|target_id" (parity check)
+    std::vector<std::string> audit_details;   // detail strings, parallel to `audits`
 
-    InvHarness() {
+    // `unwire_devices_` must be a constructor param, not a post-construction field write —
+    // `register_routes` (below) runs once, here, so the DevicesFn choice is baked in at
+    // construction time (unlike `degrade`, which every provider lambda re-checks per-call).
+    explicit InvHarness(bool unwire_devices_ = false) : unwire_devices(unwire_devices_) {
         auto auth = [](const httplib::Request&, httplib::Response&) {
             return std::optional<auth::Session>(auth::Session{});
         };
@@ -355,13 +360,18 @@ struct InvHarness {
             return degrade ? std::nullopt : std::optional<std::int64_t>(7);
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string& tt, const std::string& tid, const std::string&) {
+                            const std::string& tt, const std::string& tid,
+                            const std::string& detail) {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
+            audit_details.push_back(detail);
             return !audit_should_fail;
         };
+        InventoryRoutes::DevicesFn devices_fn = devices;
+        if (unwire_devices)
+            devices_fn = InventoryRoutes::DevicesFn{}; // empty closure — route treats as degraded
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
-                               agent_sw, devices, scope, stale, audit, ci_fn);
+                               agent_sw, devices_fn, scope, stale, audit, ci_fn);
     }
 };
 
@@ -625,6 +635,30 @@ TEST_CASE("route: devices list — CI enrichment degrade audits failure, roster 
     }
     REQUIRE(failed);
     REQUIRE_FALSE(succeeded);
+}
+
+TEST_CASE("route: devices list — unwired DevicesFn audits failure on an empty roster",
+          "[inventory][route]") {
+    // gov Gate 3 quality-engineer finding: the route's `else result.ci_degraded = true;`
+    // branch (an unwired devices_fn_, production-unreachable but defensively handled —
+    // mirrors agent_ci_fn_/agent_sw_fn_ elsewhere in this file) had no direct coverage.
+    InvHarness h{/*unwire_devices_=*/true};
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status != 403);
+    bool failed = false, succeeded = false;
+    for (const auto& a : h.audits) {
+        failed = failed || a == "inventory.devices|failure";
+        succeeded = succeeded || a == "inventory.devices|success";
+    }
+    REQUIRE(failed);
+    REQUIRE_FALSE(succeeded);
+    // The empty-roster wording is distinct from the populated-roster degrade wording.
+    bool honest_empty_detail = false;
+    for (const auto& d : h.audit_details)
+        if (contains(d, "device roster or CI store unavailable"))
+            honest_empty_detail = true;
+    REQUIRE(honest_empty_detail);
 }
 
 TEST_CASE("route: find shell gates on Inventory:Read", "[inventory][route]") {

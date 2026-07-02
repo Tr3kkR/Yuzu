@@ -16,12 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name/version/build, architecture, first/last-synced) above the installed-software
   list. Disk capacity and owner/location are deliberately withheld (a macOS
   disk-collection fix and operator-set CMDB fields, respectively, are unbuilt
-  follow-ups). List enrichment happens after the existing management-group
-  confinement, so an out-of-scope device's CI is never attached or disclosed. New
-  audit verb `inventory.device.ci` (per-device drill) and an extended
-  `inventory.devices` (fleet list) both use the behavioural-PII audit tier, since
-  serial/system UUID/MAC are device-persistent identifiers (GDPR personal data per
-  ADR-0016).
+  follow-ups). List enrichment never attaches an out-of-scope device's CI — the join
+  only looks up agent IDs already present in the roster the route renders
+  (regression-tested); per-operator management-group confinement of that roster itself
+  is designed for, not yet verified effective (ADR-0017). New audit verb
+  `inventory.device.ci` (per-device drill) and an extended `inventory.devices` (fleet
+  list) both use the behavioural-PII audit tier, since serial/system UUID/MAC are
+  device-persistent identifiers (GDPR personal data per ADR-0016); the fleet-list verb
+  now also audits `result=failure` (not just `success`) when the CI-enrichment join
+  itself degrades, so the audit trail can't misreport a partial read as clean.
 - **Device-identity daily-sync source + CMDB store (`device_ci`, ADR-0016 source #3).**
   The agent now syncs stable hardware/OS identity to central Postgres daily, on the same
   hash-skip framework as `installed_software`. The `device_ci` source fans out to the

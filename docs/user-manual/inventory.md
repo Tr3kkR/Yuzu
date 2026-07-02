@@ -193,10 +193,11 @@ same data, with three tabs:
   offline** (joined to the live registry for the online flag), **plus a device-CI
   record** — serial, model, CPU cores/threads, and RAM — sourced from the `device_ci`
   daily-sync source (ADR-0016 source #3) via `DeviceInventoryStore`. The **list** is
-  gated on the global `Inventory:Read`, filtered to the operator's visible scope by the
-  device provider, and the roster read is audited (`inventory.devices` — the
-  behavioural-PII audit tier, because the list now carries device-persistent
-  identifiers such as serial). **Clicking a device** loads its full CI record plus
+  gated on the global `Inventory:Read`; management-group confinement of the roster is
+  **designed for, not yet verified effective** (the same inert-list-scoping class as
+  Find software, below — see ADR-0017), and the roster read is audited
+  (`inventory.devices` — the behavioural-PII audit tier, because the list now carries
+  device-persistent identifiers such as serial). **Clicking a device** loads its full CI record plus
   installed software; that per-device drill is additionally gated by the
   management-group chokepoint (`Inventory:Read` for the device's group, so an operator
   only opens a device in their scope) **and is audited** — `inventory.device.software`

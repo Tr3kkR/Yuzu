@@ -178,13 +178,21 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // because the enrichment join failed" — the roster itself is offline-
                  // survivable and never fails on a CI-store outage (see InventoryDevicesResult),
                  // so this is "failure" only for the CI-enrichment half, never a 5xx.
+                 // A degrade with an empty roster (`offline_endpoint_store_` unavailable, or
+                 // an unwired provider) is worded distinctly from a degrade with a populated
+                 // roster (the CI join specifically failed) — gov Gate 3 review: the roster
+                 // never actually goes empty this way in a healthy boot (ADR-0012 fails the
+                 // server closed on a missing offline_endpoint_store_), but the detail string
+                 // shouldn't assert "roster rendered" when it wasn't.
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "inventory.devices",
                      result.ci_degraded ? "failure" : "success", "Inventory", "fleet",
                      "devices=" + std::to_string(result.rows.size()) +
-                         (result.ci_degraded
-                              ? " (CI store degraded; roster rendered without CI columns)"
-                              : " (incl. CI columns: serial/model/cpu/ram)"));
+                         (!result.ci_degraded
+                              ? " (incl. CI columns: serial/model/cpu/ram)"
+                          : result.rows.empty()
+                              ? " (device roster or CI store unavailable)"
+                              : " (CI store degraded; roster rendered without CI columns)"));
                  send_html(res, render_inventory_devices_fragment(result.rows, "", "", ""));
              });
 
