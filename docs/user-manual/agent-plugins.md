@@ -442,14 +442,11 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Lightweight vulnerability and configuration scanning. |
+| **Description** | Installed-software identity collector for server-side vulnerability matching (ADR-0018: the agent collects, never decides). |
 
 | Action | Description |
 |---|---|
-| `scan` | Run a full vulnerability scan (installed software against known CVE data). |
-| `cve_scan` | Check for a specific CVE by ID. |
-| `config_scan` | Audit system configuration against security baselines. |
-| `summary` | Return counts of critical, high, medium, and low findings. |
+| `inventory` | Collect a rich installed-software identity record (Linux NEVRA + packager + stored signature + distro; Windows/macOS app identity) for server-side NVD/OVAL/VEX correlation. |
 
 ### certificates
 

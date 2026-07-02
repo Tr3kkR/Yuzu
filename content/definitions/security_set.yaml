@@ -27,11 +27,8 @@ metadata:
       - security.firewall.rules
       # Disk encryption
       - security.encryption.state
-      # Vulnerability scanning
-      - security.vuln_scan.scan
-      - security.vuln_scan.cve_scan
-      - security.vuln_scan.config_scan
-      - security.vuln_scan.summary
+      # Vulnerability scanning — server-authoritative (ADR-0018): the agent
+      # collects installed-software identity; the server correlates it.
       - security.vuln_scan.inventory
       # Event log analysis
       - device.event_logs.errors

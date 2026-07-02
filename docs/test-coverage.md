@@ -27,7 +27,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_temp_file.cpp` | Temp file API | create_temp_file, create_temp_dir, RAII wrappers, move semantics |
 | `test_filesystem_read.cpp` | Filesystem plugin | validate_path, read parameters, CRLF stripping, binary detection, pagination |
 | `test_string_utils.cpp` | Shared utilities | icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line |
-| `test_vuln_rules.cpp` | Vuln scan rules | compare_versions, CveRule data integrity, CVE matching logic |
+| `test_vuln_identity.cpp` | Vuln scan identity collector | NEVRA decomposition (rpm/dpkg/apk/pacman), epoch/release/arch parsing, stored-signature mapping, honest-empty contract, control-char/pipe output safety (19 cases) |
 | `test_kv_store.cpp` | KV storage | Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases) |
 | `test_trigger_engine.cpp` | Trigger engine | Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases) |
 | `test_new_plugins.cpp` | Plugin runtime | Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases) |
@@ -59,7 +59,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | chargen | `chargen_line()` in string_utils | Thread/sleep loop |
 | script_exec | `split_args()` in string_utils | CreateProcess/fork/execvp |
 | installed_apps | `icontains()`, `sanitize_utf8()` | Registry enum, dpkg, rpm |
-| vuln_scan | `compare_versions()`, `icontains()`, `escape_pipes()` | Registry, package queries |
+| vuln_scan | `split_evr()`, `parse_rpm/dpkg/apk/pacman_line()`, `format_record()`, `escape_pipes()` (NEVRA/identity parsing) | Registry, package queries |
 | event_logs | `sanitize_input()` | PowerShell, journalctl, log |
 | os_info | `format_uptime()` | uname, sysctl, registry |
 | netstat | TCP state enums, IP parsing | GetExtendedTcpTable, /proc/net |
@@ -144,7 +144,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |--------|----------|---------|
 | `yuzu/string_utils.hpp` | `sdk/include/yuzu/` | Agent tests, plugins |
 | `web_utils.hpp` | `server/core/src/` | Server tests |
-| `cve_rules.hpp` | `agents/plugins/vuln_scan/src/` | Agent tests (vuln rules) |
+| `vuln_identity.hpp` | `agents/plugins/vuln_scan/src/` | Agent tests (NEVRA/identity parsing) |
 
 ---
 

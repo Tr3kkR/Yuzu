@@ -218,8 +218,8 @@ TEST_CASE("VisualizationEngine: max_categories caps and produces an 'Other' buck
 
 TEST_CASE("VisualizationEngine: multi_series groups by series_field",
           "[visualization][engine][multi_series][column]") {
-    // Schema: Agent + Severity + Category + Title + Detail (vuln_scan, 4 fields)
-    // label_field=0 (Severity), series_field=1 (Category).
+    // Generic 4-field pipe-delimited data (plugin name is arbitrary here — it
+    // only exercises the multi_series splitter). label_field=0, series_field=1.
     std::vector<StoredResponse> responses;
     responses.push_back(make_resp("a1",
         "high|chrome|CVE-1|d1\n"

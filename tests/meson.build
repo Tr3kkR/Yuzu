@@ -106,7 +106,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_string_utils.cpp',
-    'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_identity.cpp',
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
@@ -138,7 +138,7 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_utf8.cpp',
   ),
   include_directories: [
-    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+    include_directories('../agents/plugins/vuln_scan/src'),  # vuln_identity.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)

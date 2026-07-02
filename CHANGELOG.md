@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `vuln_scan` is now a pure installed-software identity collector
+  (ADR-0018 — matching is server-authoritative).** The agent no longer matches
+  CVEs or runs configuration-hardening checks: the `security.vuln_scan.scan`,
+  `.cve_scan`, `.config_scan`, and `.summary` InstructionDefinitions are
+  **removed**, and `security.vuln_scan.inventory` is reshaped from a
+  `name|version` list to an 11-column identity record
+  (`kind|ecosystem|name|epoch|version|release|arch|packager|signature_status|distro_id|distro_version`).
+  On Linux it now decomposes full NEVRA + packager + the *stored* package
+  signature status + distro (`/etc/os-release`); on Windows/macOS it emits
+  application identity. Operator automation targeting the removed IDs must
+  migrate to `security.vuln_scan.inventory`; severity-based dashboards depend on
+  server-side NVD/OVAL/VEX correlation (deferred), so the "vulnerabilities by
+  severity" demo pie is removed from the default visualization pack until that
+  lands. The agent-side `cve_rules.hpp` matcher and `config_checks.hpp` hardening
+  checks are deleted.
+
 ## [0.13.0] - 2026-07-01
 
 ### Added

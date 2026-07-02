@@ -1627,7 +1627,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `patch.inventory` | `windows_updates` | Y | Y | Y | Verified |
 | `patch.pending_reboot` | `windows_updates` | Y | Y | Y | Verified |
 | `patch.install` | `patch` | Y | Y | Y | Planned |
-| `patch.scan` | `vuln_scan` | Y | Y | Y | Verified |
+| `patch.scan` | `vuln_scan` (inventory → server-side NVD correlation) | Y | Y | Y | Planned |
 
 ### 14.7 Filesystem and Content Staging
 
@@ -1662,7 +1662,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `security.firewall.status` | `firewall` | Y | Y | Y | Verified |
 | `security.disk_encryption.status` | `bitlocker` | Y | - | - | Verified |
 | `security.disk_encryption.status` | LUKS/FileVault adapter | - | Y | Y | Proposed |
-| `security.vulnerability.scan` | `vuln_scan` | Y | Y | Y | Verified |
+| `security.vulnerability.inventory` | `vuln_scan` | Y | Y | Y | Verified |
 | `security.event_log.query` | `event_logs` | Y | Y | Y | Verified |
 | `security.ioc.check` | `ioc` | Y | Y | Y | Planned |
 | `security.certificate.inventory` | `certificates` | Y | Y | Y | Planned |

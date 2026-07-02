@@ -179,7 +179,7 @@ surface; no `viz.actions` API is introduced.
 | User action | Plugin called | Plugin source |
 |---|---|---|
 | Check binary hash against VirusTotal | `processes.hash` + new server-side VT lookup | existing + new |
-| Re-scan for vulnerabilities | `vuln_scan.scan` | existing |
+| Re-scan for vulnerabilities | `vuln_scan.inventory` (collect identity) + server-side NVD/OVAL/VEX correlation | collector existing; server correlation new |
 | View firewall rules | `firewall.list` | existing |
 | Add firewall rule (block this edge) | `firewall.add_rule` | existing on Windows; needs cross-platform |
 | Map sockets back to processes | `sockwho.list` | existing |

@@ -51,7 +51,8 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
                          "Remote Addr", "Remote Port", "State", "PID"}},
         {"sockwho",     {"Agent", "PID", "Name", "Path", "Proto",
                          "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}},
-        {"vuln_scan",   {"Agent", "Severity", "Category", "Title", "Detail"}},
+        {"vuln_scan",   {"Agent", "Kind", "Ecosystem", "Name", "Epoch", "Version",
+                         "Release", "Arch", "Packager", "Signature", "Distro", "Distro Version"}},
         {"tar",         {"Agent", "Output"}}, // Dynamic: overridden by __schema__ protocol
     };
     static const std::vector<std::string> kKeyValue{"Agent", "Key", "Value"};
@@ -97,22 +98,6 @@ inline std::string unescape_pipes(const std::string& s) {
 /// The first column ("Agent") is NOT included — the caller prepends the agent name.
 inline std::vector<std::string> split_fields(const std::string& plugin,
                                              const std::string& line) {
-    // vuln_scan: severity|category|title|detail (4 fields, last is remainder)
-    if (plugin == "vuln_scan") {
-        std::vector<std::string> parts;
-        size_t pos = 0;
-        for (int i = 0; i < 3; ++i) {
-            auto p = find_unescaped_pipe(line, pos);
-            if (p == std::string::npos) {
-                parts.push_back(unescape_pipes(line.substr(pos)));
-                return parts;
-            }
-            parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-            pos = p + 1;
-        }
-        parts.push_back(unescape_pipes(line.substr(pos))); // remainder = detail
-        return parts;
-    }
     // key|value plugins: split into exactly 2 (key, rest)
     auto& cols = columns_for_plugin(plugin);
     if (cols.size() == 3) { // Agent + Key + Value

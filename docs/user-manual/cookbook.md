@@ -570,20 +570,24 @@ for row in responses:
 
 ---
 
-### 1.9 Vulnerability Scan (`vuln_scan`)
+### 1.9 Software Identity Inventory (`vuln_scan`)
 
-Scan endpoints for known CVEs. Demonstrates security workflows with severity-based CEL.
+Collect each endpoint's installed-software identity for **server-side** vulnerability
+correlation (ADR-0018: the agent collects, never matches). Each row is a package/app
+identity — on Linux the full NEVRA + packager + stored signature status + distro; on
+Windows/macOS the application identity.
 
-#### Python: Scan All Machines for Vulnerabilities
+#### Python: Collect Software Identity Fleet-Wide
 
 ```python
-exec_id = execute("security.vuln_scan.scan")  # empty scope = all machines
-summary = wait_for(exec_id, timeout=600)  # scans take longer
-print(f"Scanned {summary['agents_success']} machines")
+exec_id = execute("security.vuln_scan.inventory")  # empty scope = all machines
+summary = wait_for(exec_id, timeout=600)
+print(f"Collected identity from {summary['agents_success']} machines")
 
-responses = get_responses("security.vuln_scan.scan", exec_id)
-critical = [r for r in responses if r["output"].get("severity") in ("critical", "high")]
-print(f"Found {len(critical)} critical/high vulnerabilities across fleet")
+responses = get_responses("security.vuln_scan.inventory", exec_id)
+# Each response row: kind|ecosystem|name|epoch|version|release|arch|packager|
+#                    signature_status|distro_id|distro_version
+print(f"{len(responses)} packages/apps reported; the server correlates them against NVD/OVAL/VEX")
 ```
 
 #### CEL Compliance Expression
@@ -891,8 +895,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.event_logs.errors` | errors | Q | WLM | log:string, hours:int32 | timestamp:string, event_id:string, source:string, message:string |
 | `device.event_logs.query` | query | Q | WLM | log:string (req), filter:string (req), count:int32 | timestamp:string, level:string, event_id:string, message:string |
 | `security.ioc.check` | ioc check | Q | WLM | ip_addresses:string, domains:string, file_hashes:string | type:string, value:string, matched:bool, detail:string |
-| `security.vuln_scan.scan` | vuln scan | Q | WLM | *(none)* | severity:string, category:string, title:string, detail:string |
-| `security.vuln_scan.summary` | vuln summary | Q | WLM | *(none)* | severity:string, count:int32 |
+| `security.vuln_scan.inventory` | software identity | Q | WLM | *(none)* | kind, ecosystem, name, epoch, version, release, arch, packager, signature_status, distro_id, distro_version (all string) |
 | `security.encryption.state` | bitlocker | Q | WLM | *(none)* | volume:string, protection_status:string, encryption_method:string |
 | `security.quarantine.status` | status | Q | WLM | *(none)* | state:string, whitelist:string |
 | `security.quarantine.isolate` | isolate | A | WLM | server_ip:string, whitelist_ips:string | status:string, rules_applied:int32 |
@@ -998,8 +1001,8 @@ execute("windows.registry.get_value", scope='ostype == "windows"',
 execute("crossplatform.script.powershell", scope='agent_id == "agent-007"',
         params={"command": "Get-ComputerInfo | Select-Object OsName, OsVersion"})
 
-# Scan for vulnerabilities fleet-wide
-execute("security.vuln_scan.scan")
+# Collect software identity fleet-wide (server correlates against NVD/OVAL/VEX)
+execute("security.vuln_scan.inventory")
 
 # Get hardware inventory
 execute("device.hardware.manufacturer")

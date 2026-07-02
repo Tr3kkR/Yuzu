@@ -548,7 +548,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `software.sccm.query` | `sccm` | Y | - | - | Verified | SCCM client integration |
 | `patch.inventory` | `windows_updates` | Y | - | - | Verified | Installed/pending updates |
 | `patch.install` | `patch` | Y | Y | Y | Planned | Orchestrated patch deploy |
-| `patch.scan` | `vuln_scan` | Y | Y | Y | Verified | NVD-based vulnerability scan |
+| `patch.scan` | `vuln_scan` (inventory → server-side NVD) | Y | Y | Y | Planned | Agent collects identity (ADR-0018); matching is server-side |
 
 ### 7.7 Filesystem and Content Staging
 
@@ -577,7 +577,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `security.firewall.status` | `firewall` | Y | Y | Y | Verified | Firewall state and rules |
 | `security.disk_encryption.status` | `bitlocker` | Y | - | - | Verified | BitLocker status (Windows) |
 | `security.disk_encryption.status` | LUKS/FileVault adapter | - | Y | Y | Proposed | Linux LUKS, macOS FileVault |
-| `security.vulnerability.scan` | `vuln_scan` | Y | Y | Y | Verified | NVD-backed scan |
+| `security.vulnerability.inventory` | `vuln_scan` | Y | Y | Y | Verified | Collect installed-software identity for server-side matching (ADR-0018) |
 | `security.event_log.query` | `event_logs` | Y | Y | Y | Verified | Event/journal log query |
 | `security.ioc.check` | `ioc` | Y | Y | Y | Planned | Hash/IP/domain IOC matching |
 | `security.certificate.inventory` | `certificates` | Y | Y | Y | Planned | Enumerate system cert stores |

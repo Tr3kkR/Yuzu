@@ -48,7 +48,8 @@ spec:
     instructionSets:
       - demo.visualization.fleet-posture
     instructionDefinitions:
-      - security.vuln_scan.scan
+      # The vulnerabilities-by-severity pie is deferred until server-side NVD
+      # findings exist (ADR-0018 — the agent no longer matches CVEs).
       - security.antivirus.defender_status
       - security.encryption.state
       - security.firewall.state
@@ -56,7 +57,6 @@ spec:
       - device.os_info.os_name
   dependencies:
     plugins:
-      - vuln_scan
       - antivirus
       - bitlocker
       - firewall

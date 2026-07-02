@@ -55,17 +55,24 @@ against ADR-0018/ADR-0019 below):
 *The agent ships thin, structured endpoint state; correlation happens server-side.*
 
 ### V1.1 Installed-software / package inventory :white_check_mark: `T1`
-`vuln_scan` `inventory` action emits `name|version` rows; reuses the daily-sync
-`installed_software` source (ADR-0016). Cross-platform.
+`vuln_scan` `inventory` action emits a rich per-package/app identity record
+(`kind|ecosystem|name|epoch|version|release|arch|packager|signature_status|distro_id|distro_version`).
+Runs on the **command path** (`CommandRequest` → response store), **separate from** the ADR-0016
+daily-sync `installed_software` source (`installed_apps`) — the two are deliberately independent
+(owner decision 2026-07-02), not a duplicate to unify. Cross-platform.
 
 ### V1.2 Process / listener / connection snapshot :white_check_mark: `T1`
 `tar` plugin `fleet_snapshot.v1` (`agents/plugins/tar/src/tar_fleet_snapshot.cpp`) —
 processes, listeners, 4-tuple connections with owning PID. Feeds V5.
 
-### V1.3 Per-OS package identity (typed identity emit) :large_orange_diamond: `T1`
-Collection exists, but the agent emits only `name|version` and drops the fields correct
-matching needs (source/ecosystem, arch, full EVR). **Decided (2026-06-30, corrected 2026-07-01
-by ADR-0018 D1):** the agent emits a **structured typed identity `oneof`** — `PackageIdentity`
+### V1.3 Per-OS package identity (typed identity emit) :white_check_mark: `T1`
+**Built (2026-07-02, `feat/vuln-scan-collector`):** the `vuln_scan.inventory` collector now emits
+the decomposed per-OS identity — ecosystem, name, epoch, version, release, arch, packager, stored
+signature status, and distro (from `/etc/os-release`) for package-managed software; application
+identity (name/publisher/version) for the Windows/macOS GUI tail (Lane 3). Emitted as pipe-delimited
+columns on the command path (not a proto oneof — vuln_scan does not ride daily-sync). **Decided
+(2026-06-30, corrected 2026-07-01 by ADR-0018 D1):** the identity model is a **structured typed
+`oneof`** — `PackageIdentity`
 (ecosystem, name, epoch, version, release, arch — lossless, decomposed, no PURL string) for
 package-managed software, and `AppIdentity` (`DisplayName`/`Publisher`/`FileVersion` on Windows,
 `CFBundleIdentifier`/version on macOS) for the GUI tail. **PURL is NOT the wire format** — it is
@@ -73,9 +80,10 @@ a server-derived projection computed only when interop needs it (SBOM/CycloneDX 
 queries for Lane 2 below). **CPE is also server-derived, never emitted by the agent** (lossy —
 cannot carry epoch/release — and dictionary-dependent). See memory `vuln-scan-agent-emits-purl`,
 ADR-0018, and `docs/vuln-scan-roadmap.md` M1a.
-> **Gap:** build the typed-identity collector per-OS (dpkg/rpm/apk + `/etc/os-release` namespace
-> + arch + EVR → `PackageIdentity`; Windows/macOS raw fields → `AppIdentity`); unify the
-> duplicate collector (vuln_scan vs `installed_apps`); add kernel + OS build rows. *(roadmap M1a)*
+> **Done:** per-OS typed-identity collector (dpkg/rpm/apk/pacman + `/etc/os-release` + arch + EVR →
+> package identity; Windows/macOS raw fields → app identity). **Remaining:** the server-side consumer
+> (NVD/OVAL/VEX correlation off these fields), `AppIdentity.binary_version` (Windows FileVersion,
+> fast-follow), and kernel/OS-build rows. *(roadmap M1a)*
 
 ---
 
@@ -90,10 +98,12 @@ server-derived PURL** (deterministic, no CPE guessing); **Lane 3** OS-native GUI
 (Windows/macOS) → **not-assessed in v1** (no curated detection content authored; federation
 deferred to ADR-0020). See V1.3 + memory `vuln-scan-agent-emits-purl`.*
 
-### V2.1 Agent-side built-in CVE rules :large_orange_diamond: `T1`
-The `vuln_scan` plugin matches against a **hardcoded** `cve_rules.hpp` (`std::array` of
-hand-written `CveRule`s, substring product match + "version below"). This is the closed-PR
-PoC with the #1301/#1206 defects: inverted multi-branch ranges, no distro backport
+### V2.1 Agent-side built-in CVE rules :white_check_mark: `T1` (retired)
+**Retired on the agent (2026-07-02, ADR-0018):** the `vuln_scan` plugin no longer matches —
+`cve_rules.hpp` (`std::array` of hand-written `CveRule`s) was deleted; the plugin is now a
+collect-thin identity collector. A v0 copy of the rules survives **server-side** in `nvd_db.cpp`
+as interim seed data pending the M1a cpeMatch reshape. The retired PoC had the #1301/#1206 defects:
+inverted multi-branch ranges, no distro backport
 awareness, substring (non-CPE) identity, severity from a bare label. The plugin does **not**
 consult the server NVD database (V2.2).
 > **Gap:** this path **retires under ADR-0018** (server-authoritative matching) — no in-place
@@ -168,10 +178,15 @@ the GUI tail only).
 
 ## V3 — Configuration & Compliance Scanning
 
-### V3.1 Config-hardening checks :large_orange_diamond: `T1`
-`vuln_scan` `config_scan` + `cve_scan` actions exist (per `vuln_scan.yaml`) at a basic
-level; severity taxonomy CRITICAL/HIGH/MEDIUM/LOW/INFO defined.
-> **Gap:** depth/coverage of checks; benchmark mapping (CIS/STIG) not present.
+### V3.1 Config-hardening checks :x: `T1` (retired from vuln_scan)
+**Retired (2026-07-02, ADR-0018):** the `vuln_scan` `config_scan` action and `config_checks.hpp`
+(UAC/SMBv1/ASLR/FileVault/firewall/password-policy checks) were **deleted** so the plugin is a pure
+identity collector. Config-hardening is a **separate track** — it is to be re-authored as
+question-type Instruction Engine `InstructionDefinition`s (design-doc fallback path), **not yet
+built and with no target date**. Until then there is a **coverage gap**: no agent-side config
+compliance checks ship.
+> **Gap:** the InstructionDefinition re-implementation is unbuilt (tracking issue owed); benchmark
+> mapping (CIS/STIG) also absent.
 
 ### V3.2 Benchmark / compliance-framework mapping :x: `T3`
 No mapping of findings to CIS/STIG/regulatory controls.
@@ -181,17 +196,22 @@ No mapping of findings to CIS/STIG/regulatory controls.
 
 ## V4 — Findings, Output & Reporting
 
-### V4.1 Structured finding output :white_check_mark: `T1`
-Pipe-delimited finding rows; `summary` action aggregates. Verified end-to-end on the
-native macOS agent (8 findings: 1 HIGH/3 MEDIUM/4 INFO).
+### V4.1 Structured finding output :large_orange_diamond: `T1`
+**Superseded (2026-07-02, ADR-0018):** the agent no longer emits *findings* (the `summary`
+severity aggregation was retired with the agent matcher). The `inventory` action now emits
+structured **identity** rows (pipe-delimited, 11 columns); *findings* are produced server-side by
+the deferred NVD/OVAL/VEX correlation, which then persists + aggregates them.
 
 ### V4.2 Findings persistence :white_check_mark: `T1`
 Findings land in the response store (filterable/aggregatable) like any instruction result.
 
-### V4.3 Dashboard surfacing & charts :large_orange_diamond: `T2`
-A `vuln_scan` chart ships in the `demo.visualization.fleet-posture` InstructionSet
-(ECharts). No dedicated `/vuln` page or per-device vuln lens yet.
-> **Gap:** dedicated vuln dashboard + MCP/REST parity (agentic-first A1). *(Epic 6 surfacing)*
+### V4.3 Dashboard surfacing & charts :x: `T2`
+The `vuln_scan` "vulnerabilities by severity" chart was **removed** from the
+`demo.visualization.fleet-posture` InstructionSet (2026-07-02) — agent-side severity no longer
+exists, so the pie is deferred until server-side NVD findings can feed it. No dedicated `/vuln`
+page or per-device vuln lens yet.
+> **Gap:** rebuild the severity chart from server findings; dedicated vuln dashboard + MCP/REST
+> parity (agentic-first A1). *(Epic 6 surfacing)*
 
 ### V4.4 Dedicated vulnerability store (current-state, dedup) :x: `T2`
 Findings are per-execution rows; there is no current-state, deduplicated, per-device

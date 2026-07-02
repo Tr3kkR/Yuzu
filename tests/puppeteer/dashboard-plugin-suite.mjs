@@ -154,7 +154,6 @@ const GROUPS = [
     ['tar export type=all limit=5', 0],
   ]],
   ['Vulnerability Scanning', [
-    ['vuln_scan summary', 1],
     ['vuln_scan inventory', 1],
   ]],
   ['HTTP Client', [

@@ -38,10 +38,10 @@ metadata:
 
   contents:
     instructionDefinitions:
-      # Pie of vulnerabilities by severity — the headline chart.
-      # Hosted on the `scan` action (one row per finding) rather than `summary`
-      # (which also emits a TOTAL row that dominates the pie).
-      - security.vuln_scan.scan
+      # NOTE: the "vulnerabilities by severity" pie is DEFERRED. Under ADR-0018
+      # the agent no longer matches CVEs (vuln_scan is now a collect-thin identity
+      # collector), so severity counts come from SERVER-SIDE NVD/OVAL/VEX findings
+      # once that correlation slice lands — the pie is rebuilt from those results.
       # Pie of Windows Defender real-time protection state.
       - security.antivirus.defender_status
       # Pie of disk encryption protection status (BitLocker / LUKS / FileVault).

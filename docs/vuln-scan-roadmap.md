@@ -45,8 +45,8 @@ still cites "Epic N", read the milestone here instead.
 
 | Area | State |
 |---|---|
-| Agent matching | ~40 **hard-coded** CVEs (`cve_rules.hpp`); substring product match + naive comparator. Runs on-demand, emits pipe-delimited findings. |
-| Agent inventory | `name\|version` only; duplicate collector (vuln_scan vs `installed_apps`). No source/arch/EVR — target is a typed `PackageIdentity`/`AppIdentity` record (ADR-0018), not PURL. |
+| Agent matching | **Retired (2026-07-02, ADR-0018)** — `cve_rules.hpp` deleted; the agent no longer matches. Matching is server-authoritative. (A v0 rule copy survives server-side in `nvd_db.cpp` pending the M1a cpeMatch reshape.) |
+| Agent inventory | `vuln_scan.inventory` emits a rich per-package/app identity record (ecosystem, name, epoch, version, release, arch, packager, stored signature status, distro) — the ADR-0018 collect-thin seed. **Runs on the command path, separate from the ADR-0016 daily-sync inventory** (`installed_apps`); the two are deliberately independent (owner decision 2026-07-02), not a duplicate to unify. Windows/macOS emit AppIdentity (Lane 3). |
 | Server NVD | `nvd_client`+`nvd_db`+`nvd_sync` **wired**, but the store is a flat `cve(product, affected_below)` (no CPE ranges) and **keyword-scoped**. Consumed only by the topology vuln overlay; the plugin never queries it. |
 | OVAL / EPSS / KEV / CVSS-vector | **None** (design-doc only). |
 | Topology graph | `FleetTopologyStore` — observed graph, in-memory 60s, no persistence, no vuln attach. |

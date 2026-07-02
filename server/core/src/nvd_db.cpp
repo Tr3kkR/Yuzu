@@ -16,7 +16,9 @@ namespace yuzu::server {
 // ── Version comparison ───────────────────────────────────────────────────────
 // Returns <0 if a<b, 0 if a==b, >0 if a>b.
 // Splits on '.' and '-', compares each segment numerically where possible.
-// Same algorithm as agents/plugins/vuln_scan/src/cve_rules.hpp.
+// (The agent-side copy in vuln_scan was retired under ADR-0018 — matching is
+// server-authoritative now; this remains the v0 comparator pending the M1a
+// NVD-store reshape to real cpeMatch version ranges.)
 
 int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
@@ -78,8 +80,9 @@ static std::string to_lower(std::string_view sv) {
 }
 
 // ── Built-in CVE rules ───────────────────────────────────────────────────────
-// Duplicated from agents/plugins/vuln_scan/src/cve_rules.hpp to avoid
-// cross-module dependencies. These are constant data that rarely changes.
+// v0 prototype seed data. The agent-side matcher these were duplicated from was
+// removed under ADR-0018 (matching is server-authoritative); this server copy is
+// the interim seed pending the M1a reshape to a real cpeMatch-ranged NVD store.
 
 struct BuiltinRule {
     std::string_view cve_id;

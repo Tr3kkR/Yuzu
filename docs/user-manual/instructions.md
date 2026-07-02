@@ -1289,11 +1289,10 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 
 See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
 
-**Worked examples (default-shipped).** Six chart-bearing definitions ship in the in-tree content library as the default demo set:
+**Worked examples (default-shipped).** Five chart-bearing definitions ship in the in-tree content library as the default demo set (the vulnerabilities-by-severity pie is deferred until server-side NVD findings exist — ADR-0018):
 
 | Definition | Chart |
 |---|---|
-| `security.vuln_scan.summary` | pie — vulnerabilities by severity |
 | `security.antivirus.defender_status` | pie — Defender real-time protection |
 | `security.encryption.state` | pie — volume protection (BitLocker / LUKS / FileVault) |
 | `security.firewall.state` | column (multi-series) — firewall state per profile |

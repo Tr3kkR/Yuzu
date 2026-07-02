@@ -127,8 +127,11 @@ finding (ADR-0005).
   re-shipping the agent.
 - **Automated data refresh**: a weekly GitHub Actions workflow regenerates the ruleset
   from NVD and opens a CODEOWNERS-gated PR.
-- **Inventory action**: `vuln_scan.inventory` emits `name|version` per package — the seed
-  of *collect thin*.
+- **Inventory action**: `vuln_scan.inventory` emits a rich identity record per package/app
+  (`kind|ecosystem|name|epoch|version|release|arch|packager|signature_status|distro_id|distro_version`)
+  — the *collect-thin* seed for server-side matching. Runs on the command path (`CommandRequest` →
+  response store), **separate from the ADR-0016 daily-sync inventory** (`installed_apps`). The agent
+  does no CVE matching (ADR-0018).
 - **Breadth of collection surface**: package managers across Win/Linux/macOS, kernel
   version, file-level binary version (PE VERSIONINFO / `.app` Info.plist), CIS config
   checks.
