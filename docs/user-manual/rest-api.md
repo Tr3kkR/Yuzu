@@ -5377,7 +5377,10 @@ Activate a time-boxed admin elevation (SOC 2 CC6.3/CC6.6) — see `docs/auth-arc
 
 Promote the **current cookie session** to admin for a bounded window. The session's effective role becomes `admin` until the window lapses, then auto-reverts.
 
-**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible`; **MFA must be enrolled** (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up is required.
+**Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
+
+- **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
+- **OIDC session:** a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
 
 **Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
 
@@ -5392,7 +5395,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 **Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), or the session dissolved mid-request; `403` — not eligible, eligibility read failed (fail-closed), **or no MFA enrolled**; the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> justification=<sanitised>`) on success; `role.elevation.denied` on a `403`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> justification=<sanitised>` — `mfa=` is placed before the free-text `justification=` field so a crafted justification can't forge the factor token) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused).
 
 #### `POST /api/v1/elevate/revoke`
 

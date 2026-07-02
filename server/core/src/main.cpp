@@ -353,6 +353,16 @@ int main(int argc, char* argv[]) {
         ->check(CLI::Range(1, 86400))
         ->envname("YUZU_JIT_MAX_ELEVATION_SECS");
 
+    app.add_flag("--jit-oidc-amr-elevation,!--no-jit-oidc-amr-elevation",
+                 cfg.jit_oidc_amr_elevation,
+                 "Allow an OIDC session whose IdP login attested MFA (the `amr` claim) to "
+                 "satisfy POST /api/v1/elevate's mandatory second-factor requirement without "
+                 "local TOTP enrollment (default: true). A no-amr (single-factor) OIDC session "
+                 "is still denied regardless. Pass --no-jit-oidc-amr-elevation to disable it — "
+                 "OIDC sessions then cannot use JIT elevation at all (an operator must elevate "
+                 "from a local session with local TOTP).")
+        ->envname("YUZU_JIT_OIDC_AMR_ELEVATION");
+
     // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
     app.add_option("--session-inactivity-secs", cfg.session_inactivity_secs,
                    "Seconds of inactivity after which an operator dashboard session is invalidated "
@@ -563,6 +573,20 @@ int main(int argc, char* argv[]) {
                      "enrollment at login before a session is issued.",
                      cfg.mfa_enforcement,
                      cfg.mfa_enforcement == "required" ? "users" : "admins");
+    }
+    // ── JIT elevation OIDC-amr posture advisory (SRE SHOULD) ──
+    // Surface once at boot, alongside the other auth-posture lines, so an
+    // incident responder can discover this without reading source or an
+    // individual audit row's `mfa=` detail. Gated on the SAME predicate
+    // `oidc::Config::is_enabled()` uses (issuer AND client-id both set — see
+    // the --auth-mode=sso-only guard below) so a local-only deployment never
+    // sees an OIDC-flavoured log line.
+    if (!cfg.oidc_issuer.empty() && !cfg.oidc_client_id.empty() &&
+        cfg.jit_oidc_amr_elevation) {
+        spdlog::info("OIDC MFA (amr) may satisfy the elevation second-factor without local TOTP "
+                     "enrollment — pass --no-jit-oidc-amr-elevation to disable it, in which case "
+                     "OIDC sessions cannot use JIT elevation at all (an operator must elevate from "
+                     "a local session with local TOTP).");
     }
     // NOTE: the --auth-mode=sso-only fail-closed guard + posture log live just
     // before the server starts to SERVE (below), NOT here — so the host-CLI

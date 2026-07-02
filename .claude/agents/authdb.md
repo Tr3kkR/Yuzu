@@ -86,6 +86,14 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   ExecutionTracker → ExecutionEventBus (PR 3 / #702). Build the payload
   under the lock, exit the locked scope, then publish lock-free.
 
+- **A federated (OIDC/SAML/SCIM) identity with no `users` row is
+  structurally elevation-ineligible.** `is_elevation_eligible`/`mfa_status`
+  are `users`-table-keyed and fail closed (not eligible / not enrolled) for
+  an absent row; OIDC login (`create_oidc_session`) never inserts one. See
+  the JIT elevation OIDC-amr follow-up (`docs/security-reviews/jit-elevation-2026-06-30.md`)
+  — its mandatory-MFA gate branches on `session.auth_source`, and an OIDC
+  session must never fall through to a local *namesake* account's row.
+
 ## Review checklist
 
 When reviewing an AuthDB-touching change, walk this list explicitly and call

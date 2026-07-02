@@ -68,6 +68,22 @@ struct Config {
     // 3600 (1h). Wired via --jit-max-elevation-secs / YUZU_JIT_MAX_ELEVATION_SECS.
     int jit_max_elevation_secs{3600};
 
+    // JIT elevation via OIDC IdP-MFA assertion (security review
+    // docs/security-reviews/jit-elevation-2026-06-30.md follow-up). When true
+    // (default), an OIDC session whose IdP login attested MFA via the `amr`
+    // claim (a seeded `Session::mfa_verified_at`, set at /auth/callback via
+    // amr_asserts_mfa) satisfies the mandatory-second-factor requirement at
+    // POST /api/v1/elevate WITHOUT local TOTP enrollment — the existing
+    // step-up freshness check still applies. A no-amr (single-factor) OIDC
+    // session is still hard-denied regardless of this flag. Set false to
+    // disable the OIDC-amr path entirely: OIDC sessions then cannot use JIT
+    // elevation at all (an OIDC session can't present a local TOTP step-up —
+    // its step-up is re-SSO), so an operator must elevate from a local session
+    // with local TOTP — an escape hatch for shops that want an elevation factor
+    // distinct from SSO. Wired via --jit-oidc-amr-elevation /
+    // YUZU_JIT_OIDC_AMR_ELEVATION.
+    bool jit_oidc_amr_elevation{true};
+
     // Operator dashboard idle (inactivity) session timeout — SOC 2 CC6.3.
     // Seconds of inactivity after which a cookie session is invalidated
     // server-side (a sliding window UNDER the absolute 8h session lifetime).

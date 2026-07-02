@@ -211,11 +211,18 @@ matches the customer ask.
    duration_secs}` promotes the caller's **effective role** to admin for a
    bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
    Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
-   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), distinct
-   from standing admin and enumerable for access reviews. Gated on eligibility +
-   **mandatory MFA enrollment** (unconditional — elevation is the privilege
-   boundary) + a fresh MFA step-up; the grant audit is fail-closed, revoking
-   eligibility ends active elevations, and self-grant is blocked.
+   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`; keyed on
+   a `users` row, which OIDC login does not create — a federated identity needs
+   one provisioned first), distinct from standing admin and enumerable for
+   access reviews. Gated on eligibility + **mandatory MFA enrollment**
+   (unconditional — elevation is the privilege boundary) + a fresh MFA step-up;
+   the grant audit is fail-closed, revoking eligibility ends active elevations,
+   and self-grant is blocked. A local session's factor is local TOTP; an OIDC
+   session with an IdP-MFA (`amr`) proof satisfies this WITHOUT local
+   enrollment, per `--jit-oidc-amr-elevation` (default true) — an OIDC session
+   never consults a local namesake account's TOTP enrollment, and
+   `--no-jit-oidc-amr-elevation` blocks OIDC sessions from elevating entirely
+   (they cannot present a local TOTP step-up).
    `auth::effective_role(session)` (admin while
    `now < elevated_until`) is honoured by `require_admin` + the permission gates;
    the window is monotonic `steady_clock`, in-memory per **cookie** session

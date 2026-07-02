@@ -2011,19 +2011,68 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the
         // privilege-crossing boundary (non-admin → full admin), so — UNLIKE the
         // other step-up sites where the actor is already admin — a second factor
-        // is required unconditionally, NOT gated on --mfa-enforcement. An eligible
-        // operator with no TOTP enrolled is refused here (require_mfa_step_up
-        // would otherwise pass them through under the default optional mode).
-        if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
-            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
-                                    auth::role_to_string(session->role), "User", session->username,
-                                    "no MFA enrolled (a second factor is required to elevate)");
-            res.status = 403;
-            res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
-                                                  cid, "enroll MFA (Settings -> Multi-Factor "
-                                                       "Authentication) before you can elevate"),
-                            "application/json");
-            return;
+        // is required unconditionally, NOT gated on --mfa-enforcement.
+        //
+        // OIDC-amr follow-up (docs/security-reviews/jit-elevation-2026-06-30.md):
+        // an OIDC session whose IdP login attested MFA via the `amr` claim
+        // already carries a seeded `Session::mfa_verified_at` (set at
+        // /auth/callback via amr_asserts_mfa). That proof satisfies "a second
+        // factor" in place of local TOTP enrollment.
+        //
+        // LOAD-BEARING: the two identity sources are handled by DISJOINT
+        // branches, not a single "skip the local check" flag. An OIDC session
+        // must NEVER fall through to the local `mfa_status` lookup — a local
+        // *namesake* account (same username, different identity) might be
+        // TOTP-enrolled, and passing that check for an OIDC caller would grant
+        // elevation on a factor the OIDC caller never actually presented
+        // (security-F1 / hardening-round S-2). This seam is the ONLY place
+        // that unconditionally blocks a single-factor (no-amr) OIDC session
+        // from elevating — require_mfa_step_up's own no-proof-OIDC branch can
+        // PASS a request through when --mfa-enforcement doesn't protect the
+        // role (e.g. "optional"), so the decision must not be deferred there.
+        const bool oidc_amr_proof = session->auth_source == "oidc" &&
+                                    session->mfa_verified_at.time_since_epoch().count() != 0;
+        const bool oidc_amr_elevation = cfg_.jit_oidc_amr_elevation && oidc_amr_proof;
+        if (session->auth_source == "oidc") {
+            // An OIDC session's ONLY acceptable second factor is a seeded amr
+            // proof (IdP-attested MFA) with the toggle on. There is no way for
+            // an OIDC session to present a local TOTP step-up (its step-up is
+            // re-SSO, not a TOTP code), so toggle-off means OIDC sessions
+            // cannot elevate at all, not "fall back to local TOTP".
+            if (!oidc_amr_elevation) {
+                const char* reason =
+                    cfg_.jit_oidc_amr_elevation
+                        ? "no MFA in SSO login (the IdP did not assert amr MFA) — "
+                          "re-authenticate via your IdP with MFA"
+                        : "OIDC-amr elevation is disabled (--no-jit-oidc-amr-elevation); "
+                          "elevate from a local session with TOTP";
+                audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                        auth::role_to_string(session->role), "User", session->username,
+                                        reason);
+                res.status = 403;
+                res.set_content(detail::error_json_a4(403, "elevation requires a second factor", cid,
+                                                      reason),
+                                "application/json");
+                return;
+            }
+            // Fall through to elevation_step_up below (freshness check on the
+            // amr-seeded proof).
+        } else {
+            // Local session: mandatory local TOTP enrollment (unchanged). An
+            // eligible operator with no TOTP enrolled is refused here
+            // (require_mfa_step_up would otherwise pass them through under the
+            // default optional mode).
+            if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+                audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                        auth::role_to_string(session->role), "User", session->username,
+                                        "no MFA enrolled (a second factor is required to elevate)");
+                res.status = 403;
+                res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
+                                                      cid, "enroll MFA (Settings -> Multi-Factor "
+                                                           "Authentication) before you can elevate"),
+                                "application/json");
+                return;
+            }
         }
         // High-risk: require a fresh MFA proof (step-up) before granting admin.
         // window floored to kElevationStepUpWindow so a globally-disabled gate
@@ -2123,9 +2172,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
         // the break-glass arm) and 500 with Sec-Audit-Failed — rather than leave
         // a silent admin window.
+        // Stamp the factor source (oidc_amr vs local_totp) so access reviews can
+        // tell an IdP-MFA'd elevation apart from a locally-enrolled one.
+        // `mfa=<label>` is placed BEFORE `justification=` — justification is
+        // operator free-text (only control-bytes sanitised), so putting it
+        // last stops a crafted justification (e.g. "x mfa=local_totp") from
+        // forging the factor token that access reviews and tests grep for
+        // (hardening-round consistency S-3).
+        const char* mfa_factor_label = oidc_amr_elevation ? "oidc_amr" : "local_totp";
         if (!audit_log_for_principal(req, "role.elevation.granted", "ok", session->username, "admin",
                                      "User", session->username,
                                      "duration_secs=" + std::to_string(duration) +
+                                         " mfa=" + mfa_factor_label +
                                          " justification=" + justification)) {
             auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
