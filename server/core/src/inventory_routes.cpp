@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -50,12 +51,13 @@ void InventoryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
                                       DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
-                                      AuditFn audit_fn) {
+                                      AuditFn audit_fn, AgentCiFn agent_ci_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
                     std::move(catalog_fn), std::move(catalog_meta_fn), std::move(versions_fn),
                     std::move(fleet_fn), std::move(agent_sw_fn), std::move(devices_fn),
-                    std::move(scope_fn), std::move(stale_fn), std::move(audit_fn));
+                    std::move(scope_fn), std::move(stale_fn), std::move(audit_fn),
+                    std::move(agent_ci_fn));
 }
 
 void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -63,7 +65,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                                       CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                                       FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn,
                                       DevicesFn devices_fn, ScopeFn scope_fn, StaleFn stale_fn,
-                                      AuditFn audit_fn) {
+                                      AuditFn audit_fn, AgentCiFn agent_ci_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -73,6 +75,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     fleet_fn_ = std::move(fleet_fn);
     agent_sw_fn_ = std::move(agent_sw_fn);
     devices_fn_ = std::move(devices_fn);
+    agent_ci_fn_ = std::move(agent_ci_fn);
     scope_fn_ = std::move(scope_fn);
     stale_fn_ = std::move(stale_fn);
     audit_fn_ = std::move(audit_fn);
@@ -148,7 +151,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  send_html(res, render_inventory_versions_fragment(name, vers));
              });
 
-    // -- DEVICES (thin CI list; global Inventory:Read, scoped provider) --
+    // -- DEVICES (CI-enriched list; global Inventory:Read, scoped provider) --
     sink.Get("/fragments/inventory/devices",
              [this](const httplib::Request& req, httplib::Response& res) {
                  auto session = auth_fn_(req, res);
@@ -156,16 +159,41 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      return;
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
-                 std::vector<InventoryDeviceRow> rows;
+                 InventoryDevicesResult result;
                  if (devices_fn_)
-                     rows = devices_fn_(session->username);
-                 // Audit the identity-bearing roster read (hostnames + agent_ids) for parity
-                 // with the other inventory surfaces (gov review #1759). Set-and-proceed via
-                 // the throw-safe kernel — scope-confined at devices_fn_, machine-scope data.
-                 (void)detail::try_persist_audit(audit_fn_, req, "inventory.devices", "success",
-                                                 "Inventory", "fleet",
-                                                 "devices=" + std::to_string(rows.size()));
-                 send_html(res, render_inventory_devices_fragment(rows, "", "", ""));
+                     result = devices_fn_(session->username);
+                 else
+                     result.ci_degraded = true; // unwired closure: no CI enrichment possible
+                 // Audit the identity-bearing roster read. PR2's device-CI columns (incl.
+                 // serial — a device-persistent identifier, ADR-0016 §"personal data under
+                 // GDPR") now ride this bulk read, so this is promoted to the
+                 // emit_behavioral_audit tier (Sec-Audit-Failed on a persist failure) —
+                 // gov Gate 2 review: ADR-0016 explicitly classifies serial/system_uuid/
+                 // primary_mac as GDPR personal data, so the lighter machine-scope-data
+                 // posture the OTHER inventory.* verbs use (host/OS/software titles — not
+                 // device-persistent identifiers) does not transfer to this route now that
+                 // it carries CI. Set-and-proceed: the HTML surface still renders.
+                 // `result.ci_degraded` (#1785 review HIGH-1) discriminates "roster read
+                 // fine, CI enrichment also fine" from "roster read fine, CI columns blank
+                 // because the enrichment join failed" — the roster itself is offline-
+                 // survivable and never fails on a CI-store outage (see InventoryDevicesResult),
+                 // so this is "failure" only for the CI-enrichment half, never a 5xx.
+                 // A degrade with an empty roster (`offline_endpoint_store_` unavailable, or
+                 // an unwired provider) is worded distinctly from a degrade with a populated
+                 // roster (the CI join specifically failed) — gov Gate 3 review: the roster
+                 // never actually goes empty this way in a healthy boot (ADR-0012 fails the
+                 // server closed on a missing offline_endpoint_store_), but the detail string
+                 // shouldn't assert "roster rendered" when it wasn't.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "inventory.devices",
+                     result.ci_degraded ? "failure" : "success", "Inventory", "fleet",
+                     "devices=" + std::to_string(result.rows.size()) +
+                         (!result.ci_degraded
+                              ? " (incl. CI columns: serial/model/cpu/ram)"
+                          : result.rows.empty()
+                              ? " (device roster or CI store unavailable)"
+                              : " (CI store degraded; roster rendered without CI columns)"));
+                 send_html(res, render_inventory_devices_fragment(result.rows, "", "", ""));
              });
 
     // -- PER-DEVICE software drill (scoped per-device; audited) --
@@ -192,7 +220,36 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      audit_fn_, req, "inventory.device.software", sw ? "success" : "failure",
                      "Inventory", "agent=" + id,
                      sw ? ("rows=" + std::to_string(sw->size())) : "store degraded");
-                 send_html(res, render_inventory_device_software_fragment(id, host, sw, online));
+
+                 // CI record (PR2). An unwired closure is treated the same as a live
+                 // store failure (mirrors agent_sw_fn_ unwired -> nullopt -> degrade
+                 // banner) — a real deployment always wires this.
+                 std::expected<std::optional<DeviceCiRecord>, CiReadError> ci =
+                     std::unexpected(CiReadError::kDegraded);
+                 if (agent_ci_fn_)
+                     ci = agent_ci_fn_(id);
+                 // Separate, distinctly-countable audit verb — serial/system_uuid/primary_mac
+                 // are device-persistent identifiers (GDPR personal data per ADR-0016), so
+                 // this uses emit_behavioral_audit (Sec-Audit-Failed on a persist failure),
+                 // the SAME tier as the tar.dns.read + tar.arp.read pair and DEX/Guardian
+                 // per-device lenses — gov Gate 2 review corrected an earlier draft that
+                 // used the lighter try_persist_audit tier (the installed-software drill's
+                 // tier), which ADR-0016 doesn't support for CI data specifically. Reading
+                 // OK even when the record is genuinely absent (a value holding
+                 // std::nullopt) is "success", not "failure" — only the kDegraded
+                 // store-failure case is a failure. Set-and-proceed: the HTML surface
+                 // still renders even on a persist failure.
+                 (void)detail::emit_behavioral_audit(
+                     audit_fn_, req, res, "inventory.device.ci",
+                     ci.has_value() ? "success" : "failure", "Inventory", "agent=" + id,
+                     !ci.has_value()   ? "store degraded"
+                     : ci->has_value() ? "found"
+                                       : "absent");
+                 const std::int64_t now_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                                    std::chrono::system_clock::now().time_since_epoch())
+                                                    .count();
+                 send_html(res, render_inventory_device_software_fragment(id, host, sw, online, ci,
+                                                                          now_secs));
              });
 
     // -- FIND shell (search box + empty results container) --

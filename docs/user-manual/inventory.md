@@ -188,19 +188,30 @@ same data, with three tabs:
   an **"updated N ago"** stamp for the rollup; immediately after a fresh server starts (or
   before the first refresh) the catalogue shows a **"building"** note until the first
   recompute lands. This keeps the default tab fast at any fleet size.
-- **Devices** — a **thin device inventory**: hostname, OS, online/offline/**stale**
-  status, and last-seen, sourced from the server's persisted endpoint state so a device
-  appears here **even when it is offline** (joined to the live registry for the online
-  flag). The **list** is gated on the global `Inventory:Read`, filtered to the
-  operator's visible scope by the device provider, and the roster read is audited
-  (`inventory.devices`). **Clicking a
-  device** loads that device's installed software; that per-device drill is additionally
-  gated by the management-group chokepoint (`Inventory:Read` for the device's group, so
-  an operator only opens a device in their scope) **and is audited**
-  (`inventory.device.software`). An offline device shows its *last daily sync*, clearly
-  labelled. The richer CI columns (serial, model, CPU, RAM, MAC …) are greyed pending
-  the device-CI sync source (a follow-on). A large device list is rendered first-N with
-  the total shown; use the filter to narrow.
+- **Devices** — hostname, OS, online/offline/**stale** status, and last-seen, sourced
+  from the server's persisted endpoint state so a device appears here **even when it is
+  offline** (joined to the live registry for the online flag), **plus a device-CI
+  record** — serial, model, CPU cores/threads, and RAM — sourced from the `device_ci`
+  daily-sync source (ADR-0016 source #3) via `DeviceInventoryStore`. The **list** is
+  gated on the global `Inventory:Read`; management-group confinement of the roster is
+  **designed for, not yet verified effective** (the same inert-list-scoping class as
+  Find software, below — see ADR-0017), and the roster read is audited
+  (`inventory.devices` — the behavioural-PII audit tier, because the list now carries
+  device-persistent identifiers such as serial). **Clicking a device** loads its full CI record plus
+  installed software; that per-device drill is additionally gated by the
+  management-group chokepoint (`Inventory:Read` for the device's group, so an operator
+  only opens a device in their scope) **and is audited** — `inventory.device.software`
+  for the software list, `inventory.device.ci` (also the behavioural-PII tier) for the
+  CI panel (manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory,
+  primary/all MAC addresses, NIC count, OS name/version/build, architecture, and
+  first/last-synced times). An offline device shows its *last daily sync*, clearly
+  labelled; a device that hasn't completed its first `device_ci` sync yet shows an
+  honest "no CI record synced" note rather than blank cells, and an unknown individual
+  field (e.g. a serial-less VM) renders as a placeholder (`—`), never the raw
+  `"unknown"` sentinel. **Disk capacity is deliberately withheld** from the CI panel
+  pending a macOS disk-collection fix, and **owner/location are not shown** — the agent
+  doesn't collect them (a future operator-set CMDB enrichment). A large device list is
+  rendered first-N with the total shown; use the filter to narrow.
 - **Find software** — type an exact title to see **which devices run it** and at which
   versions. Like the REST/MCP siblings, Find is gated on the **global `Inventory:Read`**
   and returns **fleet-wide** results: management-group confinement is **not yet effective**
@@ -211,16 +222,16 @@ same data, with three tabs:
 
 **On store degradation** the **Software**, **Find**, and **per-device-software** views —
 the *authoritative* reads — show an explicit **"unavailable"** banner rather than an
-empty table, because an empty table would read as "installed nowhere", the fail-open the
-authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** is sourced from
-the deliberately *fail-soft* endpoint-state store (durability-on-top, not authoritative),
-so during a database incident it may render an empty/short roster rather than a banner;
-its empty-state copy says so and points you to the authoritative Software tab.
-
-The full **device CI inventory** (offline-readable hardware/identity records — a
-ServiceNow-style CI record) is a planned follow-on: it adds a device-CI **daily-sync
-source** (the ADR-0016 framework's source #2) feeding a born-on-Postgres
-`DeviceInventoryStore`, at which point the greyed CI columns above become real.
+empty table, because an empty table would read as "installed nowhere", the fail-open
+the authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** (the
+list's host/OS/last-seen columns, plus the CI columns joined onto it) is sourced from
+the deliberately *fail-soft* endpoint-state store and, for CI, a best-effort
+`DeviceInventoryStore` read layered on top — a `DeviceInventoryStore` degrade during the
+list render is indistinguishable from "not yet synced" (both show the `—` placeholder),
+matching the roster's own already-fail-soft posture rather than claiming a new
+authoritative one. The **per-device CI panel** (the drill), by contrast, IS an
+authoritative three-state read: found / genuinely-not-yet-synced ("no CI record synced
+yet") / degraded (an explicit "CI record unavailable" banner) are never conflated.
 
 ## Access control
 
@@ -372,8 +383,8 @@ sync, defeating the hash-skip protocol.
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
 
 The operator-facing read surface — the `/inventory` **Devices** tab CI columns and
-the per-device CI panel — ships in **PR2**; until then the data is in Postgres but
-not yet surfaced in the dashboard.
+the per-device CI panel — is live; see the **Devices** bullet above for its columns,
+fields, and audit/degrade posture.
 
 ## See also
 
