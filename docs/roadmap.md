@@ -116,7 +116,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | Open |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
-| | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Open |
+| | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Done |
 | **14** | 14.1 | [#290](https://github.com/Tr3kkR/Yuzu/issues/290) | P2P Content Distribution | Open |
 | | 14.2 | [#291](https://github.com/Tr3kkR/Yuzu/issues/291) | Multi-Gateway Topology | Open |
 | | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | Open |
@@ -1393,8 +1393,16 @@ White-label customization for enterprise deployments:
 **Files:** `server/core/src/css_bundle.cpp`, `server/core/src/settings_routes.cpp`, `server/core/src/runtime_config_store.cpp`
 
 ### Issue 13.5: MCP Phase 2 (Write Tools)
-**Capabilities:** 24.8 (extension) | **Scope:** Server | **Status:** Open
+**Capabilities:** 24.8 (extension) | **Scope:** Server | **Status:** Done (#289)
 **Depends on:** 7.20 (MCP Phase 1)
+
+> **Shipped (R2, 2026-07):** all five write tools (`set_tag`, `delete_tag`,
+> `approve_request`, `reject_request`, `quarantine_device`) are dispatched;
+> `execute_instruction` was already done. Approval-gated ops use the
+> ticket-then-recall flow (mint `kApprovalRequired` + `approval_id`/`status_url` →
+> admin approves → recall consumes once). "SSE streaming for execution progress"
+> is satisfied by the shipped `GET /api/v1/events` (sprint W5.1) — not rebuilt.
+> See `docs/mcp-server.md` Phase 2 and `docs/user-manual/mcp.md`.
 
 6 write/execute tools for the MCP server:
 - `set_tag`, `delete_tag` — device tag management

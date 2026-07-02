@@ -58,6 +58,14 @@ public:
     /// touch the lifecycle (submit/approve/reject/consume are elsewhere).
     std::optional<Approval> get(const std::string& id) const;
 
+    /// Newest PENDING approval matching (definition_id, submitted_by,
+    /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
+    /// (#289 / governance UP-1): reusing an extant pending ticket makes the mint
+    /// idempotent and stops a supervised token flooding the global pending cap.
+    std::optional<Approval> find_pending(const std::string& definition_id,
+                                         const std::string& submitted_by,
+                                         const std::string& scope_expression) const;
+
     int pending_count() const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,

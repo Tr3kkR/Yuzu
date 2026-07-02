@@ -1,5 +1,6 @@
 #include "approval_manager.hpp"
 #include "migration_runner.hpp"
+#include "secure_random.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -10,15 +11,17 @@ namespace yuzu::server {
 
 namespace {
 
-std::string generate_id() {
-    static thread_local std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<uint64_t> dist;
-    auto hi = dist(rng);
-    auto lo = dist(rng);
-    char buf[33];
-    std::snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(hi),
-                  static_cast<unsigned long long>(lo));
-    return std::string(buf, 32);
+// Approval ids are BEARER CAPABILITIES: an MCP approval-ticket recall (#289) is
+// authorized by presenting the id, and the bound args are not secret. A
+// predictable id — e.g. mt19937 state recovered from prior outputs — would let
+// an attacker ride another operator's approved-but-unconsumed ticket
+// (governance UP-4). Draw from the CSPRNG (RAND_bytes / BCryptGenRandom) instead;
+// 16 bytes = 128-bit unguessable. Entropy failure fails the mint closed.
+std::expected<std::string, std::string> generate_id() {
+    auto hex = yuzu::server::random_hex(16);
+    if (!hex)
+        return std::unexpected(std::string("secure approval-id generation failed"));
+    return *hex;
 }
 
 int64_t now_epoch() {
@@ -140,7 +143,10 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         }
     }
 
-    auto id = generate_id();
+    auto id_r = generate_id();
+    if (!id_r)
+        return std::unexpected(id_r.error());
+    auto id = *id_r;
     auto ts = now_epoch();
 
     const char* sql = R"(
@@ -257,6 +263,44 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
 }
 
 // ---------------------------------------------------------------------------
+// Find an existing PENDING approval matching (definition_id, submitted_by,
+// scope_expression) — the MCP approval-ticket mint dedup key (#289 / governance
+// UP-1). Returning the extant ticket instead of minting a new one makes the mint
+// idempotent and bounds a single principal's junk to distinct (tool,args) tuples,
+// so a supervised token can no longer flood the GLOBAL pending-approval cap
+// shared with the REST instruction-approval workflow. Newest match wins.
+// ---------------------------------------------------------------------------
+
+std::optional<Approval> ApprovalManager::find_pending(const std::string& definition_id,
+                                                      const std::string& submitted_by,
+                                                      const std::string& scope_expression) const {
+    if (!db_ || definition_id.empty() || submitted_by.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(mtx_);
+
+    const char* sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
+                      "FROM approvals WHERE definition_id = ? AND submitted_by = ? "
+                      "AND scope_expression = ? AND status = 'pending' "
+                      "ORDER BY submitted_at DESC LIMIT 1";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+
+    sqlite3_bind_text(stmt, 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<Approval> out;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        out = row_to_approval(stmt);
+
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Consume (#289 — one-time MCP approval ticket)
 // ---------------------------------------------------------------------------
 
@@ -351,10 +395,15 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     if (reviewer == submitted_by)
         return std::unexpected("reviewer cannot be the same as the submitter");
 
-    // Atomic update: WHERE status = 'pending' prevents TOCTOU double-approve (G4-UHP-MCP-005)
+    // Atomic update; WHERE status = 'pending' prevents TOCTOU double-approve
+    // (G4-UHP-MCP-005). RETURNING carries the "row matched" signal in the step
+    // return code (SQLITE_ROW = this call transitioned it; SQLITE_DONE = already
+    // reviewed / not pending), so we never call sqlite3_changes() on the shared
+    // FULLMUTEX connection — approve/reject is now reachable via MCP, and the
+    // changes()-race would mis-report a security decision (#1033 / governance UP-2).
     const char* sql = R"(
         UPDATE approvals SET status = ?, reviewed_by = ?, reviewed_at = ?, review_comment = ?
-        WHERE id = ? AND status = 'pending'
+        WHERE id = ? AND status = 'pending' RETURNING 1
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -366,20 +415,19 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     sqlite3_bind_text(stmt, 4, comment.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 5, id.c_str(), -1, SQLITE_TRANSIENT);
 
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+    auto rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        return std::unexpected("update failed: " + err);
+        spdlog::info("ApprovalManager: {} approval {} by {}", status, id, reviewer);
+        return {};
     }
-
-    auto changes = sqlite3_changes(db_);
-    sqlite3_finalize(stmt);
-
-    if (changes == 0)
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
         return std::unexpected("approval already reviewed by another user");
-
-    spdlog::info("ApprovalManager: {} approval {} by {}", status, id, reviewer);
-    return {};
+    }
+    auto err = std::string(sqlite3_errmsg(db_));
+    sqlite3_finalize(stmt);
+    return std::unexpected("update failed: " + err);
 }
 
 } // namespace yuzu::server

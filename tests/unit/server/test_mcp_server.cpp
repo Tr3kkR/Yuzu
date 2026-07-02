@@ -4259,6 +4259,86 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     sqlite3_close(raw);
 }
 
+// Governance qa-SHOULD-1: a ticket minted for one tool must not authorize a
+// DIFFERENT tool — the `definition_id = "mcp." + tool_name` binding is the
+// privilege-escalation guard. Mint for delete_tag, present the (approved) id to
+// quarantine_device → denied, and the delete_tag ticket stays consumable.
+TEST_CASE("MCP approval ticket cannot be reused across tools",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised"); // both delete_tag and quarantine_device are approval-gated here
+
+    // Mint + approve a delete_tag ticket.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":230,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    // Present the delete_tag ticket to quarantine_device → definition_id mismatch.
+    std::string cross = R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-1","approval_id":")" +
+                        approval_id + R"("}}})";
+    auto res = ts.call(cross);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    // The ticket was NOT consumed — it still executes its real delete_tag request.
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":232,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto ok = ts.call(recall);
+    CHECK(write_tool_payload(ok)["deleted"] == true);
+    sqlite3_close(raw);
+}
+
+// Governance UP-1 (BLOCKING): the approval mint is deduplicated — two identical
+// first-calls return the SAME approval_id and leave exactly one pending row, so a
+// token cannot flood the shared pending-approval cap.
+TEST_CASE("MCP approval mint dedups identical pending requests",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    const char* call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":240,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})";
+    auto id1 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
+                   .get<std::string>();
+    auto id2 = nlohmann::json::parse(ts.call(call)->body)["error"]["data"]["approval_id"]
+                   .get<std::string>();
+    CHECK(id1 == id2);              // same ticket handed back
+    CHECK(appr.pending_count() == 1); // exactly one row, not two
+    sqlite3_close(raw);
+}
+
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
           "[mcp][integration][approval]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};

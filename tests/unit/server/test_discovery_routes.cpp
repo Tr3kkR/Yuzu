@@ -316,8 +316,8 @@ TEST_CASE("discover.scope-kinds: static catalog shape", "[discovery][scope_kinds
     // attribute_kinds mirrors scope_kind_catalog() 1:1.
     CHECK(j["attribute_kinds"].size() == yuzu::server::detail::scope_kind_catalog().size());
 
-    // 11 CompOp values published, each carrying a non-empty token.
-    CHECK(j["operators"].size() == 11);
+    // Every CompOp value published, each carrying a non-empty token.
+    CHECK(j["operators"].size() == yuzu::scope::kCompOpCount);
     for (const auto& op : j["operators"])
         CHECK_FALSE(op["token"].get<std::string>().empty());
 
@@ -412,7 +412,10 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
 TEST_CASE("CROSS-CHECK: comp_op_catalog covers every CompOp value (G9-style drift guard)",
           "[discovery][scope_kinds][crosscheck]") {
     const auto& catalog = yuzu::server::comp_op_catalog();
-    CHECK(catalog.size() == 11);
+    // Bound to the enum's single-source count, not a hardcoded literal — the
+    // catalog array is sized by kCompOpCount, so this also proves the two agree
+    // (governance arch-SHOULD-4 / cpp-expert: the -Wswitch signal is not portable).
+    CHECK(catalog.size() == yuzu::scope::kCompOpCount);
     std::vector<std::string> tokens;
     for (const auto& e : catalog) {
         auto tok = yuzu::scope::operator_token(e.op);

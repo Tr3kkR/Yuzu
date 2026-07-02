@@ -766,7 +766,14 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute"}},
     {"get_bundle_result", {"Response", "Read"}},
-    // Planned write tools (security metadata pre-registered)
+    // Write tools (#289). NOTE (governance S3/UP-3): the op here drives the C8
+    // TIER gate (tier_allows / requires_approval), NOT per-handler RBAC — each
+    // handler separately calls perm_fn with its REST-verified op (approve/reject →
+    // Approval:Approve, quarantine → Security:Execute). quarantine_device is mapped
+    // to Security:WRITE deliberately, because requires_approval() keys the
+    // supervised approval gate on Security:Write (mcp_policy.hpp); "aligning" this
+    // to Security:Execute would SILENTLY disable the approval gate on live device
+    // isolation. Do not change without re-checking mcp_policy.hpp::requires_approval.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
     {"quarantine_device", {"Security", "Write"}},
@@ -1551,10 +1558,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string supplied_id = param_str(args, "approval_id");
 
                     if (supplied_id.empty()) {
-                        // First call → mint a ticket. #1643 note: this is the
-                        // same one-audit-per-attempt cost the old deny path had,
-                        // plus one persisted `approvals` row (bounded by
-                        // ApprovalManager's 1000-pending cap + 7-day expiry).
+                        // First call → mint a ticket, but DEDUP first (governance
+                        // UP-1 BLOCKING): if this principal already has a pending
+                        // ticket for the exact same (tool, args), hand it back
+                        // instead of minting another. An idempotent mint bounds a
+                        // supervised token's junk to distinct (tool,args) tuples,
+                        // so it can no longer flood the GLOBAL 1000-pending cap that
+                        // ApprovalManager shares with the REST instruction-approval
+                        // workflow (cross-surface DoS). #1643: the one-audit-per-
+                        // attempt cost remains, but no unbounded row growth.
+                        if (auto existing = approval_manager->find_pending(
+                                definition_id, session->username, canon)) {
+                            mcp_audit("pending", "approval_id=" + existing->id + " (deduped)");
+                            res.set_content(
+                                approval_required_error(
+                                    existing->id,
+                                    "an admin must approve this approval_id (see status_url), then "
+                                    "re-call this tool with the approval_id argument to execute"),
+                                "application/json");
+                            return;
+                        }
                         auto submitted =
                             approval_manager->submit(definition_id, session->username, canon);
                         if (!submitted) {
@@ -4104,6 +4127,70 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Server-side input validation BEFORE any store write or dispatch
+                // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
+                // reaches the agent's netsh/iptables/pf sink; the agent already
+                // allow-lists each IP (is_safe_ip), but this PR opens the FIRST
+                // reachable path to that sink (REST /quarantine is record-only), so
+                // we validate at the server edge too (deploy-path precedent: reject
+                // shell-metachar/oversized input loudly, don't silently drop it).
+                if (reason.size() > 1024) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "reason exceeds 1024 characters"),
+                        "application/json");
+                    return;
+                }
+                if (whitelist.size() > 512) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "whitelist exceeds 512 characters"),
+                        "application/json");
+                    return;
+                }
+                {
+                    // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45)
+                    // so we reject anything the agent would silently drop, loudly.
+                    auto safe_ip = [](std::string_view tok) {
+                        if (tok.empty() || tok.size() > 45)
+                            return false;
+                        for (char c : tok)
+                            if (!(std::isxdigit(static_cast<unsigned char>(c)) || c == '.' ||
+                                  c == ':'))
+                                return false;
+                        return true;
+                    };
+                    bool bad = false;
+                    size_t start = 0;
+                    while (start <= whitelist.size() && !bad) {
+                        size_t comma = whitelist.find(',', start);
+                        auto tok = whitelist.substr(
+                            start, comma == std::string::npos ? std::string::npos : comma - start);
+                        // trim surrounding spaces
+                        auto b = tok.find_first_not_of(' ');
+                        auto e = tok.find_last_not_of(' ');
+                        if (b != std::string::npos)
+                            tok = tok.substr(b, e - b + 1);
+                        else
+                            tok.clear();
+                        if (!tok.empty() && !safe_ip(tok))
+                            bad = true;
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    if (bad) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "whitelist must be comma-separated IPv4/IPv6 literals"),
+                            "application/json");
+                        return;
+                    }
+                }
+                // NOTE (governance sec-LOW-1 / UP-6): live isolation preserves the
+                // agent's EXISTING management connection (iptables ESTABLISHED,RELATED
+                // etc.), so the agent can still receive the un-quarantine command over
+                // that link. It does NOT explicitly whitelist the server address for a
+                // fresh reconnect — a pre-existing quarantine-plugin design (the plugin
+                // takes no server_ip param), tracked as a follow-up, not introduced here.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);

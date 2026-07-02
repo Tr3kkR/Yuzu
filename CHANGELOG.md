@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
+  are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+  and `quarantine_device` (records the quarantine and dispatches live isolation).
+  Approval-gated tools use a ticket-then-recall flow: the first call returns
+  `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after a second
+  principal approves, the caller re-invokes with the `approval_id` and the ticket is
+  consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
+  the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+- **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
+  instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
+  an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
+  scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
+  degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
+  `status_url` target); the `auth_routes` denial shapes are unified into one A4
+  envelope carrying `correlation_id` and the missing `securable_type:operation`; the
+  ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -13,6 +14,16 @@ namespace yuzu::scope {
 // -- Comparison operators ----------------------------------------------------
 
 enum class CompOp { Eq, Neq, Like, Lt, Gt, Le, Ge, In, Contains, Matches, Exists };
+
+// Single source of truth for "how many CompOp values exist". When you add a
+// CompOp enumerator you MUST bump this AND add a `comp_op_catalog()` entry in
+// discover_routes.cpp — a `static_assert` there binds the catalog size to this
+// constant, so a mismatch is a portable BUILD failure on every compiler (the
+// exhaustive-switch `-Wswitch` signal in operator_token/eval_condition is
+// GCC/Clang-only and non-fatal, so it is not a sufficient guard on its own —
+// governance arch-SHOULD-4 / cpp-expert). Not a `CompOp::_Count` sentinel on
+// purpose: that would force a dummy case into every exhaustive CompOp switch.
+inline constexpr std::size_t kCompOpCount = 11;
 
 // -- Expression AST ----------------------------------------------------------
 

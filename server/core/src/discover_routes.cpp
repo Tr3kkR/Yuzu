@@ -3,6 +3,7 @@
 #include "agent_registry.hpp"
 #include "http_route_sink.hpp"
 #include "openapi_spec_access.hpp"
+#include "rest_a4_envelope_http.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -174,9 +175,11 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
 
 // ── /discover/scope-kinds ──────────────────────────────────────────────────
 
-const std::array<CompOpEntry, 11>& comp_op_catalog() {
+// Bind the catalog size to the enum's single-source count so adding a CompOp
+// without a catalog entry is a portable BUILD failure (governance arch-SHOULD-4).
+const std::array<CompOpEntry, yuzu::scope::kCompOpCount>& comp_op_catalog() {
     using yuzu::scope::CompOp;
-    static const std::array<CompOpEntry, 11> catalog = {{
+    static const std::array<CompOpEntry, yuzu::scope::kCompOpCount> catalog = {{
         {CompOp::Eq, "Eq", "Case-insensitive equality."},
         {CompOp::Neq, "Neq", "Case-insensitive inequality."},
         {CompOp::Like, "Like", "SQL-style wildcard match (% and _)."},
@@ -291,6 +294,21 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
 
 namespace {
 
+// A4-shaped 503 for the discovery surface. This surface exists to *teach* the
+// A4 envelope to agentic workers, so its own degraded path must speak A4 (govern-
+// ance: docs-writer BLOCKING + arch/unhappy/consistency SHOULD). a4_error mints
+// the X-Correlation-Id header and derives the body `code` from res.status.
+void discover_503(httplib::Response& res, std::string_view message) {
+    res.status = 503;
+    res.set_content(detail::a4_error(res, message,
+                                     detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                         .remediation = "retry after server "
+                                                                        "warmup; the discovery "
+                                                                        "store initialises "
+                                                                        "during startup"}),
+                    "application/json");
+}
+
 void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacStore* rbac_store,
                       InstructionStore* instruction_store,
                       yuzu::server::detail::AgentRegistry* agent_registry) {
@@ -299,11 +317,16 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  if (!rbac_store || !rbac_store->is_open()) {
-                     res.status = 503;
-                     res.set_content(R"({"error":"service unavailable"})", "application/json");
+                     discover_503(res, "discovery store unavailable");
                      return;
                  }
-                 serve_doc(req, res, build_permissions_catalog(*rbac_store));
+                 // A corrupt/locked store row can throw mid-scan — a raw 500 would
+                 // break the A4 contract this surface teaches (governance UP-11).
+                 try {
+                     serve_doc(req, res, build_permissions_catalog(*rbac_store));
+                 } catch (const std::exception&) {
+                     discover_503(res, "discovery store read failed");
+                 }
              });
 
     sink.Get("/api/v1/discover/instructions",
@@ -311,11 +334,14 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
                  if (!perm_fn(req, res, "InstructionDefinition", "Read"))
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
-                     res.status = 503;
-                     res.set_content(R"({"error":"service unavailable"})", "application/json");
+                     discover_503(res, "discovery store unavailable");
                      return;
                  }
-                 serve_doc(req, res, build_instructions_catalog(*instruction_store));
+                 try {
+                     serve_doc(req, res, build_instructions_catalog(*instruction_store));
+                 } catch (const std::exception&) {
+                     discover_503(res, "discovery store read failed");
+                 }
              });
 
     sink.Get("/api/v1/discover/routes",
@@ -340,11 +366,14 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::PermFn perm_fn, RbacS
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  if (!agent_registry) {
-                     res.status = 503;
-                     res.set_content(R"({"error":"service unavailable"})", "application/json");
+                     discover_503(res, "discovery store unavailable");
                      return;
                  }
-                 serve_doc(req, res, build_plugins_catalog(*agent_registry));
+                 try {
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry));
+                 } catch (const std::exception&) {
+                     discover_503(res, "discovery store read failed");
+                 }
              });
 }
 
