@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 3.0 | **Date:** 2026-03-30 | **Status:** Draft
+**Version:** 4.0 | **Date:** 2026-07-02 | **Status:** Draft — re-baselined against shipped state (v0.13.0-rc) per `docs/capability-industry-review-2026-07.md` §2
 
 ---
 
@@ -27,50 +27,58 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 ```
-Foundation   [================================]  33/33 done  (100%)
-Advanced     [================================]  101/101 done (100%)
-Future       [=====================-----------]  33/50 done  (66%)
-New (Ph 8-16)[=---------------------------]     2/44 done   (5%) (5 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 + 28.7 fleet-viz in flight)
+Foundation   [================================]  59/59 done (100%)
+Advanced     [===========================-----]  140/168 done (83%) (10 partial)
+Future       [=========-----------------------]  10/34 done (29%) (1 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   172/228 done (75%)
+Overall      [==========================------]  209/261 done (80%) (11 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
-| 1. Agent Lifecycle | 9 | 9 | 0 | 0 |
-| 2. Command Execution | 13 | 13 | 0 | 0 |
-| 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
-| 4. Network Info & Discovery | 11 | 9 | 0 | 2 |
-| 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
-| 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
-| 7. Software & App Mgmt | 6 | 6 | 0 | 0 |
-| 8. Patch & Update Mgmt | 9 | 8 | 0 | 1 |
-| 9. Security & Compliance | 10 | 9 | 0 | 1 |
+| 1. Agent Lifecycle Management | 9 | 9 | 0 | 0 |
+| 2. Command Execution and Orchestration | 13 | 13 | 0 | 0 |
+| 3. Device and Endpoint Information | 10 | 8 | 0 | 2 |
+| 4. Network Information and Discovery | 11 | 9 | 0 | 2 |
+| 5. Process and Service Management | 5 | 4 | 0 | 1 |
+| 6. User and Session Management | 5 | 5 | 0 | 0 |
+| 7. Software and Application Management | 6 | 6 | 0 | 0 |
+| 8. Patch and Update Management | 9 | 8 | 0 | 1 |
+| 9. Security and Compliance | 10 | 9 | 0 | 1 |
 | 10. File System Operations | 15 | 14 | 0 | 1 |
-| 11. Script & Command Exec | 4 | 4 | 0 | 0 |
-| 12. Registry & System Config | 7 | 7 | 0 | 0 |
-| 13. Content Distribution | 5 | 5 | 0 | 0 |
+| 11. Script and Command Execution | 4 | 4 | 0 | 0 |
+| 12. Registry and System Configuration | 7 | 7 | 0 | 0 |
+| 13. Content Distribution | 5 | 4 | 0 | 1 |
 | 14. User Interaction | 6 | 3 | 0 | 3 |
-| 15. Inventory & Data Collection | 5 | 4 | 0 | 1 |
-| 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
-| 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 10 | 9 | 0 | 1 |
-| 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
-| 20. Response Collection | 7 | 7 | 0 | 0 |
-| 21. Notifications & Audit | 5 | 4 | 0 | 1 |
-| 22. System & Infrastructure | 10 | 7 | 0 | 3 |
-| 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
-| 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
+| 15. Inventory and Data Collection | 5 | 5 | 0 | 0 |
+| 16. Policy and Compliance Engine | 8 | 8 | 0 | 0 |
+| 17. Triggers and Event-Driven Automation | 7 | 7 | 0 | 0 |
+| 18. Server: Authentication and Authorization | 10 | 10 | 0 | 0 |
+| 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
+| 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
+| 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
+| 22. Server: System and Infrastructure | 10 | 7 | 0 | 3 |
+| 23. Agent-Side Key-Value Storage | 3 | 3 | 0 | 0 |
+| 24. Integration and Extensibility | 10 | 8 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
-| 26. Inventory Repositories | 4 | 0 | 0 | 4 |
-| 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 9 | 0 | 3 | 6 |
+| 26. Inventory Repositories | 4 | 0 | 1 | 3 |
+| 27. Software Catalog & Licensing | 5 | 0 | 1 | 4 |
+| 28. Response Visualization | 9 | 6 | 1 | 2 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
-| 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **228** | **172** | **6** | **50** |
+| 31. System Guardian | 10 | 3 | 5 | 2 |
+| 32. DEX | 7 | 6 | 0 | 1 |
+| 33. Network Quality | 4 | 3 | 0 | 1 |
+| 34. Device Pages and Live Snapshot | 3 | 3 | 0 | 0 |
+| 35. Agent Daily-Sync Inventory | 5 | 3 | 1 | 1 |
+| 36. `/auto` | 3 | 3 | 0 | 0 |
+| 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
+| 38. Server Storage Substrate | 4 | 3 | 1 | 0 |
+| **TOTAL** | **261** | **209** | **11** | **41** |
 
-> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
+> This section is **generated** from the per-entry status icons by the re-baseline script (see `docs/capability-industry-review-2026-07.md` R1) — re-run it after editing entries rather than hand-editing these numbers. Tier tallies count entries by their `T1`/`T2`/`T3` labels; the former "New (Ph 8-16)" row is retired (those phases are now regular domains 25–31 plus the 2026 additions 32–38).
+
+> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done; scale is proven to 10K agents, not the 100K+ the tier language once implied. The production-quality dimension is tracked by `docs/capability-agentic-audit-2026-05.md` and `docs/capability-industry-review-2026-07.md` (Parts 2 and 4 — corrections ledger, maturity assessment, and industry benchmark); subsequent reviews should keep both current.
 
 ---
 
@@ -82,7 +90,7 @@ Overall      [======================---------]   172/228 done (75%)
 
 3-tier enrollment model: manual approval (Tier 1), pre-shared tokens (Tier 2), and platform trust (Tier 3, reserved). gRPC `Register` RPC with enrollment token support.
 
-> **Gap:** Tier 3 server-side certificate validation not implemented.
+> **Closed 2026-06:** superseded by the internal-PKI ladder — per-agent mTLS (CSR at enrollment → server-signed leaf), revocation/CRL, subordinate-CA mode. See §37 and `docs/pki-architecture.md`.
 
 ### 1.2 Heartbeat and Session Keepalive :white_check_mark: `T1`
 
@@ -433,6 +441,8 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 `vuln_scan` plugin + NVD database sync on server.
 
+> **Caveat:** first-generation matcher; the modern-engine redesign is an unmerged spike (PR #1206, `docs/vuln-scan-engine-design.md`). No EPSS/KEV/exploit-intelligence enrichment yet.
+
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 
 `event_logs` plugin (cross-platform).
@@ -649,7 +659,7 @@ Not implemented. List all active survey/question responses waiting for user inpu
 
 `QueryInventory` RPC on management API. Server stores inventory.
 
-> **Gap:** No advanced query language (filtering, joins).
+> **Closed:** `inventory_eval` (§15.4) provides condition evaluation; the ADR-0016 daily-sync tier (§35) adds normalized, typed, queryable software/device-CI inventory.
 
 ### 15.3 Inventory Table Enumeration :white_check_mark: `T2`
 
@@ -659,9 +669,9 @@ Not implemented. List all active survey/question responses waiting for user inpu
 
 `inventory_eval.hpp/cpp` evaluation engine. JSON dot-path field extraction, 10 comparison operators including version_gte/version_lte (semver-aware). REST: `POST /api/v1/inventory/evaluate` with conditions array and AND/OR combine.
 
-### 15.5 Inventory Replication (Local Replica) :x: `T3`
+### 15.5 Inventory Replication (Delta Sync) :white_check_mark: `T3`
 
-Not implemented. Agent-side cache with delta sync.
+Shipped via the ADR-0016 daily-sync framework: per-source hash-skip when unchanged (delta-equivalent), stable per-agent phase spread, server `need_full` cold-cache resend, weekly full floor. See §35.
 
 ---
 
@@ -676,6 +686,8 @@ Not implemented. Agent-side cache with delta sync.
 ### 16.2 Policy Evaluation and Enforcement :white_check_mark: `T2`
 
 `PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). Trigger-based evaluation with configurable trigger types (interval, file_change, service_status, event_log, registry, startup).
+
+> **Correction (2026-06):** the check→verdict→status path was dead code until the `PolicyEvaluator` background thread (10s cadence, ≥60s interval floor) was wired in `server.cpp` — policies now actually evaluate on cadence. See `docs/user-manual/policy-engine.md`.
 
 ### 16.3 Policy Assignment to Device Groups :white_check_mark: `T2`
 
@@ -777,9 +789,9 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `httplib::SSLServer` with OpenSSL. CLI flags: `--https`, `--https-port`, `--https-cert`, `--https-key`, `--no-https-redirect`. HTTP-to-HTTPS 301 redirect. Secure cookie flag. Settings UI TLS configuration section.
 
-### 18.10 Two-Factor Authentication for Approvals :x: `T2`
+### 18.10 Two-Factor Authentication :white_check_mark: `T2`
 
-Not implemented. TOTP (RFC 6238) second factor for instruction approval workflows. Per-user TOTP enrollment with QR code, email-based OTP fallback.
+TOTP (RFC 6238) shipped (`totp.hpp`, per-user enrollment via Settings) plus session **MFA step-up** on high-risk REST/Settings handlers (`mfa_step_up.{hpp,cpp}`, SOC 2 CC6.6 ladder PR1/PR2). Approval-workflow-specific OTP prompts remain follow-on work.
 
 ---
 
@@ -847,7 +859,11 @@ Named response-view configurations (column subset, sort order, filter presets) a
 
 ### 20.7 Response Offloading :white_check_mark: `T3`
 
-Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
+Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire (§28.3 is the same feature and cross-references here). Sibling `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
+
+### 20.8 Executions-History Ladder and Agentic Event Stream :white_check_mark: `T2`
+
+`command_id → execution_id` correlation (`cmd_execution_ids_`), the `ExecutionEventBus`, the executions drawer, and the `/api/v1/events` JSON SSE channel — the first surface satisfying agentic invariants A3+A4. See `docs/executions-history-ladder.md`.
 
 ---
 
@@ -874,6 +890,10 @@ Operator-registered external HTTP endpoints (*offload targets*) that receive a c
 ### 21.5 Event Source Management :x: `T3`
 
 Not implemented. Configure which events generate notifications.
+
+### 21.6 Behavioral-PII Access-Audit Chokepoint :white_check_mark: `T2`
+
+`rest_audit.hpp` (#1647): every per-device/per-signal behavioral-PII read funnels through one audit kernel — REST fails closed (503 + `Sec-Audit-Failed`, no PII served) when the audit row cannot persist; dashboard/MCP surfaces are set-and-proceed with the failure signalled. Works-council/GDPR-grade access accountability.
 
 ---
 
@@ -915,11 +935,11 @@ Not implemented. Distribute versioned binary resources via server.
 
 ### 22.9 Database Sharding (Response Partitioning) :x: `T3`
 
-Not implemented. Time-partitioned response storage (monthly SQLite files) with automatic rotation, TTL cleanup, and transparent cross-partition query routing.
+Not implemented — and **superseded**: the server storage substrate is now PostgreSQL (ADR-0006/0008/0012, see §38); scale-out is a Postgres story, not SQLite partitioning. Entry retained for history.
 
 ### 22.10 High Availability (Active-Passive) :x: `T3`
 
-Not implemented. Active-passive failover with shared storage, inter-server heartbeat, automatic failover on primary health check failure, and gateway re-registration.
+Not implemented. Active-passive failover with shared storage, inter-server heartbeat, automatic failover on primary health check failure, and gateway re-registration. The Postgres substrate (§38) now makes standard managed-PG HA reachable; failover orchestration remains unbuilt.
 
 ---
 
@@ -977,6 +997,8 @@ Not implemented. Client libraries wrapping the management API for third-party in
 
 Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status, check compliance, and investigate agents. Phase 1: 22 read-only tools (`list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`), 3 resources (`yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`), 4 prompts (`fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`).
 
+> **Update 2026-07:** ~59 tools registered (DEX perf twins, TAR, inventory, executions added); `execute_instruction` is a tracked-execution producer (#1088). **The write surface remains one dispatched tool** — `set_tag` / `delete_tag` / `approve_request` / `reject_request` / `quarantine_device` are security-mapped but undispatched (Issue 13.5).
+
 ### 24.9 MCP Authorization Tiers :white_check_mark: `T2`
 
 Three-tier authorization model enforced before RBAC: `readonly` (read-only tools), `operator` (+ tag writes, auto-approved executions), `supervised` (all operations via approval workflow). MCP tokens use existing API token system with `mcp_tier` column. Mandatory expiration (max 90 days). Kill switch: `--mcp-disable` rejects all MCP requests, `--mcp-read-only` blocks non-read tools.
@@ -1025,9 +1047,9 @@ Not implemented. Named repositories per type (inventory, compliance, entitlement
 
 Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records.
 
-### 26.3 Software Normalization :x: `T2`
+### 26.3 Software Normalization :large_orange_diamond: `T2`
 
-Not implemented. Vendor/title/version canonicalization pipeline. Normalize raw inventory entries to canonical software identities.
+Partially shipped via ADR-0016: server-recomputed canonical software rows (`SoftwareInventoryStore`) + fleet catalogue rollup (`software_catalog_rollup.*`). Single-source (agent-reported) only — connector-fed multi-source normalization remains open.
 
 ### 26.4 WSUS / CSV / File Upload Connectors :x: `T2`
 
@@ -1039,9 +1061,9 @@ Not implemented. WSUS database connector for patch compliance. CSV/TSV file uplo
 
 *Normalized software identification and license compliance management.*
 
-### 27.1 Software Catalog Store :x: `T2`
+### 27.1 Software Catalog Store :large_orange_diamond: `T2`
 
-Not implemented. Canonical software registry (vendor, title, version, edition, platform) with manual curation and automatic matching from raw inventory.
+Partially shipped: fleet software catalogue derived from ADR-0016 inventory (`software_catalog_rollup`, `/inventory` dashboard). Manual curation, edition normalization, and entitlement linkage remain open.
 
 ### 27.2 Software Usage Tracking :x: `T2`
 
@@ -1073,13 +1095,13 @@ Implemented. Server-side data transformation with built-in processors (`single_s
 
 Implemented. Named response view configurations stored per `InstructionDefinition` in a `response_templates_spec` JSON column. Synthesised `__default__` view from `spec.result.columns` or plugin schema. REST CRUD + dashboard View dropdown. See §20.6 for the full contract. Phase 8.2, issue #254.
 
-### 28.3 Response Offloading :x: `T2`
+### 28.3 Response Offloading :white_check_mark: `T2`
 
-Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.
+Shipped — this entry previously contradicted §20.7, which documents the same feature as Done (`OffloadTargetStore`, typed auth, server-side batching). See §20.7.
 
-### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
+### 28.4 TAR Dashboard Page :white_check_mark: `T2`
 
-In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+Shipped. The `/tar` page consolidates every operator-facing TAR affordance: the retention-paused-sources frame with typed-confirmation source purge (15.A), the read-only ad-hoc SQL frame with save-as-result-set (15.D), the process-tree viewer (15.H, §28.5), the Capture-sources toggle frame (ADR-0015), and the device DNS-cache/ARP panels. REST/MCP parity for the process tree is a tracked follow-up (#1562). Design: `docs/tar-dashboard.md`.
 
 ### 28.5 TAR Process Tree Viewer :white_check_mark: `T2`
 
@@ -1091,7 +1113,7 @@ Shipped (Phase 15.A). Operator-facing aggregate view of every device × source p
 
 ### 28.7 Fleet Topology 3D Visualization :large_orange_diamond: `T2`
 
-In progress (`feat/viz-engine` branch, 11-PR ladder; PRs 1–7 shipped). `/viz/fleet` page renders the fleet as translucent cubes (one per agent) with interior process dots coloured by category (`system`, `browser`, `database`, `web`, `runtime`, `other`). Backed by an aggregating `FleetTopologyStore` (60s LRU-of-2 cache, single-flight refill) producing a `fleet_topology.v1` JSON envelope. REST: `GET /api/v1/viz/fleet/topology` + HTMX fragment `/fragments/viz/fleet/topology`. WASD/orbit/zoom camera, hostname `Sprite` labels, hover tooltip with raycaster, kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (default 5000 / ceiling 100000), tier-before-permission ordering, audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate`. Remaining rungs: PR 8 intra-cube localhost edges, PR 9 cross-machine + external edges, PR 10 vulnerability overlay, PR 11 polish (LOD, edge bundling, a11y, InstancedMesh). Design: `docs/plans/feat-viz-engine-plan-2026-05-09.md`. Standing invariants: `docs/fleet-viz-invariants.md`.
+In progress — PRs 1–7 of the 11-PR ladder merged to dev 2026-05-15 (#1032, `cb2dfa1`); remaining rungs 8–11 (localhost/cross-machine edges, vulnerability overlay, polish) deferred as issues #1018–#1021. `/viz/fleet` page renders the fleet as translucent cubes (one per agent) with interior process dots coloured by category (`system`, `browser`, `database`, `web`, `runtime`, `other`). Backed by an aggregating `FleetTopologyStore` (60s LRU-of-2 cache, single-flight refill) producing a `fleet_topology.v1` JSON envelope. REST: `GET /api/v1/viz/fleet/topology` + HTMX fragment `/fragments/viz/fleet/topology`. WASD/orbit/zoom camera, hostname `Sprite` labels, hover tooltip with raycaster, kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (default 5000 / ceiling 100000), tier-before-permission ordering, audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate`. Remaining rungs: PR 8 intra-cube localhost edges, PR 9 cross-machine + external edges, PR 10 vulnerability overlay, PR 11 polish (LOD, edge bundling, a11y, InstancedMesh). Design: `docs/plans/feat-viz-engine-plan-2026-05-09.md`. Standing invariants: `docs/fleet-viz-invariants.md`.
 
 ### 28.8 Threat Graph Mode :x: `T2`
 
@@ -1156,13 +1178,13 @@ Largely shipped (Phase 15.G). Shipped: live re-eval (sibling result set), backgr
 
 *The agent-side primitive that makes guaranteed state **operationally true** rather than approximately true. PolicyStore (§16) evaluates desired-state rules on a poll-based schedule — typical 5-minute cadence. For security-sensitive settings ("this firewall port must never be open," "this registry value must never change," "this EDR process must always run") a 5-minute window is unacceptable. System Guardian uses **kernel-backed user-mode notification APIs** to detect drift within microseconds of it occurring, remediate it, and journal the event — even when the server is unreachable, even before any user has logged in. This is the headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Agent runs in user space as SYSTEM (Windows) / root (Linux) / privileged daemon (macOS); no kernel drivers required. Design: `docs/yuzu-guardian-design-v1.1.md`. Windows-first delivery: `docs/yuzu-guardian-windows-implementation-plan.md`.*
 
-### 31.1 Guardian Engine and Wire Protocol :large_orange_diamond: `T2`
+### 31.1 Guardian Engine and Wire Protocol :white_check_mark: `T2`
 
-In progress (PRs 1-2 shipped). Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log. Actions: `push_rules`, `get_status`. Every rule reports `errored` until guard implementations land in PR 3+.
+Shipped (engine + wire + server store + the Baseline deployment model — `baseline_store.*`, `deployed_snapshot` Push-gating; see `docs/guardian-baseline-model.md`). Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log. Actions: `push_rules`, `get_status`. Every rule reports `errored` until guard implementations land in PR 3+.
 
-### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :x: `T2`
+### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :large_orange_diamond: `T2`
 
-Not implemented (PRs 3, 5, 6, 7, 10). Real-time enforcement via four Windows kernel-backed user-mode APIs:
+Partial. The **Registry Guard** (`guard_registry`), **SCM/service guard** (`guard_service`), and a **file guard** (`guard_file`) are live, with enforce-promotion gated by the single `dangerous_enforce_in_spec` chokepoint; WFP and ETW guards remain open. The four designed kernel-backed user-mode APIs:
 - **Registry Guard** — `RegNotifyChangeKeyValue` + `WaitForMultipleObjects` (~0 ms latency); the canonical "registry value must equal X" enforcer.
 - **SCM Guard** — `NotifyServiceStatusChange` (~0 ms latency); enforces "service must remain running/stopped/disabled."
 - **WFP Guard** — `FwpmFilterSubscribeChanges0` (~0 ms latency); defence-in-depth filter monitor for firewall posture.
@@ -1170,9 +1192,9 @@ Not implemented (PRs 3, 5, 6, 7, 10). Real-time enforcement via four Windows ker
 
 Each guard implements `self_test()` on start to prove kernel wiring (sentinel write → expected callback within 500 ms → pass / `errored` mark). Resilience strategies (`Fixed`, `Backoff`, `Escalation`) and `RaceDetector` (sliding-window drifts/second) surface at PR 4.
 
-### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :x: `T2`
+### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :large_orange_diamond: `T2`
 
-Not implemented (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines `Microsoft-Windows-Kernel-Process` ETW (events 1/2 for start/stop, near-real-time) with periodic `CreateToolhelp32Snapshot` poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.
+Partial — the cross-platform service run-state guard shipped via the `make_service_guard()` factory (`guard_systemd.hpp`); process/WMI/software/compliance condition guards remain open (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines `Microsoft-Windows-Kernel-Process` ETW (events 1/2 for start/stop, near-real-time) with periodic `CreateToolhelp32Snapshot` poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.
 
 ### 31.4 Event Guards — Linux :large_orange_diamond: `T3`
 
@@ -1189,25 +1211,191 @@ The systemd service guard landed ahead of the rest of the Linux track (the motiv
 
 Not implemented (PR 17). macOS equivalents using Apple's Endpoint Security (ES) framework — *requires the ES entitlement*, which is a notarised-build / DDM-distributed entitlement that Apple grants per-bundle-ID. Without ES, the macOS guard surface is reduced to `fseventsd`, `launchd` plist polling, and `kqueue` file-watch. Phase 16 macOS delivery is gated on (a) Windows + Linux soak and (b) ES entitlement availability.
 
-### 31.6 State Evaluator and Remediation Engine :x: `T2`
+### 31.6 State Evaluator and Remediation Engine :large_orange_diamond: `T2`
 
-Not implemented (PRs 3, 5+). Assertion registry (`registry-value-equals`, `registry-value-absent`, `service-running`, `service-stopped`, `firewall-port-blocked`, `process-running`, `file-hash-equals`, `kernel-param-equals`, `plist-key-equals`, etc.) returns `compliant | drift | exempt` for a `StateSnapshot`. Remediation methods are **system calls only — no shell-out** (per design §14): `RegSetValueExW` / `RegDeleteValueW` (Win), `INetFwPolicy2` COM (Win firewall), service control via SCM (Win) / systemd D-Bus (Linux) / launchctl (macOS), `/proc/sys` writes (Linux), `defaults write` equivalent via plist serialisation (macOS). Re-entrancy guard per rule with 5 ms suppression window prevents the remediation from triggering its own watch callback.
+Partial — registry/file/service remediation is live behind the `dangerous_enforce_in_spec` denylist (H1 registry persistence keys + critical-service stops); the broader assertion registry remains open. Assertion registry (`registry-value-equals`, `registry-value-absent`, `service-running`, `service-stopped`, `firewall-port-blocked`, `process-running`, `file-hash-equals`, `kernel-param-equals`, `plist-key-equals`, etc.) returns `compliant | drift | exempt` for a `StateSnapshot`. Remediation methods are **system calls only — no shell-out** (per design §14): `RegSetValueExW` / `RegDeleteValueW` (Win), `INetFwPolicy2` COM (Win firewall), service control via SCM (Win) / systemd D-Bus (Linux) / launchctl (macOS), `/proc/sys` writes (Linux), `defaults write` equivalent via plist serialisation (macOS). Re-entrancy guard per rule with 5 ms suppression window prevents the remediation from triggering its own watch callback.
 
-### 31.7 Audit Journal and Server Store :large_orange_diamond: `T2`
+### 31.7 Audit Journal and Server Store :white_check_mark: `T2`
 
-Server store shipped (PR 1 — `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review). Agent-side journal (`agents/core/src/guard_audit.{hpp,cpp}`) lands with PR 3: MPSC queue + dedicated writer thread, SQLite journal table inside `kv_store.db` keyed by monotonic `event_seq`, drained by `GuardianEngine::sync_with_server` into `CommandResponse { plugin: "__guard__", action: "event" }`. Every detection and remediation journaled locally first, synced to server when online.
+Server store shipped (PR 1 — `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review) **and the agent-side journal + server `guardian_ingest` path are live** — the DEX observation layer (§32) rides the same ingest. Original journal design (`agents/core/src/guard_audit.{hpp,cpp}`): MPSC queue + dedicated writer thread, SQLite journal table inside `kv_store.db` keyed by monotonic `event_seq`, drained by `GuardianEngine::sync_with_server` into `CommandResponse { plugin: "__guard__", action: "event" }`. Every detection and remediation journaled locally first, synced to server when online.
 
 ### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2`
 
 Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:136-200`); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational; the *enforcement* half is gated on PR 3+ landing real guards.
 
-### 31.9 Dashboard and Approval Workflow :x: `T2`
+### 31.9 Dashboard and Approval Workflow :large_orange_diamond: `T2`
 
-Not implemented (PRs 4, 11, 14). Dashboard page at `/guaranteed-state` listing rules (with kernel-wiring health indicator — `guard_healthy` + `last_notification` timestamp surface "deaf because subscription silently went nowhere" vs. "compliant because nothing's happening"), event timeline, summary cards, fragments per `docs/yuzu-guardian-design-v1.1.md` §10. Approval workflow reuses the existing `ApprovalManager` with `definition_id = "guaranteed_state_rule_*"` — no manager code changes (already generic). HTMX rule editor (CRUD + YAML validation + conflict detection) at PR 14.
+Partial — the Guardian dashboard and the Baseline draft/deployed lifecycle are shipped (`guardian_page_ui.cpp`; deploys are `Push`-gated, editing a deployed Baseline's members reaches agents only via re-deploy snapshot rewrite — `docs/guardian-baseline-model.md`). Remaining: kernel-wiring health indicator + full HTMX rule editor. Original scope — dashboard page at `/guaranteed-state` listing rules (with kernel-wiring health indicator — `guard_healthy` + `last_notification` timestamp surface "deaf because subscription silently went nowhere" vs. "compliant because nothing's happening"), event timeline, summary cards, fragments per `docs/yuzu-guardian-design-v1.1.md` §10. Approval workflow reuses the existing `ApprovalManager` with `definition_id = "guaranteed_state_rule_*"` — no manager code changes (already generic). HTMX rule editor (CRUD + YAML validation + conflict detection) at PR 14.
 
 ### 31.10 Rule Signing and Quarantine Integration :x: `T2`
 
 Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. Quarantine integration: WFP block-all filter at weight 65535 (Windows) or `iptables` / `nftables` rule (Linux) drops all traffic except Yuzu's own; instruction handlers `quarantine.add_exception | remove_exception | lift`; server-side DNS resolution; resilience reset on lift so a remediation storm doesn't carry over.
+
+---
+
+## 32. DEX — Digital Employee Experience
+
+*Endpoint-experience observation, performance analytics, and upgrade evidence. Shipped 2026-Q2 on the Guardian ingest path (§31.7); previously unmapped. Docs: `docs/dex-signal-catalog.md`, `docs/user-manual/dex.md`, `docs/user-manual/preflight.md`.*
+
+### 32.1 Signal Observation Catalogue :white_check_mark: `T2`
+
+110-signal ruleless observation catalogue (`dex_signal_catalog.*`, engine `dex_observer.*`): crashes, hangs, boot/login degradation, device health. Privacy drops at the edge, per-type rate caps, uniform `detail_json` keys. Windows poll-and-latch (`dex_win_poll.*`) + Linux collector batches (`dex_linux_*`); sustained perf-breach hysteresis (`dex_perf_breach.*`).
+
+### 32.2 Continuous Device Performance Telemetry :white_check_mark: `T2`
+
+TAR `perf` capture source → `$Perf_Live`/`$Perf_Hourly`; per-app top-N process telemetry (`tar_proc_perf.*` → `$ProcPerf_*`, names-only, own toggle); fleet rollup gauges (`yuzu_fleet_perf_*`) + `/dex` device sparklines.
+
+### 32.3 App Performance Over Time :white_check_mark: `T2`
+
+Per-device daily rollups (`app_perf_daily_store.*`, 31d) → fleet aggregates with version-stratified frozen-bucket histograms (`app_perf_fleet_store.*`, 180d); one pure read model feeding REST `/api/v1/dex/perf/*`, MCP twins, and `/fragments/dex/perf/*`.
+
+### 32.4 Fleet Blast-Radius Alerting and Signal Routing :white_check_mark: `T2`
+
+Server-side N-distinct-device incident detector (`dex_blast_radius.*`) firing the `dex.blast_radius` webhook, live-tunable alert shape; per-signal operator routing (`dex_alert_router.*`) with per-(type,agent) cooldown.
+
+### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2`
+
+`/auto` Verify (§36.3): pure compare engine (`app_perf_compare.*`), agent-preserving cohort reader, REST `/dex/perf/compare` + MCP `compare_app_perf_versions`. Evidential — no verdict/threshold; audited `dex.app_perf.compare`. Industry review §3.7: no vendor ships a deploy-pipeline-integrated cohort-paired evidence artifact.
+
+### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2`
+
+`kDexCohortFloor` cohort floors on fleet/group reads (no singling-out), audit-on-open per-device lenses (§21.6), edge privacy drops. Industry review §3.7: no vendor publicly documents a k-anonymity-style cohort floor as a product feature.
+
+### 32.7 Experience Scoring and Sentiment :x: `T3`
+
+Not implemented — deliberately. Composite 0–100 experience scores (with sentiment surveys as an input) are the DEX-market standard; Yuzu currently positions evidence-not-scores. Requires an explicit product decision (industry review R7) plus the §14.4 survey primitive.
+
+---
+
+## 33. Network Quality
+
+*Measurement-first device/local-link health lens. Shipped 2026-06; previously unmapped. Doc: `docs/user-manual/network.md`.*
+
+### 33.1 Device Network Heartbeat Facts :white_check_mark: `T2`
+
+Interval retransmit rate (`RetransWindow` ΔΣretr/ΔΣsegs), RTT, throughput as thin `yuzu.net_*` heartbeat tags. Linux netlink `INET_DIAG`; Windows `GetIfTable2` + `GetTcpStatisticsEx` (retransmit gauge withheld pending validation, #1465; RTT deferred).
+
+### 33.2 Fleet Network Gauges :white_check_mark: `T2`
+
+`yuzu_fleet_net_*` gauges via shared `network_perf_rules.hpp` validators, per-OS labels (never blended cross-OS).
+
+### 33.3 `/network` Dashboard :white_check_mark: `T2`
+
+Fleet and per-device network-health page with honest caveats on unvalidated measurements.
+
+### 33.4 Degraded Classification and Per-Destination Localization :x: `T3`
+
+Deferred — a hard threshold needs real-fleet baseline; the opt-in per-connection `netqual` TAR tier (`$NetQual_Live`, bucket-only) is the shipped foundation for the drill-down.
+
+---
+
+## 34. Device Pages and Live Snapshot
+
+*The shared per-device surface. Shipped 2026-06; previously unmapped. Doc: `docs/user-manual/device-management.md`.*
+
+### 34.1 Fleet List and Device Entity Page :white_check_mark: `T2`
+
+`/devices` + `/device?id=` with Device info / DEX / Guardian lens tabs; per-render scoring only; PII lenses gate `GuaranteedState:Read` + audit-on-open.
+
+### 34.2 Live Snapshot ("Get live info") :white_check_mark: `T2`
+
+Dispatch-and-poll card grid: process tree with SHA-256 per node + live-connection join by PID (dual dispatch), services, users, netconfig, ARP/DNS (Windows), listening/connections, capture sources. Per-kind `device.live.<kind>` audit verbs; `Execution:Execute` gated.
+
+### 34.3 Agentic REST Parity for Device Surfaces :white_check_mark: `T2`
+
+`GET /dex/devices/{id}`, `POST /dex/devices/{id}/live`, agent-scoped guardian events (#1549) — fail-closed 503 + `Sec-Audit-Failed` when the access-audit row cannot persist. One deferred site: the `/live` REST throw-path migration to `rest_audit.hpp` (Stream B).
+
+---
+
+## 35. Agent Daily-Sync Inventory (ADR-0016)
+
+*Kind-to-the-network daily push of per-source endpoint state. Shipped 2026-06; previously unmapped. Docs: `docs/adr/0016-agent-daily-sync-framework.md`, `docs/user-manual/inventory.md`.*
+
+### 35.1 Sync Framework :white_check_mark: `T2`
+
+`SyncScheduler` + `__sync__` KV namespace + `LocalDispatcher`: stable per-agent phase spread, hash-skip when unchanged, server `need_full` cold-cache resend (jittered), weekly full floor. Shared `inventory_ingestion.*` seam wired identically on direct and gateway paths.
+
+### 35.2 Installed-Software Inventory :white_check_mark: `T2`
+
+Source #1 (`sync_source_installed_software.*`) → born-on-PG `SoftwareInventoryStore` (normalized rows, server-recomputed canonical hash, server-receipt freshness per #1685). `Inventory` RBAC securable.
+
+### 35.3 Device CI (Hardware/OS Identity) :large_orange_diamond: `T2`
+
+Source #3 (`sync_source_device_ci.*`) → born-on-PG `DeviceInventoryStore` (serial/UUID/MAC, works-council-relevant). Read surface + CMDB correlation are PR2 (unknown-identifier merge guard mandated).
+
+### 35.4 Software Catalogue and `/inventory` Dashboard :white_check_mark: `T2`
+
+Background catalogue rollup (`software_catalog_rollup.*`) + `/inventory` page + REST. (Cross-referenced from §26.3/§27.1.)
+
+### 35.5 Multi-Source Consolidation :x: `T2`
+
+Not implemented — connector-fed sources and identity-merge consolidation remain the §25/§26 gap.
+
+---
+
+## 36. `/auto` — Operator Automation (Assess → Act → Verify)
+
+*Pre-flight readiness, gated deployment, and paired-cohort verification. Shipped 2026-06; previously unmapped. Doc: `docs/user-manual/preflight.md`.*
+
+### 36.1 Pre-Flight Readiness (ASSESS) :white_check_mark: `T2`
+
+Born-on-PG `PreflightRunStore` + background `PreflightRunner` re-dispatching read-only checks to a frozen cohort; single verdict path (`compute_device_results`); owner-scoped reads; `Infrastructure:Read`+`Execution:Execute` gated.
+
+### 36.2 Deploy (ACT) :white_check_mark: `T2`
+
+Stage+execute on the go-cohort via `content_dist`; born-on-PG `DeploymentRunStore` with guarded one-way transitions; **execute-once enforced at three layers** (per-deployment `claim_for_exec` CAS, create-time resume guard + partial unique index, cross-deployment success exclusion); per-tick re-authorization of the mutating step; no background runner by design (slice 1).
+
+### 36.3 Verify (EVIDENCE) :white_check_mark: `T2`
+
+Cohort-paired app-perf before/after comparison (§32.5) closing the loop. Deferred: live measure-after-deploy, deploy→verify auto-fill.
+
+---
+
+## 37. Internal PKI / Certificate Authority
+
+*Full internal CA subsystem. Shipped 2026-05/06 (PR ladder 1–6 + 5b/5c/5d); previously represented only as a §1.1 gap note. Doc: `docs/pki-architecture.md`.*
+
+### 37.1 Internal CA and Default Certificates :white_check_mark: `T2`
+
+`CaStore` (`ca.db`, key material behind the `KeyProvider` seam — never in the DB); per-install default certs generated on first boot; `--cert-san` extra-SAN injection.
+
+### 37.2 Per-Agent mTLS Identity :white_check_mark: `T2`
+
+Agent CSR at enrollment (`agent_csr.*`) → `sign_agent_csr` (server-chosen subject/SAN/EKU after proof-of-possession) → app-layer enforcement; revocation is serial-scoped; works through the gateway (`ProxyRegister` signs via the same chokepoint, PR5d).
+
+### 37.3 CA Operations Surface :white_check_mark: `T2`
+
+REST `/api/v1/ca/*` (public root/CRL; `Security`-gated issued/revoke), dashboard CA panel, CRL publication; `POST /ca/issue` deliberately deferred (impersonation risk at the #1118 gate).
+
+### 37.4 Subordinate-CA Mode :white_check_mark: `T2`
+
+Built-in root subordinated to an enterprise root: CSR export, chain import + validation (`verify_chain_to_bundle`), `CaMode::Subordinate`.
+
+### 37.5 Secure-by-Default Distribution :white_check_mark: `T2`
+
+TLS-by-default images + reference gateway TLS config shipped (#1314, 2026-06-21); one-way TLS agent edge for unenrolled bootstrap (patched grpcbox, PR5c). Residual: management-listener mTLS CA-restriction (#1422).
+
+---
+
+## 38. Server Storage Substrate — PostgreSQL
+
+*ADR-0006/0008/0010/0012 program: the server's storage substrate is PostgreSQL (agent stays SQLite). Flipped 2026-06; previously unmapped (supersedes the §22.9 sharding strategy).*
+
+### 38.1 Substrate and Pool :white_check_mark: `T2`
+
+`server/core/src/pg/`: RAII (`PgConn`/`PgResult`/`PgTxn`), bounded `PgPool` with lease-RAII, `PgMigrationRunner`, timeouts/keepalives/circuit-breaker, `yuzu_pg_*` metrics, `/readyz` conjunction.
+
+### 38.2 Fail-Closed Flip :white_check_mark: `T2`
+
+`ServerImpl` constructs one shared pool before any store and refuses to start without a reachable Postgres (no SQLite fallback, ADR-0007); pool reset last in shutdown.
+
+### 38.3 Secrets at Rest :white_check_mark: `T2`
+
+Verify-only hashes or AES-256-GCM envelope blobs (`SecretCodec`, DEK-per-secret, KEK behind `KekProvider`; fail-closed boot verification, rotation lifecycle) — never plaintext columns (ADR-0010, #1320 PR 4).
+
+### 38.4 Store Migration Ladder :large_orange_diamond: `T2`
+
+Born-on-PG stores shipped (offline endpoints, preflight, deployment, software/device inventory, app-perf); the remaining ~27 legacy SQLite server stores migrate per `docs/postgres-migration-ladder.md` (all migrate — ADR-0006 Update 2026-06-22).
 
 ---
 
@@ -1257,21 +1445,25 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
 | tar | Y | Y | Y | Monitoring |
+| netprobe | Y | Y | Y | Network |
+| rdp_control | Y | - | - | Security |
+| disk_space | Y | Y | Y | System Info |
+| tags | Y | Y | Y | Device Mgmt |
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**44 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.
+**48 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins. (Count re-verified against `agents/plugins/` 2026-07-02.)
 
 ---
 
-## Appendix B: Foundation Tier Status
+## Appendix B: Foundation Tier Status (historical)
 
-**Foundation tier: 33/33 done (100%)**
+**Foundation tier as scoped in v2.x: 33/33 done (100%).** (The v4.0 Progress-at-a-Glance counts every `T1`-labelled entry — 59 as of the 2026-07 re-baseline — so the numbers differ by construction.)
 
-All Foundation-tier gaps have been closed as of 2026-03-18:
+All v2.x Foundation-tier gaps were closed as of 2026-03-18:
 
 - **1.4** Agent OTA updates -- `agents/core/src/updater.cpp`
 - **1.8** Connection diagnostics -- `connection_info` action in diagnostics plugin
