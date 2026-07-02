@@ -31,6 +31,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -4636,12 +4637,14 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
+            bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok;
+                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4758,6 +4761,10 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                // Load-bearing for the MCP write surface + REST /api/approvals/*
+                // (governance sre-BLOCKING-1). is_open() is false after a failed
+                // consumed_at migration, so a broken approval schema fails readyz.
+                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},
@@ -9724,6 +9731,17 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
+        // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
+        // catalog, published instruction definitions, REST route catalog (subset of
+        // the SAME OpenAPI document /api/v1/openapi.json serves), Scope DSL kinds +
+        // operators, and the plugin/action catalog observed across the fleet. No
+        // AuditFn: these are catalog/schema reads, not per-device PII — matches the
+        // GET /guaranteed-state/schemas precedent this module is modeled on.
+        discover_routes_ = std::make_unique<DiscoverRoutes>();
+        discover_routes_->register_routes(*web_server_, perm_fn, rbac_store_.get(),
+                                          instruction_store_.get(), &registry_);
+
         // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
         // store seams shared by the REST endpoints and the MCP twins so both read
         // the SAME substrate. Each lambda null-checks the store at call time and
@@ -10146,7 +10164,11 @@ private:
                             break;
                         }
                     }
-                });
+                },
+                // A2 discovery (roadmap Issue 17.1): backs the discover_plugins tool
+                // via the SAME AgentRegistry::help_json() the REST /discover/plugins
+                // route reads (discover_routes_ above).
+                &registry_);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -10520,6 +10542,7 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;

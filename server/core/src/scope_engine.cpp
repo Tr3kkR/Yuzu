@@ -778,4 +778,35 @@ std::expected<void, std::string> validate(std::string_view input) {
     return std::unexpected(result.error());
 }
 
+std::string_view operator_token(CompOp op) {
+    // Deliberately NO `default` — mirrors eval_condition's exhaustive switch
+    // above. Adding a CompOp enumerator without adding a case here produces a
+    // -Wswitch warning (see the header doc comment).
+    switch (op) {
+    case CompOp::Eq:
+        return "==";
+    case CompOp::Neq:
+        return "!=";
+    case CompOp::Like:
+        return "LIKE";
+    case CompOp::Lt:
+        return "<";
+    case CompOp::Gt:
+        return ">";
+    case CompOp::Le:
+        return "<=";
+    case CompOp::Ge:
+        return ">=";
+    case CompOp::In:
+        return "IN";
+    case CompOp::Contains:
+        return "CONTAINS";
+    case CompOp::Matches:
+        return "MATCHES";
+    case CompOp::Exists:
+        return "EXISTS";
+    }
+    return ""; // unreachable if the switch stays exhaustive
+}
+
 } // namespace yuzu::scope

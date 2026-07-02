@@ -100,8 +100,10 @@ echo -e "${GREEN}Authenticated as ${ADMIN_USER}${NC}"
 
 # ── Verify agent is connected ────────────────────────────────────────────
 
+# Portable (BSD/GNU): awk, not `grep -oP ... \K` (Perl regex, unsupported by
+# macOS BSD grep — Darwin-compat). Prints 0 when the metric is absent.
 AGENT_COUNT=$(curl -s -b "yuzu_session=$SESSION_COOKIE" "$SERVER_URL/metrics" 2>/dev/null \
-    | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+    | awk '/^yuzu_agents_registered_total /{v=$2} END{print v+0}')
 if [ "$AGENT_COUNT" -eq 0 ]; then
     echo -e "${RED}No agents connected. Start an agent first.${NC}"
     exit 1

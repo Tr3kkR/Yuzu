@@ -37,6 +37,13 @@ namespace yuzu::server {
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 }
 
+namespace yuzu::server::detail {
+// A2 discovery: backs the discover_plugins tool (mirrors GET /api/v1/discover/plugins,
+// discover_routes.hpp). Forward-declared (pointer-only in build_handler/register_routes);
+// the .cpp includes agent_registry.hpp for the definition.
+class AgentRegistry;
+} // namespace yuzu::server::detail
+
 namespace yuzu::server::mcp {
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
@@ -176,7 +183,11 @@ public:
                             yuzu::MetricsRegistry* metrics = nullptr,
                             AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
-                            TagPushFn tag_push_fn = {});
+                            TagPushFn tag_push_fn = {},
+                            // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
+                            // Trailing optional dep, like the rest of this parameter tail —
+                            // `nullptr` = discover_plugins answers 503 (unwired).
+                            yuzu::server::detail::AgentRegistry* agent_registry = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -198,7 +209,8 @@ public:
                          yuzu::MetricsRegistry* metrics = nullptr,
                          AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
-                         TagPushFn tag_push_fn = {});
+                         TagPushFn tag_push_fn = {},
+                         yuzu::server::detail::AgentRegistry* agent_registry = nullptr);
 };
 
 } // namespace yuzu::server::mcp

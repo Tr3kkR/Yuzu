@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
+  are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+  and `quarantine_device` (records the quarantine and dispatches live isolation).
+  Approval-gated tools use a ticket-then-recall flow: the first call returns
+  `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after a second
+  principal approves, the caller re-invokes with the `approval_id` and the ticket is
+  consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
+  the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+- **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
+  instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
+  an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
+  scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
+  degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **Agentic-worker self-orientation (R2 follow-up).** `discover_plugins` (REST + MCP,
+  now catalog `version: 2`) enriches each action with its `parameter_schema` inline
+  when the action has a published InstructionDefinition (joined on plugin+action), and
+  reports `actions_enriched_with_schema` — so a worker learns *how* to call an action,
+  not just that it exists, from one request. The `execute_instruction` and
+  `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
+  point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
+  driving the fleet with no hand-fed action list made zero blind parameter guesses.
+
+### Fixed
+
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400 rather than a silent privilege surprise.
+- **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
+  `status_url` target); the `auth_routes` denial shapes are unified into one A4
+  envelope carrying `correlation_id` and the missing `securable_type:operation`; the
+  ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
+  **Breaking —** many of those `/api/v1` errors were previously `{"error":"<string>"}`
+  and are now the nested A4 object `{"error":{"code","message","correlation_id",…}}`;
+  a client that read `error` as a string will break. Migrate to `error.code`/
+  `error.message`. See `docs/user-manual/upgrading.md`.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

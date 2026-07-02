@@ -56,9 +56,29 @@ public:
     /// status/definition_id/scope_expression/consumed_at to validate a ticket
     /// before consuming it. Returns std::nullopt when no row matches; does NOT
     /// touch the lifecycle (submit/approve/reject/consume are elsewhere).
+    /// True iff the store is usable (schema migrated). False after a failed
+    /// migration — feeds the /readyz + /healthz conjunction so a broken approval
+    /// schema fails the probe instead of serving errors behind a green light
+    /// (governance sre-BLOCKING-1). The handle is borrowed; this never closes it.
+    bool is_open() const { return db_ != nullptr; }
+
     std::optional<Approval> get(const std::string& id) const;
 
+    /// Newest PENDING approval matching (definition_id, submitted_by,
+    /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
+    /// (#289 / governance UP-1): reusing an extant pending ticket makes the mint
+    /// idempotent and stops a supervised token flooding the global pending cap.
+    std::optional<Approval> find_pending(const std::string& definition_id,
+                                         const std::string& submitted_by,
+                                         const std::string& scope_expression) const;
+
     int pending_count() const;
+
+    /// Count of PENDING approvals submitted by one principal. Backs the MCP
+    /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
+    /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
+    /// mint bounds any single supervised token's share of the GLOBAL cap.
+    int pending_count_for(const std::string& submitted_by) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);

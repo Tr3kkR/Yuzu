@@ -3,6 +3,9 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
@@ -511,9 +514,14 @@ static const ToolDef kTools[] = {
 
     // Phase 2 write tool
     {"execute_instruction",
-     "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
-     "agents_reached, plugin, and action. Poll results with query_responses or subscribe to "
-     "live JSON events via GET /api/v1/events?execution_id=<id>. "
+     "Execute a plugin action on one or more agents. ASYNC: returns immediately with command_id "
+     "+ execution_id + agents_reached; the agents run the action and report back separately. To "
+     "get results, poll query_responses with the returned execution_id — an EMPTY result means "
+     "the run is still in flight, so wait ~2-5s and retry a few times (or call "
+     "get_execution_status to confirm a terminal state), or subscribe to live JSON events via GET "
+     "/api/v1/events?execution_id=<id>. Find valid plugin/action names AND their parameters via "
+     "discover_plugins (parameter_schema is inline for actions with a published definition) or "
+     "discover_instructions — do not guess action names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      R"j({"type":"object","properties":{)j"
@@ -655,6 +663,43 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
      kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
+
+    // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
+    // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
+    // builder functions (discover_routes.hpp) so REST and MCP can't drift. Appended
+    // at the VERY END of kTools[] (governance note: minimizes rebase conflict with
+    // any concurrent PR inserting WRITE tools earlier in this array).
+    {"discover_permissions",
+     "RBAC permission catalog: every securable_type x operation pair the RBAC store "
+     "recognizes, plus the full role -> allowed-operations grid.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover RBAC permissions","safety":"catalog read only"})"},
+    {"discover_instructions",
+     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
+     "commands this worker may dispatch via execute_instruction.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover instruction definitions","safety":"catalog read only"})"},
+    {"discover_routes",
+     "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
+     "serves. Hand-maintained source, so it can under-report an undocumented route "
+     "(the response carries a caveat field).",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover REST routes","safety":"catalog read only"})"},
+    {"discover_scope_kinds",
+     "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
+     "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
+     "syntax and examples for building a `scope` expression.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover scope DSL","safety":"catalog read only, static"})"},
+    {"discover_plugins",
+     "Plugin/action catalog observed across currently-connected agents. Each action carries an "
+     "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
+     "call it, not just that it exists); actions without one are name+description only — "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
+     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "before acting.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -729,7 +774,14 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute"}},
     {"get_bundle_result", {"Response", "Read"}},
-    // Planned write tools (security metadata pre-registered)
+    // Write tools (#289). NOTE (governance S3/UP-3): the op here drives the C8
+    // TIER gate (tier_allows / requires_approval), NOT per-handler RBAC — each
+    // handler separately calls perm_fn with its REST-verified op (approve/reject →
+    // Approval:Approve, quarantine → Security:Execute). quarantine_device is mapped
+    // to Security:WRITE deliberately, because requires_approval() keys the
+    // supervised approval gate on Security:Write (mcp_policy.hpp); "aligning" this
+    // to Security:Execute would SILENTLY disable the approval gate on live device
+    // isolation. Do not change without re-checking mcp_policy.hpp::requires_approval.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
     {"quarantine_device", {"Security", "Write"}},
@@ -741,6 +793,12 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"classify_operational_question", {"Infrastructure", "Read"}},
     {"get_incident_playbook", {"Infrastructure", "Read"}},
     {"summarize_working_set", {"Infrastructure", "Read"}},
+    // A2 discovery tools (mirrors of GET /api/v1/discover/*).
+    {"discover_permissions", {"Infrastructure", "Read"}},
+    {"discover_instructions", {"InstructionDefinition", "Read"}},
+    {"discover_routes", {"Infrastructure", "Read"}},
+    {"discover_scope_kinds", {"Infrastructure", "Read"}},
+    {"discover_plugins", {"Infrastructure", "Read"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -844,7 +902,8 @@ McpServer::HandlerFn McpServer::build_handler(
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
-    QuarantineStore* quarantine_store, TagPushFn tag_push_fn) {
+    QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+    yuzu::server::detail::AgentRegistry* agent_registry) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1507,10 +1566,43 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string supplied_id = param_str(args, "approval_id");
 
                     if (supplied_id.empty()) {
-                        // First call → mint a ticket. #1643 note: this is the
-                        // same one-audit-per-attempt cost the old deny path had,
-                        // plus one persisted `approvals` row (bounded by
-                        // ApprovalManager's 1000-pending cap + 7-day expiry).
+                        // First call → mint a ticket, but DEDUP first (governance
+                        // UP-1 BLOCKING): if this principal already has a pending
+                        // ticket for the exact same (tool, args), hand it back
+                        // instead of minting another. An idempotent mint bounds a
+                        // supervised token's junk to distinct (tool,args) tuples,
+                        // so it can no longer flood the GLOBAL 1000-pending cap that
+                        // ApprovalManager shares with the REST instruction-approval
+                        // workflow (cross-surface DoS). #1643: the one-audit-per-
+                        // attempt cost remains, but no unbounded row growth.
+                        if (auto existing = approval_manager->find_pending(
+                                definition_id, session->username, canon)) {
+                            mcp_audit("pending", "approval_id=" + existing->id + " (deduped)");
+                            res.set_content(
+                                approval_required_error(
+                                    existing->id,
+                                    "an admin must approve this approval_id (see status_url), then "
+                                    "re-call this tool with the approval_id argument to execute"),
+                                "application/json");
+                            return;
+                        }
+                        // Per-submitter sub-cap (governance sec8-MEDIUM-1): dedup
+                        // handles honest retries, but an adaptive flood (a nonce
+                        // key defeats the args-hash) would still fill the GLOBAL
+                        // pending cap shared with the REST approval workflow. Bound
+                        // any single principal's share far below that global cap.
+                        constexpr int kMcpSubmitterPendingCap = 25;
+                        if (approval_manager->pending_count_for(session->username) >=
+                            kMcpSubmitterPendingCap) {
+                            mcp_audit("denied", "per-submitter pending-approval cap reached");
+                            res.set_content(
+                                a4_error(kTierDenied,
+                                         "too many pending approvals for this principal; approve or "
+                                         "let existing requests expire before creating more",
+                                         "wait for your pending approvals to be reviewed"),
+                                "application/json");
+                            return;
+                        }
                         auto submitted =
                             approval_manager->submit(definition_id, session->username, canon);
                         if (!submitted) {
@@ -4060,6 +4152,70 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Server-side input validation BEFORE any store write or dispatch
+                // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
+                // reaches the agent's netsh/iptables/pf sink; the agent already
+                // allow-lists each IP (is_safe_ip), but this PR opens the FIRST
+                // reachable path to that sink (REST /quarantine is record-only), so
+                // we validate at the server edge too (deploy-path precedent: reject
+                // shell-metachar/oversized input loudly, don't silently drop it).
+                if (reason.size() > 1024) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "reason exceeds 1024 characters"),
+                        "application/json");
+                    return;
+                }
+                if (whitelist.size() > 512) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "whitelist exceeds 512 characters"),
+                        "application/json");
+                    return;
+                }
+                {
+                    // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45)
+                    // so we reject anything the agent would silently drop, loudly.
+                    auto safe_ip = [](std::string_view tok) {
+                        if (tok.empty() || tok.size() > 45)
+                            return false;
+                        for (char c : tok)
+                            if (!(std::isxdigit(static_cast<unsigned char>(c)) || c == '.' ||
+                                  c == ':'))
+                                return false;
+                        return true;
+                    };
+                    bool bad = false;
+                    size_t start = 0;
+                    while (start <= whitelist.size() && !bad) {
+                        size_t comma = whitelist.find(',', start);
+                        auto tok = whitelist.substr(
+                            start, comma == std::string::npos ? std::string::npos : comma - start);
+                        // trim surrounding spaces
+                        auto b = tok.find_first_not_of(' ');
+                        auto e = tok.find_last_not_of(' ');
+                        if (b != std::string::npos)
+                            tok = tok.substr(b, e - b + 1);
+                        else
+                            tok.clear();
+                        if (!tok.empty() && !safe_ip(tok))
+                            bad = true;
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    if (bad) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "whitelist must be comma-separated IPv4/IPv6 literals"),
+                            "application/json");
+                        return;
+                    }
+                }
+                // NOTE (governance sec-LOW-1 / UP-6): live isolation preserves the
+                // agent's EXISTING management connection (iptables ESTABLISHED,RELATED
+                // etc.), so the agent can still receive the un-quarantine command over
+                // that link. It does NOT explicitly whitelist the server address for a
+                // fresh reconnect — a pre-existing quarantine-plugin design (the plugin
+                // takes no server_ip param), tracked as a follow-up, not introduced here.
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
@@ -4069,7 +4225,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = mcp_audit("success", agent_id);
                 // 2. Dispatch the live isolation command (plugin quarantine,
                 //    action quarantine). Out-of-band (no ExecutionTracker row):
                 //    quarantine is not an executions-drawer producer. A dispatch
@@ -4090,6 +4245,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                       e.what());
                     }
                 }
+                // Audit AFTER dispatch so the evidence row records whether the
+                // device was actually isolated (agents_reached>0) vs recorded-only
+                // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
+                bool audit_ok = mcp_audit("success", "agent_id=" + agent_id + " command_id=" +
+                                                         command_id + " agents_reached=" +
+                                                         std::to_string(agents_reached));
                 JObj record_obj;
                 record_obj.add("agent_id", agent_id)
                     .add("status", "active")
@@ -4694,6 +4855,110 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────
+            // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME
+            // builder function in discover_routes.hpp — REST and MCP read the
+            // identical catalog, so they cannot drift from each other by
+            // construction (A2: "no side-channel doc fetch").
+
+            if (tool_name == "discover_permissions") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_instructions") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_routes") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same "answers even when
+                // everything else is down" property as the REST sibling.
+                auto doc = yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json());
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_scope_kinds") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const auto& doc = yuzu::server::scope_kinds_catalog();
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_plugins") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!agent_registry) {
+                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_plugins_catalog(*agent_registry, instruction_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── Unknown tool ──────────────────────────────────────────────
             mcp_audit("failure", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
@@ -4726,7 +4991,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 InventoryScopeFn inventory_scope_fn,
                                 yuzu::MetricsRegistry* metrics,
                                 AppPerfProviders app_perf_providers,
-                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn) {
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -4738,7 +5004,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(response_scope_fn), software_inventory_store,
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn)));
+                           std::move(tag_push_fn), agent_registry));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

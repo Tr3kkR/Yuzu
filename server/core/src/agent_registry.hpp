@@ -316,6 +316,40 @@ private:
     DeviceTokenStore* device_token_store_{nullptr};
 };
 
+// -- Scope kind discovery catalog ---------------------------------------------
+//
+// One row per scope-expression ATTRIBUTE kind the `evaluate_scope` resolver
+// (agent_registry.cpp, the `resolver` lambda inside the `agents_` loop) knows
+// how to answer. Deliberately colocated with `evaluate_scope` rather than in
+// the discovery module (`discover_routes.cpp`) so a reviewer touching the
+// resolver sees this list in the same diff hunk / file.
+//
+// Does NOT cover the two GROUND kinds (`__all__`, `group:<name>`) — those are
+// short-circuited by call sites BEFORE a scope expression ever reaches
+// yuzu::scope::parse/evaluate (see docs/scope-walking-design.md §"Scope kind"
+// and the `scope != "__all__"` guards in server.cpp / dashboard_routes.cpp),
+// so they are never seen by this resolver and are listed separately by the
+// discovery route.
+//
+// DRIFT CONTRACT: any NEW `if (key == ...)` / `key.starts_with(...)` branch
+// added to the resolver lambda MUST get a matching entry here. The
+// `test_discovery_routes.cpp` CROSS-CHECK test exercises `evaluate_scope` for
+// every entry below (proving the enumerator is a SUBSET of what the resolver
+// honors) and confirms a made-up kind resolves to no match (proving the
+// resolver doesn't silently accept everything) — but it cannot detect a
+// resolver branch that was added without a matching entry here. Keep both in
+// sync by inspection when editing the resolver.
+struct ScopeKindInfo {
+    std::string kind;        ///< e.g. "tag:<key>"
+    std::string syntax;      ///< e.g. "tag:<key> <op> <value>"
+    std::string example;     ///< e.g. "tag:department == \"finance\""
+    std::string description;
+};
+
+/// Every scope-expression ATTRIBUTE kind (post-ground-kind) the resolver
+/// answers. Built once (static local) and cached; pure after construction.
+const std::vector<ScopeKindInfo>& scope_kind_catalog();
+
 // -- AgentHealthStore ---------------------------------------------------------
 // Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
 

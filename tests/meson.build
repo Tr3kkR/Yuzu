@@ -347,6 +347,7 @@ if build_server
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
+      'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
