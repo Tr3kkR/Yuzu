@@ -58,7 +58,9 @@ std::string a4_denial(httplib::Response& res, int code, const std::string& messa
 
 /// Boundary-aware cookie-value extractor.
 ///
-/// Splits the Cookie header on "; " (RFC 6265 §4.2.1 canonical separator) and
+/// Splits the Cookie header on ";" — tolerating both the RFC 6265 §4.2.1
+/// canonical "; " separator and a bare ";" (some clients/proxies omit the
+/// trailing space) by skipping leading whitespace in each segment — and
 /// performs an exact-name match so a cookie named "foo__Host-yuzu_saml_bind"
 /// cannot shadow "__Host-yuzu_saml_bind".  Returns the value string or empty.
 ///
@@ -68,7 +70,9 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
     const std::string prefix = name + "=";
     std::size_t pos = 0;
     while (pos < hdr.size()) {
-        const auto delim   = hdr.find("; ", pos);
+        // Tolerate "; " and bare ";" separators: skip optional leading whitespace.
+        while (pos < hdr.size() && (hdr[pos] == ' ' || hdr[pos] == '\t')) ++pos;
+        const auto delim   = hdr.find(';', pos);
         const auto seg_end = (delim == std::string::npos) ? hdr.size() : delim;
         const auto seg_len = seg_end - pos;
         // Exact name match: segment starts with "name=" and is at least that long.
@@ -77,7 +81,7 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
             return hdr.substr(pos + prefix.size(), seg_len - prefix.size());
         }
         if (delim == std::string::npos) break;
-        pos = delim + 2; // advance past "; "
+        pos = delim + 1; // advance past ";"
     }
     return {};
 }
@@ -1911,8 +1915,23 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // The redirect target is validated in /saml/acs — here we pass it verbatim
         // to the AuthnRequest and it bounces back as the POST body RelayState.
         auto relay_state = req.get_param_value("RelayState");
-        auto authn       = saml_provider_->build_authn_request(relay_state);
-        if (authn.url.empty()) {
+        // build_authn_request can throw under crypto/allocation failure (deflate,
+        // RNG, SHA-256); catch so we return a clean A4 500 rather than an
+        // uncaught exception that httplib would surface as a non-A4 500.
+        std::string authn_url;
+        std::string authn_cookie_secret;
+        try {
+            auto authn = saml_provider_->build_authn_request(relay_state);
+            authn_url           = authn.url;
+            authn_cookie_secret = authn.cookie_secret;
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
+                            "application/json");
+            spdlog::error("SAML /auth/saml/start: build_authn_request threw: {}", e.what());
+            return;
+        }
+        if (authn_url.empty()) {
             res.status = 500;
             res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
                             "application/json");
@@ -1927,9 +1946,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Max-Age=600 matches kRequestTtl (10 minutes) so the cookie expires
         // when the pending request does.
         res.set_header("Set-Cookie",
-            "__Host-yuzu_saml_bind=" + authn.cookie_secret +
+            "__Host-yuzu_saml_bind=" + authn_cookie_secret +
             "; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=600");
-        res.set_redirect(authn.url);
+        res.set_redirect(authn_url);
     });
 
     sink.Post("/saml/acs", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2020,12 +2039,34 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         // validate_response verifies cryptographic signature + conditions +
         // InResponseTo + browser-binding (SHA-256(cookie) == stored hash).
-        auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
-        if (!result) {
-            spdlog::warn("SAML ACS validation failed: {}", result.error());
-            audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+        // Both validate_response and create_saml_session can throw under
+        // crypto/allocation/DB failure; catch so an exception yields the same
+        // clean redirect-to-login as an ordinary validation failure rather than
+        // an uncaught exception surfacing as a non-A4 500.
+        std::string saml_name_id;
+        std::string session_token;
+        try {
+            auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
+            if (!result) {
+                spdlog::warn("SAML ACS validation failed: {}", result.error());
+                audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+                emit_event("auth.saml_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+            saml_name_id  = result.value().name_id;
+            session_token = auth_mgr_.create_saml_session(saml_name_id);
+        } catch (const std::exception& e) {
+            spdlog::error("SAML ACS: internal error during validation/session: {}", e.what());
+            audit_log(req, "auth.saml_login_failed", "error", {}, {}, "internal error");
             emit_event("auth.saml_login_failed", req,
-                       {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                       {{"source_ip", req.remote_addr}, {"error", "internal error"}}, {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_saml_login_total", {{"result", "error"}}).increment();
@@ -2035,9 +2076,6 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        const auto& assertion  = result.value();
-        auto session_token     = auth_mgr_.create_saml_session(assertion.name_id);
-
         // Clear the binding cookie now that the round-trip is complete.
         res.set_header("Set-Cookie", kBindCookieClear);
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
@@ -2045,11 +2083,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Explicit-principal audit row — request lands at /saml/acs with no session
         // cookie yet, so the default resolve_session path would leave principal empty
         // (same rationale as the OIDC /auth/callback audit, Gate 4 consistency B3).
-        audit_log_for_principal(req, "auth.saml_login", "ok", assertion.name_id, "user",
-                                "User", assertion.name_id, "auth_source=saml");
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, "user",
+                                "User", saml_name_id, "auth_source=saml");
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},
-                    {"username", assertion.name_id},
+                    {"username", saml_name_id},
                     {"auth_method", "saml"}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             m->counter("yuzu_auth_saml_login_total", {{"result", "ok"}}).increment();

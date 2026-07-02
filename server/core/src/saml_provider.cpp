@@ -351,9 +351,22 @@ static std::string get_text(xmlNodePtr node) {
     return s.substr(b, e - b + 1);
 }
 
+/// Maximum element-nesting depth we will traverse in the XSW walks. libxml2
+/// already caps parse depth (XML_PARSE_HUGE is off → default 256), but we bound
+/// our own recursion explicitly so these walks are provably stack-safe
+/// regardless of future parser-flag changes, and a pathologically deep document
+/// is rejected (fail-closed) rather than partially scanned. Legitimate SAML
+/// responses nest well under 20 levels.
+constexpr int kMaxXmlDepth = 100;
+
 /// Collect ALL saml:Assertion elements at any depth below root into out.
 /// Searching all depths catches wrapped/injected assertions for XSW detection.
-static void collect_assertions(xmlNodePtr node, std::vector<xmlNodePtr>& out) {
+/// Returns false if the document nests deeper than kMaxXmlDepth — the caller
+/// MUST reject, because a truncated collection could undercount wrapped
+/// assertions and weaken the exactly-one-Assertion XSW check.
+static bool collect_assertions(xmlNodePtr node, std::vector<xmlNodePtr>& out,
+                               int depth = 0) {
+    if (depth > kMaxXmlDepth) return false;
     for (xmlNodePtr n = xmlFirstElementChild(node); n; n = xmlNextElementSibling(n)) {
         if (n->type == XML_ELEMENT_NODE &&
             n->name && xmlStrEqual(n->name, BAD_CAST "Assertion") &&
@@ -361,8 +374,9 @@ static void collect_assertions(xmlNodePtr node, std::vector<xmlNodePtr>& out) {
             xmlStrEqual(n->ns->href, BAD_CAST kSamlAssertionNs)) {
             out.push_back(n);
         }
-        collect_assertions(n, out); // recurse regardless
+        if (!collect_assertions(n, out, depth + 1)) return false; // recurse regardless
     }
+    return true;
 }
 
 /// H-E: scan the subtree rooted at `node` (inclusive) for any element OTHER
@@ -376,8 +390,9 @@ static void collect_assertions(xmlNodePtr node, std::vector<xmlNodePtr>& out) {
 /// node sharing that ID is a strong indicator of a XSW document and must be
 /// rejected.
 static bool has_duplicate_id(xmlNodePtr node, xmlNodePtr exclude,
-                              const xmlChar* target_id) {
+                              const xmlChar* target_id, int depth = 0) {
     if (!node || !target_id) return false;
+    if (depth > kMaxXmlDepth) return true;  // fail closed: too deep to scan → treat as suspicious
     if (node->type == XML_ELEMENT_NODE && node != exclude) {
         // Check "ID" attribute (plain, no namespace — standard SAML)
         xmlChar* id_val = xmlGetProp(node, BAD_CAST "ID");
@@ -396,7 +411,7 @@ static bool has_duplicate_id(xmlNodePtr node, xmlNodePtr exclude,
         }
     }
     for (xmlNodePtr c = xmlFirstElementChild(node); c; c = xmlNextElementSibling(c)) {
-        if (has_duplicate_id(c, exclude, target_id)) return true;
+        if (has_duplicate_id(c, exclude, target_id, depth + 1)) return true;
     }
     return false;
 }
@@ -581,7 +596,9 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     // inside a forged outer assertion. Requiring exactly one element eliminates
     // the entire XSW attack class that relies on multiple assertions.
     std::vector<xmlNodePtr> assertions;
-    collect_assertions(root, assertions);
+    if (!collect_assertions(root, assertions)) {
+        return std::unexpected("SAML response XML nests too deep — rejected");
+    }
 
     if (assertions.empty()) return std::unexpected("no saml:Assertion found in response");
     if (assertions.size() > 1) {

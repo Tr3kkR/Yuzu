@@ -405,6 +405,22 @@ struct SamlTestFixture {
         return b64_encode(reinterpret_cast<const unsigned char*>(xml.data()), xml.size());
     }
 
+    /// Build a base64-encoded samlp:Response whose body nests `depth` levels of
+    /// dummy elements — deeper than the validate_response XSW-walk depth cap.
+    /// Rejection happens in collect_assertions (before signature verification),
+    /// so it needs no signature. `depth` stays well under libxml2's own 256
+    /// parse cap so libxml2 parses it and our own guard is what rejects it.
+    std::string make_deeply_nested_response(int depth) const {
+        std::string open;
+        std::string close;
+        for (int i = 0; i < depth; ++i) { open += "<x>"; close += "</x>"; }
+        std::string xml =
+            "<samlp:Response xmlns:samlp=\"" + std::string(kProtocolNs) + "\">" +
+            open + close +
+            "</samlp:Response>";
+        return b64_encode(reinterpret_cast<const unsigned char*>(xml.data()), xml.size());
+    }
+
     // ── H-E: make_response_with_duplicate_id ─────────────────────────────────
     // Build a signed response that contains a non-Assertion element carrying
     // the same ID value as the signed Assertion.  The attack vector is:
@@ -1555,6 +1571,30 @@ TEST_CASE("SAML: response with DOCTYPE declaration is rejected", "[saml]") {
     CHECK((result.error().find("DOCTYPE") != std::string::npos ||
            result.error().find("DTD")     != std::string::npos ||
            result.error().find("rejected") != std::string::npos));
+}
+
+// ── DoS: pathologically deep XML nesting is rejected (XSW-walk depth guard) ────
+
+TEST_CASE("SAML: pathologically deep XML nesting is rejected", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    SamlProvider p{cfg};
+
+    // 200 levels — under libxml2's own 256 parse cap (so it parses), but over
+    // the collect_assertions/has_duplicate_id depth guard (100), which runs
+    // before signature verification. A shallow (depth 5) document is NOT
+    // rejected by the guard, confirming the cap only trips on abuse.
+    const auto deep_b64 = f.make_deeply_nested_response(200);
+    const auto deep_res = p.validate_response(deep_b64, "");
+    REQUIRE_FALSE(deep_res.has_value());
+    CHECK(deep_res.error().find("deep") != std::string::npos);
+
+    // A shallow document passes the depth guard and is rejected later for a
+    // different reason (no assertion), proving the guard is not over-eager.
+    const auto shallow_b64 = f.make_deeply_nested_response(5);
+    const auto shallow_res = p.validate_response(shallow_b64, "");
+    REQUIRE_FALSE(shallow_res.has_value());
+    CHECK(shallow_res.error().find("deep") == std::string::npos);
 }
 
 // ── Fix 1: Oversized body is rejected at provider level ───────────────────────
