@@ -87,7 +87,15 @@ void ApprovalManager::create_tables() {
         )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
-        spdlog::error("ApprovalManager: schema migration failed");
+        // Fail closed (governance sre-BLOCKING-1 / HC-1): a failed v2 migration
+        // means the `consumed_at` column is absent, so every get/find_pending/
+        // consume_ticket/query SELECT would fail — the whole MCP write + approval
+        // surface would be silently dead behind a green readyz. NULL db_ so
+        // is_open() reports false and /readyz goes red. Do NOT close: the handle
+        // is BORROWED (shared with ExecutionTracker/ScheduleEngine on the
+        // instruction pool); the pool owner closes it.
+        spdlog::error("ApprovalManager: schema migration failed — marking store unavailable");
+        db_ = nullptr;
     }
 }
 
@@ -226,6 +234,26 @@ int ApprovalManager::pending_count() const {
     if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'", -1,
                            &stmt, nullptr) != SQLITE_OK)
         return 0;
+
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        count = sqlite3_column_int(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
+    if (!db_ || submitted_by.empty())
+        return 0;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending' AND submitted_by = ?", -1,
+            &stmt, nullptr) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
 
     int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW)

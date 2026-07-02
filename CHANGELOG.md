@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `status_url` target); the `auth_routes` denial shapes are unified into one A4
   envelope carrying `correlation_id` and the missing `securable_type:operation`; the
   ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
+  **Breaking —** many of those `/api/v1` errors were previously `{"error":"<string>"}`
+  and are now the nested A4 object `{"error":{"code","message","correlation_id",…}}`;
+  a client that read `error` as a string will break. Migrate to `error.code`/
+  `error.message`. See `docs/user-manual/upgrading.md`.
 - **`/inventory` Devices tab shows real device-CI data.** The Serial/Model/CPU-RAM
   columns (previously greyed placeholders) now read from `DeviceInventoryStore`, and
   the per-device drill grows a full CI-record panel (manufacturer, model, serial,

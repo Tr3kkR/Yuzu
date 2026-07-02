@@ -4637,12 +4637,14 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
+            bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok;
+                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4759,6 +4761,10 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                // Load-bearing for the MCP write surface + REST /api/approvals/*
+                // (governance sre-BLOCKING-1). is_open() is false after a failed
+                // consumed_at migration, so a broken approval schema fails readyz.
+                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
                 {"policy_store", policy_store_ && policy_store_->is_open()},
                 {"rbac_store", rbac_store_ && rbac_store_->is_open()},
                 {"tag_store", tag_store_ && tag_store_->is_open()},

@@ -1578,6 +1578,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        // Per-submitter sub-cap (governance sec8-MEDIUM-1): dedup
+                        // handles honest retries, but an adaptive flood (a nonce
+                        // key defeats the args-hash) would still fill the GLOBAL
+                        // pending cap shared with the REST approval workflow. Bound
+                        // any single principal's share far below that global cap.
+                        constexpr int kMcpSubmitterPendingCap = 25;
+                        if (approval_manager->pending_count_for(session->username) >=
+                            kMcpSubmitterPendingCap) {
+                            mcp_audit("denied", "per-submitter pending-approval cap reached");
+                            res.set_content(
+                                a4_error(kTierDenied,
+                                         "too many pending approvals for this principal; approve or "
+                                         "let existing requests expire before creating more",
+                                         "wait for your pending approvals to be reviewed"),
+                                "application/json");
+                            return;
+                        }
                         auto submitted =
                             approval_manager->submit(definition_id, session->username, canon);
                         if (!submitted) {
@@ -4200,7 +4217,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = mcp_audit("success", agent_id);
                 // 2. Dispatch the live isolation command (plugin quarantine,
                 //    action quarantine). Out-of-band (no ExecutionTracker row):
                 //    quarantine is not an executions-drawer producer. A dispatch
@@ -4221,6 +4237,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                       e.what());
                     }
                 }
+                // Audit AFTER dispatch so the evidence row records whether the
+                // device was actually isolated (agents_reached>0) vs recorded-only
+                // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
+                bool audit_ok = mcp_audit("success", "agent_id=" + agent_id + " command_id=" +
+                                                         command_id + " agents_reached=" +
+                                                         std::to_string(agents_reached));
                 JObj record_obj;
                 record_obj.add("agent_id", agent_id)
                     .add("status", "active")

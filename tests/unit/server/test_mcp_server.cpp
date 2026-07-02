@@ -4339,6 +4339,48 @@ TEST_CASE("MCP approval mint dedups identical pending requests",
     sqlite3_close(raw);
 }
 
+// Governance sec8-MEDIUM-1: dedup alone doesn't stop an adaptive flood (distinct
+// args → distinct canon → find_pending misses). The per-submitter sub-cap (25)
+// bounds any single principal's share of the global pending cap. The 26th
+// distinct-args mint is denied.
+TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    // 25 distinct-args mints (different agent_id each) all succeed → kApprovalRequired.
+    for (int i = 0; i < 25; ++i) {
+        std::string call =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":250,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-)" +
+            std::to_string(i) + R"(","key":"role"}}})";
+        auto b = nlohmann::json::parse(ts.call(call)->body);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    }
+    CHECK(appr.pending_count() == 25);
+
+    // The 26th distinct mint is denied by the sub-cap (kTierDenied), no new row.
+    auto capped = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":251,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-25","key":"role"}}})")
+            ->body);
+    REQUIRE(capped.contains("error"));
+    CHECK(capped["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(appr.pending_count() == 25); // not 26
+    sqlite3_close(raw);
+}
+
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
           "[mcp][integration][approval]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
