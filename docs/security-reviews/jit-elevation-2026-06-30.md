@@ -125,27 +125,135 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
   absolute expiry.** Cosmetic; an absolute `expires_at` is a tracked follow-up.
 - **Migration v4 collides with the break-glass PR (#1735, also v4).** A merge-gate
   renumber-to-v5 item, flagged in-code.
-- **OIDC-only operators cannot elevate (v1 limitation).** The mandatory-MFA gate
-  checks the local `mfa_status`, so an SSO operator with no local TOTP is
-  fail-closed-denied. Elevation gated on the OIDC `amr` assertion is a tracked
-  follow-up — safe-but-restrictive for SSO-first deployments.
+
+## Follow-up shipped (2026-07-02) — OIDC amr-asserted elevation
+
+The v1 limitation above ("OIDC-only operators cannot elevate") is closed,
+**with a prerequisite**: eligibility and MFA status are both keyed on the
+`users` table row, and OIDC login does not create one — a federated-only
+identity needs a Yuzu `users` row provisioned first (e.g.
+`POST /api/v1/users`) before an admin can grant it `elevation_eligible`. Given
+that row, an OIDC session whose IdP login attested MFA via the `amr` claim (a
+seeded `Session::mfa_verified_at`, set at `/auth/callback` via
+`amr_asserts_mfa` — the same mechanism OIDC login step-up already used) now
+satisfies the mandatory-second-factor requirement at `POST /api/v1/elevate`
+**without** local TOTP enrollment.
+
+### Hardening round (2026-07-02, post-13-agent-governance) — linchpin fix
+
+The first cut of this follow-up gated the mandatory-MFA check with a single
+`if (!oidc_amr_elevation) { <local enrollment check> } `. Governance (13
+agents) found this let an OIDC session **fall through to a local namesake's
+TOTP enrollment**: a user with the same username but a *different* identity
+(local password login vs. federated SSO) could be locally enrolled, and an
+OIDC caller with no seeded amr proof would pass the enrollment check on that
+namesake's factor, then possibly clear `elevation_step_up` too (its
+no-proof-OIDC branch PASSes under `--mfa-enforcement=optional`) — granting
+elevation with **no second factor the OIDC caller actually presented**,
+mislabeled `mfa=local_totp` in the audit trail (security-F1 / consistency
+S-2). The toggle was also inert for OIDC (it only gated the enrollment-skip,
+not the step-up's amr acceptance), so `--no-jit-oidc-amr-elevation` did not
+actually block an OIDC elevation via the namesake path either.
+
+**Fix — branch EXPLICITLY on identity source** (replaces the single-flag
+guard):
+
+```cpp
+const bool oidc_amr_proof = session->auth_source == "oidc" &&
+                            session->mfa_verified_at.time_since_epoch().count() != 0;
+const bool oidc_amr_elevation = cfg_.jit_oidc_amr_elevation && oidc_amr_proof;
+
+if (session->auth_source == "oidc") {
+    // An OIDC session's ONLY acceptable second factor is a seeded amr proof
+    // with the toggle on. It never consults the local `users` MFA column.
+    if (!oidc_amr_elevation) {
+        const char* reason = cfg_.jit_oidc_amr_elevation
+            ? "no MFA in SSO login (the IdP did not assert amr MFA) — re-authenticate via your IdP with MFA"
+            : "OIDC-amr elevation is disabled (--no-jit-oidc-amr-elevation); elevate from a local session with TOTP";
+        /* audit role.elevation.denied with `reason`; 403 */
+        return;
+    }
+    // fall through to elevation_step_up (freshness on the amr seed)
+} else {
+    if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+        /* audit role.elevation.denied "no MFA enrolled..."; 403 */
+        return;
+    }
+}
+```
+
+- **security-F1 guardrail (re-verified twice now).** The OIDC branch is gated
+  on a **seeded** proof (`mfa_verified_at != epoch`), never merely
+  `auth_source == "oidc"`, AND the two identity sources are now structurally
+  disjoint — an OIDC session can never reach the `db->mfa_status(...)` call at
+  all. This closes both the original single-factor-under-`optional` gap and
+  the namesake-fallthrough gap the hardening round found. This seam remains
+  the ONLY unconditional block for a single-factor (no-amr) OIDC session —
+  `require_mfa_step_up`'s no-proof-OIDC branch alone would PASS such a
+  request under `optional` enforcement.
+- A seeded-but-**stale** proof (older than the elevation step-up window, which
+  floors to 300s even when the global gate is globally disabled) still falls
+  through to `elevation_step_up` and is challenged, not silently granted.
+- **Toggle semantics, corrected.** `--jit-oidc-amr-elevation` /
+  `YUZU_JIT_OIDC_AMR_ELEVATION` (default true). Disabling it means **OIDC
+  sessions cannot use JIT elevation at all** — not "fall back to requiring
+  local TOTP for OIDC too" (an OIDC session structurally cannot present a
+  local TOTP step-up; its step-up challenge is re-SSO). An operator on a
+  toggle-off deployment must elevate from a local-authenticated session with
+  local TOTP.
+- **Distinct denied reasons.** The audit `detail` for `role.elevation.denied`
+  now distinguishes "no MFA in SSO login" (no amr assertion) from "OIDC-amr
+  elevation is disabled" (toggle-off) from "no MFA enrolled" (local session) —
+  three different failure modes, three different operator remediations.
+- **Audit field order (consistency S-3).** The `role.elevation.granted` detail
+  is `duration_secs=<n> mfa=<oidc_amr|local_totp> justification=<text>` — the
+  code-emitted `mfa=` field is placed **before** the operator free-text
+  `justification=` field. `justification` is only control-byte-sanitised, so
+  a crafted value like `"x mfa=local_totp"` could otherwise forge the factor
+  token a first-match grep reads; putting the genuine field first means it is
+  always found before any forged text embedded later in the justification.
+- **SRE posture log (SHOULD).** A one-time INFO line is emitted at boot when
+  OIDC is configured (`--oidc-issuer` + `--oidc-client-id` both set, the same
+  predicate `oidc::Config::is_enabled()` uses) and
+  `--jit-oidc-amr-elevation` is on, so an incident responder can discover the
+  posture without reading source or an individual audit row's `mfa=` detail.
 
 ## Validation
 
-- Unit: `tests/unit/server/test_auth_jit_elevation.cpp` `[jit]` (15 cases / 275
-  assertions) — `effective_role`/`is_elevated`, `AuthManager` elevate/revoke/
-  revoke-user-elevations, `AuthDB` eligibility, and the REST surface end-to-end
-  (granted; elevated-passes-admin-gate; **MFA-enrollment-mandatory**;
-  **stale-proof-challenged**; ineligible-denied; justification-required;
-  **wrong-typed/negative-duration → 400**; duration-clamp; revoke-reverts;
-  **eligibility-revoke-kills-elevation**; **self-grant-blocked**;
-  tokenless-rejected). Broader `[auth][mfa][session][rbac][rest][workflow][settings][token]`
-  suite green (6280 assertions); server build + link clean.
-- Governance pipeline: security-guardian PASS (no CRITICAL/HIGH; MEDIUM F1 fixed
-  in the hardening round); authdb / cpp-safety / consistency-auditor / happy-path
-  PASS; quality-engineer BLOCKING (untested step-up gate) + unhappy-path UP-1/UP-3
-  fixed; docs-writer BLOCKING (rest-api) addressed (this record + rest-api +
-  authentication + audit-log + server-admin + CHANGELOG + SKILL).
+- Unit: `tests/unit/server/test_auth_jit_elevation.cpp` `[jit]` — reconciled
+  count read directly from the test binary
+  (`tests-build-server-linux_x64/yuzu_server_tests "[jit]"`): **26 test cases,
+  627 assertions**, all green (initial ship: 15 cases / 275 assertions; first
+  OIDC-amr follow-up cut: 22 cases / 406 assertions; this hardening round adds
+  4 more — the F-1 regression-pinning case (a locally-enrolled OIDC namesake
+  with no amr proof), the toggle-off + namesake + fresh-amr case, the
+  users-row-less-identity-denied-at-eligibility case, and the audit
+  field-order anti-forgery case). Coverage: `effective_role`/`is_elevated`,
+  `AuthManager` elevate/revoke/revoke-user-elevations, `AuthDB` eligibility,
+  and the REST surface end-to-end (granted; elevated-passes-admin-gate;
+  **MFA-enrollment-mandatory**; **stale-proof-challenged**; ineligible-denied;
+  justification-required; **wrong-typed/negative-duration → 400**;
+  duration-clamp; revoke-reverts; **eligibility-revoke-kills-elevation**;
+  **self-grant-blocked**; tokenless-rejected; OIDC-amr fresh-proof-elevates;
+  OIDC no-proof-still-denied with distinct reason; **the F-1 regression case**;
+  OIDC stale-proof-challenged; toggle-off-blocks-OIDC-entirely with distinct
+  reason; toggle-off + namesake + fresh-amr; users-row-less identity denied at
+  eligibility; local-session-unaffected; audit-field-order anti-forgery). The
+  F-1 regression case was verified to FAIL against the pre-fix single-flag
+  guard (manually reverted, rebuilt, re-run: 4 cases failed exactly as
+  expected — the regression case itself plus the 3 new distinct-reason
+  assertions) and PASS against the disjoint-branch fix. Full `--suite server`
+  green; server build + link clean.
+- Governance pipeline: initial OIDC-amr follow-up review found no
+  CRITICAL/HIGH; a 13-agent hardening round found the security-F1 /
+  consistency-S2/S3 / unhappy-UP-1/UP-2/UP-8/UP-10 / compliance-MEDIUM cluster
+  fixed in this round (all findings addressed pre-merge, no residual
+  CRITICAL/HIGH). Earlier-ship governance: security-guardian PASS (no
+  CRITICAL/HIGH; MEDIUM F1 fixed in that round); authdb / cpp-safety /
+  consistency-auditor / happy-path PASS; quality-engineer BLOCKING (untested
+  step-up gate) + unhappy-path UP-1/UP-3 fixed; docs-writer BLOCKING
+  (rest-api) addressed (this record + rest-api + authentication + audit-log +
+  server-admin + CHANGELOG + SKILL).
 
 ## Reviewer
 
