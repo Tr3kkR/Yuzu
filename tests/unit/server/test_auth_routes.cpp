@@ -235,6 +235,17 @@ TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is reje
     CHECK(res.status == 403);
     CHECK(res.body.find("service-scoped tokens cannot perform admin operations") !=
           std::string::npos);
+    // #1470: the require_admin denial now emits the unified A4 envelope with a
+    // correlation_id echoed on the header. require_admin gates a whole route,
+    // not a securable:operation, so there is deliberately NO `permission` field.
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"].contains("retry_after_ms")); // A4: always present (null here)
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
@@ -290,6 +301,17 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier blocks Execute r
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("MCP token tier does not allow Execution:Execute") != std::string::npos);
+    // #1470: require_permission's MCP-tier denial now emits the unified A4
+    // envelope — a correlation_id (echoed on the header) and the structured
+    // securable_type:operation permission field (kPermissionDenied §A4).
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(j["error"]["permission"].get<std::string>() == "Execution:Execute");
+    CHECK(j["error"].contains("retry_after_ms"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read without RBAC",

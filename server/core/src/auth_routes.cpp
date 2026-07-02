@@ -14,7 +14,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
-#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 
 #include <ctime>
 
@@ -32,29 +32,12 @@ namespace {
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
 
-// A4 denial envelope for the scoped-permission gate (#1549 review MEDIUM). The
-// shared require_scoped_permission gate is the denial chokepoint for the agentic
-// per-device routes, so its 401/403 bodies must carry the A4 fields — a
-// `correlation_id` and, for permission denials, a structured
-// `securable_type:operation` permission — not the bare {"error":{"code","message"}}
-// shape the rest of the per-device surface's error branches already use. Reuses
-// the X-Correlation-Id the handler already set (so header and body agree),
-// minting one otherwise. Deliberately scoped to this gate + the require_auth 401
-// it calls; the require_admin / require_permission denials and the
-// standalone-route 401s are the tracked systemic follow-up (the whole-helper
-// A4 reshaping), not this PR.
-std::string a4_denial(httplib::Response& res, int code, const std::string& message,
-                      const std::string& permission = {}) {
-    std::string cid = res.get_header_value("X-Correlation-Id");
-    if (cid.empty()) {
-        cid = detail::make_correlation_id();
-        res.set_header("X-Correlation-Id", cid);
-    }
-    nlohmann::json err = {{"code", code}, {"message", message}, {"correlation_id", cid}};
-    if (!permission.empty())
-        err["permission"] = permission;
-    return nlohmann::json{{"error", std::move(err)}, {"meta", {{"api_version", "v1"}}}}.dump();
-}
+// The A4 denial envelope has moved to detail::a4_denial in
+// rest_a4_envelope_http.hpp (#1470 — folded into the one unified builder so
+// require_admin / require_permission / require_scoped_permission and the
+// service-scope gates all emit the same shape with a correlation_id and, where
+// known, the structured "<securable_type>:<operation>" permission field).
+// Callers below use detail::a4_denial(res, code, msg, {.permission = ...}).
 
 } // namespace
 
@@ -177,7 +160,7 @@ std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& re
         return session;
 
     res.status = 401;
-    res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+    res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
     return std::nullopt;
 }
 
@@ -195,8 +178,11 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "service-scoped token blocked from admin route");
         res.status = 403;
+        // A4 unified envelope (#1470). require_admin gates a whole route, not a
+        // single securable:operation, so no `permission` field is emitted; the
+        // correlation_id ties the 403 to the auth.admin_required audit row.
         res.set_content(
-            R"({"error":{"code":403,"message":"service-scoped tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
+            detail::a4_denial(res, 403, "service-scoped tokens cannot perform admin operations"),
             "application/json");
         return false;
     }
@@ -204,9 +190,8 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "MCP token blocked from admin route");
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"MCP tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "MCP tokens cannot perform admin operations"),
+                        "application/json");
         return false;
     }
 
@@ -222,9 +207,7 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
         // audit_fn through dozens of route registrations (governance PR4).
         audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
         return false;
     }
     return true;
@@ -258,13 +241,13 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(nlohmann::json({{"error",
-                                             {{"code", 403},
-                                              {"message", "MCP token tier does not allow " +
-                                                              securable_type + ":" + operation}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
-                            "application/json");
+            // A4 unified envelope (#1470) — the kPermissionDenied specialisation
+            // names the missing grant in the structured `permission` field.
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(
+                detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                  detail::A4ErrorOpts{.permission = perm}),
+                "application/json");
             return false;
         }
         // Approval-gated operations (supervised tier on destructive ops) cannot
@@ -272,20 +255,24 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // mcp_server.cpp denies the same case with kTierDenied (it deliberately
         // does NOT return kApprovalRequired — A4 reserves that for a pollable
         // approval it cannot produce yet); mirror that denial here so the REST
-        // transport cannot bypass it (#520).
+        // transport cannot bypass it (#520). Deliberately NO approval_id/status_url
+        // here — there is no pollable approval to hand back yet; a fabricated one
+        // would violate the very §A4 contract. permission + remediation only.
         if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " (Phase 2 not implemented)");
             res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
             res.set_content(
-                nlohmann::json(
-                    {{"error",
-                      {{"code", 403},
-                       {"message", "operation requires approval; "
-                                   "approval-gated MCP execution is not yet implemented"}}},
-                     {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_denial(
+                    res, 403,
+                    "operation requires approval; approval-gated MCP execution is not yet "
+                    "implemented",
+                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
+                                               "supervised MCP tier; perform it via an "
+                                               "operator-tier token or the dashboard",
+                                .permission = perm}),
                 "application/json");
             return false;
         }
@@ -294,24 +281,24 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
     // Scoped tokens cannot be used when RBAC is disabled.
     if (!session->token_scope_service.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens require RBAC to be enabled",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
             return false;
         }
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
-                              operation + " (ITServiceOwner permission required)";
-            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (ITServiceOwner permission required)";
+            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -323,12 +310,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(nlohmann::json({{"error",
-                                             {{"code", 403},
-                                              {"message", "permission denied: " + securable_type +
-                                                              ":" + operation}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -343,9 +327,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_denial(res, 403, "admin role required",
+                                          detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                    operation}),
+                        "application/json");
         return false;
     }
     return true;
@@ -369,28 +354,35 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // (supervised tier on destructive ops) are blocked here because Phase 2
     // re-dispatch is not built — same contract as mcp_server.cpp (#520).
     if (!session->mcp_tier.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "MCP token tier does not allow " + securable_type + ":" +
-                                          operation,
-                                      securable_type + ":" + operation),
+            res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
+        // Deliberately NO approval_id/status_url — no pollable approval exists
+        // yet (Phase 2); a fabricated one would violate §A4. permission +
+        // remediation only, mirroring require_permission and mcp_server.cpp.
         if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " (Phase 2 not implemented)");
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "operation requires approval; approval-gated MCP "
-                                      "execution is not yet implemented",
-                                      securable_type + ":" + operation),
-                            "application/json");
+            res.set_content(
+                detail::a4_denial(
+                    res, 403,
+                    "operation requires approval; approval-gated MCP execution is not yet "
+                    "implemented",
+                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
+                                               "supervised MCP tier; perform it via an "
+                                               "operator-tier token or the dashboard",
+                                .permission = perm}),
+                "application/json");
             return false;
         }
     }
@@ -398,13 +390,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // Service-scoped tokens: verify the target agent belongs to the token's service,
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
+        const std::string perm = securable_type + ":" + operation;
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens require RBAC to be enabled",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
             return false;
         }
         // Check that the ITServiceOwner role grants this permission type
@@ -412,11 +406,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
-                              operation + " (ITServiceOwner permission required)";
-            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+            std::string msg =
+                "service-scoped token does not grant " + perm + " (ITServiceOwner permission required)";
+            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -425,9 +417,10 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: tag store unavailable");
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // Transient store outage → retryable; no permission field on a 503.
+            res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
             return false;
         }
         if (!agent_id.empty()) {
@@ -437,10 +430,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                           "agent service '" + agent_service + "' does not match token scope '" +
                               session->token_scope_service + "'");
                 res.status = 403;
-                res.set_content(nlohmann::json({{"error", "forbidden"},
-                                                {"detail", "agent is not in service '" +
-                                                               session->token_scope_service + "'"}})
-                                    .dump(),
+                // Was the third denial shape ({"error":"forbidden","detail":...});
+                // now the unified A4 envelope like every other gate (#1470).
+                res.set_content(detail::a4_denial(res, 403,
+                                                  "agent is not in service '" +
+                                                      session->token_scope_service + "'",
+                                                  detail::A4ErrorOpts{.permission = perm}),
                                 "application/json");
                 return false;
             }
@@ -454,9 +449,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(a4_denial(res, 403,
-                                      "permission denied: " + securable_type + ":" + operation,
-                                      securable_type + ":" + operation),
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
             return false;
         }
@@ -471,7 +466,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                   "non-admin role denied " + securable_type + ":" + operation +
                       (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
-        res.set_content(a4_denial(res, 403, "admin role required", securable_type + ":" + operation),
+        res.set_content(detail::a4_denial(res, 403, "admin role required",
+                                          detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                    operation}),
                         "application/json");
         return false;
     }
@@ -1868,7 +1865,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                   auto session = resolve_session(req);
                   if (!session) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
@@ -1983,7 +1980,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session = auth_mgr_.validate_session(token);
         if (!session) {
             res.status = 401;
-            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
         auto* db = auth_mgr_.auth_db_ptr();
@@ -2115,7 +2112,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto until = auth_mgr_.elevate_session(token, std::chrono::seconds(duration));
         if (!until) {
             res.status = 401; // session vanished between validate and elevate
-            res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
@@ -2151,13 +2148,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                   auto token = extract_session_cookie(req);
                   if (token.empty()) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   auto session = auth_mgr_.validate_session(token);
                   if (!session) {
                       res.status = 401;
-                      res.set_content(a4_denial(res, 401, "unauthorized"), "application/json");
+                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
                   const bool was_elevated = auth_mgr_.revoke_elevation(token);

@@ -27,6 +27,7 @@
  */
 
 #include "api_token_store.hpp"
+#include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
@@ -956,6 +957,138 @@ TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
     RestEventsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/executions/exec-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}
+
+// ── GET /api/v1/approvals/{id} (A4 status_url target) ────────────────────────
+
+namespace {
+
+/// Minimal harness that wires a real ApprovalManager (in-memory SQLite) into
+/// RestApiV1 so the versioned single-approval route can be driven end-to-end
+/// via the TestRouteSink dispatch pattern. `with_manager=false` exercises the
+/// 503-on-unwired-store path.
+struct RestApprovalsHarness {
+    yuzu::server::test::TestRouteSink sink;
+    sqlite3* db{nullptr};
+    std::unique_ptr<ApprovalManager> approvals;
+    bool session_present{true};
+    bool perm_grant{true};
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api;
+
+    explicit RestApprovalsHarness(bool with_manager = true) {
+        if (with_manager) {
+            REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+            approvals = std::make_unique<ApprovalManager>(db);
+            approvals->create_tables();
+        }
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            if (!session_present) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return std::nullopt;
+            }
+            auth::Session s;
+            s.username = "tester";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            if (!perm_grant) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) -> bool {
+            return true;
+        };
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+                            /*rbac_store=*/nullptr,
+                            /*mgmt_store=*/nullptr,
+                            /*token_store=*/nullptr,
+                            /*quarantine_store=*/nullptr,
+                            /*response_store=*/nullptr,
+                            /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr,
+                            /*schedule_engine=*/nullptr,
+                            /*approval_manager=*/approvals.get(),
+                            /*tag_store=*/nullptr,
+                            /*audit_store=*/nullptr);
+    }
+
+    ~RestApprovalsHarness() {
+        approvals.reset();
+        if (db)
+            sqlite3_close(db);
+    }
+};
+
+} // namespace
+
+TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full object",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto id = h.approvals->submit("def-123", "alice", "tag:prod");
+    REQUIRE(id.has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals/" + *id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // ok_json data object mirrors the Approval struct field-for-field.
+    REQUIRE(res->body.find("\"id\":\"" + *id + "\"") != std::string::npos);
+    REQUIRE(res->body.find(R"("definition_id":"def-123")") != std::string::npos);
+    REQUIRE(res->body.find(R"("status":"pending")") != std::string::npos);
+    REQUIRE(res->body.find(R"("submitted_by":"alice")") != std::string::npos);
+    REQUIRE(res->body.find(R"("scope_expression":"tag:prod")") != std::string::npos);
+    REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+    // Response always carries the correlation-id header (agentic-first).
+    REQUIRE_FALSE(res->get_header_value("X-Correlation-Id").empty());
+}
+
+TEST_CASE("GET /api/v1/approvals/{id}: unknown id → 404 A4 envelope",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto res = h.sink.Get("/api/v1/approvals/deadbeefdeadbeefdeadbeefdeadbeef");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    // 404 is A4-shaped: code + message + correlation_id + retry_after_ms(null).
+    REQUIRE(res->body.find(R"("code":404)") != std::string::npos);
+    REQUIRE(res->body.find(R"("message":"approval not found")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
+    auto hdr = res->get_header_value("X-Correlation-Id");
+    REQUIRE_FALSE(hdr.empty());
+    REQUIRE(res->body.find("\"correlation_id\":\"" + hdr + "\"") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals/{id}: unwired store → 503 A4 envelope with retry",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h(/*with_manager=*/false);
+    auto res = h.sink.Get("/api/v1/approvals/anything");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[events][approvals][auth]") {
+    RestApprovalsHarness h;
+    h.session_present = false;
+    auto res = h.sink.Get("/api/v1/approvals/anything");
+    REQUIRE(res);
+    REQUIRE(res->status == 401);
+}
+
+TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[events][approvals][perm]") {
+    RestApprovalsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/approvals/anything");
     REQUIRE(res);
     REQUIRE(res->status == 403);
 }

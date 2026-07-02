@@ -151,21 +151,34 @@ All REST API v1 responses use a standard JSON envelope.
 }
 ```
 
-**Error:**
+**Error (A4 envelope):**
 
 ```json
 {
   "error": {
-    "code": 503,
-    "message": "human-readable message"
+    "code": 403,
+    "message": "human-readable message",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "permission": "GuaranteedState:Read"
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
+HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. Every `/api/v1/*` error response uses the structured **A4 error envelope** (per [`docs/agentic-first-principle.md`](../agentic-first-principle.md) §A4), with the `code` field matching the HTTP status. The envelope's fields:
 
-Newer agentic-first surfaces enrich `error` with two optional fields: `correlation_id` (a `req-<hex>` token also echoed on the `X-Correlation-Id` response header, for joining the response to server logs/audit rows) and, on `401`/`403` denials from per-device scoped-permission gates, `permission` — the `"SecurableType:Operation"` the caller was denied (e.g. `"GuaranteedState:Read"`). These fields are **additive**; clients parsing only `code`/`message` are unaffected. They are not yet emitted on every denial path (the admin-only / unscoped gates still return the bare envelope — a tracked follow-up), so automation must treat `correlation_id`/`permission` as present-when-available, not guaranteed.
+| Field | Always present | Meaning |
+|---|---|---|
+| `code` | yes | HTTP status echoed into the body for self-describing frames. |
+| `message` | yes | One-sentence human-readable summary. |
+| `correlation_id` | yes | A `req-<hex-ms>-<hex-seq>` token, also echoed on the `X-Correlation-Id` response header — join the response to server logs / audit rows by grepping this token. |
+| `retry_after_ms` | yes (nullable) | `null` unless the condition is retryable, in which case it advises how many milliseconds to back off (e.g. a `503` warm-up returns `5000`). |
+| `remediation` | when a hint exists | Natural-language self-recovery hint. Key is **omitted** when there is no hint (absence carries the same "no recovery available" meaning). |
+| `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable. |
+| `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
+
+As of the R2 A4 completion (2026-07) **every** `/api/v1/*` error path — including the `require_admin`, `require_permission`, and service-scope denials in the auth layer — emits this envelope; the previous "bare `{error:{code,message}}`" and `{"error":"forbidden"}` shapes are gone. Clients parsing only `code`/`message` remain unaffected (the extra keys are additive). Denials from **other** (non-`/api/v1`) surfaces may still use legacy shapes (tracked as #1552), so automation crossing surfaces should treat the enrichment fields as present-when-available.
 
 ---
 
@@ -4511,6 +4524,33 @@ Enable or disable a schedule.
 ---
 
 ### Approvals
+
+#### `GET /api/v1/approvals/{id}`
+
+Fetch a single approval by id. This is the **A4 `status_url` target**: when an operation is denied with an approval-required envelope, a worker polls this endpoint for the current status rather than re-issuing the gated request. Requires `Approval:Read`. Read-only — it never mutates the approval lifecycle.
+
+**Response (200):** the standard v1 envelope wrapping an `Approval` object:
+
+```json
+{
+  "data": {
+    "id": "…",
+    "definition_id": "…",
+    "status": "pending",
+    "submitted_by": "alice",
+    "submitted_at": 1735689600,
+    "reviewed_by": "",
+    "reviewed_at": 0,
+    "review_comment": "",
+    "scope_expression": "tag:prod"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
+
+**Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/approvals`
 

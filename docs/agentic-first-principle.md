@@ -74,6 +74,13 @@ Two specialisations:
 
 **Why this matters.** Today errors give a code and message; nothing else. An agentic worker hitting `Permission denied` cannot tell which permission, who can grant it, or whether to retry. A4 closes that loop and makes self-recovery feasible.
 
+**Status (2026-07 — R2 A4 completion).** The REST surface is now A4-complete end to end:
+
+- **One envelope builder.** `detail::error_json_a4(code, message, correlation_id, const A4ErrorOpts&)` in `server/core/src/rest_a4_envelope.hpp` is the single wire-shape authority. `A4ErrorOpts` carries the nullable `retry_after_ms`, optional `remediation`, the `permission` specialisation, and the `approval_id`/`status_url` pair. The two legacy `error_json_a4` overloads delegate to it (byte-compatible). The httplib-coupled wrapper (`detail::a4_denial` / `detail::a4_error`) lives in the sibling `rest_a4_envelope_http.hpp` so the pure builder stays testable in isolation.
+- **Denial patchwork unified.** `auth_routes.cpp`'s three former denial shapes (the raw admin-gate strings, the `require_permission` legacy objects, and the `{"error":"forbidden","detail":…}` service-scope shape) all emit the one envelope now — every 401/403/503 carries a `correlation_id` (echoed on `X-Correlation-Id`) and, where a permission is known, the structured `securable_type:operation` field.
+- **`error_json` retired in `rest_api_v1.cpp`.** All ~156 `/api/v1/*` error bodies (the #1470 debt in this file) route through `detail::a4_error(res, msg)` — body `code` derived from `res.status`, `correlation_id` + `retry_after_ms` always present. Other files' `error_json` sites remain on the #1552 backlog.
+- **`status_url` target shipped.** `GET /api/v1/approvals/{id}` (gate `Approval:Read`) returns the approval state an A4 `kApprovalRequired` envelope points at, so a worker can poll rather than re-issue. The approval-required *denials* still carry `permission` + `remediation` only and NOT `approval_id`/`status_url` — the Phase-2 re-dispatch that would populate a pollable approval is not built, and a fabricated pointer would violate this section's own contract.
+
 **Enforced by.** `security-guardian` and `consistency-auditor` on any change to error-emitting code paths.
 
 ## Where these invariants are referenced
