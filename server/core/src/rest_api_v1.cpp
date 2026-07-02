@@ -11,7 +11,8 @@
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
-#include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
+#include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
@@ -182,17 +183,10 @@ std::string ok_json(std::string_view data_json) {
     return JObj().raw("data", data_json).raw("meta", R"({"api_version":"v1"})").str();
 }
 
-std::string error_json(std::string_view message, int code = 0) {
-    JObj j;
-    if (code != 0) {
-        auto err = JObj().add("code", code).add("message", message).str();
-        j.raw("error", err);
-    } else {
-        j.add("error", message);
-    }
-    j.raw("meta", R"({"api_version":"v1"})");
-    return j.str();
-}
+// The legacy bare error_json() helper is retired (#1470): every /api/v1 error
+// body now goes through detail::a4_error(res, msg) (code derived from
+// res.status) or detail::a4_denial, so it carries correlation_id +
+// retry_after_ms per agentic-first §A4.
 
 std::string list_json(std::string_view data_json, int64_t total, int64_t start = 0,
                       int64_t page_size = 50) {
@@ -1120,33 +1114,33 @@ void RestApiV1::register_routes(
                       return;
                   if (!bundle_orch) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       return;
                   }
                   if (!body.contains("agent_id") || !body["agent_id"].is_string() ||
                       body["agent_id"].get<std::string>().empty()) {
                       res.status = 400;
                       res.set_content(
-                          error_json("agent_id (non-empty string) is required — a bundle "
+                          detail::a4_error(res, "agent_id (non-empty string) is required — a bundle "
                                      "targets one device"),
                           "application/json");
                       return;
                   }
                   if (!body.contains("steps")) {
                       res.status = 400;
-                      res.set_content(error_json("steps is required"), "application/json");
+                      res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
                   auto specs = validate_bundle_steps(body["steps"].dump());
                   if (!specs) {
                       res.status = 400;
-                      res.set_content(error_json("steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);
@@ -1158,7 +1152,7 @@ void RestApiV1::register_routes(
                   // (governance sec-M2 / comp-S1).
                   if (principal.empty()) {
                       res.status = 500;
-                      res.set_content(error_json("authenticated session has no principal", 500),
+                      res.set_content(detail::a4_error(res, "authenticated session has no principal"),
                                       "application/json");
                       return;
                   }
@@ -1179,7 +1173,7 @@ void RestApiV1::register_routes(
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());
                       res.status = 503;
-                      res.set_content(error_json("bundle dispatch failed", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "bundle dispatch failed"), "application/json");
                       return;
                   }
                   audit_fn(req, "bundle.dispatch", "success", "Execution", r.correlation_id,
@@ -1304,7 +1298,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!bundle_orch) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto session = auth_fn(req, res);
@@ -1319,7 +1313,7 @@ void RestApiV1::register_routes(
                      audit_fn(req, "bundle.collate", "denied", "Execution", id,
                               "not found or not owned");
                      res.status = 404;
-                     res.set_content(error_json("bundle not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "bundle not found"), "application/json");
                      return;
                  }
                  audit_fn(req, "bundle.collate", "success", "Execution", id,
@@ -1335,7 +1329,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1364,14 +1358,14 @@ void RestApiV1::register_routes(
             return;
         if (!mgmt_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -1389,7 +1383,7 @@ void RestApiV1::register_routes(
         auto result = mgmt_store->create_group(g);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
@@ -1403,7 +1397,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1411,7 +1405,7 @@ void RestApiV1::register_routes(
                  auto g = mgmt_store->get_group(id);
                  if (!g) {
                      res.status = 404;
-                     res.set_content(error_json("group not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "group not found"), "application/json");
                      return;
                  }
                  auto members = mgmt_store->get_members(id);
@@ -1444,7 +1438,7 @@ void RestApiV1::register_routes(
             return;
         if (!mgmt_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1452,14 +1446,14 @@ void RestApiV1::register_routes(
         auto existing = mgmt_store->get_group(id);
         if (!existing) {
             res.status = 404;
-            res.set_content(error_json("group not found"), "application/json");
+            res.set_content(detail::a4_error(res, "group not found"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -1477,7 +1471,7 @@ void RestApiV1::register_routes(
 
         if (id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
             res.status = 400;
-            res.set_content(error_json("cannot re-parent root group"), "application/json");
+            res.set_content(detail::a4_error(res, "cannot re-parent root group"), "application/json");
             return;
         }
 
@@ -1486,14 +1480,14 @@ void RestApiV1::register_routes(
             if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
                 descendants.end()) {
                 res.status = 400;
-                res.set_content(error_json("re-parenting would create a cycle"),
+                res.set_content(detail::a4_error(res, "re-parenting would create a cycle"),
                                 "application/json");
                 return;
             }
             auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
             if (ancestors.size() >= 4) {
                 res.status = 400;
-                res.set_content(error_json("maximum hierarchy depth (5) exceeded"),
+                res.set_content(detail::a4_error(res, "maximum hierarchy depth (5) exceeded"),
                                 "application/json");
                 return;
             }
@@ -1502,7 +1496,7 @@ void RestApiV1::register_routes(
         auto result = mgmt_store->update_group(updated);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "management_group.update", "success", "ManagementGroup", id, updated.name);
@@ -1516,7 +1510,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1524,7 +1518,7 @@ void RestApiV1::register_routes(
             auto result = mgmt_store->delete_group(id);
             if (!result) {
                 res.status = (result.error() == "cannot delete root group") ? 403 : 404;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "management_group.delete", "success", "ManagementGroup", id, "");
@@ -1538,7 +1532,7 @@ void RestApiV1::register_routes(
                       return;
                   if (!mgmt_store) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
 
@@ -1547,7 +1541,7 @@ void RestApiV1::register_routes(
                   auto agent_id = body.value("agent_id", "");
                   if (agent_id.empty()) {
                       res.status = 400;
-                      res.set_content(error_json("agent_id required"), "application/json");
+                      res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
                   mgmt_store->add_member(group_id, agent_id);
@@ -1564,7 +1558,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1584,7 +1578,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1609,7 +1603,7 @@ void RestApiV1::register_routes(
                       return;
                   if (!mgmt_store || !rbac_store) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
 
@@ -1617,7 +1611,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       return;
                   }
 
@@ -1627,14 +1621,14 @@ void RestApiV1::register_routes(
 
                   if (principal_id.empty() || role_name.empty()) {
                       res.status = 400;
-                      res.set_content(error_json("principal_id and role_name required"),
+                      res.set_content(detail::a4_error(res, "principal_id and role_name required"),
                                       "application/json");
                       return;
                   }
 
                   if (role_name != "Operator" && role_name != "Viewer") {
                       res.status = 403;
-                      res.set_content(error_json("only Operator and Viewer roles can be delegated"),
+                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
                                       "application/json");
                       return;
                   }
@@ -1653,7 +1647,7 @@ void RestApiV1::register_routes(
                   }
                   if (!authorized) {
                       res.status = 403;
-                      res.set_content(error_json("forbidden"), "application/json");
+                      res.set_content(detail::a4_error(res, "forbidden"), "application/json");
                       return;
                   }
 
@@ -1666,7 +1660,7 @@ void RestApiV1::register_routes(
                   auto result = mgmt_store->assign_role(assignment);
                   if (!result) {
                       res.status = 400;
-                      res.set_content(error_json(result.error()), "application/json");
+                      res.set_content(detail::a4_error(res, result.error()), "application/json");
                       return;
                   }
                   audit_fn(req, "management_group.assign_role", "success", "ManagementGroup",
@@ -1684,7 +1678,7 @@ void RestApiV1::register_routes(
                 return;
             if (!mgmt_store || !rbac_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -1692,7 +1686,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
 
@@ -1714,7 +1708,7 @@ void RestApiV1::register_routes(
             }
             if (!authorized) {
                 res.status = 403;
-                res.set_content(error_json("forbidden"), "application/json");
+                res.set_content(detail::a4_error(res, "forbidden"), "application/json");
                 return;
             }
 
@@ -1735,7 +1729,7 @@ void RestApiV1::register_routes(
                  // "no database".
                  if (!token_store || !token_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -1769,7 +1763,7 @@ void RestApiV1::register_routes(
             return;
         if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1800,13 +1794,13 @@ void RestApiV1::register_routes(
         // amplification vector outright.
         if (name.size() > 256) {
             res.status = 400;
-            res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+            res.set_content(detail::a4_error(res, "invalid_input_length: name exceeds 256 chars"),
                             "application/json");
             return;
         }
         if (scope_service.size() > 256) {
             res.status = 400;
-            res.set_content(error_json("invalid_input_length: scope_service exceeds 256 chars"),
+            res.set_content(detail::a4_error(res, "invalid_input_length: scope_service exceeds 256 chars"),
                             "application/json");
             return;
         }
@@ -1814,7 +1808,7 @@ void RestApiV1::register_routes(
         if (!scope_service.empty()) {
             if (!rbac_store || !rbac_store->is_rbac_enabled()) {
                 res.status = 400;
-                res.set_content(error_json("service-scoped tokens require RBAC to be enabled"),
+                res.set_content(detail::a4_error(res, "service-scoped tokens require RBAC to be enabled"),
                                 "application/json");
                 return;
             }
@@ -1835,7 +1829,7 @@ void RestApiV1::register_routes(
             }
             if (!authorized) {
                 res.status = 403;
-                res.set_content(error_json("ITServiceOwner authority required for service '" +
+                res.set_content(detail::a4_error(res, "ITServiceOwner authority required for service '" +
                                            scope_service + "'"),
                                 "application/json");
                 return;
@@ -1922,7 +1916,7 @@ void RestApiV1::register_routes(
             return;
         if (!token_store || !token_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1956,7 +1950,7 @@ void RestApiV1::register_routes(
                          "owner=" + existing->principal_id);
             }
             res.status = 404;
-            res.set_content(error_json("token not found"), "application/json");
+            res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
 
@@ -1965,7 +1959,7 @@ void RestApiV1::register_routes(
             // Either the token vanished between get and revoke, or the
             // revoke call itself failed. Treat as not-found for the client.
             res.status = 404;
-            res.set_content(error_json("token not found"), "application/json");
+            res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
@@ -2012,7 +2006,7 @@ void RestApiV1::register_routes(
             // through to revoke — comparing two empty strings would
             // mis-attribute the action.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500), "application/json");
+            res.set_content(detail::a4_error(res, "session has empty username"), "application/json");
             return;
         }
         // Audit emission helper — wraps audit_fn so we can capture both
@@ -2052,13 +2046,13 @@ void RestApiV1::register_routes(
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
             res.set_content(
-                error_json("self-revoke requires an interactive session, not an API token", 403),
+                detail::a4_error(res, "self-revoke requires an interactive session, not an API token"),
                 "application/json");
             return;
         }
         if (!session_revoke_fn) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
@@ -2109,7 +2103,7 @@ void RestApiV1::register_routes(
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500), "application/json");
+            res.set_content(detail::a4_error(res, "session has empty username"), "application/json");
             return;
         }
         // PR2 — MFA step-up gate. Admin force-logout of another user
@@ -2118,13 +2112,13 @@ void RestApiV1::register_routes(
             return;
         if (!session_revoke_fn) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const auto username = req.get_param_value("username");
         if (username.empty()) {
             res.status = 400;
-            res.set_content(error_json("username query parameter required", 400),
+            res.set_content(detail::a4_error(res, "username query parameter required"),
                             "application/json");
             return;
         }
@@ -2134,7 +2128,7 @@ void RestApiV1::register_routes(
             // attacker-controlled string while the SQL bind silently
             // truncates at NUL — different rows hit memory vs disk.
             res.status = 400;
-            res.set_content(error_json("invalid username format", 400), "application/json");
+            res.set_content(detail::a4_error(res, "invalid username format"), "application/json");
             return;
         }
         const auto result = session_revoke_fn(username, /*revoke_api_tokens=*/false);
@@ -2278,7 +2272,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!quarantine_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2303,7 +2297,7 @@ void RestApiV1::register_routes(
             return;
         if (!quarantine_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2318,7 +2312,7 @@ void RestApiV1::register_routes(
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
@@ -2333,7 +2327,7 @@ void RestApiV1::register_routes(
                 return;
             if (!quarantine_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -2341,7 +2335,7 @@ void RestApiV1::register_routes(
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
@@ -2356,7 +2350,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!rbac_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2379,7 +2373,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!rbac_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2402,7 +2396,7 @@ void RestApiV1::register_routes(
             return;
         if (!rbac_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2442,7 +2436,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!tag_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2465,14 +2459,14 @@ void RestApiV1::register_routes(
                      return;
                  if (!tag_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
                  auto agent_id = req.get_param_value("agent_id");
                  if (agent_id.empty()) {
                      res.status = 400;
-                     res.set_content(error_json("agent_id parameter required"), "application/json");
+                     res.set_content(detail::a4_error(res, "agent_id parameter required"), "application/json");
                      return;
                  }
                  auto tags = tag_store->get_all_tags(agent_id);
@@ -2488,14 +2482,14 @@ void RestApiV1::register_routes(
             return;
         if (!tag_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
         auto agent_id = body.value("agent_id", "");
@@ -2515,14 +2509,14 @@ void RestApiV1::register_routes(
 
         if (agent_id.empty() || key.empty()) {
             res.status = 400;
-            res.set_content(error_json("agent_id and key required"), "application/json");
+            res.set_content(detail::a4_error(res, "agent_id and key required"), "application/json");
             return;
         }
 
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
             res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         if (key == "service" && service_group_fn)
@@ -2540,7 +2534,7 @@ void RestApiV1::register_routes(
                 return;
             if (!tag_store) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -2549,7 +2543,7 @@ void RestApiV1::register_routes(
             bool deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
                 res.status = 404;
-                res.set_content(error_json("tag not found"), "application/json");
+                res.set_content(detail::a4_error(res, "tag not found"), "application/json");
                 return;
             }
             audit_fn(req, "tag.delete", "success", "Tag", agent_id + ":" + key, "");
@@ -2564,7 +2558,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -2642,20 +2636,20 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
                  if (!std::regex_match(def_id, kRtDefIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                     res.set_content(detail::a4_error(res, "definition id must match [A-Za-z0-9._-]{1,128}"),
                                      "application/json");
                      return;
                  }
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
                  ResponseTemplatesEngine engine;
@@ -2691,7 +2685,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
@@ -2699,13 +2693,13 @@ void RestApiV1::register_routes(
                  if (!std::regex_match(def_id, kRtDefIdRegex) ||
                      !std::regex_match(tid, kRtTemplateIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("malformed id"), "application/json");
+                     res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      return;
                  }
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
                  ResponseTemplatesEngine engine;
@@ -2732,7 +2726,7 @@ void RestApiV1::register_routes(
                      }
                  }
                  res.status = 404;
-                 res.set_content(error_json("template not found"), "application/json");
+                 res.set_content(detail::a4_error(res, "template not found"), "application/json");
              });
 
     // POST /api/v1/definitions/{id}/response-templates ─ create
@@ -2743,13 +2737,13 @@ void RestApiV1::register_routes(
                       return;
                   if (!instruction_store || !instruction_store->is_open()) {
                       res.status = 503;
-                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
                   auto def_id = req.matches[1].str();
                   if (!std::regex_match(def_id, kRtDefIdRegex)) {
                       res.status = 400;
-                      res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                      res.set_content(detail::a4_error(res, "definition id must match [A-Za-z0-9._-]{1,128}"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=malformed_definition_id");
@@ -2757,7 +2751,7 @@ void RestApiV1::register_routes(
                   }
                   if (req.body.size() > kRtMaxBodyBytes) {
                       res.status = 413;
-                      res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                      res.set_content(detail::a4_error(res, "request body exceeds 64 KiB cap"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=body_too_large");
@@ -2766,7 +2760,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
-                      res.set_content(error_json("invalid JSON"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=invalid_json");
                       return;
@@ -2774,7 +2768,7 @@ void RestApiV1::register_routes(
                   auto def = instruction_store->get_definition(def_id);
                   if (!def) {
                       res.status = 404;
-                      res.set_content(error_json("definition not found"), "application/json");
+                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=definition_not_found");
                       return;
@@ -2789,7 +2783,7 @@ void RestApiV1::register_routes(
                                                            /*assign_id=*/true);
                   if (!validated) {
                       res.status = 400;
-                      res.set_content(error_json(validated.error()), "application/json");
+                      res.set_content(detail::a4_error(res, validated.error()), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=validation_failed");
                       return;
@@ -2799,7 +2793,7 @@ void RestApiV1::register_routes(
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
                       res.status = 500;
-                      res.set_content(error_json("persist failure"), "application/json");
+                      res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
                       return;
@@ -2818,7 +2812,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto def_id = req.matches[1].str();
@@ -2826,14 +2820,14 @@ void RestApiV1::register_routes(
                  if (!std::regex_match(def_id, kRtDefIdRegex) ||
                      !std::regex_match(tid, kRtTemplateIdRegex)) {
                      res.status = 400;
-                     res.set_content(error_json("malformed id"), "application/json");
+                     res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=malformed_id");
                      return;
                  }
                  if (tid == ResponseTemplatesEngine::kDefaultId) {
                      res.status = 400;
-                     res.set_content(error_json("'__default__' is reserved for the synthesised "
+                     res.set_content(detail::a4_error(res, "'__default__' is reserved for the synthesised "
                                                 "default; create a new template instead"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
@@ -2842,7 +2836,7 @@ void RestApiV1::register_routes(
                  }
                  if (req.body.size() > kRtMaxBodyBytes) {
                      res.status = 413;
-                     res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                     res.set_content(detail::a4_error(res, "request body exceeds 64 KiB cap"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=body_too_large");
@@ -2851,7 +2845,7 @@ void RestApiV1::register_routes(
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded()) {
                      res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                     res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=invalid_json");
                      return;
@@ -2859,7 +2853,7 @@ void RestApiV1::register_routes(
                  auto def = instruction_store->get_definition(def_id);
                  if (!def) {
                      res.status = 404;
-                     res.set_content(error_json("definition not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=definition_not_found");
                      return;
@@ -2877,7 +2871,7 @@ void RestApiV1::register_routes(
                      }
                  if (!found) {
                      res.status = 404;
-                     res.set_content(error_json("template not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "template not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=template_not_found");
                      return;
@@ -2887,7 +2881,7 @@ void RestApiV1::register_routes(
                                                           /*assign_id=*/false);
                  if (!validated) {
                      res.status = 400;
-                     res.set_content(error_json(validated.error()), "application/json");
+                     res.set_content(detail::a4_error(res, validated.error()), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
                               def_id, "reason=validation_failed");
                      return;
@@ -2902,7 +2896,7 @@ void RestApiV1::register_routes(
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
                      res.status = 500;
-                     res.set_content(error_json("persist failure"), "application/json");
+                     res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
                      return;
@@ -2921,7 +2915,7 @@ void RestApiV1::register_routes(
                 return;
             if (!instruction_store || !instruction_store->is_open()) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
             auto def_id = req.matches[1].str();
@@ -2929,14 +2923,14 @@ void RestApiV1::register_routes(
             if (!std::regex_match(def_id, kRtDefIdRegex) ||
                 !std::regex_match(tid, kRtTemplateIdRegex)) {
                 res.status = 400;
-                res.set_content(error_json("malformed id"), "application/json");
+                res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=malformed_id");
                 return;
             }
             if (tid == ResponseTemplatesEngine::kDefaultId) {
                 res.status = 400;
-                res.set_content(error_json("the synthesised default template "
+                res.set_content(detail::a4_error(res, "the synthesised default template "
                                            "cannot be deleted"),
                                 "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
@@ -2946,7 +2940,7 @@ void RestApiV1::register_routes(
             auto def = instruction_store->get_definition(def_id);
             if (!def) {
                 res.status = 404;
-                res.set_content(error_json("definition not found"), "application/json");
+                res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=definition_not_found");
                 return;
@@ -2962,7 +2956,7 @@ void RestApiV1::register_routes(
                             templates.end());
             if (templates.size() == before) {
                 res.status = 404;
-                res.set_content(error_json("template not found"), "application/json");
+                res.set_content(detail::a4_error(res, "template not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
                          "reason=template_not_found");
                 return;
@@ -2971,7 +2965,7 @@ void RestApiV1::register_routes(
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
                 res.status = 500;
-                res.set_content(error_json("persist failure"), "application/json");
+                res.set_content(detail::a4_error(res, "persist failure"), "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
                 return;
@@ -2989,7 +2983,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!audit_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
 
@@ -3205,7 +3199,7 @@ void RestApiV1::register_routes(
             return;
         if (!inventory_store || !inventory_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("inventory store not available"), "application/json");
+            res.set_content(detail::a4_error(res, "inventory store not available"), "application/json");
             return;
         }
 
@@ -3227,7 +3221,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!inventory_store || !inventory_store->is_open()) {
                      res.status = 503;
-                     res.set_content(error_json("inventory store not available"),
+                     res.set_content(detail::a4_error(res, "inventory store not available"),
                                      "application/json");
                      return;
                  }
@@ -3238,7 +3232,7 @@ void RestApiV1::register_routes(
                  auto record = inventory_store->get(agent_id, plugin);
                  if (!record) {
                      res.status = 404;
-                     res.set_content(error_json("no inventory data found"), "application/json");
+                     res.set_content(detail::a4_error(res, "no inventory data found"), "application/json");
                      return;
                  }
 
@@ -3261,14 +3255,14 @@ void RestApiV1::register_routes(
             return;
         if (!inventory_store || !inventory_store->is_open()) {
             res.status = 503;
-            res.set_content(error_json("inventory store not available"), "application/json");
+            res.set_content(detail::a4_error(res, "inventory store not available"), "application/json");
             return;
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             return;
         }
 
@@ -3721,14 +3715,14 @@ void RestApiV1::register_routes(
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto execution_id = req.matches[1].str();
             if (!req.has_param("definition_id")) {
                 res.status = 400;
-                res.set_content(error_json("definition_id query parameter is required"),
+                res.set_content(detail::a4_error(res, "definition_id query parameter is required"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          "reason=missing_definition_id");
@@ -3743,7 +3737,7 @@ void RestApiV1::register_routes(
             static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
             if (!std::regex_match(definition_id, kIdRegex)) {
                 res.status = 400;
-                res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                res.set_content(detail::a4_error(res, "definition_id must match [A-Za-z0-9._-]{1,128}"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          "reason=malformed_definition_id");
@@ -3758,13 +3752,13 @@ void RestApiV1::register_routes(
                     chart_index = std::stoi(req.get_param_value("index"));
                 } catch (...) {
                     res.status = 400;
-                    res.set_content(error_json("index must be a non-negative integer"),
+                    res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
                                     "application/json");
                     return;
                 }
                 if (chart_index < 0) {
                     res.status = 400;
-                    res.set_content(error_json("index must be a non-negative integer"),
+                    res.set_content(detail::a4_error(res, "index must be a non-negative integer"),
                                     "application/json");
                     return;
                 }
@@ -3773,7 +3767,7 @@ void RestApiV1::register_routes(
             auto def = instruction_store->get_definition(definition_id);
             if (!def) {
                 res.status = 404;
-                res.set_content(error_json("instruction definition not found"), "application/json");
+                res.set_content(detail::a4_error(res, "instruction definition not found"), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=definition_not_found");
                 return;
@@ -3781,7 +3775,7 @@ void RestApiV1::register_routes(
             int chart_count = VisualizationEngine::count(def->visualization_spec);
             if (chart_count == 0) {
                 res.status = 404;
-                res.set_content(error_json("no visualization configured for this definition"),
+                res.set_content(detail::a4_error(res, "no visualization configured for this definition"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=no_visualization");
@@ -3789,7 +3783,7 @@ void RestApiV1::register_routes(
             }
             if (chart_index >= chart_count) {
                 res.status = 404;
-                res.set_content(error_json("visualization index out of range (have " +
+                res.set_content(detail::a4_error(res, "visualization index out of range (have " +
                                            std::to_string(chart_count) + " chart(s))"),
                                 "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
@@ -3851,7 +3845,7 @@ void RestApiV1::register_routes(
                 auto parsed = nlohmann::json::parse(result.json, nullptr, false);
                 auto msg = parsed.is_discarded() ? std::string("invalid spec")
                                                  : parsed.value("error", "invalid spec");
-                res.set_content(error_json(msg), "application/json");
+                res.set_content(detail::a4_error(res, msg), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " err=" + msg);
                 return;
@@ -3891,7 +3885,7 @@ void RestApiV1::register_routes(
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
-                          res.set_content(error_json("invalid JSON"), "application/json");
+                          res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                           return;
                       }
 
@@ -4667,7 +4661,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
             auto name = body.value("name", "");
@@ -4684,19 +4678,19 @@ void RestApiV1::register_routes(
             // but name and definition_id ride the same SQLite bind path.
             if (name.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: name exceeds 256 chars"),
                                 "application/json");
                 return;
             }
             if (device_id.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: device_id exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: device_id exceeds 256 chars"),
                                 "application/json");
                 return;
             }
             if (definition_id.size() > 256) {
                 res.status = 400;
-                res.set_content(error_json("invalid_input_length: definition_id exceeds 256 chars"),
+                res.set_content(detail::a4_error(res, "invalid_input_length: definition_id exceeds 256 chars"),
                                 "application/json");
                 return;
             }
@@ -4773,7 +4767,7 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
                 } else {
                     res.status = 404;
-                    res.set_content(error_json("token not found"), "application/json");
+                    res.set_content(detail::a4_error(res, "token not found"), "application/json");
                 }
             });
     }
@@ -4819,7 +4813,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
 
@@ -4841,7 +4835,7 @@ void RestApiV1::register_routes(
                 auto pkg_version = body.value("version", "");
                 if (pkg_name.empty() || pkg_version.empty()) {
                     res.status = 400;
-                    res.set_content(error_json("name and version are required"),
+                    res.set_content(detail::a4_error(res, "name and version are required"),
                                     "application/json");
                     return;
                 }
@@ -4862,7 +4856,7 @@ void RestApiV1::register_routes(
                 // returns 500 with no audit trail. Audit + 400 instead.
                 emit_denial("payload field has wrong JSON type — string expected");
                 res.status = 400;
-                res.set_content(error_json(std::string{"invalid field type: "} + e.what()),
+                res.set_content(detail::a4_error(res, std::string{"invalid field type: "} + e.what()),
                                 "application/json");
                 return;
             }
@@ -4883,7 +4877,7 @@ void RestApiV1::register_routes(
                 emit_denial("verify_command contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"verify_command"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"verify_command"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4891,7 +4885,7 @@ void RestApiV1::register_routes(
                 emit_denial("rollback_command contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"rollback_command"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"rollback_command"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4903,7 +4897,7 @@ void RestApiV1::register_routes(
                 emit_denial("silent_args contains shell metacharacters / control chars or "
                             "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json(std::string{"silent_args"} + kInputErr),
+                res.set_content(detail::a4_error(res, std::string{"silent_args"} + kInputErr),
                                 "application/json");
                 return;
             }
@@ -4911,7 +4905,7 @@ void RestApiV1::register_routes(
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
@@ -4956,7 +4950,7 @@ void RestApiV1::register_routes(
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
-                          res.set_content(error_json("invalid JSON"), "application/json");
+                          res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                           return;
                       }
                       SoftwareDeployment dep;
@@ -4966,7 +4960,7 @@ void RestApiV1::register_routes(
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
                           res.status = 400;
-                          res.set_content(error_json(result.error()), "application/json");
+                          res.set_content(detail::a4_error(res, result.error()), "application/json");
                           return;
                       }
                       audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
@@ -4996,7 +4990,7 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
                     res.status = 400;
-                    res.set_content(error_json("cannot start deployment"), "application/json");
+                    res.set_content(detail::a4_error(res, "cannot start deployment"), "application/json");
                 }
             });
 
@@ -5016,7 +5010,7 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = 400;
-                          res.set_content(error_json("cannot rollback deployment"),
+                          res.set_content(detail::a4_error(res, "cannot rollback deployment"),
                                           "application/json");
                       }
                   });
@@ -5037,7 +5031,7 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = 400;
-                          res.set_content(error_json("cannot cancel deployment"),
+                          res.set_content(detail::a4_error(res, "cannot cancel deployment"),
                                           "application/json");
                       }
                   });
@@ -5079,7 +5073,7 @@ void RestApiV1::register_routes(
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
                 res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
             License lic;
@@ -5093,7 +5087,7 @@ void RestApiV1::register_routes(
             auto result = license_store->activate_license(lic, key);
             if (!result) {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
             audit_fn(req, "license.activate", "success", "License", *result, lic.organization);
@@ -5115,7 +5109,7 @@ void RestApiV1::register_routes(
                 res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
             } else {
                 res.status = 404;
-                res.set_content(error_json("license not found"), "application/json");
+                res.set_content(detail::a4_error(res, "license not found"), "application/json");
             }
         });
 
@@ -5184,7 +5178,7 @@ void RestApiV1::register_routes(
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.contains("agent_id")) {
                       res.status = 400;
-                      res.set_content(error_json("invalid request body"), "application/json");
+                      res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                       return;
                   }
                   auto agent_id = body.value("agent_id", "");
@@ -5259,7 +5253,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto rows = guaranteed_state_store->list_rules();
@@ -5423,14 +5417,14 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  auto id = req.matches[1].str();
                  auto row = guaranteed_state_store->get_rule(id);
                  if (!row) {
                      res.status = 404;
-                     res.set_content(error_json("rule not found"), "application/json");
+                     res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                      return;
                  }
                  res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
@@ -5611,14 +5605,14 @@ void RestApiV1::register_routes(
                         return;
                     if (!guaranteed_state_store) {
                         res.status = 503;
-                        res.set_content(error_json("service unavailable", 503), "application/json");
+                        res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                         return;
                     }
                     auto id = req.matches[1].str();
                     auto result = guaranteed_state_store->delete_rule(id);
                     if (!result) {
                         res.status = 404;
-                        res.set_content(error_json(result.error()), "application/json");
+                        res.set_content(detail::a4_error(res, result.error()), "application/json");
                         audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
                                  id, result.error());
                         return;
@@ -5644,13 +5638,13 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
             audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
                      "invalid JSON body");
             return;
@@ -5701,7 +5695,7 @@ void RestApiV1::register_routes(
             pushed = guardian_push_fn(scope, full_sync);
             if (pushed < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid scope expression"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid scope expression"), "application/json");
                 audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
                          "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
                 return;
@@ -5731,7 +5725,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         GuaranteedStateEventQuery q;
@@ -5776,7 +5770,7 @@ void RestApiV1::register_routes(
             [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
             if (ec != std::errc{} || v < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid limit"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                 return;
             }
             q.limit = std::min(v, 1000);
@@ -5787,7 +5781,7 @@ void RestApiV1::register_routes(
             [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
             if (ec != std::errc{} || v < 0) {
                 res.status = 400;
-                res.set_content(error_json("invalid offset"), "application/json");
+                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
                 return;
             }
             q.offset = v;
@@ -5842,7 +5836,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -6235,7 +6229,7 @@ void RestApiV1::register_routes(
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -6268,7 +6262,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const std::string obs_type = req.matches[1].str();
@@ -6282,7 +6276,7 @@ void RestApiV1::register_routes(
                          std::string::npos;
                  if (!ok) {
                      res.status = 400;
-                     res.set_content(error_json("invalid obs_type"), "application/json");
+                     res.set_content(detail::a4_error(res, "invalid obs_type"), "application/json");
                      return;
                  }
                  const std::string window =
@@ -6296,7 +6290,7 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v < 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
                      limit = std::min(v, 500);
@@ -7105,7 +7099,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!net_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
@@ -7140,7 +7134,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!net_perf_fn) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  const NetPerfMetric metric = net_perf_metric_from_token(
@@ -7168,7 +7162,7 @@ void RestApiV1::register_routes(
                          std::from_chars(s.data(), s.data() + s.size(), v);
                      if (ec != std::errc{} || v <= 0) {
                          res.status = 400;
-                         res.set_content(error_json("invalid limit"), "application/json");
+                         res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
                      limit = std::min(v, 500);
