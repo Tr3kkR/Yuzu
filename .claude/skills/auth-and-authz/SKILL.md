@@ -220,9 +220,12 @@ matches the customer ask.
    `now < elevated_until`) is honoured by `require_admin` + the permission gates;
    the window is monotonic `steady_clock`, in-memory per **cookie** session
    (restart/logout drops it; API/MCP tokens can never elevate). Audits
-   `role.elevation.{granted,denied,revoked}` + `user.elevation_eligibility.set`;
-   `POST /api/v1/elevate/revoke` for step-down. (Passive `expired` is implicit
-   from `granted` + duration — a lazy/reaper expiry row is a tracked follow-up.)
+   `role.elevation.{granted,denied,revoked,expired}` + `user.elevation_eligibility.set`;
+   `POST /api/v1/elevate/revoke` for step-down. Passive expiry is now audited
+   too — lazily, at the `AuthRoutes::resolve_session` cookie chokepoint on the
+   operator's next authenticated request after the window lapses (no
+   background reaper); a session already at/past its own absolute lifetime is
+   rejected `401` rather than granted a zero-length window (dead-window guard).
    See `docs/auth-architecture.md` "JIT admin elevation";
    `tests/unit/server/test_auth_jit_elevation.cpp`.
 10. **Self-managed Certificate Authority (mTLS + code signing).** A single

@@ -33,6 +33,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -109,6 +110,147 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
     CHECK_FALSE(mgr->revoke_elevation("deadbeef"));
 }
 
+// ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
+
+TEST_CASE("AuthManager::elevate_session clamps the window to the session's own "
+         "absolute expiry",
+         "[jit][auth]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("carol", "secret123456", Role::user);
+    auto token = mgr->authenticate("carol", "secret123456");
+    REQUIRE(token.has_value());
+    auto session_before = mgr->validate_session(*token);
+    REQUIRE(session_before.has_value());
+
+    // Request a window far longer than the session's own absolute lifetime
+    // (kSessionDuration = 8h) — an elevation must never outlive the cookie
+    // session that carries it (residual-risk follow-up B).
+    auto until = mgr->elevate_session(*token, std::chrono::hours(48));
+    REQUIRE(until.has_value());
+    CHECK(*until <= session_before->expires_at);
+    // And meaningfully clamped, not merely coincidentally equal — the naive
+    // (unclamped) now+48h would be far beyond the session's ~8h expiry.
+    CHECK(*until < std::chrono::steady_clock::now() + std::chrono::hours(47));
+
+    // A short, well-inside-the-session-lifetime window is NOT clamped.
+    auto token2 = mgr->authenticate("carol", "secret123456");
+    REQUIRE(token2.has_value());
+    auto before2 = std::chrono::steady_clock::now();
+    auto until2 = mgr->elevate_session(*token2, std::chrono::seconds(60));
+    REQUIRE(until2.has_value());
+    CHECK(*until2 >= before2 + std::chrono::seconds(58));
+    CHECK(*until2 <= before2 + std::chrono::seconds(65));
+}
+
+// ── Follow-up A: lazy passive-expiry reaping ────────────────────────────────
+
+TEST_CASE("AuthManager::reap_expired_elevation fires exactly once on a passive "
+         "lapse",
+         "[jit][auth]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("dave", "secret123456", Role::user);
+    auto token = mgr->authenticate("dave", "secret123456");
+    REQUIRE(token.has_value());
+
+    // A 1s window, then a real sleep past it — duration(0) no longer works
+    // here: elevate_session's dead-window guard (governance hardening round,
+    // UP-1/UP-4) now REJECTS a request that would clamp to `until <= now`
+    // rather than granting a zero-length window, so the smallest grantable
+    // positive window must actually lapse via real time.
+    REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(1)).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    auto reaped = mgr->reap_expired_elevation(*token);
+    REQUIRE(reaped.has_value());
+    CHECK(*reaped == "dave");
+    // Idempotent: the sentinel-clear on the first reap makes a second call a
+    // no-op (never double-emits `role.elevation.expired`).
+    CHECK_FALSE(mgr->reap_expired_elevation(*token).has_value());
+
+    auto s = mgr->validate_session(*token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+
+    // Unknown / oversized token → nullopt, same posture as the sibling methods.
+    CHECK_FALSE(mgr->reap_expired_elevation("deadbeef").has_value());
+    CHECK_FALSE(mgr->reap_expired_elevation(std::string(600, 'a')).has_value());
+}
+
+TEST_CASE("AuthManager::reap_expired_elevation is a no-op after a manual revoke",
+         "[jit][auth]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("erin", "secret123456", Role::user);
+    auto token = mgr->authenticate("erin", "secret123456");
+    REQUIRE(token.has_value());
+    REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(60)).has_value());
+
+    // Manual step-down clears elevated_until to the same sentinel a passive
+    // reap would — so a manually-revoked window must never ALSO report an
+    // "expired" event (it already has its own role.elevation.revoked row).
+    CHECK(mgr->revoke_elevation(*token));
+    CHECK_FALSE(mgr->reap_expired_elevation(*token).has_value());
+
+    // Not-yet-elevated / never-elevated is likewise a no-op.
+    auto token2 = mgr->authenticate("erin", "secret123456");
+    REQUIRE(token2.has_value());
+    CHECK_FALSE(mgr->reap_expired_elevation(*token2).has_value());
+}
+
+// ── Governance hardening round: dead-window guard (UP-1/UP-4) ──────────────
+
+TEST_CASE("AuthManager::elevate_session rejects a dead window (nullopt) when the "
+         "session is already at/past its own absolute expiry",
+         "[jit][auth]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("frank", "secret123456", Role::user);
+    auto token = mgr->authenticate("frank", "secret123456");
+    REQUIRE(token.has_value());
+
+    // Push the session's absolute expires_at into the past (TEST-ONLY seam —
+    // no clean way to construct an already-expired session through the
+    // public API, since kSessionDuration is a fixed 8h and there is no
+    // reduced-lifetime session constructor). Any clamp against an
+    // already-past expires_at yields `until <= now`, which the dead-window
+    // guard must REJECT — never mutate the session or report a granted
+    // zero-or-negative-length window.
+    mgr->expire_session_for_test(*token, std::chrono::hours(9)); // > kSessionDuration (8h)
+
+    CHECK_FALSE(mgr->elevate_session(*token, std::chrono::seconds(60)).has_value());
+    // The rejected grant must not have mutated the session: no elevation was
+    // set, so a subsequent reap finds nothing to reap either.
+    CHECK_FALSE(mgr->reap_expired_elevation(*token).has_value());
+}
+
+TEST_CASE("AuthManager::reap_expired_elevation is exactly-once under concurrent "
+         "racers (TOCTOU guard, UP-7)",
+         "[jit][auth]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("grace", "secret123456", Role::user);
+    auto token = mgr->authenticate("grace", "secret123456");
+    REQUIRE(token.has_value());
+    REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(1)).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Two threads race reap_expired_elevation on the SAME already-lapsed
+    // token. The shared-lock-first-then-escalate-and-recheck design
+    // (governance hardening round) must serialise the clear-and-report step
+    // under the exclusive lock so exactly one racer observes the username
+    // and the other observes the (by-then-cleared) sentinel — never both,
+    // never neither.
+    std::optional<std::string> r1, r2;
+    std::thread t1([&] { r1 = mgr->reap_expired_elevation(*token); });
+    std::thread t2([&] { r2 = mgr->reap_expired_elevation(*token); });
+    t1.join();
+    t2.join();
+
+    const int wins = (r1.has_value() ? 1 : 0) + (r2.has_value() ? 1 : 0);
+    CHECK(wins == 1);
+    if (r1)
+        CHECK(*r1 == "grace");
+    if (r2)
+        CHECK(*r2 == "grace");
+}
+
 // ── AuthDB eligibility column ────────────────────────────────────────────────
 
 TEST_CASE("AuthDB::set/is_elevation_eligible round-trips, fail-closed", "[jit][authdb]") {
@@ -161,8 +303,13 @@ struct JitHarness {
     yuzu::server::test::TestRouteSink sink;
 
     // The comma-operator creates the temp dir (TempDir only computes the path)
-    // before AuthDB opens its files under it.
-    JitHarness() : auth_db((fs::create_directories(tmp.path), tmp.path), 0) {
+    // before AuthDB opens its files under it. `audit_store_broken` (governance
+    // hardening round, UP-3 guard) points the AuditStore at an unopenable
+    // path — SQLITE_CANTOPEN leaves it wired-but-closed (db_==nullptr), so
+    // AuditStore::log() fail-returns false without throwing, matching the
+    // idiom at test_rest_audit_sample.cpp:51.
+    explicit JitHarness(bool audit_store_broken = false)
+        : auth_db((fs::create_directories(tmp.path), tmp.path), 0) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         cfg.https_enabled = false;
         cfg.jit_max_elevation_secs = 3600;
@@ -179,7 +326,9 @@ struct JitHarness {
         REQUIRE(auth_db.set_elevation_eligible("bob", true).has_value());
 
         api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+        audit_store = audit_store_broken
+                          ? std::make_unique<AuditStore>("/nonexistent-yuzu-test-dir/audit-broken.db")
+                          : std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         REQUIRE(api_tokens->is_open());
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
@@ -248,14 +397,84 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
                       R"({"justification":"prod incident #42","duration_secs":600})");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(nlohmann::json::parse(res->body).value("expires_in", 0) == 600);
+    auto body = nlohmann::json::parse(res->body);
+    // expires_in is now the TRUE remaining time (follow-up B, computed a
+    // moment after the grant) — never MORE than the requested duration, and
+    // within a second or two of it (no clamp applies: the session's absolute
+    // lifetime is 8h, far longer than 600s).
+    int expires_in = body.value("expires_in", -1);
+    CHECK(expires_in <= 600);
+    CHECK(expires_in >= 598);
+    // expires_at is the wall-clock RFC3339 UTC projection (follow-up B),
+    // well-formed "YYYY-MM-DDTHH:MM:SSZ" — not just non-empty (governance
+    // hardening round, format assertion).
+    auto expires_at = body.value("expires_at", std::string{});
+    CHECK_FALSE(expires_at.empty());
+    CHECK(expires_at.size() == 20);
+    CHECK(expires_at.back() == 'Z');
     CHECK(h.count_audits("role.elevation.granted", "alice") == 1);
+    // The granted audit detail carries expires_at too (governance hardening
+    // round consistency check — grant audit, response body, and analytics
+    // event must all agree).
+    {
+        AuditQuery q;
+        q.action = "role.elevation.granted";
+        q.principal = "alice";
+        auto rows = h.audit_store->query(q);
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows.front().detail.find("expires_at=") != std::string::npos);
+    }
 
     // The session is now effectively admin.
     auto s = h.auth_mgr.validate_session(token);
     REQUIRE(s.has_value());
     CHECK(auth::is_elevated(*s));
     CHECK(auth::effective_role(*s) == Role::admin);
+}
+
+// When the elevation window is clamped to the session's own absolute lifetime,
+// the role.elevation.granted audit detail's duration_secs MUST equal the
+// response's post-clamp expires_in — the "all three channels agree" contract
+// (docs/auth-architecture.md:238-240). Ships green without the fix only because
+// no other test forces a clamp at the REST layer.
+TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
+          "duration_secs in sync with the response expires_in",
+          "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+
+    // Shrink the cookie session to ~120s of remaining lifetime so a full-cap
+    // (3600s) elevation request is clamped to the session's own expiry.
+    h.auth_mgr.expire_session_for_test(token, std::chrono::seconds(8 * 3600 - 120));
+
+    auto res = h.post("/api/v1/elevate", token,
+                      R"({"justification":"clamp-proof","duration_secs":3600})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    int expires_in = body.value("expires_in", -1);
+    // The window WAS clamped: far below the requested/capped 3600s.
+    CHECK(expires_in > 0);
+    CHECK(expires_in <= 130);
+
+    // Parse duration_secs out of the granted audit detail
+    // ("duration_secs=<n> justification=... expires_at=...").
+    AuditQuery q;
+    q.action = "role.elevation.granted";
+    q.principal = "alice";
+    auto rows = h.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    const std::string& detail = rows.front().detail;
+    auto pos = detail.find("duration_secs=");
+    REQUIRE(pos != std::string::npos);
+    pos += std::string("duration_secs=").size();
+    auto endp = detail.find(' ', pos);
+    int audit_duration = std::stoi(detail.substr(pos, endp - pos));
+
+    INFO("audit detail: " << detail);
+    INFO("expires_in=" << expires_in << "  audit_duration=" << audit_duration);
+    // THE contract: audit row and JSON response agree on the effective window.
+    CHECK(audit_duration == expires_in);
 }
 
 TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][routes]") {
@@ -351,7 +570,11 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit
                        R"({"justification":"x","duration_secs":9999999999999999})");
     REQUIRE(huge);
     CHECK(huge->status == 200);
-    CHECK(nlohmann::json::parse(huge->body).value("expires_in", 0) == h.cfg.jit_max_elevation_secs);
+    // expires_in is the TRUE remaining time (follow-up B) — at most the cap,
+    // and within a second or two of it (no session-lifetime clamp applies).
+    int huge_expires_in = nlohmann::json::parse(huge->body).value("expires_in", -1);
+    CHECK(huge_expires_in <= h.cfg.jit_max_elevation_secs);
+    CHECK(huge_expires_in >= h.cfg.jit_max_elevation_secs - 2);
 }
 
 TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]") {
@@ -361,7 +584,9 @@ TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]
                       R"({"justification":"x","duration_secs":999999})");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(nlohmann::json::parse(res->body).value("expires_in", 0) == h.cfg.jit_max_elevation_secs);
+    int expires_in = nlohmann::json::parse(res->body).value("expires_in", -1);
+    CHECK(expires_in <= h.cfg.jit_max_elevation_secs);
+    CHECK(expires_in >= h.cfg.jit_max_elevation_secs - 2);
 }
 
 TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") {
@@ -409,4 +634,105 @@ TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "
     auto res = h.sink.Post("/api/v1/elevate", R"({"justification":"x"})");
     REQUIRE(res);
     CHECK(res->status == 401);
+}
+
+// ── Follow-up A: role.elevation.expired lazily audited at the cookie chokepoint ──
+
+TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
+         "request after a passive lapse",
+         "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+    // Force a lapsed elevation directly via AuthManager (bypassing the REST
+    // handler, which always grants at least a bounded window): a 1s window
+    // plus a real sleep past it. duration(0) is no longer usable for this —
+    // elevate_session's dead-window guard (governance hardening round,
+    // UP-1/UP-4) REJECTS a request that would clamp to `until <= now` rather
+    // than granting a zero-length window.
+    REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    CHECK(h.count_audits("role.elevation.expired", "alice") == 0);
+
+    // The next authenticated request through resolve_session (the cookie
+    // chokepoint) lazily reaps the lapsed window and audits it exactly once —
+    // even though alice is no longer effectively admin, so the request itself
+    // is denied.
+    auto res = h.post("/api/v1/users/bob/elevation-eligibility", token, R"({"eligible":false})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.count_audits("role.elevation.expired", "alice") == 1);
+
+    // A second request does not double-emit (idempotent reap).
+    auto res2 = h.post("/api/v1/users/bob/elevation-eligibility", token, R"({"eligible":false})");
+    REQUIRE(res2);
+    CHECK(h.count_audits("role.elevation.expired", "alice") == 1);
+}
+
+TEST_CASE("a manually revoked elevation does not ALSO emit role.elevation.expired",
+         "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+    REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
+    REQUIRE(h.post("/api/v1/elevate/revoke", token, "")->status == 200);
+    CHECK(h.count_audits("role.elevation.revoked", "alice") == 1);
+
+    // A subsequent authenticated request must not report a spurious passive
+    // expiry on top of the manual revoke's own audit row.
+    auto res = h.post("/api/v1/users/bob/elevation-eligibility", token, R"({"eligible":false})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.count_audits("role.elevation.expired", "alice") == 0);
+}
+
+TEST_CASE("a reap that fires within a request leaves THAT request's session "
+         "resolving as base role (UP-9)",
+         "[jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+    REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // The lazy reap fires INSIDE resolve_session, on this very request — the
+    // request must be evaluated against the now-lapsed (base) role, not the
+    // stale elevated one, so an admin-gated action is correctly refused in
+    // the SAME request that observes the expiry.
+    auto res = h.post("/api/v1/users/bob/elevation-eligibility", token, R"({"eligible":false})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.count_audits("role.elevation.expired", "alice") == 1);
+
+    // And the session itself now reads as base role going forward.
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+    CHECK(auth::effective_role(*s) == Role::user);
+}
+
+TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store "
+         "(best-effort, UP-3)",
+         "[jit][routes]") {
+    JitHarness h(/*audit_store_broken=*/true);
+    auto token = h.session_for("alice");
+    REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // The AuditStore can't persist (unopenable path, db_==nullptr) — the
+    // lazy reap at the resolve_session chokepoint must not crash or throw,
+    // and must still CLEAR the elevation despite losing the confirmatory
+    // `role.elevation.expired` row (the window's end is still reconstructible
+    // from the — separately fail-closed — `granted` row's `duration_secs`/
+    // `expires_at`, when the grant went through the REST path; here the
+    // elevation was set directly via AuthManager to force a deterministic
+    // lapse, so there is no granted row in this harness either way — the
+    // assertion under test is narrowly "the reap itself doesn't crash and
+    // still reaps").
+    std::unique_ptr<httplib::Response> res;
+    REQUIRE_NOTHROW(res = h.post("/api/v1/users/bob/elevation-eligibility", token,
+                                 R"({"eligible":false})"));
+    REQUIRE(res);
+    CHECK(res->status == 403); // no longer effectively admin — the reap still happened
+
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
 }
