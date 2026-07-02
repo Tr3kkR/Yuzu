@@ -537,6 +537,20 @@ TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
     REQUIRE(res->body.find("UserManagement:Write") != std::string::npos);
 }
 
+TEST_CASE("OpenAPI spec lists the JIT admin-elevation routes (A2 discovery)",
+          "[events][discovery][a2][jit]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A2: the three JIT-elevation routes must be discoverable from the live spec
+    // (#1748 M1), not just the manual. Text-shape check matches the siblings.
+    REQUIRE(res->body.find(R"("/elevate":)") != std::string::npos);
+    REQUIRE(res->body.find(R"("/elevate/revoke":)") != std::string::npos);
+    REQUIRE(res->body.find(R"("/users/{username}/elevation-eligibility":)") != std::string::npos);
+    REQUIRE(res->body.find("time-boxed JIT admin elevation") != std::string::npos);
+}
+
 TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
           "[events][discovery][a2]") {
     RestEventsHarness h;

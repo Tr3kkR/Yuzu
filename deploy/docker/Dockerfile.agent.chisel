@@ -40,7 +40,7 @@ ARG TRIPLET=
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex libsystemd-dev \
+    bison flex libsystemd-dev autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -55,7 +55,12 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
-RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
+# sharing=locked on buildtrees: buildx builds linux/amd64 and linux/arm64
+# concurrently, and both mount this cache; vcpkg takes an exclusive
+# buildtrees/vcpkg-running.lock, so a shared (default) mount makes the second
+# arch fail with "failed to take lock ... Device or resource busy". `locked`
+# serialises the two vcpkg installs against this mount instead.
+RUN --mount=type=cache,target=/opt/vcpkg/buildtrees,sharing=locked \
     --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/root/.cache/vcpkg \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \

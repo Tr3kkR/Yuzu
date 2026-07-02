@@ -77,6 +77,27 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24'
 
+      - name: Install Python build deps (meson + PyYAML for content embed)
+        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+        # configure-time dependency for the bundled-content embed
+        # (server/core/scripts/embed_content.py). meson setup fails
+        # with error() if `import yaml` returns non-zero. Without an
+        # explicit install step, this self-hosted runner relied on
+        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
+        # ~/.local on the same runner). A runner re-bake would break
+        # release. Install explicitly and hash-pinned.
+        #
+        # Runs BEFORE "Verify build dependencies": meson is pip-installed
+        # here into ~/.local/bin, NOT pre-provisioned on the Big Tam
+        # (yuzu-bigtam-linux) runner. The `echo … >> $GITHUB_PATH` puts
+        # ~/.local/bin on PATH for every later step — the verify check AND
+        # the `meson setup` below — mirroring ci.yml lines 269-270. Without
+        # both the reorder and the PATH export, verify fails with
+        # "Missing tools: meson" even though the pip install succeeds.
+        run: |
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Verify build dependencies
         run: |
           MISSING=""
@@ -99,18 +120,6 @@ jobs:
             exit 1
           fi
 
-      - name: Install Python build deps (PyYAML for content embed)
-        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
-        # configure-time dependency for the bundled-content embed
-        # (server/core/scripts/embed_content.py). meson setup fails
-        # with error() if `import yaml` returns non-zero. Without an
-        # explicit install step, this self-hosted runner relied on
-        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
-        # ~/.local on the same runner). A runner re-bake would break
-        # release. Install explicitly and hash-pinned.
-        run: |
-          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
-
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux
 
@@ -122,13 +131,26 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Setup vcpkg
+        # Mirror ci.yml (Setup vcpkg) and the Windows/macOS release jobs: clone
+        # vcpkg into the workspace at the pinned VCPKG_COMMIT and invoke it by
+        # full path below. The Linux release job previously ran a bare `vcpkg`,
+        # which relied on a runner-global vcpkg on PATH — true on the retired
+        # Shulgi runner, but the Big Tam (yuzu-bigtam-linux) pool has no `vcpkg`
+        # on the non-login GHA PATH, so the install died with
+        # "vcpkg: command not found" (exit 127).
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
       - name: vcpkg sentinel (x64-linux-static)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-static
 
       - name: Install vcpkg packages (static linkage)
         run: |
-          vcpkg install --triplet x64-linux-static \
+          ${{ github.workspace }}/vcpkg/vcpkg install --triplet x64-linux-static \
             --overlay-triplets=${{ github.workspace }}/triplets \
             --x-manifest-root=${{ github.workspace }}
 
@@ -478,7 +500,17 @@ jobs:
       - name: Install Meson and ccache
         run: |
           pip install --require-hashes -r requirements-ci.txt
-          choco install ccache --yes --no-progress
+          # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
+          # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
+          # installed there, so the old `choco install ccache` aborted the
+          # step with "'choco' is not recognized". Fall back to winget only
+          # if ccache is genuinely absent (e.g. a freshly re-baked runner);
+          # on Wee Tam this branch is skipped.
+          if (-not (Get-Command ccache -ErrorAction SilentlyContinue)) {
+            winget install --id Ccache.Ccache --silent --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "ccache already present: $((Get-Command ccache).Source)"
+          }
 
       # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
       # persist on the self-hosted Windows runner between jobs. The
@@ -618,13 +650,36 @@ jobs:
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
-          # Install InnoSetup 6
-          choco install innosetup -y --no-progress
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
+          # Locate the Inno Setup compiler (ISCC.exe). Wee Tam
+          # (yuzu-weetam-windows) has no Chocolatey, so the old
+          # `choco install innosetup` aborted with "'choco' is not recognized".
+          # Install via winget when absent — but winget may place Inno Setup
+          # machine- OR user-scoped (rc3 installed 6.7.3 somewhere other than
+          # the hardcoded C:\Program Files (x86)\Inno Setup 6), so DISCOVER
+          # ISCC.exe rather than assuming a fixed path.
+          function Find-Iscc {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($p in $candidates) { if ($p -and (Test-Path $p)) { return $p } }
+            Get-ChildItem -Path @("${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA\Programs") `
+              -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            Write-Host "Inno Setup 6 not found — installing via winget"
+            winget install --id JRSoftware.InnoSetup --silent --accept-package-agreements --accept-source-agreements
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) {
             Write-Error "ISCC.exe not found after InnoSetup install"
             exit 1
           }
+          Write-Host "Using ISCC: $iscc"
 
           # Build agent installer
           Write-Host "=== Building Agent Installer ==="
@@ -1298,11 +1353,8 @@ jobs:
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      # QEMU + docker-container driver for the multi-arch (amd64+arm64)
-      # manifest-list push — same rationale as docker-publish-chisel.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. See
+      # docker-publish-chisel for the same rationale.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
@@ -1343,7 +1395,8 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile.postgres
-          platforms: linux/amd64,linux/arm64
+          # amd64-only (linux/arm64 dropped — not needed yet).
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -1416,7 +1469,7 @@ jobs:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "## Published \`yuzu-postgres\` image (multi-arch)"
+            echo "## Published \`yuzu-postgres\` image (linux/amd64)"
             echo ""
             echo '```'
             echo "$META_TAGS"
@@ -1424,7 +1477,7 @@ jobs:
             echo ""
             echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
-            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Platforms: \`linux/amd64\`."
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1504,20 +1557,13 @@ jobs:
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      # QEMU registers binf_misc handlers so buildx can build the
-      # linux/arm64 leg on this amd64 runner. Required for the multi-arch
-      # build below; see the INTERIM STRATEGY note on timeout-minutes.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU-emulated) dropped — not needed yet, and
+      # the emulated leg was slow + flaky. Re-add QEMU + arm64 when a native
+      # arm64 runner exists. docker-container driver retained for the local
+      # layer-cache export (cache-to type=local) below.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
-          # Force the docker-container driver. Multi-platform push needs a
-          # builder that can produce an OCI manifest list; the ambient
-          # `docker` driver on the self-hosted runner cannot do
-          # cross-arch / manifest-list builds and a leftover docker-driver
-          # builder would make the linux/amd64,linux/arm64 push fail.
           driver: docker-container
 
       - name: Log in to GHCR
@@ -1562,9 +1608,8 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          # Multi-arch is the whole point of this job. The arm64 leg runs
-          # under QEMU emulation on the amd64 runner (see timeout note).
-          platforms: linux/amd64,linux/arm64
+          # amd64-only (linux/arm64 dropped — not needed yet).
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -1652,7 +1697,7 @@ jobs:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (multi-arch)"
+            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (linux/amd64)"
             echo ""
             echo '```'
             echo "$META_TAGS"
@@ -1660,7 +1705,7 @@ jobs:
             echo ""
             echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
-            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Platforms: \`linux/amd64\`."
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1702,9 +1747,8 @@ jobs:
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-agent-bundle-chisel" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
-
+      # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. The bundle
+      # script builds the host-arch (amd64) image when --multiarch is omitted.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
@@ -1728,15 +1772,16 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       # Reuse the maintainer script (download release artifacts -> verify by
-      # sha256 -> lay out -> buildx multi-arch -> push). GH_TOKEN lets its
-      # `gh release download` authenticate against this just-published release.
-      - name: Build + push multi-arch agent bundle
+      # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
+      # lets its `gh release download` authenticate against this just-published
+      # release. linux/arm64 dropped — pass --push without --multiarch.
+      - name: Build + push agent bundle (amd64)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
-            --multiarch --push
+            --push
 
       - name: Resolve pushed image digest
         id: digest
@@ -1798,7 +1843,7 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.value }}
         run: |
           {
-            echo "## Published \`yuzu-agent-bundle-chisel\` delivery image (multi-arch)"
+            echo "## Published \`yuzu-agent-bundle-chisel\` delivery image (linux/amd64)"
             echo ""
             echo "**Tag:** \`${IMAGE}:${VERSION}\`  **Digest:** \`${DIGEST}\`"
             echo ""
@@ -1995,9 +2040,26 @@ jobs:
           OWNER="${{ github.repository_owner }}"
           TAG="${GITHUB_REF_NAME}"
 
-          # Start with changelog content if available
+          # Start with changelog content if available. GitHub caps release
+          # bodies at 125000 characters; a release that aggregates a large dev
+          # line (v0.13.0's [0.13.0] section is ~217 KB / 2800+ lines) blows
+          # past that and `gh release create` returns
+          # "HTTP 422: body is too long (maximum is 125000 characters)".
+          # Cap the embedded changelog (cut at a line boundary) and link to the
+          # full CHANGELOG.md when truncated; the static footer below is small,
+          # so 100000 leaves ample headroom under the 125000 limit.
+          CHANGELOG_LIMIT=100000
           if [ "$HAS_CHANGELOG" = "true" ]; then
-            cat changelog_section.md > release-notes.md
+            if [ "$(wc -c < changelog_section.md)" -gt "$CHANGELOG_LIMIT" ]; then
+              head -c "$CHANGELOG_LIMIT" changelog_section.md | sed '$d' > release-notes.md
+              {
+                echo ""
+                echo "_… changelog truncated — this release's changelog exceeds GitHub's 125,000-character release body limit._"
+                echo "_See [CHANGELOG.md](https://github.com/${OWNER}/Yuzu/blob/${TAG}/CHANGELOG.md) for the full list of changes._"
+              } >> release-notes.md
+            else
+              cat changelog_section.md > release-notes.md
+            fi
             echo "" >> release-notes.md
           else
             echo "_See commit history for changes in this release._" > release-notes.md

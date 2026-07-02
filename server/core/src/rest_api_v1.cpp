@@ -12,12 +12,14 @@
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
 #include <yuzu/server/auth_db.hpp> // is_valid_username
+#include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -634,6 +636,15 @@ const std::string& openapi_spec() {
     "/users/{username}/unlock": {
       "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
     },
+    "/users/{username}/elevation-eligibility": {
+      "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Not admin, MFA step-up refused, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "No auth.db (--data-dir unset)"}}}
+    },
+    "/elevate": {
+      "post": {"summary": "Activate a time-boxed JIT admin elevation on the current cookie session (SOC 2 CC6.3/CC6.6)", "tags": ["Authentication"], "description": "Cookie session only (API/MCP tokens get 401 and can never elevate). Caller must be elevation_eligible, have MFA enrolled (mandatory regardless of --mfa-enforcement), and pass a fresh MFA step-up. duration_secs defaults to and is clamped by --jit-max-elevation-secs; a negative value is 400. The grant audit is fail-closed. Errors use the A4 envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["justification"], "properties": {"justification": {"type": "string", "description": "Required, non-empty; control bytes sanitised; truncated to 1 KiB at a UTF-8 code-point boundary"}, "duration_secs": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "{status: ok, expires_in}"}, "400": {"description": "Blank/missing justification, wrong-typed field, or negative duration"}, "401": {"description": "Not authenticated, no cookie (token caller), or session dissolved mid-request"}, "403": {"description": "Not eligible, eligibility read failed, or no MFA enrolled"}, "500": {"description": "Grant audit unrecordable — elevation rolled back (Sec-Audit-Failed header)"}, "503": {"description": "No auth.db"}}}
+    },
+    "/elevate/revoke": {
+      "post": {"summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}"}, "401": {"description": "Not authenticated"}}}
+    },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
     },)json"
@@ -746,6 +757,9 @@ const std::string& openapi_spec() {
     },
     "/dex/perf/group": {
       "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id) — NOT audited. Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped principal does not pass the global check and cannot use this endpoint, so the only callers who reach it already have unscoped fleet-wide read — no cross-operator exposure. Scoped operators are excluded by design, not by an unfinished control.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
+    },
+    "/dex/perf/compare": {
+      "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): a sub-floor paired set carries small_cohort=true (render 'indicative'), never suppression; insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
     },
     "/network/fleet": {
       "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
@@ -1137,6 +1151,109 @@ void RestApiV1::register_routes(
                                   "application/json");
               });
 
+    // POST /api/v1/tar/retention-paused/purge — A1 structured surface for the
+    // DESTRUCTIVE TAR source purge (dashboard parity with the HTML fragment
+    // /fragments/tar/retention-paused/purge). Per-device gated on
+    // Infrastructure:Delete + management-group scope via scoped_perm_fn (fail-closed),
+    // audited fail-closed (no dispatch without durable evidence), async: returns the
+    // command_id. rows_deleted and the agent-side source_not_paused refusal live in
+    // the command's response record (the dispatch is fire-and-forget). Governance
+    // HIGH #3/#4.
+    sink.Post(
+        "/api/v1/tar/retention-paused/purge",
+        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry](
+            const httplib::Request& req, httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            auto bump = [&](const char* result) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_tar_source_purge_total", {{"result", result}})
+                        .increment();
+            };
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(400, "body must be a JSON object", cid),
+                                "application/json");
+                return;
+            }
+            const std::string device_id = body.value("device_id", "");
+            const std::string source = body.value("source", "");
+            if (device_id.empty() || source.empty()) {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(400, "device_id and source are required", cid),
+                                "application/json");
+                return;
+            }
+            if (source != "process" && source != "tcp" && source != "service" && source != "user") {
+                res.status = 400;
+                bump("invalid_input");
+                res.set_content(detail::error_json_a4(
+                                    400, "unknown source — must be one of process, tcp, service, user",
+                                    cid),
+                                "application/json");
+                return;
+            }
+            // Per-device scope gate: Infrastructure:Delete + management-group scope,
+            // fail-closed if unwired (never widen to a global gate). Emits its own
+            // 403/404 + A4 envelope on denial; we only tally the metric.
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                bump("denied");
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
+                bump("denied");
+                return;
+            }
+            if (!command_dispatch_fn) {
+                res.status = 503;
+                bump("denied");
+                res.set_content(
+                    detail::error_json_a4(503, "command dispatch unavailable", cid, 5000, ""),
+                    "application/json");
+                return;
+            }
+            // Audit BEFORE the side-effect, fail-closed (parity with /live): a
+            // destructive dispatch must not proceed if the evidence row is known lost.
+            if (audit_fn && !audit_fn(req, "tar.source.purge", "requested", "command", device_id,
+                                      "REST purge source=" + source + " cid=" + cid)) {
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                bump("denied");
+                res.set_content(
+                    detail::error_json_a4(503,
+                                          "audit subsystem unavailable; refusing to dispatch "
+                                          "without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                return;
+            }
+            const auto [command_id, sent] = command_dispatch_fn(
+                "tar", "purge_source", {device_id}, "", {{"source", source}}, /*execution_id=*/"");
+            if (sent == 0) {
+                res.status = 404;
+                bump("agent_not_connected");
+                res.set_content(
+                    detail::error_json_a4(404, "device offline or not reachable", cid, 5000, ""),
+                    "application/json");
+                return;
+            }
+            bump("success");
+            res.status = 202; // accepted — poll the command response for rows_deleted
+            res.set_content(ok_json(JObj()
+                                        .add("command_id", command_id)
+                                        .add("device_id", device_id)
+                                        .add("source", source)
+                                        .add("agents_reached", static_cast<int64_t>(sent))
+                                        .str()),
+                            "application/json");
+        });
+
     // GET /api/v1/bundles/{id} — collate (poll). Server-grouped result.
     sink.Get(R"(/api/v1/bundles/(bundle-[a-f0-9]+))",
              [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
@@ -1150,7 +1267,8 @@ void RestApiV1::register_routes(
                  }
                  auto session = auth_fn(req, res);
                  const std::string principal = session ? session->username : std::string{};
-                 const bool is_admin = session && session->role == auth::Role::admin;
+                 const bool is_admin =
+                     session && auth::effective_role(*session) == auth::Role::admin; // JIT elevation
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
@@ -1789,7 +1907,7 @@ void RestApiV1::register_routes(
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
         bool denied = existing && existing->principal_id != session->username &&
-                      session->role != auth::Role::admin;
+                      auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
         if (!existing || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
@@ -6703,6 +6821,153 @@ void RestApiV1::register_routes(
                                         .add("version", version)
                                         .add("floor", static_cast<int64_t>(kDexCohortFloor))
                                         .raw("points", points.str())
+                                        .str()),
+                            "application/json");
+        });
+
+    // GET /dex/perf/compare?app=&group=&baseline=&candidate=&window= — the /auto
+    // VERIFY before/after: the cohort-PAIRED app-perf comparison. For each machine
+    // in `group` that ran BOTH versions in-window, a per-machine delta is computed
+    // then aggregated (population held fixed — see app_perf_compare.hpp). EVIDENTIAL
+    // only: measured shift + the up/flat/down split, NO verdict, NO threshold.
+    //
+    // NO cohort floor: real canaries are 2-3 devices, so a floor would gut the
+    // feature; a sub-kDexCohortFloor paired set carries small_cohort=true so the
+    // caller marks it "indicative". The aggregate carries NO per-machine row (that
+    // PII is the audited dashboard drill only) — but an unfloored small-cohort
+    // aggregate is near-individual, so the read IS audited: dex.app_perf.compare,
+    // OPERATIONAL set-and-proceed (records who compared whose canary — the
+    // works-council accountability that REPLACES the floor's suppression; grilled
+    // 2026-06-30, the audit is load-bearing precisely because there is no floor).
+    //
+    // Authz: GLOBAL perm_fn (Read), exactly like /dex/perf/group (see that handler
+    // for why scoped-only principals never reach it — the cohort posture).
+    sink.Get(
+        "/api/v1/dex/perf/compare",
+        [perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+                                                httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!app_perf_providers.cohort) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            // group, app, baseline, candidate — all required + shared-cap valid.
+            auto require_param = [&](const char* name, std::string& out) -> bool {
+                out = req.has_param(name) ? req.get_param_value(name) : "";
+                if (out.empty()) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, std::string("missing required parameter '") + name + "'",
+                                        cid),
+                                    "application/json");
+                    return false;
+                }
+                if (!app_perf_param_valid(out)) {
+                    res.status = 400;
+                    res.set_content(detail::error_json_a4(
+                                        400, std::string("invalid parameter '") + name + "'", cid,
+                                        "must be <= 512 bytes with no control characters"),
+                                    "application/json");
+                    return false;
+                }
+                return true;
+            };
+            std::string group_id, app, baseline, candidate;
+            if (!require_param("group", group_id) || !require_param("app", app) ||
+                !require_param("baseline", baseline) || !require_param("candidate", candidate))
+                return;
+            if (yuzu::util::canon_version(baseline) == yuzu::util::canon_version(candidate)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(
+                                    400, "baseline and candidate must differ", cid,
+                                    "a before/after compare needs two distinct versions"),
+                                "application/json");
+                return;
+            }
+            int window = 7; // days each side
+            if (req.has_param("window")) {
+                char* end = nullptr;
+                const std::string w = req.get_param_value("window");
+                const long v = std::strtol(w.c_str(), &end, 10);
+                if (end != w.c_str() && *end == '\0')
+                    window = static_cast<int>(v);
+            }
+            window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
+
+            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate, window);
+            if (!cohort) { // AUTHORITATIVE degrade (member resolution OR row read)
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf cohort read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            const PairedComparison c =
+                build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
+                                 yuzu::util::canon_version(candidate), window);
+            const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+
+            // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
+            // aggregate, the per-machine drill is the fail-closed surface). Records
+            // who compared whose canary; the header flags a lost evidence row. The
+            // detail carries `paired=` so a singleton (paired=1) aggregate — which IS
+            // individual data — is distinguishable in the audit log (gov UP-7), and
+            // `view=aggregate` matches the dashboard sibling + the documented contract.
+            detail::emit_behavioral_audit(
+                audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
+                "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
+                    audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                    " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
+
+            const std::string cpu = JObj()
+                                        .add("before_mean", c.cpu_before_mean)
+                                        .add("after_mean", c.cpu_after_mean)
+                                        .add("delta_median", c.cpu_delta_median)
+                                        .add("before_p95", c.cpu_before_p95)
+                                        .add("after_p95", c.cpu_after_p95)
+                                        .str();
+            const std::string ws = JObj()
+                                       .add("before_mean", c.ws_before_mean)
+                                       .add("after_mean", c.ws_after_mean)
+                                       .add("delta_median", c.ws_delta_median)
+                                       .add("before_p95", c.ws_before_p95)
+                                       .add("after_p95", c.ws_after_p95)
+                                       .str();
+            const std::string dist = JObj()
+                                         .add("up", c.moved_up)
+                                         .add("flat", c.moved_flat)
+                                         .add("down", c.moved_down)
+                                         .str();
+            res.set_content(ok_json(JObj()
+                                        .add("app", app)
+                                        .add("group_id", group_id)
+                                        .add("baseline_version", baseline)
+                                        .add("candidate_version", candidate)
+                                        .add("window_days", static_cast<int64_t>(window))
+                                        .add("cohort_size", cohort->member_count)
+                                        .add("paired", c.paired)
+                                        .add("baseline_only", c.baseline_only)
+                                        .add("candidate_only", c.candidate_only)
+                                        .add("no_data", no_data)
+                                        .add("small_cohort", c.small_cohort)
+                                        .add("insufficient", c.insufficient)
+                                        // truncated=true → the cohort exceeded the read
+                                        // cap; the counts above are UNRELIABLE (a machine
+                                        // that ran both may be mis-read as baseline_only).
+                                        .add("truncated", cohort->truncated)
+                                        .raw("cpu", cpu)
+                                        .raw("ws", ws)
+                                        .raw("distribution", dist)
                                         .str()),
                             "application/json");
         });

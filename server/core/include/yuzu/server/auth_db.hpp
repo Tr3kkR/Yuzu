@@ -139,6 +139,20 @@ public:
         auth::Role new_role
     );
 
+    /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
+    /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
+    /// distinct from holding standing admin. Admin-managed. Single
+    /// UPDATE ... RETURNING (no sqlite3_changes() — #1033); UserNotFound when no
+    /// active row matched, InvalidUsername for malformed input. Never touches
+    /// credentials or role.
+    std::expected<void, AuthDBError> set_elevation_eligible(const std::string& username,
+                                                            bool eligible);
+
+    /// Read the per-user JIT-elevation eligibility flag. Returns false for an
+    /// absent/inactive user (fail-closed — not eligible). InvalidUsername for
+    /// malformed input.
+    std::expected<bool, AuthDBError> is_elevation_eligible(const std::string& username);
+
     // ── Session Operations ───────────────────────────────────────────────
     //
     // v1 status: AuthManager retains its in-memory `sessions_` map and does

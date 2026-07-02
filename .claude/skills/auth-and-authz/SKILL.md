@@ -207,9 +207,24 @@ matches the customer ask.
    `last_activity_at` mirror is best-effort + throttled (`touch_session_activity`,
    ≤1 write/session/60s, off `mu_`). See `docs/auth-architecture.md` "Inactivity
    session timeout"; `tests/unit/server/test_auth.cpp` `[idle]`.
-9. **JIT admin elevation** — `POST /api/v1/elevate` accepting a justification
-   + duration; promotes the caller's effective role for the window, audits
-   `role.elevation.requested|granted|expired`. Returns to base role on TTL.
+9. ~~**JIT admin elevation**~~ **DONE** — `POST /api/v1/elevate` `{justification,
+   duration_secs}` promotes the caller's **effective role** to admin for a
+   bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
+   Eligibility = the per-user `users.elevation_eligible` flag (auth.db migration
+   v5, admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), distinct
+   from standing admin and enumerable for access reviews. Gated on eligibility +
+   **mandatory MFA enrollment** (unconditional — elevation is the privilege
+   boundary) + a fresh MFA step-up; the grant audit is fail-closed, revoking
+   eligibility ends active elevations, and self-grant is blocked.
+   `auth::effective_role(session)` (admin while
+   `now < elevated_until`) is honoured by `require_admin` + the permission gates;
+   the window is monotonic `steady_clock`, in-memory per **cookie** session
+   (restart/logout drops it; API/MCP tokens can never elevate). Audits
+   `role.elevation.{granted,denied,revoked}` + `user.elevation_eligibility.set`;
+   `POST /api/v1/elevate/revoke` for step-down. (Passive `expired` is implicit
+   from `granted` + duration — a lazy/reaper expiry row is a tracked follow-up.)
+   See `docs/auth-architecture.md` "JIT admin elevation";
+   `tests/unit/server/test_auth_jit_elevation.cpp`.
 10. **Self-managed Certificate Authority (mTLS + code signing).** A single
     PKI root, server-managed, that operators can use instead of standing up
     their own CA. Two consumers:
