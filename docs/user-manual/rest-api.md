@@ -3869,6 +3869,18 @@ The same trend shape, aggregated **on-the-fly over one management group's member
 - **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
 - **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade. Not audited.
 
+#### `GET /api/v1/dex/perf/compare`
+
+The **`/auto` VERIFY** before/after comparison: did upgrading `app` from `baseline` to `candidate` change how the **same machines** in `group` perform? For each machine that ran *both* versions in the window, a per-machine CPU and working-set delta is computed (each device's own baseline-version window vs its own candidate-version window, the window anchored to that machine's transition, not to "today"), then the per-machine deltas are aggregated. A machine that ran only one version in-window is excluded and counted. **Evidential only** — no verdict, no threshold, no pass/fail. The same pure engine backs this endpoint, the `compare_app_perf_versions` MCP tool, and the dashboard VERIFY stage, so the numbers cannot disagree.
+
+- **Permission:** `GuaranteedState:Read`, gated on the **global** permission (same posture as `/dex/perf/group`).
+- **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`, clamped `1`–`31`.
+- **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the 10-device floor — **not** suppressed (canaries are deliberately small; the surface marks it *indicative*). `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
+- **No per-machine identity in the response** — the aggregate carries no `agent_id`. The per-machine pairs are a **dashboard-only** drill (`/fragments/auto/verify/drill`, audited `dex.app_perf.compare.drill`); there is **no REST or MCP per-machine surface** in this slice (a REST audited-fail-closed per-machine drill is a deferred follow-up).
+- **Error paths:** `400` on a missing/invalid required parameter or `baseline == candidate`; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
+- **Headers:** `X-Correlation-Id` on every response path; `Sec-Audit-Failed: true` when the audit row could not persist (the read still proceeds — operational set-and-proceed).
+- **Audit:** emits **`dex.app_perf.compare`** (`target_id=<group_id>`, `detail` carries `app=<name> base=<v> cand=<v> cohort=<N> paired=<N> view=aggregate cid=<cid>` — `paired=` so a singleton (paired=1) aggregate, which is effectively per-machine, is distinguishable in the log). Because VERIFY has no cohort floor, this recorded read is the accountability that replaces suppression (operational set-and-proceed, not fail-closed — the aggregate carries no per-machine identity, so a lost row leaks no PII). The MCP twin is recorded under the generic `mcp.compare_app_perf_versions` tool-call audit, which carries the same subject in its detail (group/app/versions/cohort/paired) and sets `audit_persisted:false` in the result body on a dropped row (MCP has no `Sec-Audit-Failed` header channel).
+
 #### `GET /api/v1/dex/devices/{id}`
 
 Per-device DEX read model — the machine-readable equivalent of the **DEX** lens on the `/device?id=` dashboard page.
@@ -4940,6 +4952,57 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 
 **Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
+#### `POST /fragments/tar/retention-paused/purge`
+
+Dispatch a single-device `tar.purge_source` that **permanently drops every warehouse row** for a source (`<source>_{live,hourly,daily,monthly}`) while leaving the collector **paused** — the "we have what we need; drop the rows but keep collection off" case (Phase 15.A). This is a **destructive, irreversible** operation.
+
+**Permission:** `Infrastructure:Delete` (a higher tier than re-enable's `Execution:Execute`). Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
+
+**Confirmation:** the dashboard requires the operator to type the device hostname before this POST fires (a native `prompt()`, CSP-safe). The confirmation is **client-side** — scripted callers that POST directly are still gated by the permission, the per-device visibility check, and the agent-side paused-guard.
+
+**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
+
+**Request body (form-encoded):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. |
+
+**Response:**
+- 200 OK with a `Purge dispatched — Scan to refresh.` fragment and an `HX-Trigger` toast on success. The source row remains (purge does not re-enable); a subsequent **Scan** reconciles the now-zero counts.
+- 400 with explanatory body for missing/invalid params.
+- 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
+- 503 if command dispatch is unavailable.
+
+**Audit:** Emits `tar.source.purge` with `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+
+**Metric:** `yuzu_tar_source_purge_total{result}` (counter) — counts dispatch outcomes.
+
+**Agent version:** requires an agent that implements the `tar.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
+
+#### `POST /api/v1/tar/retention-paused/purge`
+
+The **agentic-first (A1) structured surface** for the same destructive purge — for automation / MCP workers / scripted callers that need a JSON contract and a `command_id` rather than the HTML fragment above. Same effect: permanently drop a paused source's warehouse rows on one device, leaving the collector paused. **Irreversible.**
+
+**Permission:** `Infrastructure:Delete`, enforced **per-device and management-group-scoped** (the scoped gate; an out-of-scope or unauthorized device is refused, not enumerated). Fail-closed if the scope gate is unwired.
+
+**Request body (JSON):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The target agent. Must be within the caller's management scope. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
+
+**Responses:**
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
+- **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
+- **404** — dispatch reached zero agents (device offline).
+- **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
+
+**Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+
 #### `GET /fragments/tar/capture-sources`
 
 Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
@@ -5125,8 +5188,9 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
 | `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices) |
+| `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. **Recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb). |
 
-All three gate `GuaranteedState:Read` and are not audited (cohort posture). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
+The first three gate `GuaranteedState:Read` and are not audited (cohort posture). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST **and** the `/device` dashboard DEX drill (the *Application performance over time* panel), but has **no MCP twin** — its fail-closed audit contract cannot be expressed on MCP's set-and-proceed posture. See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

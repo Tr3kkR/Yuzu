@@ -22,6 +22,7 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <sqlite3.h>
@@ -840,6 +841,7 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
                                                "list_dex_perf_apps",
                                                "get_dex_app_perf",
                                                "get_dex_group_app_perf",       // B1/B2 discovery pin
+                                               "compare_app_perf_versions",    // /auto VERIFY discovery pin
                                                "get_network_fleet",
                                                "list_network_devices",         // N1: A2 discovery pin
                                                "get_fleet_posture_fast",
@@ -1399,6 +1401,82 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     CHECK(group["floor"] == yuzu::server::kDexCohortFloor); // floor echoed
     REQUIRE(group["points"].size() == 1);
     CHECK(group["points"][0]["device_count"] == 20);
+}
+
+TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential, no verdict)",
+          "[mcp][integration][dex][app_perf][verify]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.cohort =
+        [](std::string_view, std::string_view, std::string_view, std::string_view, int)
+        -> std::optional<yuzu::server::CohortRead> {
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        cr.rows = {
+            {"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500},
+            {"m2", "4.2.0.0", 10, 100, 3.0, 1000}, {"m2", "4.3.0.0", 11, 100, 4.0, 1100},
+        };
+        return cr;
+    };
+    ts.start("readonly");
+
+    SECTION("paired compare returns the measured shift") {
+        auto p = mcp_tool_payload(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})")
+                ->body);
+        CHECK(p["paired"] == 2);
+        CHECK(p["cohort_size"] == 2);
+        CHECK(p["small_cohort"] == true);
+        CHECK(p["insufficient"] == false);
+        CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
+        CHECK(p["distribution"]["up"] == 2);
+        CHECK_FALSE(p.contains("verdict")); // EVIDENTIAL — no pass/fail
+    }
+    SECTION("baseline == candidate → kInvalidParams") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.2.0.0"}}})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+}
+
+TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInternalError",
+          "[mcp][integration][dex][app_perf][verify]") {
+    const char* call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})";
+    SECTION("cohort provider unwired → kInternalError") {
+        McpTestServer ts; // app_perf_providers_for_test.cohort left null
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(ts.call(call)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    SECTION("AUTHORITATIVE degrade (cohort read nullopt) → kInternalError") {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.cohort =
+            [](std::string_view, std::string_view, std::string_view, std::string_view, int)
+            -> std::optional<yuzu::server::CohortRead> { return std::nullopt; };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(ts.call(call)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    SECTION("truncated cohort surfaces truncated:true in the payload") {
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.cohort =
+            [](std::string_view, std::string_view, std::string_view, std::string_view, int)
+            -> std::optional<yuzu::server::CohortRead> {
+            yuzu::server::CohortRead cr;
+            cr.member_count = 2;
+            cr.truncated = true;
+            cr.rows = {{"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500}};
+            return cr;
+        };
+        ts.start("readonly");
+        auto p = mcp_tool_payload(ts.call(call)->body);
+        CHECK(p["truncated"] == true);
+    }
 }
 
 TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",

@@ -195,6 +195,13 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
             "Operator-triggered TAR source re-enable attempts by result "
             "(success / scope_violation / agent_not_connected / denied / invalid_input).",
             "counter");
+        metrics_->describe(
+            "yuzu_tar_source_purge_total",
+            "Operator-triggered TAR retention-paused source purge (destructive) attempts by "
+            "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
+            "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
+            "the command response record.",
+            "counter");
     }
 
     // -- GET /fragments/results -----------------------------------------------
@@ -909,8 +916,17 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 // session-less URL.
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
-                res.set_content(render_tar_retention_paused(session->username),
-                                "text/html; charset=utf-8");
+                // Probe effective permissions WITHOUT mutating the real response
+                // (perm_fn_ writes a 403 into whatever Response it's handed on
+                // denial — feed it a throwaway, same pattern as the def-perm probe
+                // at ~line 637). Gates which row actions render: Re-enable needs
+                // Execution:Execute, Purge needs the higher Infrastructure:Delete.
+                httplib::Response perm_probe;
+                bool can_execute = perm_fn_(req, perm_probe, "Execution", "Execute");
+                bool can_delete = perm_fn_(req, perm_probe, "Infrastructure", "Delete");
+                res.set_content(
+                    render_tar_retention_paused(session->username, can_execute, can_delete),
+                    "text/html; charset=utf-8");
                 if (metrics_) {
                     metrics_->counter("yuzu_tar_dashboard_view_total",
                                       {{"frame", "retention"},
@@ -1106,6 +1122,29 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  }
                  auto session = auth_fn_(req, res);
                  if (!session) return;
+                 // CSRF same-site gate (parity with the purge fragment; defense-in-depth
+                 // on top of SameSite=Lax). Reject cross-origin/header-less cookie POSTs.
+                 {
+                     const std::string origin = req.get_header_value("Origin");
+                     const std::string referer = req.get_header_value("Referer");
+                     const bool same_site =
+                         !(origin.empty() && referer.empty()) &&
+                         origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                     if (!same_site) {
+                         audit_fn_(req, "tar.source.reenable", "denied", "command", "",
+                                   "csrf_cross_origin");
+                         if (metrics_) {
+                             metrics_->counter("yuzu_tar_source_reenable_total",
+                                               {{"result", "denied"}})
+                                 .increment();
+                         }
+                         res.status = 403;
+                         res.set_content(
+                             "<span class=\"tar-row-error\">Cross-origin request refused.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
                  if (!dispatch_fn_) {
                      res.status = 503;
                      res.set_content("<span class=\"tar-row-error\">Dispatch "
@@ -1221,6 +1260,157 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  // the row, this drops the row optimistically. The next
                  // Refresh will reconcile against a fresh tar.status.
                  res.set_content("", "text/html; charset=utf-8");
+             });
+
+    // POST /fragments/tar/retention-paused/purge — Phase 15.A destructive purge.
+    // Mirrors /reenable but (a) gates on Infrastructure:Delete (higher tier than
+    // re-enable's Execution:Execute), (b) dispatches tar.purge_source, and (c)
+    // leaves the source PAUSED (purge drops data without re-enabling collection).
+    // The agent refuses if the source is still enabled — that is the authoritative
+    // TOCTOU guard. Dispatch is fire-and-forget, so rows_deleted is computed
+    // agent-side (returned in the response record) and is NOT in this audit row.
+    svr.Post("/fragments/tar/retention-paused/purge",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                     audit_fn_(req, "tar.source.purge", "denied", "command", "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "denied"}})
+                             .increment();
+                     }
+                     return;
+                 }
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 // CSRF same-site gate for this destructive cookie-authenticated POST
+                 // (mirrors ca_routes.cpp ca.revoke / ca.import-chain). Reject a
+                 // cross-origin OR header-less request before the irreversible dispatch —
+                 // SameSite=Lax on the session cookie already blocks the naive cross-site
+                 // top-level POST, this is defense-in-depth + convention. Programmatic
+                 // callers use the structured POST /api/v1/tar/retention-paused/purge, not
+                 // this dashboard fragment, so requiring an Origin/Referer here is safe.
+                 {
+                     const std::string origin = req.get_header_value("Origin");
+                     const std::string referer = req.get_header_value("Referer");
+                     const bool same_site =
+                         !(origin.empty() && referer.empty()) &&
+                         origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                     if (!same_site) {
+                         audit_fn_(req, "tar.source.purge", "denied", "command", "",
+                                   "csrf_cross_origin");
+                         if (metrics_) {
+                             metrics_->counter("yuzu_tar_source_purge_total", {{"result", "denied"}})
+                                 .increment();
+                         }
+                         res.status = 403;
+                         res.set_content(
+                             "<span class=\"tar-row-error\">Cross-origin request refused.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<span class=\"tar-row-error\">Dispatch unavailable.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 auto device_id = req.has_param("device_id") ? req.get_param_value("device_id")
+                                                             : extract_form_value(req.body, "device_id");
+                 auto source = req.has_param("source") ? req.get_param_value("source")
+                                                       : extract_form_value(req.body, "source");
+
+                 if (device_id.empty() || source.empty()) {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "device_id and source are required.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                             .increment();
+                     }
+                     return;
+                 }
+                 // Same source scope as the frame (the four core diff sources); a
+                 // forged form value is rejected rather than dispatched.
+                 if (source != "process" && source != "tcp" && source != "service" &&
+                     source != "user") {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Unknown source — must be one of "
+                                     "process, tcp, service, user.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 // Per-device RBAC visibility (same 404-collapse as reenable so the
+                 // response cannot enumerate device existence; real reason audited).
+                 bool visible = false;
+                 if (mgmt_group_store_) {
+                     auto visible_ids = mgmt_group_store_->get_visible_agents(session->username);
+                     for (const auto& vid : visible_ids) {
+                         if (vid == device_id) {
+                             visible = true;
+                             break;
+                         }
+                     }
+                 }
+                 if (!visible) {
+                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                              std::format("scope_violation source={}", source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total",
+                                           {{"result", "scope_violation"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 params["source"] = source;
+                 auto [command_id, sent] =
+                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params);
+
+                 if (sent == 0) {
+                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                              std::format("agent_not_connected source={}", source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_purge_total",
+                                           {{"result", "agent_not_connected"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 audit_fn_(req, "tar.source.purge", "success", "command", command_id,
+                          std::format("device={} source={}", device_id, source));
+                 if (metrics_) {
+                     metrics_->counter("yuzu_tar_source_purge_total", {{"result", "success"}})
+                         .increment();
+                 }
+
+                 res.set_header("HX-Trigger",
+                                std::format("{{\"showToast\":{{\"message\":\"Purging {} data on "
+                                            "{}\",\"level\":\"success\"}}}}",
+                                            source, html_escape(std::string{device_id})));
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
+                 // The source stays paused (purge does not re-enable), so the row
+                 // remains — replace the action buttons with a dispatched note; a
+                 // Scan reconciles the (now-zero) counts.
+                 res.set_content("<span class=\"tar-row-note\">Purge dispatched — Scan to "
+                                 "refresh.</span>",
+                                 "text/html; charset=utf-8");
              });
 
     spdlog::info("DashboardRoutes: registered fragment endpoints");
@@ -1856,7 +2046,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // operator gets actionable guidance.
 
 std::string DashboardRoutes::render_tar_retention_paused(
-    const std::string& username) const {
+    const std::string& username, bool can_execute, bool can_delete) const {
     std::string scan_id;
     int scan_count = 0;
     int64_t scan_at = 0;
@@ -2150,20 +2340,43 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // sees them). Skipping the JSON-escape pass here was the Gate 2
         // sec-M3 finding — a malicious agent registering with a `device_id`
         // containing `"` could close the JSON string and inject keys.
-        html += std::format(
-            "<td style=\"text-align:right\">"
-            "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
-            "font-size:0.75rem\" "
-            "hx-post=\"/fragments/tar/retention-paused/reenable\" "
-            "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
-            "hx-target=\"closest tr\" hx-swap=\"delete\" "
-            "hx-confirm=\"Re-enable {} collector on {}?\">"
-            "Re-enable"
-            "</button>"
-            "</td>",
-            html_escape(json_escape(r.agent_id)),
-            html_escape(json_escape(r.source)),
-            html_escape(r.source), html_escape(r.agent_display));
+        // Effective-permission gating (governance LOW): the POST routes stay
+        // authoritative, but only render an action the viewer can actually use —
+        // Re-enable needs Execution:Execute, Purge needs the higher Infrastructure:
+        // Delete. A read-only / Execute-only operator sees no destructive button.
+        html += "<td style=\"text-align:right;white-space:nowrap\">";
+        if (can_execute) {
+            html += std::format(
+                "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
+                "font-size:0.75rem\" "
+                "hx-post=\"/fragments/tar/retention-paused/reenable\" "
+                "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
+                "hx-target=\"closest tr\" hx-swap=\"delete\" "
+                "hx-confirm=\"Re-enable {} collector on {}?\">"
+                "Re-enable"
+                "</button> ",
+                html_escape(json_escape(r.agent_id)), html_escape(json_escape(r.source)),
+                html_escape(r.source), html_escape(r.agent_display));
+        }
+        if (can_delete) {
+            // Purge is destructive: a typed-hostname confirm (tarPurgeConfirm, a
+            // native prompt) gates it — no hx-confirm. Data via HTML-escaped
+            // data-* attrs (read by the JS), never interpolated into script.
+            html += std::format(
+                "<button class=\"btn-danger\" style=\"padding:0.2rem 0.6rem;"
+                "font-size:0.75rem\" "
+                "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
+                "onclick=\"tarPurgeConfirm(this)\" "
+                "title=\"Permanently delete this source's stored data (source stays "
+                "paused)\">"
+                "Purge data"
+                "</button>",
+                html_escape(r.agent_id), html_escape(r.agent_display), html_escape(r.source));
+        }
+        if (!can_execute && !can_delete) {
+            html += "<span class=\"tar-row-note\">&mdash;</span>";
+        }
+        html += "</td>";
         html += "</tr>";
     }
     html += "</tbody></table>";

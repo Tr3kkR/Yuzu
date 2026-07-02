@@ -4,6 +4,15 @@
 #
 #    pip-compile --generate-hashes --output-file=requirements-ci.txt --strip-extras requirements-ci.in
 #
+colorama==0.4.6 ; sys_platform == "win32" \
+    --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
+    # via colorlog
+    # Hand-added: colorlog pulls colorama on win32 only, and this lock file
+    # was pip-compiled on Linux (which strips the win32-only transitive), so
+    # the Windows release leg hit "In --require-hashes mode, all requirements
+    # must have their versions pinned with ==. These do not: colorama".
+    # Regenerate with `pip-compile --generate-hashes --universal` to keep it.
 colorlog==6.10.1 \
     --hash=sha256:2d7e8348291948af66122cff006c9f8da6255d224e7cf8e37d8de2df3bad8c9c \
     --hash=sha256:eb4ae5cb65fe7fec7773c2306061a8e63e02efc2c72eba9d27b0fa23c94f1321

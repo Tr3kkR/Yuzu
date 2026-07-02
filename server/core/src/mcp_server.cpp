@@ -8,8 +8,11 @@
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
+#include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+
+#include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
 
@@ -454,6 +457,30 @@ static const ToolDef kTools[] = {
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
      R"j(},"required":["group_id","app"]})j"},
 
+    {"compare_app_perf_versions",
+     "Before/after app performance for an upgrade (the /auto VERIFY evidence): did "
+     "moving 'app' from 'baseline' to 'candidate' change how the SAME machines in "
+     "'group' perform? The shift is computed PER MACHINE (each device's own "
+     "baseline-version window vs its own candidate-version window, anchored to that "
+     "machine's transition, not today), then aggregated — the population is held "
+     "fixed (a fleet baseline-vs-candidate diff would be confounded). Machines that "
+     "ran only one version in-window are excluded + counted (baseline_only/"
+     "candidate_only); members with no data are no_data. EVIDENTIAL ONLY: returns "
+     "the measured shift (cpu/ws before/after means, median per-machine delta, p95 "
+     "across machines) + the up/flat/down split — NO verdict, NO threshold. You "
+     "judge from the evidence. NO floor (canaries are 2-3 devices): a sub-floor "
+     "paired set carries small_cohort=true (read as indicative), never suppression; "
+     "insufficient=true => no machine ran both. No per-machine row (that PII is the "
+     "audited dashboard drill). The read is audited (dex.app_perf.compare, "
+     "operational). Mirrors GET /api/v1/dex/perf/compare. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("group":{"type":"string","maxLength":512,"description":"Management-group id whose members are the cohort"},)j"
+     R"j("baseline":{"type":"string","maxLength":512,"description":"The before version (canonicalized + matched)"},)j"
+     R"j("candidate":{"type":"string","maxLength":512,"description":"The after version; must differ from baseline"},)j"
+     R"j("window":{"type":"integer","minimum":1,"maximum":31,"description":"Days of each version per machine (default 7)"})j"
+     R"j(},"required":["app","group","baseline","candidate"]})j"},
+
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
     {"get_network_fleet",
      "Fleet network-quality now-stats: avg/p50/p90/max + reporting populations for smoothed RTT "
@@ -631,6 +658,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
     {"get_dex_app_perf", {"GuaranteedState", "Read"}},
     {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
+    {"compare_app_perf_versions", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
@@ -3244,6 +3272,161 @@ McpServer::HandlerFn McpServer::build_handler(
                              JArr().add(JObj().add("type", "text").add("text", payload)).str())
                         .str();
                 mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── /auto VERIFY before/after (parity with GET /api/v1/dex/perf/compare) ──
+            // Cohort-PAIRED comparison: the per-machine before→after delta aggregated
+            // over a group, EVIDENTIAL only (no verdict). NO floor (canaries are 2-3
+            // devices; a sub-floor paired set carries small_cohort=true). The aggregate
+            // carries no per-machine row (that PII is the audited dashboard drill); the
+            // tool call itself is the access record (generic mcp.<tool> audit — the
+            // works-council accountability that replaces the floor's suppression).
+            if (tool_name == "compare_app_perf_versions") {
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                auto a4_data = [&](std::int64_t retry_ms, std::string_view remediation) {
+                    JObj o;
+                    o.add("correlation_id", cid);
+                    if (retry_ms > 0)
+                        o.add("retry_after_ms", retry_ms);
+                    else
+                        o.raw("retry_after_ms", "null");
+                    if (remediation.empty())
+                        o.raw("remediation", "null");
+                    else
+                        o.add("remediation", remediation);
+                    return o.str();
+                };
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation",
+                                       a4_data(0, "this MCP tier lacks GuaranteedState:Read; use a "
+                                                  "higher-tier token")),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!app_perf_providers.cohort) {
+                    res.set_content(
+                        error_response(id, kInternalError, "app-perf store provider unavailable",
+                                       a4_data(5000, "retry after server warmup; the app-perf store "
+                                                     "provider initialises during startup")),
+                        "application/json");
+                    return;
+                }
+                // app, group, baseline, candidate — all required + shared-cap valid.
+                std::string vals[4];
+                const char* names[4] = {"app", "group", "baseline", "candidate"};
+                for (int i = 0; i < 4; ++i) {
+                    if (!args.contains(names[i]) || !args[names[i]].is_string() ||
+                        args[names[i]].get<std::string>().empty()) {
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       std::string("missing required parameter '") +
+                                                           names[i] + "'",
+                                                       a4_data(0, "supply app, group, baseline, candidate")),
+                                        "application/json");
+                        return;
+                    }
+                    vals[i] = args[names[i]].get<std::string>();
+                    if (!app_perf_param_valid(vals[i])) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           std::string("invalid parameter '") + names[i] + "'",
+                                           a4_data(0, "must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                }
+                const std::string& app = vals[0];
+                const std::string& group = vals[1];
+                const std::string& baseline = vals[2];
+                const std::string& candidate = vals[3];
+                if (yuzu::util::canon_version(baseline) == yuzu::util::canon_version(candidate)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "baseline and candidate must differ",
+                                       a4_data(0, "a before/after compare needs two distinct versions")),
+                        "application/json");
+                    return;
+                }
+                // param_int reads as int64 (no std::out_of_range throw on an
+                // out-of-int32 client value, unlike .get<int>(); gov L2); clamp in
+                // 64-bit BEFORE narrowing.
+                const int window = static_cast<int>(std::clamp<std::int64_t>(
+                    param_int(args, "window", 7), 1, AppPerfDailyStore::kRetentionDays));
+
+                auto cohort = app_perf_providers.cohort(group, app, baseline, candidate, window);
+                if (!cohort) { // AUTHORITATIVE degrade
+                    res.set_content(
+                        error_response(id, kInternalError, "app-perf cohort read degraded",
+                                       a4_data(2000, "the app-perf store could not be read; retry "
+                                                     "shortly")),
+                        "application/json");
+                    return;
+                }
+                const PairedComparison c =
+                    build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
+                                     yuzu::util::canon_version(candidate), window);
+                const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+                const std::string cpu = JObj()
+                                            .add("before_mean", c.cpu_before_mean)
+                                            .add("after_mean", c.cpu_after_mean)
+                                            .add("delta_median", c.cpu_delta_median)
+                                            .add("before_p95", c.cpu_before_p95)
+                                            .add("after_p95", c.cpu_after_p95)
+                                            .str();
+                const std::string ws = JObj()
+                                           .add("before_mean", c.ws_before_mean)
+                                           .add("after_mean", c.ws_after_mean)
+                                           .add("delta_median", c.ws_delta_median)
+                                           .add("before_p95", c.ws_before_p95)
+                                           .add("after_p95", c.ws_after_p95)
+                                           .str();
+                const std::string dist = JObj()
+                                             .add("up", c.moved_up)
+                                             .add("flat", c.moved_flat)
+                                             .add("down", c.moved_down)
+                                             .str();
+                // Audit the read (load-bearing — it is the accountability that replaces
+                // the absent cohort floor, and MCP is the highest-exposure programmatic
+                // sweep path). Carry the SUBJECT (group/app/versions/cohort) + paired so
+                // a singleton aggregate is distinguishable — empty detail here was the
+                // governance HIGH (gov compliance/consistency). Set-and-proceed: capture
+                // the persist bool and surface `audit_persisted:false` in the body (MCP
+                // has no Sec-Audit-Failed header channel — the documented MCP posture).
+                const bool audit_ok =
+                    mcp_audit("success", "group=" + audit_token(group) + " app=" + audit_token(app) +
+                                             " base=" + audit_token(baseline) + " cand=" +
+                                             audit_token(candidate) + " cohort=" +
+                                             std::to_string(cohort->member_count) + " paired=" +
+                                             std::to_string(c.paired));
+                JObj payload_obj;
+                payload_obj.add("app", app)
+                    .add("group_id", group)
+                    .add("baseline_version", baseline)
+                    .add("candidate_version", candidate)
+                    .add("window_days", static_cast<int64_t>(window))
+                    .add("cohort_size", cohort->member_count)
+                    .add("paired", c.paired)
+                    .add("baseline_only", c.baseline_only)
+                    .add("candidate_only", c.candidate_only)
+                    .add("no_data", no_data)
+                    .add("small_cohort", c.small_cohort)
+                    .add("insufficient", c.insufficient)
+                    // truncated=true → cohort exceeded the read cap; counts UNRELIABLE.
+                    .add("truncated", cohort->truncated)
+                    .raw("cpu", cpu)
+                    .raw("ws", ws)
+                    .raw("distribution", dist);
+                if (!audit_ok)
+                    payload_obj.add("audit_persisted", false);
+                const std::string payload = payload_obj.str();
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
+                        .str();
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }

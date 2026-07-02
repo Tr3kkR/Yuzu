@@ -60,6 +60,56 @@ failure — restore the schema or redeploy from a clean database. (A *transient*
 store error while the server is already running just degrades `/auto` to an
 "unavailable" note; it does not take the server down.)
 
+## Verify — before / after performance
+
+The **Verify** stage at the bottom of `/auto` answers a different question from
+pre-flight: *after* an upgrade, **did it change how the same machines perform?**
+Pick a cohort (a management group), an application, the **baseline** version (what
+they ran before) and the **candidate** version (what was installed), and a window,
+then **Compare**.
+
+The comparison is **cohort-paired**. For each machine that ran *both* versions in
+the window, Verify takes that machine's own baseline-version performance and its own
+candidate-version performance and computes the difference *per machine*, then
+aggregates those differences. The window is anchored to **each machine's own version
+history**, not to a fixed "last N days", so a rollout where different machines
+upgraded at different times still pairs correctly. A machine that ran only one of the
+two versions in the window is **excluded and counted** (never guessed at). This
+matters: a fleet-wide "version A vs version B" average would compare *different
+machines* and could blame the build for a difference that is really just a different
+population — pairing on the machine removes that.
+
+Verify is **evidence, not a verdict.** It shows the measured shift — CPU and
+working-set before→after means, the typical (median) per-machine change, the spread
+across machines (p95), and how many machines went up / stayed flat / went down — and
+**lets you judge**. It never labels a build "bad" or "regressed", and there is no
+pass/fail gate (unlike pre-flight's go/no-go). An AI colleague driving the rollout
+reads the same numbers over MCP and makes the call.
+
+Real canaries are small — two or three devices — so Verify deliberately has **no
+minimum cohort size**: a small paired set is shown with an *"indicative"* note rather
+than hidden. Because that means reading a handful of named machines' data, the
+comparison is **recorded in the audit log**. The aggregate is shown without any
+per-machine identity; the **per-machine pairs** are behind a separate *"Show
+per-machine pairs"* click, so opening that view is a deliberate, separately-audited
+action.
+
+**Prerequisite:** Verify reads the retained per-device performance history, which only
+exists if **per-application performance collection is enabled** on the devices (it is
+opt-in and off by default). Without it, every Verify comparison returns *insufficient*
+with no data — pick the cohort accordingly. Even with collection on, a just-upgraded
+candidate version only appears once the upgraded machines have reported it (the next
+daily report after the upgrade), so running Verify immediately after a deploy may show
+*insufficient* until the cohort reports back. Verify dispatches nothing to the devices.
+
+You pick the cohort (a management group) manually; automatically pre-filling it from the
+ACT/deploy stage is a planned future convenience, not yet available. Very large cohorts
+(thousands of devices) can exceed the read cap, in which case Verify shows a *truncated*
+warning and the numbers are unreliable — narrow the group or shorten the window.
+
+The same comparison is available to automation: REST `GET /api/v1/dex/perf/compare`
+and MCP `compare_app_perf_versions` return the aggregate (no per-machine identity).
+
 ## Deploying to the go-cohort
 
 Pre-flight is the **assess** half of a change; the **act** half lives on the same
@@ -121,6 +171,8 @@ The same engine is designed to be driven headless by an automation worker later.
 | Deploy to a go-cohort (create + first advance) | `Infrastructure:Read` + `SoftwareDeployment:Execute` |
 | View / track a deployment — each poll also advances the engine | `SoftwareDeployment:Read` + `SoftwareDeployment:Execute` |
 | Delete a deployment | `SoftwareDeployment:Execute` |
+| Open the Verify form | `Infrastructure:Read` |
+| Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
 Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
 require you to be the creator; another operator's deployment reads as not-found).
@@ -131,4 +183,8 @@ drive a deployment.
 Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
 `preflight.run` and `preflight.run.delete`; deployments as `deployment.create`
 (result `success` / `resumed` / `no_devices`), `deployment.advance`, and
-`deployment.delete`.
+`deployment.delete`. A Verify aggregate comparison is recorded as
+`dex.app_perf.compare`; opening the per-machine pairs carries its own
+`dex.app_perf.compare.drill` verb so per-machine access stays separately countable.
+(Over MCP, `compare_app_perf_versions` is recorded under the generic
+`mcp.compare_app_perf_versions` tool-call audit.)
