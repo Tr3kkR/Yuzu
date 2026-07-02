@@ -49,19 +49,16 @@ public:
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
-    /// Single-approval lookup by id (read-only). Backs the versioned
-    /// GET /api/v1/approvals/{id} status_url target — query() cannot serve it
-    /// (its LIMIT 100 would false-404 an id that has aged past the top window).
-    /// Returns std::nullopt when no row matches. Does NOT touch the approval
-    /// lifecycle (submit/approve/reject/consumption are elsewhere).
+    /// Single-approval lookup by id (read-only). Two callers: the versioned
+    /// GET /api/v1/approvals/{id} status_url target (query()'s LIMIT 100 would
+    /// false-404 an id that has aged past the top window), and the MCP
+    /// approval-ticket recall path (#289), which reads
+    /// status/definition_id/scope_expression/consumed_at to validate a ticket
+    /// before consuming it. Returns std::nullopt when no row matches; does NOT
+    /// touch the lifecycle (submit/approve/reject/consume are elsewhere).
     std::optional<Approval> get(const std::string& id) const;
 
     int pending_count() const;
-
-    /// Fetch a single approval by id — the MCP approval-ticket recall path
-    /// (#289) reads status/definition_id/scope_expression/consumed_at to
-    /// validate a ticket before consuming it. Returns nullopt if absent.
-    std::optional<Approval> get(const std::string& id) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);
