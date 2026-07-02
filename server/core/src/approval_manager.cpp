@@ -43,6 +43,7 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
     a.reviewed_at = sqlite3_column_int64(stmt, 6);
     a.review_comment = col_text(stmt, 7);
     a.scope_expression = col_text(stmt, 8);
+    a.consumed_at = sqlite3_column_int64(stmt, 9);
     return a;
 }
 
@@ -73,6 +74,13 @@ void ApprovalManager::create_tables() {
                 ON approvals(submitted_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_definition
                 ON approvals(definition_id);
+        )"},
+        // v2 (#289 / Issue 13.5): one-time-consumption stamp for the MCP
+        // approval-ticket flow. Additive column, NOT NULL DEFAULT 0 (0 =
+        // unconsumed) so it also back-fills every pre-existing row — keeps the
+        // eventual Postgres port a trivial ADD COLUMN.
+        {2, R"(
+            ALTER TABLE approvals ADD COLUMN consumed_at INTEGER NOT NULL DEFAULT 0;
         )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
@@ -172,7 +180,7 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
         return results;
 
     std::string sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
-                      "reviewed_by, reviewed_at, review_comment, scope_expression "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
                       "FROM approvals WHERE 1=1";
     std::vector<std::string> binds;
 
@@ -247,6 +255,74 @@ int ApprovalManager::pending_count() const {
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// Get by id (#289 — MCP approval-ticket recall)
+// ---------------------------------------------------------------------------
+
+std::optional<Approval> ApprovalManager::get(const std::string& id) const {
+    if (!db_ || id.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(mtx_);
+
+    const char* sql = "SELECT id, definition_id, status, submitted_by, submitted_at, "
+                      "reviewed_by, reviewed_at, review_comment, scope_expression, consumed_at "
+                      "FROM approvals WHERE id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<Approval> out;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        out = row_to_approval(stmt);
+
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Consume (#289 — one-time MCP approval ticket)
+// ---------------------------------------------------------------------------
+
+std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id) {
+    if (!db_)
+        return std::unexpected("database not open");
+    if (id.empty())
+        return std::unexpected("approval id is required");
+
+    std::lock_guard lock(mtx_);
+
+    // Atomic CAS: only an approved, not-yet-consumed ticket transitions.
+    // RETURNING carries the "row matched" signal in the step return code, so we
+    // never call sqlite3_changes() on the shared FULLMUTEX connection (#1033).
+    // SQLITE_ROW == this call consumed it; SQLITE_DONE == already used / not
+    // approved / absent (replay-safe: a second concurrent recall loses here).
+    const char* sql = R"(
+        UPDATE approvals SET consumed_at = ?
+        WHERE id = ? AND status = 'approved' AND consumed_at = 0
+        RETURNING 1
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+
+    sqlite3_bind_int64(stmt, 1, now_epoch());
+    sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+
+    auto rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc == SQLITE_ROW) {
+        spdlog::info("ApprovalManager: consumed approval ticket {}", id);
+        return {};
+    }
+    if (rc == SQLITE_DONE)
+        return std::unexpected("approval not consumable (already used, not approved, or absent)");
+    return std::unexpected(std::string("consume failed: ") + sqlite3_errmsg(db_));
 }
 
 // ---------------------------------------------------------------------------
