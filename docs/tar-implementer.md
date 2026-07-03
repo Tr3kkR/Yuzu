@@ -130,7 +130,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
-| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. |
+| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Observability gap (tracked follow-up):** corruption is currently **log-only** — no Prometheus metric, no server audit event, no heartbeat tag surfaces it fleet-side; an operator learns of it only from the agent log. |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete tar data on uninstall",
@@ -316,6 +316,10 @@ header):
    `$Name_Tier` → `name_tier` translation, the read-only-SQL authorizer allowlist
    (`is_queryable_table`, the #760/#631 chokepoint — **no hardcoded list to
    touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
+   Untrusted operator SQL (`tar.sql`) runs only through
+   `TarDatabase::execute_user_query` (read-only connection + that authorizer);
+   the trusted `execute_query` is for registry-generated SQL only — never route
+   operator input to it.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
    `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
    branch per non-live tier. **Privacy-sensitive / usage-class sources are opt-in**

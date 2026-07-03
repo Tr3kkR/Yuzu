@@ -9,7 +9,7 @@
 #   docker build -t yuzu-server:fresh \
 #     -f deploy/docker/Dockerfile.server-local .
 
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # libpq5 replaced libsqlite3-0 in #1318 — mirrors Dockerfile.server stage 3
 # (SQLite is statically linked from vcpkg; see the comment there).

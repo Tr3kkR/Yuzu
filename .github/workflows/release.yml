@@ -252,7 +252,7 @@ jobs:
       # workflow run. Stored in GitHub's attestation registry; verified
       # customer-side with `gh attestation verify <file>`.
       - name: Attest provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             yuzu-linux-x64.tar.gz
@@ -429,7 +429,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest gateway provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             yuzu-gateway-linux-x64.tar.gz
@@ -763,7 +763,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest Windows provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             yuzu-windows-x64.zip
@@ -846,7 +846,7 @@ jobs:
         # the 45-min job budget. cache/restore@v5 also drops the
         # `save-always: true` input that the maintainers say never
         # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/Library/Caches/ccache
           key: ccache-release-macos-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -878,7 +878,7 @@ jobs:
         # plan: vcpkg.json + vcpkg-configuration.json + every overlay
         # triplet + the pinned VCPKG_COMMIT baseline. Same shape as the
         # ci.yml macOS cache key.
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
@@ -1105,7 +1105,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest macOS provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             yuzu-macos-arm64.tar.gz
@@ -1274,7 +1274,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1441,7 +1441,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1669,7 +1669,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1821,7 +1821,7 @@ jobs:
           retention-days: 3
 
       - name: Attest bundle provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ${{ steps.ref.outputs.image }}
           subject-digest: ${{ steps.digest.outputs.value }}

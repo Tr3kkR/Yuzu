@@ -204,6 +204,14 @@ Verdict semantics: a plugin failure / timeout / rejection → `error`; a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
+Implementation/lifecycle: the thread is `PolicyEvaluator`
+(`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared
+`command_dispatch_fn`; per-agent verdicts are written via
+`PolicyStore::update_agent_status`. The `policy_eval_thread_` is **joined
+before the stores are destroyed** in `~ServerImpl`/`stop()` — the eval thread
+dispatches through those stores, so the join-before-stores order is a
+use-after-free guard any shutdown refactor must preserve.
+
 > **Remediation is never automatic.** Detection runs on the schedule above;
 > applying a fix is always an explicit, operator-gated action (see
 > `POST /api/policies/{id}/remediate` below). On a server restart, any agent

@@ -138,5 +138,8 @@ per-destination drill. See the [TAR dashboard](tar.md) for the query surface.
 
 The fleet gauges (`yuzu_fleet_net_*`) are documented in
 [Metrics — Fleet network gauges](metrics.md#fleet-network-gauges). They are fed
-from the same heartbeat facts as this page, via shared validators, so the gauges
-and the dashboard cannot disagree.
+from the same heartbeat facts as this page, via the shared
+`network_perf_rules.hpp` validators, so the gauges and the dashboard cannot
+disagree. The agent emits the literal `yuzu.net_*` heartbeat keys, which must
+match the server's `kNetTag*` constants — pinned by a `static_assert` in
+`test_network_perf_model.cpp`, so drift fails the build.

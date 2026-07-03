@@ -120,3 +120,29 @@ kind is **deliberately not built yet** (no store needs it). The rule:
   multi-minute `ACCESS EXCLUSIVE` lock with a plain `CREATE INDEX`. That requires the
   non-transactional kind, which **must be built** (self-schema-qualifying, runs outside a txn)
   *before* such a migration ships. Do not weaken the transactional default to sneak one in.
+
+## Substrate quick facts (pool / runner / helpers)
+
+Design facts every store author inherits (previously recorded only in CLAUDE.md and the
+2026-06-18 conformance register; #1368 readiness items marked †):
+
+- **Pool connection setup†**: `statement_timeout`/`lock_timeout` GUCs injected on every pooled
+  connection; TCP keepalives enabled.
+- **Connect-failure circuit breaker†**: exponential backoff + jitter; while open, acquires
+  fail fast (no connection storm against a down Postgres).
+- **Observability†**: `PgPool::Observer` hooks feed `yuzu_pg_pool_{in_use,open,size}` gauges,
+  `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters, and the
+  `yuzu_pg_acquire_wait_seconds` histogram. Pool live-probe + every store's `is_open()` join
+  the `/readyz` conjunction. Chaos coverage: CH-9/10/11 (pool exhaustion, PG down at boot,
+  PG lost at runtime).
+- **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
+  refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
+  serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
+  `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`.
+- **Error/RAII hygiene**: malformed-conninfo errors are reported as a fixed string (never
+  libpq's token-quoting parse error, which can echo credential fragments); libpq-allocated
+  buffers are freed only with `PQfreemem`/`PQconninfoFree`.
+- **`pg/pg_array.hpp` `pg::to_text_array`**: serialises a string sequence to a Postgres
+  text-array literal for `unnest()`-style batched inserts. Always-quotes, escapes `\` and `"`,
+  and **drops `0x00`** — NUL is not transmittable in libpq text format, so callers must not
+  rely on NUL surviving the round-trip.

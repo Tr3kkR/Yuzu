@@ -2476,6 +2476,20 @@ Guardian ladder must check these.
   (PR 2). Both halves must stay — the load-time check is the primary
   defence, the dispatch-time intercept is defence-in-depth. See #477 for the
   known `dlopen`-before-name-check gap that the load-time check inherits.
+- **`dangerous_enforce_in_spec` is the single enforce-safety chokepoint —
+  EXTEND it, never fork it.** It lives in `guardian_rule_spec.cpp` and gates
+  dangerous enforce-promotion at every path that can set `enforcement_mode`:
+  create (`derive_rule_spec`), the REST metadata update (`rest_api_v1`), and
+  the push backstop (`guardian_push_builder`, which *downgrades* a dangerous
+  enforce to audit rather than rejecting). Any new guard type with a
+  dangerous enforce action must EXTEND `dangerous_enforce_in_spec` — never
+  add a parallel gate. When Linux service-enforce lands it must EXTEND
+  `dangerous_enforce_service_stop` with a Linux critical-unit denylist —
+  never fork the gate.
+- **The enforced set is read via `BaselineStore::deployed_member_rule_ids()`**
+  — the push fan-out and the heartbeat reconcile both gate on it; it sources
+  from each deployed Baseline's `deployed_snapshot`, not the live member set
+  (the Push-not-Write invariant in `docs/user-manual/guaranteed-state.md`).
 - **Guardian wire payloads in `CommandRequest.parameters` are not
   gateway-safe.** Any field that carries raw proto bytes (serialised
   `GuaranteedStatePush`, binary signatures, etc.) must NOT be placed in a

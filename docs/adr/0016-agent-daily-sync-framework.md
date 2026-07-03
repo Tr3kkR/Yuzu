@@ -81,8 +81,10 @@ A small, source-agnostic seam:
   blob when the hash is unchanged** since the last successful sync.
 - The server is **authoritative**: on stored-hash mismatch *or no record* it
   replies `need_full` for that source, and the agent re-pushes the full list
-  (conditional-request / HTTP-304 pattern). This covers all cold-cache cases:
-  DB wiped, new/migrated server, reassigned agent.
+  (conditional-request / HTTP-304 pattern); the resend is jittered so a
+  server-side cold cache doesn't trigger a synchronized full-resend herd.
+  This covers all cold-cache cases: DB wiped, new/migrated server,
+  reassigned agent.
 - A **weekly full-floor** (send full regardless) is the defense-in-depth
   backstop.
 - **Hash trust:** the server **recomputes the canonical hash server-side from

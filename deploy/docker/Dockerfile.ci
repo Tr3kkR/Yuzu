@@ -18,7 +18,7 @@
 
 # Ubuntu 26.04 (Resolute) — matches the Big Tam self-hosted Linux runner.
 # GCC 15 / Clang 21 are 26.04 defaults. Multi-arch OCI index digest.
-FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
+FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
 
 # ── System packages (matches ci.yml) ─────────────────────────────────────
 RUN apt-get update && apt-get install -y \

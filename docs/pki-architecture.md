@@ -36,6 +36,9 @@ valid for a deployment name a client actually dials — e.g. `--cert-san dns:gat
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
 the prior certs); clear the cert dir or replace the certs for new SANs to take effect.
+(Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
+`merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
+IP-shape check.)
 
 Server-side leaves are long-lived because the threat model is "operator forgets to
 rotate"; agent leaves are short-lived because they auto-renew over the existing
@@ -462,7 +465,9 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 - **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}`, or
   use the **Settings → Internal CA** dashboard panel (find the agent's row in the
   inventory, optionally type a reason, and click **Revoke** — the panel refreshes
-  in place with the new status; the dashboard POST is CSRF-gated). Either way it
+  in place with the new status; the dashboard POST — `POST /api/settings/ca/revoke`
+  — is CSRF-gated. Implementation: `render_ca_fragment` + the fragment/revoke
+  routes in `ca_routes.cpp`, output `html_escaped`). Either way it
   is effective immediately server-side; the agent is refused on its next
   Subscribe/Heartbeat/CheckForUpdate/OTA call (Register re-auth + the data-plane
   gates consult `ca.db` directly). An agent holding an **already-open** Subscribe

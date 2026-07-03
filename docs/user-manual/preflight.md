@@ -103,7 +103,8 @@ daily report after the upgrade), so running Verify immediately after a deploy ma
 *insufficient* until the cohort reports back. Verify dispatches nothing to the devices.
 
 You pick the cohort (a management group) manually; automatically pre-filling it from the
-ACT/deploy stage is a planned future convenience, not yet available. Very large cohorts
+ACT/deploy stage is a planned future convenience, not yet available — as is a live
+measure-after-deploy mode (Verify today reads only the retained daily history). Very large cohorts
 (thousands of devices) can exceed the read cap, in which case Verify shows a *truncated*
 warning and the numbers are unreliable — narrow the group or shorten the window.
 
@@ -118,6 +119,9 @@ page. As soon as a run has a go-cohort — at least one device in **Pass** or
 not need to finish first**; the button's count grows as more devices clear. It opens
 a deploy panel where you give an **artifact** — a download **URL**, a **filename**,
 the expected **SHA-256**, and optional silent-install **arguments** — and confirm.
+The server validates the artifact before any dispatch: the filename against a safe
+charset, the SHA-256 as exactly 64 hex chars, the URL as http(s), and the arguments
+for shell metacharacters — a spec failing any of these is rejected outright.
 The deployment targets the devices that had cleared **at the moment you clicked
 Deploy** (the cohort is frozen then). On those devices it:
 

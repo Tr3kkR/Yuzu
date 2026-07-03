@@ -23,12 +23,13 @@ legacy timestamp-window join in the executions detail drawer:
 
 - Workflow-step dispatch (`/api/workflows/:id/execute` step `cmd_dispatch`
   callback at `workflow_routes.cpp` line ~925)
-- MCP `execute_instruction` (`mcp_server.cpp`)
 - Schedule / approval-triggered dispatch
 - Rerun (`/api/executions/:id/rerun` via `create_rerun` — does not currently
   dispatch a command, so the gap is structural, not a wiring bug)
 
-Closing each gap is the scope of PR 2.x follow-ups. **When adding any new
+(MCP `execute_instruction` was on this list; it is a tracked-execution
+producer since #1088 — see `docs/user-manual/mcp.md`.) Closing each remaining
+gap is the scope of PR 2.x follow-ups. **When adding any new
 dispatch path that creates an execution row, it MUST thread `execution_id`
 into `cmd_dispatch`** — failure produces silent empty-string tagging with
 no error or warning.
