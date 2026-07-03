@@ -715,9 +715,16 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         return std::unexpected("unsupported JWT algorithm: " + alg);
 
 #ifdef _WIN32
-    // TODO: Implement BCrypt-based JWT signature verification for Windows
-    spdlog::warn("OidcProvider: JWT signature verification not yet implemented on Windows");
-    return {};
+    // SECURITY (#1856): JWT signature verification is not yet implemented on the
+    // Windows build (needs a BCrypt/CNG RSA path mirroring the OpenSSL one
+    // below). This function MUST fail CLOSED — returning success here without
+    // verifying the signature would accept an attacker-forged ID token and mint
+    // an OIDC session (account takeover). Refuse OIDC login on Windows until the
+    // BCrypt verifier lands; never `return {}` (= success) from this arm.
+    spdlog::error("OidcProvider: JWT signature verification is not implemented on "
+                  "Windows; refusing OIDC login (fail-closed, see #1856)");
+    return std::unexpected(
+        "OIDC JWT signature verification is not available on this platform (Windows)");
 #else
     // Ensure JWKS is cached and fresh
     {

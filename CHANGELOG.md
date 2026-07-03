@@ -158,6 +158,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
+### Security
+
+- **OIDC JWT signature verification now fails closed on Windows (#1856).** On the
+  Windows server build, `OidcProvider::verify_jwt_signature` was a stub that
+  returned success without verifying the token signature — an attacker-forged ID
+  token would have been accepted, allowing arbitrary OIDC session minting
+  (account takeover). It now returns an error (OIDC login is refused on Windows)
+  until a BCrypt/CNG verifier is implemented. Linux/macOS (OpenSSL) verification
+  is unchanged. Yuzu is Linux-first, so this path was likely latent in practice;
+  the fix removes the forged-token hole regardless.
+
 ## [0.13.0] - 2026-07-01
 
 ### Added
