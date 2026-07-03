@@ -80,7 +80,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
-| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |
+| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=user`), Linux/macOS only. Deferred: group→role mapping, AuthnRequest signing, AttributeStatement parsing, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
@@ -189,8 +189,16 @@ matches the customer ask.
 
 ### Priority 1 — enterprise-friction reducers
 
-6. **SAML 2.0 SP** with metadata exchange + signed assertion validation.
-   Mirrors OIDC's group-to-role mapping. Same enforcement surface as OIDC.
+6. **SAML 2.0 SP** — thin first slice shipped. SP-initiated login via
+   HTTP-Redirect binding; ACS via HTTP-POST binding. Assertion signature
+   validated against the pinned IdP cert (in-document `<KeyInfo>` ignored);
+   XML signature-wrapping defended; audience / recipient / expiry validated;
+   solicited-only + single-use `InResponseTo` (replay-protected). Sessions are
+   ephemeral, `auth_source="saml"`, `role=user` (no group→role mapping).
+   **Linux and macOS only** — Windows fails closed at startup. **Remaining
+   (next slice):** group→role mapping via AttributeStatements, AuthnRequest
+   signing, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure.
+   See `docs/auth-architecture.md` "SAML 2.0 SP".
 7. **SCIM v2 provisioning** — auto-create/disable users from the IdP.
    Reuses `auth.db` user table; new endpoint surface under `/scim/v2/`
    with bearer-token auth (separate from operator API tokens).

@@ -134,6 +134,45 @@ TEST_CASE_METHOD(StepUpFixture,
 }
 
 TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: SAML session is denied with honest 403 (not api-token "
+                 "message, not mfa_status lookup) — gate stays CLOSED",
+                 "[mfa][stepup][saml]") {
+    // F3 regression guard: SAML sessions have no local users row.  Before
+    // this fix the gate fell through to mfa_status() which returned an
+    // error (UserNotFound → fail-closed), producing a confusing
+    // "auth_db unavailable" 401.  The fix returns an honest 403 BEFORE
+    // consulting the DB.  carol has no local row (proving the lookup is skipped).
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row for SAML user
+
+    auto session = make_session("carol", "saml");
+
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                                    "DELETE /api/v1/users/carol"));
+    // Must deny (gate stays CLOSED), not bypass.
+    CHECK(res.status == 403);
+
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == 403);
+    // Message must mention SAML, not the API-token message.
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("SAML") != std::string::npos);
+    CHECK(msg.find("API") == std::string::npos);
+    CHECK(msg.find("token") == std::string::npos);
+    // mfa_step_up_required false: there is no step-up path available for SAML.
+    CHECK(body["meta"]["mfa_step_up_required"] == false);
+
+    // Audit must be emitted and mention the SAML reason.
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].action == "mfa.step_up.required");
+    CHECK(audits[0].result == "error");
+    CHECK(audits[0].detail.find("saml") != std::string::npos);
+}
+
+TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: api_token / mcp_token principals bypass the gate",
                  "[mfa][stepup]") {
     httplib::Request req;

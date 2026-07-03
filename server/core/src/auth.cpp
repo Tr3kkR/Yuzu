@@ -935,6 +935,30 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     return token;
 }
 
+// ── SAML session creation ───────────────────────────────────────────────────
+
+std::string AuthManager::create_saml_session(const std::string& name_id) {
+    std::unique_lock lock(mu_);
+
+    // Thin slice: role defaults to user — no group→role mapping (deferred).
+    // Security: admin role is NEVER granted from SAML without explicit group
+    // mapping (analogous to the OIDC admin_group_id guard — see C3 fix comment
+    // in create_oidc_session). Do not change this default without adding group
+    // mapping that is reviewed by security-guardian.
+    auto token = generate_session_token();
+    Session s;
+    s.username                   = name_id;
+    s.role                       = Role::user;
+    s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source                = "saml";
+    s.last_activity_at           = std::chrono::steady_clock::now();
+    s.last_activity_persisted_at = s.last_activity_at;
+    sessions_[token]             = std::move(s);
+
+    spdlog::info("SAML session created for '{}'", name_id);
+    return token;
+}
+
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
 std::string AuthManager::sha256_hex(const std::string& input) {

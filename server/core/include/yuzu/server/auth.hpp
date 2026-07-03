@@ -39,7 +39,7 @@ struct Session {
     std::string username;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"}; // "local", "oidc", "api_token", or "mcp_token"
+    std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
     std::string oidc_sub;             // OIDC subject claim (empty for local auth)
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
@@ -364,6 +364,13 @@ public:
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
+
+    /// Create an ephemeral session for a verified SAML assertion's NameID.
+    /// Thin slice: role defaults to `user` — no group→role mapping (deferred).
+    /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
+    /// per the standing invariant: any new session-creation site MUST stamp it
+    /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
+    std::string create_saml_session(const std::string& name_id);
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

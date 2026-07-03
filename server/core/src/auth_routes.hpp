@@ -8,6 +8,7 @@
 #include "audit_store.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
+#include "saml_provider.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
 
@@ -43,7 +44,8 @@ public:
                ApiTokenStore* api_token_store, AuditStore* audit_store,
                ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
                AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
-               std::unique_ptr<oidc::OidcProvider>& oidc_provider);
+               std::unique_ptr<oidc::OidcProvider>& oidc_provider,
+               saml::SamlProvider* saml_provider = nullptr);
 
     // -- Auth helpers (called by server.cpp to create callbacks for other modules) --
 
@@ -156,6 +158,11 @@ private:
     AnalyticsEventStore* analytics_store_;
     std::shared_mutex& oidc_mu_;
     std::unique_ptr<oidc::OidcProvider>& oidc_provider_;
+    // Non-owning pointer — lifetime is guaranteed by ServerImpl which holds the
+    // unique_ptr<SamlProvider> and outlives AuthRoutes. No mutex needed: the
+    // provider is constructed once at startup (xmlsec global init is not thread-safe;
+    // the startup phase is single-threaded) and never mutated afterward.
+    saml::SamlProvider* saml_provider_{nullptr};
 
     /// Pending MFA challenge issued after a successful password verify on
     /// /login when the user has TOTP enrolled. Keyed by an opaque random
