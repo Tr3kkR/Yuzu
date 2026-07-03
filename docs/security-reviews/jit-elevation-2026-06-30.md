@@ -114,15 +114,10 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
 
 ## Residual risks (accepted / tracked)
 
-- **No `role.elevation.expired` event on passive lapse.** The `granted` row +
-  `duration_secs` make expiry deterministic; a lazy/reaper-emitted expiry row is a
-  tracked follow-up (happy-path / unhappy-path SHOULD).
 - **An elevated operator can create standing admins / grant others' eligibility.**
   Inherent to "elevation = full admin" (a standing admin can too); self-grant is
   blocked and every eligibility change is audited with the actor. Access reviews
   must enumerate `users.elevation_eligible` and cross-check the granting actor.
-- **`expires_in` reports the granted duration, not time-remaining vs the cookie's
-  absolute expiry.** Cosmetic; an absolute `expires_at` is a tracked follow-up.
 - **Migration v4 collides with the break-glass PR (#1735, also v4).** A merge-gate
   renumber-to-v5 item, flagged in-code.
 
@@ -218,42 +213,101 @@ if (session->auth_source == "oidc") {
   `--jit-oidc-amr-elevation` is on, so an incident responder can discover the
   posture without reading source or an individual audit row's `mfa=` detail.
 
+## Follow-ups shipped (2026-07-02)
+
+Both `expires_in`/`expired`-event follow-ups flagged above have shipped:
+
+- **Follow-up A — `role.elevation.expired` on passive lapse.** Emitted LAZILY (no
+  new background thread) by `AuthManager::reap_expired_elevation`, called from the
+  `AuthRoutes::resolve_session` cookie chokepoint on the operator's first
+  authenticated request after the window elapses. Clears `elevated_until` to the
+  sentinel on the first observing call, so emission is exactly-once; a manual
+  `revoke_elevation`/`revoke_user_elevations` clears the same sentinel first, so a
+  manual step-down never ALSO produces a spurious `expired` row (verified by test).
+  **The audit emission itself is best-effort / at-most-once, not exactly-once
+  end-to-end:** the sentinel is cleared BEFORE the audit call, so a store failure
+  loses only the confirmatory `expired` row — the reap (session reverting to base
+  role) still happens regardless, and the window's end remains reconstructible
+  from the earlier, fail-closed `role.elevation.granted` row's
+  `duration_secs`/`expires_at` (verified by a broken-`AuditStore` test — no
+  crash/throw, elevation still reaped). **Accepted boundary:** an operator who
+  elevates and then abandons the session (closes the browser, lets it idle)
+  without another authenticated request never triggers the lazy reap — no event
+  fires for that lapse, though the window's end remains reconstructible from the
+  `granted` row's `duration_secs`/`expires_at`. The same boundary applies to idle
+  (inactivity) session eviction: if the idle reaper evicts the session first, the
+  next request never reaches the cookie-found branch, so the lazy reap likewise
+  never fires.
+- **Follow-up B — absolute `expires_at` + session-lifetime clamp.**
+  `AuthManager::elevate_session` now clamps
+  `elevated_until = min(now + min(duration, --jit-max-elevation-secs), session.expires_at)`
+  — an elevation can never outlive the cookie session that carries it.
+  `POST /api/v1/elevate`'s response now reports the TRUE remaining time as
+  `expires_in` (computed after any clamp, so it is `<=` the requested/capped
+  duration) plus a wall-clock `expires_at` (RFC3339 UTC). The
+  `role.elevation.granted` audit detail carries `expires_at` too, and the
+  analytics `emit_event` now carries the same post-clamp `duration_secs` as the
+  audit row and response body (all three channels agree).
+- **Governance hardening round (2026-07-02) — dead-window guard (UP-1/UP-4,
+  merge-blocker, fixed).** A session that crosses its own absolute `expires_at`
+  between `validate_session` and `elevate_session` previously clamped to
+  `until <= now` and was still granted: a `200 ok` with `expires_in:0` that
+  misled a scripted caller into believing it held admin, followed by a spurious
+  `role.elevation.expired` for a window that never actually conferred privilege.
+  `AuthManager::elevate_session` now detects `until <= now` BEFORE mutating the
+  session and returns `nullopt` — the handler's existing nullopt→401 path
+  ("session vanished between validate and elevate") covers it, so a dead window
+  is now REJECTED (401), never a zero-privilege `200 ok` grant.
+- Tests: `tests/unit/server/test_auth_jit_elevation.cpp` `[jit]`, 26 cases / 434
+  assertions (empirically verified via the Catch2 binary's own summary line, not
+  a grep of `TEST_CASE`) — cumulative across both hardening rounds: elevate_session
+  session-lifetime clamp; reap_expired_elevation exactly-once +
+  no-op-after-manual-revoke; REST-level lazy-expiry audit + no-double-emit +
+  no-emit-after-revoke; `expires_at` presence/format and
+  `expires_in <= requested` on the existing grant/cap-clamp REST cases (updated
+  from exact-equality to `<=`/tolerance since `expires_in` is now the true
+  post-grant remaining time); the dead-window rejection (`elevate_session`
+  returns nullopt for a session already at/past its own expiry, via a new
+  TEST-ONLY `expire_session_for_test` seam); concurrent TOCTOU reap
+  exactly-once under two racing threads; a lazy reap surviving an unwritable
+  `AuditStore` without crashing; a reap firing within a request resolves that
+  SAME request to base role; the `role.elevation.granted` audit detail carrying
+  `expires_at=`.
+
 ## Validation
 
 - Unit: `tests/unit/server/test_auth_jit_elevation.cpp` `[jit]` — reconciled
   count read directly from the test binary
-  (`tests-build-server-linux_x64/yuzu_server_tests "[jit]"`): **26 test cases,
-  627 assertions**, all green (initial ship: 15 cases / 275 assertions; first
-  OIDC-amr follow-up cut: 22 cases / 406 assertions; this hardening round adds
-  4 more — the F-1 regression-pinning case (a locally-enrolled OIDC namesake
-  with no amr proof), the toggle-off + namesake + fresh-amr case, the
-  users-row-less-identity-denied-at-eligibility case, and the audit
-  field-order anti-forgery case). Coverage: `effective_role`/`is_elevated`,
-  `AuthManager` elevate/revoke/revoke-user-elevations, `AuthDB` eligibility,
-  and the REST surface end-to-end (granted; elevated-passes-admin-gate;
+  (`tests-build-server-linux_x64/yuzu_server_tests "[jit]"`): **37
+  test cases, 837 assertions**, all green (this is the union of the
+  OIDC-amr follow-up and the passive-lapse/`expires_at` tails work, now merged).
+  Coverage: `effective_role`/`is_elevated`, `AuthManager` elevate/revoke/
+  revoke-user-elevations/reap_expired_elevation, `AuthDB` eligibility, and the
+  REST surface end-to-end (granted; elevated-passes-admin-gate;
   **MFA-enrollment-mandatory**; **stale-proof-challenged**; ineligible-denied;
   justification-required; **wrong-typed/negative-duration → 400**;
-  duration-clamp; revoke-reverts; **eligibility-revoke-kills-elevation**;
-  **self-grant-blocked**; tokenless-rejected; OIDC-amr fresh-proof-elevates;
-  OIDC no-proof-still-denied with distinct reason; **the F-1 regression case**;
-  OIDC stale-proof-challenged; toggle-off-blocks-OIDC-entirely with distinct
-  reason; toggle-off + namesake + fresh-amr; users-row-less identity denied at
-  eligibility; local-session-unaffected; audit-field-order anti-forgery). The
-  F-1 regression case was verified to FAIL against the pre-fix single-flag
-  guard (manually reverted, rebuilt, re-run: 4 cases failed exactly as
-  expected — the regression case itself plus the 3 new distinct-reason
-  assertions) and PASS against the disjoint-branch fix. Full `--suite server`
-  green; server build + link clean.
+  duration-clamp; **session-lifetime clamp**; **dead-window rejection**;
+  revoke-reverts; **eligibility-revoke-kills-elevation**; **self-grant-blocked**;
+  tokenless-rejected; OIDC-amr fresh-proof-elevates; OIDC no-proof-still-denied
+  with distinct reason; **the F-1 regression case**; OIDC stale-proof-challenged;
+  toggle-off-blocks-OIDC-entirely with distinct reason; toggle-off + namesake +
+  fresh-amr; users-row-less identity denied at eligibility;
+  local-session-unaffected; audit-field-order anti-forgery; lazy passive-expiry
+  reap (exactly-once, no-op-after-revoke, **concurrent-TOCTOU exactly-once**,
+  **survives-unwritable-audit-store**, **reap-within-request-resolves-base-role**);
+  `expires_at` presence/format + audit-detail substring). The F-1 regression
+  case was verified to FAIL against the pre-fix single-flag guard and PASS
+  against the disjoint-branch fix. Full `--suite server` green; server build +
+  link clean.
 - Governance pipeline: initial OIDC-amr follow-up review found no
   CRITICAL/HIGH; a 13-agent hardening round found the security-F1 /
   consistency-S2/S3 / unhappy-UP-1/UP-2/UP-8/UP-10 / compliance-MEDIUM cluster
-  fixed in this round (all findings addressed pre-merge, no residual
-  CRITICAL/HIGH). Earlier-ship governance: security-guardian PASS (no
-  CRITICAL/HIGH; MEDIUM F1 fixed in that round); authdb / cpp-safety /
-  consistency-auditor / happy-path PASS; quality-engineer BLOCKING (untested
-  step-up gate) + unhappy-path UP-1/UP-3 fixed; docs-writer BLOCKING
-  (rest-api) addressed (this record + rest-api + authentication + audit-log +
-  server-admin + CHANGELOG + SKILL).
+  fixed in that round (all findings addressed pre-merge, no residual
+  CRITICAL/HIGH). The passive-lapse/`expires_at` tails also cleared
+  security-guardian / authdb / cpp-safety / consistency-auditor / happy-path
+  PASS; quality-engineer BLOCKING (untested step-up gate) + unhappy-path
+  UP-1/UP-3 fixed; docs-writer BLOCKING (rest-api) addressed (this record +
+  rest-api + authentication + audit-log + server-admin + CHANGELOG + SKILL).
 
 ## Reviewer
 

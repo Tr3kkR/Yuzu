@@ -82,7 +82,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=user`), Linux/macOS only. Deferred: group→role mapping, AuthnRequest signing, AttributeStatement parsing, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
-| **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
+| **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
 | **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
@@ -235,9 +235,12 @@ matches the customer ask.
    `now < elevated_until`) is honoured by `require_admin` + the permission gates;
    the window is monotonic `steady_clock`, in-memory per **cookie** session
    (restart/logout drops it; API/MCP tokens can never elevate). Audits
-   `role.elevation.{granted,denied,revoked}` + `user.elevation_eligibility.set`;
-   `POST /api/v1/elevate/revoke` for step-down. (Passive `expired` is implicit
-   from `granted` + duration — a lazy/reaper expiry row is a tracked follow-up.)
+   `role.elevation.{granted,denied,revoked,expired}` + `user.elevation_eligibility.set`;
+   `POST /api/v1/elevate/revoke` for step-down. Passive expiry is now audited
+   too — lazily, at the `AuthRoutes::resolve_session` cookie chokepoint on the
+   operator's next authenticated request after the window lapses (no
+   background reaper); a session already at/past its own absolute lifetime is
+   rejected `401` rather than granted a zero-length window (dead-window guard).
    See `docs/auth-architecture.md` "JIT admin elevation";
    `tests/unit/server/test_auth_jit_elevation.cpp`.
 10. **Self-managed Certificate Authority (mTLS + code signing).** A single
