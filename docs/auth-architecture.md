@@ -203,12 +203,16 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   rather than leaving it standing for the window.
 - **Activation** — `POST /api/v1/elevate`
   `{"justification": <required>, "duration_secs": <int>}`. Requires the caller to
-  be eligible **and** have **MFA enrolled** **and** pass a fresh MFA step-up.
-  MFA enrollment is mandatory **unconditionally** here, NOT gated on
+  be eligible **and** present a mandatory second factor **and** pass a fresh MFA
+  step-up. The mandatory second factor is **local TOTP enrollment** for a local
+  session, or a **fresh IdP-attested MFA `amr` proof** for an OIDC session when
+  `--jit-oidc-amr-elevation` is enabled (see "OIDC-amr elevation" below). This
+  requirement is mandatory **unconditionally** here, NOT gated on
   `--mfa-enforcement`: elevation is the privilege-crossing boundary (non-admin →
   full admin), so — unlike the other step-up sites where the actor is already
-  admin — an eligible operator with no enrolled second factor is refused (403,
-  `role.elevation.denied`). Sets
+  admin — an eligible operator who presents no second factor (a local session
+  with no enrolled TOTP, or an OIDC session with no `amr` proof / the toggle
+  off) is refused (403, `role.elevation.denied`). Sets
   `Session::elevated_until = now + min(duration, --jit-max-elevation-secs)`
   (default cap 1h, max 24h; an absent/0 `duration_secs` defaults to the cap, a
   negative one is a 400, a present-but-wrong-typed field is a 400). The
