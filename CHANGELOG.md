@@ -7,8 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Do not add entries to this section directly** — including you, AI coding
+> agent reading this. Unreleased changes are recorded as one-file-per-change
+> fragments under [`changelog.d/`](changelog.d/README.md) and assembled here at
+> release time by `scripts/assemble-changelog.py` (direct edits fail the
+> `Changelog fragments` CI check). Entries below predate the fragment
+> convention and will be promoted normally at the next release.
+
 ### Added
 
+- **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
+- **MCP agentic write surface + approval tickets (#289, R2).** Five MCP write tools
+  are now dispatched: `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+  and `quarantine_device` (records the quarantine and dispatches live isolation).
+  Approval-gated tools use a ticket-then-recall flow: the first call returns
+  `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after a second
+  principal approves, the caller re-invokes with the `approval_id` and the ticket is
+  consumed exactly once (args-bound, replay-rejected). Approval ids are CSPRNG-drawn;
+  the mint is deduplicated so a token cannot flood the shared pending-approval queue.
+  Review-round hardening (PR #1796): `quarantine_device` is `Security:Execute` on BOTH
+  transports and the supervised approval-policy rule moved with it — closing a mismatch
+  that let a supervised token quarantine via REST `POST /api/v1/quarantine` with no
+  approval (the REST POST/DELETE routes now mirror-deny, #520); the three
+  device-targeted write tools (`set_tag`/`delete_tag`/`quarantine_device`) authorize
+  through the per-device management-group scope gate (`require_scoped_permission`), so
+  a group-confined operator cannot tag or isolate out-of-scope devices;
+  approved-but-unconsumed tickets expire after 7 days (a forgotten approval is no
+  longer a forever-valid capability); the approvals store records `consumed_by`
+  (SOC 2 CC7.2 evidence chain: submitted_by → reviewed_by → consumed_by); and the
+  device-targeted ticket-mint audit rows carry `agent_id=` so SIEM can filter pending
+  isolation requests by endpoint.
+- **A2 discovery surface (Issue 17.1, #1794).** `GET /api/v1/discover/{permissions,
+  instructions,routes,scope-kinds,plugins}` plus five mirrored read-only MCP tools let
+  an agentic worker enumerate RBAC permissions, instruction schemas, REST routes,
+  scope-DSL kinds, and plugin actions from the live server (ETag + 304, A4-shaped
+  degraded paths). REST and MCP share one builder per catalog (cannot drift).
+- **Agentic-worker self-orientation (R2 follow-up).** `discover_plugins` (REST + MCP,
+  now catalog `version: 2`) enriches each action with its `parameter_schema` inline
+  when the action has a published InstructionDefinition (joined on plugin+action), and
+  reports `actions_enriched_with_schema` — so a worker learns *how* to call an action,
+  not just that it exists, from one request. The `execute_instruction` and
+  `discover_plugins` tool descriptions now spell out the async dispatch→poll pattern and
+  point at the `yuzu://operating-model` resource. Measured effect: an LLM operator
+  driving the fleet with no hand-fed action list made zero blind parameter guesses.
+- **A4 error-envelope completion (R2).** `GET /api/v1/approvals/{id}` (the approval
+  `status_url` target); the `auth_routes` denial shapes are unified into one A4
+  envelope carrying `correlation_id` and the missing `securable_type:operation`; the
+  ~156 legacy `error_json` sites in `rest_api_v1.cpp` now emit the A4 envelope.
+  **Breaking —** many of those `/api/v1` errors were previously `{"error":"<string>"}`
+  and are now the nested A4 object `{"error":{"code","message","correlation_id",…}}`;
+  a client that read `error` as a string will break. Migrate to `error.code`/
+  `error.message`. See `docs/user-manual/upgrading.md`.
 - **Installed-software inventory gains package-manager fields (blob contract v2, ADR-0016).**
   Every row in `GET /api/v1/inventory/software` and the `query_installed_software` MCP tool
   now carries `kind` (package|app), `ecosystem` (rpm|deb|apk|pacman|windows|macos|homebrew),
@@ -158,16 +207,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
-### Security
+### Fixed
 
-- **OIDC JWT signature verification now fails closed on Windows (#1856).** On the
-  Windows server build, `OidcProvider::verify_jwt_signature` was a stub that
-  returned success without verifying the token signature — an attacker-forged ID
-  token would have been accepted, allowing arbitrary OIDC session minting
-  (account takeover). It now returns an error (OIDC login is refused on Windows)
-  until a BCrypt/CNG verifier is implemented. Linux/macOS (OpenSSL) verification
-  is unchanged. Yuzu is Linux-first, so this path was likely latent in practice;
-  the fix removes the forged-token hole regardless.
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
+  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
+  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
+  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
+  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
+  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
+  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
 
 ## [0.13.0] - 2026-07-01
 
