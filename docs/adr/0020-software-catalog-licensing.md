@@ -340,36 +340,105 @@ reclamation verdicts (conservative by design — a paid product is only
 "unused" when its install row exists AND matched usage says so, or usage is
 entirely absent → *Unreported*).
 
-## Delivery roadmap (three governed PRs)
+## Delivery roadmap and implementation plan (three governed PRs)
 
 Each PR is independently shippable, runs the full `/governance` 8-gate +
 `/test` pipelines, branches from `origin/dev`, and ships a `changelog.d/`
 fragment. Sequential (each builds on the previous PR's merged stores/UI).
+Conventional commits (`feat(agent):` / `feat(server):`); every source file
+added or renamed updates the affected `meson.build`.
 
 ### PR1 — `feat/software-licensing` — licence visibility + expiry alerting
 **Drivers 1–3. Closes #266 (reframed to agent-detected licensing — override
 of the manual entitlement register documented on the issue), closes #264
 (catalog store; automatic matching here, `/inventory` foundation delivered by
-PR #1759), advances the new §27.5 dashboard issue.**
+PR #1759), advances #1869 (§27.5 dashboard).**
 
-- Agent: `license_scan` plugin (§1) + `sync_canonical` extraction +
-  `sync_source_software_licensing` (§2), registered in `agent.cpp`.
-- Server: `SoftwareCatalogStore` + `SoftwareLicensingStore` (§3),
-  `software_licensing_ingestion` + typed-source registry entry (§4),
-  `catalog_normalize` + `license_compliance_evaluator` (§5), notifications
-  (§6), `SoftwareCatalog` securable + REST + MCP + LICENSING tab (§7).
-- Docs: this ADR; `postgres-migration-ladder.md` ticks (two stores);
-  capability-map §27.1/§27.3 status; roadmap Phase 10 staleness note;
-  `docs/user-manual/software-licensing.md`.
-- Tests: pure normalize/parser suites; `[pg]` store suites (hash-skip
-  trichotomy, replace-in-txn, nullopt-on-degrade, cascade); ingest caps +
-  **cross-pinned canonical-hash constant shared byte-for-byte between the
-  agent and server test files**; evaluator with injected clock (transitions,
-  buckets, re-arm, degrade ≠ false all-clear); route tests (authz, 503,
-  scope filter); blob-stability test.
-- Size ~3k LOC. Pre-agreed split seam if review requests it: PR1a =
-  plugin + source + stores + ingest + REST; PR1b = UI + evaluator/events +
-  MCP.
+**New files (dependency order):**
+
+| # | Path | Contents |
+|---|------|----------|
+| 1 | `agents/core/src/sync_canonical.{hpp,cpp}` | `sanitize_utf8_strict` / `clamp_field` / `sha256_hex` extracted byte-identically from `sync_source_installed_software.cpp` (which switches to them) |
+| 2 | `server/core/src/catalog_normalize.{hpp,cpp}` | pure normalisation lib: `normalize_title/vendor`, `norm_key`, tiered `match`, `effective_license_state`, constants (`kExpiryWarnDays=30`, buckets 30/14/7/1, `kRearmSecs=7d`) |
+| 3 | `server/core/src/software_catalog_store.{hpp,cpp}` | born-on-PG store, migration v1 (`catalog_products`, `catalog_aliases`) |
+| 4 | `server/core/src/software_licensing_store.{hpp,cpp}` | born-on-PG store, migration v1 (`agent_license_state`, `agent_licenses`, `license_posture_rollup`, `license_alert_state`) + server-side `canonical_hash` |
+| 5 | `agents/plugins/license_scan/` | `meson.build`, `src/license_scan_plugin.cpp` (dispatch), `src/licensing_record.hpp` (record struct + sanitiser), `src/licensing_parsers.hpp` (pure SLP/channel/SPDX/FlexLM/DEP-5 parsers), `src/licensing_probes.{hpp,cpp}` (ProbeSpec table + engine), `src/licensing_win.cpp` / `licensing_linux.cpp` / `licensing_macos.cpp` |
+| 6 | `agents/core/src/sync_source_software_licensing.{hpp,cpp}` | parse → canonical blob → sha256; `LocalDispatcher` dispatch of `license_scan list`; 24 h interval; caps 10k records / 1 MiB |
+| 7 | `server/core/src/software_licensing_ingestion.{hpp,cpp}` | ingest seam (caps, enum whitelists, expiry clamp, server-side hash recompute, replace-in-txn) |
+| 8 | `server/core/src/license_compliance_evaluator.{hpp,cpp}` | background thread: matcher pass → posture rollup → alert dedup/fire |
+| 9 | `server/core/src/inventory_licensing_ui.cpp` | pure LICENSING-tab fragment renderers (declared in `inventory_routes.hpp`) |
+| 10 | `docs/user-manual/software-licensing.md` | operator doc |
+| 11 | Tests — server: `tests/unit/server/test_catalog_normalize.cpp`, `test_software_catalog_store.cpp`, `test_software_licensing_store.cpp`, `test_software_licensing_ingestion.cpp`, `test_license_compliance_evaluator.cpp`, `test_licensing_routes.cpp`; agent: `tests/unit/test_licensing_sync.cpp`, `tests/unit/test_licensing_parsers.cpp` | see test matrix |
+
+**Modified files:** top-level `meson.build` (`subdir('agents/plugins/license_scan')`);
+`agents/core/meson.build`; `server/core/meson.build`; `tests/meson.build`;
+`agents/core/src/sync_source_installed_software.cpp` (helper extraction only —
+byte-neutral, proven by the existing cross-pin test);
+`agents/core/src/agent.cpp` (descriptor scan + `add_source`);
+`server/core/src/typed_inventory_sources.hpp` (**add `software_licensing` in
+the same commit as the seam** — omission double-stores the blob into the
+generic store on the gateway path, readable under `Infrastructure:Read`);
+`server/core/src/agent_service_impl.cpp` + `gateway_service_impl.cpp` (seam
+calls on both topologies); `server/core/src/rbac_store.cpp` (`SoftwareCatalog`
+securable + role Read grants); `server/core/src/inventory_routes.{hpp,cpp}` +
+`inventory_ui.cpp` (LICENSING tab) + `dashboard_ui.cpp` (command-palette
+entry); `server/core/src/rest_api_v1.cpp` (routes + OpenAPI literal);
+`server/core/src/mcp_server.cpp` (two tools); `server/core/src/server.cpp`
+(stores constructed in the `pg_pool_` guard, fatal on `!is_open()`,
+destruct-before-pool member order; evaluator start/stop + `set_on_alert`
+dual-sink; route closures; agent-removal `delete_agent` hook);
+`docs/postgres-migration-ladder.md` (two born-on-PG rows);
+`docs/capability-map.md` (§27.1/§27.3); `docs/roadmap.md` (Phase 10
+staleness note); `changelog.d/` fragment.
+
+**Implementation order:**
+
+1. `sync_canonical` extraction; existing installed-software cross-pin test
+   stays green (proves byte-neutrality).
+2. `catalog_normalize` + pure unit tests.
+3. Both PG stores + `[pg]` store tests (TDD against a local Postgres).
+4. Ingestion seam + `typed_inventory_sources.hpp` + service-impl wiring +
+   cross-pinned hash constants (agent↔server test files share the constant
+   byte-for-byte).
+5. `license_scan` plugin + pure parser tests.
+6. Sync source + `agent.cpp`/meson wiring + agent sync tests.
+7. Evaluator + notification/webhook emission.
+8. RBAC securable seed.
+9. LICENSING tab + REST + MCP.
+10. Docs + `changelog.d/` fragment.
+
+**Test matrix:**
+
+| Test file | Asserts |
+|---|---|
+| `test_catalog_normalize.cpp` | normalisation, match tiers T1–T3 + birth, `effective_license_state` lapse derivation |
+| `test_software_catalog_store.cpp` `[pg]` | migration-at-construction, upsert txn semantics, alias resolution, nullopt-on-degrade |
+| `test_software_licensing_store.cpp` `[pg]` | hash-skip trichotomy (stored/touched/need-full), replace-in-txn, cascade delete, posture/alert-state CRUD, **cross-pinned canonical-hash constant** |
+| `test_software_licensing_ingestion.cpp` | input caps, enum whitelisting, expiry plausibility clamp, hash recompute (never trusts claimed), empty-blob = valid replace-to-empty |
+| `test_license_compliance_evaluator.cpp` | injected clock: condition/bucket transitions, 7-day re-arm, degrade ≠ false all-clear |
+| `test_licensing_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), scope filtering, limit clamps |
+| `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics |
+| `test_licensing_parsers.cpp` (agent) | SLP LicenseStatus mapping incl. grace codes, channel/SPDX classifiers, FlexLM expiry, DEP-5 header detection, key-hint never echoes input |
+
+**Verification / acceptance (PR1):**
+1. `meson test --suite server --suite agent` green, with PG store tests
+   running against a local PostgreSQL (`YUZU_TEST_POSTGRES_DSN` set; unset =
+   clean skip, set-but-broken = fail).
+2. End-to-end demo: server on Postgres → enroll one agent → first sync cycle
+   pushes `software_licensing` → `/inventory` LICENSING tab shows the
+   machine's detected licences with type/status/expiry → temporarily widen
+   the expiring window to observe one `software_license.expiring`
+   notification + webhook event fire exactly once (dedup verified).
+3. Gateway parity: on the UAT rig (server + Erlang gateway), confirm the
+   `software_licensing` key ingests identically through `ProxyInventory` and
+   is **skipped** by the generic-blob loop (the typed-source leak trap).
+4. `/test` pipeline (includes the upgrade-from-previous-release leg — the new
+   schemas must migrate cleanly on an existing database) and `/governance`
+   8-gate pipeline; CRITICAL/HIGH findings block merge.
+
+Size ~3k LOC. Pre-agreed split seam if review requests it: PR1a =
+plugin + source + stores + ingest + REST; PR1b = UI + evaluator/events +
+MCP.
 
 ### PR2 — `feat/software-usage-metering` — usage facts for reclamation
 **Driver 4 (data layer). Closes #265.**
@@ -389,8 +458,44 @@ PR #1759), advances the new §27.5 dashboard issue.**
 - Docs: ADR-0021 (usage metering privacy posture) or an Updates section
   here; ladder tick; capability-map §27.2.
 
+**New files:** `agents/core/src/sync_source_software_usage.{hpp,cpp}`;
+`server/core/src/software_usage_store.{hpp,cpp}` (schema
+`software_usage_store`: `agent_usage_state` hash parent +
+`agent_app_usage(agent_id, app_name, last_used_day, starts_30d_bucket,
+starts_90d_bucket, days_active_90d, first_seen, last_seen)`);
+`server/core/src/software_usage_ingestion.{hpp,cpp}`;
+`tests/unit/server/test_software_usage_store.cpp`,
+`tests/unit/test_usage_sync.cpp`.
+
+**Modified files:** `agents/core/src/agent.cpp` +
+`agents/core/include/yuzu/agent/agent.hpp` + `agents/core/src/main.cpp`
+(opt-in flag, mirrored on the `inventory_disable` parsing);
+`typed_inventory_sources.hpp` (**same-commit** `software_usage` key); both
+service impls; `license_compliance_evaluator.cpp` (reclamation pass +
+exe→title seed map); `rest_api_v1.cpp`; `inventory_routes.cpp` /
+`inventory_licensing_ui.cpp` (usage column); meson files; ladder /
+capability-map / `changelog.d/`.
+
+**Implementation order:** usage store + `[pg]` test → ingest seam +
+typed-source entry + wiring → agent sync source + opt-in flag + agent tests
+→ evaluator reclamation pass + matcher cases → REST + UI column → docs.
+
+**Test matrix (key assertions):** `test_usage_sync.cpp` — TAR `sql` output
+parsing (`__schema__`/`__total__` framing), three-query merge with
+monthly-tier fallback (last-used never moves backwards), bucket boundaries,
+TAR-error ⇒ skip, **PII guard: fails if a username column is selected or a
+fixture username reaches the blob**; `test_software_usage_store.cpp` `[pg]`
+— replace semantics, nullopt-on-degrade; evaluator tests — Unreported never
+categorised Unused, reclamation = paid licence type × (Unused | Rarely).
+
+**Verification / acceptance (PR2):** suites `server`, `agent`, `tar`; E2E:
+enable TAR process capture + `--usage-sync-enable` on one agent, generate
+process activity, confirm usage rows land and the reclamation endpoint
+returns the expected categories; confirm a TAR-disabled agent reports
+*Unreported*; `/test` + `/governance`.
+
 ### PR3 — `feat/software-tags-reclamation` — tags + reclamation dashboard
-**Driver 4 (visible reclamation). Closes #267 + the new §27.5 issue.**
+**Driver 4 (visible reclamation). Closes #267 + #1869.**
 
 - `SoftwareCatalogStore` migration v2 (`catalog_tags`); tag CRUD REST
   (`SoftwareCatalog:Write`) + tag chips in the catalog/licensing UI.
@@ -400,6 +505,27 @@ PR #1759), advances the new §27.5 dashboard issue.**
   (Unused | Rarely used), per-title drill-down, charts; unmatched-usage
   coverage view (honest gap reporting).
 - MCP `query_license_reclamation`; capability-map §27.4/§27.5 done.
+
+**New files:** `tests/unit/server/test_software_catalog_tags.cpp` (`[pg]`,
+migration v2 upgrade path from v1, tag CRUD, cascade on product delete).
+
+**Modified files:** `software_catalog_store.{hpp,cpp}` (migration v2 + tag
+API); `rest_api_v1.cpp` (tag CRUD + reclamation routes); `mcp_server.cpp`;
+`inventory_routes.{hpp,cpp}` / `inventory_licensing_ui.cpp` (RECLAMATION
+view, tag chips + editor); `management_group_store.cpp` (dynamic-rule tag
+predicate, if within budget); `rbac_store.cpp` only if a grant change is
+needed (`SoftwareCatalog:Write` already seeded in PR1); ladder note /
+capability-map / `changelog.d/`.
+
+**Implementation order:** migration v2 + tag API + `[pg]` test (proves a v1
+database upgrades in place) → tag CRUD REST + UI chips → reclamation view +
+charts → management-group rule predicate (time-boxed) → MCP tool → docs.
+
+**Verification / acceptance (PR3):** the migration-upgrade test passes
+against a database created at v1 (and the `/test` upgrade-from-previous-
+release leg re-proves it); tag writes audit-logged and rejected without
+`SoftwareCatalog:Write`; reclamation view matches
+`GET /api/v1/licensing/reclamation` output; `/test` + `/governance`.
 
 ## Consequences
 
