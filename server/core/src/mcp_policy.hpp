@@ -61,6 +61,16 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (operation == "Delete") return true;
         if (securable_type == "Policy" && operation == "Write") return true;
         if (securable_type == "Security" && operation == "Write") return true;
+        // Security:Execute is live device isolation (quarantine) — as destructive
+        // as it gets. This rule and the kToolSecurity mapping
+        // {"quarantine_device", {"Security","Execute"}} in mcp_server.cpp move
+        // TOGETHER (see the invariant note above kToolSecurity): the mapping
+        // keys the C8 ticket gate on this rule, and AuthRoutes::require_permission
+        // mirrors this SAME rule on non-MCP transports, so a supervised token
+        // cannot bypass the ticket flow via POST/DELETE /api/v1/quarantine
+        // (#520; PR #1796 review C2 closed the Write/Execute mismatch that made
+        // that REST bypass possible).
+        if (securable_type == "Security" && operation == "Execute") return true;
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
     }

@@ -47,6 +47,17 @@ else
     fail "Changelog extraction produced empty output"
 fi
 
+# ── 4b. No unpromoted changelog fragments ─────────────────────────────────
+# PRs land changelog entries as changelog.d/ fragment files; the promote step
+# (scripts/assemble-changelog.py promote X.Y.Z) must have folded them all into
+# the ## [X.Y.Z] section before tagging. See changelog.d/README.md.
+FRAG_COUNT=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$FRAG_COUNT" -eq 0 ]; then
+    pass "changelog.d/ has no unpromoted fragments"
+else
+    fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
+fi
+
 # ── 5. Clean working tree ─────────────────────────────────────────────────
 if git diff --quiet HEAD && git diff --cached --quiet; then
     pass "Working tree clean (no uncommitted changes)"

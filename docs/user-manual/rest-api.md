@@ -74,6 +74,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Offload Targets](#offload-targets)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
+  - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -178,7 +179,9 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
-As of the R2 A4 completion (2026-07) **every** `/api/v1/*` error path — including the `require_admin`, `require_permission`, and service-scope denials in the auth layer — emits this envelope; the previous "bare `{error:{code,message}}`" and `{"error":"forbidden"}` shapes are gone. Clients parsing only `code`/`message` remain unaffected (the extra keys are additive). Denials from **other** (non-`/api/v1`) surfaces may still use legacy shapes (tracked as #1552), so automation crossing surfaces should treat the enrichment fields as present-when-available.
+The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
+
+> **⚠ Breaking wire-shape change (upgrade note).** Many of those legacy `/api/v1` errors were previously emitted as **`{"error":"<string>"}`** (the single-arg `error_json`) or the older nested `{"error":{"code","message"}}`. They are now uniformly the nested A4 object above. A client that read `error` as a *string* (`String(body.error)`, `body.error.startsWith(...)`) will break — `error` is always an **object** on these paths now. Migrate to `body.error.code` / `body.error.message`. See `docs/user-manual/upgrading.md`.
 
 ---
 
@@ -636,6 +639,16 @@ Create a new API token. The raw token is returned in the response and is never s
 | `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap.
+
+**Validation errors (`400`):**
+
+| Condition | Response |
+|---|---|
+| `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
+| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
+| `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
+
 **Response (201):**
 
 ```json
@@ -907,6 +920,13 @@ List all currently quarantined devices.
 Quarantine a device.
 
 **Permission:** `Security:Execute`
+
+> **Supervised MCP tokens are approval-gated here too.** A bearer token minted
+> with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
+> release below): supervised `Security:Execute` requires an approval ticket,
+> and the ticket-then-recall flow exists only on the MCP transport
+> (`quarantine_device`). The REST route mirrors the denial so switching
+> transports cannot bypass the approval gate (#520).
 
 **Request body:**
 
@@ -2550,6 +2570,150 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 **Permission:** None (public endpoint).
 
 **Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
+
+---
+
+### Discovery (A2)
+
+Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
+
+All five share the same caching contract: a content-derived `ETag` header + `Cache-Control: public, max-age=300`; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. Each is also mirrored as a read-only MCP tool of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`) — REST and MCP share the same builder functions internally, so they cannot drift from each other.
+
+#### `GET /api/v1/discover/permissions`
+
+RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "RBAC permission catalog: ...",
+  "securable_types": ["Infrastructure", "InstructionDefinition", "Execution", "..."],
+  "operations": ["Read", "Write", "Execute", "Delete", "Push"],
+  "roles": [
+    {
+      "name": "Administrator",
+      "description": "...",
+      "is_system": true,
+      "permissions": [
+        {"securable_type": "Infrastructure", "operation": "Read", "effect": "allow"}
+      ]
+    }
+  ]
+}
+```
+
+503 (`{"error":"service unavailable"}`) when the RBAC store is unavailable.
+
+#### `GET /api/v1/discover/instructions`
+
+Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands an agentic worker may dispatch via `execute_instruction` (MCP) or `POST /api/v1/instructions/execute` (REST). A disabled definition is excluded; there is no flag distinguishing "excluded because disabled" from "never existed."
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "Published (enabled) InstructionDefinition catalog: ...",
+  "count": 42,
+  "truncated": false,
+  "instructions": [
+    {
+      "id": "def-abc123",
+      "name": "Get Hostname",
+      "plugin": "system_info",
+      "action": "query",
+      "description": "...",
+      "parameter_schema": {"type": "object", "properties": {}},
+      "platforms": "windows,linux,darwin",
+      "approval_mode": "auto"
+    }
+  ]
+}
+```
+
+`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON; `null` on a stored value that fails to parse (a defensive branch — the authoring path always stores at least `{}`).
+
+#### `GET /api/v1/discover/routes`
+
+REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "source": "openapi",
+  "description": "REST route catalog, subset of the SAME document GET /api/v1/openapi.json serves...",
+  "caveat": "This catalog is derived from the hand-maintained OpenAPI document, NOT generated from the live route table. A route that exists but was never documented in the OpenAPI spec will be under-reported here too. ...",
+  "count": 210,
+  "routes": [
+    {"method": "GET", "path": "/api/v1/discover/routes", "summary": "REST route catalog (A2 discovery)", "tags": ["Discovery"], "description": "..."}
+  ]
+}
+```
+
+Read the `caveat` field: this is a snapshot of a hand-maintained document, not a generated live route table — treat it as informative, not exhaustive.
+
+#### `GET /api/v1/discover/scope-kinds`
+
+Scope DSL kinds, operators, and syntax the Scope Engine (`server/core/src/scope_engine.hpp`) and `AgentRegistry::evaluate_scope` accept when building a `scope` expression for a dispatch, policy, or Baseline. Fully static — answers even when every store is unavailable.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 1,
+  "description": "Scope DSL kinds and operators recognized by ...",
+  "ground_kinds": [
+    {"kind": "__all__", "syntax": "__all__", "example": "__all__", "description": "Every enrolled agent."},
+    {"kind": "group:<name>", "syntax": "group:<name>", "example": "group:finance-laptops", "description": "..."}
+  ],
+  "attribute_kinds": [
+    {"kind": "tag:<key>", "syntax": "tag:<key> <op> <value>", "example": "tag:department == \"finance\"", "description": "..."}
+  ],
+  "operators": [
+    {"token": "==", "name": "Eq", "description": "Case-insensitive equality."}
+  ],
+  "extended_forms": [
+    {"form": "LEN(<attr>) <op> <value>", "example": "LEN(hostname) > 5", "description": "..."}
+  ],
+  "combinators": ["AND", "OR", "NOT"]
+}
+```
+
+See also `docs/scope-walking-design.md` and `docs/asset-tagging-guide.md` for the fuller narrative treatment of the DSL.
+
+#### `GET /api/v1/discover/plugins`
+
+Plugin/action catalog observed across currently-connected agents (deduplicated by plugin name; the richest reported action list wins). **Not** a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "version": 2,
+  "description": "Plugin/action catalog observed across currently-connected agents ...",
+  "limitation": "An action carries an inline parameter_schema only when it has a published InstructionDefinition (matched on plugin+action) AND the caller holds InstructionDefinition:Read; otherwise name+description only. GET /api/v1/discover/instructions is the full schema-bearing catalog.",
+  "actions_enriched_with_schema": 1,
+  "plugins": [
+    {"name": "processes", "version": "1.0", "description": "...", "actions": [
+      {"name": "list", "description": "...", "parameter_schema": {"type": "object", "properties": {}}}
+    ]}
+  ],
+  "commands": ["processes", "processes list", "..."]
+}
+```
+
+An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
+
+> **Consumer note:** this catalog is now `"version": 2` (was `1` — v2 adds the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
 ---
 
@@ -4513,21 +4677,34 @@ Cancel a running execution.
 
 ### Schedules
 
+A schedule fires unattended through the background `ScheduleRunner` poller with no
+further permission check at fire time — so schedule creation, and re-enabling a
+disabled schedule, are the only gates against a Schedule:Write-only principal reaching
+fleet-wide command dispatch. Delete and enable/disable are owner-scoped: they only
+affect a schedule whose `created_by` matches the caller.
+
 #### `GET /api/schedules`
 
-List schedules. Accepts `definition_id` and `enabled_only` as query parameters.
+List schedules. Accepts `definition_id` and `enabled_only` as query parameters. Requires `Schedule:Read`.
 
 #### `POST /api/schedules`
 
-Create a recurring schedule for an instruction definition. Supports cron expressions.
+Create a recurring schedule for an instruction definition. Requires **both**
+`Schedule:Write` and `Execution:Execute` — a schedule is a fleet-wide command-dispatch
+primitive (empty `scope_expression` targets every agent; `requires_approval` defaults to
+`false`).
 
 #### `DELETE /api/schedules/{id}`
 
-Delete a schedule.
+Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
+principal is left untouched (reports `deleted: false`, same as a nonexistent id).
 
 #### `POST /api/schedules/{id}/enable`
 
-Enable or disable a schedule.
+Enable or disable a schedule you created. Requires `Schedule:Write`; enabling (but not
+disabling) additionally requires `Execution:Execute`, since enabling arms the schedule to
+fire — an operator can always disable a schedule to stop it even without
+`Execution:Execute`.
 
 ---
 

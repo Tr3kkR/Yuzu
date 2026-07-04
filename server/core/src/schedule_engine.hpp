@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -46,17 +47,35 @@ public:
 
     std::vector<InstructionSchedule> query_schedules(const ScheduleQuery& q = {}) const;
     std::expected<std::string, std::string> create_schedule(const InstructionSchedule& sched);
-    bool delete_schedule(const std::string& id);
-    void set_enabled(const std::string& id, bool enabled);
+
+    /// Owner-scoped delete (M-01, #1806): `created_by` is REQUIRED (no
+    /// default) so a caller cannot accidentally pass an empty principal and
+    /// have it silently match every legacy row with an empty created_by —
+    /// that would reopen the exact cross-tenant mutation gap this closes.
+    /// Returns false for a wrong-owner id exactly like a nonexistent one, so
+    /// this cannot be used to probe id existence across owners.
+    bool delete_schedule(const std::string& id, const std::string& created_by);
+
+    /// Owner-scoped enable/disable (M-01, #1806) — same required-`created_by`
+    /// contract as delete_schedule. Returns true iff a row matched (id AND
+    /// created_by), so the route can audit only on an actual change.
+    bool set_enabled(const std::string& id, bool enabled, const std::string& created_by);
 
     std::vector<InstructionSchedule> evaluate_due() const;
     void advance_schedule(const std::string& id);
 
 private:
     sqlite3* db_;
-    // No application-level mutex: every method prepare-and-finalizes its
-    // statements, so SQLITE_OPEN_FULLMUTEX on the shared instructions.db
-    // connection is sufficient. Cached prepared statements would change this.
+    // M-03 (#1806): the poller thread (ScheduleRunner::tick(), on a
+    // background thread) now calls evaluate_due()/advance_schedule()
+    // concurrently with REST-handler threads calling query/create/delete/
+    // set_enabled. SQLITE_OPEN_FULLMUTEX only serializes individual sqlite3
+    // C-API calls; it does NOT make a read-modify-write sequence spanning
+    // several calls (advance_schedule's SELECT-then-UPDATE) atomic with
+    // respect to another thread's interleaved statements on the same
+    // connection. Every public method takes this lock: mutators take it
+    // exclusively, the const query methods take it shared.
+    mutable std::shared_mutex mtx_;
 };
 
 } // namespace yuzu::server

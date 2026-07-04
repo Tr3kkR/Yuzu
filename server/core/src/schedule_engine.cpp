@@ -3,6 +3,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 
@@ -125,7 +126,10 @@ void ScheduleEngine::create_tables() {
 }
 
 void ScheduleEngine::stop() {
-    // stub -- will stop the scheduler tick thread when implemented
+    // No engine-side resources to stop: the poller thread that drives
+    // evaluate_due/advance_schedule (#1191) is owned by ServerImpl
+    // (schedule_tick_thread_, joined in stop() before the stores), the same
+    // ownership shape as policy_eval_thread_ / preflight_runner_thread_.
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +140,8 @@ std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQ
     std::vector<InstructionSchedule> results;
     if (!db_)
         return results;
+
+    std::shared_lock lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM schedules WHERE 1=1";
     std::vector<std::string> binds;
@@ -178,6 +184,14 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     if (!is_valid_frequency(sched.frequency_type))
         return std::unexpected(
             "frequency_type must be one of: once, interval, daily, weekly, monthly");
+    // Floor guard: a 0/negative interval would compute next_execution_at ==
+    // now and, now that the ScheduleRunner poller drives evaluate_due
+    // (#1191), re-fire on every tick forever. advance_schedule clamps the
+    // same way for pre-floor legacy rows.
+    if (sched.frequency_type == "interval" && sched.interval_minutes < 1)
+        return std::unexpected("interval_minutes must be >= 1");
+
+    std::unique_lock lock(mtx_);
 
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();
@@ -230,39 +244,56 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
 // Delete
 // ---------------------------------------------------------------------------
 
-bool ScheduleEngine::delete_schedule(const std::string& id) {
+bool ScheduleEngine::delete_schedule(const std::string& id, const std::string& created_by) {
     if (!db_)
         return false;
 
+    std::unique_lock lock(mtx_);
+
+    // M-01/L-01 (#1806): owner-scoped RETURNING delete — created_by is
+    // enforced at the SQL WHERE clause (the sole seam, matching
+    // deployment_run_store's owner-scope pattern) instead of a separate
+    // pre-check, so there is no TOCTOU window between "is this mine" and
+    // "delete it". RETURNING replaces the sqlite3_changes() anti-pattern
+    // (#1033) — the row count comes from the statement itself, not a second
+    // unsynchronized read of db_->nChange on this shared connection.
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM schedules WHERE id=?", -1, &stmt, nullptr) !=
-        SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "DELETE FROM schedules WHERE id=? AND created_by=? RETURNING id",
+                          -1, &stmt, nullptr) != SQLITE_OK)
         return false;
 
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    auto changes = sqlite3_changes(db_);
+    sqlite3_bind_text(stmt, 2, created_by.c_str(), -1, SQLITE_TRANSIENT);
+    bool deleted = sqlite3_step(stmt) == SQLITE_ROW;
     sqlite3_finalize(stmt);
-    return changes > 0;
+    return deleted;
 }
 
 // ---------------------------------------------------------------------------
 // Enable / Disable
 // ---------------------------------------------------------------------------
 
-void ScheduleEngine::set_enabled(const std::string& id, bool enabled) {
+bool ScheduleEngine::set_enabled(const std::string& id, bool enabled,
+                                 const std::string& created_by) {
     if (!db_)
-        return;
+        return false;
 
+    std::unique_lock lock(mtx_);
+
+    // M-01 (#1806): same owner-scoped RETURNING pattern as delete_schedule.
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "UPDATE schedules SET enabled=? WHERE id=?", -1, &stmt, nullptr) !=
-        SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db_,
+                          "UPDATE schedules SET enabled=? WHERE id=? AND created_by=? "
+                          "RETURNING id",
+                          -1, &stmt, nullptr) != SQLITE_OK)
+        return false;
 
     sqlite3_bind_int(stmt, 1, enabled ? 1 : 0);
     sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
+    sqlite3_bind_text(stmt, 3, created_by.c_str(), -1, SQLITE_TRANSIENT);
+    bool changed = sqlite3_step(stmt) == SQLITE_ROW;
     sqlite3_finalize(stmt);
+    return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +304,8 @@ std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
     std::vector<InstructionSchedule> results;
     if (!db_)
         return results;
+
+    std::shared_lock lock(mtx_);
 
     auto now = now_epoch();
 
@@ -303,6 +336,14 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
     if (!db_)
         return;
 
+    // M-03 (#1806): the SELECT-then-UPDATE below is a read-modify-write
+    // spanning two prepared statements — the actual race FULLMUTEX does not
+    // cover (it only serializes each individual sqlite3 call, not the pair).
+    // One unique_lock for the whole sequence so a concurrent
+    // create/delete/set_enabled/query on another thread cannot interleave
+    // between the read and the write.
+    std::unique_lock lock(mtx_);
+
     // Read current schedule state
     std::string select_sql =
         std::string("SELECT ") + kSelectAllCols + " FROM schedules WHERE id = ?";
@@ -325,7 +366,9 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
     if (sched.frequency_type == "once") {
         next = 0; // disable after single execution
     } else if (sched.frequency_type == "interval") {
-        next = now + static_cast<int64_t>(sched.interval_minutes) * 60;
+        // Clamp legacy rows that predate the create-time floor: 0/negative
+        // would land next_execution_at <= now and re-fire every poller tick.
+        next = now + static_cast<int64_t>(std::max(sched.interval_minutes, 1)) * 60;
     } else if (sched.frequency_type == "daily") {
         next = now + 86400;
     } else if (sched.frequency_type == "weekly") {
@@ -348,7 +391,15 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
     sqlite3_bind_int64(upd, 1, next);
     sqlite3_bind_int64(upd, 2, now);
     sqlite3_bind_text(upd, 3, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(upd);
+    // L-02 (#1806): a discarded non-SQLITE_DONE step left a failed advance
+    // silent — the schedule would stay at its old next_execution_at and
+    // re-fire on every subsequent poller tick instead of just this one.
+    if (sqlite3_step(upd) != SQLITE_DONE) {
+        spdlog::error("ScheduleEngine: advance_schedule failed for id={}: {}", id,
+                      sqlite3_errmsg(db_));
+        sqlite3_finalize(upd);
+        return;
+    }
     sqlite3_finalize(upd);
 
     spdlog::debug("ScheduleEngine: advanced schedule id={} (freq={}, next_at={})", id,

@@ -4,12 +4,14 @@
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -783,6 +785,21 @@ const std::string& openapi_spec() {
     },
     "/network/devices": {
       "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
+    },
+    "/discover/permissions": {
+      "get": {"summary": "RBAC permission catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Agentic-first (A1/A2, docs/agentic-first-principle.md) — every securable_type x operation pair the RbacStore recognizes, plus the full role -> allowed-operations grid (RbacStore::list_roles + get_role_permissions). Cheap pass-through over in-memory RBAC state; ETag + Cache-Control:max-age=300 + 304 revalidation, same contract as GET /guaranteed-state/schemas.", "responses": {"200": {"description": "{version, description, securable_types[], operations[], roles[].{name, description, is_system, permissions[].{securable_type, operation, effect}}}"}, "304": {"description": "Not Modified (If-None-Match matched)"}, "503": {"description": "RBAC store unavailable"}}}
+    },
+    "/discover/instructions": {
+      "get": {"summary": "Published InstructionDefinition catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires InstructionDefinition:Read. Agentic-first (A1/A2) subset of InstructionStore::query_definitions (enabled_only=true — only invokable definitions are published) carrying id/name/plugin/action/description/parameter_schema/platforms/approval_mode. parameter_schema is parsed into a nested JSON Schema object when the stored value is valid JSON, else null. Same ETag/Cache-Control/304 contract as GET /guaranteed-state/schemas, computed per-request over the live definition set.", "responses": {"200": {"description": "{version, description, instructions[].{id, name, plugin, action, description, parameter_schema, platforms, approval_mode}}"}, "304": {"description": "Not Modified"}, "503": {"description": "Instruction store unavailable"}}}
+    },
+    "/discover/routes": {
+      "get": {"summary": "REST route catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Subsets the SAME hand-maintained OpenAPI document GET /api/v1/openapi.json serves (openapi_spec_json(), so the two can never show different data), so it inherits that document's known limitation: it is NOT generated from the live route table and can under-report a route that exists but was never documented. The response therefore carries \"source\":\"openapi\" plus a caveat string. RBAC requirement per route is embedded in each route's free-text description (no structured field yet), same as the source document.", "responses": {"200": {"description": "{version, source:\"openapi\", caveat, routes[].{method, path, summary, tags[], description}}"}, "304": {"description": "Not Modified"}}}
+    },
+    "/discover/scope-kinds": {
+      "get": {"summary": "Scope DSL kind + operator catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Compiled-in static catalog (answers even when every store is down, like GET /guaranteed-state/schemas): the two GROUND kinds (__all__, group:<name>) that short-circuit per-device evaluation, every ATTRIBUTE kind the AgentRegistry::evaluate_scope resolver answers (from scope_kind_catalog(), agent_registry.hpp — colocated with the resolver so the two can't silently diverge), the CompOp comparison operators (via yuzu::scope::operator_token, scope_engine.hpp), and the EXISTS/LEN(...)/STARTSWITH(...) extended forms.", "responses": {"200": {"description": "{version, description, ground_kinds[], attribute_kinds[], operators[].{token,name,description}, extended_forms[], combinators[]}"}, "304": {"description": "Not Modified"}}}
+    },
+    "/discover/plugins": {
+      "get": {"summary": "Plugin/action catalog observed across connected agents (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Wraps AgentRegistry::help_json() (deduplicated plugin metadata across all currently-connected agents, richest action list wins per plugin name) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent. Action entries are bare {name, description} pairs; per-action PARAMETER schemas are NOT available from agents and the response says so explicitly (consult GET /discover/instructions for the subset of actions that also have a published InstructionDefinition with parameter_schema).", "responses": {"200": {"description": "{version, description, limitation, plugins[].{name, version, description, actions[].{name, description}}, commands[]}"}, "304": {"description": "Not Modified"}, "503": {"description": "Agent registry unavailable"}}}
     }
   }
 })json";
@@ -866,6 +883,13 @@ bool is_safe_install_command(std::string_view s) {
 }
 
 } // anonymous namespace
+
+// External-linkage accessor declared in openapi_spec_access.hpp — see that
+// header for why this thin wrapper exists (openapi_spec() itself stays
+// TU-local; this just forwards to it from outside the anonymous namespace).
+const std::string& openapi_spec_json() {
+    return openapi_spec();
+}
 
 namespace detail {
 
@@ -1750,6 +1774,11 @@ void RestApiV1::register_routes(
                          .add("revoked", t.revoked);
                      if (!t.scope_service.empty())
                          item.add("scope_service", t.scope_service);
+                     // Echo the MCP tier so an operator can verify what they
+                     // minted (authdb Q3 / consistency #6 — the field is settable
+                     // now, so it must be readable back).
+                     if (!t.mcp_tier.empty())
+                         item.add("mcp_tier", t.mcp_tier);
                      arr.add(item);
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
@@ -1780,6 +1809,48 @@ void RestApiV1::register_routes(
         auto name = body.value("name", "");
         auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
+        // MCP tier (#289 follow-up): create_token already accepts this — the
+        // handler had silently dropped it, so a documented `mcp_tier` in the body
+        // produced an empty-tier (RBAC-defer) token, defeating self-service MCP
+        // provisioning. Honor it, validating against the closed tier set so a
+        // typo can't mint an unrecognised tier (which tier_allows would treat as
+        // "defer to RBAC" — a silent privilege surprise).
+        auto mcp_tier = body.value("mcp_tier", "");
+        if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid mcp_tier: must be one of readonly, "
+                                                  "operator, supervised (or omitted)"),
+                            "application/json");
+            return;
+        }
+        // A token carrying an MCP tier or a service scope MUST have an expiration
+        // (create_token enforces this + a 90-day cap). Pre-validate here so a
+        // routine client omission / over-long TTL returns a clean 400 instead of
+        // falling through to the shared `!result` branch below, which is
+        // CSPRNG-failure-ONLY: it would 503, false-page on-call via
+        // yuzu_secure_random_failure_total, and write a false `csprng_unavailable`
+        // SOC-2 audit row for a plain input error (gov Gate: security-guardian /
+        // authdb / compliance / consistency / enterprise / happy+unhappy-path).
+        // Mirrors create_token's two expiry rules; the full de-duplication (a
+        // discriminable create_token error) is the tracked typed-error follow-up.
+        if (!mcp_tier.empty() || !scope_service.empty()) {
+            if (expires_at <= 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "expires_at is required for an MCP-tier or "
+                                                      "service-scoped token"),
+                                "application/json");
+                return;
+            }
+            if (!mcp_tier.empty()) {
+                const int64_t now = static_cast<int64_t>(std::time(nullptr));
+                if (expires_at - now > 90LL * 24 * 3600) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "MCP token TTL cannot exceed 90 days"),
+                                    "application/json");
+                    return;
+                }
+            }
+        }
 
         // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
         // length BEFORE any audit emission. An unbounded `name` would be
@@ -1836,7 +1907,8 @@ void RestApiV1::register_routes(
             }
         }
 
-        auto result = token_store->create_token(name, session->username, expires_at, scope_service);
+        auto result =
+            token_store->create_token(name, session->username, expires_at, scope_service, mcp_tier);
         if (!result) {
             // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure so
             // on-call has a paging surface short of grepping audit logs.
@@ -1896,7 +1968,13 @@ void RestApiV1::register_routes(
             res.set_content(envelope.str(), "application/json");
             return;
         }
-        auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
+        // Record the granted MCP tier in the create audit — it is the privilege
+        // boundary of the credential, and a SOC-2 CC6.1/6.2 access review must be
+        // answerable from durable evidence, not the mutable api_tokens table
+        // (gov Gate 6 compliance HIGH; authdb Q4 / consistency #6).
+        std::string detail = "mcp_tier=" + (mcp_tier.empty() ? std::string("none") : mcp_tier);
+        if (!scope_service.empty())
+            detail += "; scope_service=" + scope_service;
         // Success-path audit fire-and-forget — bool intentionally discarded
         // because the response is 201 Created regardless; if the audit row
         // fails to persist, the AuditStore::emit_failed_ counter still

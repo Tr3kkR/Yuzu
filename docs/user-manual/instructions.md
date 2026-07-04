@@ -556,6 +556,27 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 | `monthly` | `time_of_day`, `day_of_month` | Runs once per month. `day_of_month`: 1-28 (no 29/30/31 to avoid month-length issues). |
 | `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute. |
 
+### Execution semantics
+
+A server-side poller checks for due schedules every 30 seconds, so a fire can
+land up to ~30 seconds after its due time. Scheduled runs travel the same
+dispatch path as manual runs: each fire creates a tracked execution
+(attributed to the schedule's creator) that appears in the Executions history,
+and emits an `instruction.schedule_fired` audit event. An occurrence that
+cannot run — unknown or disabled definition, no agents in scope, dispatch
+failure — is recorded and skipped; it does not retry into a backlog.
+
+Approval-gated runs (the schedule's `requires_approval` flag, or a definition
+whose `approvalMode` is not `auto` — there is no operator session on the
+scheduled path, so `role-gated` also requires a ticket) submit one approval
+request per occurrence and hold at the due time. Approving the ticket fires
+the run within one poller cycle; rejecting it skips that occurrence, and the
+next occurrence submits a fresh request. Approvals follow the standard
+four-eyes rule, so the schedule's creator cannot approve their own scheduled
+runs. Poller health is observable via the `yuzu_schedule_fires_total`,
+`yuzu_schedule_fire_failures_total`, `yuzu_schedule_approvals_submitted_total`
+and `yuzu_schedule_tick_errors_total` counters.
+
 ### Schedule Properties
 
 | Field | Type | Description |

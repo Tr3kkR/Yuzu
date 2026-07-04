@@ -397,16 +397,91 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from 
                                             now + 3600, "", "supervised");
     REQUIRE(raw.has_value());
     auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/v1/executions"; // a REST (non-MCP) transport
     httplib::Response res;
 
     // tier_allows("supervised", Execution, Execute) → true
     // requires_approval("supervised", Execution, Execute) → true
-    // → must be blocked at the auth layer (approval re-dispatch is Phase 2)
+    // → on a REST transport the approval gate is enforced here so an MCP token
+    //   cannot bypass the ticket flow by switching endpoints (#520).
     bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
-    CHECK(res.body.find("not yet implemented") != std::string::npos);
+}
+
+// Complement of the above: on the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate
+// in mcp_server.cpp is the authoritative approval gate (ticket-then-recall, #289),
+// so require_permission must NOT re-deny an approval-gated op here — otherwise the
+// recall consumes the ticket then dies at the auth layer. This is the exact
+// integration bug the UAT smoke caught (the MCP unit harness mocks perm_fn).
+TEST_CASE("AuthRoutes::require_permission — approval gate is skipped on the MCP transport",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-mcp", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/mcp/v1/"; // the MCP transport — C8 governs approval
+    httplib::Response res;
+
+    // Same (supervised, Execution:Execute) that the REST case above denies — here
+    // the approval denial must NOT fire. RBAC is permissive in this fixture (the
+    // "allows Read" case returns true), so this passes through to true.
+    bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
+    CHECK(ok);
+    CHECK(res.body.find("approval") == std::string::npos); // the approval gate did not fire
+}
+
+// PR #1796 review C2: quarantine is Security:Execute on BOTH transports. The
+// kToolSecurity mapping and requires_approval("supervised","Security","Execute")
+// move together (see the invariant note above kToolSecurity in mcp_server.cpp),
+// so the REST POST/DELETE /api/v1/quarantine routes — which gate on
+// perm_fn("Security","Execute") — are mirror-denied here for a supervised token.
+// Before the fix the mapping said Security:Write while the routes checked
+// Execute, so requires_approval() was false for the REST pair and a supervised
+// MCP token could quarantine (and release) via REST with NO approval (#520).
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine POST",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-post", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "POST";
+    req.path = "/api/v1/quarantine"; // the exact route the REST quarantine gate runs on
+    httplib::Response res;
+
+    // tier_allows("supervised", Security, Execute) → true
+    // requires_approval("supervised", Security, Execute) → true (the C2 rule)
+    // → non-MCP transport ⇒ the approval mirror-denial fires (#520).
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine DELETE",
+          "[auth_routes][scope][mcp][quarantine]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-quar-del", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.method = "DELETE";
+    req.path = "/api/v1/quarantine/agent-1"; // release route — same Security:Execute gate
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Security", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
 }
 
 TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocked from approval-gated Delete",

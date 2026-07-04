@@ -36,3 +36,31 @@ jobs:
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
+
+  # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
+  # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's
+  # [Unreleased] section (the perpetual merge-conflict / approval-invalidation
+  # hotspot). This job lints the fragments and fails any PR whose diff changes
+  # the [Unreleased] section content directly — with a failure message that
+  # tells the (human or agent) author exactly how to convert the edit into a
+  # fragment. The release promote (CHANGELOG.md changes + fragment deletions
+  # in the same diff) is recognised and allowed.
+  changelog-fragments:
+    name: Changelog fragments
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Lint changelog.d/ fragment files
+        run: python3 scripts/assemble-changelog.py --check
+
+      - name: Block direct edits to CHANGELOG.md [Unreleased]
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 scripts/assemble-changelog.py --guard "$BASE_SHA"

@@ -3,6 +3,9 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
@@ -516,9 +519,14 @@ static const ToolDef kTools[] = {
 
     // Phase 2 write tool
     {"execute_instruction",
-     "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
-     "agents_reached, plugin, and action. Poll results with query_responses or subscribe to "
-     "live JSON events via GET /api/v1/events?execution_id=<id>. "
+     "Execute a plugin action on one or more agents. ASYNC: returns immediately with command_id "
+     "+ execution_id + agents_reached; the agents run the action and report back separately. To "
+     "get results, poll query_responses with the returned execution_id — an EMPTY result means "
+     "the run is still in flight, so wait ~2-5s and retry a few times (or call "
+     "get_execution_status to confirm a terminal state), or subscribe to live JSON events via GET "
+     "/api/v1/events?execution_id=<id>. Find valid plugin/action names AND their parameters via "
+     "discover_plugins (parameter_schema is inline for actions with a published definition) or "
+     "discover_instructions — do not guess action names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      R"j({"type":"object","properties":{)j"
@@ -576,6 +584,62 @@ static const ToolDef kTools[] = {
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j"},
 
+    // ── Phase 2 write tools (#289 / Issue 13.5) — dispatched below ──────────
+    // The optional `approval_id` argument on the approval-gated tools
+    // (delete_tag, quarantine_device) carries a ticket from a prior
+    // kApprovalRequired (-32006) response: the first call mints a pollable
+    // approval and returns approval_id + status_url; after an admin approves
+    // it, re-call with that approval_id to execute (one-time; replay-safe).
+    {"set_tag",
+     "Set a device tag (structured category or free-form). Mirrors PUT /api/v1/tags. "
+     "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
+     "a structured-category change, exactly like the REST path.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
+     R"j("key":{"type":"string","description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
+     R"j("value":{"type":"string","description":"Tag value; category keys validate against their allowed set"})j"
+     R"j(},"required":["agent_id","key","value"]})j"},
+
+    {"delete_tag",
+     "Delete a device tag by agent_id + key. Mirrors DELETE /api/v1/tags/{agent_id}/{key}. "
+     "Destructive (Tag:Delete): approval-gated on the operator AND supervised tiers — the first "
+     "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
+     "after an admin approves.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
+     R"j("key":{"type":"string","description":"Tag key to delete"},)j"
+     R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
+     R"j(},"required":["agent_id","key"]})j"},
+
+    {"approve_request",
+     "Approve a pending approval request by id. Mirrors POST /api/approvals/{id}/approve "
+     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     R"j({"type":"object","properties":{)j"
+     R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
+     R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
+     R"j(},"required":["approval_id"]})j"},
+
+    {"reject_request",
+     "Reject a pending approval request by id. Mirrors POST /api/approvals/{id}/reject "
+     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     R"j({"type":"object","properties":{)j"
+     R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
+     R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
+     R"j(},"required":["approval_id"]})j"},
+
+    {"quarantine_device",
+     "Isolate a device from the network (records the quarantine AND dispatches the live "
+     "quarantine-plugin isolation), whitelisting the management server. Mirrors POST "
+     "/api/v1/quarantine plus the isolation command. Destructive (Security:Execute): "
+     "approval-gated on the supervised tier — the first call returns an approval ticket, re-call "
+     "with the returned approval_id after an admin approves.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
+     R"j("reason":{"type":"string","description":"Optional quarantine reason (audited)"},)j"
+     R"j("whitelist":{"type":"string","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
+     R"j(},"required":["agent_id"]})j"},
+
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
      "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
@@ -604,6 +668,43 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
      kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
+
+    // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
+    // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
+    // builder functions (discover_routes.hpp) so REST and MCP can't drift. Appended
+    // at the VERY END of kTools[] (governance note: minimizes rebase conflict with
+    // any concurrent PR inserting WRITE tools earlier in this array).
+    {"discover_permissions",
+     "RBAC permission catalog: every securable_type x operation pair the RBAC store "
+     "recognizes, plus the full role -> allowed-operations grid.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover RBAC permissions","safety":"catalog read only"})"},
+    {"discover_instructions",
+     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
+     "commands this worker may dispatch via execute_instruction.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover instruction definitions","safety":"catalog read only"})"},
+    {"discover_routes",
+     "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
+     "serves. Hand-maintained source, so it can under-report an undocumented route "
+     "(the response carries a caveat field).",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover REST routes","safety":"catalog read only"})"},
+    {"discover_scope_kinds",
+     "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
+     "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
+     "syntax and examples for building a `scope` expression.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover scope DSL","safety":"catalog read only, static"})"},
+    {"discover_plugins",
+     "Plugin/action catalog observed across currently-connected agents. Each action carries an "
+     "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
+     "call it, not just that it exists); actions without one are name+description only — "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
+     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "before acting.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -611,10 +712,12 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 // ── Write/execute tools (blocked by read_only_mode) ──────────────────────
 // These tool names perform Write/Execute/Delete operations.
 // The read_only_mode guard rejects them proactively.
-//   Implemented dispatch: execute_instruction (line 1313)
-//   Security-mapped but no dispatch yet (Issue 13.5): set_tag, delete_tag,
-//                                                     approve_request, reject_request,
-//                                                     quarantine_device
+// All are now dispatched (#289 / Issue 13.5): execute_instruction +
+// execute_bundle + revoke_certificate + the five below (set_tag, delete_tag,
+// approve_request, reject_request, quarantine_device). The approval-gated
+// members (delete_tag, quarantine_device, and — via the generic C8 gate —
+// execute_instruction/revoke_certificate/execute_bundle on the supervised
+// tier) route through the ticket-then-recall approval flow.
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
@@ -676,10 +779,25 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute"}},
     {"get_bundle_result", {"Response", "Read"}},
-    // Planned write tools (security metadata pre-registered)
+    // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
+    // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
+    // NOT per-handler RBAC — each handler separately calls perm_fn with its
+    // REST-verified op (approve/reject → Approval:Approve, quarantine →
+    // Security:Execute). INVARIANT: this mapping and mcp_policy.hpp's
+    // requires_approval() move TOGETHER. quarantine_device maps to
+    // Security:Execute — the SAME (securable, op) its handler and the REST
+    // POST/DELETE /api/v1/quarantine routes check — and requires_approval()
+    // gates supervised Security:Execute, so BOTH transports agree: the C8 gate
+    // tickets the MCP call, and AuthRoutes::require_permission mirror-denies the
+    // REST route for a supervised token (#520). The previous Security:Write
+    // mapping (paired with a Write-keyed policy rule) left the REST route — which
+    // checks Execute — with requires_approval()==false: a supervised token could
+    // quarantine via REST with NO approval. If you change a tool's mapping OR a
+    // requires_approval() rule, re-check the OTHER side and every REST route that
+    // shares the (securable, op) pair.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
-    {"quarantine_device", {"Security", "Write"}},
+    {"quarantine_device", {"Security", "Execute"}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
@@ -688,6 +806,12 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"classify_operational_question", {"Infrastructure", "Read"}},
     {"get_incident_playbook", {"Infrastructure", "Read"}},
     {"summarize_working_set", {"Infrastructure", "Read"}},
+    // A2 discovery tools (mirrors of GET /api/v1/discover/*).
+    {"discover_permissions", {"Infrastructure", "Read"}},
+    {"discover_instructions", {"InstructionDefinition", "Read"}},
+    {"discover_routes", {"Infrastructure", "Read"}},
+    {"discover_scope_kinds", {"Infrastructure", "Read"}},
+    {"discover_plugins", {"Infrastructure", "Read"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -790,7 +914,9 @@ McpServer::HandlerFn McpServer::build_handler(
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
     DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers) {
+    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
+    QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -1361,6 +1487,36 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
+            // A4 approval-required envelope (#289 / Issue 13.5). Unlike the plain
+            // a4_error above, kApprovalRequired (-32006) MUST carry approval_id +
+            // status_url so the agentic worker can poll the approval and re-call.
+            // `approval_id` is a server-generated 32-hex id (ApprovalManager) and
+            // `status_url` is a server-built path, so both are raw-embedded like
+            // correlation_id; `remediation` is JSON-escaped defensively.
+            auto approval_required_error = [&id](const std::string& approval_id,
+                                                 std::string_view remediation) {
+                const std::string cid = yuzu::server::detail::make_correlation_id();
+                std::string data = R"({"correlation_id":")" + cid +
+                                   R"(","retry_after_ms":null,"remediation":)" +
+                                   json_quoted_string(remediation) + R"(,"approval_id":")" +
+                                   approval_id + R"(","status_url":")" +
+                                   ("/api/v1/approvals/" + approval_id) + R"("})";
+                return error_response(id, kApprovalRequired, "operation requires approval", data);
+            };
+
+            // Canonical JSON of the tool arguments for approval-ticket binding
+            // (#289): a submitted ticket stores this string in scope_expression,
+            // and a recall recomputes it to prove the same tool+args are being
+            // executed. Default nlohmann::json is std::map-backed → object keys
+            // dump in sorted order, so client key order does not matter. The
+            // `approval_id` argument is stripped on BOTH submit and recall so the
+            // ticket-carrying re-call hashes identically to the original mint.
+            auto canonical_args = [](nlohmann::json a) -> std::string {
+                if (a.is_object())
+                    a.erase("approval_id");
+                return a.dump();
+            };
+
             // ── C7: read_only_mode enforcement ──────────────────────────
             // When the server is in read-only mode, reject any tool that
             // performs a Write/Execute/Delete operation.
@@ -1391,32 +1547,163 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 if (requires_approval(tier, sec_type, sec_op)) {
-                    // Approval-gated MCP execution is not yet implemented:
-                    // the approval workflow can record the request but has no
-                    // re-dispatch path to resume execution after admin approval
-                    // (Phase 2 — see docs/mcp-server.md). Return an explicit error
-                    // rather than silently queuing.
-                    //
-                    // Deliberately NOT kApprovalRequired (-32006): the A4 contract
-                    // (docs/agentic-first-principle.md) requires that code's envelope
-                    // to carry `approval_id` + `status_url` so the agent can poll the
-                    // workflow. With no re-dispatch path there is nothing pollable —
-                    // minting an approval that can never resume would be a worse
-                    // contract lie than denying outright. The operation IS denied
-                    // here, so a tier-denial (whose data promises no pollable
-                    // approval) is the honest shape; the remediation points the
-                    // caller at the surfaces where the supervised tier does work.
-                    res.set_content(
-                        a4_error(
-                            kTierDenied,
-                            "This operation requires approval, but approval-gated "
-                            "MCP execution is not yet implemented. Use the REST API "
-                            "or dashboard for operations that require the supervised tier.",
-                            "approval-gated MCP execution is not implemented; perform this "
-                            "operation via the REST API or dashboard"),
-                        "application/json");
-                    mcp_audit("denied", "approval-gated execution not implemented");
-                    return;
+                    // ── Approval ticket flow (#289 / Issue 13.5, design D1) ──
+                    // ticket-then-recall: the first call MINTS a pollable
+                    // approval and returns kApprovalRequired (-32006) with
+                    // approval_id + status_url; after an admin approves it, the
+                    // caller RE-CALLS the same tool passing that approval_id,
+                    // which is validated + atomically consumed here before the
+                    // tool handler runs. This is the generic gate, so it also
+                    // governs supervised execute_instruction / revoke_certificate
+                    // / execute_bundle — Phase 2 supervised re-dispatch.
+                    if (!approval_manager) {
+                        // No approval manager wired (test harness / stripped
+                        // deploy). We cannot mint a POLLABLE ticket, so we deny
+                        // honestly with NO approval_id — the A4 contract forbids
+                        // a -32006 without a pollable approval. Production always
+                        // wires approval_manager (server.cpp), so this is the
+                        // degraded path only.
+                        mcp_audit("denied", "approval-gated; approval manager unavailable");
+                        res.set_content(
+                            a4_error(kTierDenied,
+                                     "This operation requires approval, but the approval manager "
+                                     "is not available on this server.",
+                                     "approval-gated MCP execution is unavailable here; use the "
+                                     "REST API or dashboard"),
+                            "application/json");
+                        return;
+                    }
+
+                    const std::string definition_id = "mcp." + tool_name;
+                    const std::string canon = canonical_args(args);
+                    const std::string supplied_id = param_str(args, "approval_id");
+                    // M2 (PR #1796): device-targeted tools prefix the pending
+                    // audit detail with the endpoint so SIEM can filter
+                    // mcp.<tool>|pending by agent_id (the success audit already
+                    // carries it; the mint audit did not).
+                    const std::string audit_agent = param_str(args, "agent_id");
+                    const std::string mint_detail_prefix =
+                        audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
+
+                    if (supplied_id.empty()) {
+                        // First call → mint a ticket, but DEDUP first (governance
+                        // UP-1 BLOCKING): if this principal already has a pending
+                        // ticket for the exact same (tool, args), hand it back
+                        // instead of minting another. An idempotent mint bounds a
+                        // supervised token's junk to distinct (tool,args) tuples,
+                        // so it can no longer flood the GLOBAL 1000-pending cap that
+                        // ApprovalManager shares with the REST instruction-approval
+                        // workflow (cross-surface DoS). #1643: the one-audit-per-
+                        // attempt cost remains, but no unbounded row growth.
+                        if (auto existing = approval_manager->find_pending(
+                                definition_id, session->username, canon)) {
+                            mcp_audit("pending",
+                                      mint_detail_prefix + "approval_id=" + existing->id +
+                                          " (deduped)");
+                            res.set_content(
+                                approval_required_error(
+                                    existing->id,
+                                    "an admin must approve this approval_id (see status_url), then "
+                                    "re-call this tool with the approval_id argument to execute"),
+                                "application/json");
+                            return;
+                        }
+                        // Per-submitter sub-cap (governance sec8-MEDIUM-1): dedup
+                        // handles honest retries, but an adaptive flood (a nonce
+                        // key defeats the args-hash) would still fill the GLOBAL
+                        // pending cap shared with the REST approval workflow. Bound
+                        // any single principal's share far below that global cap.
+                        constexpr int kMcpSubmitterPendingCap = 25;
+                        if (approval_manager->pending_count_for(session->username) >=
+                            kMcpSubmitterPendingCap) {
+                            mcp_audit("denied", "per-submitter pending-approval cap reached");
+                            res.set_content(
+                                a4_error(kTierDenied,
+                                         "too many pending approvals for this principal; approve or "
+                                         "let existing requests expire before creating more",
+                                         "wait for your pending approvals to be reviewed"),
+                                "application/json");
+                            return;
+                        }
+                        auto submitted =
+                            approval_manager->submit(definition_id, session->username, canon);
+                        if (!submitted) {
+                            mcp_audit("failure", "approval submit failed: " + submitted.error());
+                            res.set_content(
+                                a4_error(kInternalError, "failed to create approval request",
+                                         "retry later, or use the REST API / dashboard"),
+                                "application/json");
+                            return;
+                        }
+                        mcp_audit("pending", mint_detail_prefix + "approval_id=" + *submitted);
+                        res.set_content(
+                            approval_required_error(
+                                *submitted,
+                                "an admin must approve this approval_id (see status_url), then "
+                                "re-call this tool with the approval_id argument to execute"),
+                            "application/json");
+                        return;
+                    }
+
+                    // Recall path → validate the supplied ticket.
+                    auto appr = approval_manager->get(supplied_id);
+                    if (!appr || appr->definition_id != definition_id ||
+                        appr->scope_expression != canon) {
+                        // Absent, or for a different tool / different arguments.
+                        mcp_audit("denied", "approval_id does not match this request");
+                        res.set_content(
+                            a4_error(kPermissionDenied,
+                                     "approval_id does not match this tool and arguments",
+                                     "submit this exact call without approval_id to obtain a "
+                                     "matching approval ticket"),
+                            "application/json");
+                        return;
+                    }
+                    if (appr->status == "pending") {
+                        // Not approved yet — hand the ticket back so the caller
+                        // keeps polling status_url (idempotent, no new mint).
+                        res.set_content(
+                            approval_required_error(
+                                supplied_id,
+                                "approval is still pending; wait for an admin to approve it (see "
+                                "status_url), then re-call this tool"),
+                            "application/json");
+                        return;
+                    }
+                    if (appr->status != "approved") {
+                        // rejected / expired.
+                        mcp_audit("denied", "approval " + supplied_id + " status=" + appr->status);
+                        res.set_content(
+                            a4_error(kPermissionDenied, "approval was " + appr->status,
+                                     "submit a new request without approval_id to obtain a fresh "
+                                     "approval ticket"),
+                            "application/json");
+                        return;
+                    }
+                    // status == approved → atomically consume (one-time; the CAS
+                    // rejects a replay of an already-consumed ticket and wins the
+                    // race against a concurrent recall, so a mutating tool runs at
+                    // most once per ticket).
+                    // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
+                    // authenticated principal recalling the tool.
+                    if (auto consumed =
+                            approval_manager->consume_ticket(supplied_id, session->username);
+                        !consumed) {
+                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        res.set_content(
+                            a4_error(kPermissionDenied,
+                                     "approval already used (one-time ticket)",
+                                     "submit a new request without approval_id to obtain a fresh "
+                                     "approval ticket"),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                    // Ticket consumed → fall through to the tool handler below.
+                    // NOTE: the per-handler perm_fn (real RBAC op) has not run
+                    // yet; a tier-allows-but-RBAC-denies token can mint→approve→
+                    // then 403 at the handler, burning the ticket. Rare, flows
+                    // from the deliberate two-gate (tier then RBAC) split.
                 }
             }
 
@@ -3747,6 +4034,295 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── set_tag (#289) ────────────────────────────────────────────
+            // Tier handled by the generic C8 block above (Tag:Write). Mirrors
+            // PUT /api/v1/tags: category-key normalisation + set_tag_checked +
+            // agent tag-push (D4).
+            if (tool_name == "set_tag") {
+                if (!tag_store) {
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                auto key = param_str(args, "key");
+                auto value = param_str(args, "value");
+                // Normalize structured-category keys to lowercase (mirror REST).
+                std::string lower_key = lower_copy(key);
+                for (const auto* cat : {"role", "environment", "location", "service"}) {
+                    if (lower_key == cat) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+                if (agent_id.empty() || key.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id and key are required"),
+                                    "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate — a management-group-
+                // confined operator may tag only devices inside their groups.
+                // Runs AFTER agent_id parse (the scope needs the target); falls
+                // back to the global perm_fn when unwired (test harness).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Tag", "Write")) {
+                    return;
+                }
+                auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
+                if (!set_res) {
+                    mcp_audit("failure", agent_id + ":" + key);
+                    res.set_content(error_response(id, kInvalidParams, set_res.error()),
+                                    "application/json");
+                    return;
+                }
+                // D4: fire the agent tag-push exactly like the REST path.
+                if (tag_push_fn)
+                    tag_push_fn(agent_id, key);
+                bool audit_ok = mcp_audit("success", agent_id + ":" + key);
+                JObj payload;
+                payload.add("set", true).add("agent_id", agent_id).add("key", key);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                return;
+            }
+
+            // ── delete_tag (#289) ─────────────────────────────────────────
+            // Destructive (Tag:Delete) — approval-gated on operator AND
+            // supervised, so it only reaches here after a consumed ticket.
+            // Mirrors DELETE /api/v1/tags/{agent_id}/{key} + the revoke_certificate
+            // audit-and-surface template (#1240).
+            if (tool_name == "delete_tag") {
+                if (!tag_store) {
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                auto key = param_str(args, "key");
+                std::string lower_key = lower_copy(key);
+                for (const auto* cat : {"role", "environment", "location", "service"}) {
+                    if (lower_key == cat) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+                if (agent_id.empty() || key.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id and key are required"),
+                                    "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate (see set_tag above).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Tag", "Delete")) {
+                    return;
+                }
+                bool deleted = tag_store->delete_tag(agent_id, key);
+                if (!deleted) {
+                    // 404-equivalent (mirror the REST 404 on a missing tag).
+                    mcp_audit("failure", "not found " + agent_id + ":" + key);
+                    res.set_content(error_response(id, kInvalidParams, "tag not found"),
+                                    "application/json");
+                    return;
+                }
+                bool audit_ok = mcp_audit("success", agent_id + ":" + key);
+                JObj payload;
+                payload.add("deleted", true).add("agent_id", agent_id).add("key", key);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                return;
+            }
+
+            // ── approve_request / reject_request (#289) ───────────────────
+            // Tier handled by C8 (Approval:Write → supervised only). Real RBAC
+            // op is Approval:Approve (matches REST /api/approvals/{id}/{approve,
+            // reject}). Reviewer≠submitter + pending-only are enforced atomically
+            // in ApprovalManager::set_review_status.
+            if (tool_name == "approve_request" || tool_name == "reject_request") {
+                if (!perm_fn(req, res, "Approval", "Approve"))
+                    return;
+                if (!approval_manager) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Approval manager unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto target_id = param_str(args, "approval_id");
+                auto comment = param_str(args, "comment");
+                if (target_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "approval_id is required"),
+                                    "application/json");
+                    return;
+                }
+                const bool is_approve = (tool_name == "approve_request");
+                auto review_res = is_approve
+                                      ? approval_manager->approve(target_id, session->username, comment)
+                                      : approval_manager->reject(target_id, session->username, comment);
+                if (!review_res) {
+                    mcp_audit("failure", target_id);
+                    res.set_content(error_response(id, kInvalidParams, review_res.error()),
+                                    "application/json");
+                    return;
+                }
+                bool audit_ok = mcp_audit("success", target_id);
+                JObj payload;
+                payload.add(is_approve ? "approved" : "rejected", true)
+                    .add("approval_id", target_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                return;
+            }
+
+            // ── quarantine_device (#289, design D2 — record + real isolate) ─
+            // Destructive (Security:Execute) — approval-gated on supervised, so
+            // it only reaches here after a consumed ticket. Records the
+            // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
+            // quarantine-plugin isolation via the same DispatchFn chain.
+            if (tool_name == "quarantine_device") {
+                if (!quarantine_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Quarantine store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                auto reason = param_str(args, "reason");
+                auto whitelist = param_str(args, "whitelist");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // H1 (PR #1796): per-device scope gate — a management-group-
+                // confined operator may isolate only devices inside their groups.
+                // Falls back to the global perm_fn when unwired (test harness).
+                if (scoped_perm_fn) {
+                    if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                        return;
+                } else if (!perm_fn(req, res, "Security", "Execute")) {
+                    return;
+                }
+                // Server-side input validation BEFORE any store write or dispatch
+                // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
+                // reaches the agent's netsh/iptables/pf sink; the agent already
+                // allow-lists each IP (is_safe_ip), but this PR opens the FIRST
+                // reachable path to that sink (REST /quarantine is record-only), so
+                // we validate at the server edge too (deploy-path precedent: reject
+                // shell-metachar/oversized input loudly, don't silently drop it).
+                if (reason.size() > 1024) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "reason exceeds 1024 characters"),
+                        "application/json");
+                    return;
+                }
+                if (whitelist.size() > 512) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "whitelist exceeds 512 characters"),
+                        "application/json");
+                    return;
+                }
+                {
+                    // Mirror the agent's is_safe_ip charset ([0-9a-fA-F.:], <=45)
+                    // so we reject anything the agent would silently drop, loudly.
+                    auto safe_ip = [](std::string_view tok) {
+                        if (tok.empty() || tok.size() > 45)
+                            return false;
+                        for (char c : tok)
+                            if (!(std::isxdigit(static_cast<unsigned char>(c)) || c == '.' ||
+                                  c == ':'))
+                                return false;
+                        return true;
+                    };
+                    bool bad = false;
+                    size_t start = 0;
+                    while (start <= whitelist.size() && !bad) {
+                        size_t comma = whitelist.find(',', start);
+                        auto tok = whitelist.substr(
+                            start, comma == std::string::npos ? std::string::npos : comma - start);
+                        // trim surrounding spaces
+                        auto b = tok.find_first_not_of(' ');
+                        auto e = tok.find_last_not_of(' ');
+                        if (b != std::string::npos)
+                            tok = tok.substr(b, e - b + 1);
+                        else
+                            tok.clear();
+                        if (!tok.empty() && !safe_ip(tok))
+                            bad = true;
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    if (bad) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "whitelist must be comma-separated IPv4/IPv6 literals"),
+                            "application/json");
+                        return;
+                    }
+                }
+                // NOTE (governance sec-LOW-1 / UP-6): live isolation preserves the
+                // agent's EXISTING management connection (iptables ESTABLISHED,RELATED
+                // etc.), so the agent can still receive the un-quarantine command over
+                // that link. It does NOT explicitly whitelist the server address for a
+                // fresh reconnect — a pre-existing quarantine-plugin design (the plugin
+                // takes no server_ip param), tracked as a follow-up, not introduced here.
+                // 1. Persist the quarantine record (store row only; mirror REST).
+                auto quar_res =
+                    quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
+                if (!quar_res) {
+                    mcp_audit("failure", agent_id);
+                    res.set_content(error_response(id, kInvalidParams, quar_res.error()),
+                                    "application/json");
+                    return;
+                }
+                // 2. Dispatch the live isolation command (plugin quarantine,
+                //    action quarantine). Out-of-band (no ExecutionTracker row):
+                //    quarantine is not an executions-drawer producer. A dispatch
+                //    failure leaves the record persisted (the agent may be offline)
+                //    and is surfaced via agents_reached=0, not a fatal error.
+                std::string command_id;
+                int agents_reached = 0;
+                if (dispatch_fn) {
+                    std::unordered_map<std::string, std::string> qparams;
+                    if (!whitelist.empty())
+                        qparams["whitelist_ips"] = whitelist;
+                    try {
+                        std::tie(command_id, agents_reached) = dispatch_fn(
+                            "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
+                            /*execution_id=*/"");
+                    } catch (const std::exception& e) {
+                        spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
+                                      e.what());
+                    }
+                }
+                // Audit AFTER dispatch so the evidence row records whether the
+                // device was actually isolated (agents_reached>0) vs recorded-only
+                // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
+                bool audit_ok = mcp_audit("success", "agent_id=" + agent_id + " command_id=" +
+                                                         command_id + " agents_reached=" +
+                                                         std::to_string(agents_reached));
+                JObj record_obj;
+                record_obj.add("agent_id", agent_id)
+                    .add("status", "active")
+                    .add("quarantined_by", session->username)
+                    .add("reason", reason)
+                    .add("whitelist", whitelist);
+                JObj payload;
+                payload.add("command_id", command_id)
+                    .add("agents_reached", agents_reached)
+                    .raw("quarantine_record", record_obj.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                return;
+            }
+
             // ── execute_bundle (ADR-0011) ─────────────────────────────────
             // Async fan-out of one instruction into several plugin actions on ONE
             // device. Thin wrapper over the shared BundleOrchestrator — the SAME
@@ -4335,6 +4911,123 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────
+            // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME
+            // builder function in discover_routes.hpp — REST and MCP read the
+            // identical catalog, so they cannot drift from each other by
+            // construction (A2: "no side-channel doc fetch").
+
+            if (tool_name == "discover_permissions") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_instructions") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto doc = yuzu::server::build_instructions_catalog(*instruction_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_routes") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                // Compiled-in — no store dependency, same "answers even when
+                // everything else is down" property as the REST sibling.
+                auto doc = yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json());
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_scope_kinds") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const auto& doc = yuzu::server::scope_kinds_catalog();
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            if (tool_name == "discover_plugins") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!agent_registry) {
+                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
+                                    "application/json");
+                    return;
+                }
+                // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):
+                // parameter_schema enrichment is InstructionDefinition:Read
+                // content (the same data /discover/instructions gates on that
+                // grant). Attach it only when the caller actually holds that
+                // grant; otherwise serve the name+description catalog (the
+                // nullptr path). Mirrors the REST /discover/plugins gate so the
+                // two surfaces cannot diverge.
+                InstructionStore* enrich_store =
+                    (rbac_store && rbac_store->is_open() && session &&
+                     rbac_store->check_permission(session->username, "InstructionDefinition",
+                                                  "Read"))
+                        ? instruction_store
+                        : nullptr;
+                auto doc = yuzu::server::build_plugins_catalog(*agent_registry, enrich_store);
+                auto result = tool_result(doc.json, kObjectOutputSchema);
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
             // ── Unknown tool ──────────────────────────────────────────────
             mcp_audit("failure", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
@@ -4366,7 +5059,10 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 SoftwareInventoryStore* software_inventory_store,
                                 InventoryScopeFn inventory_scope_fn,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers) {
+                                AppPerfProviders app_perf_providers,
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry,
+                                ScopedPermFn scoped_perm_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -4377,7 +5073,9 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(dex_perf_fn), std::move(net_perf_fn),
                            std::move(response_scope_fn), software_inventory_store,
                            std::move(inventory_scope_fn), metrics,
-                           std::move(app_perf_providers)));
+                           std::move(app_perf_providers), quarantine_store,
+                           std::move(tag_push_fn), agent_registry,
+                           std::move(scoped_perm_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",

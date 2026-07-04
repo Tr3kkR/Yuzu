@@ -93,6 +93,25 @@ All code changes follow mandatory governance gates defined in `CLAUDE.md`. In su
 3. Write a clear PR title and description using the PR template
 4. Keep PRs small where possible; large features should be broken into incremental PRs
 
+## Changelog
+
+**Do not edit `CHANGELOG.md` in a PR** — direct edits to its `[Unreleased]`
+section are rejected by the `Changelog fragments` CI check (they made every
+second PR conflict and void its approvals). Instead, add **one new file**
+describing your change:
+
+```
+changelog.d/<PR-or-issue-number>-<short-slug>.<section>.md
+```
+
+where `<section>` is one of `added`, `changed`, `deprecated`, `removed`,
+`fixed`, `security`, and the body is the finished bullet (starting `- `)
+exactly as it should read in the changelog. Fragments are assembled into
+`CHANGELOG.md` at release time. Full convention (including guidance for AI
+coding agents): [`changelog.d/README.md`](changelog.d/README.md). Changes with
+no operator-visible effect (pure refactors, CI plumbing, test-only) can skip
+the fragment.
+
 ## Coding Standards
 
 The project follows C++23 conventions enforced by `.clang-tidy`:

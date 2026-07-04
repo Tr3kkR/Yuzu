@@ -338,6 +338,8 @@ yuzu_server_core_lib = static_library(
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
+    'src/schedule_routes.cpp',
+    'src/schedule_runner.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
@@ -406,6 +408,7 @@ yuzu_server_core_lib = static_library(
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
+    'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
     'src/viz_routes.cpp',
     'src/viz_page_ui.cpp',
     'src/viz_host_page_ui.cpp',

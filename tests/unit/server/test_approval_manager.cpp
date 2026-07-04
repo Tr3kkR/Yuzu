@@ -324,3 +324,136 @@ TEST_CASE("ApprovalManager: reject nonexistent ID fails", "[approval_manager]") 
     auto result = mgr.reject("nonexistent-id", "admin1", "rejecting nothing");
     CHECK(!result.has_value());
 }
+
+// ── Consumption traceability (PR #1796 H3/N2, SOC-2 CC7.2) ─────────────────
+
+TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling principal",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+
+    auto consumed = mgr.consume_ticket(*id, "operator1");
+    REQUIRE(consumed.has_value());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at > 0);
+    CHECK(row->consumed_by == "operator1"); // who and when agree (same CAS UPDATE)
+}
+
+TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    // An unattributable consumption would be a CC7.2 evidence hole.
+    auto consumed = mgr.consume_ticket(*id, "");
+    CHECK(!consumed.has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // ticket untouched — still consumable
+}
+
+TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the original consumer",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+
+    auto replay = mgr.consume_ticket(*id, "operator2");
+    CHECK(!replay.has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_by == "operator1"); // the losing recall never overwrites
+}
+
+// ── Expiry sweep (PR #1796 N3 + L2) ────────────────────────────────────────
+// The sweep runs lazily inside submit(). One shared 7-day window: pending
+// tickets age out from submitted_at; approved-but-unconsumed tickets (leaked
+// one-time capabilities) age out from reviewed_at. Counts come from stepping
+// RETURNING rows, never sqlite3_changes() after step (#1033).
+
+namespace {
+/// Backdate a timestamp column directly — the sweep triggers on the NEXT
+/// submit(), exactly like production (no test-only sweep entry point).
+void backdate(sqlite3* db, const std::string& id, const char* column, int64_t seconds_ago) {
+    auto sql = std::string("UPDATE approvals SET ") + column + " = " + column + " - " +
+               std::to_string(seconds_ago) + " WHERE id = '" + id + "'";
+    REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+constexpr int64_t k8Days = 8 * 24 * 3600;
+} // namespace
+
+TEST_CASE("ApprovalManager: stale pending approvals expire on the next submit",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto stale = mgr.submit("def-old", "operator1", "scope");
+    REQUIRE(stale.has_value());
+    backdate(tdb.db, *stale, "submitted_at", k8Days);
+
+    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+
+    auto row = mgr.get(*stale);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "expired");
+}
+
+TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after review",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+    backdate(tdb.db, *id, "reviewed_at", k8Days);
+
+    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "expired"); // the leaked capability token is dead
+
+    // An expired ticket is no longer consumable.
+    auto consumed = mgr.consume_ticket(*id, "operator1");
+    CHECK(!consumed.has_value());
+}
+
+TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    backdate(tdb.db, *id, "reviewed_at", k8Days);
+
+    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "approved");        // untouched — it is evidence, not a capability
+    CHECK(row->consumed_by == "operator1");  // trail intact
+}

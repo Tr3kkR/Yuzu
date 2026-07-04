@@ -191,6 +191,10 @@ The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose
 
 **Before tagging**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify locally: `bash scripts/check-compose-versions.sh 0.12.0`. Otherwise the job fails only after the full build matrix (~30–60 wasted runner-min, nothing published). New compose file ⇒ also add it to the `FILES` array in the script — auto-discovery is deliberately off.
 
+## Changelog
+
+**Never edit `CHANGELOG.md`** — add one fragment file `changelog.d/<PR#>-<slug>.<section>.md` (body = the finished `- ` bullet), assembled at release. A hook + the `Changelog fragments` CI job enforce this; see `changelog.d/README.md`.
+
 ## Routed concerns (read the doc, not this file)
 
 | Concern | Doc | Loaded by |

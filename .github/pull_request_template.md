@@ -16,6 +16,7 @@
 
 ## Checklist
 
+- [ ] Changelog fragment added: `changelog.d/<PR#>-<slug>.<section>.md` — do **not** edit `CHANGELOG.md` (see [`changelog.d/README.md`](../changelog.d/README.md); skip only if the change has no operator-visible effect)
 - [ ] Builds on Linux (GCC and Clang)
 - [ ] Builds on Windows (MSVC)
 - [ ] Tests pass (`ctest --preset linux-debug`)

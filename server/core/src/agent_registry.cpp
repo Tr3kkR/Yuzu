@@ -1149,6 +1149,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
+        // DRIFT CONTRACT: every branch below MUST have a matching entry in
+        // scope_kind_catalog() (declared just after this class in
+        // agent_registry.hpp) — that catalog backs GET /api/v1/discover/scope-kinds
+        // and its CROSS-CHECK test. Add the branch AND the catalog entry together.
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
             // from_result_set:<id> — composable-scope membership (capability
@@ -1190,6 +1194,28 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         }
     }
     return matched;
+}
+
+const std::vector<ScopeKindInfo>& scope_kind_catalog() {
+    static const std::vector<ScopeKindInfo> catalog = {
+        {"from_result_set:<id>", "from_result_set:<id>", "from_result_set:rs_01H8X3ZQK7YB2",
+         "Owner-checked membership of a previously-saved result set (composable "
+         "scope, docs/scope-walking-design.md). A set the caller does not own "
+         "resolves to no match."},
+        {"ostype", "ostype <op> <value>", R"(ostype == "windows")",
+         "Agent-reported OS family (windows/linux/darwin)."},
+        {"hostname", "hostname <op> <value>", R"(hostname LIKE "WIN-%")",
+         "Agent-reported hostname."},
+        {"arch", "arch <op> <value>", R"(arch == "x86_64")", "Agent-reported CPU architecture."},
+        {"agent_version", "agent_version <op> <value>", R"(agent_version == "0.12.0")",
+         "Agent daemon version string."},
+        {"tag:<key>", "tag:<key> <op> <value>", R"(tag:department == "finance")",
+         "Scopable tag value — checked in-memory first, then the persistent "
+         "TagStore (see docs/asset-tagging-guide.md)."},
+        {"props.<key>", "props.<key> <op> <value>", R"(props.owner == "jdoe")",
+         "Custom property value from the CustomPropertiesStore."},
+    };
+    return catalog;
 }
 
 // -- AgentHealthStore ---------------------------------------------------------

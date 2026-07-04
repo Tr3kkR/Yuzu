@@ -139,7 +139,7 @@ TEST_CASE("ScheduleEngine: query enabled_only", "[schedule_engine]") {
     auto r1 = engine.create_schedule(make_schedule("def-1", "daily", "Enabled"));
     auto r2 = engine.create_schedule(make_schedule("def-2", "daily", "Disabled"));
     REQUIRE(r2.has_value());
-    engine.set_enabled(*r2, false);
+    engine.set_enabled(*r2, false, "admin");
 
     ScheduleQuery q;
     q.enabled_only = true;
@@ -167,7 +167,7 @@ TEST_CASE("ScheduleEngine: delete schedule", "[schedule_engine]") {
     auto result = engine.create_schedule(make_schedule("def-1", "interval"));
     REQUIRE(result.has_value());
 
-    bool deleted = engine.delete_schedule(*result);
+    bool deleted = engine.delete_schedule(*result, "admin");
     REQUIRE(deleted);
 
     auto results = engine.query_schedules();
@@ -179,8 +179,27 @@ TEST_CASE("ScheduleEngine: delete nonexistent returns false", "[schedule_engine]
     ScheduleEngine engine(tdb.db);
     engine.create_tables();
 
-    bool deleted = engine.delete_schedule("nonexistent-id");
+    bool deleted = engine.delete_schedule("nonexistent-id", "admin");
     CHECK(!deleted);
+}
+
+// M-01 (#1806): a non-owner must not be able to delete (or probe the
+// existence of) another principal's schedule via Schedule:Delete.
+TEST_CASE("ScheduleEngine: delete by a non-owner is rejected and the row survives",
+          "[schedule_engine][m01]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto result = engine.create_schedule(make_schedule("def-1", "interval"));
+    REQUIRE(result.has_value());
+
+    bool deleted = engine.delete_schedule(*result, "someone-else");
+    CHECK(!deleted);
+
+    auto results = engine.query_schedules();
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].id == *result);
 }
 
 // ── Enable / Disable ───────────────────────────────────────────────────────
@@ -193,7 +212,7 @@ TEST_CASE("ScheduleEngine: set_enabled disables schedule", "[schedule_engine]") 
     auto result = engine.create_schedule(make_schedule("def-1", "interval"));
     REQUIRE(result.has_value());
 
-    engine.set_enabled(*result, false);
+    CHECK(engine.set_enabled(*result, false, "admin"));
 
     ScheduleQuery q;
     q.enabled_only = true;
@@ -209,13 +228,32 @@ TEST_CASE("ScheduleEngine: set_enabled re-enables schedule", "[schedule_engine]"
     auto result = engine.create_schedule(make_schedule("def-1", "interval"));
     REQUIRE(result.has_value());
 
-    engine.set_enabled(*result, false);
-    engine.set_enabled(*result, true);
+    engine.set_enabled(*result, false, "admin");
+    engine.set_enabled(*result, true, "admin");
 
     ScheduleQuery q;
     q.enabled_only = true;
     auto enabled = engine.query_schedules(q);
     REQUIRE(enabled.size() == 1);
+}
+
+// M-01 (#1806): a non-owner's set_enabled must be a no-op, not a silent
+// fleet-wide arm/disarm of someone else's schedule.
+TEST_CASE("ScheduleEngine: set_enabled by a non-owner is rejected and does not change state",
+          "[schedule_engine][m01]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto result = engine.create_schedule(make_schedule("def-1", "interval"));
+    REQUIRE(result.has_value());
+
+    CHECK_FALSE(engine.set_enabled(*result, false, "someone-else"));
+
+    ScheduleQuery q;
+    q.enabled_only = true;
+    auto enabled = engine.query_schedules(q);
+    REQUIRE(enabled.size() == 1); // still enabled — the non-owner's call did nothing
 }
 
 // ── evaluate_due ───────────────────────────────────────────────────────────
@@ -260,7 +298,7 @@ TEST_CASE("ScheduleEngine: evaluate_due does not return disabled schedule", "[sc
     sched.interval_minutes = 1;
     auto result = engine.create_schedule(sched);
     REQUIRE(result.has_value());
-    engine.set_enabled(*result, false);
+    engine.set_enabled(*result, false, "admin");
 
     // Set next_execution_at to past
     auto now = now_epoch();

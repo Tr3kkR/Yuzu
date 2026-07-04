@@ -349,28 +349,28 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                 "application/json");
             return false;
         }
-        // Approval-gated operations (supervised tier on destructive ops) cannot
-        // proceed because the approval workflow re-dispatch path is Phase 2 work.
-        // mcp_server.cpp denies the same case with kTierDenied (it deliberately
-        // does NOT return kApprovalRequired — A4 reserves that for a pollable
-        // approval it cannot produce yet); mirror that denial here so the REST
-        // transport cannot bypass it (#520). Deliberately NO approval_id/status_url
-        // here — there is no pollable approval to hand back yet; a fabricated one
-        // would violate the very §A4 contract. permission + remediation only.
-        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+        // Approval-gated operations (supervised tier on destructive ops).
+        // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
+        // mcp_server.cpp is the AUTHORITATIVE approval gate: it mints a ticket,
+        // and on a recall it verifies + consumes a valid approval before the
+        // per-tool handler ever calls this function (#289 ticket-then-recall).
+        // Re-denying here would break that recall (consume-then-deny) — so skip
+        // it on the MCP endpoint. Keep the denial for EVERY OTHER transport: a
+        // REST route hit by an MCP token must not bypass the ticket flow (#520).
+        if (req.path != "/mcp/v1/" &&
+            mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
-                          securable_type + ":" + operation + " (Phase 2 not implemented)");
+                          securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
             res.set_content(
                 detail::a4_denial(
                     res, 403,
-                    "operation requires approval; approval-gated MCP execution is not yet "
-                    "implemented",
+                    "operation requires approval for this MCP tier on this transport",
                     detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; perform it via an "
-                                               "operator-tier token or the dashboard",
+                                               "supervised MCP tier; use the MCP ticket-then-recall "
+                                               "flow (POST /mcp/v1/) or the dashboard",
                                 .permission = perm}),
                 "application/json");
             return false;
@@ -450,8 +450,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
     // RBAC/role check using the creator's actual role. Approval-gated operations
-    // (supervised tier on destructive ops) are blocked here because Phase 2
-    // re-dispatch is not built — same contract as mcp_server.cpp (#520).
+    // on a non-MCP transport are denied here; on `/mcp/v1/` the ticket-then-recall
+    // flow in mcp_server.cpp is the authoritative approval gate (see guard below,
+    // #289/#520).
     if (!session->mcp_tier.empty()) {
         const std::string perm = securable_type + ":" + operation;
         if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
@@ -464,22 +465,29 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                             "application/json");
             return false;
         }
-        // Deliberately NO approval_id/status_url — no pollable approval exists
-        // yet (Phase 2); a fabricated one would violate §A4. permission +
-        // remediation only, mirroring require_permission and mcp_server.cpp.
-        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+        // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
+        // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
+        // #289) — skip the denial there so a recall isn't consume-then-denied.
+        // Enforced on every other transport so a REST route hit by an MCP token
+        // cannot bypass the ticket flow (#520). NOTE: no MCP write tool is wired
+        // to require_scoped_permission today (they all use require_permission),
+        // so there is no live double-gate here — this guard + the aligned message
+        // are defense-in-depth so a future scoped-auth MCP tool (e.g. an ADR-0017
+        // agent-confined one) can't silently reintroduce consume-then-deny.
+        // Mirrors require_permission exactly (gov: architect/consistency/security).
+        if (req.path != "/mcp/v1/" &&
+            mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
-                          securable_type + ":" + operation + " (Phase 2 not implemented)");
+                          securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
             res.set_content(
                 detail::a4_denial(
                     res, 403,
-                    "operation requires approval; approval-gated MCP execution is not yet "
-                    "implemented",
+                    "operation requires approval for this MCP tier on this transport",
                     detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; perform it via an "
-                                               "operator-tier token or the dashboard",
+                                               "supervised MCP tier; use the MCP ticket-then-recall "
+                                               "flow (POST /mcp/v1/) or the dashboard",
                                 .permission = perm}),
                 "application/json");
             return false;

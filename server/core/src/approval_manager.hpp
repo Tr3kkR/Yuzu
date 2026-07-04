@@ -21,6 +21,24 @@ struct Approval {
     int64_t reviewed_at{0};
     std::string review_comment;
     std::string scope_expression;
+    // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
+    // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
+    // 0 while unconsumed. Additive column (migration v2) — keeps the eventual
+    // Postgres port trivial.
+    int64_t consumed_at{0};
+    // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
+    // principal whose recall executed the gated tool. Empty while unconsumed.
+    // Additive column (migration v3). Completes the ticket's evidence chain:
+    // submitted_by → reviewed_by → consumed_by.
+    std::string consumed_by;
+    /// Empty for an interactively-submitted ticket (workflow_routes.cpp) or an
+    /// MCP-minted one (mcp_server.cpp); set to the owning schedule's id for a
+    /// scheduled-fire submission (M-02, #1806) so
+    /// ScheduleRunner::fire_with_approval can match a ticket to the ONE
+    /// schedule occurrence that asked for it, instead of to every schedule
+    /// sharing the same (submitted_by, definition_id, scope_expression)
+    /// tuple. Additive column (migration v4).
+    std::string schedule_id;
 };
 
 struct ApprovalQuery {
@@ -38,26 +56,68 @@ public:
 
     void create_tables();
 
+    /// `schedule_id` (M-02, #1806): empty for the interactive submit path;
+    /// the owning schedule's id for a scheduled-fire submission — see the
+    /// `Approval::schedule_id` doc comment for why this matters.
     std::expected<std::string, std::string> submit(const std::string& definition_id,
                                                    const std::string& submitted_by,
-                                                   const std::string& scope_expression);
+                                                   const std::string& scope_expression,
+                                                   const std::string& schedule_id = "");
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
-    /// Single-approval lookup by id (read-only). Backs the versioned
-    /// GET /api/v1/approvals/{id} status_url target — query() cannot serve it
-    /// (its LIMIT 100 would false-404 an id that has aged past the top window).
-    /// Returns std::nullopt when no row matches. Does NOT touch the approval
-    /// lifecycle (submit/approve/reject/consumption are elsewhere).
+    /// Single-approval lookup by id (read-only). Two callers: the versioned
+    /// GET /api/v1/approvals/{id} status_url target (query()'s LIMIT 100 would
+    /// false-404 an id that has aged past the top window), and the MCP
+    /// approval-ticket recall path (#289), which reads
+    /// status/definition_id/scope_expression/consumed_at to validate a ticket
+    /// before consuming it. Returns std::nullopt when no row matches; does NOT
+    /// touch the lifecycle (submit/approve/reject/consume are elsewhere).
+    /// True iff the store is usable (schema migrated). False after a failed
+    /// migration — feeds the /readyz + /healthz conjunction so a broken approval
+    /// schema fails the probe instead of serving errors behind a green light
+    /// (governance sre-BLOCKING-1). The handle is borrowed; this never closes it.
+    bool is_open() const { return db_ != nullptr; }
+
     std::optional<Approval> get(const std::string& id) const;
 
+    /// Newest PENDING approval matching (definition_id, submitted_by,
+    /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
+    /// (#289 / governance UP-1): reusing an extant pending ticket makes the mint
+    /// idempotent and stops a supervised token flooding the global pending cap.
+    std::optional<Approval> find_pending(const std::string& definition_id,
+                                         const std::string& submitted_by,
+                                         const std::string& scope_expression) const;
+
     int pending_count() const;
+
+    /// Count of PENDING approvals submitted by one principal. Backs the MCP
+    /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
+    /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
+    /// mint bounds any single supervised token's share of the GLOBAL cap.
+    int pending_count_for(const std::string& submitted_by) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);
 
     std::expected<void, std::string> reject(const std::string& id, const std::string& reviewer,
                                             const std::string& comment);
+
+    /// Atomically consume an APPROVED, not-yet-consumed approval as a one-time
+    /// MCP ticket (#289). Returns ok() iff THIS call transitioned consumed_at
+    /// 0→now — the CAS (`WHERE status='approved' AND consumed_at=0 RETURNING 1`)
+    /// carries the match signal in the step return code, so there is no
+    /// `sqlite3_changes()` race on the shared FULLMUTEX connection (#1033). A
+    /// replay of an already-consumed ticket, or an absent/non-approved id,
+    /// returns unexpected. The caller validates definition_id + args BEFORE
+    /// calling; this method guards the double-consume (concurrent-recall) race so
+    /// a mutating tool executes at most once per ticket.
+    ///
+    /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
+    /// CC7.2) — the caller passes the authenticated principal; it is stored in
+    /// the same CAS UPDATE so the who and the when can never disagree.
+    std::expected<void, std::string> consume_ticket(const std::string& id,
+                                                    const std::string& consumed_by);
 
 private:
     std::expected<void, std::string> set_review_status(const std::string& id,
