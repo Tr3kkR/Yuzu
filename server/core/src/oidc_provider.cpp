@@ -271,11 +271,35 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
         }
     }
 
-    // groups claim: array of Entra security group object IDs
+    // groups claim: array of Entra security group object IDs. `groups_claim_present`
+    // is set whenever the key exists at all (even an empty array) — that is what
+    // lets the caller distinguish "IdP asserts zero groups" from "IdP omitted the
+    // claim" below.
     if (j.contains("groups") && j["groups"].is_array()) {
+        claims.groups_claim_present = true;
         for (auto& g : j["groups"])
             if (g.is_string())
                 claims.groups.push_back(g.get<std::string>());
+    }
+
+    // Group overage (UP-1): Entra (and Graph-backed IdPs generally) OMIT the
+    // `groups` claim entirely — replacing it with an indirection pointer —
+    // once a user belongs to more groups than fit in the token (the
+    // documented threshold is 200 for a v2.0 token with the default claim).
+    // The overage pointer is a `_claim_names` object whose keys name the
+    // overaged claims (`{"groups": "src1"}`), paired with a `_claim_sources`
+    // object describing where to fetch them (e.g. the Graph `getMemberObjects`
+    // endpoint). We key overage detection on `_claim_names.groups`
+    // SPECIFICALLY: a bare `_claim_sources` (or a `_claim_names` naming some
+    // OTHER overaged claim such as `roles`) does NOT mean the groups claim is
+    // truncated, so it must not suppress a genuine groups deprovision. When
+    // groups IS overaged, a caller MUST NOT read the (absent) `groups` array as
+    // "this user is in zero groups", or a heavily-grouped legitimate user has
+    // every one of their IdP-sourced RBAC memberships silently deleted on next
+    // login (see `groups_claim_reconcilable`).
+    if (j.contains("_claim_names") && j["_claim_names"].is_object() &&
+        j["_claim_names"].contains("groups")) {
+        claims.groups_overage = true;
     }
 
     // amr claim: RFC 8176 authentication-method references. Array of
@@ -293,6 +317,10 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
     }
 
     return claims;
+}
+
+bool groups_claim_reconcilable(const IdTokenClaims& claims) {
+    return claims.groups_claim_present && !claims.groups_overage;
 }
 
 std::expected<void, std::string>

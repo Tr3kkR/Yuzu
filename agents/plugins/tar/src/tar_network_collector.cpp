@@ -64,6 +64,11 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+// netqual (per-connection quality via TCP ESTATS — ADR-0020).
+#include <tcpestats.h>
+#include <atomic>
+#include <cstring>
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #endif
 
 // Need netdb.h for getnameinfo on POSIX (included via arpa/inet.h on some
@@ -408,7 +413,10 @@ bool nq_send_dump(int fd, uint8_t family) {
 
 /// Owning-process image name from the socket inode's pid. /proc/[pid]/comm is
 /// the image name only (kernel-truncated to 15 chars) — matches the procperf
-/// "names only" privacy posture, never a command line.
+/// "names only" privacy posture, never a command line. NOTE: unlike procperf's
+/// parse_linux_pid_stat, the bytes are stored UNSANITIZED ('|'/control bytes
+/// pass through) — same class as the process source's status Name:; hardening
+/// all raw-comm consumers together is a tracked follow-up.
 std::string nq_read_comm(uint32_t pid) {
     if (pid == 0)
         return {};
@@ -526,6 +534,8 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
             nq_collect(raw, fam, inode_pid, out);
     return out;
 }
+
+std::string_view netqual_effective_capture_method() { return "inetdiag"; }
 
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
@@ -667,9 +677,11 @@ std::vector<NetConnection> enumerate_connections() {
     return result;
 }
 
-// netqual per-connection quality is Linux-only for now (macOS: nstat /
+// netqual per-connection quality is Linux + Windows for now (macOS: nstat /
 // PRIVATE_TCP_INFO is kPlanned — see the netqual schema source).
 std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
+
+std::string_view netqual_effective_capture_method() { return "none"; }
 
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
@@ -842,6 +854,231 @@ void collect_udp6(std::vector<NetConnection>& out) {
     }
 }
 
+// ── netqual: per-connection quality via TCP ESTATS (ADR-0020) ────────────────
+// Extended stats are DISABLED per connection until SetPerTcp[6]ConnectionEStats
+// enables them (admin-only; a non-elevated agent latches kDenied and netqual
+// records nothing), and the ROD blocks are undefined until the Rw echo reads
+// EnableCollection=TRUE. So the collector runs a two-tick protocol: enable +
+// baseline-read on first sight, emit since-enable deltas on later ticks. Stats
+// are NEVER disabled — since 1709 a disable can reset counters under other
+// ESTATS consumers on the box (and vice versa: a foreign reset shows up here as
+// a negative delta, which nq_delta_clamped degrades to 0 for one tick).
+
+/// Per-tick bound on new Set...EStats enables, so a connection-storm tick costs
+/// a bounded number of extra syscalls; the remainder enable on later ticks.
+constexpr std::size_t kNetQualEnableCapPerTick = 128;
+/// Bound on tracked connections (the per-tick emit cap is kNetQualTopN=50; this
+/// is headroom so a degraded connection is found even on connection-heavy hosts).
+constexpr std::size_t kNetQualMaxTracked = 2048;
+/// If more than this many wall-clock seconds elapsed since the last sweep, every
+/// surviving baseline is re-anchored (emits nothing this tick) instead of
+/// differenced: a delta spanning a long gap — netqual disabled for hours, or the
+/// host slept with connections surviving resume — would otherwise report the
+/// whole gap's cumulative retransmits as ONE tick's `lost` (the current-loss
+/// gauge) and sort those falsified rows to the top-N. Comfortably above the 60s
+/// fast cadence, so a multi-minute gap means disable/sleep, not a slow tick.
+/// Mirrors the #538 clean-baseline-on-re-enable contract Linux netqual gets for
+/// free (it holds no cross-tick state).
+constexpr std::int64_t kNetQualStaleSweepSeconds = 300;
+
+/// Baseline + liveness state for one tracked connection.
+struct NqTracked {
+    NqWinCounters prev{};
+    bool baselined{false}; // first successful ROD read happened; deltas valid
+    uint64_t seen_tick{0};
+};
+
+std::mutex g_nq_mtx; // guards the statics below (collect_fast vs snapshot)
+std::unordered_map<std::string, NqTracked> g_nq_tracked;
+uint64_t g_nq_tick = 0;
+std::int64_t g_nq_last_sweep_unix = 0; // wall-clock of the previous sweep (stale guard)
+
+// Elevation gate: 0=unknown, 1=active, 2=denied. Token elevation is fixed for
+// the process lifetime, so kDenied never re-arms (unlike the module ETW latch).
+std::atomic<int> g_nq_gate{0};
+constexpr int kNqGateActive = 1;
+constexpr int kNqGateDenied = 2;
+
+ULONG nq_set_estats(MIB_TCPROW& row, TCP_ESTATS_TYPE type, PUCHAR rw, ULONG rw_size) {
+    return SetPerTcpConnectionEStats(&row, type, rw, 0, rw_size, 0);
+}
+ULONG nq_set_estats(MIB_TCP6ROW& row, TCP_ESTATS_TYPE type, PUCHAR rw, ULONG rw_size) {
+    return SetPerTcp6ConnectionEStats(&row, type, rw, 0, rw_size, 0);
+}
+ULONG nq_get_estats(MIB_TCPROW& row, TCP_ESTATS_TYPE type, PUCHAR rw, ULONG rw_size, PUCHAR rod,
+                    ULONG rod_size) {
+    return GetPerTcpConnectionEStats(&row, type, rw, 0, rw_size, nullptr, 0, 0, rod, 0, rod_size);
+}
+ULONG nq_get_estats(MIB_TCP6ROW& row, TCP_ESTATS_TYPE type, PUCHAR rw, ULONG rw_size, PUCHAR rod,
+                    ULONG rod_size) {
+    return GetPerTcp6ConnectionEStats(&row, type, rw, 0, rw_size, nullptr, 0, 0, rod, 0, rod_size);
+}
+
+/// Enable Path + Data collection on one connection. ERROR_ACCESS_DENIED is the
+/// caller's latch signal; any other failure just means this connection stays
+/// un-baselined and is retried on a later tick.
+template <typename Row>
+ULONG nq_enable(Row& row) {
+    TCP_ESTATS_PATH_RW_v0 path_rw{};
+    path_rw.EnableCollection = TRUE;
+    ULONG ret = nq_set_estats(row, TcpConnectionEstatsPath,
+                              reinterpret_cast<PUCHAR>(&path_rw), sizeof(path_rw));
+    if (ret != NO_ERROR)
+        return ret;
+    TCP_ESTATS_DATA_RW_v0 data_rw{};
+    data_rw.EnableCollection = TRUE;
+    return nq_set_estats(row, TcpConnectionEstatsData, reinterpret_cast<PUCHAR>(&data_rw),
+                         sizeof(data_rw));
+}
+
+/// Read Path + Data RODs into plain counters. Returns NO_ERROR only when both
+/// reads succeed AND both Rw echoes confirm collection is on — the RODs are
+/// documented "meaningless random data" otherwise. ERROR_NOT_FOUND propagates
+/// (connection closed between table read and here); a disabled Rw echo maps to
+/// ERROR_INVALID_STATE so the caller re-enables.
+template <typename Row>
+ULONG nq_read(Row& row, NqWinCounters& out) {
+    TCP_ESTATS_PATH_RW_v0 path_rw{};
+    TCP_ESTATS_PATH_ROD_v0 path_rod{};
+    ULONG ret = nq_get_estats(row, TcpConnectionEstatsPath, reinterpret_cast<PUCHAR>(&path_rw),
+                              sizeof(path_rw), reinterpret_cast<PUCHAR>(&path_rod),
+                              sizeof(path_rod));
+    if (ret != NO_ERROR)
+        return ret;
+    TCP_ESTATS_DATA_RW_v0 data_rw{};
+    TCP_ESTATS_DATA_ROD_v0 data_rod{};
+    ret = nq_get_estats(row, TcpConnectionEstatsData, reinterpret_cast<PUCHAR>(&data_rw),
+                        sizeof(data_rw), reinterpret_cast<PUCHAR>(&data_rod), sizeof(data_rod));
+    if (ret != NO_ERROR)
+        return ret;
+    if (!path_rw.EnableCollection || !data_rw.EnableCollection)
+        return ERROR_INVALID_STATE; // another consumer disabled us — re-enable
+
+    out.smoothed_rtt_ms = path_rod.SmoothedRtt;
+    out.rtt_var_ms = path_rod.RttVar;
+    out.pkts_retrans = path_rod.PktsRetrans;
+    out.timeouts = path_rod.Timeouts;
+    out.fast_retran = path_rod.FastRetran;
+    out.dup_acks_in = path_rod.DupAcksIn;
+    out.ecn_signals = path_rod.EcnSignals;
+    out.cur_timeout_count = path_rod.CurTimeoutCount;
+    out.segs_out = static_cast<int64_t>(data_rod.SegsOut);
+    return NO_ERROR;
+}
+
+/// Owning-process image basename from the connection's pid — same names-only
+/// privacy posture as procperf (never a path, never a command line). Per-tick
+/// cache: connection-heavy hosts share few distinct pids.
+std::string nq_process_name(uint32_t pid, std::unordered_map<uint32_t, std::string>& cache) {
+    if (pid == 0)
+        return {};
+    if (auto it = cache.find(pid); it != cache.end())
+        return it->second;
+    std::string name;
+    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h) {
+        WCHAR path[MAX_PATH * 2];
+        DWORD len = static_cast<DWORD>(std::size(path));
+        if (::QueryFullProcessImageNameW(h, 0, path, &len)) {
+            std::wstring_view wpath(path, len);
+            const auto slash = wpath.find_last_of(L'\\');
+            if (slash != std::wstring_view::npos)
+                wpath.remove_prefix(slash + 1);
+            name = yuzu::win::from_wide(wpath.data(), static_cast<int>(wpath.size()));
+        }
+        ::CloseHandle(h);
+    }
+    cache.emplace(pid, name);
+    return name;
+}
+
+/// One connection's pass through the two-tick protocol. `enables` is the shared
+/// per-tick Set budget. Returns false only on the ACCESS_DENIED latch signal.
+template <typename Row>
+bool nq_visit(Row& row, std::string key, const std::string& proto, std::string remote,
+              uint32_t pid, std::size_t& enables,
+              std::unordered_map<uint32_t, std::string>& name_cache,
+              std::vector<TcpQualitySample>& out) {
+    auto it = g_nq_tracked.find(key);
+    if (it == g_nq_tracked.end()) {
+        if (g_nq_tracked.size() >= kNetQualMaxTracked || enables >= kNetQualEnableCapPerTick)
+            return true; // over budget — untracked this tick, retried later
+        ++enables;
+        const ULONG ret = nq_enable(row);
+        if (ret == ERROR_ACCESS_DENIED)
+            return false;
+        if (ret != NO_ERROR)
+            return true; // connection raced closed / transient — retry later
+        NqTracked t;
+        t.seen_tick = g_nq_tick;
+        // Baseline read now: with a fresh enable the counters start ~0, but if
+        // ANOTHER consumer already had stats on they are large — reading (not
+        // assuming zero) keeps the first emitted delta honest either way.
+        t.baselined = (nq_read(row, t.prev) == NO_ERROR);
+        g_nq_tracked.emplace(std::move(key), std::move(t));
+        return true; // enable tick emits nothing
+    }
+
+    it->second.seen_tick = g_nq_tick;
+    NqWinCounters cur;
+    const ULONG ret = nq_read(row, cur);
+    if (ret == ERROR_NOT_FOUND) {
+        g_nq_tracked.erase(it); // closed under us
+        return true;
+    }
+    if (ret == ERROR_INVALID_STATE) {
+        // Foreign disable: re-enable (budgeted) and re-baseline next tick.
+        if (enables < kNetQualEnableCapPerTick) {
+            ++enables;
+            if (nq_enable(row) == ERROR_ACCESS_DENIED)
+                return false;
+        }
+        it->second.baselined = false;
+        return true;
+    }
+    if (ret != NO_ERROR)
+        return true; // transient — keep baseline, skip this tick
+    if (!it->second.baselined) {
+        it->second.prev = cur; // first good read after (re-)enable — baseline only
+        it->second.baselined = true;
+        return true;
+    }
+    out.push_back(nq_win_build_sample(cur, it->second.prev, proto, std::move(remote),
+                                      nq_process_name(pid, name_cache)));
+    it->second.prev = cur;
+    return true;
+}
+
+/// Fetch an OWNER_PID TCP table for `family`, retrying the documented
+/// size-probe/fetch TOCTOU up to 3× on ERROR_INSUFFICIENT_BUFFER (the table can
+/// grow between the size call and the fetch on a connection-churn host — the
+/// same race the sibling collect_tcp4/6 loops guard). Returns true (buf filled,
+/// possibly empty when the host has no connections of this family — a valid
+/// result safe to prune against) or false (the family could NOT be read this
+/// tick — the caller must skip pruning it, or a transient failure would erase
+/// every still-live baseline and blank netqual for that family for many ticks).
+bool nq_fetch_tcp_table(ULONG family, std::vector<BYTE>& buf) {
+    buf.clear();
+    DWORD size = 0;
+    GetExtendedTcpTable(nullptr, &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0)
+        return true; // no connections of this family — genuine empty, prune-safe
+    buf.resize(size);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const DWORD ret =
+            GetExtendedTcpTable(buf.data(), &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (ret == NO_ERROR)
+            return true;
+        if (ret == ERROR_INSUFFICIENT_BUFFER) {
+            buf.resize(size); // grew between probe and fetch — retry at the new size
+            continue;
+        }
+        break; // hard failure — leave buf cleared, report unread
+    }
+    buf.clear();
+    return false;
+}
+
 } // namespace
 
 std::vector<NetConnection> enumerate_connections() {
@@ -855,9 +1092,127 @@ std::vector<NetConnection> enumerate_connections() {
     return result;
 }
 
-// netqual per-connection quality is Linux-only for now (Windows: ESTATS /
-// Microsoft-Windows-TCPIP ETW is kPlanned — see the netqual schema source).
-std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
+std::vector<TcpQualitySample> collect_tcp_quality() {
+    std::vector<TcpQualitySample> out;
+    if (g_nq_gate.load(std::memory_order_relaxed) == kNqGateDenied)
+        return out; // non-elevated: latched for the process lifetime
+
+    // Raw ESTABLISHED tables (OWNER_PID variants — the pid feeds process_name).
+    // Fetched before the state lock (retry the size race, like the sibling
+    // collectors); only the tracked-map work is serialized. v4_ok/v6_ok gate
+    // the per-family prune below so a transient read failure does not wipe live
+    // baselines.
+    std::vector<BYTE> buf4, buf6;
+    const bool v4_ok = nq_fetch_tcp_table(AF_INET, buf4);
+    const bool v6_ok = nq_fetch_tcp_table(AF_INET6, buf6);
+
+    std::lock_guard lock(g_nq_mtx);
+    ++g_nq_tick;
+
+    // Stale-gap guard: if too long elapsed since the last sweep (netqual was
+    // disabled, or the host slept), re-anchor every surviving baseline so this
+    // tick emits nothing rather than reporting the whole gap's retransmits as
+    // one tick's current loss. Connections still established get re-baselined in
+    // the visit loops; ones that vanished are pruned as usual.
+    const std::int64_t now_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+    if (g_nq_last_sweep_unix != 0 &&
+        now_unix - g_nq_last_sweep_unix > kNetQualStaleSweepSeconds) {
+        for (auto& [k, t] : g_nq_tracked)
+            t.baselined = false;
+    }
+    g_nq_last_sweep_unix = now_unix;
+
+    std::size_t enables = 0;
+    std::unordered_map<uint32_t, std::string> name_cache;
+    bool denied = false;
+
+    if (!buf4.empty()) {
+        auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf4.data());
+        for (DWORD i = 0; i < table->dwNumEntries && !denied; ++i) {
+            auto& r = table->table[i];
+            if (r.dwState != MIB_TCP_STATE_ESTAB)
+                continue;
+            MIB_TCPROW row{};
+            row.dwState = r.dwState;
+            row.dwLocalAddr = r.dwLocalAddr;
+            row.dwLocalPort = r.dwLocalPort;
+            row.dwRemoteAddr = r.dwRemoteAddr;
+            row.dwRemotePort = r.dwRemotePort;
+            std::string remote = format_win_addr4(r.dwRemoteAddr);
+            std::string key = nq_v4_key(format_win_addr4(r.dwLocalAddr),
+                                        ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
+                                        ntohs(static_cast<u_short>(r.dwRemotePort)));
+            denied = !nq_visit(row, std::move(key), "tcp", std::move(remote),
+                               static_cast<uint32_t>(r.dwOwningPid), enables, name_cache, out);
+        }
+    }
+    if (!buf6.empty()) {
+        auto* table = reinterpret_cast<MIB_TCP6TABLE_OWNER_PID*>(buf6.data());
+        for (DWORD i = 0; i < table->dwNumEntries && !denied; ++i) {
+            auto& r = table->table[i];
+            if (r.dwState != MIB_TCP_STATE_ESTAB)
+                continue;
+            MIB_TCP6ROW row{};
+            row.State = static_cast<MIB_TCP_STATE>(r.dwState);
+            std::memcpy(&row.LocalAddr, r.ucLocalAddr, sizeof(row.LocalAddr));
+            row.dwLocalScopeId = r.dwLocalScopeId; // required, or link-local rows
+            row.dwLocalPort = r.dwLocalPort;       // fail ERROR_NOT_FOUND
+            std::memcpy(&row.RemoteAddr, r.ucRemoteAddr, sizeof(row.RemoteAddr));
+            row.dwRemoteScopeId = r.dwRemoteScopeId;
+            row.dwRemotePort = r.dwRemotePort;
+            std::string remote = format_win_addr6(r.ucRemoteAddr);
+            // Scope IDs are part of the key (see nq_v6_key): two link-local
+            // connections can share address+port and differ only by zone.
+            std::string key = nq_v6_key(format_win_addr6(r.ucLocalAddr), r.dwLocalScopeId,
+                                        ntohs(static_cast<u_short>(r.dwLocalPort)), remote,
+                                        r.dwRemoteScopeId,
+                                        ntohs(static_cast<u_short>(r.dwRemotePort)));
+            denied = !nq_visit(row, std::move(key), "tcp6", std::move(remote),
+                               static_cast<uint32_t>(r.dwOwningPid), enables, name_cache, out);
+        }
+    }
+
+    if (denied) {
+        // One warn for the whole session — the status action carries the state
+        // (netqual_capture_method=none) from here on.
+        g_nq_gate.store(kNqGateDenied, std::memory_order_relaxed);
+        spdlog::warn("TAR netqual: SetPerTcpConnectionEStats returned ACCESS_DENIED — "
+                     "ESTATS needs an elevated agent; netqual records nothing this session");
+        g_nq_tracked.clear();
+        return {};
+    }
+    g_nq_gate.store(kNqGateActive, std::memory_order_relaxed);
+
+    // Prune connections that left the ESTABLISHED table (stats die with the TCB;
+    // nothing to disable — see the never-disable note above) — but ONLY for a
+    // family whose table we actually read this tick. A family whose fetch failed
+    // (v4_ok/v6_ok == false) is skipped: its entries keep their baselines and are
+    // revisited next tick, instead of being wiped and re-enabled 128-at-a-time.
+    std::erase_if(g_nq_tracked, [&](const auto& kv) {
+        if (kv.second.seen_tick == g_nq_tick)
+            return false; // observed this tick — keep
+        return kv.first.starts_with("tcp6|") ? v6_ok : v4_ok;
+    });
+    return out;
+}
+
+std::string_view netqual_effective_capture_method() {
+    // Tri-state, honestly: only claim "estats" once the elevation gate has
+    // actually latched active. Until the first collect_fast tick tests it (or
+    // when netqual is disabled), the gate is kNqGateUnknown and we report
+    // "estats_pending" — NOT "estats" — so a non-elevated agent no longer
+    // advertises "estats" for the first interval before flipping to "none".
+    switch (g_nq_gate.load(std::memory_order_relaxed)) {
+    case kNqGateDenied:
+        return "none";
+    case kNqGateActive:
+        return "estats";
+    default:
+        return "estats_pending";
+    }
+}
 
 #else
 // Unsupported platform
@@ -867,6 +1222,7 @@ std::vector<NetConnection> enumerate_connections() {
 std::vector<TcpQualitySample> collect_tcp_quality() {
     return {};
 }
+std::string_view netqual_effective_capture_method() { return "none"; }
 #endif
 
 } // namespace yuzu::tar

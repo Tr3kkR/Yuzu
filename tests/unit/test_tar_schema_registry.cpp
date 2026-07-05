@@ -237,7 +237,8 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // disabled on a fresh agent; software is opt-in too (off by default — the
     // cautious posture for a new capture source, #1620); everything else is
     // always-on.
-    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software"}) {
+    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software", "netconn",
+                             "mapdrive"}) {
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }
@@ -281,6 +282,35 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
     }
 }
 
+TEST_CASE("TAR schema: perf + procperf are supported on Windows AND Linux (procfs)",
+          "[tar][schema][perf]") {
+    const auto& sources = capture_sources();
+    for (const auto* name : {"perf", "procperf"}) {
+        auto it = std::find_if(sources.begin(), sources.end(),
+                               [&](const CaptureSourceDef& s) { return s.name == name; });
+        REQUIRE(it != sources.end());
+        // All three OS rows must be PRESENT — without this the loop would pass
+        // vacuously if a row were ever dropped from os_support.
+        REQUIRE(it->os_support.size() == 3);
+        bool saw_windows = false, saw_linux = false, saw_macos = false;
+        for (const auto& os : it->os_support) {
+            INFO("source=" << name << " os=" << os.os);
+            if (os.os == "windows" || os.os == "linux") {
+                (os.os == "windows" ? saw_windows : saw_linux) = true;
+                CHECK(os.status == OsSupportStatus::kSupported);
+                if (os.os == "linux")
+                    CHECK(os.capture_method == "procfs");
+            } else {
+                saw_macos = (os.os == "macos");
+                CHECK(os.status == OsSupportStatus::kPlanned); // macOS still planned
+            }
+        }
+        CHECK(saw_windows);
+        CHECK(saw_linux);
+        CHECK(saw_macos);
+    }
+}
+
 TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns",
           "[tar][schema][software]") {
     CHECK(translate_dollar_name("$Software_Live") == "software_live");
@@ -313,4 +343,76 @@ TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns"
         INFO("software_daily column=" << c);
         CHECK(std::find(daily_cols.begin(), daily_cols.end(), c) != daily_cols.end());
     }
+}
+
+TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-0020)",
+          "[tar][schema][netqual]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "netqual"; });
+    REQUIRE(it != sources.end());
+
+    // Windows graduated kPlanned -> kSupportedConstrained (elevation-gated, ms
+    // RTT, since-enable lifetimes); Linux stays fully supported; macOS planned.
+    for (const auto& os : it->os_support) {
+        INFO("netqual os=" << os.os);
+        if (os.os == "windows") {
+            CHECK(os.status == OsSupportStatus::kSupportedConstrained);
+            CHECK(os.capture_method == "estats");
+        } else if (os.os == "linux") {
+            CHECK(os.status == OsSupportStatus::kSupported);
+        } else {
+            CHECK(os.status == OsSupportStatus::kPlanned);
+        }
+    }
+    auto win_methods = accepted_capture_methods_for_os("netqual", "windows");
+    CHECK(std::find(win_methods.begin(), win_methods.end(), "estats") != win_methods.end());
+
+    // live + the per-boot retrospective baseline tier.
+    REQUIRE(it->granularities.size() == 2);
+    CHECK(it->granularities[0].suffix == "live");
+    CHECK(it->granularities[1].suffix == "boot");
+    CHECK(it->granularities[1].retention_type == RetentionType::kRowCount);
+
+    CHECK(translate_dollar_name("$NetQual_Boot") == "netqual_boot");
+    CHECK(is_queryable_table("netqual_boot"));
+    auto boot_cols = columns_for_table("netqual_boot");
+    for (const auto* c : {"boot_ts", "window_s", "retrans_segs", "segs_out", "if_in_errors"}) {
+        INFO("netqual_boot column=" << c);
+        CHECK(std::find(boot_cols.begin(), boot_cols.end(), c) != boot_cols.end());
+    }
+}
+
+TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevtapi support",
+          "[tar][schema][netconn]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "netconn"; });
+    REQUIRE(it != sources.end());
+    CHECK(it->dollar_name == "NetConn");
+    CHECK_FALSE(it->default_enabled); // opt-in usage-class posture
+
+    REQUIRE(it->granularities.size() == 1);
+    CHECK(it->granularities[0].suffix == "live");
+    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+
+    for (const auto& os : it->os_support) {
+        INFO("netconn os=" << os.os);
+        if (os.os == "windows") {
+            CHECK(os.status == OsSupportStatus::kSupported);
+            CHECK(os.capture_method == "wevtapi");
+        } else {
+            CHECK(os.status == OsSupportStatus::kPlanned);
+        }
+    }
+
+    CHECK(translate_dollar_name("$NetConn_Live") == "netconn_live");
+    CHECK(is_queryable_table("netconn_live"));
+    auto cols = columns_for_table("netconn_live");
+    // The full column set IS the privacy contract: closed enum/numeric fields
+    // only — any free-text addition (SSID, profile name, GUID) must fail here.
+    const std::vector<std::string> expected = {"id",         "ts",       "snapshot_id",
+                                               "action",     "channel",  "category",
+                                               "capability", "iface_kind", "reason_code"};
+    CHECK(cols == expected);
 }

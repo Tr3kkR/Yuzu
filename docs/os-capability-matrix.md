@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-06-27._
+_Last hand-updated: 2026-07-03._
 
 ## Matrix
 
@@ -26,9 +26,9 @@ _Last hand-updated: 2026-06-27._
 | **Guardian — file guard** | ✅ | ⛔ | ⛔ | `guard_file.cpp` (no-op off-Windows) |
 | **Guardian — service run-state guard** | ✅ enforce | 🟡 observe-only | ⛔ | `make_service_guard()` in `guard_systemd.hpp`; Win `ServiceGuard` (SCM), Linux `SystemdServiceGuard` (sd-bus, enforce deferred) |
 | **DEX — reliability signals** (crashes, hangs, service/boot, storage, kernel faults, perf/thermal, …) | ✅ | 🟡 growing (17 signals: perf cpu/mem/disk + storage/uptime + journald unit-crash/hung + coredump-crash + OOM + time-unsynced + kernel panic/disk/fs/dirty-shutdown/MCE/hung-task + thermal-throttle) | 🟡 | Win: `dex_observer.cpp`/`dex_win_poll.cpp`; Linux: `dex_linux_collector.cpp`/`dex_linux_proc.cpp`/`dex_linux_storage.cpp`/`dex_linux_journal.cpp`/`dex_linux_kmsg.cpp`/`dex_linux_sysfs.cpp`; macOS: `dex_macos_collector.cpp` (DiagnosticReports/OSLog/IOKit). Catalogue: `docs/dex-signal-catalog.md` |
-| **DEX — performance telemetry** (CPU/mem/disk levels) | ✅ | ✅ | ⛔ | `tar_perf.cpp` (Win: GetSystemTimes/IOCTL_DISK_PERFORMANCE/GetIfTable2; Linux: `/proc`). macOS absent from the rollup |
+| **DEX — performance telemetry** (CPU/mem/disk levels) | ✅ | ✅ | ⛔ | Two paths, both live on Win+Linux: DEX breach sampling (`dex_win_poll.cpp` / `dex_linux_proc.cpp`) and the TAR `$Perf_*` sampler (`tar_perf.cpp` — Win kernel counters; Linux `/proc` via `parse_linux_perf_counters`). macOS absent from the rollup |
 | **DEX — per-app file version** (on procperf + on crash/hang signals; the `(name, version)` identity) | ✅ | ⛔ (emits `""`) | ⛔ (emits `""`) | Win: procperf reads `VS_FIXEDFILEINFO` via `GetFileVersionInfo` (`tar_proc_perf.cpp`, schema v4); crash/hang read WER `AppVersion` (`dex_signal_catalog.cpp`, migration {8}); both canonicalized by `yuzu::util::canon_version`. Linux/macOS emit `""` (unknown bucket) — version capture is a follow-up (`COREDUMP_PACKAGE_VERSION` / ELF `.note.package`; `.ips` bundle) |
-| **DEX — per-app performance over time** (B1 per-device daily + B2 fleet aggregate/histogram, by `(app, version, day)`) | ✅ | ⛔ (no data) | ⛔ (no data) | Fed by procperf (Windows-only — see "DEX — performance telemetry" / per-app rows), shipped via the `app_perf` daily-sync source (`sync_source_app_perf.cpp`) → server `AppPerfDailyStore` (B1) → `AppPerfRollup`/`AppPerfFleetStore` (B2). Off-Windows procperf is `kPlanned`, so the source's rollup is empty and nothing is sent. Server plumbing is platform-agnostic — Linux/macOS light up when their per-app collectors land |
+| **DEX — per-app performance over time** (B1 per-device daily + B2 fleet aggregate/histogram, by `(app, version, day)`) | ✅ | 🟡 (opt-in; version `""`) | ⛔ (no data) | Fed by procperf (Windows + Linux — see "DEX — performance telemetry" / per-app rows), shipped via the `app_perf` daily-sync source (`sync_source_app_perf.cpp`) → server `AppPerfDailyStore` (B1) → `AppPerfRollup`/`AppPerfFleetStore` (B2). Linux rows land in the `version=""` unknown bucket (per-app file version row above) once `procperf_enabled=true` is set. macOS procperf is `kPlanned`, so its rollup is empty and nothing is sent; server plumbing is platform-agnostic — macOS lights up when its per-app collector lands |
 | **Network quality** (`/network`: throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | ⛔ | `net_quality_sampler.cpp`; per-OS detail in `docs/user-manual/network.md` "Platform coverage" |
 | **TAR warehouse capture sources** (per source) | varies | varies | varies | **Authoritative & machine-readable:** `tar_schema_registry.cpp` `OsSupportStatus::{kSupported,kPlanned}` per source, with a notes string |
 | **TAR — ARP table** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `arp` def (Win `kSupported` via `iphlpapi`; Linux `kPlanned` `/proc/net/arp`; macOS `kPlanned` route sysctl, constrained — `entry_type 'unknown'`); collector `tar_arp_collector.cpp` (ADR-0015, opt-in) |

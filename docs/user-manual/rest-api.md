@@ -3999,7 +3999,7 @@ One signal type's drill-down.
 Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` is the coverage-honest denominator (perf collectors are Windows-only today). Not audited.
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` counts online Windows devices — historically the coverage-honest denominator when perf collectors were Windows-only. **Known limitation:** the TAR perf collector now also runs on Linux, so `reporting` can legitimately exceed `windows_online` on mixed fleets; an OS-aware denominator is a tracked follow-up. Not audited.
 
 #### `GET /api/v1/dex/perf/cohorts`
 
@@ -4022,7 +4022,7 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle. **Known limitation:** Linux perf devices are excluded from this complement list — same OS-aware-denominator follow-up as `/dex/perf/fleet` above — so a Linux non-reporter does not appear here); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
 ### Application performance over time
@@ -4857,13 +4857,32 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`, and
+`total_cves`. **`total_cves` is a count of distinct CVEs** in the local store.
+(Prior to the CPE-range-matching change it counted one row per affected
+product, so a multi-product CVE inflated the figure — after upgrade the number
+reads lower even once fully synced, and reads near-zero briefly after the
+one-time schema migration until the next sync repopulates the mirror. This is
+expected, not data loss.)
+
 #### `POST /api/nvd/sync`
 
 Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
-Match installed software against known CVEs in the NVD database.
+Match installed software against known CVEs in the NVD database. Matching
+evaluates full CPE version ranges (`versionStartIncluding/Excluding`,
+`versionEndIncluding/Excluding`, exact and wildcard). Product identity is
+matched by name (case-insensitive); vendor-precise CPE identity is a planned
+enhancement (ADR-0018), so name-collision false positives are possible.
+In each match, `fixed_in` carries the range's **exclusive upper bound**
+(`versionEndExcluding`) when present; it is empty for inclusive-end, exact,
+or wildcard matches — empty means "no fix boundary derivable from the range
+shape", not "no fix available". Distro revision markers (e.g. Debian `~` in
+`1.0.0~deb1`) are compared as plain separators rather than pre-release
+markers, so distro-backported versions can produce false negatives until
+backport-aware matching (M1b/OVAL) lands.
 
 ---
 

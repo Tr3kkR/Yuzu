@@ -21,6 +21,16 @@
  * `retrans`/`segs_out` are lifetime-cumulative CONTEXT only — never build a
  * "current loss" signal from their ratio (it is diluted by historical clean
  * segments, which is exactly why the device-aggregate signal was disproven).
+ *
+ * Windows (ESTATS — ADR-0020) diverges in three documented ways:
+ *   - `lost` is the per-tick DELTA of Path.PktsRetrans (wrap-clamped >= 0);
+ *     Windows exposes no instantaneous lost-segment gauge, and the delta is
+ *     the closest moves-with-current-conditions analogue.
+ *   - `retrans`/`segs_out` count since STATS-ENABLE (the first tick the
+ *     collector saw the connection), not since connection start.
+ *   - `ca_state` is SYNTHESIZED from Path deltas (nq_win_ca_state below);
+ *     `rtt_us`/`rtt_var_us` are ms-resolution scaled to µs (a sub-ms LAN RTT
+ *     reads as 0).
  */
 
 #include "tar_db.hpp" // NetQualRow
@@ -28,7 +38,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <string>
+#include <string_view>
+#include <utility> // std::move (nq_win_build_sample)
 #include <vector>
 
 namespace yuzu::tar {
@@ -147,6 +160,108 @@ inline std::vector<NetQualRow> select_netqual_rows(const std::vector<TcpQualityS
         rows.push_back(std::move(r));
     }
     return rows;
+}
+
+// ── Windows ESTATS derivation (pure — the platform reads stay in the collector) ──
+
+/// PURE: build the g_nq_tracked key for a v6 connection. The scope IDs are
+/// LOAD-BEARING: two link-local connections can share the same textual
+/// address+port and differ only by zone (dwLocalScopeId / dwRemoteScopeId) —
+/// which the MIB_TCP6ROW the collector builds also requires — so a key without
+/// them would collide and attribute one connection's RTT/retransmit deltas to
+/// the other. Kept pure + header-inline so the distinctness is unit-testable
+/// cross-platform.
+inline std::string nq_v6_key(std::string_view laddr, std::uint32_t lscope, int lport,
+                             std::string_view raddr, std::uint32_t rscope, int rport) {
+    return std::format("tcp6|{}%{}:{}|{}%{}:{}", laddr, lscope, lport, raddr, rscope, rport);
+}
+
+/// PURE: build the g_nq_tracked key for a v4 connection (no scope id in IPv4).
+inline std::string nq_v4_key(std::string_view laddr, int lport, std::string_view raddr,
+                             int rport) {
+    return std::format("tcp|{}:{}|{}:{}", laddr, lport, raddr, rport);
+}
+
+/// One tick's raw Windows ESTATS counters for a connection, cumulative since
+/// stats-enable (TCP_ESTATS_PATH_ROD_v0 + TCP_ESTATS_DATA_ROD_v0), copied into
+/// plain integers so the derivation below stays header-pure and unit-testable
+/// off Windows. RTT fields are ESTATS-native MILLISECONDS.
+struct NqWinCounters {
+    int64_t smoothed_rtt_ms{0};
+    int64_t rtt_var_ms{0};
+    int64_t pkts_retrans{0};
+    int64_t timeouts{0};
+    int64_t fast_retran{0};
+    int64_t dup_acks_in{0};
+    int64_t ecn_signals{0};
+    int64_t cur_timeout_count{0}; ///< instantaneous (not cumulative)
+    int64_t segs_out{0};
+};
+
+/// Per-tick deltas of the Path counters (wrap-clamped >= 0), the input to
+/// nq_win_ca_state. cur_timeout_count is carried as-is: it is a live gauge of
+/// outstanding RTO episodes, not a counter.
+struct NqPathDeltas {
+    int64_t timeouts{0};
+    int64_t fast_retran{0};
+    int64_t pkts_retrans{0};
+    int64_t dup_acks_in{0};
+    int64_t ecn_signals{0};
+    int64_t cur_timeout_count{0};
+};
+
+/// Counter delta clamped at zero: ESTATS Path counters are 32-bit and another
+/// ESTATS consumer disabling/re-enabling collection can reset them, so a
+/// negative delta means "unknown this tick", never a real value.
+inline int64_t nq_delta_clamped(int64_t cur, int64_t prev) {
+    const int64_t d = cur - prev;
+    return d < 0 ? 0 : d;
+}
+
+/// Synthesize a Linux tcpi_ca_state analogue (0=Open .. 4=Loss) from one tick's
+/// Path deltas. Precedence mirrors severity: an RTO episode (in progress or
+/// completed this tick) is Loss; any retransmission activity is Recovery; ECN
+/// congestion signals are CWR; duplicate ACKs alone are Disorder; else Open.
+inline int64_t nq_win_ca_state(const NqPathDeltas& d) {
+    if (d.cur_timeout_count > 0 || d.timeouts > 0)
+        return 4; // Loss
+    if (d.fast_retran > 0 || d.pkts_retrans > 0)
+        return 3; // Recovery
+    if (d.ecn_signals > 0)
+        return 2; // CWR
+    if (d.dup_acks_in > 0)
+        return 1; // Disorder
+    return 0;     // Open
+}
+
+/// PURE: derive a TcpQualitySample from this tick's ESTATS counters and the
+/// previous tick's (both cumulative since stats-enable). Applies the Windows
+/// semantics documented in the header comment: µs scaling, delta-based `lost`,
+/// synthesized `ca_state`. The collector calls this only for connections with a
+/// previous baseline — the enable tick emits nothing (RODs are undefined until
+/// collection is on, and a since-enable delta needs two reads).
+inline TcpQualitySample nq_win_build_sample(const NqWinCounters& cur, const NqWinCounters& prev,
+                                            std::string proto, std::string remote_addr,
+                                            std::string process_name) {
+    NqPathDeltas d;
+    d.timeouts = nq_delta_clamped(cur.timeouts, prev.timeouts);
+    d.fast_retran = nq_delta_clamped(cur.fast_retran, prev.fast_retran);
+    d.pkts_retrans = nq_delta_clamped(cur.pkts_retrans, prev.pkts_retrans);
+    d.dup_acks_in = nq_delta_clamped(cur.dup_acks_in, prev.dup_acks_in);
+    d.ecn_signals = nq_delta_clamped(cur.ecn_signals, prev.ecn_signals);
+    d.cur_timeout_count = cur.cur_timeout_count;
+
+    TcpQualitySample s;
+    s.proto = std::move(proto);
+    s.remote_addr = std::move(remote_addr);
+    s.process_name = std::move(process_name);
+    s.rtt_us = cur.smoothed_rtt_ms * 1000; // ESTATS Path is ms; the schema is µs
+    s.rtt_var_us = cur.rtt_var_ms * 1000;
+    s.lost = d.pkts_retrans;      // current-conditions gauge (see SIGNAL DISCIPLINE)
+    s.retrans = cur.pkts_retrans; // cumulative since stats-enable — context
+    s.segs_out = cur.segs_out;    // cumulative since stats-enable — context
+    s.ca_state = nq_win_ca_state(d);
+    return s;
 }
 
 } // namespace yuzu::tar

@@ -159,6 +159,129 @@ TEST_CASE("OIDC: amr absent leaves the vector empty", "[oidc][amr]") {
     CHECK(result->amr.empty());
 }
 
+// ── groups claim / group-overage (UP-1) ─────────────────────────────────────
+
+TEST_CASE("OIDC: groups claim present and non-empty", "[oidc][groups]") {
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["g1", "g2"]
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    REQUIRE(result->groups.size() == 2);
+    CHECK(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: groups claim present but empty — genuine deprovisioning assertion",
+         "[oidc][groups]") {
+    // Distinct from "claim absent": the IdP explicitly asserts the user is
+    // in ZERO groups (e.g. every group membership was removed). This MUST
+    // be reconcilable — it's what makes deprovisioning propagate.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": []
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: groups claim absent (no overage pointer either)", "[oidc][groups]") {
+    // A plain IdP that simply never emits a `groups` claim — not the same as
+    // the Entra overage case, but must be treated identically by the
+    // caller: unreconcilable (don't run a destructive reconcile against an
+    // absent claim).
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK_FALSE(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: Entra group overage via _claim_names/_claim_sources (UP-1)",
+         "[oidc][groups]") {
+    // Real Entra shape: `groups` is OMITTED and replaced by an indirection
+    // pointer once the user is in more groups than fit in the token.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "_claim_names": {"groups": "src1"},
+        "_claim_sources": {
+            "src1": {
+                "endpoint": "https://graph.microsoft.com/v1.0/users/user123/getMemberObjects"
+            }
+        }
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->groups_claim_present);
+    CHECK(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK_FALSE(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: non-groups overage does NOT flag groups overage (precision)",
+         "[oidc][groups]") {
+    // A `_claim_sources` / `_claim_names` naming some OTHER overaged claim
+    // (here `roles`) must NOT suppress a genuine groups deprovision: an
+    // authoritative, present `groups` array alongside a roles-overage pointer
+    // is still reconcilable. Keying overage on `_claim_names.groups` avoids the
+    // over-conservative skip flagged in the #1832 hardening security re-review.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["gid-a"],
+        "_claim_names": {"roles": "src1"},
+        "_claim_sources": {"src1": {"endpoint": "https://graph.microsoft.com/..."}}
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(groups_claim_reconcilable(*result));  // groups authoritative -> reconcile runs
+}
+
+TEST_CASE("OIDC: an unrelated _claim_names entry does not flag groups overage",
+         "[oidc][groups]") {
+    // Only a `groups` key inside `_claim_names` counts — some IdPs use the
+    // same indirection mechanism for other overaged claims (e.g. `roles`).
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["g1"],
+        "_claim_names": {"roles": "src1"}
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(groups_claim_reconcilable(*result));
+}
+
 TEST_CASE("OIDC: malformed iat/exp/sub do not throw (sec-M1 type-guard)", "[oidc][amr]") {
     // A signature-valid token whose iat is a JSON string, or sub is a
     // number, must NOT throw an uncaught nlohmann type_error out of

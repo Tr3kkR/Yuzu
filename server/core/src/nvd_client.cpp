@@ -25,6 +25,10 @@ constexpr int kResultsPerPage = 2000;
 constexpr auto kPublicInterval = std::chrono::milliseconds(6000); // 5 req / 30s
 constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);  // 50 req / 30s
 
+// Per-request socket timeouts (tighten httplib's 300s connect/read defaults).
+constexpr time_t kConnectTimeoutSec = 30;
+constexpr time_t kReadTimeoutSec = 60;
+
 std::string current_iso_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -60,9 +64,7 @@ std::string url_encode(const std::string& value) {
 
 } // namespace
 
-NvdClient::NvdClient(std::string api_key, std::string proxy_url)
-    : api_key_(std::move(api_key)),
-      last_request_time_(std::chrono::steady_clock::time_point::min()) {
+NvdClient::NvdClient(std::string api_key, std::string proxy_url) : api_key_(std::move(api_key)) {
     // Parse proxy URL: "http://host:port" or "host:port"
     if (!proxy_url.empty()) {
         auto url = proxy_url;
@@ -97,19 +99,45 @@ void NvdClient::apply_proxy(httplib::Client& client) const {
     }
 }
 
-void NvdClient::rate_limit() {
-    auto interval = api_key_.empty() ? kPublicInterval : kApiKeyInterval;
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = now - last_request_time_;
+void NvdClient::configure_client(httplib::Client& client) const {
+    // Tighten httplib's very generous 300s connection/read defaults. (The write
+    // timeout keeps httplib's 5s default — NVD requests are tiny GETs.)
+    client.set_connection_timeout(kConnectTimeoutSec);
+    client.set_read_timeout(kReadTimeoutSec);
+    apply_proxy(client);
+}
 
-    if (elapsed < interval) {
-        auto wait = interval - elapsed;
+void NvdClient::rate_limit() {
+    const auto interval = api_key_.empty() ? kPublicInterval : kApiKeyInterval;
+    const auto now = std::chrono::steady_clock::now();
+    const auto wait = nvd_rate_limit_wait(last_request_time_, now, interval);
+    if (wait > std::chrono::steady_clock::duration::zero()) {
         spdlog::debug("NVD rate limit: sleeping {}ms",
                       std::chrono::duration_cast<std::chrono::milliseconds>(wait).count());
         std::this_thread::sleep_for(wait);
     }
-
     last_request_time_ = std::chrono::steady_clock::now();
+}
+
+std::chrono::steady_clock::duration
+nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
+                    std::chrono::steady_clock::time_point now,
+                    std::chrono::steady_clock::duration interval) {
+    // No prior request → no wait. (The previous code used a time_point::min()
+    // sentinel here, so `now - last` overflowed and slept ~292 years, #1867.)
+    if (!last) {
+        return std::chrono::steady_clock::duration::zero();
+    }
+    const auto elapsed = now - *last;
+    // Only throttle for a positive elapsed strictly inside the interval. A
+    // non-positive elapsed (a backwards/non-monotonic clock, or a stray future
+    // `last`) returns zero rather than `interval - negative` — that is what
+    // defends the ~292-year overflow class against ANY caller, not just the
+    // real one (which is monotonic + nullopt-guarded).
+    if (elapsed <= std::chrono::steady_clock::duration::zero() || elapsed >= interval) {
+        return std::chrono::steady_clock::duration::zero();
+    }
+    return interval - elapsed;
 }
 
 NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp) {
@@ -122,9 +150,7 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
         rate_limit();
 
         httplib::Client client(std::string("https://") + kNvdHost);
-        client.set_connection_timeout(30);
-        client.set_read_timeout(60);
-        apply_proxy(client);
+        configure_client(client);
 
         std::string query = std::string(kNvdPath) + "?" +
                             "lastModStartDate=" + url_encode(iso_timestamp) +
@@ -184,9 +210,7 @@ NvdFetchResult NvdClient::fetch_by_keyword(const std::string& keyword, int start
     rate_limit();
 
     httplib::Client client(std::string("https://") + kNvdHost);
-    client.set_connection_timeout(30);
-    client.set_read_timeout(60);
-    apply_proxy(client);
+    configure_client(client);
 
     std::string query = std::string(kNvdPath) + "?" + "keywordSearch=" + url_encode(keyword) +
                         "&resultsPerPage=" + std::to_string(kResultsPerPage) +
@@ -300,8 +324,17 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
             }
         }
 
-        // Extract CPE matches from configurations
-        bool has_cpe = false;
+        // One record per CVE; one CpeMatch per cpeMatch node. Keep the full
+        // version-range tuple (NVD already provides it) instead of collapsing
+        // to a single upper bound.
+        CveRecord record;
+        record.cve_id = cve_id;
+        record.severity = severity;
+        record.description = description;
+        record.published = published;
+        record.last_modified = last_modified;
+        record.source = "nvd";
+
         if (cve.contains("configurations") && cve["configurations"].is_array()) {
             for (const auto& config : cve["configurations"]) {
                 if (!config.contains("nodes") || !config["nodes"].is_array()) {
@@ -330,56 +363,34 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
                             continue;
                         }
 
-                        std::string vendor = parts[3];
-                        std::string product = parts[4];
+                        auto lower = [](std::string s) {
+                            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                                return static_cast<char>(std::tolower(c));
+                            });
+                            return s;
+                        };
 
-                        // Normalize to lowercase
-                        std::transform(
-                            product.begin(), product.end(), product.begin(),
-                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        std::transform(
-                            vendor.begin(), vendor.end(), vendor.begin(),
-                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-                        // Extract version constraint
-                        std::string affected_below;
-                        if (match.contains("versionEndExcluding")) {
-                            affected_below = match.value("versionEndExcluding", "");
-                        } else if (match.contains("versionEndIncluding")) {
-                            affected_below = match.value("versionEndIncluding", "");
+                        CpeMatch cm;
+                        cm.cpe_vendor = lower(parts[3]);
+                        cm.cpe_product = lower(parts[4]);
+                        if (parts.size() > 5) {
+                            cm.cpe_version = parts[5]; // '*'/'-' = any (handled downstream)
                         }
+                        cm.version_start_including = match.value("versionStartIncluding", "");
+                        cm.version_start_excluding = match.value("versionStartExcluding", "");
+                        cm.version_end_including = match.value("versionEndIncluding", "");
+                        cm.version_end_excluding = match.value("versionEndExcluding", "");
+                        cm.is_vulnerable = match.value("vulnerable", true);
 
-                        CveRecord record;
-                        record.cve_id = cve_id;
-                        record.product = product;
-                        record.vendor = vendor;
-                        record.affected_below = affected_below;
-                        record.severity = severity;
-                        record.description = description;
-                        record.published = published;
-                        record.last_modified = last_modified;
-                        record.source = "nvd";
-
-                        result.records.push_back(std::move(record));
-                        has_cpe = true;
+                        record.matches.push_back(std::move(cm));
                     }
                 }
             }
         }
 
-        // If no CPE configurations, still create a record with empty product/vendor
-        // so the CVE data isn't lost
-        if (!has_cpe) {
-            CveRecord record;
-            record.cve_id = cve_id;
-            record.severity = severity;
-            record.description = description;
-            record.published = published;
-            record.last_modified = last_modified;
-            record.source = "nvd";
-
-            result.records.push_back(std::move(record));
-        }
+        // Header-only records (no CPE configuration) are still kept so the CVE
+        // metadata isn't lost; they simply never match inventory.
+        result.records.push_back(std::move(record));
     }
 
     spdlog::debug("NVD parsed {} records from {} vulnerabilities", result.records.size(),

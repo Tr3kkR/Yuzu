@@ -111,6 +111,11 @@ server-side series store).
   (the honest denominator: an average over 12 devices is never silently
   presented as fleet-wide truth). Perf telemetry is collected by **Windows and
   Linux agents** today; macOS is absent from these numbers, not zero.
+  **Known limitation:** the Reporting card's caption still counts **Windows
+  devices online** as its denominator, so on a mixed fleet the reporting count
+  can legitimately exceed it, and the card's *not-reporting* drill lists
+  Windows devices only (a Linux device whose perf breaks does not appear
+  there). An OS-aware denominator is a tracked follow-up.
 - **Cohort benchmarking** — fleet-relative percentiles per **cohort**: the
   distinct values of an operator-chosen **tag key** (default `model`; pick any
   key from the selector — e.g. an `image` key compares a vanilla VDI image

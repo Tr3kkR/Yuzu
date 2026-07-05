@@ -114,7 +114,10 @@ env `YUZU_NVD_SYNC_INTERVAL`; status REST endpoint.
 >    Reshaping to the real CPE-range model is required; **"widen the keywords" does NOT fix this.**
 > 2. **Corpus is keyword-scoped** (`kInitialSyncKeywords`), not a full mirror; no API key by
 >    default → low rate limit. *(roadmap M1a)*
-> **Note:** the parent map's §9.4 "NVD database sync on server" claim is **accurate** — keep it.
+> **Note:** the parent map's §9.4 "NVD database sync on server" claim describes wired infra, but
+> **the sync never actually ran until 2026-07-04** — a `rate_limit()` integer overflow slept ~292
+> years before the first HTTP request on every deployment (fixed in the NVD rate-limit PR; #1867).
+> It is now verified E2E-populating. Treat "NVD sync works" as true only from that fix onward.
 
 ### V2.3 NVD → inventory correlation join :large_orange_diamond: `T2`
 `NvdDatabase::match_inventory` exists but matches by `product LIKE ?` + a **naive

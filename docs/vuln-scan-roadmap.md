@@ -47,7 +47,7 @@ still cites "Epic N", read the milestone here instead.
 |---|---|
 | Agent matching | ~40 **hard-coded** CVEs (`cve_rules.hpp`); substring product match + naive comparator. Runs on-demand, emits pipe-delimited findings. |
 | Agent inventory | `name\|version` only; duplicate collector (vuln_scan vs `installed_apps`). No source/arch/EVR — target is a typed `PackageIdentity`/`AppIdentity` record (ADR-0018), not PURL. |
-| Server NVD | `nvd_client`+`nvd_db`+`nvd_sync` **wired**, but the store is a flat `cve(product, affected_below)` (no CPE ranges) and **keyword-scoped**. Consumed only by the topology vuln overlay; the plugin never queries it. |
+| Server NVD | `nvd_client`+`nvd_db`+`nvd_sync` **wired**. Store **reshaped to normalized `cve` + `cve_match` with full CPE version ranges** (`versionStart/EndIncluding/Excluding`) + an NVD-grade comparator — the schema half of M1a landed, **on SQLite** (born-on-PG deferred per owner decision; see `postgres-migration-ladder.md`). Still **keyword-scoped** (full-catalog backfill pending) and identity is **product-name based** (vendor-precise CPE matching pending ADR-0018). `/api/nvd/match` does real range matching; still consumed only by the topology vuln overlay (the agent plugin doesn't query it yet). |
 | OVAL / EPSS / KEV / CVSS-vector | **None** (design-doc only). |
 | Topology graph | `FleetTopologyStore` — observed graph, in-memory 60s, no persistence, no vuln attach. |
 | Asset value / crown jewels | **None.** |

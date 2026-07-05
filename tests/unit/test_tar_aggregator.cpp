@@ -461,6 +461,7 @@ TEST_CASE("TAR #538: diff_state_key mapping is the single source of truth", "[ta
     CHECK(diff_state_key("software") == "software");
     CHECK(diff_state_key("arp") == "arp"); // ADR-0015
     CHECK(diff_state_key("dns") == "dns"); // ADR-0015
+    CHECK(diff_state_key("mapdrive") == "mapdrive"); // §3.8
     // No snapshot-diff baseline: disabling these is a state no-op.
     CHECK(diff_state_key("perf").empty());
     CHECK(diff_state_key("procperf").empty());
@@ -475,12 +476,17 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // map it here, diff_state_key would return empty → the disable-clear becomes
     // a silent no-op and #538 silently regresses for the new source. Pin every
     // registered source to an explicit classification so a new one fails loudly.
-    const std::set<std::string_view> diff_sources = {"process", "tcp", "service", "user",
-                                                      "software", "arp", "dns"};
+    const std::set<std::string_view> diff_sources = {"process", "tcp",  "service",  "user",
+                                                      "software", "arp", "dns", "mapdrive"};
     // module is a stream-drained source (EventRing, like the process ETW/ES
     // stream) with no snapshot-diff baseline, so diff_state_key("module") is
     // empty and disabling it is a state no-op — non-diff, same as perf/netqual.
-    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module"};
+    // netconn (ADR-0020) is high-water-mark based: its only state is the
+    // netconn_backfill_hwm config key, and keeping it across a disable is the
+    // FEATURE (the OS event log retains the paused window, so a re-enable
+    // recovers it losslessly — no ghost events possible, nothing to clear).
+    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module",
+                                                          "netconn"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);

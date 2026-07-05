@@ -59,10 +59,11 @@ yuzu_agent_core_dep = declare_dependency(
 
 executable(
   'yuzu-agent',
-  files('src/main.cpp'),
+  files('src/main.cpp', 'src/service_win.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),
+    include_directories('../shared'),  # win_sc_handle.hpp SC_HANDLE RAII owner (#1822, _WIN32-gated)
   ],
   dependencies: [yuzu_agent_core_dep, spdlog_dep, cli11_dep, sqlite3_dep],
   install: true,

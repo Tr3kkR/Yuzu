@@ -29,13 +29,20 @@ NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_
       interval_{sync_interval} {}
 
 NvdSyncManager::~NvdSyncManager() {
-    stop();
+    // If stop() returns false here it detached a wedged thread, which means the
+    // owner did NOT honour the leak contract (ServerImpl::stop() releases the
+    // unique_ptr on false, so the dtor normally never runs on that path). By the
+    // time the dtor runs on a false result the members are already being torn
+    // down under a live thread — unavoidable at that point; the fix lives at the
+    // owner (see ServerImpl::stop()). Discard the result here.
+    (void)stop();
 }
 
 void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
         return; // already running
     }
+    finished_.store(false);
 #ifdef __cpp_lib_jthread
     sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
 #else
@@ -45,26 +52,46 @@ void NvdSyncManager::start() {
     spdlog::info("NVD sync manager started (interval={}s)", interval_.count());
 }
 
-void NvdSyncManager::stop() {
+bool NvdSyncManager::stop() {
     if (!sync_thread_.joinable()) {
-        return;
+        return true; // never started or already cleanly stopped — safe to destroy
     }
 #ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
-    {
-        std::lock_guard<std::mutex> lock{mu_};
-        cv_.notify_all();
-    }
-    sync_thread_.join();
 #else
     stop_requested_ = true;
+#endif
     {
         std::lock_guard<std::mutex> lock{mu_};
         cv_.notify_all();
     }
-    sync_thread_.join();
-#endif
-    spdlog::info("NVD sync manager stopped");
+
+    // #1867: bounded join. The sync thread may be wedged in an NVD fetch that
+    // ignores its per-request timeouts; an unconditional join() would hang the
+    // whole process on shutdown and defeat any restart policy. Wait a short
+    // grace period for the loop to exit cleanly, then detach + warn so the
+    // process can still terminate. Detach is the lesser evil (the process is
+    // going down anyway) versus a permanent hang.
+    constexpr auto kGrace = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kGrace;
+    while (!finished_.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (finished_.load()) {
+        sync_thread_.join();
+        spdlog::info("NVD sync manager stopped");
+        return true;
+    }
+    // Detached: the abandoned thread still references this manager's members
+    // (client_, mu_, cv_, status_, and the NvdDatabase). Signal the owner to
+    // LEAK this manager instead of destroying it — otherwise the thread wakes
+    // (once #1872 lets it make real requests) and writes freed memory. Returning
+    // false is the contract for "do not destroy me".
+    spdlog::warn("NVD sync thread did not exit within {}s (stuck in a fetch?); detaching + leaking "
+                 "the manager to avoid wedging shutdown / a teardown UAF (see #1867)",
+                 kGrace.count());
+    sync_thread_.detach();
+    return false;
 }
 
 void NvdSyncManager::sync_now() {
@@ -109,9 +136,24 @@ void NvdSyncManager::sync_loop() {
         lock.unlock();
         do_sync();
     }
+
+    // Signal a clean exit so stop() can join() instead of detaching (#1867).
+    finished_.store(true);
 }
 
 void NvdSyncManager::do_sync() {
+    // Reject a concurrent sync (periodic loop vs. detached "Sync now"): running
+    // two on the same client_ races last_request_time_ and doubles NVD load.
+    bool expected = false;
+    if (!sync_active_.compare_exchange_strong(expected, true)) {
+        spdlog::info("NVD sync already in progress — skipping this trigger");
+        return;
+    }
+    struct ActiveGuard {
+        std::atomic<bool>& flag;
+        ~ActiveGuard() { flag.store(false); }
+    } active_guard{sync_active_};
+
     {
         std::lock_guard<std::mutex> lock{mu_};
         status_.syncing = true;

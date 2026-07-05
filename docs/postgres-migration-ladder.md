@@ -78,6 +78,14 @@ Migrate last because they require `SecretCodec` (or a verify-only-hash schema) i
 
 ## Notes
 
+- **`NvdDatabase` (`nvd_db`) — deferred, still SQLite (2026-07-04).** The store was reshaped
+  (v1→v2: flat `cve` → normalized `cve` + `cve_match` with full CPE version ranges) but
+  **deliberately kept on SQLite** as an eyes-open owner override of the born-on-PG mandate,
+  to ship matching precision now; the born-on-PG reshape is vuln-scan roadmap **M1a** and stays
+  queued. Recorded here (not a fresh exception ADR — the store is not new) so a control-mapping
+  review doesn't read the ladder as silently non-compliant. The normalized header/match split
+  maps directly onto the eventual two PG tables, so this reduces migration debt rather than
+  adding it.
 - The count is ~27 `*Store` classes + the auth DB; the exact set is whatever currently opens a
   `sqlite3*` under `server/core/src/`. Re-derive before declaring the ladder complete:
   `grep -rl "sqlite3_open" server/core/src`.

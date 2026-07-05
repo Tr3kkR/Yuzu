@@ -318,3 +318,35 @@ TEST_CASE("TAR warehouse rollups: arp/dns are live + hourly only (ADR-0015)",
     CHECK(is_queryable_table("arp_live"));
     CHECK(is_queryable_table("dns_live"));
 }
+
+TEST_CASE("TAR warehouse rollups: mapdrive is live + hourly only (§3.8)",
+          "[tar][warehouse][rollup][mapdrive]") {
+    CHECK_FALSE(rollup_sql("mapdrive", "hourly").empty());
+    CHECK(rollup_sql("mapdrive", "daily").empty());
+    CHECK(rollup_sql("mapdrive", "monthly").empty());
+    CHECK(rollup_sql("mapdrive", "hourly").find("FROM mapdrive_live") != std::string::npos);
+    CHECK(rollup_sql("mapdrive", "hourly").find("INSERT INTO mapdrive_hourly") !=
+          std::string::npos);
+    // direction participates in the rollup grouping.
+    CHECK(rollup_sql("mapdrive", "hourly").find("direction") != std::string::npos);
+    // `historical` rows are excluded so a recent-artifact backfill row cannot emit a
+    // zero-count hourly row (adversarial-review LOW).
+    CHECK(rollup_sql("mapdrive", "hourly").find("action IN ('appeared', 'removed')") !=
+          std::string::npos);
+
+    auto ddl = generate_warehouse_ddl();
+    CHECK(ddl.find("mapdrive_live") != std::string::npos);
+    CHECK(ddl.find("mapdrive_hourly") != std::string::npos);
+    CHECK(translate_dollar_name("$MapDrive_Live").value_or("") == "mapdrive_live");
+    CHECK(translate_dollar_name("$MapDrive_Hourly").value_or("") == "mapdrive_hourly");
+    CHECK(is_queryable_table("mapdrive_live"));
+    CHECK(is_queryable_table("mapdrive_hourly"));
+
+    // The live table carries the direction-polymorphic columns + origin.
+    auto cols = columns_for_table("mapdrive_live");
+    for (const auto* c : {"direction", "local_mount", "remote_path", "remote_host", "username",
+                          "provider", "origin"}) {
+        INFO("mapdrive_live column=" << c);
+        CHECK(std::find(cols.begin(), cols.end(), c) != cols.end());
+    }
+}
