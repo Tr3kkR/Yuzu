@@ -4,6 +4,7 @@ date: 2026-07-06
 owner: Alex Young
 deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06
 scope: capability §27 — agent licence detection, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, and the per-user privacy carve-out
+context-refs: capability §27 issues #264–#267; #266 (entitlement-register reversal); ADR-0017 flip-wave (#1634, #1715); superseded standalone ADR PR #1870 (rev 1–5 review history); deferred — #1921 (KEK operator surface), #1922 (oidc_client_secret gap), #1923 (round-3 review items)
 ---
 
 # 0024 — Software Licensing & Entitlements (SLE: agent-detected licences + multi-source entitlements)
@@ -15,7 +16,9 @@ agent-detected licences on the ADR-0016 daily-sync framework, multi-source
 entitlements, server-side compliance evaluation, and a new top-level SLE page. It also
 renames the capability from the map's "Software Catalog & Licensing" to **"Software
 Licensing & Entitlements" (SLE)** — the capability-map §27 entry is retitled
-accordingly. It records a single, contained deviation from ADR-0016's
+accordingly. It supersedes the closed standalone ADR PR #1870 (five review rounds; the
+rev 1–5 history remains on that PR), and is numbered 0024 because 0021–0023 are
+reserved by in-flight ADR branches. It records a single, contained deviation from ADR-0016's
 machine-scope/no-PII posture — per-user licence probing on the licence source only
 (Decision 11) — which requires maintainer sign-off. Yuzu's own product-licence
 machinery (`LicenseStore`, the `License` RBAC securable, capability §22.3) is
@@ -114,7 +117,9 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    server-side — the claimed hash is never trusted), not over re-parsed rows — so
    skipping unknown record kinds cannot push a mixed-version agent into the permanent
    full-resend loop ADR-0016 documents for the parse-then-recompute sources, and the
-   forward-compat rule below is genuinely loop-free in both directions. The wire key
+   forward-compat rule below is genuinely loop-free in both directions. (One accepted
+   consequence: a server-side projection fix does not re-project a stable estate by
+   itself — the framework's `need_full` path remains the forced-resync lever.) The wire key
    rides `InventoryReport.plugin_data` — **no proto change, no gateway regen** (opaque
    `map<string,bytes>`). Interval 24 h; hash-skip is meaningful because licence
    estates are stable day-to-day. **Blob-stability rule:** the canonical blob contains
@@ -179,7 +184,10 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    are `NULL`, never a fabricated zero; multi-source seat sums keep the **per-source
    breakdown visible** (double-counting is shown, not hidden); the "installed but
    licence-unreported" delta is shown, not hidden; and detection `confidence` and
-   `unknown` states are first-class throughout.
+   `unknown` states are first-class throughout. Verdict *freshness* is part of the same
+   posture: compliance surfaces carry the rollup's as-of time and evaluator staleness is
+   observable rather than silent — a wedged keep-last-good evaluator serving stale
+   verdicts is the same fail-open class as a silent empty list.
 
 8. **Lapse, expiry, and renewal emit deduplicated notifications and webhook events.**
    The evaluator fires `software_license.expiring` / `software_license.expired` (and
@@ -188,7 +196,10 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    **worsening** condition/bucket transition (buckets 30/14/7/1 days) or on persistence
    past a 7-day re-arm; an improving transition never fires, and a condition that
    clears and re-asserts inside the re-arm window is held down — so oscillating states
-   (KMS grace↔expired drift, daily re-imaged VMs) cannot spam. `renewal_due` uses the
+   (KMS grace↔expired drift, daily re-imaged VMs) cannot spam. On the *first* evaluation
+   of an estate (and after a loss of dedup state) existing conditions are treated as new
+   and fire once per product — a bounded burst, deliberately preferred over silently
+   baselining pre-existing expiries on a compliance surface. `renewal_due` uses the
    **same bucket/re-arm machinery**, keyed on the entitlement plane's renewal date.
    This satisfies "not dashboard-only" without daily noise, and escalates as expiry
    approaches.
@@ -210,7 +221,9 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    Operator Read + Write; ITServiceOwner full CRUD** (as for its other operational
    securables); **ApiTokenManager none**; admin roles per their global pattern — a
    conscious acceptance that entitlement financial metadata is visible to every Read
-   holder, consistent with how other securables scope. Connector *configuration*
+   holder, consistent with how other securables scope; deployments needing tighter cost
+   visibility use the existing remedies (deny-override, custom roles) rather than a new
+   field-level mechanism. Connector *configuration*
    (tenant/client IDs and the secret) is **admin-gated** (the `admin_fn_`
    OIDC-Settings precedent), **not** `SoftwareLicensing:Write`; only Sync-now rides the
    securable. **No MFA step-up anywhere in §27** — nothing here executes on endpoints
@@ -235,7 +248,10 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     real confinement immediately; only the **true fan-out list reads**
     (`/sle/licenses/{key}/devices`, list fragments) ship global-gated and are
     **registered as flip-wave consumers of ADR-0017 PR-A** (the admit-then-filter
-    chokepoint; umbrella #1634, prerequisite #1715). *Rejected: wiring an ad-hoc
+    chokepoint; umbrella #1634, prerequisite #1715). SLE gates are built on the
+    fail-closed enforcement primitive (`rbac_enforcement_in_effect()`), not the
+    `is_rbac_enabled()` shape whose corrupt-rbac.db fail-open is tracked by #1717 —
+    or they land after #1717 closes it. *Rejected: wiring an ad-hoc
     per-row filter for the fan-out reads — that is exactly the pattern ADR-0017 exists
     to replace, and PR-A is not implemented yet (the `#1716` forward-references in
     `server/core` point at a closed doc-honesty PR, not the gate).*
@@ -255,15 +271,20 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     reversible). `collect` sends the raw name (opt-in); `omit` suppresses the
     *identifier*, not the *probe* (`user_scope` still distinguishes per-user
     detections). GDPR posture stated plainly: a hashed `user_ref` is still personal data
-    (Recital 26); erasure is knob-flip to `omit` (full-replaced fleet-wide within one
-    24 h cycle) plus the **agent-decommission cascade — the per-store `delete_agent`
+    (Recital 26); erasure is knob-flip to `omit` (full-replaced within one 24 h cycle
+    for syncing agents; offline agents purge on reconnect or via decommission) plus the
+    **agent-decommission cascade — the per-store `delete_agent`
     methods exist today with no production caller, so this capability builds the
     decommission fan-out and registers its stores with it**; there is **no row-level
     erasure API**, a stated gap. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
     flapping surface diagnostics never touch the blob and are fetched live via the
-    command path on the `/sle/agents/{id}` drill. The **usage source and the M365
+    command path on the `/sle/agents/{id}` drill. Reads that render `user_ref` rows
+    (that drill) join the per-open behavioral-audit tier (the `dex.device.view`
+    convention: audited per open, fail-closed) and register in the enterprise read
+    inventory; the four new stores and the `user_ref` data class register in the
+    enterprise data inventory at implementation time. The **usage source and the M365
     connector do not inherit** this carve-out. Maintainer sign-off on this deviation is
     required. *Rejected: raw-collect default (reversed at review) and unsalted
     `sha256/12` (dictionary-reversible).*
@@ -310,13 +331,18 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     Connector secret writes follow the OIDC-settings posture (admin gate, **no
     step-up**); if Settings credential writes ever gain step-up, connector config
     follows in the same change. **The KEK operator surface (rotation, retirement, the
-    break-glass flag) is deliberately deferred to a tracked issue** — an accepted,
-    recorded deviation from ADR-0010's ships-with-the-first-secret expectation: until
-    that issue lands, the KEK has no operator rotation path. Connector input is pinned
-    against the SSRF class: GUID/verified-domain validation, **fixed token/Graph
-    hosts**, and `@odata.nextLink` followed **only when same-origin** with a bounded
-    page count. The pre-existing `oidc_client_secret` plaintext gap is neither extended
-    nor touched (separately tracked).
+    break-glass flag) is deliberately deferred to #1921** — an accepted, recorded
+    deviation from ADR-0010's ships-with-the-first-secret expectation: until #1921
+    lands, the KEK has no operator rotation path, and a Postgres restore *without* the
+    keys directory is hard-down until the keys backup is restored (the break-glass
+    relief valve arrives with #1921). The M365 client secret itself remains replaceable
+    at any time by re-entry in Settings; only the wrapping key lacks an operator path.
+    Connector input is pinned against the SSRF class: GUID/verified-domain validation,
+    **fixed token/Graph hosts**, `@odata.nextLink` followed **only when same-origin**
+    with a bounded page count, **no redirect following** (or same-origin-pinned
+    redirects only), and bounded response size and timeout per call. The pre-existing
+    `oidc_client_secret` plaintext gap is neither extended nor touched (separately
+    tracked: #1922).
 
 14. **CSV ingest is one shared pure parser with upsert-by-key, a mandatory dry-run, and
     hard caps.** A single pure `csv_import` library (RFC-4180 quoting/CRLF/BOM,
@@ -386,3 +412,11 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
 - Fleet network cost is negligible: licence blobs hash-skip on stable estates, usage
   blobs are small and only from active machines that opted in, and the Graph sync is
   one tenant-level call pair per day.
+
+## Ratification
+
+Acceptance of this ADR carries two explicit sign-offs beyond the design itself:
+(1) the **Decision 11 deviation** from ADR-0016's machine-scope/no-PII posture
+(per-user licence probing, pseudonymous by default, contained to two fields on one
+source); (2) the **Decision 13 deferral** of the KEK operator surface to #1921, a
+recorded deviation from ADR-0010's ships-with-the-first-secret expectation.

@@ -1046,7 +1046,7 @@ Not implemented. WSUS database connector for patch compliance. CSV/TSV file uplo
 
 ## 27. Software Licensing & Entitlements (SLE)
 
-*Normalized software identification, agent-detected software licences, entitlements, and compliance management. Renamed from "Software Catalog & Licensing" by ADR-0024 ("software catalog" keeps its existing `/inventory` meaning; design of record: `docs/adr/0024-software-licensing-entitlements.md`).*
+*Normalized software identification, agent-detected software licences, entitlements, and compliance management. Renamed from "Software Catalog & Licensing" by ADR-0024 ("software catalog" keeps its existing `/inventory` meaning; design of record: `docs/adr/0024-software-licensing-entitlements.md`). Sub-capability descriptions below predate ADR-0024 and are stale where they conflict with it.*
 
 ### 27.1 Product Registry :x: `T2`
 
@@ -1062,7 +1062,7 @@ Not implemented. Entitlement records (product, purchased_seats, license_type). C
 
 ### 27.4 Software Tags :x: `T2`
 
-Not implemented. Server-side tags on software catalog entries for categorization (approved, prohibited, eval). Usable in Management Group rules.
+Not implemented. Server-side tags on product registry entries for categorization (approved, prohibited, eval). Usable in Management Group rules.
 
 ### 27.5 License Compliance Dashboard :x: `T2`
 

@@ -273,6 +273,13 @@ Each connector is a self-contained class implementing the Connector interface:
 
 *Normalized software identification for license management and compliance.*
 
+> **Superseded by ADR-0024 (2026-07-06):** the design of record for this phase is now
+> `docs/adr/0024-software-licensing-entitlements.md` ("Software Licensing &
+> Entitlements", capability §27 — renamed by the same ADR). The sketch below is stale
+> where it conflicts (SQLite `CatalogStore` → born-on-Postgres `ProductRegistryStore`;
+> manual-only entitlements → five-source entitlement plane; `/api/v1/catalog/*` →
+> `/api/v1/sle/*`; usage metering becomes opt-in and machine-scope).
+
 **Duration estimate: 1 sprint**
 
 | Issue | Title | Scope | Depends On |
