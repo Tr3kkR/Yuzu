@@ -462,6 +462,11 @@ int main(int argc, char* argv[]) {
     app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")->each([&cfg](const std::string&) {
         cfg.nvd_sync_enabled = false;
     });
+    app.add_option("--nvd-backfill-years", cfg.nvd_backfill_years,
+                   "How many years back the newest-first NVD backfill walks (<=0 = full history; "
+                   "default: 8)")
+        ->default_val(8)
+        ->envname("YUZU_NVD_BACKFILL_YEARS");
 
     // OTA agent update options
     app.add_option("--update-dir", cfg.update_dir, "Directory for agent update binaries")

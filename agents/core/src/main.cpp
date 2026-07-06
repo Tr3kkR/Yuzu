@@ -1,7 +1,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <cstdio>
 #include <io.h>
 #pragma section(".CRT$XCB", read)
 [[maybe_unused]] static void __cdecl diag_before_static_init() {
@@ -17,6 +16,8 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
+#include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
+
 #include <CLI/CLI.hpp>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -24,7 +25,9 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 
 #include <atomic>
 #include <csignal>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <win_sc_handle.hpp> // shared yuzu::win SC_HANDLE RAII owner (#1822)
+#else
 #include <unistd.h>
 #endif
 #include <sqlite3.h>
@@ -32,8 +35,10 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 static std::atomic<yuzu::agent::Agent*> g_agent{nullptr};
 
@@ -51,8 +56,38 @@ static void on_signal(int sig) {
         a->stop();
 }
 
+// Verifies preconditions and constructs the Agent. Shared by the console path and
+// the Windows service path (service_win.cpp's ServiceMain calls this on its own
+// thread, after reporting SERVICE_START_PENDING) so both go through identical
+// startup checks. Returns nullptr on failure; the reason is already spdlog'd.
+static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
+    // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
+    if (sqlite3_threadsafe() == 0) {
+        spdlog::critical(
+            "SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
+        return nullptr;
+    }
+
+    // Resolve persistent agent ID
+    auto id_result = yuzu::agent::resolve_agent_id(cfg.agent_id, cfg.data_dir / "agent.db");
+    if (!id_result) {
+        spdlog::error("Failed to resolve agent ID: {}", id_result.error().message);
+        return nullptr;
+    }
+    cfg.agent_id = std::move(*id_result);
+    spdlog::info("Agent ID: {}", cfg.agent_id);
+    // Unconditional so a service left running against the wrong address (e.g. a
+    // manual --install-service re-run that reset binPath and dropped a prior
+    // --server, or a fleet upgrade script that didn't replay --server on a silent
+    // reinstall) is diagnosable from the log alone -- the reconnect loop in run()
+    // is otherwise silent about what it's even trying to reach (Gate 4 unhappy-
+    // path finding, governance re-run).
+    spdlog::info("Server address: {}", cfg.server_address);
+
+    return yuzu::agent::Agent::create(std::move(cfg));
+}
+
 int main(int argc, char* argv[]) {
-    fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
     app.set_version_flag("--version",
                          std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
@@ -176,8 +211,14 @@ int main(int argc, char* argv[]) {
     // Windows service management
     bool install_service = false;
     bool remove_service = false;
+    bool service_mode = false;
     app.add_flag("--install-service", install_service, "Install as Windows service and exit");
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
+    // Internal marker set by --install-service on the service binPath (and by the
+    // installer) so the process knows to run under the SCM instead of as a console
+    // program. Hidden from --help via the empty group; not meant for interactive use.
+    app.add_flag("--service", service_mode, "Run under the Windows Service Control Manager")
+        ->group("");
 
     // #1303: seed the security fallback from a VALUE-AWARE env var BEFORE parse so a
     // passed --tls-system-roots CLI flag still wins (it only opts in). Without this,
@@ -189,59 +230,122 @@ int main(int argc, char* argv[]) {
 
 #ifdef _WIN32
     if (install_service || remove_service) {
-        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+        yuzu::win::ScHandle scm;
+        scm.reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS));
         if (!scm) {
             std::cerr << "Failed to open SCM (run as administrator)\n";
             return EXIT_FAILURE;
         }
         if (install_service) {
             wchar_t exe_path[MAX_PATH];
-            GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-            SC_HANDLE svc = CreateServiceW(scm, L"YuzuAgent", L"Yuzu Agent",
-                                           SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-                                           SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-                                           exe_path, nullptr, nullptr, nullptr, nullptr, nullptr);
-            if (svc) {
-                SERVICE_DESCRIPTIONW desc;
-                desc.lpDescription =
-                    const_cast<wchar_t*>(L"Yuzu endpoint management agent");
-                ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
-                SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
-                ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
-                SC_ACTION actions[3] = {
-                    {SC_ACTION_RESTART, 60000},
-                    {SC_ACTION_RESTART, 60000},
-                    {SC_ACTION_RESTART, 60000}};
-                SERVICE_FAILURE_ACTIONSW failure = {};
-                failure.dwResetPeriod = 86400;
-                failure.cActions = 3;
-                failure.lpsaActions = actions;
-                ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
-                CloseServiceHandle(svc);
-                std::cout << "Service 'YuzuAgent' installed successfully\n";
-            } else {
-                auto err = GetLastError();
-                std::cerr << (err == ERROR_SERVICE_EXISTS ? "Service already exists\n"
-                                                          : "Failed to create service\n");
-                CloseServiceHandle(scm);
+            DWORD exe_path_len = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+            if (exe_path_len == 0 || exe_path_len == MAX_PATH) {
+                std::cerr << "Failed to resolve the agent's own executable path\n";
                 return EXIT_FAILURE;
             }
+            // #1822: quote the path (a bare path containing spaces, e.g. under
+            // "Program Files", is otherwise misparsed by the SCM) and append the
+            // --service marker the SCM-launched process needs to find the
+            // ServiceMain dispatcher instead of running the console main().
+            std::wstring bin_path = yuzu::agent::win::make_service_binpath(exe_path);
+
+            yuzu::win::ScHandle svc;
+            svc.reset(CreateServiceW(scm.get(), yuzu::agent::win::kServiceName, L"Yuzu Agent",
+                                     SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                                     SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin_path.c_str(),
+                                     nullptr, nullptr, nullptr, nullptr, nullptr));
+
+            bool updated_existing = false;
+            if (!svc) {
+                DWORD create_err = GetLastError();
+                if (create_err == ERROR_SERVICE_MARKED_FOR_DELETE) {
+                    // 1072: the service was just deleted (e.g. a --remove-service
+                    // moments earlier, or a concurrent uninstall) and stays in this
+                    // state until every open handle to it closes -- typically the
+                    // exiting old process's own SCM handle. Distinguished from the
+                    // generic failure below so a scripted repair/reinstall doesn't
+                    // read "Failed to create service" as an unrelated problem when a
+                    // short retry would succeed (Gate 4 unhappy-path finding,
+                    // governance re-run).
+                    std::cerr << "Service is pending deletion from a recent removal -- "
+                                 "wait a moment and retry --install-service\n";
+                    return EXIT_FAILURE;
+                }
+                if (create_err != ERROR_SERVICE_EXISTS) {
+                    std::cerr << "Failed to create service\n";
+                    return EXIT_FAILURE;
+                }
+                // Idempotent re-install: heals a stale binPath from an earlier
+                // (pre-#1822) install that lacks the --service marker, or one whose
+                // args changed. SERVICE_NO_CHANGE preserves start type / error
+                // control / everything else.
+                svc.reset(OpenServiceW(scm.get(), yuzu::agent::win::kServiceName,
+                                       SERVICE_CHANGE_CONFIG));
+                if (!svc) {
+                    std::cerr << "Service exists but could not be opened for update\n";
+                    return EXIT_FAILURE;
+                }
+                if (!ChangeServiceConfigW(svc.get(), SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+                                          SERVICE_NO_CHANGE, bin_path.c_str(), nullptr, nullptr,
+                                          nullptr, nullptr, nullptr, nullptr)) {
+                    std::cerr << "Failed to update existing service configuration\n";
+                    return EXIT_FAILURE;
+                }
+                updated_existing = true;
+            }
+
+            // Each of these is best-effort hardening on top of the core binPath fix
+            // (description / delayed-start / crash-and-error recovery) -- a failure
+            // here must not abort the install (the service is already usable
+            // without it), but silently swallowing it would leave e.g. the
+            // recovery-actions guarantee unconfigured while still printing
+            // "installed successfully" (Gate-4 UP-6). Warn, don't abort.
+            SERVICE_DESCRIPTIONW desc;
+            desc.lpDescription = const_cast<wchar_t*>(L"Yuzu endpoint management agent");
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DESCRIPTION, &desc))
+                std::cerr << "Warning: failed to set service description (" << GetLastError()
+                          << ")\n";
+            SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                       &delayed))
+                std::cerr << "Warning: failed to set delayed auto-start (" << GetLastError()
+                          << ")\n";
+            SC_ACTION actions[3] = {
+                {SC_ACTION_RESTART, 60000},
+                {SC_ACTION_RESTART, 60000},
+                {SC_ACTION_RESTART, 60000}};
+            SERVICE_FAILURE_ACTIONSW failure = {};
+            failure.dwResetPeriod = 86400;
+            failure.cActions = 3;
+            failure.lpsaActions = actions;
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &failure))
+                std::cerr << "Warning: failed to configure crash-recovery actions ("
+                          << GetLastError() << ")\n";
+            // #1822: recovery actions only fire on a crash by default -- also fire
+            // them on a clean exit with an error (e.g. the #1303 fail-closed
+            // startup refusal), approximating systemd's Restart=always.
+            SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag))
+                std::cerr << "Warning: failed to enable recovery-on-error-exit ("
+                          << GetLastError() << ")\n";
+
+            std::cout << (updated_existing ? "Service 'YuzuAgent' updated\n"
+                                           : "Service 'YuzuAgent' installed successfully\n");
         }
         if (remove_service) {
-            SC_HANDLE svc = OpenServiceW(scm, L"YuzuAgent", DELETE | SERVICE_STOP);
+            yuzu::win::ScHandle svc;
+            svc.reset(
+                OpenServiceW(scm.get(), yuzu::agent::win::kServiceName, DELETE | SERVICE_STOP));
             if (svc) {
                 SERVICE_STATUS status;
-                ControlService(svc, SERVICE_CONTROL_STOP, &status);
-                DeleteService(svc) ? std::cout << "Service removed\n"
-                                   : std::cerr << "Failed to delete service\n";
-                CloseServiceHandle(svc);
+                ControlService(svc.get(), SERVICE_CONTROL_STOP, &status);
+                DeleteService(svc.get()) ? std::cout << "Service removed\n"
+                                         : std::cerr << "Failed to delete service\n";
             } else {
                 std::cerr << "Service not found\n";
-                CloseServiceHandle(scm);
                 return EXIT_FAILURE;
             }
         }
-        CloseServiceHandle(scm);
         return EXIT_SUCCESS;
     }
 #endif
@@ -256,14 +360,32 @@ int main(int argc, char* argv[]) {
 
     // Configure logging — stderr + optional rotating file
     spdlog::set_level(spdlog::level::from_str(log_level));
+#ifdef _WIN32
+    if (service_mode && log_file.empty()) {
+        // No console under the SCM -- without --log-file the agent would log to
+        // nowhere. Default alongside persistent state.
+        log_file = (cfg.data_dir / "yuzu-agent.log").string();
+    }
+#endif
     if (!log_file.empty()) {
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            log_file, log_max_size, log_max_files);
-        auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
-        auto logger =
-            std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{stderr_sink, file_sink});
-        logger->set_level(spdlog::level::from_str(log_level));
-        spdlog::set_default_logger(logger);
+        try {
+            std::vector<spdlog::sink_ptr> sinks;
+            sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                log_file, log_max_size, log_max_files));
+#ifdef _WIN32
+            if (!service_mode)
+#endif
+                sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
+            auto logger = std::make_shared<spdlog::logger>("", sinks.begin(), sinks.end());
+            logger->set_level(spdlog::level::from_str(log_level));
+            spdlog::set_default_logger(logger);
+        } catch (const std::exception& e) {
+            // A missing/unwritable log directory must not crash the process before
+            // the SCM dispatcher connects (the same failure class #1822 fixes: an
+            // uncaught exception here would silently reproduce error 1053).
+            std::cerr << "Failed to open log file '" << log_file << "': " << e.what()
+                      << " — falling back to the default logger\n";
+        }
     }
     if (log_format == "json") {
         spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("agent"));
@@ -273,26 +395,32 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
-    // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
-    if (sqlite3_threadsafe() == 0) {
-        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
-        return EXIT_FAILURE;
+#ifdef _WIN32
+    // #1822: hand off to the SCM ServiceMain dispatcher instead of running the
+    // console path below. run_service() blocks for the lifetime of the service.
+    if (service_mode) {
+        return yuzu::agent::win::run_service(
+            [cfg = std::move(cfg)]() mutable { return make_agent(std::move(cfg)); });
     }
+#endif
 
-    // Resolve persistent agent ID
-    auto id_result = yuzu::agent::resolve_agent_id(cfg.agent_id, cfg.data_dir / "agent.db");
-    if (!id_result) {
-        spdlog::error("Failed to resolve agent ID: {}", id_result.error().message);
+    auto agent = make_agent(std::move(cfg));
+    if (!agent)
         return EXIT_FAILURE;
-    }
-    cfg.agent_id = std::move(*id_result);
-    spdlog::info("Agent ID: {}", cfg.agent_id);
 
-    // Signal handling
+    // Signal handling — installed only once `agent` exists (right after
+    // make_agent() returns, right before g_agent is published), so on_signal
+    // (which no-ops when g_agent is null) never silently swallows a Ctrl-C/
+    // SIGTERM that arrives during make_agent()'s work (a SQLite open/write in
+    // resolve_agent_id() plus a trivial in-memory Agent construction -- the
+    // actual heavy work, plugin load and KV/TAR store open, happens later
+    // inside agent->run() below, which was already covered by this
+    // registration point before make_agent() existed). Installing the
+    // handlers any earlier -- e.g. before calling make_agent() -- would
+    // widen that pre-existing signal gap to cover make_agent()'s work too
+    // (Gate 3 cpp-expert finding, governance re-run).
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
-
-    auto agent = yuzu::agent::Agent::create(std::move(cfg));
     g_agent.store(agent.get(), std::memory_order_release);
     agent->run();
 

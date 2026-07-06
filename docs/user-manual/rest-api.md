@@ -760,7 +760,9 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+
+**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -870,15 +872,27 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
 
+Two route forms, same handler:
+
+- **Path form** — `POST /api/v1/users/{username}/elevation-eligibility` — **local usernames only** in practice: both forms validate the target with `is_valid_principal` (#1852), but a path segment cannot carry the `/` and `#` an SSO principal contains, so only a local username reaches the handler this way.
+- **Query form** — `POST /api/v1/users/elevation-eligibility?username=<principal>` — **required for a durable SSO principal** (`oidc:<iss>#<sub>`). A path segment cannot carry the `/` (in the issuer URL) and `#` an SSO principal contains — the server percent-decodes the path and strips the URL fragment before route matching, so the path form 404s for every real IdP identity. The query form accepts the same shapes as `DELETE /api/v1/sessions` above (`is_valid_principal`, #1852): a strict local username, or an SSO principal (URL-encode the `#` as `%23`; `/` does not need escaping in a query value).
+
+This is an `UPDATE`-only operation against an existing `users` row, never an `INSERT` — an SSO principal only has a row once the operator has **logged in at least once** (first login auto-provisions it). Granting eligibility against a principal with no row yet returns `404`, which for an SSO principal specifically means "this operator has never signed in" rather than "no such user was ever created".
+
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
+
+# SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
+curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Content-Type: application/json" -d '{"eligible":true}' \
+  'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
 ```
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found; `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -3999,7 +4013,7 @@ One signal type's drill-down.
 Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` is the coverage-honest denominator (perf collectors are Windows-only today). Not audited.
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` counts online Windows devices — historically the coverage-honest denominator when perf collectors were Windows-only. **Known limitation:** the TAR perf collector now also runs on Linux, so `reporting` can legitimately exceed `windows_online` on mixed fleets; an OS-aware denominator is a tracked follow-up. Not audited.
 
 #### `GET /api/v1/dex/perf/cohorts`
 
@@ -4022,7 +4036,7 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle. **Known limitation:** Linux perf devices are excluded from this complement list — same OS-aware-denominator follow-up as `/dex/perf/fleet` above — so a Linux non-reporter does not appear here); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. Machine-health telemetry (device state, not behavioral data) — not audited.
 
 ### Application performance over time
@@ -4857,13 +4871,76 @@ Returns recent analytics events. Accepts `limit` as a query parameter (default 5
 
 Returns the status of the NVD (National Vulnerability Database) sync.
 
+Response fields: `enabled`, `syncing`, `last_sync_time`, `last_error`,
+`total_cves`, `backfill_complete`, and `backfill_oldest_published`.
+`enabled` reflects whether NVD **sync** is configured on (i.e. `--no-nvd-sync` was
+*not* passed) — not merely whether the local mirror DB is open. Under `--no-nvd-sync`
+the mirror stays queryable (`/api/nvd/match` still works against seeded/previously-synced
+data) but `enabled` is `false` and `POST /api/nvd/sync` returns an error. Only `enabled`
+and `total_cves` are guaranteed present; the sync-progress fields (`syncing`,
+`last_sync_time`, `last_error`, `backfill_complete`, `backfill_oldest_published`) are
+omitted when sync is disabled, and the whole body is `{"enabled":false}` when the mirror
+DB is closed.
+**`total_cves` is a count of distinct CVEs** in the local store.
+(Prior to the CPE-range-matching change it counted one row per affected
+product, so a multi-product CVE inflated the figure — after upgrade the number
+reads lower even once fully synced, and reads near-zero briefly after the
+one-time schema migration until the next sync repopulates the mirror. This is
+expected, not data loss.)
+
+`backfill_complete` (boolean) reports whether the newest-first catalog backfill
+has reached its configured floor **and the catalog holds real NVD-sourced CVEs** —
+the built-in fallback rules seeded at startup do **not** count, so `total_cves` can
+be non-zero while `backfill_complete` is still `false`. A mirror with no NVD CVEs is
+never reported complete, so a fresh or rate-limited deployment (or one whose upstream
+NVD fetches have not yet returned data) shows `false` with the cursor at the floor
+until real NVD data lands. That is expected, not a stall.
+`backfill_oldest_published` (ISO 8601 string)
+is the progress cursor — the `published` date of the oldest CVE fetched so far,
+walking backwards. During the initial backfill `total_cves` climbs continuously
+and `last_sync_time` advances after **every** successful fetch window — so a
+non-empty `last_sync_time` does **not** mean the mirror is complete. Use
+`backfill_complete` (with the `backfill_oldest_published` cursor for progress) as
+the authoritative "initial mirror built" signal, not `last_sync_time`.
+
+`last_error` (string, present only while sync is enabled) surfaces the most recent
+sync-health problem and is cleared at the start of the next sync tick — a non-empty
+value is a transient, self-healing condition, not a product bug. Values you may see:
+a transient fetch failure (`NVD backfill fetch failed (<reason>) — retrying (mirror
+incomplete)` or `NVD freshness fetch failed (<reason>) — retrying`, where `<reason>` is
+one of `connection`/`http_429`/`http_403`/`http_other`/`parse` — cleared once a fetch
+succeeds; a persistent `http_403` means a bad/revoked `--nvd-api-key`, so rotate it, and
+`http_429` is expected rate-limiting that self-heals via backoff); a local persist failure
+(`NVD backfill window persist failed — mirror
+incomplete` / `NVD freshness window persist failed` — a disk/DB issue; the mirror holds
+its cursor and stays `backfill_complete: false` rather than dropping the fetched CVEs);
+a prolonged upstream outage (`NVD returning empty responses — mirror not populated`); and
+re-confirmation of a suspicious empty window (`re-confirming a suspicious empty NVD window
+(n/N)` — an older published-date window returned empty *after* real data had already
+landed; the backfill holds, staying `backfill_complete: false`, and re-checks it before
+trusting it, so a stale cache/proxy serving an empty page can't make it skip a populated
+range and falsely report complete).
+These are operational states, not product bugs — the mirror recovers automatically
+once the underlying condition clears.
+
 #### `POST /api/nvd/sync`
 
 Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
-Match installed software against known CVEs in the NVD database.
+Match installed software against known CVEs in the NVD database. Matching
+evaluates full CPE version ranges (`versionStartIncluding/Excluding`,
+`versionEndIncluding/Excluding`, exact and wildcard). Product identity is
+matched by name (case-insensitive); vendor-precise CPE identity is a planned
+enhancement (ADR-0018), so name-collision false positives are possible.
+In each match, `fixed_in` carries the range's **exclusive upper bound**
+(`versionEndExcluding`) when present; it is empty for inclusive-end, exact,
+or wildcard matches — empty means "no fix boundary derivable from the range
+shape", not "no fix available". Distro revision markers (e.g. Debian `~` in
+`1.0.0~deb1`) are compared as plain separators rather than pre-release
+markers, so distro-backported versions can produce false negatives until
+backport-aware matching (M1b/OVAL) lands.
 
 ---
 
@@ -5605,7 +5682,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 **Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
 
 - **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
-- **OIDC session:** a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
+- **OIDC session:** ⚠️ **temporarily unavailable** — since the `oidc:<iss>#<sub>` identity re-key (#1837/#1857), an OIDC session has no local `users` row and is denied at the eligibility gate (`403`, `"eligibility read failed"`); restoration is tracked in #1852. *The `amr` behaviour described here is the intended path #1852 restores:* a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
 
 **Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
 

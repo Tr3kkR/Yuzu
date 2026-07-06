@@ -50,6 +50,58 @@ bool is_valid_username(const std::string& username) {
     return true;
 }
 
+bool is_reserved_identity_prefix(const std::string& username) {
+    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:"};
+    for (auto prefix : kReservedPrefixes) {
+        if (username.size() < prefix.size())
+            continue;
+        bool matches = true;
+        for (std::size_t i = 0; i < prefix.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(username[i])) !=
+                std::tolower(static_cast<unsigned char>(prefix[i]))) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches)
+            return true;
+    }
+    return false;
+}
+
+// #1852 — a durable SSO identity's `username` column holds the STABLE
+// principal `"oidc:" + iss + "#" + sub` (or the `saml:`/`ad:` equivalents),
+// which `is_valid_username`'s strict local-account charset (no ':') rejects
+// outright. Elevation eligibility and target-user admin actions must be able
+// to key on that principal WITHOUT loosening `is_valid_username` itself (it
+// still gates the ~20 local-account call sites unchanged). This validator is
+// deliberately a strict SUPERSET: any string `is_valid_username` accepts is
+// still accepted here unchanged; a string is ADDITIONALLY accepted only when
+// it starts with a reserved SSO prefix (oidc:/saml:/ad:, so a local-charset
+// loosening can never accidentally satisfy this path) and then passes a
+// narrow blocklist covering SQL/log/shell metacharacters — not the tight
+// local allowlist, because a real principal embeds an IdP issuer URL
+// (`:`, `/`, `.`) and an opaque `sub` that IdPs are free to populate with
+// `@`/`~`/`%`/`|` etc. (URNs, email-shaped subs, base64url).
+bool is_valid_principal(const std::string& s) {
+    if (is_valid_username(s)) {
+        return true; // strict local charset unchanged
+    }
+    if (!is_reserved_identity_prefix(s)) {
+        return false; // must start oidc:/saml:/ad: — no other charset loosening
+    }
+    if (s.empty() || s.size() > 255) {
+        return false;
+    }
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F || c == ';' || c == '=' || c == '\\' || c == '\'' ||
+            c == '"' || c == '`' || c == ' ') {
+            return false;
+        }
+    }
+    return true; // permits : # / . _ - @ ~ % | after the prefix (iss URL + opaque sub)
+}
+
 // ── SQLite column-text accessor (null-safe) ──────────────────────────────────
 //
 // sqlite3_column_text returns nullptr when the column value is SQL NULL.
@@ -571,6 +623,34 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
         {5, R"(
             ALTER TABLE users ADD COLUMN elevation_eligible INTEGER NOT NULL DEFAULT 0;
         )"},
+        // v6: Durable SSO identity (#1852). `create_oidc_session` mints a
+        // stable `oidc:<iss>#<sub>` principal but historically wrote NO row
+        // to `users` — so elevation eligibility (v5) had nothing to key on
+        // and JIT admin elevation was unreachable for every SSO operator
+        // (#1837 fallout). Five nullable/defaulted columns so existing rows
+        // survive without backfill: `identity_source` distinguishes an
+        // SSO-provisioned row from a local one (defaults 'local', so every
+        // pre-v6 row is correctly classified with zero migration work);
+        // `external_iss`/`external_sub` carry the raw IdP claims (the
+        // `username` column already encodes them into the stable principal,
+        // but keeping them queryable separately avoids re-parsing that
+        // string at every read site); `display_name` is the last-seen
+        // human-readable label (never used for authorization — see
+        // auth.hpp's `Session::username` doc); `last_seen_at` is the
+        // re-login timestamp a future SCIM-less deprovisioning sweep ages
+        // against (an IdP-side removal has no push signal into Yuzu today).
+        // `password_hash`/`salt_hex` stay NOT NULL on this table — SSO rows
+        // populate them with '' (empty), which the constant-time password
+        // compare on the LOCAL login path already fails closed against
+        // (see the file header note on `create_oidc_session`); this
+        // migration does not touch that invariant.
+        {6, R"(
+            ALTER TABLE users ADD COLUMN identity_source TEXT NOT NULL DEFAULT 'local';
+            ALTER TABLE users ADD COLUMN external_iss TEXT;
+            ALTER TABLE users ADD COLUMN external_sub TEXT;
+            ALTER TABLE users ADD COLUMN display_name TEXT;
+            ALTER TABLE users ADD COLUMN last_seen_at DATETIME;
+        )"},
     };
 
     if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
@@ -640,9 +720,70 @@ std::expected<void, AuthDBError> AuthDB::upsert_user(const std::string& username
     return {};
 }
 
-std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& username) {
+// #1852 — durable SSO identity. See the header doc for the fail-soft/
+// role-and-eligibility-preservation contract; `is_valid_principal` (not
+// `is_valid_username`) is the gate since `principal` carries the
+// `oidc:<iss>#<sub>` stable form.
+std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& principal,
+                                                              const std::string& iss,
+                                                              const std::string& sub,
+                                                              const std::string& display_name,
+                                                              const std::string& source) {
+    if (!is_valid_principal(principal)) {
+        spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'", principal);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+
+    // password_hash/salt_hex are '' — never resolvable on the local login
+    // path (empty-hash rows fail the constant-time compare, see the file
+    // header note). role='user' on first insert only; the ON CONFLICT arm
+    // deliberately omits role/elevation_eligible so a standing grant on
+    // this principal survives re-login (#1852 CRITICAL invariant).
+    // governance round — the ON CONFLICT arm deliberately does NOT set
+    // `is_active = 1`. A first INSERT still defaults is_active=1 (schema
+    // default), but re-login must never RESURRECT a row that a future
+    // deprovisioning path (#1859) has soft-deleted (is_active=0) — that
+    // would let a revoked SSO operator regain a working account merely by
+    // logging in again, silently defeating the deprovisioning control.
     static const char* sql = R"(
-        SELECT username, role, password_hash, salt_hex
+        INSERT INTO users(username, password_hash, salt_hex, role, identity_source,
+                          external_iss, external_sub, display_name, last_seen_at)
+        VALUES (?, '', '', 'user', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(username) DO UPDATE SET
+            display_name = excluded.display_name,
+            last_seen_at = CURRENT_TIMESTAMP
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare upsert_sso_identity statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, principal.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, iss.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, sub.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, display_name.c_str(), -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        spdlog::error("upsert_sso_identity failed for '{}': {}", principal,
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+
+    return {};
+}
+
+std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& username) {
+    // #1852 governance round — identity_source is selected so callers (in
+    // particular the /api/v1/elevate source-scope guard) can tell an
+    // OIDC-provisioned row apart from a local one without a second query.
+    static const char* sql = R"(
+        SELECT username, role, password_hash, salt_hex, identity_source
         FROM users
         WHERE username = ? AND is_active = 1
     )";
@@ -677,6 +818,9 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     entry.role = auth::string_to_role(col_text(stmt, 1));
     entry.hash_hex = col_text(stmt, 2);
     entry.salt_hex = col_text(stmt, 3);
+    // col_text is null-safe; identity_source is NOT NULL DEFAULT 'local'
+    // (migration v6) so this is defensive against schema drift only.
+    entry.identity_source = col_text(stmt, 4);
     // Note: is_active and last_login_at exist in DB but not in UserEntry struct.
     // DB query filters is_active=1, so all returned users are active.
 
@@ -685,8 +829,12 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
 }
 
 std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
+    // #1852 — identity_source is surfaced so the Settings user-list can
+    // distinguish a durable SSO row (which the strict local-only mutation
+    // routes — delete, role-change, password-reset — must never act on)
+    // from a local account.
     static const char* sql = R"(
-        SELECT username, role
+        SELECT username, role, identity_source
         FROM users
         WHERE is_active = 1
         ORDER BY username
@@ -704,6 +852,7 @@ std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
         auth::UserEntry entry;
         entry.username = col_text(stmt, 0);
         entry.role = auth::string_to_role(col_text(stmt, 1));
+        entry.identity_source = col_text(stmt, 2);
         users.push_back(std::move(entry));
     }
 
@@ -975,9 +1124,24 @@ std::expected<void, AuthDBError> AuthDB::invalidate_all_sessions(const std::stri
     // truncates at the first NUL byte, so a NUL-embedded username would
     // delete the wrong rows while the in-memory `==` comparison in
     // AuthManager would match no one — the layers would silently
-    // diverge. Sibling primitives `add_user` and `update_role` validate
-    // here for the same reason.
-    if (!is_valid_username(username)) {
+    // diverge.
+    //
+    // governance round (cons-S1) — gated on `is_valid_principal`, not the
+    // strict `is_valid_username`: this is a target-lookup DELETE against
+    // the `sessions` table (no row is ever CREATED here), so accepting a
+    // durable SSO principal (`oidc:<iss>#<sub>`) is safe by the same
+    // reasoning as the REST `DELETE /api/v1/sessions?username=` route
+    // (rest_api_v1.cpp). Before this fix, force-logging-out an SSO
+    // operator via that route always hit `InvalidUsername` here (OIDC
+    // sessions are never persisted to the `sessions` table in the first
+    // place, so the DELETE would have deleted 0 rows and succeeded) —
+    // the handler then audited `result="partial"`/`db_error=true` for an
+    // action that fully succeeded, corrupting the audit trail (cons-S1).
+    // The other two callers of this method, `remove_user` and
+    // `update_role`, are local-account-only call sites (their own inputs
+    // are already `is_valid_username`-checked upstream), so widening the
+    // gate here does not loosen anything for them.
+    if (!is_valid_principal(username)) {
         spdlog::warn("invalidate_all_sessions: invalid username");
         return std::unexpected(AuthDBError::InvalidUsername);
     }
@@ -2211,7 +2375,11 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 
 std::expected<void, AuthDBError> AuthDB::set_elevation_eligible(const std::string& username,
                                                                bool eligible) {
-    if (!is_valid_username(username)) {
+    // #1852 — `username` may be a durable SSO principal (`oidc:<iss>#<sub>`),
+    // which `is_valid_username`'s strict local charset rejects. This is a
+    // target-lookup on an EXISTING row, never a create path, so
+    // `is_valid_principal` is the correct gate.
+    if (!is_valid_principal(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     // Single UPDATE ... RETURNING (no sqlite3_changes() — #1033). The RETURNING
@@ -2243,7 +2411,9 @@ std::expected<void, AuthDBError> AuthDB::set_elevation_eligible(const std::strin
 }
 
 std::expected<bool, AuthDBError> AuthDB::is_elevation_eligible(const std::string& username) {
-    if (!is_valid_username(username)) {
+    // #1852 — see set_elevation_eligible's comment: this reads the same
+    // durable-SSO-principal-keyed row.
+    if (!is_valid_principal(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     static const char* sql = R"(

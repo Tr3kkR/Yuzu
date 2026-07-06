@@ -1,38 +1,60 @@
 /**
  * test_nvd.cpp — Unit tests for NVD database, version comparison, and JSON parsing
  *
- * Covers: compare_versions(), NvdDatabase CRUD + match_inventory(),
+ * Covers: compare_versions() (shared numeric comparator, unchanged),
+ *         nvd_version_compare()/nvd_version_in_range() (NVD-grade),
+ *         NvdDatabase CRUD + cpeMatch-range match_inventory(),
  *         NvdClient::parse_response().
  */
 
 #include "nvd_client.hpp"
 #include "nvd_db.hpp"
+#include "nvd_version.hpp"
+#include "nvd_sync.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <httplib.h>
+#include <sqlite3.h>
 
-#include <filesystem>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::server;
 
-// ── Version Comparison ───────────────────────────────────────────────────────
+namespace {
+// A CVE with a single product/version-end-excluding cpeMatch (the common case
+// and the shape the builtin rules use).
+CveRecord make_cve(std::string id, std::string product, std::string end_excluding,
+                   std::string severity = "HIGH") {
+    CveRecord rec;
+    rec.cve_id = std::move(id);
+    rec.severity = std::move(severity);
+    rec.description = "Test vulnerability";
+    rec.source = "nvd";
+    CpeMatch cm;
+    cm.cpe_product = std::move(product);
+    cm.version_end_excluding = std::move(end_excluding);
+    rec.matches.push_back(std::move(cm));
+    return rec;
+}
+} // namespace
+
+// ── Shared numeric comparator (compare_versions) — unchanged, must stay green ──
 
 TEST_CASE("compare_versions: equal versions", "[nvd][version]") {
     REQUIRE(compare_versions("1.0.0", "1.0.0") == 0);
-}
-
-TEST_CASE("compare_versions: less than", "[nvd][version]") {
-    REQUIRE(compare_versions("1.0.0", "2.0.0") < 0);
-}
-
-TEST_CASE("compare_versions: greater than", "[nvd][version]") {
-    REQUIRE(compare_versions("2.0.0", "1.0.0") > 0);
-}
-
-TEST_CASE("compare_versions: patch level", "[nvd][version]") {
-    REQUIRE(compare_versions("1.2.3", "1.2.4") < 0);
-    REQUIRE(compare_versions("1.2.4", "1.2.3") > 0);
 }
 
 TEST_CASE("compare_versions: numeric not lexicographic", "[nvd][version]") {
@@ -41,20 +63,93 @@ TEST_CASE("compare_versions: numeric not lexicographic", "[nvd][version]") {
 }
 
 TEST_CASE("compare_versions: missing segments", "[nvd][version]") {
-    // Missing segments treated as 0
     REQUIRE(compare_versions("1.0", "1.0.0") == 0);
     REQUIRE(compare_versions("1", "1.0.0") == 0);
 }
 
-TEST_CASE("compare_versions: pre-release suffix", "[nvd][version]") {
-    // "beta" < "rc" in string comparison when numeric comparison fails
-    REQUIRE(compare_versions("1.0.0-beta", "1.0.0-rc") < 0);
+// ── NVD-grade comparator (nvd_version_compare) ───────────────────────────────
+
+TEST_CASE("nvd_version_compare: basic ordering", "[nvd][version]") {
+    REQUIRE(nvd_version_compare("1.0.0", "1.0.0") == 0);
+    REQUIRE(nvd_version_compare("1.2.3", "1.2.4") < 0);
+    REQUIRE(nvd_version_compare("2.0.0", "1.0.0") > 0);
+    REQUIRE(nvd_version_compare("1.10.0", "1.9.0") > 0);
+    REQUIRE(nvd_version_compare("124.0.6367.202", "124.0.6367.201") > 0);
 }
 
-TEST_CASE("compare_versions: empty strings", "[nvd][version]") {
-    REQUIRE(compare_versions("", "") == 0);
-    REQUIRE(compare_versions("1.0", "") > 0);
-    REQUIRE(compare_versions("", "1.0") < 0);
+TEST_CASE("nvd_version_compare: padding is equal", "[nvd][version]") {
+    REQUIRE(nvd_version_compare("1.0", "1.0.0") == 0);
+    REQUIRE(nvd_version_compare("1", "1.0.0") == 0);
+    REQUIRE(nvd_version_compare("1.0.1", "1.0") > 0);
+}
+
+TEST_CASE("nvd_version_compare: pre-release ordering", "[nvd][version]") {
+    REQUIRE(nvd_version_compare("1.0.0-alpha", "1.0.0-beta") < 0);
+    REQUIRE(nvd_version_compare("1.0.0-beta", "1.0.0-rc1") < 0);
+    REQUIRE(nvd_version_compare("1.0.0-rc1", "1.0.0") < 0);
+    REQUIRE(nvd_version_compare("1.0.0-rc2", "1.0.0-rc1") > 0);
+    REQUIRE(nvd_version_compare("1.0.0", "1.0.0-rc1") > 0);
+}
+
+TEST_CASE("nvd_version_compare: numeric outranks alpha at same position", "[nvd][version]") {
+    // Vendor patch suffixes: a trailing non-prerelease alpha is HIGHER.
+    REQUIRE(nvd_version_compare("9.8p1", "9.8") > 0);   // openssh
+    REQUIRE(nvd_version_compare("1.0.2k", "1.0.2") > 0); // openssl letter releases
+    REQUIRE(nvd_version_compare("1.9.5p2", "1.9.5p3") < 0);
+}
+
+TEST_CASE("nvd_version_compare: epoch stripped and ignored", "[nvd][version]") {
+    REQUIRE(nvd_version_compare("1:1.0", "1.0") == 0);
+    REQUIRE(nvd_version_compare("0:2.0", "2.0") == 0);
+}
+
+TEST_CASE("nvd_version_compare: empty strings", "[nvd][version]") {
+    REQUIRE(nvd_version_compare("", "") == 0);
+    REQUIRE(nvd_version_compare("1.0", "") > 0);
+    REQUIRE(nvd_version_compare("", "1.0") < 0);
+}
+
+// ── Range predicate (nvd_version_in_range) ───────────────────────────────────
+// VersionRange fields: {exact, start_including, start_excluding,
+//                       end_including, end_excluding}
+
+TEST_CASE("nvd_version_in_range: end excluding", "[nvd][range]") {
+    VersionRange r{"", "", "", "", "3.0.7"};
+    REQUIRE(nvd_version_in_range("3.0.6", r));
+    REQUIRE_FALSE(nvd_version_in_range("3.0.7", r));
+    REQUIRE_FALSE(nvd_version_in_range("3.1.0", r));
+}
+
+TEST_CASE("nvd_version_in_range: end including", "[nvd][range]") {
+    VersionRange r{"", "", "", "3.0.7", ""};
+    REQUIRE(nvd_version_in_range("3.0.7", r));
+    REQUIRE_FALSE(nvd_version_in_range("3.0.8", r));
+}
+
+TEST_CASE("nvd_version_in_range: start+end band", "[nvd][range]") {
+    VersionRange r{"", "2.0", "", "", "3.0"}; // [2.0, 3.0)
+    REQUIRE(nvd_version_in_range("2.0", r));
+    REQUIRE(nvd_version_in_range("2.5", r));
+    REQUIRE_FALSE(nvd_version_in_range("1.9", r));
+    REQUIRE_FALSE(nvd_version_in_range("3.0", r));
+}
+
+TEST_CASE("nvd_version_in_range: start excluding", "[nvd][range]") {
+    VersionRange r{"", "", "2.0", "", ""}; // (2.0, )
+    REQUIRE_FALSE(nvd_version_in_range("2.0", r));
+    REQUIRE(nvd_version_in_range("2.1", r));
+}
+
+TEST_CASE("nvd_version_in_range: exact pin", "[nvd][range]") {
+    VersionRange r{"1.2.3", "", "", "", ""};
+    REQUIRE(nvd_version_in_range("1.2.3", r));
+    REQUIRE_FALSE(nvd_version_in_range("1.2.4", r));
+}
+
+TEST_CASE("nvd_version_in_range: wildcard / no constraint means all versions", "[nvd][range]") {
+    REQUIRE(nvd_version_in_range("9.9.9", VersionRange{"*", "", "", "", ""}));
+    REQUIRE(nvd_version_in_range("9.9.9", VersionRange{"-", "", "", "", ""}));
+    REQUIRE(nvd_version_in_range("9.9.9", VersionRange{"", "", "", "", ""}));
 }
 
 // ── NvdDatabase ──────────────────────────────────────────────────────────────
@@ -66,59 +161,44 @@ TEST_CASE("NvdDatabase: open in-memory", "[nvd][db]") {
 
 TEST_CASE("NvdDatabase: upsert and count", "[nvd][db]") {
     NvdDatabase db(":memory:");
-    CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "openssl";
-    rec.vendor = "openssl";
-    rec.affected_below = "3.0.7";
-    rec.severity = "HIGH";
-    rec.description = "Test vulnerability";
-    rec.source = "nvd";
-
-    db.upsert_cve(rec);
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
     REQUIRE(db.total_cve_count() == 1);
 }
 
 TEST_CASE("NvdDatabase: upsert batch", "[nvd][db]") {
     NvdDatabase db(":memory:");
     std::vector<CveRecord> records;
-    for (int i = 0; i < 5; ++i) {
-        CveRecord rec;
-        rec.cve_id = "CVE-2024-000" + std::to_string(i);
-        rec.product = "test";
-        rec.vendor = "test";
-        rec.severity = "MEDIUM";
-        rec.source = "nvd";
-        records.push_back(std::move(rec));
-    }
-
-    db.upsert_cves(records);
+    for (int i = 0; i < 5; ++i)
+        records.push_back(make_cve("CVE-2024-000" + std::to_string(i), "test", "1.0"));
+    REQUIRE(db.upsert_cves(records)); // returns true on a fully-persisted batch
     REQUIRE(db.total_cve_count() == 5);
 }
 
-TEST_CASE("NvdDatabase: upsert same ID replaces", "[nvd][db]") {
+TEST_CASE("NvdDatabase: upsert same ID replaces header, count stays 1", "[nvd][db]") {
     NvdDatabase db(":memory:");
-    CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "test";
-    rec.severity = "LOW";
-    rec.source = "nvd";
-
+    auto rec = make_cve("CVE-2024-0001", "test", "1.0", "LOW");
     db.upsert_cve(rec);
     rec.severity = "CRITICAL";
     db.upsert_cve(rec);
-
     REQUIRE(db.total_cve_count() == 1);
+}
+
+TEST_CASE("NvdDatabase: header-only CVE counted, never matches", "[nvd][db]") {
+    NvdDatabase db(":memory:");
+    CveRecord rec;
+    rec.cve_id = "CVE-2024-5000";
+    rec.severity = "HIGH";
+    rec.description = "no cpe";
+    rec.source = "nvd";
+    db.upsert_cve(rec); // no matches
+    REQUIRE(db.total_cve_count() == 1);
+    REQUIRE(db.match_inventory({{"anything", "1.0"}}).empty());
 }
 
 TEST_CASE("NvdDatabase: metadata round-trip", "[nvd][db]") {
     NvdDatabase db(":memory:");
     db.set_meta("last_sync", "2024-01-01T00:00:00Z");
     REQUIRE(db.get_meta("last_sync") == "2024-01-01T00:00:00Z");
-}
-
-TEST_CASE("NvdDatabase: get_meta returns empty for missing key", "[nvd][db]") {
-    NvdDatabase db(":memory:");
     REQUIRE(db.get_meta("nonexistent").empty());
 }
 
@@ -126,81 +206,153 @@ TEST_CASE("NvdDatabase: seed_builtin_rules is idempotent", "[nvd][db]") {
     NvdDatabase db(":memory:");
     db.seed_builtin_rules();
     auto count1 = db.total_cve_count();
-
     db.seed_builtin_rules();
     auto count2 = db.total_cve_count();
-
     REQUIRE(count1 == count2);
     REQUIRE(count1 > 0);
+}
+
+// ── v1 -> v2 schema migration (real upgrade path) ────────────────────────────
+
+TEST_CASE("NvdDatabase: v1 database with data upgrades to v2", "[nvd][db][migration]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-migration-"}};
+    const std::string path = tmp.path.string();
+
+    // 1. Hand-build a v1-schema database on disk: the OLD flat cve table with a
+    //    real row, a sync cursor, and schema_meta pinned at version 1 — exactly
+    //    what a persisted volume from before this change looks like.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        const char* v1 = R"(
+            CREATE TABLE cve (
+                cve_id TEXT PRIMARY KEY, product TEXT NOT NULL, vendor TEXT,
+                affected_below TEXT NOT NULL, fixed_in TEXT, severity TEXT NOT NULL,
+                description TEXT NOT NULL, published TEXT, last_modified TEXT,
+                source TEXT DEFAULT 'nvd');
+            CREATE INDEX idx_cve_product ON cve(product);
+            CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL,
+                                      upgraded_at TEXT);
+            INSERT INTO cve (cve_id, product, vendor, affected_below, fixed_in, severity, description)
+                VALUES ('CVE-2014-0160','openssl','openssl','1.0.1g','1.0.1g','CRITICAL','Heartbleed');
+            INSERT INTO sync_meta (key, value) VALUES ('last_sync_time','2024-01-01T00:00:00Z');
+            INSERT INTO schema_meta (store, version, upgraded_at)
+                VALUES ('nvd_database', 1, '2024-01-01T00:00:00Z');
+        )";
+        char* err = nullptr;
+        REQUIRE(sqlite3_exec(raw, v1, nullptr, nullptr, &err) == SQLITE_OK);
+        sqlite3_free(err);
+        sqlite3_close(raw);
+    }
+
+    // 2. Opening through NvdDatabase runs the v2 migration.
+    NvdDatabase db(path);
+    REQUIRE(db.is_open());
+
+    // 3. The old flat rows are dropped (reconstructable from the next sync). The
+    //    header table is empty and the old product no longer matches — proving
+    //    the migration ran, not that it silently kept the v1 table.
+    REQUIRE(db.total_cve_count() == 0);
+    REQUIRE(db.match_inventory({{"openssl", "1.0.1f"}}).empty()); // would have matched under v1
+
+    // 4. The sync cursor must NOT survive: v2 dropped the catalog, so a preserved
+    //    last_sync_time would make the next sync incremental and the dropped rows
+    //    would never be re-fetched (silently gone from /api/nvd/match forever). An
+    //    empty cursor routes do_sync() to the full initial sync the upgrade docs
+    //    promise ("fully reconstructable / self-healing").
+    REQUIRE(db.get_meta("last_sync_time").empty());
+
+    // 5. The reshaped schema is fully functional post-upgrade.
+    db.upsert_cve(make_cve("CVE-2024-0001", "nginx", "1.25.0"));
+    REQUIRE(db.total_cve_count() == 1);
+    REQUIRE(db.match_inventory({{"nginx", "1.24.0"}}).size() == 1);
 }
 
 // ── Inventory Matching ───────────────────────────────────────────────────────
 
 TEST_CASE("NvdDatabase: match_inventory finds vulnerable version", "[nvd][match]") {
     NvdDatabase db(":memory:");
-    CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "openssl";
-    rec.vendor = "openssl";
-    rec.affected_below = "3.0.7";
-    rec.severity = "HIGH";
-    rec.source = "nvd";
-    db.upsert_cve(rec);
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
 
-    std::vector<SoftwareItem> inventory = {{"openssl", "3.0.6"}};
-    auto matches = db.match_inventory(inventory);
+    auto matches = db.match_inventory({{"openssl", "3.0.6"}});
     REQUIRE(matches.size() == 1);
     REQUIRE(matches[0].cve_id == "CVE-2024-0001");
     REQUIRE(matches[0].installed_version == "3.0.6");
+    REQUIRE(matches[0].fixed_in == "3.0.7");
 }
 
 TEST_CASE("NvdDatabase: match_inventory skips fixed version", "[nvd][match]") {
     NvdDatabase db(":memory:");
-    CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "openssl";
-    rec.vendor = "openssl";
-    rec.affected_below = "3.0.7";
-    rec.severity = "HIGH";
-    rec.source = "nvd";
-    db.upsert_cve(rec);
-
-    std::vector<SoftwareItem> inventory = {{"openssl", "3.0.7"}};
-    auto matches = db.match_inventory(inventory);
-    REQUIRE(matches.empty());
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
+    REQUIRE(db.match_inventory({{"openssl", "3.0.7"}}).empty());
 }
 
 TEST_CASE("NvdDatabase: match_inventory empty inventory", "[nvd][match]") {
     NvdDatabase db(":memory:");
-    CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "test";
-    rec.affected_below = "1.0";
-    rec.source = "nvd";
-    db.upsert_cve(rec);
-
-    auto matches = db.match_inventory({});
-    REQUIRE(matches.empty());
+    db.upsert_cve(make_cve("CVE-2024-0001", "test", "1.0"));
+    REQUIRE(db.match_inventory({}).empty());
 }
 
 TEST_CASE("NvdDatabase: match_inventory case-insensitive product", "[nvd][match]") {
     NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
+    REQUIRE(db.match_inventory({{"OpenSSL", "3.0.6"}}).size() == 1);
+}
+
+TEST_CASE("NvdDatabase: match_inventory honours a version band", "[nvd][match]") {
+    NvdDatabase db(":memory:");
     CveRecord rec;
-    rec.cve_id = "CVE-2024-0001";
-    rec.product = "openssl"; // lowercase in DB
-    rec.affected_below = "3.0.7";
+    rec.cve_id = "CVE-2024-0007";
+    rec.severity = "HIGH";
+    rec.description = "band";
     rec.source = "nvd";
+    CpeMatch cm;
+    cm.cpe_product = "nginx";
+    cm.version_start_including = "1.20.0";
+    cm.version_end_excluding = "1.24.0";
+    rec.matches.push_back(cm);
     db.upsert_cve(rec);
 
-    // Inventory uses mixed case — should still match
-    std::vector<SoftwareItem> inventory = {{"OpenSSL", "3.0.6"}};
-    auto matches = db.match_inventory(inventory);
-    REQUIRE(matches.size() == 1);
+    REQUIRE(db.match_inventory({{"nginx", "1.22.0"}}).size() == 1);
+    REQUIRE(db.match_inventory({{"nginx", "1.19.0"}}).empty()); // below start
+    REQUIRE(db.match_inventory({{"nginx", "1.24.0"}}).empty()); // at exclusive end
+}
+
+TEST_CASE("NvdDatabase: multi-product CVE preserved (row-loss regression)", "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    CveRecord rec;
+    rec.cve_id = "CVE-2024-9999";
+    rec.severity = "HIGH";
+    rec.description = "multi-product";
+    rec.source = "nvd";
+    rec.matches.push_back(CpeMatch{.cpe_product = "producta", .version_end_excluding = "1.0"});
+    rec.matches.push_back(CpeMatch{.cpe_product = "productb", .version_end_excluding = "2.0"});
+    db.upsert_cve(rec);
+
+    // Both products are independently matchable — the old INSERT OR REPLACE bug
+    // kept only the last row and would fail one of these.
+    REQUIRE(db.match_inventory({{"producta", "0.9"}}).size() == 1);
+    REQUIRE(db.match_inventory({{"productb", "1.5"}}).size() == 1);
+    REQUIRE(db.match_inventory({{"productb", "2.0"}}).empty());
+    REQUIRE(db.total_cve_count() == 1);
+}
+
+TEST_CASE("NvdDatabase: re-upsert replaces the match set", "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
+    REQUIRE(db.match_inventory({{"openssl", "3.0.6"}}).size() == 1);
+
+    // Re-sync the same CVE with a different product; the old openssl row must go.
+    db.upsert_cve(make_cve("CVE-2024-0001", "nginx", "1.25.0"));
+    REQUIRE(db.match_inventory({{"openssl", "3.0.6"}}).empty());
+    REQUIRE(db.match_inventory({{"nginx", "1.24.0"}}).size() == 1);
+    REQUIRE(db.total_cve_count() == 1);
 }
 
 // ── NVD JSON Parsing ─────────────────────────────────────────────────────────
 
-TEST_CASE("parse_response: minimal valid JSON", "[nvd][parse]") {
+TEST_CASE("parse_response: keeps cpeMatch range fields", "[nvd][parse]") {
     NvdClient client;
     std::string json = R"({
         "totalResults": 1,
@@ -214,6 +366,7 @@ TEST_CASE("parse_response: minimal valid JSON", "[nvd][parse]") {
                     "nodes": [{
                         "cpeMatch": [{
                             "criteria": "cpe:2.3:a:vendor:product:*:*:*:*:*:*:*:*",
+                            "versionStartIncluding": "1.0.0",
                             "versionEndExcluding": "1.2.3"
                         }]
                     }]
@@ -226,11 +379,13 @@ TEST_CASE("parse_response: minimal valid JSON", "[nvd][parse]") {
     REQUIRE(result.total_results == 1);
     REQUIRE(result.records.size() == 1);
     REQUIRE(result.records[0].cve_id == "CVE-2024-0001");
-    REQUIRE(result.records[0].product == "product");
-    REQUIRE(result.records[0].vendor == "vendor");
-    REQUIRE(result.records[0].affected_below == "1.2.3");
     REQUIRE(result.records[0].description == "Test vuln");
     REQUIRE(result.records[0].source == "nvd");
+    REQUIRE(result.records[0].matches.size() == 1);
+    REQUIRE(result.records[0].matches[0].cpe_vendor == "vendor");
+    REQUIRE(result.records[0].matches[0].cpe_product == "product");
+    REQUIRE(result.records[0].matches[0].version_start_including == "1.0.0");
+    REQUIRE(result.records[0].matches[0].version_end_excluding == "1.2.3");
 }
 
 TEST_CASE("parse_response: CVSS v3.1 severity extraction", "[nvd][parse]") {
@@ -241,15 +396,10 @@ TEST_CASE("parse_response: CVSS v3.1 severity extraction", "[nvd][parse]") {
             "cve": {
                 "id": "CVE-2024-0002",
                 "descriptions": [{"lang": "en", "value": "Critical vuln"}],
-                "metrics": {
-                    "cvssMetricV31": [{
-                        "cvssData": { "baseSeverity": "CRITICAL" }
-                    }]
-                }
+                "metrics": { "cvssMetricV31": [{ "cvssData": { "baseSeverity": "CRITICAL" } }] }
             }
         }]
     })";
-
     auto result = client.parse_response(json);
     REQUIRE(result.records.size() == 1);
     REQUIRE(result.records[0].severity == "CRITICAL");
@@ -263,13 +413,10 @@ TEST_CASE("parse_response: CVSS v2 fallback", "[nvd][parse]") {
             "cve": {
                 "id": "CVE-2024-0003",
                 "descriptions": [{"lang": "en", "value": "Old vuln"}],
-                "metrics": {
-                    "cvssMetricV2": [{ "baseSeverity": "HIGH" }]
-                }
+                "metrics": { "cvssMetricV2": [{ "baseSeverity": "HIGH" }] }
             }
         }]
     })";
-
     auto result = client.parse_response(json);
     REQUIRE(result.records.size() == 1);
     REQUIRE(result.records[0].severity == "HIGH");
@@ -277,9 +424,7 @@ TEST_CASE("parse_response: CVSS v2 fallback", "[nvd][parse]") {
 
 TEST_CASE("parse_response: empty vulnerabilities array", "[nvd][parse]") {
     NvdClient client;
-    std::string json = R"({"totalResults": 0, "vulnerabilities": []})";
-
-    auto result = client.parse_response(json);
+    auto result = client.parse_response(R"({"totalResults": 0, "vulnerabilities": []})");
     REQUIRE(result.total_results == 0);
     REQUIRE(result.records.empty());
 }
@@ -300,12 +445,12 @@ TEST_CASE("parse_response: tracks latest lastModified", "[nvd][parse]") {
             {"cve": {"id": "CVE-2024-0002", "lastModified": "2024-06-15T12:00:00.000"}}
         ]
     })";
-
     auto result = client.parse_response(json);
     REQUIRE(result.last_modified_timestamp == "2024-06-15T12:00:00.000");
 }
 
-TEST_CASE("parse_response: multiple CPE nodes produce multiple records", "[nvd][parse]") {
+TEST_CASE("parse_response: multiple cpeMatch produce one record with many matches",
+          "[nvd][parse]") {
     NvdClient client;
     std::string json = R"({
         "totalResults": 1,
@@ -326,7 +471,880 @@ TEST_CASE("parse_response: multiple CPE nodes produce multiple records", "[nvd][
     })";
 
     auto result = client.parse_response(json);
-    REQUIRE(result.records.size() == 2);
-    REQUIRE(result.records[0].product == "producta");
-    REQUIRE(result.records[1].product == "productb");
+    REQUIRE(result.records.size() == 1);
+    REQUIRE(result.records[0].matches.size() == 2);
+    REQUIRE(result.records[0].matches[0].cpe_product == "producta");
+    REQUIRE(result.records[0].matches[1].cpe_product == "productb");
+}
+
+// ── Governance hardening round (c1735cd3 review) ─────────────────────────────
+
+TEST_CASE("nvd_version_compare: attached letter-release is a patch, not pre-release",
+          "[nvd][version]") {
+    // Regression for cpp-expert S1: OpenSSL-style "1.0.2a" is a patch ABOVE
+    // "1.0.2"; ranking single-letter a/b as pre-release flipped this and would
+    // flip vulnerable<->fixed against a version bound.
+    REQUIRE(nvd_version_compare("1.0.2a", "1.0.2") > 0);
+    REQUIRE(nvd_version_compare("1.0.2b", "1.0.2a") > 0);
+    REQUIRE(nvd_version_compare("1.0.2a", "1.0.2b") < 0);
+    // Multi-letter pre-release words still rank as pre-release.
+    REQUIRE(nvd_version_compare("1.0.0-dev", "1.0.0-alpha") < 0);
+    REQUIRE(nvd_version_compare("1.0.0-pre", "1.0.0-rc") < 0);
+    REQUIRE(nvd_version_compare("1.0.0-preview", "1.0.0") < 0);
+}
+
+TEST_CASE("nvd_version_compare: overflow-safe on huge numeric segments", "[nvd][version]") {
+    // Digit runs far beyond a 64-bit integer must still order correctly (the
+    // reason numeric_compare is string-length based, not stoll).
+    REQUIRE(nvd_version_compare("99999999999999999999", "100000000000000000000") < 0);
+    REQUIRE(nvd_version_compare("100000000000000000000", "99999999999999999999") > 0);
+    REQUIRE(nvd_version_compare("007", "7") == 0); // leading zeros
+}
+
+TEST_CASE("nvd_version_in_range: bounds take precedence over exact when both set",
+          "[nvd][range]") {
+    // exact pinned to 1.2.3 but an end_excluding bound also present → bounds win.
+    VersionRange r{"1.2.3", "", "", "", "9.9"};
+    REQUIRE(nvd_version_in_range("1.2.4", r)); // in [,9.9) → vulnerable via bound
+    REQUIRE_FALSE(nvd_version_in_range("9.9", r));
+}
+
+TEST_CASE("nvd_version_in_range: open-ended and both-inclusive bounds", "[nvd][range]") {
+    REQUIRE(nvd_version_in_range("9.9", VersionRange{"", "2.0", "", "", ""}));      // [2.0, )
+    REQUIRE_FALSE(nvd_version_in_range("1.0", VersionRange{"", "2.0", "", "", ""})); // below start
+    VersionRange band{"", "1.0", "", "2.0", ""};                                    // [1.0, 2.0]
+    REQUIRE(nvd_version_in_range("1.0", band));
+    REQUIRE(nvd_version_in_range("2.0", band));
+    REQUIRE_FALSE(nvd_version_in_range("2.1", band));
+}
+
+TEST_CASE("NvdDatabase: is_vulnerable=false rows are excluded from matches", "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    CveRecord rec;
+    rec.cve_id = "CVE-2024-8000";
+    rec.severity = "HIGH";
+    rec.description = "running-on platform node";
+    rec.source = "nvd";
+    rec.matches.push_back(
+        CpeMatch{.cpe_product = "linux_kernel", .version_end_excluding = "9.9", .is_vulnerable = false});
+    db.upsert_cve(rec);
+    REQUIRE(db.match_inventory({{"linux_kernel", "1.0"}}).empty());
+}
+
+TEST_CASE("NvdDatabase: match_inventory skips empty name/version", "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
+    // Empty fields are skipped; a valid item in the same batch still matches.
+    auto m = db.match_inventory({{"", "1.0"}, {"openssl", ""}, {"openssl", "3.0.6"}});
+    REQUIRE(m.size() == 1);
+    REQUIRE(m[0].cve_id == "CVE-2024-0001");
+}
+
+TEST_CASE("NvdDatabase: LIKE metacharacters in name do not broaden the match", "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-2024-0001", "openssl", "3.0.7"));
+    // '%' must be treated literally (escaped), not as a wildcard that matches
+    // "openssl". A literal "a%b" product is not in the DB → no match.
+    REQUIRE(db.match_inventory({{"a%b", "1.0"}}).empty());
+    REQUIRE(db.match_inventory({{"%", "1.0"}}).empty());
+}
+
+TEST_CASE("NvdDatabase: v2 migration is idempotent across reopen", "[nvd][db][migration]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-remigrate-"}};
+    const std::string path = tmp.path.string();
+    {
+        NvdDatabase db(path);
+        db.upsert_cve(make_cve("CVE-2024-0001", "nginx", "1.25.0"));
+        REQUIRE(db.total_cve_count() == 1);
+    }
+    // Reopen: schema_meta already at v2, so migration 2 must NOT re-run / wipe.
+    NvdDatabase db2(path);
+    REQUIRE(db2.total_cve_count() == 1);
+    REQUIRE(db2.match_inventory({{"nginx", "1.24.0"}}).size() == 1);
+}
+
+TEST_CASE("NvdDatabase: a failed upsert rolls back atomically (no partial state)",
+          "[nvd][match]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-atomic-"}};
+    const std::string path = tmp.path.string();
+
+    NvdDatabase db(path);
+    db.upsert_cve(make_cve("CVE-A", "openssl", "3.0.7"));
+    REQUIRE(db.total_cve_count() == 1);
+
+    // Force a mid-upsert failure by dropping cve_match out from under the store
+    // via a second connection: the header INSERT succeeds, the cve_match DELETE
+    // then fails to prepare → the whole CVE must ROLLBACK TO the savepoint, so
+    // the new header must NOT survive (UP-1: no partial commit).
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "DROP TABLE cve_match;", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    db.upsert_cve(make_cve("CVE-B", "nginx", "1.25.0")); // must roll back
+    REQUIRE(db.total_cve_count() == 1); // CVE-B header did not survive the rollback
+}
+
+// ── Rate-limit wait (regression for the #1867 first-request overflow) ─────────
+
+TEST_CASE("nvd_rate_limit_wait: first request never waits (overflow regression)",
+          "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+    // No prior request (nullopt) — the old time_point::min() sentinel overflowed
+    // here and slept ~292 years; must be zero.
+    REQUIRE(nvd_rate_limit_wait(std::nullopt, now, interval) == steady_clock::duration::zero());
+}
+
+TEST_CASE("nvd_rate_limit_wait: throttles within the interval, not after", "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+
+    // A request 1s ago → wait exactly the remaining 5s (pure function, deterministic).
+    const auto w = nvd_rate_limit_wait(now - milliseconds(1000), now, interval);
+    REQUIRE(duration_cast<milliseconds>(w).count() == 5000);
+
+    // A request well outside the interval → no wait.
+    REQUIRE(nvd_rate_limit_wait(now - seconds(30), now, interval) == steady_clock::duration::zero());
+    // Exactly at the interval boundary → no wait.
+    REQUIRE(nvd_rate_limit_wait(now - milliseconds(6000), now, interval) ==
+            steady_clock::duration::zero());
+}
+
+TEST_CASE("nvd_rate_limit_wait: non-positive elapsed never waits (overflow-class guard)",
+          "[nvd][ratelimit]") {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    const auto interval = milliseconds(6000);
+    // A `last` in the future (backwards/non-monotonic clock) must return zero, not
+    // `interval - negative` — the defence against the ~292yr overflow class.
+    REQUIRE(nvd_rate_limit_wait(now + milliseconds(10), now, interval) ==
+            steady_clock::duration::zero());
+    REQUIRE(nvd_rate_limit_wait(now + hours(1000000), now, interval) ==
+            steady_clock::duration::zero());
+    // elapsed == 0 (same instant) → no wait.
+    REQUIRE(nvd_rate_limit_wait(now, now, interval) == steady_clock::duration::zero());
+}
+
+// ── PR2b: prefix-anchored matching (perf-P1) ─────────────────────────────────
+
+TEST_CASE("NvdDatabase: match is prefix-anchored (product starts with name), not substring",
+          "[nvd][match]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve("CVE-A", "libopenssl", "3.0.7")); // product embeds 'openssl'
+
+    // Under the old LIKE '%name%', inventory 'openssl' matched 'libopenssl'. Now
+    // matching is prefix-anchored (index-usable), so the product must START WITH
+    // the inventory name — 'openssl' no longer matches 'libopenssl'.
+    REQUIRE(db.match_inventory({{"openssl", "3.0.6"}}).empty());
+    // A genuine prefix still matches.
+    REQUIRE(db.match_inventory({{"libopenssl", "3.0.6"}}).size() == 1);
+    REQUIRE(db.match_inventory({{"lib", "3.0.6"}}).size() == 1); // 'lib' is a prefix
+    // Escaped metacharacters still can't broaden the prefix.
+    db.upsert_cve(make_cve("CVE-B", "openssl", "3.0.7"));
+    REQUIRE(db.match_inventory({{"open_sl", "3.0.6"}}).empty()); // '_' is literal, not a wildcard
+}
+
+// ── PR2b: 120-day window splitter (pure) ─────────────────────────────────────
+
+TEST_CASE("nvd_split_windows: partitions [start,end] into <=max windows, oldest-first",
+          "[nvd][window]") {
+    using namespace std::chrono;
+    const auto base = system_clock::time_point{};
+    const auto max = hours(24 * 120);
+
+    // 300 days / 120 → 3 contiguous windows covering the whole span.
+    auto w = nvd_split_windows(base, base + hours(24 * 300), max);
+    REQUIRE(w.size() == 3);
+    REQUIRE(w.front().first == base);
+    REQUIRE(w.back().second == base + hours(24 * 300));
+    REQUIRE(w[0].second == w[1].first); // contiguous
+    REQUIRE(w[1].second == w[2].first);
+    for (const auto& [s, e] : w)
+        REQUIRE(e - s <= max);
+
+    // Exactly one window at/under the cap.
+    REQUIRE(nvd_split_windows(base, base + max, max).size() == 1);
+    REQUIRE(nvd_split_windows(base, base + hours(24 * 10), max).size() == 1);
+
+    // Degenerate inputs → empty.
+    REQUIRE(nvd_split_windows(base + hours(1), base, max).empty()); // inverted
+    REQUIRE(nvd_split_windows(base, base, max).empty());            // zero span
+    REQUIRE(nvd_split_windows(base, base + max, hours(0)).empty()); // zero window
+}
+
+// ── PR2b: backfill / freshness state machine (mock fetcher) ──────────────────
+
+namespace {
+struct MockFetcher : INvdFetcher {
+    std::vector<std::pair<std::string, std::string>> published_calls;
+    std::vector<std::pair<std::string, std::string>> modified_calls;
+    bool fail = false;
+    bool empty_ok = false; // fetch succeeds (ok=true) but returns zero records (NVD outage shape)
+    // Per-call override: given the 1-based published-window call index, return true for a
+    // data window or false for an ok+empty window. Lets a test script "data then empty".
+    std::function<bool(std::size_t)> data_predicate;
+    NvdFailureReason fail_reason = NvdFailureReason::kConnection; // returned when fail==true
+
+    static CveRecord one_cve(std::size_t n) {
+        CveRecord rec;
+        rec.cve_id = "CVE-MOCK-" + std::to_string(n);
+        rec.severity = "HIGH";
+        rec.description = "mock";
+        rec.source = "nvd";
+        CpeMatch cm;
+        cm.cpe_product = "product" + std::to_string(n);
+        cm.version_end_excluding = "9.9";
+        rec.matches.push_back(cm);
+        return rec;
+    }
+    NvdFetchResult make(std::size_t n) {
+        NvdFetchResult r;
+        if (fail) {
+            r.ok = false;
+            r.reason = fail_reason;
+            return r;
+        }
+        r.ok = true;
+        bool give_data = !empty_ok;
+        if (give_data && data_predicate)
+            give_data = data_predicate(n);
+        if (give_data)
+            r.records.push_back(one_cve(n));
+        return r;
+    }
+    NvdFetchResult fetch_by_published_window(const std::string& s, const std::string& e) override {
+        published_calls.emplace_back(s, e);
+        return make(published_calls.size());
+    }
+    NvdFetchResult fetch_modified_between(const std::string& s, const std::string& e) override {
+        modified_calls.emplace_back(s, e);
+        NvdFetchResult r;
+        if (fail) {
+            r.ok = false;
+            r.reason = fail_reason;
+        }
+        return r;
+    }
+};
+
+long long secs_ago(int days) {
+    const auto tp = std::chrono::system_clock::now() - std::chrono::days(days);
+    return std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+}
+} // namespace
+
+TEST_CASE("NvdSyncManager: backfill walks newest-first, contiguous, to the floor", "[nvd][backfill]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+
+    mgr.sync_now(); // runs the whole backfill synchronously
+
+    // ~1 year / 120 days → 3 full windows + a remainder = 4.
+    REQUIRE(m->published_calls.size() >= 3);
+    REQUIRE(m->published_calls.size() <= 4);
+    // Newest-first: the first window ends later (lexicographically greater ISO) than the last.
+    REQUIRE(m->published_calls.front().second > m->published_calls.back().second);
+    // Contiguous: window[i].start == window[i+1].end (walking backward).
+    for (std::size_t i = 0; i + 1 < m->published_calls.size(); ++i)
+        REQUIRE(m->published_calls[i].first == m->published_calls[i + 1].second);
+    // Completed + upserted; no freshness yet. Completion is derived (cursor vs floor).
+    REQUIRE(mgr.status().backfill_complete);
+    REQUIRE(db->total_cve_count() == m->published_calls.size());
+    REQUIRE(m->modified_calls.empty());
+
+    // Once complete, the next sync does freshness, not backfill.
+    const auto before = m->published_calls.size();
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == before); // no more backfill windows (freshness path)
+}
+
+TEST_CASE("NvdSyncManager: a failed backfill window leaves the cursor and doesn't complete",
+          "[nvd][backfill]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true;
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+
+    mgr.sync_now();
+
+    REQUIRE(m->published_calls.size() == 1);              // stopped after the first failure
+    REQUIRE_FALSE(mgr.status().backfill_complete);        // not complete (no cursor to reach floor)
+    REQUIRE(db->get_meta("backfill_oldest_published").empty()); // cursor never advanced (#1875)
+}
+
+TEST_CASE("NvdSyncManager: freshness splits a >120-day gap into windows", "[nvd][freshness]") {
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    // Completion is derived from the cursor vs the floor AND a non-empty catalog: a
+    // cursor older than the 8-year floor (~9y ago) plus stored CVEs → complete.
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
+    db->set_meta("last_freshness_check", std::to_string(secs_ago(300)));
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)})); // content guard: complete requires CVEs
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 8);
+
+    mgr.sync_now();
+
+    REQUIRE(m->published_calls.empty());       // backfill already complete → freshness path
+    REQUIRE(m->modified_calls.size() == 3);    // 300 days / 120 → 3 windows
+}
+
+// ── PR2b governance Gate 7 — cursor integrity + parse-failure + index plan ───
+
+TEST_CASE("NvdSyncManager: a corrupt/absurd cursor does NOT false-complete the backfill",
+          "[nvd][backfill]") {
+    // #1889 / UP-3: parse_cursor rejects a pre-catalog cursor (below NVD's fixed
+    // 1999-01-01 start), so the backfill restarts from `now` and actually builds —
+    // never jumps to ~1970 and false-completes with an empty store. These three are
+    // all pre-1999 garbage. (A post-1999 value below the *configured* floor is NOT
+    // garbage — it's a legitimately-deeper cursor — so it's tested separately as a
+    // resume/complete case, not here.)
+    for (const char* bad : {"-5" /* 1969 */, "0" /* 1970 */, "500000000" /* 1985 */}) {
+        auto db = std::make_shared<NvdDatabase>(":memory:");
+        db->set_meta("backfill_oldest_published", bad);
+        auto mock = std::make_unique<MockFetcher>();
+        auto* m = mock.get();
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+        mgr.sync_now();
+        INFO("bad cursor = " << bad);
+        REQUIRE(m->published_calls.size() >= 3);  // it walked from now, not false-completed
+        REQUIRE(mgr.status().backfill_complete);   // legitimately reached the floor
+        REQUIRE(db->total_cve_count() == m->published_calls.size());
+    }
+}
+
+TEST_CASE("NvdSyncManager: a future cursor is clamped to now (no livelock)", "[nvd][backfill]") {
+    // UP-4: a clock-skew future cursor must be clamped to `now`, else backfill asks
+    // NVD for a future window forever. First window must end at ~now, not the future.
+    const auto future =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            (std::chrono::system_clock::now() + std::chrono::days(400)).time_since_epoch())
+            .count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(future));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() >= 3);
+    REQUIRE(mgr.status().backfill_complete);
+    // Newest window's end (first call) is ~now, well before the +400d future.
+    const auto now_iso_year = std::to_string(1900); // sanity: string compare below
+    (void)now_iso_year;
+    REQUIRE(m->published_calls.front().second < std::to_string(2100)); // not a year-2100+ future
+}
+
+TEST_CASE("NvdSyncManager: full-history (backfill_years=0) resumes from a valid in-catalog cursor",
+          "[nvd][backfill]") {
+    // #1889: a persisted cursor within the catalog (>= NVD's 1999 start) must RESUME,
+    // not restart. Full-history floor is the fixed 1999 start; seed a 2005 cursor and
+    // the next fetch window must resume near 2005, not jump back to `now`.
+    using namespace std::chrono;
+    const auto cursor_2005 =
+        duration_cast<seconds>(sys_days{2005y / June / 1}.time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_2005));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // stop after the first window so we can inspect the resume point
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == 1); // resumed and attempted exactly one window
+    // Window END = the resumed cursor (~2005), NOT a restart from ~now.
+    REQUIRE(m->published_calls.front().second.substr(0, 4) == "2005");
+    // Fetch failed → cursor held unchanged (no false advance), proving pure resume.
+    REQUIRE(db->get_meta("backfill_oldest_published") == std::to_string(cursor_2005));
+}
+
+TEST_CASE("NvdSyncManager: full-history REJECTS a pre-catalog garbage cursor (no false-complete)",
+          "[nvd][backfill]") {
+    // #1889 review r2 (Blocker 1): the full-history floor is anchored at NVD's fixed
+    // 1999 catalog start, NOT now-100y (~1926, a negative epoch). So a garbage sub-1999
+    // cursor like "-5" (→1969) must be REJECTED and the backfill restarted from `now` —
+    // never walk 1969→1926 and mark itself complete, silently skipping 1969→present.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", "-5"); // parses to 1969: pre-catalog garbage
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // inspect the first (restarted) window, then stop
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == 1);
+    // Restarted from ~now (recent year), NOT resumed at the garbage 1969 point.
+    REQUIRE(m->published_calls.front().second.substr(0, 4) >= "2020");
+    REQUIRE_FALSE(mgr.status().backfill_complete); // fetch failed → not falsely completed
+}
+
+TEST_CASE("NvdSyncManager: deepening backfill_years reopens a completed shallow backfill",
+          "[nvd][backfill]") {
+    // #1889 review r2 (Blocker 2): completion is derived from the stored cursor vs the
+    // CURRENT floor, not a sticky flag. An 8-year backfill that completed, then restarts
+    // as full-history (years=0), must RESUME fetching the older range — not run freshness
+    // forever while reporting the catalog complete.
+    using namespace std::chrono;
+    const auto cursor_8y_ago =
+        duration_cast<seconds>((system_clock::now() - years(8)).time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_8y_ago)); // shallow-complete
+    db->set_meta("last_freshness_check", std::to_string(secs_ago(1)));         // freshness would be a no-op
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // one window is enough to prove backfill (not freshness) ran
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/0);
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty()); // BACKFILL ran (older range reopened)...
+    REQUIRE(m->modified_calls.empty());        // ...not the freshness-only path (the defect)
+}
+
+TEST_CASE("NvdSyncManager: an absurd backfill_years clamps the floor (no overflow/false-complete)",
+          "[nvd][backfill]") {
+    // Defensive: --nvd-backfill-years is unbounded at config parse; a huge value must
+    // not overflow the years->clock subtraction into a garbage (far-future) floor that
+    // would false-complete. The floor clamps to NVD's 1999 start, so a 2005 cursor is
+    // still ABOVE the floor and resumes (not complete) rather than false-completing.
+    using namespace std::chrono;
+    const auto cursor_2005 =
+        duration_cast<seconds>(sys_days{2005y / June / 1}.time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_2005));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true;
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/100000);
+    mgr.sync_now();
+    REQUIRE_FALSE(mgr.status().backfill_complete);   // floor≈1999 < 2005 cursor → not complete
+    REQUIRE(m->published_calls.size() == 1);          // resumed a real window (no false-complete)
+    REQUIRE(m->published_calls.front().second.substr(0, 4) == "2005"); // resumed at the cursor
+}
+
+TEST_CASE("NvdSyncManager: a completed bounded backfill stays complete + displayed across drift",
+          "[nvd][backfill]") {
+    // #1889 review r2/S1: completion is derived from cursor <= current floor, and the
+    // cursor display uses the fixed 1999 bound. A completed 8-year backfill whose cursor
+    // sits below today's (wall-clock-drifted) floor must STILL report complete AND
+    // display its cursor — never flip to "incomplete" (a re-backfill storm) or blank it.
+    using namespace std::chrono;
+    const auto cursor_9y_ago =
+        duration_cast<seconds>((system_clock::now() - years(9)).time_since_epoch()).count();
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(cursor_9y_ago));
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)})); // content guard: complete requires CVEs
+    auto mock = std::make_unique<MockFetcher>();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    const auto st = mgr.status();
+    REQUIRE(st.backfill_complete);                        // cursor (~9y) <= floor (~8y) + CVEs → complete
+    REQUIRE_FALSE(st.backfill_oldest_published.empty());  // >= 1999 → displayed, not blanked
+}
+
+TEST_CASE("NvdSyncManager: an at-floor cursor with an EMPTY catalog is NOT complete (content guard)",
+          "[nvd][backfill]") {
+    // Governance Gate 4 UP-1/UP-2: completion must reflect stored CONTENT, not just
+    // cursor position. A corrupt/at-floor cursor with zero CVEs — from a writable/corrupt
+    // nvd.db, or an NVD outage returning empty windows — must NOT report the mirror
+    // complete, or a vuln scan silently returns clean (false-negative). The content guard
+    // keeps it "incomplete" so the backfill re-runs.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // below 8y floor
+    auto mock = std::make_unique<MockFetcher>();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    REQUIRE_FALSE(mgr.status().backfill_complete);        // empty catalog → not complete
+    REQUIRE(db->upsert_cves({MockFetcher::one_cve(1)}));  // add content...
+    REQUIRE(mgr.status().backfill_complete);              // ...now genuinely complete
+}
+
+TEST_CASE("NvdSyncManager: an emptied catalog with a stuck at-floor cursor re-fetches (recovery)",
+          "[nvd][backfill]") {
+    // Governance Gate 6 SRE: if the catalog is emptied out-of-band (corruption / manual
+    // truncate / disk loss) while backfill_oldest_published is still pinned at the floor,
+    // the walk would be a no-op and the mirror would sit incomplete forever. do_backfill
+    // must detect empty+at-floor and reset the cursor to `now` to actually re-fetch.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at/below 8y floor
+    // catalog is EMPTY — no upsert
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty()); // it re-fetched instead of sitting idle
+    REQUIRE(db->nvd_cve_count() > 0);           // real NVD catalog repopulated
+    REQUIRE(mgr.status().backfill_complete);    // and is now genuinely complete
+}
+
+TEST_CASE("NvdSyncManager: built-in fallback rows do NOT satisfy the completion content guard",
+          "[nvd][backfill]") {
+    // #1889 review r4 Blocker 2: seed_builtin_rules() adds source='builtin' rows before
+    // the first sync. total_cve_count() counts them, so an empty-NVD mirror with a cursor
+    // at the floor would falsely report complete and skip straight to freshness. The guard
+    // uses nvd_cve_count() (source='nvd'), so builtins alone never mark a mirror complete.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->seed_builtin_rules();          // source='builtin' rows, zero real NVD data
+    REQUIRE(db->total_cve_count() > 0); // builtins present...
+    REQUIRE(db->nvd_cve_count() == 0);  // ...but zero NVD rows
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at/below 8y floor
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->fail = true; // we only need the completeness verdict + proof it attempts a real fetch
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    REQUIRE_FALSE(mgr.status().backfill_complete); // builtins don't satisfy the guard
+    mgr.sync_now();
+    REQUIRE_FALSE(m->published_calls.empty());     // reached do_backfill (a real fetch), not freshness
+    REQUIRE(m->modified_calls.empty());            // definitely not the freshness path
+}
+
+TEST_CASE("NvdSyncManager: empty-catalog recovery is bounded (no infinite re-walk)",
+          "[nvd][backfill]") {
+    // #1889 review r4 minor: if NVD returns well-formed-but-EMPTY windows during an outage
+    // (result.ok true, zero records), the empty-catalog recovery must not re-walk the full
+    // range on every tick forever — it is capped at kMaxEmptyCatalogResets.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9))); // at floor
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->empty_ok = true; // every fetch succeeds but returns zero records
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    for (int i = 0; i < 20; ++i)
+        mgr.sync_now();
+    // Bounded: ~25 windows per walk × 5 capped resets ≈ ≤125, far below an uncapped
+    // 20 passes × ~25 = ~500. And an all-empty catalog never falsely completes.
+    REQUIRE(m->published_calls.size() < 200);
+    REQUIRE_FALSE(mgr.status().backfill_complete);
+}
+
+TEST_CASE("NvdSyncManager: capped empty-catalog recovery resumes when NVD data returns",
+          "[nvd][backfill]") {
+    // The cap must NOT require a server restart to recover (grill-with-docs self-review):
+    // once capped, do_backfill probes the newest window each tick, and when NVD returns
+    // data it clears the cap and rebuilds the catalog to completion.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    db->set_meta("backfill_oldest_published", std::to_string(secs_ago(365 * 9)));
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->empty_ok = true; // NVD outage: ok but empty windows
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/8);
+    for (int i = 0; i < 10; ++i)
+        mgr.sync_now(); // drive past the cap
+    REQUIRE_FALSE(mgr.status().backfill_complete);
+    m->empty_ok = false; // NVD recovers — real data again
+    for (int i = 0; i < 3; ++i)
+        mgr.sync_now(); // probe detects data → full re-walk → complete
+    REQUIRE(mgr.status().backfill_complete);
+    REQUIRE(db->nvd_cve_count() > 0);
+}
+
+TEST_CASE("NvdSyncManager: a suspicious empty window after real data is HELD, not skipped",
+          "[nvd][backfill]") {
+    // #1889 review r5 (Blocker): once real NVD data has landed, an ok+empty older window is
+    // suspicious (a stale cache/proxy serving an empty page for a populated range). The walk
+    // must HOLD at the last data window rather than advance past the empty one and risk
+    // reporting the mirror complete over a hole.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->data_predicate = [](std::size_t call) { return call == 1; }; // window 1 data, rest ok+empty
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    mgr.sync_now();
+    REQUIRE(m->published_calls.size() == 2);       // window 1 (data) + window 2 (empty → held)
+    REQUIRE(db->nvd_cve_count() == 1);             // window 1's CVE persisted
+    REQUIRE_FALSE(mgr.status().backfill_complete); // held at window 1; not complete over the hole
+}
+
+TEST_CASE("NvdSyncManager: a stably-empty window is accepted after re-confirmation (no wedge)",
+          "[nvd][backfill]") {
+    // The hold must not wedge on a GENUINELY-empty window (e.g. near the 1999 floor before
+    // NVD's earliest published CVE): after kSuspiciousEmptyConfirmations checks it accepts the
+    // empty and advances, so the backfill still reaches the floor and completes.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    m->data_predicate = [](std::size_t call) { return call == 1; }; // only window 1 ever has data
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    for (int i = 0; i < 12; ++i)
+        mgr.sync_now(); // each empty window is re-confirmed then accepted
+    REQUIRE(mgr.status().backfill_complete); // reached the floor — never wedged
+    REQUIRE(db->nvd_cve_count() == 1);       // window 1 had data; the rest were genuinely empty
+}
+
+TEST_CASE("NvdSyncManager: a transient empty window recovers on retry — the hole is filled",
+          "[nvd][backfill]") {
+    // A window that returns ok+empty transiently (stale cache) then real data on retry must
+    // NOT be skipped — the hold re-fetches it and fills the hole.
+    auto db = std::make_shared<NvdDatabase>(":memory:");
+    auto mock = std::make_unique<MockFetcher>();
+    auto* m = mock.get();
+    // Window 2's FIRST fetch (call 2) is empty; every other call — including its retry — has data.
+    m->data_predicate = [](std::size_t call) { return call != 2; };
+    NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, /*backfill_years=*/1);
+    for (int i = 0; i < 6; ++i)
+        mgr.sync_now();
+    REQUIRE(mgr.status().backfill_complete);
+    REQUIRE(db->nvd_cve_count() >= 2); // window 2's data was recovered on retry, not skipped
+}
+
+TEST_CASE("NvdClient::parse_response: totalResults>0 with empty vulnerabilities is a failure",
+          "[nvd][parse]") {
+    // #1889 review r5 (minor #3): a self-contradictory NVD response (claims results but returns
+    // none — a stale cache/proxy or truncated body) must be a FAILURE so the caller holds and
+    // retries, not treated as a verified-empty window. A genuine totalResults==0 stays ok=true.
+    NvdClient client;
+    REQUIRE_FALSE(client.parse_response(R"({"totalResults":100,"vulnerabilities":[]})").ok);
+    REQUIRE(client.parse_response(R"({"totalResults":0,"vulnerabilities":[]})").ok); // genuinely empty
+}
+
+TEST_CASE("NvdClient::parse_response: out-of-range totalResults is a parse failure, not a silent wrap",
+          "[nvd][parse]") {
+    // PR #1912 review (HIGH): is_number_integer() checks JSON type, not C++ int range, so
+    // get<int>() SILENTLY NARROWS an oversized value NEGATIVE (no throw). A negative total would
+    // slip past the `total_results > 0` contradiction guard (false-"verifying" a stale/corrupt
+    // empty page → permanent CVE false-negatives) and break `start_index >= total_results`
+    // pagination. Every out-of-range/non-integer totalResults must be reason=kParse, ok=false.
+    NvdClient c;
+    // > INT_MAX (2^31): get<int>() wraps to INT_MIN without the range check.
+    auto big = c.parse_response(R"({"totalResults":2147483648,"vulnerabilities":[]})");
+    REQUIRE_FALSE(big.ok);
+    REQUIRE(big.reason == NvdFailureReason::kParse);
+    // INT64_MAX: wraps to -1.
+    auto huge = c.parse_response(R"({"totalResults":9223372036854775807,"vulnerabilities":[]})");
+    REQUIRE_FALSE(huge.ok);
+    REQUIRE(huge.reason == NvdFailureReason::kParse);
+    // A literal negative totalResults.
+    auto neg = c.parse_response(R"({"totalResults":-5,"vulnerabilities":[]})");
+    REQUIRE_FALSE(neg.ok);
+    REQUIRE(neg.reason == NvdFailureReason::kParse);
+    // A non-integer totalResults.
+    auto str = c.parse_response(R"({"totalResults":"1000","vulnerabilities":[]})");
+    REQUIRE_FALSE(str.ok);
+    REQUIRE(str.reason == NvdFailureReason::kParse);
+    // Exactly INT_MAX stays in range (accepted as a value; the contradiction guard then trips
+    // because records are empty — but as a parse failure, NOT a silent negative wrap).
+    auto max = c.parse_response(R"({"totalResults":2147483647,"vulnerabilities":[]})");
+    REQUIRE_FALSE(max.ok);
+    REQUIRE(max.reason == NvdFailureReason::kParse);
+}
+
+TEST_CASE("NvdDatabase::upsert_cves returns false when the DB is not open", "[nvd][db]") {
+    // #1889 review r4 Blocker 1: the bool return is the signal do_backfill/do_freshness
+    // use to hold the resume cursor on a persistence failure. A closed DB is the
+    // deterministic, cross-platform failure case.
+    NvdDatabase db("/proc/yuzu-nonexistent-dir/nvd.db"); // cannot be created/opened
+    REQUIRE_FALSE(db.is_open());
+    REQUIRE_FALSE(db.upsert_cves({MockFetcher::one_cve(1)})); // false, nothing persisted
+}
+
+TEST_CASE("NvdClient::parse_response: 200-with-bad-body is ok=false, empty window is ok=true",
+          "[nvd][parse]") {
+    NvdClient c;
+    // Unparseable body (proxy/error page delivered as 200) → failure, not empty.
+    auto bad = c.parse_response("<html>503 Service Unavailable</html>");
+    REQUIRE_FALSE(bad.ok);
+    // Well-formed but unexpected shape (no vulnerabilities array) → failure.
+    auto weird = c.parse_response(R"({"message":"rate limited"})");
+    REQUIRE_FALSE(weird.ok);
+    // Genuinely-empty window → success with zero records.
+    auto empty = c.parse_response(R"({"totalResults":0,"vulnerabilities":[]})");
+    REQUIRE(empty.ok);
+    REQUIRE(empty.records.empty());
+}
+
+TEST_CASE("cve_match NOCASE index turns the LIKE-prefix match into a seek, not a scan",
+          "[nvd][perf]") {
+    // Guards the perf-P1 fix: match_inventory's case-insensitive `LIKE 'name%'`
+    // only uses an index when that index is COLLATE NOCASE (migration v3). Assert
+    // the query planner seeks, exactly as match_inventory issues it.
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    const char* schema =
+        "CREATE TABLE cve_match(id INTEGER PRIMARY KEY, cve_id TEXT, cpe_product TEXT NOT NULL,"
+        " is_vulnerable INTEGER DEFAULT 1);"
+        "CREATE INDEX idx_cve_match_product ON cve_match(cpe_product COLLATE NOCASE);";
+    REQUIRE(sqlite3_exec(db, schema, nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* q =
+        "EXPLAIN QUERY PLAN SELECT id FROM cve_match "
+        "WHERE cpe_product LIKE 'openssl%' ESCAPE '\\' AND is_vulnerable = 1;";
+    REQUIRE(sqlite3_prepare_v2(db, q, -1, &stmt, nullptr) == SQLITE_OK);
+    std::string plan;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (const unsigned char* d = sqlite3_column_text(stmt, 3))
+            plan += reinterpret_cast<const char*>(d);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    INFO("query plan: " << plan);
+    REQUIRE(plan.find("idx_cve_match_product") != std::string::npos); // uses the index
+    REQUIRE(plan.find("SCAN") == std::string::npos);                  // not a full scan
+}
+
+// ── PR2c: upsert dedupe-by-cve_id (#1882) ────────────────────────────────────
+
+TEST_CASE("NvdDatabase: upsert_cves merges duplicate cve_id, losing no matches", "[nvd][db]") {
+    NvdDatabase db(":memory:");
+    // A batch with TWO records sharing a cve_id but DIFFERENT products — without
+    // the merge, the second's delete-then-insert would wipe the first's match.
+    std::vector<CveRecord> batch;
+    batch.push_back(make_cve("CVE-2024-DUP", "productone", "2.0"));
+    batch.push_back(make_cve("CVE-2024-DUP", "producttwo", "3.0"));
+    db.upsert_cves(batch);
+
+    REQUIRE(db.total_cve_count() == 1);                                   // one distinct CVE
+    REQUIRE(db.match_inventory({{"productone", "1.0"}}).size() == 1);     // first product kept
+    REQUIRE(db.match_inventory({{"producttwo", "1.0"}}).size() == 1);     // second product kept
+}
+
+// ── PR2c: 429 backoff schedule + failure-reason callback (#1880) ─────────────
+
+TEST_CASE("nvd_backoff_delay: Retry-After honoured, else exponential with cap", "[nvd][backoff]") {
+    using namespace std::chrono;
+    // Numeric Retry-After wins (capped at 30min).
+    REQUIRE(nvd_backoff_delay(1, "45") == seconds(45));
+    REQUIRE(nvd_backoff_delay(1, "999999") == seconds(1800)); // capped
+    // Zero / non-numeric (HTTP-date) Retry-After falls through to exp backoff.
+    REQUIRE(nvd_backoff_delay(3, "0") == seconds(120));
+    REQUIRE(nvd_backoff_delay(1, "Wed, 21 Oct 2025 07:28:00 GMT") == seconds(30));
+    // Exponential by attempt (1-based): 30, 60, 120, … capped at 1800.
+    REQUIRE(nvd_backoff_delay(1, "") == seconds(30));
+    REQUIRE(nvd_backoff_delay(2, "") == seconds(60));
+    REQUIRE(nvd_backoff_delay(3, "") == seconds(120));
+    REQUIRE(nvd_backoff_delay(10, "") == seconds(1800)); // capped
+}
+
+TEST_CASE("NvdSyncManager: a sync failure tallies its reason in status; cancel does not",
+          "[nvd][failure]") {
+    // Pull model (#1909): report_failure increments a per-reason counter surfaced via
+    // status().failure_counts, which the /metrics scrape emits as
+    // yuzu_nvd_sync_failures_total — no cross-thread callback.
+    {
+        auto db = std::make_shared<NvdDatabase>(":memory:");
+        auto mock = std::make_unique<MockFetcher>();
+        mock->fail = true;
+        mock->fail_reason = NvdFailureReason::kHttp403;
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+        mgr.sync_now();
+        const auto st = mgr.status();
+        REQUIRE(st.failure_counts[nvd_reason_index(NvdFailureReason::kHttp403)] == 1);
+        // Only the 403 series moved.
+        REQUIRE(st.failure_counts[nvd_reason_index(NvdFailureReason::kConnection)] == 0);
+    }
+    // A cancellation is NOT a failure — no series moves.
+    {
+        auto db = std::make_shared<NvdDatabase>(":memory:");
+        auto mock = std::make_unique<MockFetcher>();
+        mock->fail = true;
+        mock->fail_reason = NvdFailureReason::kCancelled;
+        NvdSyncManager mgr(db, std::move(mock), std::chrono::seconds{3600}, 1);
+        mgr.sync_now();
+        for (auto n : mgr.status().failure_counts)
+            REQUIRE(n == 0);
+    }
+}
+
+// ── PR2c: reason→label + reason→index parity (yuzu_nvd_sync_failures_total) ───
+
+TEST_CASE("nvd_reason_label maps every reason to its stable metric label", "[nvd][failure]") {
+    // The SINGLE source of truth for the yuzu_nvd_sync_failures_total label set —
+    // pinning the strings so they can't drift from describe()/docs/changelog.
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kConnection)) == "connection");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttp429)) == "http_429");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttp403)) == "http_403");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kHttpOther)) == "http_other");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kParse)) == "parse");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kNone)) == "none");
+    REQUIRE(std::string(nvd_reason_label(NvdFailureReason::kCancelled)) == "none");
+}
+
+TEST_CASE("nvd_reason_index: counted reasons are dense 0..N-1, cancel/none are -1",
+          "[nvd][failure]") {
+    // The index must stay in lockstep with nvd_reason_label's counted order and the
+    // kNvdCountedFailureReasons-sized failure_counts array (a stale index would tally
+    // the wrong series or index out of bounds).
+    REQUIRE(nvd_reason_index(NvdFailureReason::kConnection) == 0);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttp429) == 1);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttp403) == 2);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kHttpOther) == 3);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kParse) == 4);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kNone) == -1);
+    REQUIRE(nvd_reason_index(NvdFailureReason::kCancelled) == -1);
+}
+
+// ── #1879/#1880 in-fetch integration: 429 retry loop + mid-backoff cancellation ──
+// These drive the real fetch_paginated retry/backoff/cancel paths against a local
+// httplib::Server on an OS-assigned ephemeral port (no fixed port → no shared-runner
+// collision). An API key keeps the inter-request throttle at 600ms; the tests use a
+// small Retry-After so the backoff itself is short.
+
+namespace {
+// Bring up an NVD-shaped server on 127.0.0.1:<ephemeral>. handler owns the response.
+struct LocalNvdServer {
+    httplib::Server svr;
+    int port = 0;
+    std::thread th;
+    template <typename Handler>
+    explicit LocalNvdServer(Handler h) {
+        svr.Get("/rest/json/cves/2.0", std::move(h));
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0); // bind failed → fail loudly, don't spin forever below
+        th = std::thread([this] { svr.listen_after_bind(); });
+        // Bounded readiness wait (~2s) so a server that never comes up fails the test
+        // with a diagnostic instead of hanging the whole suite.
+        for (int i = 0; i < 2000 && !svr.is_running(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        REQUIRE(svr.is_running());
+    }
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(port); }
+    ~LocalNvdServer() {
+        svr.stop();
+        if (th.joinable())
+            th.join();
+    }
+};
+} // namespace
+
+TEST_CASE("NvdClient::fetch_paginated: an HTTP 429 backs off and retries the same page",
+          "[nvd][http]") {
+    std::atomic<int> hits{0};
+    LocalNvdServer server([&](const httplib::Request&, httplib::Response& res) {
+        if (++hits == 1) {
+            res.status = 429;
+            res.set_header("Retry-After", "1"); // 1s backoff, then retry
+        } else {
+            res.status = 200;
+            res.set_content(R"({"totalResults":0,"vulnerabilities":[]})", "application/json");
+        }
+    });
+    NvdClient c("test-key", /*proxy=*/{}, server.url());
+    auto r = c.fetch_by_published_window("2024-01-01T00:00:00.000", "2024-01-02T00:00:00.000");
+    REQUIRE(r.ok);              // the retry after the 429 succeeded
+    REQUIRE(hits.load() == 2);  // exactly one retry — the 429 didn't fail the window
+}
+
+TEST_CASE("NvdClient::fetch_paginated: a cancel during the 429 backoff aborts promptly",
+          "[nvd][http]") {
+    LocalNvdServer server([](const httplib::Request&, httplib::Response& res) {
+        res.status = 429;
+        res.set_header("Retry-After", "5"); // a 5s backoff we intend to interrupt
+    });
+    std::atomic<bool> cancel{false};
+    NvdClient c("test-key", /*proxy=*/{}, server.url());
+    c.set_cancel_flag(&cancel);
+    std::thread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        cancel.store(true);
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = c.fetch_by_published_window("2024-01-01T00:00:00.000", "2024-01-02T00:00:00.000");
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    canceller.join();
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.reason == NvdFailureReason::kCancelled);
+    // Woke mid-backoff (~400ms), nowhere near the full 5s Retry-After.
+    REQUIRE(elapsed < std::chrono::seconds(3));
 }

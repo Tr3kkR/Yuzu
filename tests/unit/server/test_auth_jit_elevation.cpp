@@ -382,9 +382,11 @@ struct JitHarness {
         return auth_mgr.create_local_session(u, r, fresh_mfa);
     }
 
-    // An OIDC-authenticated cookie session for `u` (reuses `u`'s already-seeded
-    // auth.db row for eligibility/username matching — only auth_source and
-    // mfa_verified_at differ from a local session).
+    // An OIDC-authenticated cookie session whose display name is `u`. NOTE: post
+    // #1837/#1857 the session's PRINCIPAL is the namespaced `oidc:<iss>#sub-<u>`,
+    // NOT `u` — so it does NOT match a local users row keyed on `u` (this is the
+    // severed cross-principal borrow; see the "OIDC sessions and JIT elevation"
+    // section below). Used only to exercise the OIDC elevation-denial path.
     //   proof=absent  -> epoch sentinel (no `amr` asserted / single-factor SSO)
     //   proof=fresh   -> mfa_verified_at = now (IdP-MFA'd just now)
     //   proof=stale   -> mfa_verified_at older than the elevation step-up window
@@ -396,7 +398,8 @@ struct JitHarness {
         } else if (proof == OidcProof::stale) {
             mfa_at = std::chrono::steady_clock::now() - std::chrono::seconds(400);
         }
-        return auth_mgr.create_oidc_session(u, u + "@example.com", "sub-" + u, {}, "", mfa_at);
+        return auth_mgr.create_oidc_session(u, u + "@example.com", "sub-" + u,
+                                            "https://idp.example", {}, "", mfa_at);
     }
 
     // detail string of the most-recent matching audit row ("" if none).
@@ -605,151 +608,64 @@ TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit]
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-// ── OIDC amr-asserted elevation (docs/security-reviews/jit-elevation-2026-06-30.md
-//    follow-up) ─────────────────────────────────────────────────────────────
-
-TEST_CASE("POST /api/v1/elevate: an OIDC session with a fresh amr-MFA proof elevates "
-          "without local TOTP enrollment",
+// ── OIDC sessions and JIT elevation — SEVERED by the #1837/#1857 principal re-key ──
+// #1837/#1857 re-keys the OIDC session principal to the immutable, namespaced
+// `oidc:<iss>#<sub>` pair. JIT elevation eligibility + MFA are a local-`users`
+// mechanism (keyed on users-table columns), and an OIDC identity provisions no
+// such row — so an OIDC session is now DENIED at the ELIGIBILITY gate, before
+// the OIDC-amr second-factor branch (retained in auth_routes.cpp, currently
+// unreachable-for-success) is ever reached. This is deliberate: it severs the
+// pre-#1837 accident where an SSO display name that coincidentally equalled a
+// provisioned LOCAL username borrowed that local user's eligibility + TOTP (a
+// cross-principal privilege grant — the exact hazard the earlier "namesake"
+// hardening worried about). Concretely, the `oidc:<iss>#<sub>` principal
+// contains ':'/'#', which are not valid local-username characters, so
+// `is_elevation_eligible` fails closed and the route denies 403 without
+// touching privilege state. Durable OIDC elevation against the stable principal
+// is tracked in #1852, which will reactivate the OIDC-amr branch; the tests
+// asserting a successful OIDC-amr grant were removed here and belong with #1852.
+TEST_CASE("POST /api/v1/elevate: an OIDC session cannot elevate — denied at the "
+          "eligibility gate (#1837/#1857 severance; restoration tracked in #1852)",
           "[jit][routes][oidc]") {
     JitHarness h;
-    // bob has a local password account (eligible, present in auth.db) but is
-    // NOT MFA-enrolled — within this harness that's what "OIDC-only, no local
-    // TOTP" means: is_elevation_eligible/mfa_status only care about the
-    // users-table columns, not whether a password hash exists. His OIDC
-    // session carries a fresh IdP-MFA proof, which the OIDC branch accepts in
-    // place of local enrollment.
+    // bob has a local users row (eligible), but his OIDC session's principal is
+    // the namespaced oidc:<iss>#<sub>, NOT "bob" — it can never match bob's (or
+    // any) local users row. A fresh IdP-MFA amr proof does not change this: the
+    // denial is at eligibility, upstream of the OIDC-amr branch.
     auto token = h.oidc_session_for("bob", JitHarness::OidcProof::fresh);
     auto res = h.post("/api/v1/elevate", token,
                       R"({"justification":"prod incident #99","duration_secs":600})");
     REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(h.count_audits("role.elevation.granted", "bob") == 1);
-    CHECK(h.audit_detail("role.elevation.granted", "bob").find("mfa=oidc_amr") !=
-         std::string::npos);
+    CHECK(res->status == 403);
+
+    // The session's actual principal (and audit-principal key) is the namespaced
+    // OIDC id, never the local display name.
     auto s = h.auth_mgr.validate_session(token);
     REQUIRE(s.has_value());
-    CHECK(auth::is_elevated(*s));
-}
-
-TEST_CASE("POST /api/v1/elevate: an OIDC session with NO amr proof is still denied "
-          "(security-F1 guardrail)",
-          "[jit][routes][oidc]") {
-    JitHarness h;
-    // bob is eligible but NOT locally MFA-enrolled. A single-factor SSO login
-    // (no `amr` MFA claim) carries the epoch sentinel. The skip must be gated
-    // on a SEEDED proof, not merely auth_source=="oidc" — this must remain a
-    // hard 403 regardless of --mfa-enforcement (require_mfa_step_up's own
-    // no-proof-OIDC branch would otherwise pass this through under "optional").
-    auto token = h.oidc_session_for("bob", JitHarness::OidcProof::absent);
-    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(h.count_audits("role.elevation.denied", "bob") == 1);
-    // Distinct denied reason: no amr assertion (not the toggle-off reason).
-    CHECK(h.audit_detail("role.elevation.denied", "bob").find("no MFA in SSO login") !=
-         std::string::npos);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
-}
-
-TEST_CASE("POST /api/v1/elevate: an OIDC session for a locally-enrolled NAMESAKE with NO "
-          "amr proof is still denied (F-1 regression — must not inherit the namesake's "
-          "local TOTP)",
-          "[jit][routes][oidc]") {
-    JitHarness h;
-    // carol is a LOCAL, elevation-eligible, TOTP-ENROLLED user. Her OIDC
-    // session (same username, no seeded amr proof) must NOT fall through to
-    // her local `mfa_status` row — that would grant elevation on a factor the
-    // OIDC caller never actually presented (hardening-round security-F1 /
-    // consistency S-2). Pre-fix code branched `if (!oidc_amr_elevation) {
-    // <local enrollment check> }`, which PASSED here because carol IS locally
-    // enrolled — this is the exact regression the disjoint auth_source
-    // branch closes; this case fails on the pre-fix code and passes on the
-    // restructured gate.
-    auto token = h.oidc_session_for("carol", JitHarness::OidcProof::absent);
-    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(h.count_audits("role.elevation.denied", "carol") == 1);
-    CHECK(h.count_audits("role.elevation.granted", "carol") == 0);
-    CHECK(h.audit_detail("role.elevation.granted", "carol").find("mfa=local_totp") ==
-         std::string::npos);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
-}
-
-TEST_CASE("POST /api/v1/elevate: an OIDC session with a STALE amr proof is challenged, "
-          "not silently granted",
-          "[jit][routes][oidc]") {
-    JitHarness h;
-    // The proof exists (passes the OIDC-branch factor check) but is older
-    // than the elevation step-up window — must fall through to a step-up
-    // challenge, not a silent grant.
-    auto token = h.oidc_session_for("bob", JitHarness::OidcProof::stale);
-    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
-    REQUIRE(res);
-    CHECK(res->status != 200);
+    CHECK(s->username.rfind("oidc:", 0) == 0);
+    // No grant on any principal; a denial IS recorded against the OIDC id; the
+    // window never opens.
+    CHECK(h.count_audits("role.elevation.granted", s->username) == 0);
     CHECK(h.count_audits("role.elevation.granted", "bob") == 0);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+    CHECK(h.count_audits("role.elevation.denied", s->username) == 1);
+    CHECK_FALSE(auth::is_elevated(*s));
 }
 
-TEST_CASE("POST /api/v1/elevate: jit_oidc_amr_elevation=false blocks OIDC sessions "
-          "entirely (they cannot fall back to local TOTP)",
-          "[jit][routes][oidc]") {
-    JitHarness h;
-    h.cfg.jit_oidc_amr_elevation = false; // escape hatch: opt out of the amr path
-    // bob is eligible with a FRESH amr proof — would elevate under the default
-    // toggle, but with the escape hatch off OIDC sessions cannot elevate at
-    // all (there is no way for an OIDC session to present a local TOTP
-    // step-up; its step-up is re-SSO, not a TOTP code).
-    auto token = h.oidc_session_for("bob", JitHarness::OidcProof::fresh);
-    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(h.count_audits("role.elevation.denied", "bob") == 1);
-    // Distinct denied reason: toggle-off (not the no-amr-assertion reason).
-    CHECK(h.audit_detail("role.elevation.denied", "bob").find("OIDC-amr elevation is disabled") !=
-         std::string::npos);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
-}
-
-TEST_CASE("POST /api/v1/elevate: toggle-off + locally-enrolled namesake + fresh amr proof "
-          "is denied, not a mislabeled grant (unhappy UP-10)",
-          "[jit][routes][oidc]") {
-    JitHarness h;
-    h.cfg.jit_oidc_amr_elevation = false;
-    // carol is locally enrolled AND her OIDC session carries a FRESH amr
-    // proof — with the toggle OFF, OIDC sessions cannot elevate at all
-    // (never "fall back to local TOTP", which an OIDC caller structurally
-    // cannot present).
-    auto token = h.oidc_session_for("carol", JitHarness::OidcProof::fresh);
-    auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(h.count_audits("role.elevation.denied", "carol") == 1);
-    CHECK(h.count_audits("role.elevation.granted", "carol") == 0);
-    CHECK(h.audit_detail("role.elevation.denied", "carol").find("OIDC-amr elevation is disabled") !=
-         std::string::npos);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
-}
-
-TEST_CASE("POST /api/v1/elevate: a users-row-less OIDC identity is denied at the "
-          "ELIGIBILITY gate (documents the users-row provisioning prerequisite)",
+TEST_CASE("POST /api/v1/elevate: a federated-only OIDC identity (no local users row) "
+          "is likewise denied (#1837/#1857 severance)",
           "[jit][routes][oidc]") {
     JitHarness h;
     // "dave" was never seeded into auth.db — a genuinely federated-only
-    // identity with no local users row. is_elevation_eligible is
-    // users-table-keyed and fails closed ("not eligible") for an absent row,
-    // so this is denied at the EARLIER eligibility gate, before the MFA
-    // branch is even reached. Documents the real-world prerequisite: an OIDC
-    // identity must have a Yuzu users row (e.g. via POST /api/v1/users)
-    // before an admin can grant it elevation eligibility at all.
+    // identity. Same outcome as an OIDC session whose sub coincides with a
+    // local username: denied at the eligibility gate, no elevation.
     auto token = h.oidc_session_for("dave", JitHarness::OidcProof::fresh);
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
     REQUIRE(res);
     CHECK(res->status == 403);
-    CHECK(h.count_audits("role.elevation.denied", "dave") == 1);
-    CHECK(h.audit_detail("role.elevation.denied", "dave").find("not eligible") !=
-         std::string::npos);
-    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
+    auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(h.count_audits("role.elevation.denied", s->username) == 1);
+    CHECK_FALSE(auth::is_elevated(*s));
 }
 
 // Local operator path is unchanged: enrollment is still mandatory (see the

@@ -153,18 +153,23 @@ def match_suite(failed_name, tests):
 
 
 # ── running Catch2 binaries ───────────────────────────────────────────────────
-def _run(cmd, env, workdir, extra=None):
+def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
     return subprocess.run(
         cmd + (extra or []), env=e, cwd=workdir or None,
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=timeout,
     )
 
 
 def catch2_failed_cases(test, this_os):
     """Re-run a failed Catch2 suite with the junit reporter; return failed case
-    names, or None if it isn't a classifiable Catch2 run (non-Catch2 / crash)."""
+    names, or None if it isn't a classifiable Catch2 run (non-Catch2 / crash /
+    hang). `timeout` mirrors the suite's own meson-configured timeout (falsy ->
+    None, meson's own "no timeout" convention) so a genuine hang degrades to a
+    clean unclassifiable result instead of blocking the job indefinitely — the
+    observed failure mode this guards is a fast abnormal exit, not a hang, so
+    this is a robustness net rather than a fix for that specific pattern."""
     cmd = test.get("cmd") or []
     if not cmd or not CATCH2_EXE.search(os.path.basename(cmd[0])):
         return None  # gateway (python) or anything not a Catch2 binary
@@ -172,11 +177,12 @@ def catch2_failed_cases(test, this_os):
     os.close(fd)
     try:
         _run(cmd, test.get("env"), test.get("workdir"),
-             extra=["--reporter", "junit", "--out", xml_path])
+             extra=["--reporter", "junit", "--out", xml_path],
+             timeout=test.get("timeout") or None)
         if not os.path.getsize(xml_path):
             return None  # crash/timeout before any reporter output -> unclassifiable
         return _failed_testcase_names(xml_path)
-    except (ET.ParseError, OSError):
+    except (ET.ParseError, OSError, subprocess.TimeoutExpired):
         return None
     finally:
         try:
@@ -187,9 +193,15 @@ def catch2_failed_cases(test, this_os):
 
 def retry_case(test, case, retries):
     """Re-run a single Catch2 case by exact name up to `retries` times; True if
-    any attempt passes."""
+    any attempt passes. A hung retry counts as a failed attempt, not a script
+    crash — same timeout source and rationale as catch2_failed_cases()."""
     for _ in range(retries):
-        if _run(test.get("cmd"), test.get("env"), test.get("workdir"), extra=[case]).returncode == 0:
+        try:
+            result = _run(test.get("cmd"), test.get("env"), test.get("workdir"), extra=[case],
+                          timeout=test.get("timeout") or None)
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0:
             return True
     return False
 

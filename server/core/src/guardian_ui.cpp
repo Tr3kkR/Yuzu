@@ -722,10 +722,10 @@ extern const char* const kGuardianHtml =
 
     /* ── Populate nav bar + context bar ─────────────────────── */
     fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-      document.getElementById('nav-user').textContent = d.username;
+      document.getElementById('nav-user').textContent = (d.display_name || d.username);
       var role = d.rbac_role || d.role;
       document.getElementById('role-badge').textContent = role;
-      document.getElementById('context-user').textContent = d.username;
+      document.getElementById('context-user').textContent = (d.display_name || d.username);
       document.body.setAttribute('data-role', role);
       if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
         var sl = document.getElementById('nav-settings-link');

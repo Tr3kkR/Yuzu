@@ -185,3 +185,12 @@ docs/dex-brd-coverage.md
 .lora-prefs/
 .agents/
 spike/
+
+# Local runtime SQLite databases (large, reconstructable — never commit; a dev
+# --data-dir pointed in-tree must not commit the catalog). PR2b.
+*.db
+*.db-wal
+*.db-shm
+# ...but never silently hide an intentionally-committed test fixture DB (#1889
+# review): the broad *.db net above would otherwise drop it from `git add`.
+!tests/**/*.db

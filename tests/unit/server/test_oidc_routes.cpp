@@ -213,7 +213,8 @@ TEST_CASE("OIDC — a trailing space in --oidc-admin-group still matches after t
     REQUIRE(oidc_admin_group == "Admins");
 
     auto token = mgr.create_oidc_session("Trimmed Admin", "trimmed_admin@example.test",
-                                         "oidc-sub-1", {"Admins"}, oidc_admin_group, {});
+                                         "oidc-sub-1", "https://idp.example", {"Admins"},
+                                         oidc_admin_group, {});
     auto session = mgr.validate_session(token);
     REQUIRE(session.has_value());
     CHECK(session->role == auth::Role::admin);
@@ -231,7 +232,8 @@ TEST_CASE("OIDC — an untrimmed --oidc-admin-group would NOT match (regression 
     // rather than only in production.
     const std::string untrimmed_admin_group = "Admins ";
     auto token = mgr.create_oidc_session("Untrimmed Admin", "untrimmed_admin@example.test",
-                                         "oidc-sub-2", {"Admins"}, untrimmed_admin_group, {});
+                                         "oidc-sub-2", "https://idp.example", {"Admins"},
+                                         untrimmed_admin_group, {});
     auto session = mgr.validate_session(token);
     REQUIRE(session.has_value());
     CHECK(session->role == auth::Role::user);

@@ -414,6 +414,41 @@ appears if an agent of that OS still emits the retired tag).
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
+## NVD CVE sync metrics
+
+The server maintains a local mirror of the NVD (National Vulnerability Database)
+CVE catalog (see [NVD CVE sync](server-admin.md#nvd-cve-sync) for the sync flags).
+These metrics surface the catalog's size, backfill progress, and sync-window
+health. The gauges are refreshed on every `/metrics` scrape.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_nvd_total_cves` | gauge | Distinct CVEs in the local NVD catalog. Grows as the newest-first backfill walks history, then holds steady with periodic freshness re-checks. |
+| `yuzu_nvd_backfill_complete` | gauge | `1` when the newest-first NVD backfill has reached its floor (`--nvd-backfill-years`), else `0`. `0` for an extended period on a fresh server without an API key is expected — the backfill is rate-limited (see below). |
+| `yuzu_nvd_sync_failures_total{reason}` | counter | NVD sync window failures, labelled by `reason` ∈ {`connection`, `http_429`, `http_403`, `http_other`, `parse`}. All five `reason` series are initialised to `0` at startup, so the counter (and its HELP/TYPE) is present on a healthy server — `absent()`-style alerts stay meaningful and Grafana never shows "No data" until the first failure. A shutdown-triggered cancel is deliberately **not** counted. |
+
+**Reading the `reason` label:** `http_429` is rate-limiting (backed off and retried
+automatically — expected during a large backfill without an API key, not a fault);
+`http_403` is a bad or revoked `--nvd-api-key` (not retried — rotate the key);
+`connection` is an egress/network failure to `services.nvd.nist.gov`; `http_other`
+is any other non-2xx status; `parse` is a malformed response body. See
+[Rate-limit and auth-error handling](server-admin.md#nvd-cve-sync) for operator guidance.
+
+**Alerting.** Only `http_403` is unambiguously operator-actionable, so page on it and
+merely record the rest:
+
+```
+# Page: bad/revoked API key — sync makes no progress until rotated
+increase(yuzu_nvd_sync_failures_total{reason="http_403"}[1h]) > 0
+# Do NOT page on http_429 — it is expected rate-limiting, self-heals via backoff.
+```
+
+Note that `http_429` **will** climb during a first-run full backfill on a server with no
+`--nvd-api-key` (each window that exhausts its retry budget increments it before the next
+tick retries) — that is expected first-run behaviour, not a regression. A sustained
+`yuzu_nvd_backfill_complete == 0` (see above) is the durable "mirror stuck" signal, not the
+failures counter on its own.
+
 ## Management group metrics
 
 The server exposes two gauges for management group telemetry. These are

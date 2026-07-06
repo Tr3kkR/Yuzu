@@ -21,7 +21,7 @@
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
-#include <yuzu/server/auth_db.hpp> // is_valid_username
+#include <yuzu/server/auth_db.hpp> // is_valid_username, is_valid_principal
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
@@ -1090,7 +1090,16 @@ void RestApiV1::register_routes(
             return;
 
         JObj data;
-        data.add("username", session->username).add("role", auth::role_to_string(session->role));
+        // #1837: `username` is the STABLE authorization principal (an
+        // opaque `oidc:<iss>#<sub>` id for SSO sessions); `display_name` is
+        // the human-readable label ("" for a legacy session created before
+        // this field existed, so fall back to `username`) — expose both so
+        // API/dashboard callers keep a readable identity without weakening
+        // what `check_permission`/audit key on.
+        data.add("username", session->username)
+            .add("display_name",
+                session->display_name.empty() ? session->username : session->display_name)
+            .add("role", auth::role_to_string(session->role));
 
         if (rbac_store && rbac_store->is_rbac_enabled()) {
             data.add("rbac_enabled", true);
@@ -2163,9 +2172,10 @@ void RestApiV1::register_routes(
     // DELETE /api/v1/sessions?username=<name> — admin-only force-logout.
     // Gated by `UserManagement:Write` because the action mutates a user's
     // access state (parity with role change / disable). `username` query
-    // parameter is required AND validated with `is_valid_username` so a
-    // NUL byte in the input cannot truncate the SQL bind in a way that
-    // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
+    // parameter is required AND validated with `is_valid_principal` (#1852
+    // — accepts a durable SSO principal too) so a NUL byte in the input
+    // cannot truncate the SQL bind in a way that diverges from the
+    // in-memory `==` comparison (sec-H1 / UP-8).
     sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, step_up_fn, session_revoke_fn](
                                         const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "UserManagement", "Write"))
@@ -2200,11 +2210,15 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
-        if (!is_valid_username(username)) {
+        if (!is_valid_principal(username)) {
             // sec-H1: reject NUL bytes, control characters, newlines.
             // Without this the audit `target_id` records the full
             // attacker-controlled string while the SQL bind silently
             // truncates at NUL — different rows hit memory vs disk.
+            // #1852 — `username` may be a durable SSO principal
+            // (`oidc:<iss>#<sub>`); an admin must be able to force-logout
+            // an SSO operator too. `is_valid_principal` is a strict
+            // superset of `is_valid_username`.
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid username format"), "application/json");
             return;

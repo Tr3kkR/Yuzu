@@ -448,6 +448,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = it->second.role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
@@ -526,6 +527,7 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     auto token = generate_session_token();
     Session s;
     s.username = username;
+    s.display_name = username; // local auth: username IS the human label
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "local";
@@ -983,6 +985,7 @@ Role resolve_role_from_groups(const std::vector<std::string>& groups,
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& email, const std::string& oidc_sub,
+                                             const std::string& iss,
                                              const std::vector<std::string>& groups,
                                              const std::string& admin_group_id,
                                              std::chrono::steady_clock::time_point mfa_verified_at) {
@@ -990,9 +993,19 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
 
     Role role = resolve_role_from_groups(groups, admin_group_id);
 
+    // #1837 — the STABLE authorization principal is `iss` + `sub`, never a
+    // display name. `sub` is only guaranteed unique per-issuer (RFC 7519),
+    // and a display name is a mutable, IdP-editable label two users can
+    // share — keying on it let two same-named users collide onto one
+    // principal, which #1832's RBAC reconcile then makes destructive
+    // (one user's login can delete the other's group memberships).
+    const std::string stable_username = "oidc:" + iss + "#" + oidc_sub;
+    const std::string resolved_display = display_name.empty() ? email : display_name;
+
     auto token = generate_session_token();
     Session s;
-    s.username = display_name.empty() ? email : display_name;
+    s.username = stable_username;
+    s.display_name = resolved_display;
     s.role = role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
@@ -1002,10 +1015,38 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
-    spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",
-                 display_name.empty() ? email : display_name, email, oidc_sub,
-                 role_to_string(role));
+    spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
+                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
     return token;
+}
+
+// #1852 — see the header doc for the fail-soft / lock-ordering contract.
+void AuthManager::provision_sso_identity(const std::string& principal, const std::string& iss,
+                                         const std::string& sub,
+                                         const std::string& display_name) {
+    if (!auth_db_) {
+        // Legacy config-file-only deployment — no durable store to
+        // provision into. Not an error: elevation is unreachable for this
+        // deployment mode regardless (POST /api/v1/elevate 503s without
+        // auth_db_ptr()).
+        return;
+    }
+    auto result = auth_db_->upsert_sso_identity(principal, iss, sub, display_name, "oidc");
+    if (!result) {
+        spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
+                     "principal cannot elevate until a future login provisions it)",
+                     principal, static_cast<int>(result.error()));
+        return;
+    }
+    // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
+    // Every successful login re-runs this upsert (it is also the re-login
+    // refresh path, not just first-provision), so a sustained spike is a
+    // signal worth alerting on: either a legitimate onboarding wave or an
+    // IdP-side provisioning flood/credential-stuffing sweep against the SSO
+    // login path.
+    if (metrics_) {
+        metrics_->counter("yuzu_auth_sso_provision_total", {{"source", "oidc"}}).increment();
+    }
 }
 
 // ── SAML session creation ───────────────────────────────────────────────────
@@ -1015,11 +1056,16 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
                                              const std::string& admin_group) {
     std::unique_lock lock(mu_);
 
+    // #1837 fast-follow: key SAML on entity_id#NameID (SAML doesn't sync to
+    // rbac_store yet, so its display-name-collision principal risk is
+    // dormant — see docs/auth-architecture.md "Stable principal vs. display
+    // name"). `username` stays the raw NameID; only `display_name` changes.
     Role role = resolve_role_from_groups(groups, admin_group);
 
     auto token = generate_session_token();
     Session s;
     s.username                   = name_id;
+    s.display_name               = name_id;
     s.role                       = role;
     s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source                = "saml";

@@ -20,6 +20,8 @@ The `sre` and `architect` agents load this document on any change that adds, rem
 
 `yuzu_auth_break_glass_login_total` (SOC 2 CC6.6) increments **after** the break-glass password is verified (a wrong password takes the `auth.login_failed` path and never increments it), paired with a `Severity::kCritical` `auth.breakglass.login` audit row. Because break-glass use is rare by design there is no flood risk; alert on **any** increment. The richer evidence chain for SIEM correlation is the audit row (`auth.breakglass.armed` → `auth.breakglass.login`/`auth.breakglass.denied`); wire an alert on the counter as the cheap always-on signal.
 
+The NVD CVE sync exposes three server metrics — `yuzu_nvd_total_cves` (gauge), `yuzu_nvd_backfill_complete` (gauge), and `yuzu_nvd_sync_failures_total{reason}` (counter, `reason` ∈ {`connection`, `http_429`, `http_403`, `http_other`, `parse`}). The counter follows the standard bounded-label convention: every `reason` series is initialised to `0` at startup so the family (and its HELP/TYPE) is present on a healthy server and `absent()`-style alerts stay meaningful. See [metrics.md → NVD CVE sync metrics](user-manual/metrics.md#nvd-cve-sync-metrics) for the full per-metric reference and `reason`-label semantics.
+
 ## Audit events
 
 Structured JSON envelope:

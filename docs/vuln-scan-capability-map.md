@@ -12,7 +12,7 @@ against ADR-0018/ADR-0019 below):
 - North-star design: `docs/vuln-scan-engine-design.md` (floor = Phases 1–5, differentiator = Phases 6–8)
 - Theory: `CAVM_WhitePaper_v16` (EUC, composite score, AMAPC, choke points, crown jewels, gate model)
 - Topology: `server/core/src/fleet_topology_store.{hpp,cpp}`, `fleet_topology_types.hpp`
-- NVD infra: `nvd_client` + `nvd_db` (`NvdDatabase`) + `nvd_sync` (`NvdSyncManager`) — **wired** in `server.cpp:982-987`; feeds the fleet-topology vuln overlay (`match_inventory`). Keyword-scoped, agent plugin not joined to it.
+- NVD infra: `nvd_client` + `nvd_db` (`NvdDatabase`) + `nvd_sync` (`NvdSyncManager`) — **wired**; feeds the fleet-topology vuln overlay (`match_inventory`). Full newest-first catalog backfill (was keyword-scoped); agent plugin not joined to it.
 - Epic/issue breakdown: this workstream's sequenced plan (Epics 1–7)
 - ADR: `docs/adr/0018-server-authoritative-vulnerability-matching.md` — matching location, wire
   format (typed identity, not PURL), Lane 1/2/3 routing
@@ -105,28 +105,38 @@ consult the server NVD database (V2.2).
 **WIRED** (transport + a store), but **the match model is wrong, not just the corpus.**
 `nvd_client` (HTTPS → `services.nvd.nist.gov`, NVD 2.0 API, API-key+proxy) → `nvd_db`
 (`NvdDatabase`) → `nvd_sync` (`NvdSyncManager`, 4h). Constructed/started in `server.cpp:982-987`
-when `nvd_sync_enabled`; CLI `--nvd-sync-interval` / `--nvd-api-key` / `--no-nvd-sync`,
-env `YUZU_NVD_SYNC_INTERVAL`; status REST endpoint.
-> **Gap (two layers):**
-> 1. **Schema can't represent CPE ranges.** The store is a flat `cve(product, affected_below)`
->    with a single upper bound — it cannot hold NVD's `cpeMatch` criteria
->    (`versionStartIncluding/Excluding`, `versionEndIncluding/Excluding`, multiple ranges per CVE).
->    Reshaping to the real CPE-range model is required; **"widen the keywords" does NOT fix this.**
-> 2. **Corpus is keyword-scoped** (`kInitialSyncKeywords`), not a full mirror; no API key by
->    default → low rate limit. *(roadmap M1a)*
-> **Note:** the parent map's §9.4 "NVD database sync on server" claim is **accurate** — keep it.
+when `nvd_sync_enabled`; CLI `--nvd-sync-interval` / `--nvd-api-key` / `--nvd-proxy` /
+`--nvd-backfill-years` / `--no-nvd-sync`, env `YUZU_NVD_SYNC_INTERVAL` /
+`YUZU_NVD_BACKFILL_YEARS`; status REST endpoint.
+> **Gap (was two layers; layer 1 now CLOSED):**
+> 1. **Schema now represents CPE ranges — CLOSED.** The store was reshaped (v1→v2 migration)
+>    from the flat `cve(product, affected_below)` into a normalized `cve` + `cve_match` model
+>    that holds NVD's `cpeMatch` range bounds (`version_start/end_including/excluding`, multiple
+>    ranges per CVE) — see the `cve_match` schema in `nvd_db.cpp`. Delivered by the
+>    CPE-range-matching PR.
+> 2. **Corpus is now a full newest-first backfill** (configurable depth via
+>    `--nvd-backfill-years`, default 8y, `0` = full history; resumable across restarts,
+>    then periodic freshness), no longer keyword-scoped — that gap is **CLOSED**. The
+>    remaining gap is **vendor-precise identity** (product-name matching, ADR-0018), not
+>    corpus size; with no API key by default the initial backfill is slow (low rate limit).
+> **Note:** the parent map's §9.4 "NVD database sync on server" claim describes wired infra, but
+> **the sync never actually ran until 2026-07-04** — a `rate_limit()` integer overflow slept ~292
+> years before the first HTTP request on every deployment (fixed in the NVD rate-limit PR; #1867).
+> It is now verified E2E-populating. Treat "NVD sync works" as true only from that fix onward.
 
 ### V2.3 NVD → inventory correlation join :large_orange_diamond: `T2`
-`NvdDatabase::match_inventory` exists but matches by `product LIKE ?` + a **naive
-`compare_versions < affected_below`** — substring identity, no CPE, no range semantics, no
-epoch/release/semver awareness. It is consumed by the **fleet-topology vuln overlay** only
-(`FleetTopologyStore`, `include_vuln=true`); the agent plugin's findings are **not** correlated
-against it.
-> **Gap:** replace with a real correlation engine — typed-identity→CPE mapping (curated +
-> pgvector fuzzy, Lane 1's NVD-fallback and Lane 3's future federation) + range-aware comparator
-> (recover the #1206 comparator) + `cpeMatch` range test, alongside Lane 1's OVAL-primary (V2.4)
-> and Lane 2's OSV.dev-by-PURL (V2.9) — as part of the single server correlation engine.
-> *(roadmap M1a; topology attach is M3)*
+`NvdDatabase::match_inventory` now matches with **real CPE range semantics**: it builds a
+`VersionRange` from each `cve_match` row and calls `nvd_version_in_range` (`nvd_db.cpp`),
+honouring `versionStart/EndIncluding/Excluding`. Product selection is still name-based
+(`product LIKE ?`), so range evaluation is only as precise as the product-name match feeding
+it. It is consumed by the **fleet-topology vuln overlay** only (`FleetTopologyStore`,
+`include_vuln=true`); the agent plugin's findings are **not** correlated against it.
+> **Gap (range comparator now DONE; identity is the remaining gap):** the range-aware
+> comparator + `cpeMatch` range test shipped with the CPE-range PR. What remains is
+> **vendor-precise identity** — typed-identity→CPE mapping (curated + pgvector fuzzy, Lane 1's
+> NVD-fallback and Lane 3's future federation) to replace the prefix-anchored `product LIKE 'name%'`
+> match (ADR-0018) — alongside Lane 1's OVAL-primary (V2.4) and Lane 2's OSV.dev-by-PURL (V2.9), as
+> part of the single server correlation engine. *(roadmap M1a; topology attach is M3)*
 
 ### V2.4 Distro advisory / OVAL backport correlation :x: `T1`
 **Not ingested.** No OVAL/OVD anywhere in code — design-doc only
@@ -306,8 +316,8 @@ No co-location batching or remediation-governance surface.
 ## Merge guidance (folding into `docs/capability-map.md`)
 
 1. **§9.4 Vulnerability Scanning** — replace the single `:white_check_mark: T1` line. The
-   floor is **not** done: the agent matcher is the defective PoC (V2.1), NVD ingest is
-   keyword-scoped and not joined to plugin findings (V2.2/V2.3), OVAL/backport correlation is
+   floor is **not** done: the agent matcher is the defective PoC (V2.1), NVD ingest now does a
+   full-catalog backfill but is not joined to plugin findings (V2.2/V2.3), OVAL/backport correlation is
    absent (V2.4), OSV.dev/language-ecosystem correlation is absent (V2.9), and finding status is
    still boolean rather than tri-state (V4.5). Downgrade §9.4 to `:large_orange_diamond:`. The
    "NVD database sync on server" claim is **accurate — keep it** (corrects the 2026-06-30

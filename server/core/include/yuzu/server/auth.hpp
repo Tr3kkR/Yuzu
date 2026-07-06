@@ -33,10 +33,31 @@ struct UserEntry {
     Role role;
     std::string salt_hex;
     std::string hash_hex;
+    /// #1852 — `'local'` for a password-authenticated account (auth.db
+    /// migration v6 default; every pre-v6 row and every row created via
+    /// `upsert_user` is `'local'`), `'oidc'`/`'saml'`/`'ad'` for a durable
+    /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
+    /// populated by every list/read path — see the call site's doc comment.
+    std::string identity_source{"local"};
 };
 
 struct Session {
+    /// STABLE authorization principal. For local/API-token auth this is the
+    /// login username; for OIDC/SSO auth (#1837) this is `"oidc:" + iss +
+    /// "#" + sub` — the IdP-issuer-scoped, immutable subject claim — NEVER a
+    /// human-readable label. `check_permission`, `reconcile_idp_memberships`,
+    /// elevation eligibility, and every audit `principal` field key on THIS
+    /// field. Two SSO users who happen to share a display name (or a display
+    /// name that later changes, e.g. after a legal name change) must never
+    /// collide or resolve to the same principal — see
+    /// docs/auth-architecture.md "Stable principal vs. display name".
     std::string username;
+    /// Human-readable label for UI/audit-DETAIL rendering only — NEVER used
+    /// for authorization or as a map/store key. For local auth this mirrors
+    /// `username`; for OIDC/SSO auth this is the IdP `name` claim (falling
+    /// back to `email`) at the time of the most recent login, so it tracks
+    /// display-name changes without perturbing the stable `username` above.
+    std::string display_name;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
     std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
@@ -395,8 +416,22 @@ public:
     /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
     /// so an NTP step cannot extend the step-up window — see
     /// docs/auth-mfa-design.md hard invariant #5.
+    ///
+    /// #1837 — the session's STABLE `username` (authorization principal) is
+    /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
+    /// display name is a mutable, IdP-side, human-editable label (two users
+    /// can share one, and a rename must not sever an existing user's group
+    /// memberships/roles). `iss` is the token issuer that scopes `sub` to a
+    /// specific IdP (RFC 7519 — `sub` is only unique per-issuer). `display_name`
+    /// is retained on the `Session` purely for human-readable rendering. There
+    /// is no persistent principal→display-name directory for rendering a
+    /// principal outside a live session (e.g. an admin user list, or audit-row
+    /// rendering) — the human name for such a case is recovered from that
+    /// specific SSO audit row's `display=`/`email=` detail field instead (see
+    /// /auth/callback's `audit_log_for_principal` calls). A durable directory
+    /// is tracked in #1852.
     std::string create_oidc_session(const std::string& display_name, const std::string& email,
-                                    const std::string& oidc_sub,
+                                    const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
                                     std::chrono::steady_clock::time_point mfa_verified_at = {});
@@ -412,6 +447,29 @@ public:
     std::string create_saml_session(const std::string& name_id,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group = {});
+
+    /// #1852 — auto-provision (or refresh) a durable `users` row for an
+    /// OIDC-authenticated principal, so JIT admin elevation (which reads
+    /// `auth.db users.elevation_eligible`) has something to key on. Forwards
+    /// to `AuthDB::upsert_sso_identity(..., "oidc")` when `auth_db_` is set
+    /// (a legacy config-file-only deployment has no durable store — a
+    /// silent no-op). `principal` is the stable `"oidc:" + iss + "#" + sub`
+    /// form (matches `create_oidc_session`'s construction exactly — pass
+    /// the SAME string). Call this AFTER `create_oidc_session` at the route
+    /// layer, NOT from inside `create_oidc_session` itself: that method
+    /// holds `mu_` for the in-memory session map, and this performs
+    /// independent auth.db I/O that must not serialize behind it.
+    /// **Fail-soft**: an AuthDB error is logged and swallowed — the
+    /// caller's session is already minted and must not be un-minted
+    /// because provisioning failed; the principal simply cannot elevate
+    /// until a future successful login provisions it. SAML is NOT wired
+    /// to this method yet — SAML sessions are keyed on the raw NameID
+    /// (no reserved-prefix stable principal; see `create_saml_session`'s
+    /// "#1837 fast-follow" comment), which `is_valid_principal` would
+    /// reject, so a SAML session cannot elevate until that fast-follow
+    /// lands (docs/auth-architecture.md).
+    void provision_sso_identity(const std::string& principal, const std::string& iss,
+                                const std::string& sub, const std::string& display_name);
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

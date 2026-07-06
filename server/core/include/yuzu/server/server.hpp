@@ -147,6 +147,7 @@ struct Config {
     std::string nvd_proxy;   // HTTP proxy for NVD API (e.g. "http://proxy:8080")
     std::chrono::seconds nvd_sync_interval{4 * 3600}; // Default: 4 hours
     bool nvd_sync_enabled{true};
+    int nvd_backfill_years{8}; // Newest-first backfill depth; <=0 = full history
 
     // OTA agent updates
     std::filesystem::path

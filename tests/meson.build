@@ -148,6 +148,7 @@ agent_test_exe = executable(
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
     'unit/test_installed_apps_registry_utf8.cpp',
+    'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
   ),
   include_directories: [
@@ -181,6 +182,10 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
+  tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
+  tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
+  tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
+  tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -200,6 +205,7 @@ tar_test_exe = executable(
   'yuzu_tar_tests',
   files(
     'unit/test_tar_diff.cpp',
+    'unit/test_tar_netconn.cpp',
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
@@ -212,6 +218,7 @@ tar_test_exe = executable(
     'unit/test_tar_proc_es.cpp',
     'unit/test_tar_module_stream.cpp',
     'unit/test_tar_module_etw.cpp',
+    'unit/test_tar_mapdrive.cpp',
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
@@ -226,6 +233,9 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_proc_etw.cpp',
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_module_etw.cpp',
+    '../agents/plugins/tar/src/tar_netqual_boot.cpp',
+    '../agents/plugins/tar/src/tar_netconn_win.cpp',
+    '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
@@ -247,6 +257,7 @@ if build_server
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
       'unit/server/test_auth_jit_elevation.cpp',
+      'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
@@ -289,6 +300,7 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_routes.cpp',
       'unit/server/test_saml_provider.cpp',

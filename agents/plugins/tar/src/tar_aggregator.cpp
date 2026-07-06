@@ -221,8 +221,19 @@ std::string_view diff_state_key(std::string_view source) {
         return "arp";
     if (source == "dns")
         return "dns";
-    // perf/procperf keep an in-memory previous reading; netqual is stateless;
-    // module is a stream-drained source (no snapshot-diff baseline).
+    // §3.8 — mapdrive is a snapshot-diff source: the collect_slow leg keeps a
+    // baseline under get_state/set_state "mapdrive", so the on-disable clear must
+    // reach it or a re-enable would emit ghost appeared/removed mapping deltas for
+    // the paused window (#538). (The one-time historical backfill does NOT use this
+    // baseline — it inserts directly, gated by the mapdrive_backfill_done key.)
+    if (source == "mapdrive")
+        return "mapdrive";
+    // perf/procperf keep an in-memory previous reading; netqual holds only a
+    // wall-clock-guarded in-memory baseline (re-anchored on a long gap, never a
+    // stored diff); netconn is high-water-mark based (its only state is the
+    // netconn_backfill_hwm config key, deliberately kept across a disable so the
+    // OS event log recovers the paused window); module is stream-drained. None
+    // of these has a snapshot-diff baseline to clear here.
     return {};
 }
 

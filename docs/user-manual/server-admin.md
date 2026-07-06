@@ -20,11 +20,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 12. [SAML 2.0 SP Configuration](#saml-20-sp-configuration)
 13. [Data Storage and Encryption](#data-storage-and-encryption)
 14. [PostgreSQL Substrate](#postgresql-substrate)
-15. [Retention Settings](#retention-settings)
-16. [Settings API Reference](#settings-api-reference)
-17. [Deployment](#deployment)
-18. [Windows Service Installation](#windows-service-installation)
-19. [Planned Features](#planned-features)
+15. [NVD CVE sync](#nvd-cve-sync)
+16. [Retention Settings](#retention-settings)
+17. [Settings API Reference](#settings-api-reference)
+18. [Deployment](#deployment)
+19. [Windows Service Installation](#windows-service-installation)
+20. [Planned Features](#planned-features)
 
 ---
 
@@ -84,7 +85,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and the grant is in-memory per cookie session (auto-reverts on lapse; a restart drops it). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
-| `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
+| `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. ⚠️ **This flag currently has no observable effect** — since the #1837/#1857 identity re-key, an OIDC session is denied JIT elevation at the eligibility gate (its `oidc:<iss>#<sub>` principal has no local `users` row), before the `amr` branch this flag controls is reached; OIDC elevation is restored by #1852. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
 | `--session-inactivity-secs` | `0` | **Idle (inactivity) session timeout** (SOC 2 CC6.3). Seconds of inactivity after which an operator **dashboard cookie session** is invalidated server-side — a **sliding** window that resets on each authenticated request, *under* the absolute 8-hour session lifetime. `0` (default) **disables** it (only the absolute lifetime applies — existing deployments are unaffected); a recommended hardened value is `900` (15 min). Scope is cookie sessions only: **API tokens and MCP tokens are never idle-timed-out** (long-lived automation is unaffected); OIDC users simply re-authenticate via SSO. The active window is logged once at boot for evidence; a value ≥ the absolute 8-hour session lifetime (28800s) is accepted but elicits a startup `WARN` (the idle window can never fire before absolute expiry). Env: `YUZU_SESSION_INACTIVITY_SECS`. |
 | `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only OIDC SSO mints a session — so the server **refuses to start** unless OIDC is configured (`--oidc-issuer`). A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
@@ -190,7 +191,11 @@ working set, by image name) to the TAR edge warehouse. **It is off by default**
 (`procperf_enabled=false`) and collects nothing until an operator opts in — it
 is a distinct, usage-class telemetry category subject to works-council / DPA
 review, separate from the device-level performance sampling (`perf_enabled`,
-on by default, no per-app identity) that shipped in the prior release. To
+on by default, no per-app identity) that shipped in the prior release **on
+Windows** — on Linux, device-level sampling starts automatically **on upgrade
+to this release** (see the upgrade checklist in the user manual's
+[Upgrading](upgrading.md) page and the TAR manual's upgrade note; opt out per
+host with `perf_enabled=false`). To
 enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
 instruction (fleet-wide or per-device). The data is image names only (no
 command lines), 7-day raw / 31-day hourly retention, and is captured in the
@@ -1002,6 +1007,31 @@ Decrypt failures are counted per store and failure class as `yuzu_server_secret_
 
 ---
 
+## NVD CVE sync
+
+The server maintains a local mirror of the NVD (National Vulnerability Database) CVE
+catalog, used by the fleet-topology vulnerability overlay. On first boot it runs a
+newest-first **backfill** of the full catalog, then switches to periodic freshness
+re-checks. Configuration is via CLI flags at startup (each has an env-var equivalent).
+
+| CLI Flag | Env | Default | Description |
+|---|---|---|---|
+| `--nvd-api-key` | `YUZU_NVD_API_KEY` | *(none)* | NVD API key. Raises the NVD rate limit substantially — the difference between the initial backfill taking minutes versus hours. |
+| `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy URL for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. |
+| `--nvd-sync-interval` | `YUZU_NVD_SYNC_INTERVAL` | `4` | Freshness re-check cadence, in hours, once the backfill has completed. |
+| `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. The floor is clamped to NVD's catalog start (1999-01-01) and to a 200-year effective maximum, so no value reaches before the catalog begins. |
+| `--no-nvd-sync` | — | off | Disable NVD sync entirely. |
+
+> **Note:** the initial backfill makes sustained HTTPS requests to `services.nvd.nist.gov`
+> and grows the local NVD database to hundreds of MB. Without an API key it can take hours.
+> The backfill is resumable — after a restart it resumes from where it left off rather than
+> starting over. Sync progress is observable via `GET /api/nvd/status`
+> (`backfill_complete`, `backfill_oldest_published`, `total_cves`).
+
+**Rate-limit and auth-error handling:** HTTP 429 responses are backed off automatically (honouring `Retry-After`, else exponential to a 30-minute cap) and the same page is retried — expect `NVD HTTP 429 … backing off` warnings during a large backfill without an API key; this is expected, not a failure. HTTP 403 means a bad or revoked `--nvd-api-key`: it is logged distinctly and NOT retried — check/rotate the key. Both surface via `yuzu_nvd_sync_failures_total{reason=...}` (see the [metrics reference](metrics.md#nvd-cve-sync-metrics)).
+
+---
+
 ## Retention Settings
 
 The server applies retention policies to stored data to manage disk usage. Retention values are set via CLI flags at startup.
@@ -1268,48 +1298,76 @@ bash scripts/start-stack.sh status   # show running processes and ports
 
 ## Windows Service Installation
 
-On Windows, Yuzu server and agent can be installed as Windows services for automatic startup and recovery. A native Windows service wrapper is planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager).
+On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see the **Agent: `--install-service`** subsection below. A native wrapper for the Yuzu **server** is still planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager) for the server, as described below.
 
-### Using sc.exe
+### Agent: `--install-service` (native, recommended)
+
+```cmd
+REM Register the service (binPath is written for you, including the internal
+REM --service marker the agent needs to run under the SCM control protocol)
+yuzu-agent.exe --install-service
+
+REM Point it at your server / data dir / log file via sc config -- this is the
+REM EXACT quoting convention the shipped installer's own [Run] sc.exe config
+REM line uses (empirically verified working per #1822): quote ONLY the
+REM executable path, leave --service and the flag tokens bare/individually
+REM quoted after it. sc.exe reassembles all of this back into one binPath
+REM value regardless of how many separate quoted segments the command line
+REM contains, so this still works unmodified under a spaced path like
+REM "Program Files" (Gate 4 consistency-auditor finding, governance re-run --
+REM a prior revision of this example wrapped the entire value in one outer
+REM quote pair with escaped inner quotes, a different, less copy-paste-
+REM friendly convention from what the installer itself actually ships).
+sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe" --service --server yuzu.example.com:50051 --data-dir "C:\ProgramData\Yuzu" --plugin-dir "C:\Yuzu\plugins" --log-file "C:\Yuzu\logs\yuzu-agent.log"
+
+sc.exe start YuzuAgent
+sc.exe stop YuzuAgent
+
+REM Remove it
+yuzu-agent.exe --remove-service
+```
+
+The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix — tracked separately as #1442). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` and #1442 for the tracked follow-up, and the [Service Account](#service-account) guidance below (written for the server, but the same `obj=` mechanism applies).
+
+Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. **It resets binPath to the bare exe + `--service` marker** (the same minimal form shown above), dropping any `--server`/`--data-dir`/`--plugin-dir`/`--log-file` a prior `sc config` had applied — always follow it with `sc.exe config` to restore your runtime args, exactly as the installer's own `[Run]` sequence does (`--install-service` then `sc config` then `sc start`). Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
+
+> **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
+
+> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
+
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers two distinct causes that land on the same code — either the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
+
+### Server: sc.exe (native wrapper not yet available)
 
 ```cmd
 REM Create the Yuzu server service
 sc.exe create YuzuServer binPath= "C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key" start= auto DisplayName= "Yuzu Server"
 
-REM Create the Yuzu agent service
-sc.exe create YuzuAgent binPath= "C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50051" start= auto DisplayName= "Yuzu Agent"
-
 REM Set startup type to automatic (delayed start, recommended)
 sc.exe config YuzuServer start= delayed-auto
-sc.exe config YuzuAgent start= delayed-auto
 
 REM Configure recovery: restart on first, second, and subsequent failures
 sc.exe failure YuzuServer reset= 86400 actions= restart/5000/restart/10000/restart/30000
-sc.exe failure YuzuAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
 
-REM Start the services
+REM Start / stop the service
 sc.exe start YuzuServer
-sc.exe start YuzuAgent
-
-REM Stop the services
 sc.exe stop YuzuServer
-sc.exe stop YuzuAgent
 ```
 
 > **Note:** With `sc.exe`, spaces after `=` are required (e.g., `start= auto`, not `start=auto`). This is a quirk of the `sc.exe` command parser.
 
 ### Using NSSM
 
-[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog.
+[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog. It remains a valid option for the **server** (no native wrapper yet) and for the **agent** if you prefer NSSM's process-monitoring/log-rotation over the native `--install-service` path — just don't pass `--service` to an NSSM-wrapped agent (see the note above).
 
 ```cmd
 REM Install services
 nssm install YuzuServer "C:\Yuzu\yuzu-server.exe"
 nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
 
-REM Set arguments
+REM Set arguments (no --service for the NSSM-wrapped agent)
 nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
-nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50051"
+nssm set YuzuAgent AppParameters "--server yuzu.example.com:50051"
 
 REM Configure startup and recovery
 nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START

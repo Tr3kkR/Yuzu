@@ -67,6 +67,39 @@ namespace yuzu::server {
 
 namespace {
 
+// governance round (arch-S1) — percent-encode a URL query-PARAMETER VALUE
+// (RFC 3986 unreserved set — alnum, `-`, `_`, `.`, `~` pass through
+// unchanged; everything else, including `#`, `&`, `%`, `+`, and space, is
+// percent-escaped). Distinct from `html_escape`: `html_escape` neutralises
+// HTML metacharacters for BODY text and does NOT touch `#`, so a value
+// containing `#` (e.g. the durable SSO principal `oidc:<iss>#<sub>`,
+// #1852) embedded via `html_escape` alone into an
+// `hx-delete="...?username=" + html_escape(v)` attribute is silently
+// truncated by the browser, which treats the un-encoded `#` as a URL
+// fragment separator — the server then receives a truncated query value
+// with no error signal. Use `url_encode` for the query-parameter VALUE and
+// reserve `html_escape` for the surrounding HTML-attribute quoting / any
+// body-text rendering of the same value. Mirrors the identical helper
+// already local to device_ui.cpp / dex_routes.cpp / inventory_ui.cpp et al.
+// (deliberately per-file, not centralised in web_utils.hpp — several of
+// those files declare the same name in their own anonymous namespace, so a
+// namespace-scope version there is ambiguous against unqualified lookup).
+std::string url_encode(const std::string& s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
 std::string highlight_yaml_value(const std::string& val) {
     if (val.empty())
         return {};
@@ -440,8 +473,24 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
             const bool is_self = !current_username.empty() && u.username == current_username;
-            html += "<tr><td>" + html_escape(u.username) +
-                    "</td>"
+            // #1852 — a durable SSO row (`identity_source != "local"`, e.g.
+            // an auto-provisioned `oidc:<iss>#<sub>` principal) now appears
+            // in this list. Its `username` fails the STRICT
+            // `is_valid_username` gate that guards local-account mutation
+            // routes (delete, password-reset, role-change — see
+            // auth_db.hpp's `is_valid_principal` doc), so those buttons are
+            // suppressed for it below rather than rendering a button that
+            // always 400s. Session-revoke and elevation-eligibility are
+            // principal-keyed (`is_valid_principal`) and stay available.
+            const bool is_sso = u.identity_source != "local";
+            html += "<tr><td>" + html_escape(u.username);
+            if (is_sso) {
+                html += " <span class=\"role-badge\" style=\"background:#1f6feb22;"
+                        "color:#58a6ff;font-size:0.6rem;margin-left:0.3rem\" "
+                        "title=\"Auto-provisioned via SSO (identity_source=" +
+                        html_escape(u.identity_source) + ")\">SSO</span>";
+            }
+            html += "</td>"
                     "<td><span class=\"role-badge " +
                     std::string(cls) + "\">" + html_escape(role_str) +
                     "</span></td>"
@@ -474,28 +523,47 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         "hx-on::after-request=\"window.location='/login'\""
                         ">Sign out everywhere</button>";
             } else {
+                // governance round (arch-S1) — the query-parameter VALUE
+                // must be URL-encoded, not HTML-escaped: `html_escape`
+                // leaves `#` untouched, and a durable SSO principal
+                // (`oidc:<iss>#<sub>`, #1852) embedded raw here has its
+                // `#` treated by the browser as a URL-fragment separator,
+                // silently truncating the request the server receives —
+                // a no-op "Revoke sessions" click with no visible error.
+                // `html_escape` is still applied to the confirm-dialog TEXT
+                // below (a body-text rendering, not a URL).
                 html += "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
                         "margin-right:0.3rem\" "
                         "hx-delete=\"/api/v1/sessions?username=" +
-                        html_escape(u.username) +
+                        url_encode(u.username) +
                         "\" "
                         "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Force &quot;" +
                         html_escape(u.username) +
                         "&quot; to log in again? Active dashboard sessions "
                         "will end immediately. Their API tokens are NOT revoked.\""
-                        ">Revoke sessions</button>"
-                        "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                        "hx-delete=\"/api/settings/users/" +
-                        html_escape(u.username) +
-                        "\" "
-                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Remove user &quot;" +
-                        html_escape(u.username) +
-                        "&quot;?\""
-                        ">Remove</button>";
+                        ">Revoke sessions</button>";
+                // #1852 — the Remove button is suppressed for an SSO row:
+                // DELETE /api/settings/users/:username stays gated by the
+                // STRICT `is_valid_username` (local-account charset only —
+                // see the file header comment on that route), so it would
+                // always 400 against an `oidc:<iss>#<sub>` principal. There
+                // is no local-delete equivalent for a durable SSO identity
+                // yet — its lifecycle is IdP-driven (see `last_seen_at` /
+                // docs/auth-architecture.md).
+                if (!is_sso) {
+                    html += "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-delete=\"/api/settings/users/" +
+                            html_escape(u.username) +
+                            "\" "
+                            "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                            "hx-confirm=\"Remove user &quot;" +
+                            html_escape(u.username) +
+                            "&quot;?\""
+                            ">Remove</button>";
+                }
             }
             html += "</td></tr>";
         }
@@ -3387,6 +3455,24 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username: must be 1-64 chars, alphanumeric + ._- only","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
+        }
+
+        // #1837 governance follow-up — reserve the `oidc:`/`saml:`/`ad:` SSO-
+        // principal namespace prefixes on LOCAL user creation. Defense-in-
+        // depth: is_valid_username's ':' rejection already makes the exact
+        // stable principal string unconstructable here, but an explicit
+        // reservation documents intent and survives a future charset change.
+        if (is_reserved_identity_prefix(username)) {
+            spdlog::warn("POST /api/settings/users: username '{}' uses a reserved SSO-principal "
+                        "prefix — rejected",
+                        username);
+            audit_fn_(req, "user.create", "denied", "User", username, "reserved_prefix");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Username cannot begin with a reserved prefix: oidc:, saml:, or ad:","level":"error"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         }

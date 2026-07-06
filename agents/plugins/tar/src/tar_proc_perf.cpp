@@ -5,7 +5,12 @@
 #include <yuzu/version_string.hpp> // shared format_file_version / normalize_ffi_version
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cstddef>
+#include <limits>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -19,9 +24,89 @@ std::uint64_t delta(std::uint64_t prev, std::uint64_t cur) {
     return cur >= prev ? cur - prev : 0;
 }
 
+// Saturating add/multiply — a hostile /proc mount can put 2^64-scale integers
+// in a stat field; the products below would wrap (defined, but garbage). We
+// saturate to UINT64_MAX so a forged value yields a pinned reading rather than
+// a wrapped one (the module's "tolerate untrusted /proc" contract). Physically
+// real kernels never approach these bounds.
+std::uint64_t sat_add(std::uint64_t a, std::uint64_t b) {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a + b;
+}
+std::uint64_t sat_mul(std::uint64_t a, std::uint64_t b) {
+    return (b != 0 && a > std::numeric_limits<std::uint64_t>::max() / b)
+               ? std::numeric_limits<std::uint64_t>::max()
+               : a * b;
+}
+
 // (pid, create_time) identity key — PID alone is reused by the OS.
 std::uint64_t proc_key(const ProcCounter& p) {
     return proc_identity(p.pid, p.create_time_100ns);
+}
+
+// Canonicalize a raw kernel `comm` for storage AND for redaction-pattern
+// matching. Both MUST use the IDENTICAL transform: procperf stores the
+// sanitized name, so an operator pattern has to be matched in the same space
+// or a name the sanitizer rewrote (`evil|app` → `evil_app`) would silently
+// escape a pattern that targets its raw form (`*evil|app*`). Transform:
+//   - `\` and `\n` are escaped exactly as the kernel escapes /proc status
+//     Name: (preserving the procperf↔process_live name join);
+//   - `|`, other control bytes (< 0x20), and DEL (0x7f) become `_` (comm is
+//     attacker-settable and would otherwise inject separators into the
+//     pipe-delimited sql/export/app_perf wire formats);
+//   - a well-formed multi-byte UTF-8 sequence passes through (legitimate
+//     non-ASCII app names survive), but an ILL-FORMED byte (a stray/overlong
+//     lead byte, a broken continuation, or a sequence truncated by the 15-byte
+//     comm cap mid-character) becomes `_`, so the stored name is always valid
+//     UTF-8 and can never fail the server's app_perf Postgres text insert.
+std::string sanitize_comm(std::string_view raw) {
+    std::string out;
+    out.reserve(raw.size());
+    std::size_t i = 0;
+    while (i < raw.size()) {
+        const auto c0 = static_cast<unsigned char>(raw[i]);
+        if (raw[i] == '\\') {
+            out += "\\\\";
+            ++i;
+        } else if (raw[i] == '\n') {
+            out += "\\n";
+            ++i;
+        } else if (c0 == '|' || c0 < 0x20 || c0 == 0x7f) {
+            out += '_';
+            ++i;
+        } else if (c0 < 0x80) {
+            out += static_cast<char>(c0);
+            ++i;
+        } else {
+            // Multi-byte UTF-8. Validate the whole sequence (length from the
+            // lead byte, well-formed continuations, no overlong/surrogate/
+            // out-of-range codepoint); emit it intact iff valid, else one `_`
+            // and resync one byte.
+            int len = c0 >= 0xF0 ? 4 : c0 >= 0xE0 ? 3 : c0 >= 0xC0 ? 2 : 0;
+            bool ok = len >= 2 && i + static_cast<std::size_t>(len) <= raw.size();
+            std::uint32_t cp = ok ? (c0 & (0x7fu >> len)) : 0;
+            for (int k = 1; ok && k < len; ++k) {
+                const auto cc = static_cast<unsigned char>(raw[i + static_cast<std::size_t>(k)]);
+                if ((cc & 0xC0) != 0x80) {
+                    ok = false;
+                } else {
+                    cp = (cp << 6) | (cc & 0x3fu);
+                }
+            }
+            const std::uint32_t min_cp = len == 2 ? 0x80 : len == 3 ? 0x800 : 0x10000;
+            if (ok && (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)))
+                ok = false; // overlong, surrogate, or out of range
+            if (ok) {
+                out.append(raw.substr(i, static_cast<std::size_t>(len)));
+                i += static_cast<std::size_t>(len);
+            } else {
+                out += '_';
+                ++i;
+            }
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -53,6 +138,37 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
     for (const auto& p : prev.procs)
         prev_cpu[proc_key(p)] = p.cpu_100ns;
 
+    // Build the redaction match set in the SANITIZED comm space. procperf
+    // stores each name via sanitize_comm, so a pattern must be matched against
+    // that same transform or a name the sanitizer rewrote (`evil|app` →
+    // `evil_app`) would escape a pattern that targets its raw form. `*` passes
+    // through sanitize_comm unchanged, so should_redact's star-stripping still
+    // works on the sanitized pattern.
+    //
+    // BEST-EFFORT on the 15-byte comm (TASK_COMM_LEN). The kernel truncates the
+    // name to 15 raw bytes, so a pattern whose sensitive substring is not a
+    // ≤15-byte prefix-aligned slice of comm cannot match — the bytes are gone.
+    // As a partial mitigation, any core LONGER than the comm width also matches
+    // by its comm-width prefix (only ever ADDS redaction — the privacy-safe
+    // direction; it can also over-suppress an unrelated same-prefix app). This
+    // does NOT make redaction complete on Linux; see docs/user-manual/tar.md.
+    std::vector<std::string> match_patterns;   // sanitized, full cores
+    std::vector<std::string> comm_fallback;    // sanitized, comm-width prefixes
+    match_patterns.reserve(redaction.size());
+    for (const auto& pat : redaction) {
+        std::string s = sanitize_comm(pat);
+        std::string_view core = s;
+        while (!core.empty() && core.front() == '*')
+            core.remove_prefix(1);
+        while (!core.empty() && core.back() == '*')
+            core.remove_suffix(1);
+        if (core.empty())
+            continue;
+        if (core.size() > kLinuxCommWidth)
+            comm_fallback.emplace_back(core.substr(0, kLinuxCommWidth));
+        match_patterns.push_back(std::move(s));
+    }
+
     // Aggregate by image name (app-level, the BRD row-22 unit). `rep_*` track
     // the largest-working-set instance — the representative whose on-disk image
     // version stands in for the app this tick (resolved later, off the lock).
@@ -68,7 +184,12 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
     for (const auto& p : cur.procs) {
         if (p.name.empty())
             continue; // Idle / unnameable kernel entries — never a row
-        if (!redaction.empty() && should_redact(p.name, redaction))
+        // p.name is already sanitized; match_patterns/comm_fallback are in the
+        // same space, so a name the sanitizer rewrote can no longer dodge a
+        // pattern that targets its raw form.
+        if (!match_patterns.empty() && (should_redact(p.name, match_patterns) ||
+                                        (!comm_fallback.empty() &&
+                                         should_redact(p.name, comm_fallback))))
             continue; // operator-redacted apps never appear in the warehouse
         auto& a = by_name[p.name];
         ++a.instances;
@@ -123,6 +244,78 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
                                                 : a.ws_bytes > b.ws_bytes;
               });
     return out;
+}
+
+std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_view stat_content,
+                                                long clk_tck, long page_size) {
+    if (clk_tck <= 0 || page_size <= 0)
+        return std::nullopt;
+
+    // comm sits between the first '(' and the LAST ')' — it may itself contain
+    // spaces and parens (prctl(PR_SET_NAME)), so the last-')' rule is the only
+    // correct parse and the content must never be line-split first.
+    const auto open = stat_content.find('(');
+    const auto close = stat_content.rfind(')');
+    if (open == std::string_view::npos || close == std::string_view::npos || close <= open)
+        return std::nullopt;
+
+    // Tokens after the ')' are stat fields 3+, so 0-indexed: field N → N−3.
+    //   utime=11  stime=12  starttime=19  rss=21   (proc(5), fields 14/15/22/24)
+    constexpr std::size_t kUtime = 11, kStime = 12, kStartTime = 19, kRss = 21;
+    constexpr std::size_t kNeed = kRss + 1;
+    const auto is_field_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    std::string_view rest = stat_content.substr(close + 1);
+    std::string_view tok[kNeed];
+    std::size_t count = 0, i = 0;
+    while (i < rest.size() && count < kNeed) {
+        while (i < rest.size() && is_field_ws(rest[i]))
+            ++i;
+        const std::size_t start = i;
+        while (i < rest.size() && !is_field_ws(rest[i]))
+            ++i;
+        if (i > start)
+            tok[count++] = rest.substr(start, i - start);
+    }
+    if (count < kNeed)
+        return std::nullopt;
+
+    // Exception-free full-consumption parse (the dex_linux_proc rule —
+    // malformed content must never unwind out of the collect tick, and a
+    // corrupt token rejects the row rather than being half-accepted). rss is
+    // signed in the kernel's format string; a negative reading clamps to 0.
+    const auto parse_num = []<typename T>(std::string_view t, T) -> std::optional<T> {
+        T v = 0;
+        const auto [p, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
+        return (ec == std::errc{} && p == t.data() + t.size()) ? std::optional{v} : std::nullopt;
+    };
+    const auto utime = parse_num(tok[kUtime], std::uint64_t{});
+    const auto stime = parse_num(tok[kStime], std::uint64_t{});
+    const auto starttime = parse_num(tok[kStartTime], std::uint64_t{});
+    const auto rss = parse_num(tok[kRss], std::int64_t{});
+    if (!utime || !stime || !starttime || !rss)
+        return std::nullopt;
+
+    ProcCounter p;
+    p.pid = pid;
+    // comm is attacker-settable RAW bytes (prctl(PR_SET_NAME)); sanitize_comm
+    // neutralizes wire-format separators, escapes '\'/'\n' for the
+    // process_live name join, and scrubs ill-formed UTF-8. derive_proc_samples
+    // matches operator redaction patterns in this SAME sanitized space.
+    p.name = sanitize_comm(stat_content.substr(open + 1, close - open - 1));
+    // Ticks → 100 ns: ×1e7/clk_tck, multiply first (a real kernel needs ~570
+    // CPU-years of jiffies to overflow; a forged /proc value is caught by the
+    // saturating multiply). Keeps derive_proc_samples' capacity denominator
+    // (elapsed·1e7·ncores) working unchanged.
+    const auto clk = static_cast<std::uint64_t>(clk_tck);
+    p.cpu_100ns = sat_mul(sat_add(*utime, *stime), 10'000'000u) / clk;
+    p.create_time_100ns = static_cast<std::int64_t>(sat_mul(*starttime, 10'000'000u) / clk);
+    p.ws_bytes = *rss > 0
+                     ? sat_mul(static_cast<std::uint64_t>(*rss),
+                               static_cast<std::uint64_t>(page_size))
+                     : 0;
+    return p;
 }
 
 } // namespace yuzu::tar
@@ -328,7 +521,12 @@ ProcSnapshot read_proc_counters() {
             // make ucs_to_utf8 read out of bounds.
             const auto* nb = reinterpret_cast<const unsigned char*>(e->ImageName.Buffer);
             if (nb && e->ImageName.Length > 0 && nb >= base && nb + e->ImageName.Length <= end)
-                p.name = ucs_to_utf8(e->ImageName);
+                // sanitize_comm is a no-op on well-formed NTFS image names, but
+                // applying it keeps every platform's names in the SAME space as
+                // the sanitized redaction patterns derive_proc_samples matches
+                // against (and scrubs any ill-formed UTF-8 from the UTF-16
+                // conversion). See the pure-section sanitize_comm.
+                p.name = sanitize_comm(ucs_to_utf8(e->ImageName));
             if (p.name.empty() && pid == 4)
                 p.name = "System"; // the kernel: real working set, no image name
             snap.procs.push_back(std::move(p));
@@ -364,7 +562,80 @@ void resolve_proc_versions(std::vector<ProcPerfSample>& samples,
 
 } // namespace yuzu::tar
 
-#else // !_WIN32 — Linux (/proc/[pid]/stat) and macOS (proc_pid_rusage) are kPlanned
+#elif defined(__linux__)
+
+#include <dirent.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <memory>
+#include <string>
+
+namespace yuzu::tar {
+
+ProcSnapshot read_proc_counters() {
+    ProcSnapshot snap;
+    snap.ts_epoch = static_cast<std::int64_t>(std::time(nullptr));
+    // Process-lifetime constants — thread-safe magic statics, fetched once.
+    static const long clk = ::sysconf(_SC_CLK_TCK);
+    static const long page = ::sysconf(_SC_PAGESIZE);
+    // RAII owner (the HandleGuard rationale): allocations inside the walk can
+    // throw bad_alloc, and a manual closedir after the loop would leak the fd
+    // on every such unwind — a repeatable per-tick leak, since the trigger
+    // engine catches and re-ticks.
+    const std::unique_ptr<DIR, int (*)(DIR*)> dir{::opendir("/proc"), &::closedir};
+    if (!dir || clk <= 0 || page <= 0)
+        return snap; // valid stays false
+    // One /proc/<pid>/stat read per numeric entry. Kernel threads are
+    // deliberately INCLUDED (parity with Windows recording pid 4 `System`):
+    // rss 0 keeps them out of the working-set top-N, and a genuinely hot
+    // kworker surfacing in the CPU top-N is signal, not noise. A hidepid
+    // mount just yields fewer rows — never an invalid snapshot. The path and
+    // content buffers are hoisted and refilled via chunked read() so the
+    // ~hundreds-of-PIDs walk reuses their capacity instead of churning the
+    // heap every 30 s tick.
+    snap.procs.reserve(256);
+    std::string path;
+    std::string content;
+    content.reserve(1024); // a pid stat payload is well under 1 KB
+    while (const dirent* de = ::readdir(dir.get())) {
+        std::uint32_t pid = 0;
+        const char* name = de->d_name;
+        const char* end = name + std::strlen(name);
+        const auto [p, ec] = std::from_chars(name, end, pid);
+        if (ec != std::errc{} || p != end || pid == 0)
+            continue; // not a numeric pid entry
+        path.assign("/proc/").append(name).append("/stat");
+        std::ifstream f(path);
+        if (!f)
+            continue; // pid exited between readdir and open — expected churn
+        char buf[1024];
+        content.clear();
+        while (f.read(buf, sizeof buf))
+            content.append(buf, static_cast<std::size_t>(f.gcount()));
+        content.append(buf, static_cast<std::size_t>(f.gcount()));
+        if (f.bad())
+            continue; // mid-read I/O error — fail closed rather than tokenize a
+                      // truncated tail (parity with read_proc in tar_perf.cpp)
+        if (auto pc = parse_linux_pid_stat(pid, content, clk, page))
+            snap.procs.push_back(std::move(*pc));
+    }
+    snap.ncores = static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN));
+    snap.valid = snap.ncores > 0 && !snap.procs.empty();
+    return snap;
+}
+
+// Linux emits version="" — there is no handle-free on-disk version source
+// wired yet (ELF .note.package is the documented follow-up; see the
+// os-capability-matrix per-app file-version row). Leave the cache untouched.
+void resolve_proc_versions(std::vector<ProcPerfSample>& /*samples*/,
+                           std::unordered_map<std::uint64_t, std::string>& /*cache*/) {}
+
+} // namespace yuzu::tar
+
+#else // !_WIN32 && !__linux__ — macOS (proc_pid_rusage) is kPlanned
 
 #include <ctime>
 
@@ -376,7 +647,7 @@ ProcSnapshot read_proc_counters() {
     return snap; // valid=false — collect_perf records nothing on this platform yet
 }
 
-// No per-process version source yet (the Linux/macOS per-app collectors are
+// No per-process version source yet (the macOS per-app collector is
 // kPlanned). Leave every version "" without touching the cache.
 void resolve_proc_versions(std::vector<ProcPerfSample>& /*samples*/,
                            std::unordered_map<std::uint64_t, std::string>& /*cache*/) {}

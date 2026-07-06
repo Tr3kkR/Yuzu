@@ -50,12 +50,39 @@ struct IdTokenClaims {
     int64_t iat{0};
     int64_t nbf{0}; // not-before (RFC 7519 §4.1.5); 0 = absent
     std::vector<std::string> groups; // Entra security group object IDs
+    /// True iff the token payload actually contained a `groups` key (even an
+    /// empty array). Distinguishes "IdP asserted zero groups" (a genuine
+    /// deprovisioning event) from "IdP omitted the claim" — Entra drops
+    /// `groups` entirely once a user belongs to more groups than fit in the
+    /// token and sends a `_claim_names`/`_claim_sources` overage pointer
+    /// instead (see `groups_overage`). `reconcile_idp_memberships` MUST NOT
+    /// run against an empty `groups` vector unless this is true, or a
+    /// heavily-grouped legitimate user gets every IdP-sourced RBAC
+    /// membership silently deleted on next login (governance UP-1).
+    bool groups_claim_present{false};
+    /// True when the token carries Entra/Graph group-overage indicators — a
+    /// `_claim_names` object with a `"groups"` entry and/or a
+    /// `_claim_sources` object — meaning the IdP could NOT fit the user's
+    /// full group membership in the token. `claims.groups` is therefore
+    /// partial/absent, never authoritative, for this login.
+    bool groups_overage{false};
     /// RFC 8176 Authentication Method Reference values asserted by the IdP
     /// (Entra adds the non-standard "mfa" value). Parsed so /auth/callback
     /// can seed the session's MFA-verified timestamp when the IdP attests a
     /// multi-factor login. Empty when the IdP omits the claim.
     std::vector<std::string> amr;
 };
+
+/// True when `claims.groups` is safe to reconcile against the RBAC store as
+/// the user's COMPLETE asserted group set for this login (upsert asserted +
+/// DELETE everything else under that source). False when the IdP omitted the
+/// `groups` claim or replaced it with an overage pointer — in either case the
+/// caller must SKIP reconciliation entirely (leave existing memberships
+/// untouched) rather than treat an unreadable claim as "the user is in zero
+/// groups". Mirrors the `amr_asserts_mfa` free-function pattern
+/// (`mfa_step_up.hpp`) so the decision is unit-testable without a live route
+/// harness. Governance UP-1 (#1832 hardening round).
+[[nodiscard]] bool groups_claim_reconcilable(const IdTokenClaims& claims);
 
 /// Cached JWK public key for JWT signature verification.
 struct CachedJwk {

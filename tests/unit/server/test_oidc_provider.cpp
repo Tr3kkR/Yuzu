@@ -159,6 +159,129 @@ TEST_CASE("OIDC: amr absent leaves the vector empty", "[oidc][amr]") {
     CHECK(result->amr.empty());
 }
 
+// ── groups claim / group-overage (UP-1) ─────────────────────────────────────
+
+TEST_CASE("OIDC: groups claim present and non-empty", "[oidc][groups]") {
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["g1", "g2"]
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    REQUIRE(result->groups.size() == 2);
+    CHECK(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: groups claim present but empty — genuine deprovisioning assertion",
+         "[oidc][groups]") {
+    // Distinct from "claim absent": the IdP explicitly asserts the user is
+    // in ZERO groups (e.g. every group membership was removed). This MUST
+    // be reconcilable — it's what makes deprovisioning propagate.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": []
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: groups claim absent (no overage pointer either)", "[oidc][groups]") {
+    // A plain IdP that simply never emits a `groups` claim — not the same as
+    // the Entra overage case, but must be treated identically by the
+    // caller: unreconcilable (don't run a destructive reconcile against an
+    // absent claim).
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK_FALSE(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: Entra group overage via _claim_names/_claim_sources (UP-1)",
+         "[oidc][groups]") {
+    // Real Entra shape: `groups` is OMITTED and replaced by an indirection
+    // pointer once the user is in more groups than fit in the token.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "_claim_names": {"groups": "src1"},
+        "_claim_sources": {
+            "src1": {
+                "endpoint": "https://graph.microsoft.com/v1.0/users/user123/getMemberObjects"
+            }
+        }
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->groups_claim_present);
+    CHECK(result->groups_overage);
+    CHECK(result->groups.empty());
+    CHECK_FALSE(groups_claim_reconcilable(*result));
+}
+
+TEST_CASE("OIDC: non-groups overage does NOT flag groups overage (precision)",
+         "[oidc][groups]") {
+    // A `_claim_sources` / `_claim_names` naming some OTHER overaged claim
+    // (here `roles`) must NOT suppress a genuine groups deprovision: an
+    // authoritative, present `groups` array alongside a roles-overage pointer
+    // is still reconcilable. Keying overage on `_claim_names.groups` avoids the
+    // over-conservative skip flagged in the #1832 hardening security re-review.
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["gid-a"],
+        "_claim_names": {"roles": "src1"},
+        "_claim_sources": {"src1": {"endpoint": "https://graph.microsoft.com/..."}}
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(groups_claim_reconcilable(*result));  // groups authoritative -> reconcile runs
+}
+
+TEST_CASE("OIDC: an unrelated _claim_names entry does not flag groups overage",
+         "[oidc][groups]") {
+    // Only a `groups` key inside `_claim_names` counts — some IdPs use the
+    // same indirection mechanism for other overaged claims (e.g. `roles`).
+    auto jwt = make_test_jwt(R"({
+        "sub": "user123",
+        "iss": "https://issuer",
+        "nonce": "n",
+        "exp": 9999999999,
+        "groups": ["g1"],
+        "_claim_names": {"roles": "src1"}
+    })");
+    auto result = OidcProvider::parse_id_token(jwt);
+    REQUIRE(result.has_value());
+    CHECK(result->groups_claim_present);
+    CHECK_FALSE(result->groups_overage);
+    CHECK(groups_claim_reconcilable(*result));
+}
+
 TEST_CASE("OIDC: malformed iat/exp/sub do not throw (sec-M1 type-guard)", "[oidc][amr]") {
     // A signature-valid token whose iat is a JSON string, or sub is a
     // number, must NOT throw an uncaught nlohmann type_error out of
@@ -239,6 +362,7 @@ TEST_CASE("OIDC: validate_claims — valid", "[oidc]") {
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "test-nonce";
     claims.exp = std::chrono::duration_cast<std::chrono::seconds>(
                      std::chrono::system_clock::now().time_since_epoch())
@@ -261,6 +385,7 @@ TEST_CASE("OIDC: validate_claims — missing exp is rejected (Gate 8)", "[oidc]"
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "test-nonce";
     claims.exp = 0; // missing/invalid
 
@@ -281,6 +406,7 @@ TEST_CASE("OIDC: validate_claims — future iat is rejected (Hermes A1)", "[oidc
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "n";
     claims.exp = now + 3600;
     claims.iat = now + 7200; // 2h in the future, well past clock skew
@@ -306,6 +432,7 @@ TEST_CASE("OIDC: validate_claims — iat within clock-skew window is accepted (U
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "n";
     claims.exp = now + 3600;
     claims.iat = now + 120; // 2 min ahead — within the 300 s tolerance
@@ -325,6 +452,7 @@ TEST_CASE("OIDC: validate_claims — nbf in the past is accepted", "[oidc][amr]"
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "n";
     claims.exp = now + 3600;
     claims.iat = now;
@@ -345,6 +473,7 @@ TEST_CASE("OIDC: validate_claims — nbf in the future is rejected (Hermes A3)",
     IdTokenClaims claims;
     claims.iss = "https://issuer";
     claims.aud = "my-client";
+    claims.sub = "user-123";
     claims.nonce = "n";
     claims.exp = now + 3600;
     claims.iat = now;
@@ -398,6 +527,7 @@ TEST_CASE("OIDC: validate_claims — expired token", "[oidc]") {
     IdTokenClaims claims;
     claims.iss = "https://iss";
     claims.aud = "c";
+    claims.sub = "user-123";
     claims.nonce = "n";
     claims.exp = 1000000000; // long expired
 
@@ -415,12 +545,119 @@ TEST_CASE("OIDC: validate_claims — wrong nonce", "[oidc]") {
     IdTokenClaims claims;
     claims.iss = "https://iss";
     claims.aud = "c";
+    claims.sub = "user-123";
     claims.nonce = "actual";
     claims.exp = 9999999999;
 
     auto result = provider.validate_claims(claims, "expected");
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("nonce mismatch") != std::string::npos);
+}
+
+// ── sub validation (#1837 governance follow-up) ─────────────────────────────
+//
+// `sub` is the authorization-load-bearing half of the stable RBAC principal
+// `oidc:<iss>#<sub>` (auth_routes.cpp /auth/callback). A degenerate/hostile
+// `sub` must never reach that construction — validate_claims is the single
+// chokepoint that already rejects iss/aud/exp/nonce mismatches, so the sub
+// checks live there too (fail-closed: no session minted).
+
+TEST_CASE("OIDC: validate_claims — missing sub is rejected", "[oidc][sub]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+    // claims.sub left at its default-constructed empty string — mirrors
+    // parse_id_token's behaviour when the IdP token omits `sub` or sends a
+    // non-string value.
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("sub") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — sub containing a control/newline char is rejected",
+          "[oidc][sub]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user\n123"; // would corrupt the audit `principal` column
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("sub") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — over-length sub is rejected", "[oidc][sub]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = std::string(256, 'a'); // 1 over the 255-char cap
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("sub") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — a 255-char sub is accepted (boundary)", "[oidc][sub]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = std::string(255, 'a'); // exactly the cap
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — two tokens with empty sub are BOTH rejected, "
+          "never collapsed onto the same principal",
+          "[oidc][sub]") {
+    // Regression guard for the exact hazard this validation closes: before
+    // this check, two distinct users whose IdP omitted `sub` would both
+    // build the principal `oidc:<iss>#` and collapse onto one RBAC identity.
+    // Now neither login succeeds — there is no session to collapse.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims_a;
+    claims_a.iss = "https://issuer";
+    claims_a.aud = "my-client";
+    claims_a.nonce = "n";
+    claims_a.exp = 9999999999;
+    // sub left empty — "user A"
+
+    IdTokenClaims claims_b = claims_a; // sub left empty — "user B" too
+
+    CHECK_FALSE(provider.validate_claims(claims_a, "n").has_value());
+    CHECK_FALSE(provider.validate_claims(claims_b, "n").has_value());
 }
 
 // ── Auth flow ────────────────────────────────────────────────────────────────

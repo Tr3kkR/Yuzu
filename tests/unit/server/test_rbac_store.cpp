@@ -7,15 +7,19 @@
  */
 
 #include "management_group_store.hpp"
+#include "migration_runner.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -417,6 +421,439 @@ TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
 
     auto members = store.get_group_members("temp");
     CHECK(members.empty());
+}
+
+// ── IdP membership reconciliation (#1832) ───────────────────────────────────
+
+TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store]") {
+    CHECK(namespaced_group_name("entra", "abc-123") == "entra:abc-123");
+    CHECK(namespaced_group_name("saml", "g1") == "saml:g1");
+    // 'local' is NOT namespaced.
+    CHECK(namespaced_group_name("local", "raw-name") == "raw-name");
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships namespacing prevents confused deputy",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    // A LOCAL group named "admins" already carries a role.
+    store.create_group({"admins", "Local admins", "local", "", 0});
+    REQUIRE(store.assign_role({"group", "admins", "Operator"}).has_value());
+
+    // The IdP asserts a group with the SAME raw id "admins" for carol.
+    auto reconciled = store.reconcile_idp_memberships("carol", "entra", {{"admins", "Admins"}});
+    REQUIRE(reconciled.has_value());
+
+    // carol must NOT inherit the local group's role via the same-named IdP
+    // group — she landed in "entra:admins", a distinct row with no role
+    // assignment of its own yet.
+    CHECK_FALSE(store.check_permission("carol", "Execution", "Execute"));
+
+    // The local group's membership is never touched by reconcile.
+    auto local_members = store.get_group_members("admins");
+    CHECK(local_members.empty());
+
+    // Assigning the role to the NAMESPACED group (the correct, explicit
+    // grant an operator would make) is what it takes for carol to get it —
+    // proving namespacing, not raw-name collision, decides the outcome.
+    REQUIRE(store.assign_role({"group", "entra:admins", "Operator"}).has_value());
+    CHECK(store.check_permission("carol", "Execution", "Execute"));
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships add/remove diff", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    REQUIRE(store.reconcile_idp_memberships("dave", "entra", {{"A", "A"}, {"B", "B"}})
+                .has_value());
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"dave"});
+    CHECK(store.get_group_members("entra:B") == std::vector<std::string>{"dave"});
+
+    // A separately-added LOCAL membership must survive every reconcile.
+    store.create_group({"crew", "", "local", "", 0});
+    store.add_group_member("crew", "dave");
+
+    // Re-login only asserts A now — B must be dropped.
+    REQUIRE(store.reconcile_idp_memberships("dave", "entra", {{"A", "A"}}).has_value());
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"dave"});
+    CHECK(store.get_group_members("entra:B").empty());
+    CHECK(store.get_group_members("crew") == std::vector<std::string>{"dave"});
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships empty asserted removes only that source",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {{"A", "A"}}).has_value());
+    REQUIRE(store.reconcile_idp_memberships("erin", "saml", {{"S1", "S1"}}).has_value());
+    store.create_group({"local-crew", "", "local", "", 0});
+    store.add_group_member("local-crew", "erin");
+
+    // Next SSO login asserts NO groups at all — full deprovisioning.
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {}).has_value());
+
+    CHECK(store.get_group_members("entra:A").empty());
+    // Untouched: a different source, and a local group.
+    CHECK(store.get_group_members("saml:S1") == std::vector<std::string>{"erin"});
+    CHECK(store.get_group_members("local-crew") == std::vector<std::string>{"erin"});
+}
+
+// qa-S1: the row-presence assertions above prove the DELETE didn't touch the
+// local group's *membership table row*, but the invariant that actually
+// matters is the permission it grants. Attach a role to the LOCAL group and
+// prove check_permission is bit-for-bit unchanged before and after an
+// empty-asserted (full-deprovisioning) reconcile — this is what would catch
+// a future regression that widens the stale-membership DELETE's scoping
+// (e.g. a refactor that drops the `group_name IN (SELECT name FROM groups
+// WHERE source = ?)` clause) even if row-presence checks were accidentally
+// preserved.
+TEST_CASE("RbacStore: empty-asserted reconcile cannot strip a local role grant",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    store.create_group({"local-crew", "", "local", "", 0});
+    store.add_group_member("local-crew", "erin");
+    REQUIRE(store.assign_role({"group", "local-crew", "Operator"}).has_value());
+
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {{"A", "A"}}).has_value());
+
+    // Baseline: erin holds Operator permissions via the local group.
+    REQUIRE(store.check_permission("erin", "Execution", "Execute"));
+    REQUIRE(store.check_permission("erin", "Tag", "Write"));
+    REQUIRE_FALSE(store.check_permission("erin", "Infrastructure", "Write"));
+
+    // Full deprovisioning of the 'entra' source — asserts NO groups at all.
+    REQUIRE(store.reconcile_idp_memberships("erin", "entra", {}).has_value());
+
+    // The local role grant must be bit-for-bit unchanged.
+    CHECK(store.check_permission("erin", "Execution", "Execute"));
+    CHECK(store.check_permission("erin", "Tag", "Write"));
+    CHECK_FALSE(store.check_permission("erin", "Infrastructure", "Write"));
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships enforces the group-count cap", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    std::vector<std::pair<std::string, std::string>> asserted;
+    asserted.reserve(RbacStore::kMaxIdpGroupsPerLogin + 1);
+    for (size_t i = 0; i <= RbacStore::kMaxIdpGroupsPerLogin; ++i)
+        asserted.emplace_back("g" + std::to_string(i), "g" + std::to_string(i));
+
+    auto result = store.reconcile_idp_memberships("frank", "entra", asserted);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "group_count_exceeded");
+
+    // No mutation on rejection.
+    CHECK(store.list_groups().empty());
+    CHECK(store.get_group_members("entra:g0").empty());
+}
+
+// qa-S3: exactly the cap boundary succeeds — only `> kMaxIdpGroupsPerLogin`
+// is rejected, not `==`.
+TEST_CASE("RbacStore: reconcile_idp_memberships accepts exactly the group-count cap",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    std::vector<std::pair<std::string, std::string>> asserted;
+    asserted.reserve(RbacStore::kMaxIdpGroupsPerLogin);
+    for (size_t i = 0; i < RbacStore::kMaxIdpGroupsPerLogin; ++i)
+        asserted.emplace_back("g" + std::to_string(i), "g" + std::to_string(i));
+
+    auto result = store.reconcile_idp_memberships("frank2", "entra", asserted);
+    REQUIRE(result.has_value());
+    CHECK(result->added == RbacStore::kMaxIdpGroupsPerLogin);
+    CHECK(store.get_group_members("entra:g0") == std::vector<std::string>{"frank2"});
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships is idempotent", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    std::vector<std::pair<std::string, std::string>> asserted = {{"A", "A"}, {"B", "B"}};
+    REQUIRE(store.reconcile_idp_memberships("gina", "entra", asserted).has_value());
+    REQUIRE(store.reconcile_idp_memberships("gina", "entra", asserted).has_value());
+
+    CHECK(store.get_group_members("entra:A") == std::vector<std::string>{"gina"});
+    CHECK(store.get_group_members("entra:B") == std::vector<std::string>{"gina"});
+    CHECK(store.list_groups().size() == 2);
+}
+
+// comp-S2/cons-S3: the {added, removed} counts a caller uses to decide
+// whether to write a provisioning audit row.
+TEST_CASE("RbacStore: reconcile_idp_memberships reports added/removed counts",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    auto first = store.reconcile_idp_memberships("hank", "entra", {{"A", "A"}, {"B", "B"}});
+    REQUIRE(first.has_value());
+    CHECK(first->added == 2);
+    CHECK(first->removed == 0);
+
+    // No-op re-login: same asserted set, nothing added or removed.
+    auto noop = store.reconcile_idp_memberships("hank", "entra", {{"A", "A"}, {"B", "B"}});
+    REQUIRE(noop.has_value());
+    CHECK(noop->added == 0);
+    CHECK(noop->removed == 0);
+
+    // Drop B, add C: one added, one removed.
+    auto diff = store.reconcile_idp_memberships("hank", "entra", {{"A", "A"}, {"C", "C"}});
+    REQUIRE(diff.has_value());
+    CHECK(diff->added == 1);
+    CHECK(diff->removed == 1);
+}
+
+// UP-6: reconcile_idp_memberships must never accept "local" (or an empty
+// string) as `source` — the stale-membership DELETE it runs is scoped to
+// `groups.source = ?` and is only safe for an IdP source. A miswired call
+// with "local" would mass-delete local group memberships fleet-wide.
+TEST_CASE("RbacStore: reconcile_idp_memberships rejects source=='local'", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    store.create_group({"crew", "", "local", "", 0});
+    store.add_group_member("crew", "ivan");
+    REQUIRE(store.assign_role({"group", "crew", "Operator"}).has_value());
+
+    auto result = store.reconcile_idp_memberships("ivan", "local", {{"crew", "crew"}});
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+
+    // No mutation: the local membership and its role grant survive.
+    CHECK(store.get_group_members("crew") == std::vector<std::string>{"ivan"});
+    CHECK(store.check_permission("ivan", "Execution", "Execute"));
+}
+
+TEST_CASE("RbacStore: reconcile_idp_memberships rejects an empty source", "[rbac_store]") {
+    RbacStore store(":memory:");
+    auto result = store.reconcile_idp_memberships("ivan", "", {{"g", "g"}});
+    REQUIRE_FALSE(result.has_value());
+}
+
+// sec-L1: a group row that pre-exists with a DIFFERENT source than this
+// reconcile call (e.g. a local group literally named `entra:x`, created
+// before the create_group reserved-prefix guard existed, or by direct DB
+// manipulation) must never be joined — that would leak whatever roles are
+// granted to the pre-existing group to the IdP-authenticated user.
+TEST_CASE("RbacStore: reconcile_idp_memberships does not join a pre-existing "
+         "differently-sourced group",
+         "[rbac_store]") {
+    // The `create_group` reserved-prefix guard means a source='local' create
+    // named "entra:x" can no longer be made through the public API — which
+    // is exactly the point of this scenario: a row like this can only exist
+    // as a LEGACY artifact from before the guard shipped (or direct DB
+    // manipulation). Seed it by bypassing the app layer, the same way a real
+    // pre-upgrade deployment's data would.
+    const auto path = yuzu::test::unique_temp_path("rbac-secl1-");
+    {
+        RbacStore seed(path); // creates schema + seed_defaults
+        REQUIRE(seed.is_open());
+    }
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        REQUIRE(sqlite3_exec(db,
+                             "INSERT INTO groups (name, description, source, external_id, "
+                             "created_at) VALUES ('entra:x', 'Local admins', 'local', '', 100);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+
+    {
+        RbacStore store(path);
+        REQUIRE(store.is_open());
+        REQUIRE(store.assign_role({"group", "entra:x", "Administrator"}).has_value());
+
+        auto reconciled = store.reconcile_idp_memberships("judy", "entra", {{"x", "x"}});
+        REQUIRE(reconciled.has_value());
+        CHECK(reconciled->added == 0); // the join was skipped, not counted as added
+
+        // judy must NOT be a member of the pre-existing local group, and must
+        // NOT inherit its Administrator role.
+        CHECK(store.get_group_members("entra:x").empty());
+        CHECK_FALSE(store.check_permission("judy", "Infrastructure", "Write"));
+    } // close `store` before deleting the file — Windows cannot remove an open
+      // file (Linux unlinks it lazily), and the throwing remove() overload would
+      // otherwise fail this test on MSVC. Use the non-throwing overload for cleanup.
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
+    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
+}
+
+// UP-9: an asserted entry with a blank/whitespace-only external_id must be
+// skipped, never turned into a garbage `entra:` / `entra:   ` group.
+TEST_CASE("RbacStore: reconcile_idp_memberships skips blank external_id", "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    auto reconciled =
+        store.reconcile_idp_memberships("karen", "entra", {{"", "Empty"}, {"   ", "Blank"},
+                                                            {"real-id", "Real"}});
+    REQUIRE(reconciled.has_value());
+    CHECK(reconciled->added == 1);
+
+    CHECK(store.get_group_members("entra:real-id") == std::vector<std::string>{"karen"});
+    CHECK(store.get_group_members("entra:").empty());
+    // No group was created for the blank/whitespace entries.
+    auto groups = store.list_groups();
+    CHECK(groups.size() == 1);
+    CHECK(groups[0].name == "entra:real-id");
+}
+
+TEST_CASE("RbacStore: create_group rejects a local group with a reserved IdP prefix",
+         "[rbac_store]") {
+    RbacStore store(":memory:");
+
+    auto local_collision = store.create_group({"entra:x", "", "local", "", 0});
+    REQUIRE_FALSE(local_collision.has_value());
+
+    // Every reserved prefix is covered.
+    CHECK_FALSE(store.create_group({"saml:x", "", "local", "", 0}).has_value());
+    CHECK_FALSE(store.create_group({"ad:x", "", "local", "", 0}).has_value());
+    CHECK_FALSE(store.create_group({"local:x", "", "local", "", 0}).has_value());
+
+    // An IdP-sourced create of the SAME name is exempt from the guard.
+    auto idp_create = store.create_group({"entra:x", "", "entra", "x", 0});
+    CHECK(idp_create.has_value());
+
+    // A local group whose name merely CONTAINS (not starts with) a reserved
+    // token is fine — only the leading `prefix:` is reserved.
+    CHECK(store.create_group({"my-entra:team", "", "local", "", 0}).has_value());
+}
+
+// qa-S2: a store on disk at schema v1 (pre-#1832) migrates cleanly to v2 —
+// idx_groups_source + idx_group_members_username get created and existing
+// rows survive. Mirrors the `test_migration_runner.cpp` adoption-scenario
+// pattern: seed a v1-only schema directly with the runner, insert data,
+// close, then reopen through the real RbacStore constructor (which always
+// runs the FULL migration list) and check both the schema and the data.
+namespace {
+bool index_exists(sqlite3* db, const char* name) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?;", -1,
+                           &stmt, nullptr) != SQLITE_OK)
+        return false;
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+} // namespace
+
+TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
+         "[rbac_store][migration]") {
+    const auto path = yuzu::test::unique_temp_path("rbac-migration-");
+
+    // v1-only migration list — exactly rbac_store's historical v1 schema,
+    // duplicated here (not `#include`d from rbac_store.cpp) so this test
+    // fails loudly if a future edit changes v1's shape without updating
+    // this fixture, rather than silently drifting.
+    static const std::vector<yuzu::server::Migration> kV1Only = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS securable_types (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS operations (
+                id          TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
+                operation       TEXT NOT NULL REFERENCES operations(id),
+                effect          TEXT NOT NULL DEFAULT 'allow',
+                PRIMARY KEY (role_name, securable_type, operation)
+            );
+            CREATE TABLE IF NOT EXISTS principal_roles (
+                principal_type  TEXT NOT NULL,
+                principal_id    TEXT NOT NULL,
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                PRIMARY KEY (principal_type, principal_id, role_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
+                ON principal_roles(principal_type, principal_id);
+            CREATE TABLE IF NOT EXISTS groups (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                source      TEXT NOT NULL DEFAULT 'local',
+                external_id TEXT,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+                username    TEXT NOT NULL,
+                PRIMARY KEY (group_name, username)
+            );
+            CREATE TABLE IF NOT EXISTS rbac_config (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            );
+        )"},
+    };
+
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(yuzu::server::MigrationRunner::run(db, "rbac_store", kV1Only));
+        REQUIRE(yuzu::server::MigrationRunner::current_version(db, "rbac_store") == 1);
+        REQUIRE_FALSE(index_exists(db, "idx_groups_source"));
+        REQUIRE_FALSE(index_exists(db, "idx_group_members_username"));
+
+        // Seed data that must survive the upgrade. Deliberately a LOCAL
+        // group/membership, not an IdP-sourced one (#1837 v3 legitimately
+        // purges IdP-sourced group_members — that behavior is covered by
+        // its own dedicated migration test in test_oidc_principal_key.cpp;
+        // this test's purpose is unrelated generic data survival across the
+        // rest of the migration ladder).
+        sqlite3_exec(db,
+                    "INSERT INTO groups (name, description, source, external_id, created_at) "
+                    "VALUES ('seed-team', 'seed', 'local', '', 100);"
+                    "INSERT INTO group_members (group_name, username) VALUES ('seed-team', 'leo');"
+                    "INSERT INTO roles (name, description, is_system, created_at) "
+                    "VALUES ('Custom', 'seed role', 0, 100);",
+                    nullptr, nullptr, nullptr);
+        sqlite3_close(db);
+    }
+
+    // Reopen through the production constructor — runs the FULL migration
+    // list (v1 adoption no-op + v2 index creation + v3 no-op for local
+    // groups) and seed_defaults().
+    {
+        RbacStore store(path);
+        REQUIRE(store.is_open());
+
+        // Pre-existing data preserved.
+        auto groups = store.list_groups();
+        auto found = std::find_if(groups.begin(), groups.end(),
+                                  [](const RbacGroup& g) { return g.name == "seed-team"; });
+        REQUIRE(found != groups.end());
+        CHECK(found->source == "local");
+        CHECK(store.get_group_members("seed-team") == std::vector<std::string>{"leo"});
+        CHECK(store.get_role("Custom").has_value());
+
+        // v2 index creation — the store's own connection isn't reachable
+        // from the test, so open a second raw connection on the same file
+        // to inspect sqlite_master (WAL-mode readers see committed schema
+        // changes from another connection on the same file).
+        sqlite3* verify_db = nullptr;
+        REQUIRE(sqlite3_open_v2(path.string().c_str(), &verify_db, SQLITE_OPEN_READONLY,
+                                nullptr) == SQLITE_OK);
+        CHECK(index_exists(verify_db, "idx_groups_source"));
+        CHECK(index_exists(verify_db, "idx_group_members_username"));
+        sqlite3_close(verify_db);
+    }
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"));
+    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"));
 }
 
 // ── ITServiceOwner role ──────────────────────────────────────────────────────

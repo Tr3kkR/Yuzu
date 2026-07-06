@@ -1,5 +1,14 @@
 # Security review — JIT admin elevation (SOC 2 CC6.3/CC6.6)
 
+> ⚠️ **Superseded in part by #1837/#1857 (OIDC principal re-key).** The OIDC-amr
+> elevation portions of this review are **temporarily inactive**: an OIDC session
+> is now keyed on the immutable `oidc:<iss>#<sub>` principal, which has no local
+> `users` row, so it is denied JIT elevation at the eligibility gate (the
+> OIDC-amr second-factor branch is retained but unreachable-for-success). The
+> OIDC-amr test cases cited below were replaced with severance tests on the
+> #1857 branch; local-session JIT elevation is unchanged. Restoration of OIDC
+> elevation against the stable principal is tracked in **#1852**.
+
 **Date:** 2026-06-30
 **Change:** Just-in-time admin elevation — a pre-authorized operator activates a
 time-boxed, justified, MFA-gated admin window via `POST /api/v1/elevate`, then

@@ -39,6 +39,7 @@
 #include "update_registry.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -387,6 +388,111 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: duplicate username rejected"
     // The original password must still authenticate — the rejection must
     // not have run upsert_user under the hood.
     CHECK(h.auth_mgr.authenticate("bob", "bobpassword12").has_value());
+}
+
+// ── Reserved SSO-principal prefix guard (#1837 governance follow-up) ───────
+//
+// A local user literally named `oidc:<iss>#<sub>` would re-open the severed
+// elevation-borrow (that local `users` row would supply the eligibility/TOTP
+// the SSO principal lacks). `is_valid_username`'s pre-existing ':' rejection
+// already makes the exact stable-principal string unconstructable as a local
+// username — this test exercises that outcome end-to-end through the create
+// route (colon survives URL-decoding intact, exercising the same branch as
+// the "$bogus" invalid-username test above).
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: oidc-namespaced username rejected",
+          "[settings][users][reserved-prefix]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // "oidc:x#y" percent-encoded so url_decode reconstructs the literal
+    // colon/hash bytes in the handler.
+    auto res = h.Post("/api/settings/users",
+                        "username=oidc%3Ax%23y&password=newuserpassword&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK_FALSE(h.has_user("oidc:x#y"));
+}
+
+// Direct unit coverage of the new reserved-prefix helper itself: the route-
+// level test above is preempted by is_valid_username's ':' rejection before
+// ever reaching is_reserved_identity_prefix, so it does not exercise the new
+// logic. These pin the helper's contract directly (case-insensitivity,
+// prefix-only matching, and that it does not false-positive on ordinary
+// usernames that merely start with the same letters).
+TEST_CASE("is_reserved_identity_prefix: rejects oidc:/saml:/ad: case-insensitively",
+          "[settings][users][reserved-prefix]") {
+    CHECK(is_reserved_identity_prefix("oidc:whatever"));
+    CHECK(is_reserved_identity_prefix("OIDC:Whatever"));
+    CHECK(is_reserved_identity_prefix("saml:whatever"));
+    CHECK(is_reserved_identity_prefix("SaMl:whatever"));
+    CHECK(is_reserved_identity_prefix("ad:whatever"));
+    CHECK(is_reserved_identity_prefix("AD:whatever"));
+}
+
+TEST_CASE("is_reserved_identity_prefix: does not false-positive on ordinary usernames",
+          "[settings][users][reserved-prefix]") {
+    CHECK_FALSE(is_reserved_identity_prefix("bob"));
+    CHECK_FALSE(is_reserved_identity_prefix("admin"));
+    // Starts with the same letters but no colon — not a namespaced principal.
+    CHECK_FALSE(is_reserved_identity_prefix("adam"));
+    CHECK_FALSE(is_reserved_identity_prefix("oidcuser"));
+    CHECK_FALSE(is_reserved_identity_prefix(""));
+}
+
+// ── is_valid_principal (#1852 durable SSO identity) ─────────────────────────
+//
+// A strict superset of is_valid_username: every string the strict validator
+// accepts is accepted unchanged, and a reserved-prefixed SSO principal is
+// ADDITIONALLY accepted after a narrow control-byte/metacharacter blocklist.
+// Used ONLY at target-lookup chokepoints for an EXISTING user (elevation
+// eligibility, session revoke) — never at user-creation, which stays on
+// is_valid_username (+ is_reserved_identity_prefix).
+
+TEST_CASE("is_valid_principal: accepts a well-formed OIDC/SAML stable principal",
+          "[settings][users][principal]") {
+    CHECK(is_valid_principal("oidc:https://idp.example.com/#sub-123"));
+    CHECK(is_valid_principal("saml:https://idp.example.com/metadata#user@example.com"));
+    CHECK(is_valid_principal("ad:corp.example.com#S-1-5-21-123"));
+    // Opaque sub alphabets a real IdP may emit: URL path segments, tildes,
+    // percent-encoding, pipe-separated composite subs.
+    CHECK(is_valid_principal("oidc:https://idp/#a~b%20c|d"));
+}
+
+TEST_CASE("is_valid_principal: still accepts a strict local username unchanged",
+          "[settings][users][principal]") {
+    CHECK(is_valid_principal("bob"));
+    CHECK(is_valid_principal("admin"));
+    CHECK(is_valid_principal("alice.smith-1_2"));
+    CHECK_FALSE(is_valid_principal("")); // is_valid_username already rejects; no prefix either
+}
+
+TEST_CASE("is_valid_principal: rejects a bad-prefix string that is also not a strict username",
+          "[settings][users][principal]") {
+    // Contains ':' (fails is_valid_username) but not a reserved prefix.
+    CHECK_FALSE(is_valid_principal("notreserved:whatever"));
+    CHECK_FALSE(is_valid_principal("http://evil.example/#sub"));
+}
+
+TEST_CASE("is_valid_principal: rejects control bytes, injection metacharacters, and space",
+          "[settings][users][principal]") {
+    CHECK_FALSE(is_valid_principal(std::string("oidc:https://idp/#sub\x01")));
+    CHECK_FALSE(is_valid_principal(std::string("oidc:https://idp/#sub\x7F")));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\nwith-newline"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub;DROP TABLE users"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub=malicious"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\\backslash"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub'quote"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub\"dquote"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub`backtick"));
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub with space"));
+}
+
+TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][users][principal]") {
+    std::string long_sub(300, 'a');
+    CHECK_FALSE(is_valid_principal("oidc:https://idp/#" + long_sub));
 }
 
 // ── Weak-password guard — UAT-reported silent fail ─────────────────────────

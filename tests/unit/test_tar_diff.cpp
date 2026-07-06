@@ -588,3 +588,76 @@ TEST_CASE("DNS diff: TTL decrement on same resolution is not churn", "[tar][diff
     std::vector<DnsEntry> cur = {{"example.com", "A", "93.184.216.34", 30, "cache"}};
     CHECK(compute_dns_events(prev, cur, 100, 1).empty());
 }
+
+// =============================================================================
+// Mapped-drive diff tests (§3.8) — keyed on (direction, local_mount,
+// remote_path, remote_host, username); provider is value-only.
+// MapDriveEntry field order: {direction, local_mount, remote_path, remote_host,
+// username, provider}.
+// =============================================================================
+
+TEST_CASE("mapdrive diff: outbound appeared and removed", "[tar][diff][mapdrive]") {
+    std::vector<MapDriveEntry> prev = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB"}};
+    std::vector<MapDriveEntry> cur = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB"},
+        {"outbound", "Y:", "\\\\nas\\home", "nas", "bob", "SMB"}};
+    auto ev = compute_mapdrive_events(prev, cur, 100, 7);
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0].action == "appeared");
+    CHECK(ev[0].local_mount == "Y:");
+    CHECK(ev[0].direction == "outbound");
+    CHECK(ev[0].origin == "live"); // never blank; historical rows bypass the diff
+    CHECK(ev[0].snapshot_id == 7);
+
+    auto removed = compute_mapdrive_events(cur, prev, 101, 8);
+    REQUIRE(removed.size() == 1);
+    CHECK(removed[0].action == "removed");
+    CHECK(removed[0].local_mount == "Y:");
+    CHECK(removed[0].origin == "live");
+}
+
+TEST_CASE("mapdrive diff: provider change on same mapping is not churn",
+          "[tar][diff][mapdrive]") {
+    std::vector<MapDriveEntry> prev = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB"}};
+    std::vector<MapDriveEntry> cur = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "alice", "WebDAV"}};
+    CHECK(compute_mapdrive_events(prev, cur, 100, 1).empty());
+}
+
+TEST_CASE("mapdrive diff: direction is keyed — outbound and inbound do not collide",
+          "[tar][diff][mapdrive]") {
+    // Same host+user on both sides: an outbound map to `peer` and an inbound
+    // session from `peer` must be two distinct mappings, not a collision.
+    std::vector<MapDriveEntry> prev;
+    std::vector<MapDriveEntry> cur = {
+        {"outbound", "Z:", "\\\\peer\\share", "peer", "alice", "SMB"},
+        {"inbound", "", "", "peer", "alice", "SMB"}};
+    auto ev = compute_mapdrive_events(prev, cur, 100, 1);
+    REQUIRE(ev.size() == 2);
+    CHECK(ev[0].origin == "live");
+    CHECK(ev[1].origin == "live");
+}
+
+TEST_CASE("mapdrive diff: re-credentialed mount is removed + appeared",
+          "[tar][diff][mapdrive]") {
+    // username is keyed: remapping Z: under new creds is a genuine transition —
+    // a single diff yields one appeared (new creds) + one removed (old creds).
+    std::vector<MapDriveEntry> prev = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB"}};
+    std::vector<MapDriveEntry> cur = {
+        {"outbound", "Z:", "\\\\srv\\share", "srv", "bob", "SMB"}};
+    auto ev = compute_mapdrive_events(prev, cur, 100, 1);
+    REQUIRE(ev.size() == 2);
+    bool saw_appeared_bob = false, saw_removed_alice = false;
+    for (const auto& e : ev) {
+        if (e.action == "appeared" && e.username == "bob")
+            saw_appeared_bob = true;
+        if (e.action == "removed" && e.username == "alice")
+            saw_removed_alice = true;
+        CHECK(e.origin == "live");
+    }
+    CHECK(saw_appeared_bob);
+    CHECK(saw_removed_alice);
+}

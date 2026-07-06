@@ -7,6 +7,7 @@
 
 #include "tar_db.hpp"
 #include "tar_netqual.hpp"
+#include "tar_netqual_boot.hpp"
 #include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
 
@@ -14,6 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -954,6 +956,221 @@ TEST_CASE("netqual: select_netqual_rows with cap=0 keeps everything", "[tar][net
     }
     auto rows = select_netqual_rows(samples, 1, 1, /*cap=*/0);
     CHECK(rows.size() == 5);
+}
+
+TEST_CASE("netqual: collect_netqual_boot off-Windows no-op contract", "[tar][netqual]") {
+    // The platform collector itself is NOT driven from a unit test — it reads
+    // live OS counters and belongs to the harness/UAT, matching how the ETW /
+    // ARP / DNS collectors are treated (docs/tar-implementer.md,
+    // test_tar_proc_etw.cpp). Here we pin only the cross-platform contract: off
+    // Windows the collector is a clean nullopt no-op. The row's warehouse
+    // persistence is covered cross-platform by the insert_netqual_boot_row
+    // round-trip test above (hand-built row); the Windows since-boot read is a
+    // UAT concern.
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+#ifndef _WIN32
+    CHECK_FALSE(yuzu::tar::collect_netqual_boot(now).has_value());
+#else
+    (void)now; // Windows since-boot read is exercised by UAT, not here
+#endif
+}
+
+TEST_CASE("TarDatabase: insert_netqual_boot_row round-trips every column",
+          "[tar][store][netqual]") {
+    // Cross-platform (qe-S2): construct the row directly rather than via the
+    // Windows-only collector, so all 13 bindings are exercised on every host.
+    auto t = make_test_db();
+    NetQualBootRow r;
+    r.ts = 1710000000;
+    r.snapshot_id = 55;
+    r.boot_ts = 1709990000;
+    r.window_s = 10000;
+    r.retrans_segs = 42;
+    r.segs_out = 987654;
+    r.estab_resets = 3;
+    r.if_in_errors = 5;
+    r.if_in_discards = 7;
+    r.if_out_errors = 11;
+    r.if_out_discards = 13;
+    r.if_in_octets = 111222333;
+    r.if_out_octets = 444555666;
+    REQUIRE(t.db.insert_netqual_boot_row(r));
+
+    auto res = t.db.execute_query(
+        "SELECT ts, snapshot_id, boot_ts, window_s, retrans_segs, segs_out, estab_resets, "
+        "if_in_errors, if_in_discards, if_out_errors, if_out_discards, if_in_octets, "
+        "if_out_octets FROM netqual_boot");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    const auto& row = res->rows[0];
+    CHECK(row[0] == "1710000000");
+    CHECK(row[1] == "55");
+    CHECK(row[2] == "1709990000");
+    CHECK(row[3] == "10000");
+    CHECK(row[4] == "42");
+    CHECK(row[5] == "987654");
+    CHECK(row[6] == "3");
+    CHECK(row[7] == "5");
+    CHECK(row[8] == "7");
+    CHECK(row[9] == "11");
+    CHECK(row[10] == "13");
+    CHECK(row[11] == "111222333");
+    CHECK(row[12] == "444555666");
+}
+
+TEST_CASE("TarDatabase: insert_netqual_boot_row returns false (no crash) when the table is gone",
+          "[tar][store][netqual]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE netqual_boot").has_value());
+    NetQualBootRow r;
+    r.ts = 1;
+    CHECK_FALSE(t.db.insert_netqual_boot_row(r));
+    REQUIRE(t.db.execute_query("SELECT 1").has_value()); // connection not wedged
+}
+
+TEST_CASE("TarDatabase: insert_netconn_events round-trips every column + empty no-op",
+          "[tar][store][netconn]") {
+    // qe-S1: the netconn insert had zero coverage. Exercise every binding and
+    // the empty-batch success, cross-platform (the row struct is platform-free).
+    auto t = make_test_db();
+    CHECK(t.db.insert_netconn_events({})); // empty batch is a no-op success
+
+    std::vector<NetConnRow> rows;
+    NetConnRow a;
+    a.ts = 1710000100;
+    a.snapshot_id = 9;
+    a.action = "wifi_disconnected";
+    a.channel = "wlan";
+    a.category = "";
+    a.capability = "";
+    a.iface_kind = "wifi";
+    a.reason_code = 229377;
+    rows.push_back(a);
+    NetConnRow b;
+    b.ts = 1710000200;
+    b.snapshot_id = 9;
+    b.action = "capability_changed";
+    b.channel = "ncsi";
+    b.category = "";
+    b.capability = "internet";
+    b.iface_kind = "";
+    b.reason_code = 4;
+    rows.push_back(b);
+    REQUIRE(t.db.insert_netconn_events(rows));
+
+    auto res = t.db.execute_query(
+        "SELECT ts, snapshot_id, action, channel, category, capability, iface_kind, "
+        "reason_code FROM netconn_live ORDER BY ts");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 2);
+    CHECK(res->rows[0][2] == "wifi_disconnected");
+    CHECK(res->rows[0][3] == "wlan");
+    CHECK(res->rows[0][6] == "wifi");
+    CHECK(res->rows[0][7] == "229377");
+    CHECK(res->rows[1][2] == "capability_changed");
+    CHECK(res->rows[1][5] == "internet");
+    CHECK(res->rows[1][7] == "4");
+}
+
+TEST_CASE("TarDatabase: insert_netconn_events returns false (no crash) when the table is gone",
+          "[tar][store][netconn]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_query("DROP TABLE netconn_live").has_value());
+    NetConnRow r;
+    r.ts = 1;
+    r.action = "connected";
+    r.channel = "networkprofile";
+    CHECK_FALSE(t.db.insert_netconn_events({r}));
+    REQUIRE(t.db.execute_query("SELECT 1").has_value());
+}
+
+TEST_CASE("netqual: nq_v6_key includes scope IDs so same-text/different-scope rows are distinct",
+          "[tar][netqual]") {
+    using yuzu::tar::nq_v4_key;
+    using yuzu::tar::nq_v6_key;
+
+    // Two link-local connections with IDENTICAL textual address + port but
+    // different zone (scope) IDs must NOT collide in g_nq_tracked — otherwise
+    // one connection's RTT/retransmit deltas are attributed to the other.
+    const auto a = nq_v6_key("fe80::1", 11, 5000, "fe80::2", 11, 443);
+    const auto b = nq_v6_key("fe80::1", 22, 5000, "fe80::2", 22, 443); // same text, diff scope
+    CHECK(a != b);
+
+    // Identical everything (incl. scope) yields the SAME key (stable tracking).
+    CHECK(nq_v6_key("fe80::1", 11, 5000, "fe80::2", 11, 443) == a);
+
+    // The scope is embedded, not merely appended out of band.
+    CHECK(a == "tcp6|fe80::1%11:5000|fe80::2%11:443");
+
+    // v4 has no scope dimension; the key is proto|laddr:lport|raddr:rport.
+    CHECK(nq_v4_key("10.0.0.1", 5000, "8.8.8.8", 443) == "tcp|10.0.0.1:5000|8.8.8.8:443");
+    // v4 and v6 keys never collide (distinct proto prefixes).
+    CHECK(nq_v4_key("10.0.0.1", 1, "10.0.0.2", 2) != nq_v6_key("10.0.0.1", 0, 1, "10.0.0.2", 0, 2));
+}
+
+TEST_CASE("netqual: nq_win_ca_state severity precedence", "[tar][netqual]") {
+    using yuzu::tar::NqPathDeltas;
+    using yuzu::tar::nq_win_ca_state;
+
+    CHECK(nq_win_ca_state({}) == 0); // no signals => Open
+
+    // Each signal alone maps to its state.
+    CHECK(nq_win_ca_state({.dup_acks_in = 3}) == 1);                      // Disorder
+    CHECK(nq_win_ca_state({.ecn_signals = 1}) == 2);                      // CWR
+    CHECK(nq_win_ca_state({.pkts_retrans = 2}) == 3);                     // Recovery
+    CHECK(nq_win_ca_state({.fast_retran = 1}) == 3);                      // Recovery
+    CHECK(nq_win_ca_state({.timeouts = 1}) == 4);                         // Loss (RTO fired)
+    CHECK(nq_win_ca_state({.cur_timeout_count = 1}) == 4);                // Loss (RTO in progress)
+
+    // Precedence: the most severe signal wins when several fire in one tick.
+    CHECK(nq_win_ca_state({.timeouts = 1, .fast_retran = 5, .pkts_retrans = 9,
+                           .dup_acks_in = 20, .ecn_signals = 2}) == 4);
+    CHECK(nq_win_ca_state({.fast_retran = 1, .dup_acks_in = 20, .ecn_signals = 2}) == 3);
+    CHECK(nq_win_ca_state({.dup_acks_in = 20, .ecn_signals = 2}) == 2);
+}
+
+TEST_CASE("netqual: nq_win_build_sample scales ms->us, deltas lost, clamps wrap",
+          "[tar][netqual]") {
+    using yuzu::tar::NqWinCounters;
+    using yuzu::tar::nq_win_build_sample;
+
+    NqWinCounters prev;
+    prev.pkts_retrans = 10;
+    prev.timeouts = 1;
+    prev.segs_out = 1000;
+
+    NqWinCounters cur;
+    cur.smoothed_rtt_ms = 42;
+    cur.rtt_var_ms = 7;
+    cur.pkts_retrans = 14; // +4 this tick
+    cur.timeouts = 1;      // unchanged
+    cur.segs_out = 5000;
+
+    auto s = nq_win_build_sample(cur, prev, "tcp", "203.0.113.9", "edge");
+    CHECK(s.proto == "tcp");
+    CHECK(s.remote_addr == "203.0.113.9"); // raw here — select_netqual_rows buckets it away
+    CHECK(s.process_name == "edge");
+    CHECK(s.rtt_us == 42000); // ESTATS ms -> schema µs
+    CHECK(s.rtt_var_us == 7000);
+    CHECK(s.lost == 4);       // delta, not cumulative
+    CHECK(s.retrans == 14);   // cumulative since stats-enable — context
+    CHECK(s.segs_out == 5000);
+    CHECK(s.ca_state == 3);   // retrans activity, no new/live RTO => Recovery
+
+    // Counter reset/wrap (another ESTATS consumer toggled collection): negative
+    // deltas clamp to 0 — "unknown this tick", never a bogus loss spike.
+    NqWinCounters reset; // all-zero cur vs non-zero prev
+    auto z = nq_win_build_sample(reset, cur, "tcp6", "2001:db8::1", "svc");
+    CHECK(z.lost == 0);
+    CHECK(z.ca_state == 0);
+
+    // A live RTO episode (cur_timeout_count gauge) forces Loss even with no
+    // completed-timeout delta.
+    NqWinCounters rto = cur;
+    rto.cur_timeout_count = 2;
+    CHECK(nq_win_build_sample(rto, cur, "tcp", "198.51.100.2", "db").ca_state == 4);
 }
 
 TEST_CASE("TarDatabase: insert_netqual_samples returns false (no crash) when the table is gone",

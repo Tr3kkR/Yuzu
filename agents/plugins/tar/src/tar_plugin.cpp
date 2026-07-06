@@ -27,6 +27,8 @@
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_netconn.hpp"
+#include "tar_netqual_boot.hpp"
 #include "tar_perf.hpp"
 #include "tar_proc_perf.hpp"
 #include "tar_schema_registry.hpp"
@@ -68,6 +70,23 @@ int64_t now_epoch_seconds() {
 int64_t next_snapshot_id() {
     static std::atomic<int64_t> counter{0};
     return now_epoch_seconds() * 1000 + counter.fetch_add(1, std::memory_order_relaxed) % 1000;
+}
+
+// Operator-configurable retroactive reach for the netconn backfill, in seconds
+// (ADR-0020 privacy note). Defaults to kNetConnLookbackS (7 days); 0 means "no
+// retrospective read" — the backfill window collapses to empty and the source
+// records only forward connectivity from enablement, for jurisdictions where
+// pre-notice collection is not permitted. Clamped to [0, 90 days] so a bad
+// config value cannot request an unbounded window.
+int64_t netconn_lookback_seconds(yuzu::tar::TarDatabase& db) {
+    try {
+        return yuzu::tar::nq_clamp_lookback(std::stoll(db.get_config(
+            "netconn_lookback_seconds", std::to_string(yuzu::tar::kNetConnLookbackS))));
+    } catch (...) {
+        // Non-numeric stored value (should be impossible — do_configure rejects
+        // it) → fall back to the default rather than throw across a collect leg.
+        return yuzu::tar::kNetConnLookbackS;
+    }
 }
 
 // ── State serialization helpers ──────────────────────────────────────────────
@@ -194,6 +213,42 @@ std::vector<yuzu::tar::DnsEntry> json_to_dns(const std::string& s) {
             e.data = j.value("data", "");
             e.ttl_remaining_s = j.value("ttl_remaining_s", int64_t{0});
             e.source = j.value("source", "");
+            result.push_back(std::move(e));
+        }
+    } catch (...) {}
+    return result;
+}
+
+// mapdrive snapshot baseline (capability-map §3.8): serializes the MapDriveEntry
+// fields only (no ts/action/origin — those are event, not baseline, data). The
+// baseline is implicitly `origin=live`; historical rows never touch it.
+json mapdrive_to_json(const std::vector<yuzu::tar::MapDriveEntry>& entries) {
+    json arr = json::array();
+    for (const auto& e : entries) {
+        arr.push_back({{"direction", e.direction},
+                       {"local_mount", e.local_mount},
+                       {"remote_path", e.remote_path},
+                       {"remote_host", e.remote_host},
+                       {"username", e.username},
+                       {"provider", e.provider}});
+    }
+    return arr;
+}
+
+std::vector<yuzu::tar::MapDriveEntry> json_to_mapdrive(const std::string& s) {
+    std::vector<yuzu::tar::MapDriveEntry> result;
+    if (s.empty())
+        return result;
+    try {
+        auto arr = json::parse(s);
+        for (const auto& j : arr) {
+            yuzu::tar::MapDriveEntry e;
+            e.direction = j.value("direction", "");
+            e.local_mount = j.value("local_mount", "");
+            e.remote_path = j.value("remote_path", "");
+            e.remote_host = j.value("remote_host", "");
+            e.username = j.value("username", "");
+            e.provider = j.value("provider", "");
             result.push_back(std::move(e));
         }
     } catch (...) {}
@@ -523,6 +578,17 @@ public:
         if (db_->get_config("software_enabled", "").empty()) {
             db_->set_config("software_enabled", "false");
         }
+        // ADR-0020: seed the opt-in netconn_enabled key (same rationale as
+        // module/software above — the source is default-off in the registry).
+        if (db_->get_config("netconn_enabled", "").empty()) {
+            db_->set_config("netconn_enabled", "false");
+        }
+        // §3.8: seed the opt-in mapdrive_enabled key (default-off, like module /
+        // software) so source_enabled / retention / configure all agree the source
+        // starts disabled.
+        if (db_->get_config("mapdrive_enabled", "").empty()) {
+            db_->set_config("mapdrive_enabled", "false");
+        }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
         // LAZILY by collect_fast on the first tick where module_enabled is true (so
@@ -531,6 +597,135 @@ public:
         // non-Windows (M4/M5 add macOS Endpoint Security, M6 adds Linux auditd).
         module_stream_ = std::make_unique<yuzu::tar::ModuleEtwCollector>();
 #endif
+
+        // ── netqual boot baseline + netconn history backfill (ADR-0020) ──────
+        // Both are RETROSPECTIVE one-shot reads of state the OS accumulated
+        // BEFORE TAR ran this boot, taken at init with t_live as the boundary.
+        // Cross-platform no-ops where unimplemented (the collectors return
+        // nullopt/{} off Windows); failures are warn-and-continue — a
+        // diagnostics plugin never fails init over retrospective data.
+        if (db_->get_config("netqual_enabled", "false") == "true") {
+            // One row per boot (the counters are per-boot state); keyed on the
+            // boot instant exactly like the proc ETL backfill above, and set
+            // ONLY on insert success so a failure retries on the next restart.
+            const auto nq_boot_key = std::to_string(yuzu::tar::boot_time_unix());
+            if (db_->get_config("netqual_boot_backfill_ts", "") != nq_boot_key) {
+                if (auto row = yuzu::tar::collect_netqual_boot(t_live)) {
+                    row->snapshot_id = next_snapshot_id();
+                    if (db_->insert_netqual_boot_row(*row)) {
+                        db_->set_config("netqual_boot_backfill_ts", nq_boot_key);
+                        spdlog::info(
+                            "TAR: netqual boot baseline recorded ({}s pre-TAR window)",
+                            row->window_s);
+                    } else {
+                        spdlog::warn("TAR: netqual boot baseline insert failed "
+                                     "(will retry on restart)");
+                    }
+                }
+            }
+        }
+        if (db_->get_config("netconn_enabled", "false") == "true" &&
+            db_->get_config("netconn_backfill_hwm", "").empty()) {
+            // First-ever read: pull the OS-retained connectivity history from
+            // before TAR existed on this box ([t_live - lookback, t_live)).
+            // The hwm then hands incremental reads to the collect_slow leg; it
+            // is set ONLY on success, so a failed backfill retries on the next
+            // slow tick (which sees the still-empty hwm and re-runs the deep
+            // read — same window, EvtQuery is cheap at this event rate).
+            //
+            // The retroactive REACH is operator-configurable (ADR-0020 privacy
+            // note): netconn_lookback_seconds bounds how far before enablement
+            // the backfill reads. nq_netconn_plan turns lookback==0 into a
+            // FORWARD-ONLY plan (read nothing, seed the hwm to t_live) so no
+            // pre-enablement history is read where a works-council/DPO forbids
+            // it; a positive lookback reads [t_live - lookback, t_live).
+            const auto plan = yuzu::tar::nq_netconn_plan(/*have_hwm=*/false, 0,
+                                                         netconn_lookback_seconds(*db_), t_live);
+            if (!plan.read) {
+                // Forward-only: seed the hwm so the slow leg reads forward from here.
+                db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+            } else {
+                auto nc_rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
+                const auto nc_snap = next_snapshot_id();
+                for (auto& r : nc_rows)
+                    r.snapshot_id = nc_snap;
+                if (nc_rows.empty()) {
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                } else if (db_->insert_netconn_events(nc_rows)) {
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                    spdlog::info("TAR: netconn backfilled {} pre-TAR connectivity events",
+                                 nc_rows.size());
+                } else {
+                    spdlog::warn(
+                        "TAR: netconn history backfill insert failed (slow tick retries)");
+                }
+            }
+        }
+
+        // §3.8: one-time historical mapped-drive backfill. Seeds PAST mappings from
+        // persistent OS artifacts (Windows registry Network/MRU/MountPoints2 +
+        // Security event log; Linux fstab + Samba logs) as origin='historical' rows
+        // that bypass the live diff. Gated on the source toggle AND a one-shot
+        // dedup key so it runs at most once per data dir — the key stays UNSET on
+        // insert failure so the next restart retries (mirrors last_backfill_boot_ts).
+        // Init-time so it materializes on the first (re)start after an operator
+        // enables the source, matching the ETW boot-backfill precedent above.
+        if (source_enabled(*db_, "mapdrive")) {
+            if (!db_->get_config("mapdrive_backfill_done", "").empty()) {
+                spdlog::info("TAR: mapdrive historical backfill already done — skipped");
+            } else {
+                // enumerate_mapdrive_history touches the registry / offline hives /
+                // subprocesses and does substantial allocation; a std::bad_alloc (or
+                // any future throwing edit) must not cross the plugin C-ABI boundary
+                // out of init(). Catch here; a throw is NOT the same as "no history"
+                // — enumerated_ok gates the done-key so a throw leaves it unset and
+                // the next restart retries (only a clean empty result records done).
+                std::vector<yuzu::tar::MapDriveHistoryRow> hist;
+                bool enumerated_ok = false;
+                try {
+                    hist = yuzu::tar::enumerate_mapdrive_history();
+                    enumerated_ok = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw ({}) — "
+                                 "will retry on restart",
+                                 e.what());
+                } catch (...) {
+                    spdlog::warn("TAR: mapdrive historical backfill enumeration threw — "
+                                 "will retry on restart");
+                }
+                const auto snap = next_snapshot_id();
+                std::vector<yuzu::tar::MapDriveEvent> typed;
+                typed.reserve(hist.size());
+                for (auto& h : hist) {
+                    yuzu::tar::MapDriveEvent ev;
+                    ev.ts = h.ts;
+                    ev.snapshot_id = snap;
+                    ev.action = "historical";
+                    ev.direction = h.entry.direction;
+                    ev.local_mount = h.entry.local_mount;
+                    ev.remote_path = h.entry.remote_path;
+                    ev.remote_host = h.entry.remote_host;
+                    ev.username = h.entry.username;
+                    ev.provider = h.entry.provider;
+                    ev.origin = "historical";
+                    typed.push_back(std::move(ev));
+                }
+                if (!enumerated_ok) {
+                    // Enumeration threw (already logged) — leave the key unset so the
+                    // next restart retries rather than permanently skipping history.
+                } else if (typed.empty()) {
+                    spdlog::info("TAR: no historical mapped drives found to backfill");
+                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
+                } else if (db_->insert_mapdrive_events(typed)) {
+                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
+                    spdlog::info("TAR: backfilled {} historical mapped-drive rows", typed.size());
+                } else {
+                    // Leave the key unset so the next restart retries.
+                    spdlog::warn("TAR: mapdrive historical backfill insert failed (continuing; "
+                                 "will retry on restart)");
+                }
+            }
+        }
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
@@ -672,7 +867,8 @@ private:
     // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
     int collect_fast_impl(yuzu::CommandContext& ctx,
                           std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
-                          std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr) {
+                          std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr,
+                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -865,7 +1061,11 @@ private:
         // privacy bucket leaves select_netqual_rows; the raw remote address is
         // dropped there and never persisted. Empty off Linux (collector stub).
         if (db_->get_config("netqual_enabled", "false") == "true") {
-            auto samples = yuzu::tar::collect_tcp_quality();
+            // netqual_pre: pre-collected by the caller OUTSIDE collect_mu_ (the
+            // Windows ESTATS pass is one enable+read syscall pair per tracked
+            // connection — same rationale as arp_pre/dns_pre). Inline when null.
+            auto samples =
+                netqual_pre ? std::move(*netqual_pre) : yuzu::tar::collect_tcp_quality();
             auto rows =
                 yuzu::tar::select_netqual_rows(samples, ts, snap_id, yuzu::tar::kNetQualTopN);
             if (!rows.empty()) {
@@ -1023,8 +1223,13 @@ private:
         // run under collect_mu_ inside collect_fast_impl.
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
+        // netqual is opt-in with an explicit-"true" gate (see the leg) — and its
+        // Windows ESTATS pass is a per-connection enable+read syscall sweep, so
+        // it pre-collects lock-free with arp/dns.
+        const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
         std::vector<yuzu::tar::ArpEntry> arp_pre;
         std::vector<yuzu::tar::DnsEntry> dns_pre;
+        std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
@@ -1033,13 +1238,17 @@ private:
                 arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
+            if (netqual_on)
+                netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
             arp_pre.clear();
             dns_pre.clear();
+            netqual_pre.clear();
         }
         std::lock_guard lock(collect_mu_);
-        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
+        return collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
+                                 netqual_on ? &netqual_pre : nullptr);
     }
 
     // ── collect_perf: device performance sample (BRD A1) ─────────────────────
@@ -1060,11 +1269,13 @@ private:
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
         if (!source_enabled(*db_, "perf")) {
-            ctx.write_output("tar|collect_perf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
-                ctx.write_output("tar|collect_perf|0|unsupported_platform");
+                ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                             yuzu::tar::kCollectStatusUnsupportedPlatform));
             } else {
                 bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
@@ -1082,9 +1293,11 @@ private:
                     }
                 }
                 if (!perf_enabled_now) {
-                    ctx.write_output("tar|collect_perf|0|source_disabled");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusSourceDisabled));
                 } else if (!sample.valid) {
-                    ctx.write_output("tar|collect_perf|0|baseline");
+                    ctx.write_output(std::format("tar|collect_perf|0|{}",
+                                                 yuzu::tar::kCollectStatusBaseline));
                 } else {
                     yuzu::tar::PerfRow row;
                     row.ts = cur.ts_epoch;
@@ -1102,7 +1315,8 @@ private:
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
                     } else {
-                        ctx.write_output("tar|collect_perf|1|sample_recorded");
+                        ctx.write_output(std::format("tar|collect_perf|1|{}",
+                                                     yuzu::tar::kCollectStatusSampleRecorded));
                     }
                 }
             }
@@ -1119,12 +1333,14 @@ private:
         // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
         // memory project-telemetry-privacy-works-council.
         if (db_->get_config("procperf_enabled", "false") != "true") {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
         if (!proc_cur.valid) {
-            ctx.write_output("tar|collect_procperf|0|unsupported_platform");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusUnsupportedPlatform));
             return rc;
         }
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
@@ -1145,11 +1361,13 @@ private:
             }
         }
         if (!procperf_enabled_now) {
-            ctx.write_output("tar|collect_procperf|0|source_disabled");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         if (samples.empty()) {
-            ctx.write_output("tar|collect_procperf|0|baseline");
+            ctx.write_output(std::format("tar|collect_procperf|0|{}",
+                                         yuzu::tar::kCollectStatusBaseline));
             return rc;
         }
         // Resolve each app's on-disk file version OUTSIDE collect_mu_ — the
@@ -1177,7 +1395,8 @@ private:
             ctx.write_output("error|procperf insert failed");
             return 1;
         }
-        ctx.write_output(std::format("tar|collect_procperf|{}|apps_recorded", rows.size()));
+        ctx.write_output(std::format("tar|collect_procperf|{}|{}", rows.size(),
+                                     yuzu::tar::kCollectStatusAppsRecorded));
         return rc;
     }
 
@@ -1226,6 +1445,79 @@ private:
             }
 
             db_->set_state(usr_key, users_to_json(current).dump());
+        }
+
+        // netconn: OS-logged connectivity transitions (ADR-0020). OPT-IN with an
+        // explicit-"true" gate like netqual. Incremental read from the high-water
+        // mark; an EMPTY hwm means "never read" (fresh enable, or the init
+        // backfill failed) and triggers the deep lookback — so an operator who
+        // enables the source LATER still recovers the OS-retained history. The
+        // hwm advances ONLY on success, so a failed tick re-reads the same
+        // window; rows carry the EVENT's own ts. Non-fatal like every opt-in leg.
+        if (db_->get_config("netconn_enabled", "false") == "true") {
+            // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
+            // by the operator-configurable retroactive reach; a set hwm -> forward
+            // incremental read [hwm, ts). nq_netconn_plan centralises this AND the
+            // forward-only case: with netconn_lookback_seconds=0 and no hwm the
+            // window is empty, so the plan reads nothing but STILL seeds the hwm
+            // to ts — otherwise the leg would recompute from==ts every tick and
+            // never advance (a late enable with lookback=0 would wedge). rows
+            // carry the EVENT's own ts. Non-fatal like every opt-in leg.
+            const auto hwm_str = db_->get_config("netconn_backfill_hwm", "");
+            bool have_hwm = !hwm_str.empty();
+            int64_t hwm = 0;
+            if (have_hwm) {
+                try {
+                    hwm = std::stoll(hwm_str);
+                } catch (...) {
+                    have_hwm = false; // corrupt hwm -> treat as fresh (deep read)
+                }
+            }
+            const auto plan =
+                yuzu::tar::nq_netconn_plan(have_hwm, hwm, netconn_lookback_seconds(*db_), ts);
+            if (!plan.read) {
+                // Empty/backward window (lookback 0 forward-only, or clock skew):
+                // read nothing, but advance the hwm so forward reads begin.
+                db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+            } else {
+                auto rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
+                for (auto& r : rows)
+                    r.snapshot_id = snap_id;
+                if (rows.empty()) {
+                    // Nothing in the window (or channels missing) — still advance
+                    // so the next tick doesn't re-scan the same empty window.
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                } else if (db_->insert_netconn_events(rows)) {
+                    db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                    total_events += static_cast<int>(rows.size());
+                } else {
+                    spdlog::error("TAR: netconn insert failed this tick (skipped)");
+                }
+            }
+        }
+
+        // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
+        // so source_enabled returns false until an operator turns it on. NON-FATAL on
+        // insert failure — the always-on service/user legs above may have already
+        // committed, so a failure here must not misreport the tick (do NOT `return
+        // 1`); the diff baseline advances ONLY on insert success so a failed insert
+        // retries the same deltas next tick. The one-time historical backfill is
+        // separate (init, mapdrive_backfill_done) and does not touch this baseline.
+        if (source_enabled(*db_, "mapdrive")) {
+            const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
+            auto current = yuzu::tar::enumerate_mapdrive();
+            auto previous = json_to_mapdrive(db_->get_state(md_key));
+            auto typed = yuzu::tar::compute_mapdrive_events(previous, current, ts, snap_id);
+            bool ok = true;
+            if (!typed.empty()) {
+                ok = db_->insert_mapdrive_events(typed);
+                if (ok)
+                    total_events += static_cast<int>(typed.size());
+                else
+                    spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+            }
+            if (ok)
+                db_->set_state(md_key, mapdrive_to_json(current).dump());
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -1430,6 +1722,28 @@ private:
             (module_stream_active_ && module_stream_) ? module_stream_->method_name() : "none"));
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
+
+        // netqual capture method (ADR-0020) — the method actually in effect:
+        // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
+        // active), "estats_pending" (Windows, gate not yet tested — or netqual
+        // off), "none" (Windows after the ACCESS_DENIED latch, macOS). Emitted
+        // UNCONDITIONALLY (key-always-present contract, same as the process/
+        // module keys above) so an operator can tell "netqual is on but the
+        // agent can't collect" apart from "netqual is off".
+        ctx.write_output(std::format("config|netqual_capture_method|{}",
+                                     yuzu::tar::netqual_effective_capture_method()));
+
+        // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
+        // dependent path like process/module), so this reports the platform method
+        // for parity with the other *_capture_method keys; the full per-OS matrix is
+        // in the `compatibility` action. "none" where the source is kPlanned.
+#if defined(_WIN32)
+        ctx.write_output("config|mapdrive_capture_method|wnet");
+#elif defined(__linux__)
+        ctx.write_output("config|mapdrive_capture_method|procfs");
+#else
+        ctx.write_output("config|mapdrive_capture_method|none");
+#endif
         return 0;
     }
 
@@ -1546,10 +1860,19 @@ private:
                   "(name || ' ' || record_type || ' ' || data) AS detail_json "
                   "FROM dns_live" +
                   where + tail;
+        } else if (type_filter == "mapdrive") {
+            // §3.8. detail_json is a human summary (direction mount remote [host]
+            // user); the full row (incl. origin/provider) is via tar.sql over
+            // $MapDrive_Live. Includes historical rows (action='historical').
+            sql = "SELECT ts, 'mapdrive' AS event_type, action, snapshot_id, "
+                  "(direction || ' ' || local_mount || ' ' || remote_path || ' [' || "
+                  "remote_host || '] ' || username) AS detail_json "
+                  "FROM mapdrive_live" +
+                  where + tail;
         } else {
-            // No-filter union stays the core four-source event timeline. arp/dns
-            // are device-state caches (opt-in, dns is PII) — reachable only via an
-            // explicit type filter above or tar.sql, never the default feed.
+            // No-filter union stays the core event timeline. arp/dns/mapdrive are
+            // opt-in device-state / PII sources — reachable only via an explicit
+            // type filter above or tar.sql, never the default feed.
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
                   "process_live" +
@@ -1657,6 +1980,8 @@ private:
                 table = "arp_live";
             else if (type_filter == "dns") // ADR-0015
                 table = "dns_live";
+            else if (type_filter == "mapdrive") // §3.8
+                table = "mapdrive_live";
             else {
                 ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
                 return 1;
@@ -1688,11 +2013,13 @@ private:
     // ── snapshot action (force immediate full collection) ─────────────────────
 
     int do_snapshot(yuzu::CommandContext& ctx) {
-        // Pre-enumerate arp/dns lock-free (same rationale as do_collect_fast).
+        // Pre-enumerate arp/dns/netqual lock-free (same rationale as do_collect_fast).
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
+        const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
         std::vector<yuzu::tar::ArpEntry> arp_pre;
         std::vector<yuzu::tar::DnsEntry> dns_pre;
+        std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
@@ -1701,14 +2028,18 @@ private:
                 arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
+            if (netqual_on)
+                netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns enumeration threw; skipping this tick");
+            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
             arp_pre.clear();
             dns_pre.clear();
+            netqual_pre.clear();
         }
         {
             std::lock_guard lock(collect_mu_);
-            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr);
+            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
+                              netqual_on ? &netqual_pre : nullptr);
             collect_slow_impl(ctx);
         }
         // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
@@ -1868,6 +2199,7 @@ private:
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
+        auto netconn_lookback = params.get("netconn_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -1878,6 +2210,12 @@ private:
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
         bool software_provided = false;
+        // netconn_lookback_seconds: the documented forward-only privacy control
+        // (ADR-0020). A numeric value is CLAMPED to [0, 90 days] (0 = no
+        // pre-enablement read) so a privacy-tightening request never fails on a
+        // fat-fingered bound; a non-numeric value is rejected.
+        int64_t netconn_lookback_secs = 0;
+        bool netconn_lookback_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -1934,6 +2272,22 @@ private:
                 ctx.write_output("error|software_interval must be 0 (disable) or 300-86400 seconds");
                 return 1;
             }
+        }
+
+        if (!netconn_lookback.empty()) {
+            netconn_lookback_provided = true;
+            bool parsed = false;
+            try {
+                netconn_lookback_secs = std::stoll(std::string{netconn_lookback});
+                parsed = true;
+            } catch (...) {}
+            if (!parsed) {
+                ctx.write_output("error|netconn_lookback_seconds must be an integer 0-7776000 "
+                                 "(0 = forward-only, no pre-enablement read)");
+                return 1;
+            }
+            // Clamp rather than reject an out-of-range bound (see the field decl).
+            netconn_lookback_secs = yuzu::tar::nq_clamp_lookback(netconn_lookback_secs);
         }
 
         // Cross-field validation BEFORE any writes
@@ -2092,6 +2446,15 @@ private:
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
             changed = true;
         }
+        if (netconn_lookback_provided) {
+            // Persist the CLAMPED value so the stored config and the echo agree
+            // with what the collect legs will actually read (nq_clamp_lookback is
+            // applied again on read, defensively). 0 => forward-only.
+            db_->set_config("netconn_lookback_seconds", std::to_string(netconn_lookback_secs));
+            ctx.write_output(
+                std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
+            changed = true;
+        }
         if (have_redaction) {
             db_->set_config("redaction_patterns", std::string{redaction});
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
@@ -2157,6 +2520,17 @@ private:
                 return 1;
             }
             ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
+            // Consent clarity (#1831 review): enabling procperf does more than
+            // collect on-device — the top-N per-app names + versions feed the
+            // daily app_perf sync to the central server (B1/B2). An operator
+            // opting in for local triage must see that the app identity leaves
+            // the device. Surfaced here, in the manual, and in the CHANGELOG.
+            if (src_name == "procperf" && v == "true")
+                ctx.write_output(
+                    "notice|procperf: per-app names + versions are now sampled AND "
+                    "synced off-device to the central app_perf store (daily); disable "
+                    "with procperf_enabled=false or --inventory-disable to keep the "
+                    "device fully local");
             // Echo the resulting paused_at so the dashboard sees the transition
             // timestamp without an extra status round-trip — single source of
             // truth (re-read, not re-derived).

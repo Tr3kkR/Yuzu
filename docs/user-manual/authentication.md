@@ -297,6 +297,22 @@ Admin via OIDC is granted **only** through explicit membership in the configured
 
 > **Note:** Only a single admin group mapping is currently supported via the `--oidc-admin-group` CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.
 
+### RBAC Group Provisioning (#1832)
+
+Independently of the `--oidc-admin-group` admin mapping above, every OIDC login reconciles the IdP's `groups` claim into the RBAC store so that group-scoped role assignments take effect for SSO users. There is no dedicated group-membership UI — a group-scoped role grant is made via the management-group role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose `principal_id` field is free text: set `"principal_type": "group"` and `"principal_id": "entra:<group-id>"` to delegate `Operator` or `Viewer` to everyone the IdP asserts is in that group. Each asserted group is written as `entra:<group-id>` — **namespaced** by identity source, never the raw IdP group id — so a locally-created RBAC group can never collide with (or be impersonated by) a same-named IdP group.
+>
+> **Do not confuse the two forms.** `--oidc-admin-group` (the admin mapping above) matches against the **raw** IdP group object id as it appears in the token's `groups` claim — configure it with the raw id (e.g. `a1b2c3d4-…`), *not* the namespaced `entra:<id>` form, or admin elevation silently fails. Only group-scoped RBAC role delegation (`principal_id`) uses the namespaced `entra:<id>` form.
+
+The reconcile also removes any of the user's `entra:`-owned memberships that the IdP no longer asserts, so a group removal on the IdP side takes effect on the user's **next SSO login** — memberships are **not** revoked mid-session; a live cookie session or already-issued API token retains its prior roles until re-authentication (residual, tracked in #1836 — the operator's manual mitigation in the interim is `DELETE /api/v1/sessions?username=<name>`, "Session lifetime" above). A malformed or oversized (`>200` groups) assertion, or a reconcile-store failure, denies the login outright rather than granting a session with stale roles.
+
+**Entra group overage.** Once a user belongs to more groups than fit in the ID token (Entra's documented threshold is 200 groups), Entra omits the `groups` claim entirely and sends a `_claim_names`/`_claim_sources` indirection pointer instead. Reconciliation is **skipped** for that login — existing memberships are left exactly as they were, and the login still succeeds — rather than reading the resulting empty claim as "this user is in zero groups" and deleting every one of their existing memberships. A heavily-grouped legitimate user simply doesn't get their SSO-driven roles updated on an overaged login until Entra can report the full set (out-of-band group lookup, e.g. via Microsoft Graph, is not implemented in this release).
+
+See the `auth.sso_group_provision` audit action (`docs/user-manual/audit-log.md`) for the full `result=ok|skipped|error` contract and detail-field shape.
+
+> **Upgrade note:** Before this fix, OIDC groups were synced under their raw (un-namespaced) id, so an operator may have assigned an RBAC role directly to a group named e.g. `8f3c...` (the raw Entra group id). Those role assignments do **not** automatically move to the new namespaced group. **Re-assign any such role to `entra:<group-id>`** via the same `POST /api/v1/management-groups/{id}/roles` API — the old raw-id group row is left in place (harmless, but no longer reachable by future logins) and can be deleted once you've confirmed the namespaced group has the role.
+
+> **Operational note (fail-closed):** a transient `rbac.db` failure during an OIDC login denies the login outright (no session minted) rather than granting one under unreconciled roles (`docs/auth-architecture.md` "RBAC group provisioning (#1832)"). This does not affect the break-glass/local-password path (`/login`, hardened-mode escape hatch): break-glass logins never call `/auth/callback` and so never touch RBAC group reconciliation.
+
 ### Entra ID Setup Checklist
 
 1. Register an application in Entra ID (Azure Portal > App registrations).
@@ -608,12 +624,10 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
 
-**Prerequisite for a federated (OIDC/SSO) operator:** eligibility is keyed on a Yuzu `users` table row, and signing in via OIDC does **not** create one. A federated-only identity must already have a `users` row — provision it first (e.g. `POST /api/v1/users`) — or the eligibility call above 404s. This is a known limitation; auto-provisioning eligibility by OIDC identity is tracked as a follow-up, not yet implemented.
+**2. The eligible operator elevates** when they need admin. A second factor is **mandatory** to elevate, regardless of `--mfa-enforcement` — but which second factor depends on how the operator signed in:
 
-**2. The eligible operator elevates** when they need admin. A second factor is mandatory to elevate, regardless of `--mfa-enforcement`, and satisfied one of two ways depending on how the operator is currently authenticated (their identity SOURCE, not their username — an OIDC session never consults a local namesake account's TOTP enrollment):
-
-- **Local account:** the operator must have **MFA enrolled** and will be challenged for a fresh TOTP code.
-- **OIDC/SSO account:** if the operator's *current* SSO login was authenticated with IdP MFA (asserted via the OIDC `amr` claim), that assertion satisfies the second-factor requirement — **no local TOTP enrollment needed**. A single-factor SSO login (no IdP MFA) is still denied. This is controlled by `--jit-oidc-amr-elevation` (default enabled). Disabling it (`--no-jit-oidc-amr-elevation`) means **OIDC sessions cannot use JIT elevation at all** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so the operator must elevate from a local-authenticated session with local TOTP instead.
+- **Local (password) sessions** must have **MFA enrolled** and are challenged for a fresh **TOTP code** via the shared step-up gate.
+- **OIDC/SSO sessions** are NOT challenged for a TOTP code (a durable SSO identity has no local TOTP secret to check against — see "SSO operators" below) — the second factor is the **IdP-attested `amr` claim** captured at login.
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
@@ -624,6 +638,26 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 ```
 
 `expires_in` is the TRUE remaining seconds computed after the grant (always `<=` the requested `duration_secs` — it is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute lifetime, so it is never an exact echo of the request), and `expires_at` is the same window as a wall-clock RFC3339 UTC timestamp. The session is now admin for the window (capped by `--jit-max-elevation-secs`, default 1h). It **auto-reverts** when the window lapses, on logout, or on a server restart — the elevation is never persisted. Step down early with `POST /api/v1/elevate/revoke`. Every step (`role.elevation.granted`/`denied`/`revoked`/`expired`, `user.elevation_eligibility.set`) is audited — the `granted` row's detail records which factor was used (`mfa=local_totp` or `mfa=oidc_amr`). Technical invariants: `docs/auth-architecture.md` "JIT admin elevation".
+
+### SSO operators
+
+An OIDC/SSO operator elevates through the same two steps above, with the following differences:
+
+- **Eligibility is granted on the durable, stable principal** — `oidc:<iss>#<sub>` (the IdP-issuer-scoped subject claim, never the display name) — via the **query form** of the eligibility endpoint, `POST /api/v1/users/elevation-eligibility?username=<principal>`, e.g.:
+
+  ```bash
+  curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+    -H "Content-Type: application/json" -d '{"eligible":true}' \
+    'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
+  ```
+
+  The path form (`POST /api/v1/users/{username}/elevation-eligibility`) remains for local usernames only — an SSO principal contains `/` and `#`, which a path segment cannot carry (the server percent-decodes and strips the URL fragment before route matching), so it must use the query form instead.
+
+  The operator must have **logged in at least once** before an admin can grant eligibility — first login auto-provisions a durable row for the principal (`AuthDB::upsert_sso_identity`); granting eligibility against a principal with no row yet **404s** ("user not found"), since the grant is an `UPDATE` against an existing row, not an `INSERT`.
+- **The second factor is the IdP-attested `amr` claim**, captured on the OIDC session at login — never a local TOTP challenge. A session created from a login where the IdP did not assert `amr` is denied elevation unconditionally (`403`, "elevation requires an IdP-attested MFA proof"), independent of the `--mfa-enforcement` setting. Disabling `--jit-oidc-amr-elevation` (default enabled) turns OIDC JIT elevation off entirely — an OIDC session cannot fall back to a local TOTP step-up (its step-up challenge is re-authenticating via SSO), so operators must elevate from a local-authenticated session with local TOTP instead.
+- **Finding the principal string**: Settings → Users lists every durable SSO identity with an **SSO** badge next to its row; the row's displayed name IS the `oidc:<iss>#<sub>` principal to use in the eligibility-grant URL above.
+- **SAML operators cannot elevate today** — SAML carries no `amr`-equivalent claim, so a SAML session fails closed at the same MFA gate a non-MFA'd OIDC session would hit. SAML JIT elevation is a deferred workstream (see `docs/auth-architecture.md` "JIT admin elevation").
+- **Cross-protocol identity-source scoping**: an elevation grant is scoped to the identity *source* that earned it, not just the principal string — the check is a **direct equality** between the session's own `auth_source` and the eligible row's `identity_source` (`local`↔`local`, `oidc`↔`oidc`, `saml`↔`saml`), not an "oidc-or-else-local" fallback. A local session can only spend a grant recorded against an `identity_source='local'` row; a SAML session (SAML JIT elevation is not yet provisioned — see below) would need an `identity_source='saml'` row, which no row carries today, so SAML fails closed at this gate too. This closes a theoretical collision where a crafted SAML NameID (or a legacy local row) shares a principal string with a real OIDC identity.
 
 ## MCP Tokens
 

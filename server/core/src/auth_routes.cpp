@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <shared_mutex>
+#include <string_view>
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -31,6 +32,11 @@ namespace {
 // operator-supplied reason is sanitised (control bytes → space) and truncated to
 // this before it reaches the audit detail.
 constexpr std::size_t kMaxJustificationLength = 1024;
+
+// Max stored length of a single sanitised detail value (e.g. an OIDC
+// display name or email). These are short identity labels, not free-text
+// justifications, so the cap is much tighter than kMaxJustificationLength.
+constexpr std::size_t kMaxDetailValueLength = 128;
 
 // The A4 denial envelope has moved to detail::a4_denial in
 // rest_a4_envelope_http.hpp (#1470 — folded into the one unified builder so
@@ -93,6 +99,38 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
 }
 
 } // namespace
+
+namespace detail {
+
+// See declaration + full rationale in auth_routes.hpp. Lives in the named
+// `detail` namespace (not the anonymous one above) so unit tests can link
+// against it directly — mirrors the rest_a4_envelope.hpp pattern.
+std::string sanitize_detail_value(std::string_view v) {
+    std::string out;
+    out.reserve(std::min(v.size(), kMaxDetailValueLength));
+    for (char c : v) {
+        const auto uc = static_cast<unsigned char>(c);
+        out.push_back((c == ';' || c == '=' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7F)
+                          ? '_'
+                          : c);
+    }
+    if (out.size() > kMaxDetailValueLength) {
+        out.resize(kMaxDetailValueLength);
+        std::size_t i = out.size();
+        while (i > 0 && (static_cast<unsigned char>(out[i - 1]) & 0xC0) == 0x80)
+            --i;
+        if (i > 0) {
+            const unsigned char lead = static_cast<unsigned char>(out[i - 1]);
+            const std::size_t seq_len =
+                lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+            if (out.size() - (i - 1) < seq_len)
+                out.resize(i - 1);
+        }
+    }
+    return out;
+}
+
+} // namespace detail
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -188,6 +226,12 @@ std::string AuthRoutes::extract_form_value(const std::string& body, const std::s
 auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
     auth::Session synth;
     synth.username = api_token.principal_id;
+    // #1837: no separate display label is stored for a token; fall back to
+    // the principal id itself (matches the pre-#1837 behavior for local
+    // principals, and is the best available label for a stable SSO id with
+    // no live session to render a human name from — there is no persistent
+    // principal→display-name directory; see #1852).
+    synth.display_name = api_token.principal_id;
     synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
     synth.token_scope_service = api_token.scope_service;
     synth.mcp_tier = api_token.mcp_tier;
@@ -1847,6 +1891,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto result = oidc_provider_->handle_callback(code, state);
         if (!result) {
+            // No display=/email= detail here — handle_callback failed before
+            // claims were extracted (token exchange, signature, or
+            // validate_claims rejection incl. the #1837 governance sub/iss
+            // checks), so there is no human name to carry. Every OTHER
+            // auth.oidc_login_failed / auth.sso_group_provision emission
+            // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
             audit_log(req, "auth.oidc_login_failed", "failure");
             emit_event("auth.oidc_login_failed", req,
@@ -1862,7 +1912,147 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
+        // #1837 — the STABLE authorization principal, not the mutable
+        // display name: `sub` is only guaranteed unique per-issuer (RFC
+        // 7519), so it must be scoped by `iss`. Two SSO users who happen to
+        // share a display name (or one whose display name later changes)
+        // must never collide onto — or silently migrate onto — the same
+        // principal, which #1832's RBAC reconcile would otherwise make
+        // destructive (one user's login deleting the other's group
+        // memberships). Mirrors AuthManager::create_oidc_session's
+        // construction exactly.
+        const std::string username = "oidc:" + claims.iss + "#" + claims.sub;
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+
+        // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
+        // minting a session, so a provisioning failure denies the login
+        // outright (fail-closed) instead of granting a session under
+        // stale/unreconciled roles. `reconcile_idp_memberships` writes
+        // NAMESPACED group names (`entra:<gid>`, via
+        // `RbacStore::namespaced_group_name`) — the confused-deputy fix: a
+        // locally-created group can never collide with (or be impersonated
+        // by) a same-named IdP group. It also DELETEs any of this user's
+        // 'entra'-sourced memberships that were NOT re-asserted this login,
+        // which is the deprovisioning-bypass fix — IdP-side group removal
+        // now takes effect on the user's next SSO login instead of
+        // accumulating forever. Local memberships are never touched.
+        //
+        // UP-1 hardening: reconciliation only runs when
+        // `groups_claim_reconcilable(claims)` is true — i.e. the token
+        // actually carried a `groups` key AND it was not replaced by an
+        // Entra group-overage pointer. A user in >200 Entra groups gets
+        // NEITHER of those, and treating the resulting empty `claims.groups`
+        // as "this user is in zero groups" would DELETE every one of their
+        // existing entra:-owned memberships on this login — silent mass
+        // deprovisioning of a legitimate, heavily-grouped user. That case is
+        // SKIPPED entirely (existing memberships left untouched; the login
+        // itself still proceeds — this is fail-OPEN on membership, never on
+        // authentication). See `docs/user-manual/authentication.md` "RBAC
+        // Group Provisioning" (the real heading — keep this anchor in sync).
+        if (rbac_store_) {
+            if (!oidc::groups_claim_reconcilable(claims)) {
+                const std::string reason =
+                    claims.groups_overage ? "groups_overage" : "groups_absent";
+                spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
+                            reason);
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "skipped", username, "user", "", "",
+                    "reason=" + reason + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "skipped"}})
+                        .increment();
+                }
+            } else if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
+                spdlog::warn(
+                    "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
+                    username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
+                audit_log_for_principal(
+                    req, "auth.sso_group_provision", "error", username, "user", "", "",
+                    "reason=group_count_exceeded;count=" +
+                        std::to_string(claims.groups.size()) + ";source=entra" +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
+                // cons-S2 — also emit the same failed-OIDC-login signal the
+                // sibling token-exchange-failure branch emits above, so a
+                // SIEM query counting failed OIDC logins by
+                // `auth.oidc_login_failed` doesn't miss a provisioning-denied
+                // login (this branch denies the login just as surely).
+                audit_log_for_principal(
+                    req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                    std::string("reason=group_count_exceeded") +
+                        ";display=" + detail::sanitize_detail_value(display) +
+                        ";email=" + detail::sanitize_detail_value(email));
+                emit_event("auth.oidc_login_failed", req,
+                          {{"source_ip", req.remote_addr},
+                           {"username", username},
+                           {"error", "group_count_exceeded"}},
+                          {}, Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "error"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            } else {
+                std::vector<std::pair<std::string, std::string>> asserted;
+                asserted.reserve(claims.groups.size());
+                for (const auto& gid : claims.groups)
+                    asserted.emplace_back(gid, gid);
+
+                auto reconciled =
+                    rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
+                if (!reconciled) {
+                    spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
+                                reconciled.error());
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() + ";source=entra" +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
+                    // cons-S2 — see the over-cap branch above.
+                    audit_log_for_principal(
+                        req, "auth.oidc_login_failed", "error", username, "user", "", "",
+                        "reason=" + reconciled.error() +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
+                    emit_event("auth.oidc_login_failed", req,
+                              {{"source_ip", req.remote_addr},
+                               {"username", username},
+                               {"error", reconciled.error()}},
+                              {}, Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "entra"}, {"result", "error"}})
+                            .increment();
+                    }
+                    res.set_redirect("/login?error=sso_failed");
+                    return;
+                }
+
+                // cons-S3 — a no-op reconcile (nothing added or removed; the
+                // asserted set exactly matched what was already on record)
+                // writes no provisioning audit row. Every login after the
+                // first steady-state one is typically a no-op; auditing each
+                // would swamp the log with rows carrying no new information.
+                if (reconciled->added + reconciled->removed > 0) {
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "ok", username, "user", "", "",
+                        "source=entra;added=" + std::to_string(reconciled->added) +
+                            ";removed=" + std::to_string(reconciled->removed) +
+                            ";display=" + detail::sanitize_detail_value(display) +
+                            ";email=" + detail::sanitize_detail_value(email));
+                }
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_sso_group_provision_total",
+                              {{"source", "entra"}, {"result", "ok"}})
+                        .increment();
+                }
+            }
+        }
 
         // PR3 / SOC 2 CC6.6 — seed the session's MFA-verified timestamp
         // when the IdP `amr` claim attests a multi-factor login. The
@@ -1901,29 +2091,29 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                      std::chrono::duration_cast<std::chrono::steady_clock::duration>(age);
         }
 
-        auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub,
+        auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
 
-        // Sync Entra groups into the RBAC store so that group-scoped role
-        // assignments (e.g. ApiTokenManager on an Entra group) take effect.
-        if (rbac_store_ && !claims.groups.empty()) {
-            auto username = display.empty() ? email : display;
-            for (const auto& gid : claims.groups) {
-                (void)rbac_store_->create_group({.name = gid,
-                                                 .description = "Entra ID group (auto-synced)",
-                                                 .source = "entra",
-                                                 .external_id = gid});
-                (void)rbac_store_->add_group_member(gid, username);
-            }
-        }
+        // #1852 — auto-provision a durable auth.db row for this stable
+        // principal so JIT admin elevation has something to key on
+        // (elevation_eligible / role survive across logins). Deliberately
+        // called HERE, outside `create_oidc_session` — that method holds
+        // `mu_` for the in-memory session map, and this performs
+        // independent auth.db I/O that must not serialize behind it.
+        // Fail-soft: a provisioning error is logged and swallowed by
+        // `provision_sso_identity` itself; the session minted above is
+        // never un-minted because of it (a login must not fail here).
+        auth_mgr_.provision_sso_identity(username, claims.iss, claims.sub, display);
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
         // Explicit-principal audit row — request lands at /auth/callback
         // with no session cookie yet, so the default resolve_session
         // path would leave principal empty (Gate 4 consistency B3). Use
-        // the validated `display` from the IdP as the canonical
-        // principal name. Role is resolved from the freshly-minted
+        // the STABLE `username` (#1837: "oidc:<iss>#<sub>") as the
+        // canonical audit principal — never the mutable display name, or
+        // an IdP-side rename would sever the audit trail's identity
+        // linkage across logins. Role is resolved from the freshly-minted
         // session — for the audit row we re-validate to capture the
         // role the user actually holds (group-mapping may have made
         // them admin).
@@ -1935,29 +2125,40 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Record whether the IdP attested MFA (the `amr` decision) in the
         // audit detail so the CC6.6 "was this privileged SSO login MFA-
         // verified" question is answerable from Yuzu's own chain without
-        // cross-referencing IdP logs (governance compliance-S2).
+        // cross-referencing IdP logs (governance compliance-S2). Also carry
+        // the human-readable `display`/`email` in the detail string (never
+        // in the principal field) so a SIEM operator can see both the
+        // stable identity and a readable name for the same row.
         // #1830.2: when the login resolved to admin, also name the granting
-        // group — mirrors the SAML admin audit detail (comp-S1/UP-5 above)
-        // so a reviewer can see WHY this OIDC login is admin without
-        // cross-referencing boot flags.
-        // cons-N1: leading "auth_source=oidc;" token mirrors SAML's
-        // "auth_source=saml;" leading token (the shared ";admin_group=<value>"
-        // suffix below already matches).
+        // group — mirrors the SAML admin audit detail so a reviewer can see
+        // WHY this OIDC login is admin without cross-referencing boot flags.
+        // cons-N1: leading "auth_source=oidc;" mirrors SAML's leading
+        // "auth_source=saml;" token.
+        //
+        // `display`/`email` are IdP-supplied — `detail::sanitize_detail_value()`
+        // is applied to prevent `;`/`=`/newlines/control bytes/markup from
+        // corrupting this flat "k=v;k=v" detail string's SIEM parsing or
+        // causing stored XSS if rendered unescaped. The stable `username`
+        // principal (`oidc:<iss>#<sub>`) is NOT sanitized here — it is the
+        // audit KEY, not a detail value, and is never embedded in `detail`.
         auto oidc_audit_detail = std::string("auth_source=oidc;amr_mfa_asserted=") +
-                                 (amr_mfa_asserted ? "true" : "false");
+                                 (amr_mfa_asserted ? "true" : "false") +
+                                 ";display=" + detail::sanitize_detail_value(display) +
+                                 ";email=" + detail::sanitize_detail_value(email);
         if (effective_role == auth::role_to_string(auth::Role::admin)) {
             oidc_audit_detail += ";admin_group=" + admin_gid;
         }
-        audit_log_for_principal(req, "auth.oidc_login", "ok", display, effective_role, "User",
-                                display, oidc_audit_detail);
+        audit_log_for_principal(
+            req, "auth.oidc_login", "ok", username, effective_role, "User", username,
+            oidc_audit_detail);
         emit_event("auth.oidc_login", req,
                    {{"source_ip", req.remote_addr},
-                    {"username", display},
+                    {"username", username},
                     {"auth_method", "oidc"},
                     {"amr_mfa_asserted", amr_mfa_asserted},
-                    {"oidc_sub", claims.sub},
-                    {"email", email},
-                    {"name", claims.name}});
+                    {"oidc_sub", detail::sanitize_detail_value(claims.sub)},
+                    {"email", detail::sanitize_detail_value(email)},
+                    {"name", detail::sanitize_detail_value(claims.name)}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             // #1828.2: mirror the SAML login counter — role sourced from the
             // same effective_role already resolved for the audit row above.
@@ -2278,113 +2479,142 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // POST /api/v1/users/<name>/elevation-eligibility — admin grants/revokes who
     // may elevate. Body: {"eligible": <bool>}. Admin + step-up gated.
-    sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)",
-              [this, elevation_step_up, kElevationStepUpWindow](const httplib::Request& req,
-                                                                httplib::Response& res) {
-                  const auto cid = detail::make_correlation_id();
-                  res.set_header("X-Correlation-Id", cid);
-                  // Inline A4 admin gate (#1748 H3): a new REST route must carry the
-                  // A4 envelope on its denial path, not require_admin's legacy
-                  // {"error":{code,message}} body. Replicates require_admin's
-                  // token-type guards + role check, but gates on effective_role
-                  // (so an active elevation passes) and audits `auth.admin_required`.
-                  auto session = resolve_session(req);
-                  if (!session) {
-                      res.status = 401;
-                      res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
-                      return;
-                  }
-                  if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
-                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
-                                "non-interactive token blocked from admin route");
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
-                                                                 "perform admin operations",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  if (auth::effective_role(*session) != auth::Role::admin) {
-                      audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "admin role required", cid,
-                                                            "elevate via POST /api/v1/elevate, or use "
-                                                            "an admin account"),
-                                      "application/json");
-                      return;
-                  }
-                  if (!elevation_step_up(req, res, *session,
-                                         "POST /api/v1/users/{name}/elevation-eligibility",
-                                         kElevationStepUpWindow))
-                      return;
-                  auto* db = auth_mgr_.auth_db_ptr();
-                  if (!db) {
-                      res.status = 503;
-                      res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
-                                                                 "persistent auth store",
-                                                            cid, "start the server with --data-dir"),
-                                      "application/json");
-                      return;
-                  }
-                  const auto target = req.matches[1].str();
-                  if (target.empty() || !is_valid_username(target)) {
-                      res.status = 400;
-                      res.set_content(detail::error_json_a4(400, "invalid username format", cid,
-                                                            "username must match the allowed format"),
-                                      "application/json");
-                      return;
-                  }
-                  // Block self-grant (review UP-6 / security-LOW): an operator —
-                  // including one acting under an active elevation — must not set
-                  // their OWN eligibility, which would let a temporary admin
-                  // window manufacture a durable self-elevation right. Eligibility
-                  // is always granted by another admin.
-                  if (target == session->username) {
-                      audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
-                                "self_grant_blocked");
-                      res.status = 403;
-                      res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
-                                                                 "eligibility",
-                                                            cid, "another administrator must set it"),
-                                      "application/json");
-                      return;
-                  }
-                  auto body = nlohmann::json::parse(req.body, nullptr, false);
-                  if (!body.is_object() || !body.contains("eligible") ||
-                      !body["eligible"].is_boolean()) {
-                      res.status = 400;
-                      res.set_content(detail::error_json_a4(400, "body must be {\"eligible\": bool}",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  const bool eligible = body["eligible"].get<bool>();
-                  if (auto r = db->set_elevation_eligible(target, eligible); !r) {
-                      const auto err = r.error();
-                      const int code = err == AuthDBError::UserNotFound ? 404 : 500;
-                      audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
-                                "store error");
-                      res.status = code;
-                      res.set_content(detail::error_json_a4(code,
-                                                            code == 404 ? "user not found"
-                                                                        : "failed to update",
-                                                            cid),
-                                      "application/json");
-                      return;
-                  }
-                  // Revoking eligibility must terminate any in-flight elevation
-                  // immediately (governance UP-1) — symmetric with the session
-                  // wipe on demote/delete, so an incident-response "revoke now"
-                  // actually drops the operator's admin access rather than
-                  // leaving it standing for up to the window.
-                  int cleared = 0;
-                  if (!eligible)
-                      cleared = auth_mgr_.revoke_user_elevations(target);
-                  audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
-                            std::string(eligible ? "eligible=true" : "eligible=false") +
-                                (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
-                  res.set_content(R"({"status":"ok"})", "application/json");
-              });
+    //
+    // Registered on TWO route forms (both bound to the same handler below):
+    //   - /api/v1/users/([^/]+)/elevation-eligibility  — path-segment form, for
+    //     local usernames.
+    //   - /api/v1/users/elevation-eligibility?username=<principal> — query form,
+    //     REQUIRED for a durable SSO principal (`oidc:<iss>#<sub>`). httplib
+    //     percent-decodes the path (%2F -> '/', %23 -> '#') and strips the
+    //     literal '#' fragment BEFORE route-regex matching, so a `([^/]+)`
+    //     path segment can never carry the '/' and '#' an SSO principal
+    //     contains — that route 404s for every real IdP identity. The query
+    //     form mirrors the proven `DELETE /api/v1/sessions?username=` pattern.
+    auto set_elevation_eligibility = [this, elevation_step_up, kElevationStepUpWindow](
+                                         const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        // Inline A4 admin gate (#1748 H3): a new REST route must carry the
+        // A4 envelope on its denial path, not require_admin's legacy
+        // {"error":{code,message}} body. Replicates require_admin's
+        // token-type guards + role check, but gates on effective_role
+        // (so an active elevation passes) and audits `auth.admin_required`.
+        auto session = resolve_session(req);
+        if (!session) {
+            res.status = 401;
+            res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
+            return;
+        }
+        if (!session->token_scope_service.empty() || !session->mcp_tier.empty()) {
+            audit_log(req, "auth.admin_required", "denied", "endpoint", req.path,
+                      "non-interactive token blocked from admin route");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "non-interactive tokens cannot "
+                                                       "perform admin operations",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        if (auth::effective_role(*session) != auth::Role::admin) {
+            audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "admin role required", cid,
+                                                  "elevate via POST /api/v1/elevate, or use "
+                                                  "an admin account"),
+                            "application/json");
+            return;
+        }
+        if (!elevation_step_up(req, res, *session,
+                               "POST /api/v1/users/{name}/elevation-eligibility",
+                               kElevationStepUpWindow))
+            return;
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
+                                                       "persistent auth store",
+                                                  cid, "start the server with --data-dir"),
+                            "application/json");
+            return;
+        }
+        // Path-segment form (local usernames) OR query form (SSO
+        // principals — see the route-registration comment above for
+        // why a path segment can't carry the '/' and '#' of an
+        // `oidc:<iss>#<sub>` principal).
+        const std::string target = (req.matches.size() > 1 && req.matches[1].matched)
+                                        ? req.matches[1].str()
+                                        : req.get_param_value("username");
+        // #1852 — `target` may be a durable SSO principal
+        // (`oidc:<iss>#<sub>`); an admin must be able to grant
+        // elevation eligibility to an SSO operator, not just a
+        // local account. `is_valid_principal` is a strict
+        // superset of `is_valid_username`, so local-target
+        // behaviour is unchanged.
+        if (target.empty() || !is_valid_principal(target)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "invalid username format", cid,
+                                                  "username must match the allowed format"),
+                            "application/json");
+            return;
+        }
+        // Block self-grant (review UP-6 / security-LOW): an operator —
+        // including one acting under an active elevation — must not set
+        // their OWN eligibility, which would let a temporary admin
+        // window manufacture a durable self-elevation right. Eligibility
+        // is always granted by another admin.
+        if (target == session->username) {
+            audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                      "self_grant_blocked");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "cannot change your own elevation "
+                                                       "eligibility",
+                                                  cid, "another administrator must set it"),
+                            "application/json");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (!body.is_object() || !body.contains("eligible") ||
+            !body["eligible"].is_boolean()) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "body must be {\"eligible\": bool}",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        const bool eligible = body["eligible"].get<bool>();
+        if (auto r = db->set_elevation_eligible(target, eligible); !r) {
+            const auto err = r.error();
+            const int code = err == AuthDBError::UserNotFound ? 404 : 500;
+            audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
+                      "store error");
+            res.status = code;
+            res.set_content(detail::error_json_a4(code,
+                                                  code == 404 ? "user not found"
+                                                              : "failed to update",
+                                                  cid),
+                            "application/json");
+            return;
+        }
+        // Revoking eligibility must terminate any in-flight elevation
+        // immediately (governance UP-1) — symmetric with the session
+        // wipe on demote/delete, so an incident-response "revoke now"
+        // actually drops the operator's admin access rather than
+        // leaving it standing for up to the window.
+        int cleared = 0;
+        if (!eligible)
+            cleared = auth_mgr_.revoke_user_elevations(target);
+        audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
+                  std::string(eligible ? "eligible=true" : "eligible=false") +
+                      (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
+        res.set_content(R"({"status":"ok"})", "application/json");
+    };
+    // Path form: local usernames.
+    sink.Post(R"(/api/v1/users/([^/]+)/elevation-eligibility)", set_elevation_eligibility);
+    // Query form: required for SSO principals (`?username=oidc:<iss>#<sub>`,
+    // percent-encoded). The two patterns don't collide — this fixed path has
+    // exactly two segments after /api/v1/users, the path-param pattern
+    // requires three.
+    sink.Post(R"(/api/v1/users/elevation-eligibility)", set_elevation_eligibility);
 
     // POST /api/v1/elevate — activate a time-boxed admin elevation on THIS cookie
     // session. Body: {"justification": <str, required>, "duration_secs": <int>}.
@@ -2429,6 +2659,47 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                                   "ask an administrator to grant you elevation "
                                                   "eligibility"),
                             "application/json");
+            return;
+        }
+        // governance round (UP-6/UP-7/cons-N2) — source-scope the eligibility
+        // grant: `is_elevation_eligible` above keyed on the raw principal
+        // STRING alone, so a session whose principal happens to collide
+        // with an eligible row's username (a crafted SAML NameID equal to
+        // `oidc:<iss>#<sub>`, or a legacy `identity_source='local'` row
+        // literally named `oidc:x#y` that somehow has
+        // `elevation_eligible=1`) would otherwise borrow that row's grant.
+        // Require the row's `identity_source` to MATCH the session's own
+        // `auth_source`: an OIDC session may only elevate an
+        // `identity_source='oidc'` row; every other session (local,
+        // and — until SAML provisioning exists — saml) requires
+        // `identity_source='local'`. Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (SQLite is the source of
+        // truth for identity_source).
+        auto row = db->get_user(session->username);
+        if (!row) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "identity-source lookup failed");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
+            return;
+        }
+        // The eligible row's `identity_source` must equal the session's own
+        // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
+        // expects `identity_source=="saml"`, which no row carries today (SAML
+        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
+        // this gate; and a SAML NameID crafted to collide with a `local` (or
+        // `oidc`) row can no longer satisfy it. This keeps the guard correct
+        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
+        // cyber-review finding, #1852 hardening).
+        const std::string& expected_identity_source = session->auth_source;
+        if (row->identity_source != expected_identity_source) {
+            audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    "identity-source mismatch");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid), "application/json");
             return;
         }
         // MFA is MANDATORY to elevate (review #JIT security-F1). Elevation is the

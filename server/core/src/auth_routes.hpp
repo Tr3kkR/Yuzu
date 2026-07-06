@@ -23,9 +23,37 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace yuzu::server {
+
+namespace detail {
+
+/// Sanitises an externally-controlled string (the motivating case is an
+/// OIDC `display`/`email`/`sub` claim — a hostile or misconfigured IdP, or a
+/// user-set display name, is not trusted input) before it is concatenated
+/// into an audit `detail` string or an emit_event JSON attribute. `detail`
+/// is a flat "k=v;k=v" string parsed by SIEM tooling and rendered on the
+/// dashboard audit log; an unsanitised value could inject `;`/`=` to forge
+/// additional fields, or `\r`/`\n`/other control bytes to inject fake log
+/// lines or corrupt terminal/log-viewer rendering. Replaces `;`, `=`, `\r`,
+/// `\n`, and any control byte (incl. DEL) with `_`, then truncates to 128
+/// bytes — backing up to a UTF-8 code-point boundary so a multi-byte value
+/// never ends mid-sequence. Dependency-free by design. Exposed in
+/// `yuzu::server::detail` (mirrors the rest_a4_envelope.hpp pattern) so unit
+/// tests can call it directly.
+///
+/// This is audit-detail-field-injection defense ONLY — it does NOT strip
+/// HTML markup, so it is not by itself a stored-XSS defense. An IdP-supplied
+/// value with no control bytes (e.g. `<script>...</script>` as a display
+/// name) passes through unchanged; the audit-log dashboard render layer's
+/// HTML-escaping (`html_escape`) is what neutralises markup when this value
+/// is later rendered. Never rely on this function alone to make a value
+/// HTML-safe.
+std::string sanitize_detail_value(std::string_view v);
+
+} // namespace detail
 
 struct Config;
 

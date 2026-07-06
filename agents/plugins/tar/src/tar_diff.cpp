@@ -678,4 +678,44 @@ std::vector<DnsEvent> compute_dns_events(
     return events;
 }
 
+std::vector<MapDriveEvent> compute_mapdrive_events(
+    const std::vector<MapDriveEntry>& previous,
+    const std::vector<MapDriveEntry>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<MapDriveEvent> events;
+
+    // \x1f (unit separator) cannot appear in a drive/UNC/host/user string, so the
+    // composite key is collision-free without escaping (`:` and `\` are unsafe —
+    // drive letters and UNC paths contain them). direction and username ARE keyed;
+    // provider is a value-only field (a provider flap on the same mapping is not a
+    // transition).
+    auto make_key = [](const MapDriveEntry& m) -> std::string {
+        return m.direction + "\x1f" + m.local_mount + "\x1f" + m.remote_path + "\x1f" +
+               m.remote_host + "\x1f" + m.username;
+    };
+
+    std::unordered_map<std::string, const MapDriveEntry*> prev_map;
+    for (const auto& m : previous) prev_map[make_key(m)] = &m;
+    std::unordered_map<std::string, const MapDriveEntry*> curr_map;
+    for (const auto& m : current) curr_map[make_key(m)] = &m;
+
+    // origin is stamped "live" on every diff row so the DDL '' default never leaks
+    // as a third origin value; historical rows never flow through this diff.
+    for (const auto& m : current) {
+        if (!prev_map.contains(make_key(m)))
+            events.push_back({timestamp, snapshot_id, "appeared", m.direction,
+                              m.local_mount, m.remote_path, m.remote_host, m.username,
+                              m.provider, "live"});
+    }
+    for (const auto& m : previous) {
+        if (!curr_map.contains(make_key(m)))
+            events.push_back({timestamp, snapshot_id, "removed", m.direction,
+                              m.local_mount, m.remote_path, m.remote_host, m.username,
+                              m.provider, "live"});
+    }
+
+    return events;
+}
+
 } // namespace yuzu::tar

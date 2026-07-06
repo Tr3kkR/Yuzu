@@ -403,10 +403,10 @@ extern const char* const kGuardianDetailPageHtml =
 
     /* Populate nav user / role badge, mirroring the dashboard chrome. */
     fetch('/api/me').then(function (r) { return r.json(); }).then(function (d) {
-      var nu = document.getElementById('nav-user'); if (nu) nu.textContent = d.username || '';
+      var nu = document.getElementById('nav-user'); if (nu) nu.textContent = (d.display_name || d.username) || '';
       var role = d.rbac_role || d.role || '';
       var rb = document.getElementById('role-badge'); if (rb) rb.textContent = role;
-      var cu = document.getElementById('context-user'); if (cu) cu.textContent = d.username || '';
+      var cu = document.getElementById('context-user'); if (cu) cu.textContent = (d.display_name || d.username) || '';
       if (d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
         var sl = document.getElementById('nav-settings-link'); if (sl) sl.style.display = 'none';
       }

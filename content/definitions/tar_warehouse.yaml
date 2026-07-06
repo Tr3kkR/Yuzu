@@ -788,3 +788,59 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.recent_mapdrive
+  displayName: "TAR: Mapped drives (recent + historical)"
+  version: 1.0.0
+  description: >
+    Mapped network-share activity (capability-map §3.8) in both directions —
+    outbound (drives this host maps to remote shares) and inbound (remote hosts
+    mapping this host's shares). Live rows carry appeared/removed; historical
+    rows (origin='historical', from registry / fstab / event-log backfill) carry
+    action='historical'. Requires the opt-in `mapdrive` capture source to be
+    enabled on the device; rows expose usernames + share paths (identity/usage-
+    class telemetry under the works-council posture).
+  tags: [tar, warehouse, mapdrive, network, lateral-movement, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active

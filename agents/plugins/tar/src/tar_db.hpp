@@ -130,6 +130,26 @@ struct DnsEvent {
     std::string source;
 };
 
+/// One mapdrive_live row (capability-map §3.8 — network-share mappings, both
+/// directions). One row per appeared/removed transition of a (direction,
+/// local_mount, remote_path, remote_host, username) mapping; `provider` is a
+/// value field, not part of the diff key. `origin` ∈ {live, historical}:
+/// `live` rows come from the snapshot-diff (action appeared/removed); `historical`
+/// rows come from the one-time init backfill (action='historical', ts = the
+/// source artifact's time or 0) and bypass the diff entirely.
+struct MapDriveEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action;    // appeared, removed, historical
+    std::string direction; // outbound, inbound
+    std::string local_mount;
+    std::string remote_path;
+    std::string remote_host;
+    std::string username;
+    std::string provider;
+    std::string origin;    // live, historical
+};
+
 /// One perf_live row (BRD A1 — continuous device performance sampling).
 struct PerfRow {
     int64_t ts{0};
@@ -217,6 +237,55 @@ struct NetQualRow {
                                // degraded-signal candidates before committing 4b.3's query.
 };
 
+/// One netqual_boot row (ADR-0020) — the per-boot RETROSPECTIVE baseline,
+/// written once per boot at plugin init from cumulative-since-boot OS counters
+/// (Windows: GetTcpStatisticsEx2 IPv4+IPv6 + GetIfTable2 non-loopback totals).
+/// `window_s = ts - boot_ts` is the pre-TAR window the counters summarize:
+/// "what was network quality like this boot, before TAR was running".
+///
+/// SIGNAL DISCIPLINE — these are since-boot cumulative TOTALS: one average over
+/// the whole window, coarse retrospective CONTEXT only. Never derive a
+/// current-loss verdict from their ratio (see NetQualRow above — the
+/// device-aggregate live signal was empirically disproven). Host-wide, no
+/// per-connection or per-process attribution, no addresses: nothing usage-class
+/// on the row, but it ships under netqual's opt-in toggle regardless.
+struct NetQualBootRow {
+    int64_t ts{0};              // t_live: when TAR started observing this boot
+    int64_t snapshot_id{0};
+    int64_t boot_ts{0};         // epoch seconds of system boot
+    int64_t window_s{0};        // ts - boot_ts (clamped >= 0)
+    int64_t retrans_segs{0};    // TCP segments retransmitted since boot (v4+v6)
+    int64_t segs_out{0};        // TCP segments sent since boot (v4+v6)
+    int64_t estab_resets{0};    // established->reset transitions since boot
+    int64_t if_in_errors{0};    // non-loopback interface totals since boot
+    int64_t if_in_discards{0};
+    int64_t if_out_errors{0};
+    int64_t if_out_discards{0};
+    int64_t if_in_octets{0};
+    int64_t if_out_octets{0};
+};
+
+/// One netconn_live row (ADR-0020) — a single OS-logged connectivity
+/// transition (network connect/disconnect, NCSI capability change, Wi-Fi
+/// connect/fail/disconnect). `ts` is the EVENT's timestamp, not the read
+/// time: backfilled rows carry timestamps from before TAR existed on the box.
+///
+/// PRIVACY — every TEXT field is a closed enum token produced by the
+/// allow-list parser in tar_netconn.hpp; no SSID, BSSID, profile name,
+/// interface GUID, MAC, or any other free-text event field is ever extracted
+/// from the source event (test-pinned in test_tar_netconn.cpp).
+struct NetConnRow {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action;     // connected/disconnected/wifi_connected/
+                            // wifi_connect_failed/wifi_disconnected/capability_changed
+    std::string channel;    // networkprofile/ncsi/wlan
+    std::string category;   // public/private/domain ("" when n/a)
+    std::string capability; // none/local/internet ("" when n/a)
+    std::string iface_kind; // wifi ("" when unknown)
+    int64_t reason_code{0}; // WLAN disconnect/fail reason or NCSI change reason
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -302,9 +371,12 @@ public:
     bool insert_software_events(const std::vector<SoftwareEvent>& events);
     bool insert_arp_events(const std::vector<ArpEvent>& events);
     bool insert_dns_events(const std::vector<DnsEvent>& events);
+    bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
+    bool insert_netqual_boot_row(const NetQualBootRow& row);
+    bool insert_netconn_events(const std::vector<NetConnRow>& rows);
     bool insert_module_events(const std::vector<ModuleRow>& rows);
 
     /**
