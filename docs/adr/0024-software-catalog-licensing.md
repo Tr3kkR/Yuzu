@@ -1,7 +1,7 @@
 # ADR-0024: Software Catalog & Licensing (agent-detected compliance + entitlements)
 
 **Date:** 2026-07-04
-**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules) · 2026-07-06 (rev 4 — second review round on PR #1870: renumbered 0021→0024 [0021 is claimed by two open branches (spark-reflex, cavm-observed-reachability), 0022 by vuln-dashboard, 0023 by vuln-correlation-engine — verified across all open remote branches, first-to-merge wins]; the M365 client secret moves **out of `RuntimeConfigStore` entirely** into a SecretCodec-registered column on the born-on-PG entitlement store, and PR2 owns the codec's **first production wiring** with named encrypted-at-rest / fail-closed tests; `--license-scan-user-ref` default flipped `collect`→`hash` and `hash` upgraded from unsalted `sha256/12` to a **per-agent keyed HMAC**; `docs/os-capability-matrix.md` + `docs/agent-privilege-model.md` rows added to the PR1 file plan)
+**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules) · 2026-07-06 (rev 4 — second review round on PR #1870: renumbered 0021→0024 [0021 is claimed by two open branches (spark-reflex, cavm-observed-reachability), 0022 by vuln-dashboard, 0023 by vuln-correlation-engine — verified across all open remote branches, first-to-merge wins]; the M365 client secret moves **out of `RuntimeConfigStore` entirely** into a SecretCodec-registered column on the born-on-PG entitlement store, and PR2 owns the codec's **first production wiring** with named encrypted-at-rest / fail-closed tests; `--license-scan-user-ref` default flipped `collect`→`hash` and `hash` upgraded from unsalted `sha256/12` to a **per-agent keyed HMAC**; `docs/os-capability-matrix.md` + `docs/agent-privilege-model.md` rows added to the PR1 file plan; same-day internal governance pass [6 gates, docs-only adaptation — all PASS, no CRITICAL/HIGH] folded in: `exe_hints` persisted from migration v1, M365 connector input pinning + admin-gated config + config-write audit event, worsening-only/hold-down alert semantics, §6 Observability metric families, §8 GDPR-personal-data/erasure/`omit`-scope/effective-mode-verifiability clarifications, `host_ref` format pin, no-reaper retention statements, user-manual REST/MCP/TOC/metrics doc rows across PR1–PR4, PR3 `delete_agent` hook)
 **Status:** Proposed
 **Component:** Agent (new `license_scan` plugin + sync source) · Server (three new Postgres stores, ingest seams, compliance evaluator, M365 licensing connector, SCL page, REST/MCP) · Gateway (proxy passthrough)
 **Authors:** Alex Young
@@ -242,8 +242,13 @@ detected licence rows + posture rollups + alert dedup. Migration v1:
   clock-skew rule)
 - `agent_licenses(id, agent_id FK CASCADE, product, vendor, version,
   license_type, state, expiry_at /*agent-observed epoch, 0=none*/, channel,
-  key_hint, detector, user_scope, user_ref, collected_at, first_seen,
-  last_seen)` + indexes on `agent_id`, `state`, partial on `expiry_at > 0`
+  key_hint, detector, exe_hints, user_scope, user_ref, collected_at,
+  first_seen, last_seen)` + indexes on `agent_id`, `state`, partial on
+  `expiry_at > 0` — `exe_hints` is persisted from migration v1 (governance
+  pass): it is on the §1 wire contract and is §9's authoritative
+  product↔exe bridge for PR3's usage join; adding it later would leave the
+  column empty on stable estates (hash-skip suppresses re-sync exactly when
+  nothing changes)
 - `license_posture_rollup(product_key PK /*soft key = catalog norm_key*/,
   vendor, title, device_count, install_count, per-effective-state counts,
   next_expiry_at, expiring_soon_count, refreshed_at)`
@@ -327,8 +332,14 @@ Unused* — reclamation must not fire on missing data.
 
 The evaluator computes per-product condition fingerprints — `expired`
 (expired+unlicensed count > 0) and `expiring` bucketed by min-days-to-expiry
-(30/14/7/1) — and fires **only** on (a) fingerprint/bucket transition, or
-(b) persistence past a 7-day re-arm. Emission uses the existing dual-sink
+(30/14/7/1) — and fires **only** on (a) a **worsening** fingerprint/bucket
+transition (an improving transition — e.g. renewing the nearest-expiring
+licence moves the bucket 7→30 — never fires; governance pass), or
+(b) persistence past a 7-day re-arm. A condition that clears and re-asserts
+inside the re-arm window is suppressed (hold-down) so oscillating states
+(KMS grace↔expired drift, daily re-imaged VMs) cannot spam; both the
+improving-transition and clear/re-assert cases are named rows in the
+`test_license_compliance_evaluator.cpp` matrix. Emission uses the existing dual-sink
 pattern (`server.cpp` alert wiring): `NotificationStore::create(...)` +
 `webhook_store_`/`offload_target_store_->fire_event(...)` with event types
 **`software_license.expiring`** / **`software_license.expired`** and payload
@@ -337,12 +348,29 @@ bucket}`. PR2 adds **`software_entitlement.renewal_due`** (§10) with the same
 bucket/re-arm discipline and its own dedup table. This satisfies "not
 dashboard-only" without daily spam, and escalates as expiry approaches.
 
+**Observability (governance pass).** Each PR ships metric families per
+`docs/observability-conventions.md` (bounded labels, initialised-to-0,
+named like the NVD-sync precedent), with matching
+`docs/user-manual/metrics.md` and `docs/prometheus/yuzu-alerts.yml` rows in
+the PR file plans: PR1 — evaluator last-success-timestamp gauge +
+cycle-failure counter (a stuck keep-last-good evaluator must be scrapeable,
+not just a UI freshness caption), ingestion-reject counter (caps/enum
+whitelist hits — a fleet-misbehaviour signal), notification-fired counter;
+PR2 — `yuzu_server_m365_lic_sync_failures_total{reason}` cloning the NVD
+convention + connector last-success gauge; PR3 — usage ingest counters.
+
 ### 7. Access surfaces — the SCL page, REST, RBAC, MCP
 
 New securable **`SoftwareCatalog`** seeded in `rbac_store.cpp seed_defaults()`
 in PR1: **Read** granted to the standard viewer/operator role lists (all
-views), **Write** to admin/operator roles (entitlement CRUD/import and
-connector triggers in PR2, tag writes in PR4). **No MFA step-up anywhere in
+views — a **conscious acceptance**, noted here and in the PR2 data-inventory
+row, that entitlement financial metadata (cost, contract/PO refs) is visible
+to every `SoftwareCatalog:Read` holder fleet-wide, consistent with how other
+securables scope), **Write** to admin/operator roles (entitlement CRUD/import
+and connector triggers in PR2, tag writes in PR4). Connector *configuration*
+— tenant/client IDs and the client secret — is **admin-gated** (the
+`admin_fn_` OIDC-Settings precedent), not `SoftwareCatalog:Write`; only
+**Sync-now** rides the securable (§10.3, governance pass). **No MFA step-up anywhere in
 §27**: entitlement records are financial metadata and nothing here executes
 on endpoints — the `software-packages` step-up precedent exists because that
 endpoint introduces *executable content dispatched to the fleet*. RBAC Write
@@ -375,8 +403,9 @@ The software **catalog stays on `/inventory`** (owner decision); the SCL
 header carries a cross-link. Nav: an SCL link is inserted after Inventory in
 **all 11 hand-duplicated nav copies** plus the command-palette `navEntries`;
 the pre-existing Result Sets nav drift is reconciled in the same PR as its
-own commit (after a `git log` check that the short nav on the viz host page
-is drift, not design).
+own commit — the drift spans **three** files (the viz-host short nav plus
+the two guardian navs missing the Result Sets link), each confirmed drift,
+not design, via a `git log` check before editing.
 
 **REST** (`rest_api_v1.cpp`; everything under a unified **`/api/v1/scl/*`**
 prefix; modelled on the `/api/v1/inventory/software` handler: auth → perm →
@@ -397,7 +426,11 @@ read time** (ADR-0017:221-231). They are therefore **pinned global-only, by
 design and not by accident**: when list reads flip to admit-then-filter
 fleet-wide, these aggregates remain gated on the *global*
 `SoftwareCatalog:Read` — a group-confined principal is **denied (403)**, never
-served a partial or leaky rollup. Per-row surfaces
+served a partial or leaky rollup. The SCL fragments render that denial as
+explicit guidance ("requires global SoftwareCatalog:Read"), not a bare 403 —
+an all-scoped-operators deployment (MSP/divisional) sees an honest
+explanation, and recompute-per-visible-set remains the documented future
+option for that shape (governance pass). Per-row surfaces
 (`/scl/licenses/{key}/devices`, `/scl/agents/{agent_id}`, device drill
 fragments) take the admit-then-filter chokepoint. Named tests in
 `test_scl_routes.cpp` prove both halves: `[scl][adr0017]`
@@ -462,6 +495,25 @@ name>`. Containment and remediation path:
   `hash`, asserts HMAC-key stability across runs (same profile → same
   pseudonym after agent restart; distinct profiles → distinct pseudonyms),
   and asserts the HMAC key itself never appears in the blob or logs.
+- **Honest legal + verification posture (governance pass):** a hashed
+  `user_ref` is pseudonymized and therefore still **personal data under
+  GDPR** (Recital 26) — retention and erasure obligations attach even in
+  the default mode. The erasure path, stated plainly: licence records are
+  full-replaced on every sync, so flipping the knob to `omit` purges the
+  identifiers fleet-wide within one 24 h cycle, and agent removal cascades
+  via the `delete_agent` hook; there is **no row-level erasure API** (an
+  honestly stated gap — the PR1 data-inventory row carries both facts). A
+  deployment electing `collect` owns its DPIA/lawful-basis assessment.
+  `omit` suppresses the *identifier*, not per-user *probing* — per-user
+  hives are still read and `user_scope=user` records still ship (on a
+  single-user device the person may be attributable by inference); fully
+  suppressing per-user probing today means the source-level
+  `inventory_disable` opt-out, and a dedicated per-user-probe disable is
+  the named future knob if a deployment demands it. Fleet posture is
+  **centrally verifiable**: the source's `surfaces` diagnostics report the
+  effective `user-ref` mode per agent and the per-device SCL drill
+  (`/scl/agents/{agent_id}`) surfaces it — an auditor can evidence "every
+  agent runs `hash`" without endpoint-by-endpoint config inspection.
 - **Transparency ships in PR1 too:** the enterprise data inventory
   (`docs/enterprise-readiness-soc2-first-customer.md`) and
   `docs/user-manual/software-licensing.md` document exactly which fields are
@@ -516,6 +568,13 @@ blob as a second record kind (protected by the §1 forward-compat rule):
 ent|product|vendor|feature|seats_total|seats_in_use|license_type|term_end|source(flexlm|kms)|host_ref
 ```
 
+`host_ref` is format-pinned so the §10.2 identity keys derive
+deterministically from the wire (governance pass): FlexLM records carry
+`<server>:<port>` from the `.lic` `SERVER` line; KMS records carry the
+observing agent's ID, with `product` carrying the KMS SKU identifier —
+yielding `flexlm:<server>:<port>:<feature>` and `kms:<agent_id>:<sku>`
+without server-side guessing.
+
 #### 10.2 `SoftwareEntitlementStore` (born-on-PG, schema `software_entitlement_store`)
 
 Migration v1 tables:
@@ -540,7 +599,11 @@ Migration v1 tables:
   seats_assigned, installed_count, winning_source, basis, delta, compliance,
   next_renewal_at, refreshed_at)` — evaluator output, replace-in-txn.
 - `entitlement_alert_state(product_key, kind renewal_due|overdeployed,
-  fingerprint, bucket, last_fired_at, PK(product_key, kind))`.
+  fingerprint, bucket, last_fired_at, PK(product_key, kind))` —
+  `overdeployed` is a **reserved** kind (governance pass): no
+  over-deployment alert ships in PR2 (the Compliance view is the surface);
+  reserving the CHECK value now avoids a migration if that alert is added
+  later.
 - `connector_secret(connector TEXT PK, secret_enc BYTEA NOT NULL,
   updated_by, updated_at)` — one row per connector (`graph_m365` in v1);
   `secret_enc` is a **`SecretCodec` envelope blob, never plaintext** (§10.3).
@@ -563,9 +626,16 @@ the same licence server converges on one row; agent_kms = per-host
 annotation fields. Postures: reads authoritative (nullopt → 503/banner);
 connector/agent ingest fail-soft; manual/CSV/REST writes user-facing and
 audited (`software_entitlement.create/update/delete/import`, denied rows
-included). One secret column in the whole store —
+included) — connector **config and secret writes are additionally audited**
+(`software_entitlement.connector_config_update`, denied rows included),
+since repointing the tenant is a security-relevant change (governance
+pass). One secret column in the whole store —
 `connector_secret.secret_enc`, SecretCodec-registered per §10.3 — and no
-plaintext secret column anywhere.
+plaintext secret column anywhere. Retention, stated honestly for the PR2
+data-inventory row (governance pass): soft-retired entitlements,
+`entitlement_imports` provenance, and operator identities have **no
+reaper** — explicit DELETE is the disposal mechanism, matching the
+enterprise doc's honest-gap convention for stores without one.
 
 #### 10.3 Microsoft Graph M365 connector
 
@@ -581,6 +651,22 @@ renewal, totalLicenses, isTrial). **No per-user `licenseDetails` fan-out**
 (N×HTTP cost + PII, both avoided). skuPartNumber → product title via a seed
 map + the §5 matcher. Required Graph application permission:
 `Organization.Read.All`.
+
+**Connector input pinning (governance pass — named PR2 tests):**
+`tenant_id` must match GUID-or-verified-domain syntax and `client_id` GUID
+syntax, rejected at the Settings/REST layer before storage; the token and
+Graph base hosts are **fixed constants** (`login.microsoftonline.com`,
+`graph.microsoft.com`) — operator input is never string-built into a URL
+beyond the path-segment-encoded tenant; `@odata.nextLink` is followed
+**only when same-origin with the Graph base**, with a bounded page count —
+a poisoned `nextLink` must never steer the bearer token off-host (the SSRF
+class). Recovery pairing, documented in PR2's operator docs: the
+`FileKeyProvider` KEK lives outside Postgres, so a PG-only restore leaves
+`secret_enc` undecryptable — correctly fail-closed, the connector stays
+loudly down until the secret is re-entered in Settings; the KEK directory
+joins the documented backup scope, and the three PR2 fatal-boot causes (PG
+unreachable / migration failure / codec `init()` failure) get **distinct
+triage tokens** as a named acceptance criterion.
 
 Config lives in **Settings** (clone of the OIDC section: form + **Test
 Connection** button that acquires a token and fetches one `subscribedSkus`
@@ -739,7 +825,14 @@ package-metadata surface — entitlement certs and FlexLM do carry expiry);
 row: the per-user offline-hive probe (`RegLoadKey`) uses
 `SeBackupPrivilege`/`SeRestorePrivilege`, **already granted** by
 `scripts/install-agent-user.ps1` — the row cites the existing grant, no new
-privilege is introduced); `changelog.d/` fragment.
+privilege is introduced); `docs/user-manual/rest-api.md` (**governance
+pass** — the four `/api/v1/scl/*` read endpoints documented per the
+manual's method/permissions/examples convention; in-code OpenAPI literals
+alone do not satisfy the docs gate); `docs/user-manual/mcp.md` (both new
+tools in the Available Tools table with their securable);
+`docs/user-manual/README.md` (TOC row for `software-licensing.md`);
+`docs/user-manual/metrics.md` + `docs/prometheus/yuzu-alerts.yml` (PR1
+metric families, §6 Observability); `changelog.d/` fragment.
 
 **Implementation order:**
 
@@ -826,7 +919,15 @@ production `SecretCodec` wiring** — `FileKeyProvider` + codec construction,
 files; ladder/capability-map/`changelog.d/`;
 `docs/enterprise-readiness-soc2-first-customer.md` (**data-inventory row for
 `software_entitlement_store`** — entitlement financial-metadata class,
-retention/deletion; SecretCodec-encrypted connector secret noted);
+retention/deletion incl. the no-reaper statement; SecretCodec-encrypted
+connector secret noted);
+`docs/user-manual/rest-api.md` + `docs/user-manual/mcp.md` (**governance
+pass** — entitlement/compliance/connector endpoints + the new MCP tool);
+`docs/user-manual/software-licensing.md` (connector settings, required
+egress `login.microsoftonline.com` / `graph.microsoft.com` :443 + proxy
+statement, KEK backup scope + keyless-restore runbook step);
+`docs/user-manual/metrics.md` + `docs/prometheus/yuzu-alerts.yml` (M365
+sync-failure metrics);
 `directory_sync.cpp` (switch to `graph_http` — behaviour-neutral refactor).
 
 **Implementation order:** `SecretCodec` boot wiring in `server.cpp`
@@ -882,9 +983,12 @@ if not (compliance math needs rows, not sources — the seam is clean).
   `--usage-sync-enable` / `YUZU_AGENT_USAGE_SYNC_ENABLE`, default off; TAR
   absent/disabled → source no-ops → asset is *Unreported*.
 - Server: `SoftwareUsageStore` + `software_usage_ingestion.{hpp,cpp}` +
-  `typed_inventory_sources.hpp` key (**same-commit**); evaluator reclamation
-  pass (usage→catalog join per §9; Used/Rarely/Unused/Unreported per §5);
-  `GET /api/v1/scl/reclamation?unused_days=90`; usage columns on SCL views.
+  `typed_inventory_sources.hpp` key (**same-commit**); the agent-removal
+  `delete_agent` hook wires this store too (governance pass — usage rows
+  keyed by `agent_id` must not orphan on decommission); evaluator
+  reclamation pass (usage→catalog join per §9; Used/Rarely/Unused/Unreported
+  per §5); `GET /api/v1/scl/reclamation?unused_days=90`; usage columns on
+  SCL views.
 - Tests: `test_software_usage_store.cpp` `[pg]`; `test_usage_sync.cpp` — TAR
   `sql` output parsing, three-query merge with monthly fallback (last-used
   never moves backwards), bucket boundaries, TAR-error ⇒ skip, **PII guard:
@@ -899,7 +1003,10 @@ if not (compliance math needs rows, not sources — the seam is clean).
   and this document holds 0024; re-verify against **all** open remote
   branches at PR time, first-to-merge wins) or an Updates section here;
   ladder tick; capability-map §27.2; **data-inventory row for
-  `software_usage_store`** (usage telemetry class, retention, opt-in).
+  `software_usage_store`** (usage telemetry class, retention, opt-in);
+  `--usage-sync-enable` documented in `software-licensing.md`;
+  `docs/user-manual/rest-api.md` row for the reclamation endpoint +
+  metrics rows (governance pass).
 
 ### PR4 — `feat/software-tags-reclamation` — tags + reclamation view
 **Driver 5 (visible reclamation). Closes #267 + #1869.**
@@ -920,7 +1027,9 @@ if not (compliance math needs rows, not sources — the seam is clean).
   `GET /api/v1/scl/reclamation`; `/test` + `/governance`.
 - Docs: a tags ADR or a rev here (number assigned at PR time);
   capability-map §27.4/§27.5 done; data-inventory row updated for
-  `product_tags`.
+  `product_tags`; `docs/user-manual/rest-api.md` (tag CRUD endpoints) +
+  `docs/user-manual/mcp.md` (`query_license_reclamation`) rows
+  (governance pass).
 
 ## Consequences
 
