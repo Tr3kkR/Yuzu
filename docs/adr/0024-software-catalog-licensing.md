@@ -1,7 +1,7 @@
 # ADR-0024: Software Catalog & Licensing (agent-detected compliance + entitlements)
 
 **Date:** 2026-07-04
-**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules) · 2026-07-06 (rev 4 — second review round on PR #1870: renumbered 0021→0024 [0021 is claimed by two open branches (spark-reflex, cavm-observed-reachability), 0022 by vuln-dashboard, 0023 by vuln-correlation-engine — verified across all open remote branches, first-to-merge wins]; the M365 client secret moves **out of `RuntimeConfigStore` entirely** into a SecretCodec-registered column on the born-on-PG entitlement store, and PR2 owns the codec's **first production wiring** with named encrypted-at-rest / fail-closed tests; `--license-scan-user-ref` default flipped `collect`→`hash` and `hash` upgraded from unsalted `sha256/12` to a **per-agent keyed HMAC**; `docs/os-capability-matrix.md` + `docs/agent-privilege-model.md` rows added to the PR1 file plan; same-day internal governance pass [6 gates, docs-only adaptation — all PASS, no CRITICAL/HIGH] folded in: `exe_hints` persisted from migration v1, M365 connector input pinning + admin-gated config + config-write audit event, worsening-only/hold-down alert semantics, §6 Observability metric families, §8 GDPR-personal-data/erasure/`omit`-scope/effective-mode-verifiability clarifications, `host_ref` format pin, no-reaper retention statements, user-manual REST/MCP/TOC/metrics doc rows across PR1–PR4, PR3 `delete_agent` hook)
+**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules) · 2026-07-06 (rev 4 — second review round on PR #1870: renumbered 0021→0024 [0021 is claimed by two open branches (spark-reflex, cavm-observed-reachability), 0022 by vuln-dashboard, 0023 by vuln-correlation-engine — verified across all open remote branches, first-to-merge wins]; the M365 client secret moves **out of `RuntimeConfigStore` entirely** into a SecretCodec-registered column on the born-on-PG entitlement store, and PR2 owns the codec's **first production wiring** with named encrypted-at-rest / fail-closed tests; `--license-scan-user-ref` default flipped `collect`→`hash` and `hash` upgraded from unsalted `sha256/12` to a **per-agent keyed HMAC**; `docs/os-capability-matrix.md` + `docs/agent-privilege-model.md` rows added to the PR1 file plan; same-day internal governance pass [6 gates, docs-only adaptation — all PASS, no CRITICAL/HIGH] folded in: `exe_hints` persisted from migration v1, M365 connector input pinning + admin-gated config + config-write audit event, worsening-only/hold-down alert semantics, §6 Observability metric families, §8 GDPR-personal-data/erasure/`omit`-scope/effective-mode-verifiability clarifications, `host_ref` format pin, no-reaper retention statements, user-manual REST/MCP/TOC/metrics doc rows across PR1–PR4, PR3 `delete_agent` hook) · 2026-07-06 (rev 5 — third review round on PR #1870, **blockers only**; the round's should-fix/minor items are deliberately deferred to the implementation PRs per operator direction and remain recorded on the PR review: §10.3 SecretCodec wiring **reordered** to `register_secret_column` + `set_audit_hook` **before** `codec.init()` — `init()` snapshots the registered columns for the boot-time orphan scan and emits the first-boot `kek.generated` audit event, so the rev-4 order silently dropped both; §7 per-device SCL routes **no longer claim the not-yet-implemented ADR-0017 PR-A chokepoint** — they ship global-gated in PR1 (the same inert-confinement posture as every existing list read) and are registered as flip-wave consumers of PR-A [#1634 umbrella, #1715 prerequisite — PR-A has no dedicated tracker; the `#1716` comment forward-references in server/core point at a closed doc-honesty PR, not the gate], with the filters-before-LIMIT test landing at the flip)
 **Status:** Proposed
 **Component:** Agent (new `license_scan` plugin + sync source) · Server (three new Postgres stores, ingest seams, compliance evaluator, M365 licensing connector, SCL page, REST/MCP) · Gateway (proxy passthrough)
 **Authors:** Alex Young
@@ -413,8 +413,11 @@ prefix; modelled on the `/api/v1/inventory/software` handler: auth → perm →
 `error_json_a4` + X-Correlation-Id; OpenAPI literals updated):
 
 - PR1: `GET /api/v1/scl/summary` · `GET /api/v1/scl/licenses?state=&expiring_within_days=&q=&limit=`
-  · `GET /api/v1/scl/licenses/{key}/devices` (ADR-0017 admit-then-filter
-  before LIMIT) · `GET /api/v1/scl/agents/{agent_id}` (scoped per-device gate).
+  · `GET /api/v1/scl/licenses/{key}/devices` ·
+  `GET /api/v1/scl/agents/{agent_id}` — all four gated on **global
+  `SoftwareCatalog:Read`** in PR1 (see "Per-row surfaces — honest
+  sequencing" below for why the per-device pair does not claim the
+  ADR-0017 chokepoint yet).
 
 **ADR-0017 aggregate pinning (rev 3, blocker fix).** The SCL fleet-wide
 aggregate surfaces — `GET /api/v1/scl/summary`, `GET /api/v1/scl/licenses`,
@@ -430,14 +433,38 @@ served a partial or leaky rollup. The SCL fragments render that denial as
 explicit guidance ("requires global SoftwareCatalog:Read"), not a bare 403 —
 an all-scoped-operators deployment (MSP/divisional) sees an honest
 explanation, and recompute-per-visible-set remains the documented future
-option for that shape (governance pass). Per-row surfaces
-(`/scl/licenses/{key}/devices`, `/scl/agents/{agent_id}`, device drill
-fragments) take the admit-then-filter chokepoint. Named tests in
-`test_scl_routes.cpp` prove both halves: `[scl][adr0017]`
+option for that shape (governance pass).
+
+**Per-row surfaces — honest sequencing (rev 5, blocker fix).** The
+admit-then-filter chokepoint (`authorize_list_read`, ADR-0017 **PR-A**) is
+**not implemented yet** — the open umbrella is **#1634** (systemic
+response-read scoping) with the PR-A prerequisite decision in **#1715**;
+PR-A itself has **no dedicated tracker yet**, and the `#1716`
+forward-references scattered through existing `server/core` comments point
+at a *closed* doc-honesty companion PR, not the gate — do not follow them.
+Rev 4 was wrong to write as if PR1 could call the chokepoint. PR1
+therefore does **not** build the foundation and does **not** wire an
+ad-hoc per-row filter (the exact pattern ADR-0017 exists to replace).
+Instead the per-row surfaces (`/scl/licenses/{key}/devices`,
+`/scl/agents/{agent_id}`, device drill fragments) ship gated on **global
+`SoftwareCatalog:Read`** — the same inert-confinement posture every
+existing list read in the codebase has today, no worse and no better —
+and are hereby **registered as flip-wave consumers of ADR-0017 PR-A**
+(#1634/#1715): when the chokepoint lands, these routes take
+`authorize_list_read` (filter before LIMIT) in the same fleet-wide flip as
+the other list reads, and the follow-up test
+`"per-device drill filters before LIMIT"` lands with that flip, not with
+PR1. MCP tools are classified by the same row-shape test at wiring time
+(ADR-0017's "does a returned row carry an agent id?"): a §27 MCP tool
+returning fleet aggregates stays pinned-global like its REST twin; any
+tool returning per-device rows joins this flip-wave registration alongside
+its REST sibling. Named tests in `test_scl_routes.cpp` at PR1: `[scl][adr0017]`
 `"aggregate routes are global-gated: scoped principal gets 403, never a
-partial rollup"` and `"per-device drill filters before LIMIT"`. Recomputing
-aggregates per visible set is the documented future alternative if
-group-scoped rollups are ever demanded; it is out of scope here.
+partial rollup"` and `"per-device drills are global-gated (chokepoint
+pending ADR-0017 PR-A: scoped principal gets 403, never an unfiltered
+row set)"`. Recomputing aggregates per visible set is the documented
+future alternative if group-scoped rollups are ever demanded; it is out of
+scope here.
 - PR2 (§10): entitlement CRUD + CSV import + compliance + connector routes.
 - PR3: `GET /api/v1/scl/reclamation?unused_days=90`.
 - PR4: `GET/POST/DELETE /api/v1/scl/catalog/products/{id}/tags`.
@@ -687,18 +714,35 @@ row_pk = "graph_m365")`.
 #1320 PR 4 with unit tests but no server-side consumer yet), so PR2
 explicitly owns, in `server.cpp`:
 
-- construct `FileKeyProvider` (it implements the `KekProvider` seam,
-  `key_provider.hpp`) + `SecretCodec`, and run `codec.init(conn)` on a
-  pinned pool lease **before** any PG store opens (ADR-0010 §2 boot order);
+- **strict construction order (rev 5, blocker fix):** construct
+  `FileKeyProvider` (it implements the `KekProvider` seam,
+  `key_provider.hpp`) + `SecretCodec` → **`register_secret_column(...)`** →
+  **`set_audit_hook(...)`** → **`codec.init(conn)`** on a pinned pool lease
+  → only then open the PG stores (ADR-0010 §2 boot order). Registration and
+  the audit hook MUST precede `init()`: `init()` snapshots the registered
+  columns and feeds that snapshot to the boot-time orphan scan
+  (`secret_codec.cpp` — a restored DB with a `connector_secret.secret_enc`
+  blob but a deleted `secrets.kek_meta` row must fail closed at *boot* with
+  `kek_orphaned`, not surface later at decrypt time), and `init()` emits the
+  first-boot `kek.generated` audit event, which is lost if the hook is not
+  yet installed. This is the order the codec's own boot-scan tests pin
+  (the orphaned-kek_version and unsupported-pk-type cases in
+  `test_secret_codec.cpp` register before `init()`; the codec tolerates
+  late registration for other flows, but a column only gets boot-time
+  orphan protection when registered pre-`init()`), and it is safe on
+  first boot: the orphan scan explicitly skips registered columns whose
+  tables are not yet migrated (`42P01 undefined_table → continue`), so
+  registering a column for a store that has not been constructed yet is
+  correct, not a race;
 - `init()` failure = `startup_failed` — the server refuses to boot rather
   than run with unreadable secrets (the codec header's stated wiring
   obligation; no deferred-init path, so the `/readyz` conjunction clause is
   not needed);
-- `register_secret_column({"software_entitlement_store",
+- registration tuple: `register_secret_column({"software_entitlement_store",
   "connector_secret", "secret_enc", pk_column = "connector"})` (the column
   registration names the PK *column*; the AAD tuple above binds each blob to
-  its PK *value*) and `set_audit_hook(...)` → AuditStore (`kek.generated`,
-  `kek.rotated`, `kek.retired`, `secret.decrypt_failure` verbs).
+  its PK *value*); audit hook → AuditStore (`kek.generated`, `kek.rotated`,
+  `kek.retired`, `secret.decrypt_failure` verbs).
 
 Store API: `set_connector_secret()` encrypts (an encrypt failure **aborts
 the write transaction** — never a plaintext or empty write);
@@ -860,7 +904,7 @@ metric families, §6 Observability); `changelog.d/` fragment.
 | `test_software_licensing_store.cpp` `[pg]` | hash-skip trichotomy (stored/touched/need-full), replace-in-txn, cascade delete, posture/alert-state CRUD, **cross-pinned canonical-hash constant** |
 | `test_software_licensing_ingestion.cpp` | input caps, enum whitelisting, expiry plausibility clamp, hash recompute (never trusts claimed), empty-blob = valid replace-to-empty, **unknown record kinds skipped** |
 | `test_license_compliance_evaluator.cpp` | injected clock: condition/bucket transitions, 7-day re-arm, degrade ≠ false all-clear |
-| `test_scl_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), subnav active states, shell substitution + active-nav replace pair, limit clamps, **`[scl][adr0017]` aggregate pinning: scoped principal → 403 on summary/licenses (never a partial rollup); per-device drill filters before LIMIT** |
+| `test_scl_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), subnav active states, shell substitution + active-nav replace pair, limit clamps, **`[scl][adr0017]` pinning: scoped principal → 403 on summary/licenses (never a partial rollup) AND on the per-device drills (global-gated pending ADR-0017 PR-A — the "filters before LIMIT" test lands with the fleet-wide flip, not PR1)** |
 | `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics, **unknown record kinds skipped**, **`--license-scan-user-ref` collect/hash/omit modes: default is `hash`; HMAC pseudonym stable across agent restarts, distinct per profile; HMAC key never reaches blob/logs** |
 | `test_licensing_parsers.cpp` (agent) | SLP LicenseStatus mapping incl. grace codes, channel/SPDX classifiers, FlexLM expiry, DEP-5 header detection, key-hint never echoes input, **non-ASCII registry fixture (wide-API/UTF-8 round-trip)** |
 
@@ -914,8 +958,8 @@ secret lives SecretCodec-encrypted in the entitlement store, §10.3);
 OpenAPI); `mcp_server.cpp` (`query_software_entitlements`, extend the
 summary tool); `server.cpp` (store + connector lifecycle wiring; **first
 production `SecretCodec` wiring** — `FileKeyProvider` + codec construction,
-`init()` before PG stores open, init-failure = `startup_failed`,
-`register_secret_column` + audit hook, §10.3); meson
+`register_secret_column` + audit hook, then `init()` before PG stores open,
+init-failure = `startup_failed` — §10.3 strict order); meson
 files; ladder/capability-map/`changelog.d/`;
 `docs/enterprise-readiness-soc2-first-customer.md` (**data-inventory row for
 `software_entitlement_store`** — entitlement financial-metadata class,
@@ -931,8 +975,9 @@ sync-failure metrics);
 `directory_sync.cpp` (switch to `graph_http` — behaviour-neutral refactor).
 
 **Implementation order:** `SecretCodec` boot wiring in `server.cpp`
-(provider + `init()` + fail-closed boot, §10.3) → entitlement store
-(incl. `connector_secret` + codec column registration) + `[pg]` tests →
+(provider + **column registration + audit hook + `init()`, in §10.3's
+strict order** — registration precedes `init()`, fail-closed boot) →
+entitlement store (incl. the `connector_secret` table) + `[pg]` tests →
 `csv_import` + parser tests → REST CRUD/import + dry-run → GUI
 (Entitlements view, form, upload) → `graph_http` extraction
 (directory_sync stays green) → M365 connector + Settings section + Test
@@ -1107,15 +1152,19 @@ if not (compliance math needs rows, not sources — the seam is clean).
   posture (licence source only) and the usage source's and M365 connector's
   full conformance. The typed-source registry rule (§4) implements ADR-0016
   §5 parity.
-- **ADR-0017** — per-device SCL reads route through the admit-then-filter
-  list gate; the fleet-wide aggregate surfaces are **pinned global-only by
-  design** (a group-confined principal gets 403, never a partial or leaky
-  rollup — enforced by §7's named `[scl][adr0017]` tests), mirroring the
-  `/inventory` `software_catalog` precedent that ADR-0017:221-231 documents.
+- **ADR-0017** — the SCL fleet-wide aggregate surfaces are **pinned
+  global-only by design** (a group-confined principal gets 403, never a
+  partial or leaky rollup); the per-device SCL reads ship **global-gated at
+  PR1** and are **registered as flip-wave consumers of ADR-0017 PR-A**
+  (#1634 umbrella; #1715 prerequisite) — they adopt the admit-then-filter chokepoint when it
+  lands, in the same fleet-wide flip as every other list read (§7, rev 5).
+  Both halves are enforced by §7's named `[scl][adr0017]` tests, mirroring
+  the `/inventory` `software_catalog` precedent that ADR-0017:221-231
+  documents.
 - **ADR-0010** — no software-licence key material is stored (moot by
   construction); the M365 client secret is a registered `SecretCodec`
   column on the entitlement store from PR2, which also carries the codec's
-  **first production wiring** (boot `init()` fail-closed, column
-  registration, audit hook — §10.3). The legacy `oidc_client_secret`
+  **first production wiring** (column registration + audit hook, then boot
+  `init()` fail-closed — §10.3 strict order). The legacy `oidc_client_secret`
   plaintext gap (SQLite `RuntimeConfigStore`) is out of scope and
   separately tracked.
