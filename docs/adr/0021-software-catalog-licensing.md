@@ -1,7 +1,7 @@
-# ADR-0020: Software Catalog & Licensing (agent-detected compliance + entitlements)
+# ADR-0021: Software Catalog & Licensing (agent-detected compliance + entitlements)
 
 **Date:** 2026-07-04
-**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page)
+**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules)
 **Status:** Proposed
 **Component:** Agent (new `license_scan` plugin + sync source) · Server (three new Postgres stores, ingest seams, compliance evaluator, M365 licensing connector, SCL page, REST/MCP) · Gateway (proxy passthrough)
 **Authors:** Alex Young
@@ -37,7 +37,7 @@ operator questions the platform cannot answer today:
   counts) riding the same daily-sync source as a second record kind.
 
 Three new born-on-Postgres stores hold canonical software identities
-(`SoftwareCatalogStore`, with deterministic automatic matching), detected
+(`ProductRegistryStore`, with deterministic automatic matching), detected
 licence state (`SoftwareLicensingStore`), and entitlements
 (`SoftwareEntitlementStore`). A background evaluator derives **effective
 licence state** (including lapse) server-side, computes per-product
@@ -45,8 +45,8 @@ licence state** (including lapse) server-side, computes per-product
 fleet posture, and emits deduplicated `software_license.expiring` /
 `software_license.expired` / `software_entitlement.renewal_due`
 notifications + webhook events. Operators get a **new top-level SCL page**
-(Software Catalogue & Licensing: Licences | Entitlements | Compliance
-sub-views, with the software catalogue staying on `/inventory`, cross-linked),
+(Software Catalog & Licensing: Licences | Entitlements | Compliance
+sub-views, with the software catalog staying on `/inventory`, cross-linked),
 `/api/v1/scl/*` REST, and MCP tools, all gated on a new `SoftwareCatalog`
 securable.
 
@@ -63,8 +63,10 @@ fabricated zero.
 **Deliberate deviation:** at the product owner's direction, licence detection
 probes **per-user surfaces** (user registry hives, profile licence files) for
 coverage, which deviates from ADR-0016's machine-scope/no-PII posture. §8
-isolates that data in two suppressible fields and defines the remediation
-path; this carve-out applies to the `software_licensing` source **only**.
+isolates that data in two fields controlled by a **named knob shipped in PR1**
+(`--license-scan-user-ref=collect|hash|omit`, default `collect`) and makes
+data-inventory transparency a PR1 acceptance criterion; this carve-out
+applies to the `software_licensing` source **only**.
 
 ## Context
 
@@ -98,13 +100,27 @@ seat counts and KMS activation counts), plus a GUI form, GUI CSV upload, and
 a CSV REST ingest. The earlier rejection stands **only for licence
 detection**, which remains agent-only. The owner also directed a **brand-new
 top-level "SCL" dashboard page**, reversing rev 1's tab-on-/inventory choice;
-the software catalogue itself stays on `/inventory` (SCL links across).
+the software catalog itself stays on `/inventory` (SCL links across).
 
 Name collisions constrain the design: `LicenseStore` and the `License` RBAC
 securable already exist for **Yuzu's own product licence** (capability §22.3)
 and are untouched; everything here uses
-`SoftwareCatalog*`/`SoftwareLicensing*`/`SoftwareEntitlement*` naming and
-`software_license.*`/`software_entitlement.*` event names.
+`ProductRegistry*`/`SoftwareLicensing*`/`SoftwareEntitlement*` naming and
+`software_license.*`/`software_entitlement.*` event names. Likewise,
+"software catalog" already means the shipped `/inventory` rollup of
+**installed** software (`SoftwareCatalogRow`/`SoftwareCatalogRollup`) — the
+new canonical-identity store is therefore named **`ProductRegistryStore`**
+(a master-data registry, not a catalog), and "software catalog" keeps its
+existing meaning. The **`SoftwareCatalog` securable name is retained**: it
+gates the whole §27 capability surface and matches the capability-map name,
+not the registry store.
+
+**Terminology rule (rev 3, applies to all downstream docs/UI/support copy):**
+the bare word "licence" is ambiguous the moment this ships. Always qualify:
+**"Yuzu licence"** for the product licence (§22.3), **"software licence"** /
+**"detected licence"** for endpoint software licensing. Spelling of the
+capability name follows the capability map: **"Catalog"** (SCL = "Software
+Catalog & Licensing").
 
 ## Decision
 
@@ -152,6 +168,13 @@ Sanitisation: every field strips `| \n \r 0x1F 0x1E NUL` and clamps to
 1024 bytes; the sync source re-clamps defensively and the server seam clamps
 again (untrusted input).
 
+**Registry string encoding (rev 3):** all Windows registry string reads in
+this plugin follow the repo-wide rule — wide `Reg*W` APIs +
+`WideCharToMultiByte(CP_UTF8)` via `agents/shared/win_str.hpp`, never
+`Reg*A` — and `test_licensing_parsers.cpp` includes a **non-ASCII registry
+fixture** (product/vendor values with non-Latin characters) proving the
+round-trip.
+
 **Forward compatibility (load-bearing, shipped in PR1):** both the agent-side
 blob parser and the server ingest seam **skip unrecognised record-kind
 prefixes** (test-enforced). This lets later PRs add record kinds — §10's
@@ -195,16 +218,16 @@ Per the postgres-store playbook (migrate-at-construction on a pinned lease,
 schema-qualified runtime SQL, `exec_params`, `RETURNING`, bounded leases,
 fatal-on-open-failure inside the `pg_pool_` guard, destruct-before-pool):
 
-**`SoftwareCatalogStore`** (schema `software_catalog_store`) — §27.1 canonical
+**`ProductRegistryStore`** (schema `product_registry_store`) — §27.1 canonical
 identities + match links. Migration v1:
 
-- `catalog_products(product_id BIGSERIAL PK, norm_key TEXT UNIQUE, vendor,
+- `products(product_id BIGSERIAL PK, norm_key TEXT UNIQUE, vendor,
   title, edition, platform, created_at, updated_at)`
-- `catalog_aliases(source, raw_name, raw_publisher, product_id FK CASCADE,
+- `product_aliases(source, raw_name, raw_publisher, product_id FK CASCADE,
   method, confidence, first_matched_at, last_seen_at,
   PK(source, raw_name, raw_publisher))` + index on `product_id`
 
-Migration v2 (PR4): `catalog_tags(product_id FK CASCADE, tag, created_by,
+Migration v2 (PR4): `product_tags(product_id FK CASCADE, tag, created_by,
 created_at, PK(product_id, tag))`.
 
 Posture: authoritative reads (nullopt on degrade → REST 503); writes come only
@@ -268,7 +291,7 @@ completion-spaced hourly cadence, keep-last-good, stop/join before store
 teardown). Passes, sequential:
 
 1. **Catalog matching** (§27.1) via a pure library
-   `catalog_normalize.{hpp,cpp}`: `normalize_title` (lowercase, strip
+   `product_normalize.{hpp,cpp}`: `normalize_title` (lowercase, strip
    arch/version/edition tokens → edition extracted), `normalize_vendor`
    (strip legal suffixes, alias table), then strictly ordered deterministic
    tiers — `exact_norm` (1.0) → `title_vendor` (0.9) → `token_set` (0.8) →
@@ -286,7 +309,7 @@ teardown). Passes, sequential:
    syncing* before its licence lapsed still shows `expired` (driver 2's
    definition of lapsed: effective state ∈ {expired, unlicensed});
    `next_expiry_at`; `expiring_soon_count` (≤ 30 days); `install_count`
-   joined from installed-software rows through `catalog_aliases` — the
+   joined from installed-software rows through `product_aliases` — the
    "installed but licence-unreported" delta is shown, not hidden.
 3. **Entitlement compliance pass** (PR2, §10): purchased-vs-deployed per
    product, renewal calendar.
@@ -326,7 +349,7 @@ endpoint introduces *executable content dispatched to the fleet*. RBAC Write
 control.
 
 **The SCL page (rev 2).** A brand-new top-level dashboard page **`/scl`**
-("SCL — Software Catalogue & Licensing"), built on the shared guardian shell
+("SCL — Software Catalog & Licensing"), built on the shared guardian shell
 (`kGuardianDetailPageHtml`: {{TITLE}}/{{FRAGMENT}} substitution + the
 exact-string active-nav replace pair), implemented as
 `scl_routes.{hpp,cpp}` + `scl_ui.cpp` cloning the `/inventory` model
@@ -347,7 +370,7 @@ TestRouteSink tests; MSVC 16380-byte raw-string chunking). Sub-views as
   bars; `unentitled` products listed honestly, not hidden.
 - **Reclamation** (PR4): candidates = paid licence type × Unused/Rarely.
 
-The software **catalogue stays on `/inventory`** (owner decision); the SCL
+The software **catalog stays on `/inventory`** (owner decision); the SCL
 header carries a cross-link. Nav: an SCL link is inserted after Inventory in
 **all 11 hand-duplicated nav copies** plus the command-palette `navEntries`;
 the pre-existing Result Sets nav drift is reconciled in the same PR as its
@@ -362,6 +385,25 @@ prefix; modelled on the `/api/v1/inventory/software` handler: auth → perm →
 - PR1: `GET /api/v1/scl/summary` · `GET /api/v1/scl/licenses?state=&expiring_within_days=&q=&limit=`
   · `GET /api/v1/scl/licenses/{key}/devices` (ADR-0017 admit-then-filter
   before LIMIT) · `GET /api/v1/scl/agents/{agent_id}` (scoped per-device gate).
+
+**ADR-0017 aggregate pinning (rev 3, blocker fix).** The SCL fleet-wide
+aggregate surfaces — `GET /api/v1/scl/summary`, `GET /api/v1/scl/licenses`,
+and the Licences-view fragments they feed — are built from the precomputed
+`license_posture_rollup` (and later `entitlement_posture`), whose counts are
+aggregated across every management group. Exactly like their `/inventory`
+`software_catalog` twin, they **cannot take a per-row admit-then-filter at
+read time** (ADR-0017:221-231). They are therefore **pinned global-only, by
+design and not by accident**: when list reads flip to admit-then-filter
+fleet-wide, these aggregates remain gated on the *global*
+`SoftwareCatalog:Read` — a group-confined principal is **denied (403)**, never
+served a partial or leaky rollup. Per-row surfaces
+(`/scl/licenses/{key}/devices`, `/scl/agents/{agent_id}`, device drill
+fragments) take the admit-then-filter chokepoint. Named tests in
+`test_scl_routes.cpp` prove both halves: `[scl][adr0017]`
+`"aggregate routes are global-gated: scoped principal gets 403, never a
+partial rollup"` and `"per-device drill filters before LIMIT"`. Recomputing
+aggregates per visible set is the documented future alternative if
+group-scoped rollups are ever demanded; it is out of scope here.
 - PR2 (§10): entitlement CRUD + CSV import + compliance + connector routes.
 - PR3: `GET /api/v1/scl/reclamation?unused_days=90`.
 - PR4: `GET/POST/DELETE /api/v1/scl/catalog/products/{id}/tags`.
@@ -385,9 +427,24 @@ name>`. Containment and remediation path:
 - Machine-scope records (`user_scope=machine`, `user_ref` empty) remain the
   overwhelming majority; per-user probes add coverage for per-user-licensed
   products (JetBrains, Adobe-class) that are otherwise `unknown`.
-- **Remediation later** (as directed): a single agent-side flag can suppress
-  or hash `user_ref` without schema or wire changes; a follow-up issue tracks
-  making that the works-council deployment profile default if required.
+- **The configuration knob ships in PR1, named and tested (rev 3):**
+  **`--license-scan-user-ref=collect|hash|omit`** (env
+  `YUZU_AGENT_LICENSE_SCAN_USER_REF`), applied in the sync source before the
+  canonical blob is built — `collect` sends the profile name, `hash` sends
+  `sha256/12(profile)`, `omit` sends an empty field (records stay,
+  `user_scope` still distinguishes per-user detections). **Default:
+  `collect`** — per explicit operator direction, the overwhelming majority of
+  managed fleets (~95%) have no works-council constraint, and restricting
+  detection by default would cost real capability there for no benefit. The
+  requirement is transparency + configurability, not safe-by-default: a
+  deployment that needs suppression today has a lever on day one, and
+  `test_licensing_sync.cpp` covers all three modes.
+- **Transparency ships in PR1 too:** the enterprise data inventory
+  (`docs/enterprise-readiness-soc2-first-customer.md`) and
+  `docs/user-manual/software-licensing.md` document exactly which fields are
+  collected per surface (including `user_scope`/`user_ref` and the knob), so
+  what is collected can be shown to a works council on request. Both are PR1
+  acceptance criteria — nothing is deferred to unfiled follow-ups.
 - The **usage** source (PR3) does **not** inherit this carve-out: usage rows
   stay machine-scope, the per-user TAR dimension is aggregated out on the
   agent (`GROUP BY` app name only), and a unit test fails if a username
@@ -497,9 +554,14 @@ Config lives in **Settings** (clone of the OIDC section: form + **Test
 Connection** button that acquires a token and fetches one `subscribedSkus`
 page), persisted via `RuntimeConfigStore` allow-listed keys
 `m365_lic_tenant_id` / `m365_lic_client_id` / `m365_lic_client_secret` /
-`m365_lic_enabled`. **The client secret is stored plaintext today — the same
-explicitly-documented caveat as `oidc_client_secret`; wiring both through
-ADR-0010 SecretCodec is flagged as follow-up debt, not silently accepted.**
+`m365_lic_enabled`. **The client secret is stored via `SecretCodec` (ADR-0010
+envelope encryption, `pg/secret_codec.hpp`) from day one — mandatory in PR2,
+not follow-up debt.** The store playbook already lists `runtime_config` among
+the stores that *require* SecretCodec; a brand-new secret must not extend the
+known `oidc_client_secret` plaintext gap (that legacy gap is explicitly out
+of scope here — PR2 wires the codec for the new key only, on the
+already-shipped mechanism). Rev-3 change per PR #1870 review (blocker,
+confirmed against `docs/postgres-store-playbook.md`).
 The SCL Entitlements view shows a status card (configured, last/next sync,
 rows, last error) + a Write-gated, audited **Sync now**
 (`POST /api/v1/scl/connectors/m365/sync`, 202 + status URL;
@@ -558,7 +620,7 @@ added or renamed updates the affected `meson.build`.
 
 ### PR1 — `feat/software-licensing` — detection + stores + SCL page (Licences) + expiry alerting
 **Drivers 1–3. Closes #264 (catalog store; automatic matching here,
-`/inventory` catalogue foundation delivered by PR #1759 and cross-linked);
+`/inventory` catalog foundation delivered by PR #1759 and cross-linked);
 advances #266 and #1869.**
 
 **New files (dependency order):**
@@ -566,16 +628,16 @@ advances #266 and #1869.**
 | # | Path | Contents |
 |---|------|----------|
 | 1 | `agents/core/src/sync_canonical.{hpp,cpp}` | `sanitize_utf8_strict` / `clamp_field` / `sha256_hex` extracted byte-identically from `sync_source_installed_software.cpp` (which switches to them) |
-| 2 | `server/core/src/catalog_normalize.{hpp,cpp}` | pure normalisation lib: `normalize_title/vendor`, `norm_key`, tiered `match`, `effective_license_state`, constants (`kExpiryWarnDays=30`, buckets 30/14/7/1, `kRearmSecs=7d`) |
-| 3 | `server/core/src/software_catalog_store.{hpp,cpp}` | born-on-PG store, migration v1 (`catalog_products`, `catalog_aliases`) |
+| 2 | `server/core/src/product_normalize.{hpp,cpp}` | pure normalisation lib: `normalize_title/vendor`, `norm_key`, tiered `match`, `effective_license_state`, constants (`kExpiryWarnDays=30`, buckets 30/14/7/1, `kRearmSecs=7d`) |
+| 3 | `server/core/src/product_registry_store.{hpp,cpp}` | born-on-PG store, migration v1 (`products`, `product_aliases`) |
 | 4 | `server/core/src/software_licensing_store.{hpp,cpp}` | born-on-PG store, migration v1 (`agent_license_state`, `agent_licenses`, `license_posture_rollup`, `license_alert_state`) + server-side `canonical_hash` |
 | 5 | `agents/plugins/license_scan/` | `meson.build`, `src/license_scan_plugin.cpp` (dispatch), `src/licensing_record.hpp` (record struct + sanitiser), `src/licensing_parsers.hpp` (pure SLP/channel/SPDX/FlexLM/DEP-5 parsers), `src/licensing_probes.{hpp,cpp}` (ProbeSpec table + engine), `src/licensing_win.cpp` / `licensing_linux.cpp` / `licensing_macos.cpp` |
 | 6 | `agents/core/src/sync_source_software_licensing.{hpp,cpp}` | parse → canonical blob → sha256; `LocalDispatcher` dispatch of `license_scan list`; 24 h interval; caps 10k records / 1 MiB; **skips unknown record kinds** (§1) |
 | 7 | `server/core/src/software_licensing_ingestion.{hpp,cpp}` | ingest seam (caps, enum whitelists, expiry clamp, server-side hash recompute, replace-in-txn, skip-unknown-kind) |
 | 8 | `server/core/src/license_compliance_evaluator.{hpp,cpp}` | background thread: matcher pass → posture rollup → alert dedup/fire |
-| 9 | `server/core/src/scl_routes.{hpp,cpp}` + `scl_ui.cpp` | the `/scl` page: guardian-shell route, `scl_subnav`, Licences view renderers, state-mix donut provider, catalogue cross-link |
+| 9 | `server/core/src/scl_routes.{hpp,cpp}` + `scl_ui.cpp` | the `/scl` page: guardian-shell route, `scl_subnav`, Licences view renderers, state-mix donut provider, catalog cross-link |
 | 10 | `docs/user-manual/software-licensing.md` | operator doc |
-| 11 | Tests — server: `tests/unit/server/test_catalog_normalize.cpp`, `test_software_catalog_store.cpp`, `test_software_licensing_store.cpp`, `test_software_licensing_ingestion.cpp`, `test_license_compliance_evaluator.cpp`, `test_scl_routes.cpp`; agent: `tests/unit/test_licensing_sync.cpp`, `tests/unit/test_licensing_parsers.cpp` | see test matrix |
+| 11 | Tests — server: `tests/unit/server/test_product_normalize.cpp`, `test_product_registry_store.cpp`, `test_software_licensing_store.cpp`, `test_software_licensing_ingestion.cpp`, `test_license_compliance_evaluator.cpp`, `test_scl_routes.cpp`; agent: `tests/unit/test_licensing_sync.cpp`, `tests/unit/test_licensing_parsers.cpp` | see test matrix |
 
 **Modified files:** top-level `meson.build` (`subdir('agents/plugins/license_scan')`);
 `agents/core/meson.build`; `server/core/meson.build`; `tests/meson.build`;
@@ -595,7 +657,13 @@ OpenAPI literal); `server/core/src/mcp_server.cpp` (two tools);
 `server/core/src/server.cpp` (stores in the `pg_pool_` guard, fatal on
 `!is_open()`, destruct-before-pool order; evaluator start/stop +
 `set_on_alert` dual-sink; SCL route closures; agent-removal `delete_agent`
-hook); `docs/postgres-migration-ladder.md` (two born-on-PG rows);
+hook); `agents/core/include/yuzu/agent/agent.hpp` + `agents/core/src/main.cpp`
+(`--license-scan-user-ref` flag parsing, §8);
+`docs/postgres-migration-ladder.md` (two born-on-PG rows);
+`docs/enterprise-readiness-soc2-first-customer.md` (**data-inventory rows for
+`product_registry_store` + `software_licensing_store`** — data class,
+retention/deletion/opt-out, the `user_scope`/`user_ref` fields and knob;
+correct any daily-sync "no end-user PII" line this makes inaccurate);
 `docs/capability-map.md` (§27.1/§27.3); `docs/roadmap.md` (Phase 10
 staleness note); `changelog.d/` fragment.
 
@@ -603,7 +671,7 @@ staleness note); `changelog.d/` fragment.
 
 1. `sync_canonical` extraction; existing installed-software cross-pin test
    stays green (proves byte-neutrality).
-2. `catalog_normalize` + pure unit tests.
+2. `product_normalize` + pure unit tests.
 3. Both PG stores + `[pg]` store tests (TDD against a local Postgres).
 4. Ingestion seam + `typed_inventory_sources.hpp` + service-impl wiring +
    cross-pinned hash constants (agent↔server test files share the constant
@@ -620,14 +688,14 @@ staleness note); `changelog.d/` fragment.
 
 | Test file | Asserts |
 |---|---|
-| `test_catalog_normalize.cpp` | normalisation, match tiers T1–T3 + birth, `effective_license_state` lapse derivation |
-| `test_software_catalog_store.cpp` `[pg]` | migration-at-construction, upsert txn semantics, alias resolution, nullopt-on-degrade |
+| `test_product_normalize.cpp` | normalisation, match tiers T1–T3 + birth, `effective_license_state` lapse derivation |
+| `test_product_registry_store.cpp` `[pg]` | migration-at-construction, upsert txn semantics, alias resolution, nullopt-on-degrade |
 | `test_software_licensing_store.cpp` `[pg]` | hash-skip trichotomy (stored/touched/need-full), replace-in-txn, cascade delete, posture/alert-state CRUD, **cross-pinned canonical-hash constant** |
 | `test_software_licensing_ingestion.cpp` | input caps, enum whitelisting, expiry plausibility clamp, hash recompute (never trusts claimed), empty-blob = valid replace-to-empty, **unknown record kinds skipped** |
 | `test_license_compliance_evaluator.cpp` | injected clock: condition/bucket transitions, 7-day re-arm, degrade ≠ false all-clear |
-| `test_scl_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), subnav active states, shell substitution + active-nav replace pair, scope filtering, limit clamps |
-| `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics, **unknown record kinds skipped** |
-| `test_licensing_parsers.cpp` (agent) | SLP LicenseStatus mapping incl. grace codes, channel/SPDX classifiers, FlexLM expiry, DEP-5 header detection, key-hint never echoes input |
+| `test_scl_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), subnav active states, shell substitution + active-nav replace pair, limit clamps, **`[scl][adr0017]` aggregate pinning: scoped principal → 403 on summary/licenses (never a partial rollup); per-device drill filters before LIMIT** |
+| `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics, **unknown record kinds skipped**, **`--license-scan-user-ref` collect/hash/omit modes** |
+| `test_licensing_parsers.cpp` (agent) | SLP LicenseStatus mapping incl. grace codes, channel/SPDX classifiers, FlexLM expiry, DEP-5 header detection, key-hint never echoes input, **non-ASCII registry fixture (wide-API/UTF-8 round-trip)** |
 
 **Verification / acceptance (PR1):**
 1. `meson test --suite server --suite agent` green, with PG store tests
@@ -645,6 +713,9 @@ staleness note); `changelog.d/` fragment.
 4. `/test` pipeline (includes the upgrade-from-previous-release leg — the new
    schemas must migrate cleanly on an existing database) and `/governance`
    8-gate pipeline; CRITICAL/HIGH findings block merge.
+5. **Docs acceptance (rev 3):** the enterprise data-inventory rows and the
+   user-manual collection disclosure (§8) are present in the PR — reviewable
+   evidence that a works council could be shown exactly what is collected.
 
 Size ~3.5k LOC. Pre-agreed split seam if review requests it: PR1a =
 plugin + source + stores + ingest + REST; PR1b = SCL page + evaluator/events
@@ -673,8 +744,11 @@ upload form, connector status card); `settings_routes.cpp` + `settings_ui.cpp`
 `rest_api_v1.cpp` (entitlement CRUD/import/compliance/connector routes +
 OpenAPI); `mcp_server.cpp` (`query_software_entitlements`, extend the
 summary tool); `server.cpp` (store + connector lifecycle wiring); meson
-files; ladder/capability-map/`changelog.d/`; `directory_sync.cpp` (switch to
-`graph_http` — behaviour-neutral refactor).
+files; ladder/capability-map/`changelog.d/`;
+`docs/enterprise-readiness-soc2-first-customer.md` (**data-inventory row for
+`software_entitlement_store`** — entitlement financial-metadata class,
+retention/deletion; SecretCodec-encrypted connector secret noted);
+`directory_sync.cpp` (switch to `graph_http` — behaviour-neutral refactor).
 
 **Implementation order:** entitlement store + `[pg]` tests → `csv_import` +
 parser tests → REST CRUD/import + dry-run → GUI (Entitlements view, form,
@@ -731,13 +805,15 @@ if not (compliance math needs rows, not sources — the seam is clean).
   capture + `--usage-sync-enable` on one agent, generate activity, confirm
   usage rows land and reclamation returns expected categories; a
   TAR-disabled agent reports *Unreported*; `/test` + `/governance`.
-- Docs: ADR-0021 (usage privacy posture) or an Updates section here; ladder
-  tick; capability-map §27.2.
+- Docs: a dedicated usage-metering ADR (number assigned at PR time — 0021/0022
+  are contested by other open branches) or an Updates section here; ladder
+  tick; capability-map §27.2; **data-inventory row for
+  `software_usage_store`** (usage telemetry class, retention, opt-in).
 
 ### PR4 — `feat/software-tags-reclamation` — tags + reclamation view
 **Driver 5 (visible reclamation). Closes #267 + #1869.**
 
-- `SoftwareCatalogStore` migration v2 (`catalog_tags`); tag CRUD REST
+- `ProductRegistryStore` migration v2 (`product_tags`); tag CRUD REST
   (`GET/POST/DELETE /api/v1/scl/catalog/products/{id}/tags`,
   `SoftwareCatalog:Write`) + tag chips in the SCL views.
 - Management-group dynamic-rule integration ("devices with software tagged
@@ -745,13 +821,15 @@ if not (compliance math needs rows, not sources — the seam is clean).
 - RECLAMATION sub-view on `/scl`: candidates = paid `license_type` ×
   (Unused | Rarely used), per-title drill-down, charts; unmatched-usage
   coverage view (honest gap reporting). MCP `query_license_reclamation`.
-- **New files:** `tests/unit/server/test_software_catalog_tags.cpp` (`[pg]`,
+- **New files:** `tests/unit/server/test_software_product_tags.cpp` (`[pg]`,
   migration v2 upgrade path from v1, tag CRUD, cascade on product delete).
 - **Verification:** migration-upgrade test against a v1-created database
   (plus the `/test` upgrade leg); tag writes audited and rejected without
   `SoftwareCatalog:Write`; reclamation view matches
   `GET /api/v1/scl/reclamation`; `/test` + `/governance`.
-- Docs: ADR-0022 (or a rev here); capability-map §27.4/§27.5 done.
+- Docs: a tags ADR or a rev here (number assigned at PR time);
+  capability-map §27.4/§27.5 done; data-inventory row updated for
+  `product_tags`.
 
 ## Consequences
 
@@ -773,9 +851,9 @@ if not (compliance math needs rows, not sources — the seam is clean).
   reconciled in the same PR).
 - The per-user carve-out (§8) is a deliberate, contained ADR-0016 deviation
   requiring maintainer sign-off, with a one-flag suppression path.
-- The M365 connector persists its client secret plaintext in
-  `RuntimeConfigStore` (parity with OIDC today); ADR-0010 SecretCodec wiring
-  for both is flagged follow-up debt.
+- The M365 connector's client secret is envelope-encrypted via SecretCodec
+  from its first commit (PR2); the pre-existing `oidc_client_secret`
+  plaintext gap remains separately tracked and is not extended.
 - Fleet network cost is negligible: licence blobs hash-skip (stable
   estates), usage blobs are tens of KB daily from active machines only;
   Graph sync is one tenant-level call pair per day.
@@ -826,6 +904,7 @@ if not (compliance math needs rows, not sources — the seam is clean).
 - **ADR-0017** — per-device SCL reads route through the admit-then-filter
   list gate; fleet aggregates carry the documented inert-confinement caveat
   until the gate lands fleet-wide.
-- **ADR-0010** — no licence key material is stored (moot by construction);
-  the M365 client secret in `RuntimeConfigStore` is the flagged exception,
-  tracked as SecretCodec follow-up debt alongside `oidc_client_secret`.
+- **ADR-0010** — no software-licence key material is stored (moot by
+  construction); the M365 client secret is stored via SecretCodec from PR2
+  (the playbook already mandates it for `runtime_config`). The legacy
+  `oidc_client_secret` plaintext gap is out of scope and separately tracked.
