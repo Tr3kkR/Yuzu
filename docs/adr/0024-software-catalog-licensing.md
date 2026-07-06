@@ -1,7 +1,7 @@
-# ADR-0021: Software Catalog & Licensing (agent-detected compliance + entitlements)
+# ADR-0024: Software Catalog & Licensing (agent-detected compliance + entitlements)
 
 **Date:** 2026-07-04
-**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules)
+**Revised:** 2026-07-04 (rev 2 — entitlements return to scope; SCL top-level page) · 2026-07-06 (rev 3 — review remediation on PR #1870: renumbered 0020→0021 [0020 was already owned by the accepted TAR-netqual retrospective]; M365 secret via SecretCodec; SCL aggregates pinned global-only per ADR-0017; named `user_ref` config knob shipped in PR1; `ProductRegistryStore` rename; enterprise data-inventory acceptance criteria; terminology and registry-encoding rules) · 2026-07-06 (rev 4 — second review round on PR #1870: renumbered 0021→0024 [0021 is claimed by two open branches (spark-reflex, cavm-observed-reachability), 0022 by vuln-dashboard, 0023 by vuln-correlation-engine — verified across all open remote branches, first-to-merge wins]; the M365 client secret moves **out of `RuntimeConfigStore` entirely** into a SecretCodec-registered column on the born-on-PG entitlement store, and PR2 owns the codec's **first production wiring** with named encrypted-at-rest / fail-closed tests; `--license-scan-user-ref` default flipped `collect`→`hash` and `hash` upgraded from unsalted `sha256/12` to a **per-agent keyed HMAC**; `docs/os-capability-matrix.md` + `docs/agent-privilege-model.md` rows added to the PR1 file plan)
 **Status:** Proposed
 **Component:** Agent (new `license_scan` plugin + sync source) · Server (three new Postgres stores, ingest seams, compliance evaluator, M365 licensing connector, SCL page, REST/MCP) · Gateway (proxy passthrough)
 **Authors:** Alex Young
@@ -64,7 +64,8 @@ fabricated zero.
 probes **per-user surfaces** (user registry hives, profile licence files) for
 coverage, which deviates from ADR-0016's machine-scope/no-PII posture. §8
 isolates that data in two fields controlled by a **named knob shipped in PR1**
-(`--license-scan-user-ref=collect|hash|omit`, default `collect`) and makes
+(`--license-scan-user-ref=collect|hash|omit`, **default `hash`** — a per-agent
+keyed-HMAC pseudonym, rev 4; raw profile names are opt-in) and makes
 data-inventory transparency a PR1 acceptance criterion; this carve-out
 applies to the `software_licensing` source **only**.
 
@@ -427,18 +428,40 @@ name>`. Containment and remediation path:
 - Machine-scope records (`user_scope=machine`, `user_ref` empty) remain the
   overwhelming majority; per-user probes add coverage for per-user-licensed
   products (JetBrains, Adobe-class) that are otherwise `unknown`.
-- **The configuration knob ships in PR1, named and tested (rev 3):**
+- **The configuration knob ships in PR1, named and tested (rev 3; modes and
+  default revised in rev 4):**
   **`--license-scan-user-ref=collect|hash|omit`** (env
   `YUZU_AGENT_LICENSE_SCAN_USER_REF`), applied in the sync source before the
-  canonical blob is built — `collect` sends the profile name, `hash` sends
-  `sha256/12(profile)`, `omit` sends an empty field (records stay,
-  `user_scope` still distinguishes per-user detections). **Default:
-  `collect`** — per explicit operator direction, the overwhelming majority of
-  managed fleets (~95%) have no works-council constraint, and restricting
-  detection by default would cost real capability there for no benefit. The
-  requirement is transparency + configurability, not safe-by-default: a
-  deployment that needs suppression today has a lever on day one, and
-  `test_licensing_sync.cpp` covers all three modes.
+  canonical blob is built — `collect` sends the raw profile name, `hash`
+  sends a **pseudonym**: `HMAC-SHA256(k_agent, profile)` truncated to 16 hex
+  characters, where `k_agent` is a random 256-bit key generated on first use
+  (OS CSPRNG), persisted in the agent's local KvStore, and **never
+  transmitted or logged** — not the rev-3 unsalted `sha256/12(profile)`,
+  which a low-entropy profile name (`jsmith`, `admin`) makes trivially
+  dictionary-reversible. `omit` sends an empty field (records stay,
+  `user_scope` still distinguishes per-user detections). **Default: `hash`**
+  (rev 4, per the PR #1870 second review round): every other per-user or
+  behavioral source in this project ships off/safe by default (`procperf`,
+  `$Software`, `$NetQual`, `$NetConn` — enterprise-readiness works-council
+  section), the existing `installed_software` daily-sync source is
+  machine-scope by deliberate ADR-0016 §8 decision (per-user enumeration
+  "deliberately not used"), and the TAR `software` source documents the same
+  no-per-user-hives / no-`NTUSER.DAT` posture in
+  `docs/agent-privilege-model.md` — a raw-identifier default here would
+  reverse that posture. The default-`hash` pseudonym keeps the per-user
+  **capability** intact on unconstrained fleets (per-user detections still
+  flow; distinct users on a machine stay distinct and stable across syncs,
+  so per-user seat math works within a device), while raw operator-readable
+  names are one explicit flag away (`collect`). Honest
+  limits, stated in the operator docs: `hash` is **pseudonymization, not
+  anonymization** — the mapping is stable per agent (linkable over time on
+  one device; the same person on two devices yields two unrelated
+  pseudonyms, so cross-device user dedup needs `collect`) — and
+  works-council-grade suppression is **`omit`**, not `hash`.
+  `test_licensing_sync.cpp` covers all three modes, asserts the default is
+  `hash`, asserts HMAC-key stability across runs (same profile → same
+  pseudonym after agent restart; distinct profiles → distinct pseudonyms),
+  and asserts the HMAC key itself never appears in the blob or logs.
 - **Transparency ships in PR1 too:** the enterprise data inventory
   (`docs/enterprise-readiness-soc2-first-customer.md`) and
   `docs/user-manual/software-licensing.md` document exactly which fields are
@@ -454,7 +477,8 @@ name>`. Containment and remediation path:
   the OS-provided partial (last-5) or an in-memory SHA-256 prefix of key
   files; full keys never touch output, logs, or KvStore. This moots ADR-0010
   SecretCodec for these stores by construction. (The M365 connector's client
-  secret is a separate, flagged concern — §10.)
+  secret is handled separately — SecretCodec-encrypted on the entitlement
+  store, §10.3.)
 
 Maintainer sign-off on this section is requested explicitly in the PR1
 review (it amends ADR-0016's posture for this source).
@@ -517,6 +541,12 @@ Migration v1 tables:
   next_renewal_at, refreshed_at)` — evaluator output, replace-in-txn.
 - `entitlement_alert_state(product_key, kind renewal_due|overdeployed,
   fingerprint, bucket, last_fired_at, PK(product_key, kind))`.
+- `connector_secret(connector TEXT PK, secret_enc BYTEA NOT NULL,
+  updated_by, updated_at)` — one row per connector (`graph_m365` in v1);
+  `secret_enc` is a **`SecretCodec` envelope blob, never plaintext** (§10.3).
+  `TEXT` PK is deliberate: it is one of the two PK types the codec's AAD
+  canonical encoding supports (`SecretCodec::SecretColumn` — BIGINT / text;
+  `SERIAL`/`int4` would brick rotation).
 
 **Identity/upsert per source:** manual = server UUID, full CRUD; csv =
 `external_id` column if present else `sha256/16(product|vendor|contract_ref|term_end)`,
@@ -533,7 +563,9 @@ the same licence server converges on one row; agent_kms = per-host
 annotation fields. Postures: reads authoritative (nullopt → 503/banner);
 connector/agent ingest fail-soft; manual/CSV/REST writes user-facing and
 audited (`software_entitlement.create/update/delete/import`, denied rows
-included). No secret columns.
+included). One secret column in the whole store —
+`connector_secret.secret_enc`, SecretCodec-registered per §10.3 — and no
+plaintext secret column anywhere.
 
 #### 10.3 Microsoft Graph M365 connector
 
@@ -552,16 +584,48 @@ map + the §5 matcher. Required Graph application permission:
 
 Config lives in **Settings** (clone of the OIDC section: form + **Test
 Connection** button that acquires a token and fetches one `subscribedSkus`
-page), persisted via `RuntimeConfigStore` allow-listed keys
-`m365_lic_tenant_id` / `m365_lic_client_id` / `m365_lic_client_secret` /
-`m365_lic_enabled`. **The client secret is stored via `SecretCodec` (ADR-0010
-envelope encryption, `pg/secret_codec.hpp`) from day one — mandatory in PR2,
-not follow-up debt.** The store playbook already lists `runtime_config` among
-the stores that *require* SecretCodec; a brand-new secret must not extend the
-known `oidc_client_secret` plaintext gap (that legacy gap is explicitly out
-of scope here — PR2 wires the codec for the new key only, on the
-already-shipped mechanism). Rev-3 change per PR #1870 review (blocker,
-confirmed against `docs/postgres-store-playbook.md`).
+page). **Non-secret** keys — `m365_lic_tenant_id` / `m365_lic_client_id` /
+`m365_lic_enabled` — persist via `RuntimeConfigStore` allow-listed keys.
+**The client secret never touches `RuntimeConfigStore`** (rev 4): that store
+is SQLite today (`runtime-config.db`, `runtime_config_store.hpp` — where the
+`oidc_client_secret` plaintext gap lives), and `SecretCodec` is
+Postgres-substrate machinery (its AAD binds to a PG schema/table/column/row
+and its rotation scan walks registered PG columns over libpq) — an
+"encrypted key in runtime config" would be unrotatable and off-registry.
+Instead the secret is a **registered `SecretCodec` column on the born-on-PG
+entitlement store**: `connector_secret.secret_enc` (§10.2), per-row AAD
+tuple `("software_entitlement_store", "connector_secret", "secret_enc",
+row_pk = "graph_m365")`.
+
+**PR2 is `SecretCodec`'s first production wiring** (the codec shipped in
+#1320 PR 4 with unit tests but no server-side consumer yet), so PR2
+explicitly owns, in `server.cpp`:
+
+- construct `FileKeyProvider` (it implements the `KekProvider` seam,
+  `key_provider.hpp`) + `SecretCodec`, and run `codec.init(conn)` on a
+  pinned pool lease **before** any PG store opens (ADR-0010 §2 boot order);
+- `init()` failure = `startup_failed` — the server refuses to boot rather
+  than run with unreadable secrets (the codec header's stated wiring
+  obligation; no deferred-init path, so the `/readyz` conjunction clause is
+  not needed);
+- `register_secret_column({"software_entitlement_store",
+  "connector_secret", "secret_enc", pk_column = "connector"})` (the column
+  registration names the PK *column*; the AAD tuple above binds each blob to
+  its PK *value*) and `set_audit_hook(...)` → AuditStore (`kek.generated`,
+  `kek.rotated`, `kek.retired`, `secret.decrypt_failure` verbs).
+
+Store API: `set_connector_secret()` encrypts (an encrypt failure **aborts
+the write transaction** — never a plaintext or empty write);
+`connector_secret()` decrypts **fail-closed** — on failure the connector
+does not run, its status card shows the generic
+`SecretCodec::to_external_error()` string (never the failure class — no
+tamper/existence oracle), and the failure is audited + counted. The
+Settings form's secret field is **write-only** (the UI shows
+configured-yes/no, never echoes the value). This keeps the ADR-0010 §Decision
+4 claim honest: the new secret lands envelope-encrypted from its first
+commit, and the legacy `oidc_client_secret` gap is neither extended nor
+touched (it remains separately tracked). Rev-3 intent, made concrete in
+rev 4 per the PR #1870 second review round.
 The SCL Entitlements view shows a status card (configured, last/next sync,
 rows, last error) + a Write-gated, audited **Sync now**
 (`POST /api/v1/scl/connectors/m365/sync`, 202 + status URL;
@@ -665,7 +729,17 @@ hook); `agents/core/include/yuzu/agent/agent.hpp` + `agents/core/src/main.cpp`
 retention/deletion/opt-out, the `user_scope`/`user_ref` fields and knob;
 correct any daily-sync "no end-user PII" line this makes inaccurate);
 `docs/capability-map.md` (§27.1/§27.3); `docs/roadmap.md` (Phase 10
-staleness note); `changelog.d/` fragment.
+staleness note); `docs/os-capability-matrix.md` (**rev 4** — per-OS rows for
+the `license_scan` surfaces, source-cited per the matrix's own convention:
+Windows SLP/C2R/ProbeSpec/per-user-hive, Linux package/entitlement-cert/
+FlexLM, macOS receipts + vendor plists, with deliberate gaps recorded
+per-surface, e.g. no lapse detection on the Linux rpm/dpkg
+package-metadata surface — entitlement certs and FlexLM do carry expiry);
+`docs/agent-privilege-model.md` (**rev 4** — a `license_scan`
+row: the per-user offline-hive probe (`RegLoadKey`) uses
+`SeBackupPrivilege`/`SeRestorePrivilege`, **already granted** by
+`scripts/install-agent-user.ps1` — the row cites the existing grant, no new
+privilege is introduced); `changelog.d/` fragment.
 
 **Implementation order:**
 
@@ -694,7 +768,7 @@ staleness note); `changelog.d/` fragment.
 | `test_software_licensing_ingestion.cpp` | input caps, enum whitelisting, expiry plausibility clamp, hash recompute (never trusts claimed), empty-blob = valid replace-to-empty, **unknown record kinds skipped** |
 | `test_license_compliance_evaluator.cpp` | injected clock: condition/bucket transitions, 7-day re-arm, degrade ≠ false all-clear |
 | `test_scl_routes.cpp` | authz (401/403), 503-on-degrade banner (never empty table), subnav active states, shell substitution + active-nav replace pair, limit clamps, **`[scl][adr0017]` aggregate pinning: scoped principal → 403 on summary/licenses (never a partial rollup); per-device drill filters before LIMIT** |
-| `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics, **unknown record kinds skipped**, **`--license-scan-user-ref` collect/hash/omit modes** |
+| `test_licensing_sync.cpp` (agent) | same cross-pin constant, parser overflow/injection, blob stability (countdown → same hash), empty-vs-primary-surface-error semantics, **unknown record kinds skipped**, **`--license-scan-user-ref` collect/hash/omit modes: default is `hash`; HMAC pseudonym stable across agent restarts, distinct per profile; HMAC key never reaches blob/logs** |
 | `test_licensing_parsers.cpp` (agent) | SLP LicenseStatus mapping incl. grace codes, channel/SPDX classifiers, FlexLM expiry, DEP-5 header detection, key-hint never echoes input, **non-ASCII registry fixture (wide-API/UTF-8 round-trip)** |
 
 **Verification / acceptance (PR1):**
@@ -740,28 +814,43 @@ store); `license_compliance_evaluator.{hpp,cpp}` (compliance pass, §10.5);
 `scl_routes/{cpp,hpp}` + `scl_ui.cpp` (Entitlements + Compliance views, CSV
 upload form, connector status card); `settings_routes.cpp` + `settings_ui.cpp`
 (M365 licensing config section + Test Connection);
-`runtime_config_store.cpp` (`m365_lic_*` allow-list keys);
+`runtime_config_store.cpp` (**non-secret** `m365_lic_tenant_id` /
+`m365_lic_client_id` / `m365_lic_enabled` allow-list keys only — the client
+secret lives SecretCodec-encrypted in the entitlement store, §10.3);
 `rest_api_v1.cpp` (entitlement CRUD/import/compliance/connector routes +
 OpenAPI); `mcp_server.cpp` (`query_software_entitlements`, extend the
-summary tool); `server.cpp` (store + connector lifecycle wiring); meson
+summary tool); `server.cpp` (store + connector lifecycle wiring; **first
+production `SecretCodec` wiring** — `FileKeyProvider` + codec construction,
+`init()` before PG stores open, init-failure = `startup_failed`,
+`register_secret_column` + audit hook, §10.3); meson
 files; ladder/capability-map/`changelog.d/`;
 `docs/enterprise-readiness-soc2-first-customer.md` (**data-inventory row for
 `software_entitlement_store`** — entitlement financial-metadata class,
 retention/deletion; SecretCodec-encrypted connector secret noted);
 `directory_sync.cpp` (switch to `graph_http` — behaviour-neutral refactor).
 
-**Implementation order:** entitlement store + `[pg]` tests → `csv_import` +
-parser tests → REST CRUD/import + dry-run → GUI (Entitlements view, form,
-upload) → `graph_http` extraction (directory_sync stays green) → M365
-connector + Settings section + Test Connection → agent `ent|` records +
-ingest routing → evaluator compliance pass + Compliance view →
-`software_entitlement.renewal_due` events → MCP → docs.
+**Implementation order:** `SecretCodec` boot wiring in `server.cpp`
+(provider + `init()` + fail-closed boot, §10.3) → entitlement store
+(incl. `connector_secret` + codec column registration) + `[pg]` tests →
+`csv_import` + parser tests → REST CRUD/import + dry-run → GUI
+(Entitlements view, form, upload) → `graph_http` extraction
+(directory_sync stays green) → M365 connector + Settings section + Test
+Connection → agent `ent|` records + ingest routing → evaluator compliance
+pass + Compliance view → `software_entitlement.renewal_due` events → MCP →
+docs.
 
 **Test highlights:** RFC-4180 quoting/CRLF/BOM/column-mapping/line-numbered
 errors/1 MiB cap/dry-run purity (stub store, zero writes); upsert-by-key on
 re-upload; connector-owned 409 + annotation-field exception; Graph stub —
 token failure → status error, nextLink paging, prepaid/consumed/renewal
-mapping, secrets absent from logs; evaluator
+mapping, secrets absent from logs; **secret-at-rest suite in
+`test_software_entitlement_store.cpp` `[pg]`** — encrypted-at-rest (a raw
+SQL read of `connector_secret.secret_enc` parses as an ADR-0010 blob-v1
+envelope and contains no plaintext substring), decrypt-failure-fail-closed
+(corrupted blob → store surfaces the error, connector refuses to run,
+`secret.decrypt_failure` audited, external surface shows only
+`to_external_error()`), encrypt-failure-aborts-txn (no partial/plaintext
+write), secret never echoed by the Settings/REST read path; evaluator
 compliant/over_deployed/under_used/unentitled/unknown classification + basis
 selection + renewal buckets with injected clock; `ent|` parser + mixed-fleet
 forward-compat both directions.
@@ -805,9 +894,11 @@ if not (compliance math needs rows, not sources — the seam is clean).
   capture + `--usage-sync-enable` on one agent, generate activity, confirm
   usage rows land and reclamation returns expected categories; a
   TAR-disabled agent reports *Unreported*; `/test` + `/governance`.
-- Docs: a dedicated usage-metering ADR (number assigned at PR time — 0021/0022
-  are contested by other open branches) or an Updates section here; ladder
-  tick; capability-map §27.2; **data-inventory row for
+- Docs: a dedicated usage-metering ADR (number assigned at PR time — as of
+  rev 4, 0021 is claimed by two open branches, 0022 and 0023 by one each,
+  and this document holds 0024; re-verify against **all** open remote
+  branches at PR time, first-to-merge wins) or an Updates section here;
+  ladder tick; capability-map §27.2; **data-inventory row for
   `software_usage_store`** (usage telemetry class, retention, opt-in).
 
 ### PR4 — `feat/software-tags-reclamation` — tags + reclamation view
@@ -850,10 +941,15 @@ if not (compliance math needs rows, not sources — the seam is clean).
   (accepted at owner direction; the long-standing Result Sets drift gets
   reconciled in the same PR).
 - The per-user carve-out (§8) is a deliberate, contained ADR-0016 deviation
-  requiring maintainer sign-off, with a one-flag suppression path.
+  requiring maintainer sign-off. Default posture is **pseudonymous**
+  (keyed-HMAC `hash`); raw profile names are opt-in (`collect`) and full
+  suppression is one flag (`omit`).
 - The M365 connector's client secret is envelope-encrypted via SecretCodec
-  from its first commit (PR2); the pre-existing `oidc_client_secret`
-  plaintext gap remains separately tracked and is not extended.
+  from its first commit, in a registered column on the entitlement store —
+  PR2 carries the codec's first production wiring (boot-time `init()`,
+  fail-closed) as a scoped, tested deliverable; the pre-existing
+  `oidc_client_secret` plaintext gap remains separately tracked and is not
+  extended.
 - Fleet network cost is negligible: licence blobs hash-skip (stable
   estates), usage blobs are tens of KB daily from active machines only;
   Graph sync is one tenant-level call pair per day.
@@ -892,8 +988,9 @@ if not (compliance math needs rows, not sources — the seam is clean).
 
 - **ADR-0006/0007/0008/0012** — all new stores are born-on-Postgres under
   the store contract; no SQLite anywhere (the entitlement connector's
-  runtime config uses the existing `RuntimeConfigStore`, which predates the
-  cutover and is already on the migration ladder).
+  **non-secret** runtime config uses the existing `RuntimeConfigStore`,
+  which predates the cutover and is already on the migration ladder; its
+  client secret does not — §10.3).
 - **ADR-0016** — this feature is two new daily-sync sources riding the
   framework exactly as anticipated (licensing in PR1, usage in PR3; PR2's
   `ent|` records extend the licensing blob under the §1 forward-compat
@@ -902,9 +999,14 @@ if not (compliance math needs rows, not sources — the seam is clean).
   full conformance. The typed-source registry rule (§4) implements ADR-0016
   §5 parity.
 - **ADR-0017** — per-device SCL reads route through the admit-then-filter
-  list gate; fleet aggregates carry the documented inert-confinement caveat
-  until the gate lands fleet-wide.
+  list gate; the fleet-wide aggregate surfaces are **pinned global-only by
+  design** (a group-confined principal gets 403, never a partial or leaky
+  rollup — enforced by §7's named `[scl][adr0017]` tests), mirroring the
+  `/inventory` `software_catalog` precedent that ADR-0017:221-231 documents.
 - **ADR-0010** — no software-licence key material is stored (moot by
-  construction); the M365 client secret is stored via SecretCodec from PR2
-  (the playbook already mandates it for `runtime_config`). The legacy
-  `oidc_client_secret` plaintext gap is out of scope and separately tracked.
+  construction); the M365 client secret is a registered `SecretCodec`
+  column on the entitlement store from PR2, which also carries the codec's
+  **first production wiring** (boot `init()` fail-closed, column
+  registration, audit hook — §10.3). The legacy `oidc_client_secret`
+  plaintext gap (SQLite `RuntimeConfigStore`) is out of scope and
+  separately tracked.
