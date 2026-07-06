@@ -63,7 +63,7 @@ Overall      [======================---------]   172/228 done (75%)
 | 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
-| 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
+| 27. Software Licensing & Entitlements (SLE) | 5 | 0 | 0 | 5 |
 | 28. Response Visualization | 9 | 0 | 3 | 6 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
@@ -1044,13 +1044,13 @@ Not implemented. WSUS database connector for patch compliance. CSV/TSV file uplo
 
 ---
 
-## 27. Software Catalog & Licensing
+## 27. Software Licensing & Entitlements (SLE)
 
-*Normalized software identification and license compliance management.*
+*Normalized software identification, agent-detected software licences, entitlements, and compliance management. Renamed from "Software Catalog & Licensing" by ADR-0024 ("software catalog" keeps its existing `/inventory` meaning; design of record: `docs/adr/0024-software-licensing-entitlements.md`).*
 
-### 27.1 Software Catalog Store :x: `T2`
+### 27.1 Product Registry :x: `T2`
 
-Not implemented. Canonical software registry (vendor, title, version, edition, platform) with manual curation and automatic matching from raw inventory.
+Not implemented. Canonical software-identity registry (vendor, title, version, edition, platform) with deterministic automatic matching from raw inventory; manual curation layers on aliases later (ADR-0024 Decision 6).
 
 ### 27.2 Software Usage Tracking :x: `T2`
 

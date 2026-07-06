@@ -1102,6 +1102,16 @@ Multi-source inventory cleanup pipeline:
 
 *Normalized software identification for license management and compliance reporting.*
 
+> **Superseded by ADR-0024 (2026-07-06).** This phase's design is superseded by
+> `docs/adr/0024-software-licensing-entitlements.md` ("Software Licensing &
+> Entitlements", capability §27 — renamed by the same ADR). The sketches below are
+> stale where they conflict: the SQLite `CatalogStore` becomes the born-on-Postgres
+> `ProductRegistryStore`; entitlements are a five-source plane (manual, CSV, M365
+> connector, agent-observed FlexLM/KMS), not a manual-only register; licence detection
+> is a new agent `license_scan` plugin on the ADR-0016 daily-sync framework; REST is
+> unified under `/api/v1/sle/*`. The issue breakdown is retained for traceability
+> (10.1–10.4 ↔ #264–#267).
+
 ### Issue 10.1: Software Catalog Store
 **Capability:** new | **Scope:** Server | **Status:** Open
 **Depends on:** 9.8
