@@ -112,3 +112,28 @@ groups:
         annotations:
           summary: "High agent disconnect rate on gateway"
           description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."
+
+      # SLE compliance evaluator staleness (the /sle licence posture rollup,
+      # replaced hourly; keep-last-good means an aging as-of stamp is the only
+      # other signal). The `> 0` guard skips the seeded-0 "building" window on
+      # cold boot; the never-succeeded case is the Failing rule below.
+      - alert: YuzuSleEvaluatorStale
+        expr: >
+          (time() - yuzu_server_sle_evaluator_last_success_timestamp) > 7200
+          and yuzu_server_sle_evaluator_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLE compliance evaluator is stale"
+          description: "The SLE licence-posture rollup has not been replaced in over 2h (cadence 1h); lapses/expiries may be under-reported. Check yuzu_server_sle_evaluator_runs_total{outcome!=\"success\"}."
+
+      # SLE evaluator cycles failing or skipping (incl. never-succeeded/building).
+      - alert: YuzuSleEvaluatorFailing
+        expr: sum(rate(yuzu_server_sle_evaluator_runs_total{outcome!="success"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLE compliance evaluator cycles are failing or degraded"
+          description: "degraded = an authoritative input keeps degrading so cycles skip (keep-last-good); error = the posture replace failed. last_success_timestamp still 0 means the posture never populated."

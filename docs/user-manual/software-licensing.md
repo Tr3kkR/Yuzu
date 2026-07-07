@@ -114,8 +114,14 @@ securable — see [Access control](#access-control)):
 |---|---|---|
 | `GET /api/v1/sle/summary` | fleet KPI tiles (counts by state, expiring-soon) | fleet aggregate (global-gated) |
 | `GET /api/v1/sle/licenses?state=&expiring_within_days=&q=&limit=` | the detected-licence list, rolled up per product | fleet aggregate (global-gated) |
-| `GET /api/v1/sle/licenses/{key}/devices` | which devices carry a given product | fan-out list (global-gated) |
-| `GET /api/v1/sle/agents/{agent_id}` | one device's detected licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
+| `GET /api/v1/sle/licenses/{key}/devices` | which devices carry a given product (worst effective state per device) | fan-out list (global-gated) |
+| `GET /api/v1/sle/agents/{agent_id}` | one device's detected licences, **including any `user_ref` rows**, plus `effective_user_ref_mode` (the mode the device's last stored blob declared — verifies a knob flip landed) | **per-device scoped** (403 outside your management-group scope) |
+| `POST /api/v1/sle/agents/{agent_id}/surfaces` | **live** per-surface diagnostics (which detection surfaces ran / failed, with reason tokens such as `privilege_missing`) — dispatched to the agent on demand, never persisted | **per-device scoped** + `Execution:Execute` |
+| `DELETE /api/v1/sle/agents/{agent_id}` | the decommission trigger — durably erases the device's stored per-agent rows (see [Erasure and opt-out](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` |
+
+Two MCP tools mirror the aggregates for agentic workers:
+`query_software_licenses` and `get_license_compliance_summary` (see
+[MCP](mcp.md), rows 52–53).
 
 The fleet-aggregate surfaces are **pinned global-only by design** (they are precomputed
 rollups across every management group, exactly like the `/inventory` software catalog):
@@ -133,6 +139,40 @@ successful empty result — so a licence query can never read a transient outage
 The point-and-click view of the same data is the **SLE** page (top-nav **SLE** →
 **Licences**): tables and KPI tiles, with the software **catalog** remaining on the
 `/inventory` page, cross-linked.
+
+## The compliance evaluator
+
+The posture the aggregates and the SLE page serve is a **precomputed rollup**,
+recomputed by a background **compliance evaluator** on an hourly cadence (one
+cycle also runs shortly after server startup):
+
+1. **Matcher** — detected `(product, vendor)` pairs and installed-software
+   catalogue titles are matched against the **product registry**
+   (deterministic tiers, no fuzzy matching); newly detected products mint
+   registry rows, and the match links re-derive **every cycle**, so a matcher
+   improvement self-heals historical links. Detections the registry cannot yet
+   identify aggregate into an honest **(unmatched)** bucket — nothing silently
+   disappears.
+2. **Rollup** — per-product effective-state counts (the server-now lapse rule:
+   a device that stopped syncing before its licence lapsed still shows
+   `expired`), device/install counts, and the expiry outlook, replaced
+   atomically with a fresh **as-of** stamp.
+3. **Alerts** — `software_license.expiring` / `software_license.expired`
+   notifications + webhook/offload events with durable per-product dedup:
+   expiring escalates on **worsening** buckets only (30 → 14 → 7 → 1 days), a
+   persisting condition re-fires after a **7-day re-arm**, and the first
+   evaluation of an estate fires **once per product in-condition** (a bounded
+   burst, not spam). Over-deployment deliberately does **not** alert in v1.
+
+**Keep-last-good honesty:** if the rollup replace fails — or **any**
+authoritative input read degrades — the evaluator **skips the cycle** and the
+previous rollup keeps serving; the as-of stamp visibly ages (the SLE page
+flags it stale past 2 h) and the seeded
+`yuzu_server_sle_evaluator_last_success_timestamp` gauge drives the
+`YuzuSleEvaluatorStale`/`YuzuSleEvaluatorFailing` Prometheus rules (see
+[metrics](metrics.md#software-licensing-sle-evaluator-metrics)). A partial
+rollup is never published — an evaluator fed by a degraded input would
+otherwise silently shrink the estate.
 
 ## Access control
 
@@ -167,6 +207,17 @@ enabling the SLE sources — deny-override wins).
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect,
   or when it is decommissioned via the agent-decommission cascade that clears all of its
   per-device stores).
+- **Decommission a device:** `DELETE /api/v1/sle/agents/{agent_id}` runs the
+  cascade — every registered per-agent store (generic inventory, installed
+  software, app-perf, device-CI, detected licences including `user_ref`) drops
+  the device's rows. Requires per-device `SoftwareLicensing:Delete`
+  (Administrator / IT Service Owner). The erasure is **audited durably**
+  (`sle.agent.decommission`): a fail-closed *attempt* event persists **before**
+  anything is erased, then an outcome event records the per-store breakdown —
+  the GDPR Art. 17 evidence chain. Honesty note: a per-store `deleted` means
+  the delete was *invoked without an exception*, not row-level-confirmed
+  erasure (#1947 tracks the confirming upgrade); a failed store returns `500`
+  and the idempotent DELETE can simply be re-issued.
 - **Stated gap:** there is **no row-level erasure API** — you cannot delete a single
   `user_ref` row while keeping the device's other rows. The knob-flip full-replace and
   the decommission cascade are the erasure mechanisms; a targeted per-subject (DSAR)

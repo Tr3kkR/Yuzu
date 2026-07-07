@@ -484,6 +484,42 @@ yuzu_server_group_members_total / yuzu_server_management_groups_total
 yuzu_server_management_groups_total == 0
 ```
 
+## Software licensing (SLE) evaluator metrics
+
+The SLE compliance evaluator (ADR-0024) recomputes the `/sle` licence-posture
+rollup hourly and raises the deduplicated `software_license.expiring` /
+`software_license.expired` events. Its metric family is `yuzu_server_sle_*`.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_sle_evaluator_runs_total{outcome}` | counter | Evaluator cycles by outcome. `success` = the posture rollup was replaced; `degraded` = an authoritative input (product registry, detected products, installed-software catalogue) degraded, so the cycle **skipped and kept the last-good rollup** — a full replace from partial inputs would silently shrink the posture; `error` = the rollup replace failed or the tick threw |
+| `yuzu_server_sle_evaluator_duration_seconds` | gauge | Wall-clock of the last evaluator cycle (matcher + rollup + alert pass, off the request path) |
+| `yuzu_server_sle_evaluator_last_success_timestamp` | gauge | Epoch seconds of the last successful posture replace. **Seeded to 0 at thread start** ("building") so the series always exists; the staleness alert guards `> 0` to skip the building window. Keep-last-good without this gauge would be a silent fail-open — the `/sle` as-of stamp is its UI twin |
+| `yuzu_server_sle_alert_fired_total{kind}` | counter | `software_license.expiring` / `expired` alerts fired (worsening-bucket 30/14/7/1-day or 7-day re-arm transitions only; the first evaluation of an estate fires once per product in-condition — a bounded burst, not spam) |
+| `yuzu_server_sle_alert_suppressed_total{kind,reason}` | counter | Conditions evaluated but not fired: `holddown` = dedup held it; `state_degraded` = the dedup-state read degraded (a degrade must never re-fire as "never fired") |
+| `yuzu_server_sle_alert_delivery_failed_total` | counter | Alert sink deliveries that threw (notification/webhook/offload). Dedup is armed **before** delivery, so a failed delivery is a lost notification, never a re-fire |
+
+The shared read-degrade counter also covers the SLE stores:
+`yuzu_inventory_read_degrade_total{source="software_licensing"}` and
+`{source="product_registry"}`.
+
+**Alerting rules:** `YuzuSleEvaluatorStale` and `YuzuSleEvaluatorFailing` ship in
+[`docs/prometheus/yuzu-alerts.yml`](../prometheus/yuzu-alerts.yml).
+
+**Useful PromQL queries:**
+
+```promql
+# Posture staleness (seconds since the last successful replace; guard building)
+(time() - yuzu_server_sle_evaluator_last_success_timestamp)
+  and yuzu_server_sle_evaluator_last_success_timestamp > 0
+
+# Cycles skipped on degraded inputs (keep-last-good) over the last hour
+increase(yuzu_server_sle_evaluator_runs_total{outcome="degraded"}[1h])
+
+# Licence alerts fired by kind
+sum by (kind) (increase(yuzu_server_sle_alert_fired_total[24h]))
+```
+
 ## Useful PromQL queries
 
 ### Fleet overview

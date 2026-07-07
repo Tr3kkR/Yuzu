@@ -577,6 +577,51 @@ groups:
             last good rollup. Investigate Postgres availability / the recompute duration
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSleEvaluatorStale
+        # The /sle licence posture is a precomputed rollup replaced hourly by the SLE
+        # compliance evaluator. On failure OR on any authoritative-input degrade the
+        # evaluator keeps the last-good rollup (never a partial replace, F4), so the
+        # page's as-of stamp ages with no other automated signal — and an aging posture
+        # under-reports lapses/expiries. `> 0` GUARD IS LOAD-BEARING:
+        # last_success_timestamp is seeded to 0 at thread start (the "building"
+        # sentinel), so a naive `now - ts` fires on every cold boot; the guard skips the
+        # building window. The never-succeeded case is the Failing rule below.
+        expr: |
+          (time() - yuzu_server_sle_evaluator_last_success_timestamp) > 7200
+          and yuzu_server_sle_evaluator_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLE compliance evaluator is stale"
+          description: >-
+            The SLE licence-posture rollup has not been replaced in over 2h (cadence is
+            1h). Keep-last-good is serving an aging /sle as-of stamp; lapses and expiries
+            may be under-reported. Check
+            yuzu_server_sle_evaluator_runs_total{outcome!="success"} ("degraded" = an
+            authoritative input — registry / detected products / installed-software
+            catalogue — keeps degrading so cycles skip; "error" = the rollup replace
+            itself fails) and the evaluator log.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSleEvaluatorFailing
+        # Catches what the staleness alert's `> 0` guard deliberately skips: a server
+        # whose evaluator cycles keep failing or skipping (incl. one that has never
+        # succeeded, last_success still 0 — the posture never populates).
+        expr: |
+          sum(rate(yuzu_server_sle_evaluator_runs_total{outcome!="success"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLE compliance evaluator cycles are failing or degraded"
+          description: >-
+            yuzu_server_sle_evaluator_runs_total{outcome!="success"} is rising. "degraded"
+            = an authoritative input read keeps degrading, so the cycle skips and keeps
+            the last-good rollup (F4 — never a partial replace); "error" = the posture
+            replace failed or the tick threw. If last_success_timestamp is still 0 the
+            posture has never populated ("building"). Investigate Postgres availability
+            and yuzu_inventory_read_degrade_total{source=~"software_licensing|product_registry"}.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
       # is no fleet-size-independent absolute threshold: >50 is day-one noise on a

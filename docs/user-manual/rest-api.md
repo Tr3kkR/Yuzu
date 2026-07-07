@@ -81,6 +81,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Device Tokens](#device-tokens)
   - [Software Deployment](#software-deployment)
   - [License Management](#license-management)
+  - [Software Licensing (SLE)](#software-licensing-sle)
   - [Topology](#topology)
   - [Fleet Statistics](#fleet-statistics)
   - [File Retrieval](#file-retrieval)
@@ -2398,6 +2399,8 @@ Create a new webhook subscription.
 | `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+| `software_license.expiring` | A product's detected software licence enters an expiry bucket (30/14/7/1 days to expiry; re-fires only on a worsening bucket or after a 7-day re-arm — see [Software licence detection](software-licensing.md)) | `event`, `product_key`, `vendor`, `title`, `device_count`, `next_expiry_at`, `days_left`, `bucket` |
+| `software_license.expired` | A product has expired or unlicensed detections (the first evaluation of an estate fires once per product in-condition; thereafter dedup + 7-day re-arm apply) | same as `software_license.expiring`, with `bucket` = 0 and `days_left` = 0 |
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
@@ -3474,6 +3477,119 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Software Licensing (SLE)
+
+The `/api/v1/sle/*` surface (ADR-0024) serves **detected third-party software
+licences** — what the `license_scan` daily sync found on endpoints, evaluated
+hourly by the compliance evaluator into a per-product posture rollup. Three
+things it is **not**: the `License` securable above (Yuzu's **own** product
+licence), the `/inventory` installed-software catalogue (`Inventory:Read` —
+installations regardless of licensing), and an editable record (detection is
+agent-observed; there is no operator override). Gated on the
+**`SoftwareLicensing`** securable (Viewer/PolicyEditor Read; Operator
+Read+Write; IT Service Owner full CRUD; ApiTokenManager none). See
+[Software licence detection](software-licensing.md) for the collection and
+privacy model, and [MCP tools](mcp.md) 52/53 for the agentic twins.
+
+Every route echoes `X-Correlation-Id`; store degrades return `503` with the A4
+envelope, **never** an empty `200` (an empty compliance surface would read as
+"nothing detected / nothing lapsed").
+
+#### `GET /api/v1/sle/summary`
+
+Fleet licence-posture headline from the precomputed rollup. **Pinned
+global-only** (ADR-0017): a management-group-confined principal is denied
+(`403`), never served a partial rollup.
+
+**Permission:** global `SoftwareLicensing:Read`
+
+**Response fields:** `as_of` (the posture meta stamp; `0` = never evaluated),
+`evaluated` (an evaluated-but-empty estate reads `true` with zero counts —
+distinct from a never-run evaluator), `products`, `installs`,
+`lapsed_products`, `expiring_soon` (30-day window), `next_expiry_at`.
+
+#### `GET /api/v1/sle/licenses`
+
+Per-product posture rows, filtered then capped.
+
+**Permission:** global `SoftwareLicensing:Read` (pinned global-only)
+
+**Query parameters:** `state`
+(`licensed|subscription_active|trial|grace|expired|unlicensed|unknown|lapsed` —
+matches products whose corresponding effective-state count is non-zero;
+`lapsed` = expired ∪ unlicensed), `expiring_within_days`, `q` (case-insensitive
+substring over title/vendor/product_key), `limit` (1–1000, default 200;
+`result_truncated_by_cap: true` when more rows match).
+
+#### `GET /api/v1/sle/licenses/{key}/devices`
+
+Devices carrying a detected licence for `key` (the registry product key), one
+row per device with the **worst effective state** (server-now lapse rule) and
+the earliest future expiry, hostname-enriched. An unknown key is an honest
+empty list. A true fan-out list read: ships global-gated and is a registered
+ADR-0017 PR-A flip-wave consumer (#1634/#1715).
+
+**Permission:** global `SoftwareLicensing:Read`
+
+#### `GET /api/v1/sle/agents/{agent_id}`
+
+One device's detected licences **including the per-user fields**
+`user_scope`/`user_ref` (personal data, ADR-0024 Decision 11), plus
+`effective_user_ref_mode` — the user-ref mode the device's **last stored**
+sync blob declared (`collect`|`hash`|`omit`; `null` = never synced this
+source), the operator's verification that a `--license-scan-user-ref` knob
+flip actually landed.
+
+**Permission:** `SoftwareLicensing:Read` **scoped to the device**
+(ancestor-aware; `403` outside scope)
+
+**Audit:** per-open behavioural `sle.agent.view`, **fail-closed** — if the
+audit row cannot persist, `503` + `Sec-Audit-Failed: true` and no licence PII
+is served.
+
+#### `POST /api/v1/sle/agents/{agent_id}/surfaces`
+
+**Live** detection-surface diagnostics: dispatches the agent's
+`license_scan surfaces` action over the command path and returns the parsed
+per-surface probe status (`ok` + row count, or `error` + a reason token such
+as `privilege_missing`). Live-only by design — never persisted server-side.
+The payload carries **no per-user data** (per-user outcomes aggregate per
+surface on the agent; the server whitelist-parses `probe_status` lines only).
+
+**Permission:** `SoftwareLicensing:Read` **and** `Execution:Execute`, both
+scoped to the device
+
+**Responses:** `200` `{agent_id, live: true, as_of, count,
+surfaces[].{surface, status, rows?, detail?}}` · `429` concurrent-cap ·
+`502` device error/malformed output · `503` offline or dispatch/response
+store unavailable · `504` no response within the ~20 s poll budget (a
+WMI-degraded host can need longer — retry, or read the stored drill).
+
+**Audit:** `sle.agent.surfaces` (set-and-proceed, before dispatch).
+
+#### `DELETE /api/v1/sle/agents/{agent_id}`
+
+**Decommission**: durably erases the device's stored per-agent rows across
+every registered store (generic inventory, installed software, app-perf,
+device-CI, detected licences including `user_ref`) — the GDPR Art. 17 erasure
+trigger.
+
+**Permission:** `SoftwareLicensing:Delete` **scoped to the device** (only
+Administrator and IT Service Owner hold Delete)
+
+**Audit (two durable events):** `sle.agent.decommission` — an `attempt` row
+persists **before** the cascade (fail-closed: `503` + `Sec-Audit-Failed` and
+**nothing is erased** if it cannot), then a `success`/`partial` outcome row
+with the per-store breakdown.
+
+**Honesty:** each store's delete swallows its own transient failure, so
+`deleted` means *attempted* (invoked without an exception), not
+row-level-confirmed erasure (#1947 tracks the status-returning upgrade). A
+store that threw reports `failed` and the response is `500` — the cascade is
+idempotent; re-issue the DELETE.
 
 ---
 
