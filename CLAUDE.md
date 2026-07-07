@@ -249,6 +249,8 @@ For server tests that need live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQ
 
 The Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`) are installed **user-global**, not committed — they follow the operator, not collaborators. Re-run `/setup-matt-pocock-skills` to change.
 
+**`/dev-team`** is committed **project-level** (`.claude/skills/dev-team/`), *unlike* the Matt Pocock set above — so every collaborator gets it via git. It runs an Opus "senior" session that plans and delegates to Sonnet `junior-developer` subagents (scoped edits, targeted tests, then `/test --quick`), consulting a Fable `enterprise-architect` (both in `.claude/agents/`) for material or disputed calls, then integrates the result behind `/test` + `/governance`. Invoke `/dev-team <task>`. If Fable is unavailable in an environment, override `enterprise-architect`'s frontmatter to `model: opus`.
+
 ### Plugin scope — `frontend-design` is marketing-only
 
 The `frontend-design` plugin is scoped to **marketing / sales / demo surfaces only** — its deliberately-varied light/dark aesthetic fits a standalone pitch surface, not the consistency-prizing **dark-theme-only** product. Use it on the Cedar & Vale sales deck (`deploy/docker/cedar-vale/app/`) and future standalone marketing pages. **Never on product UI** — `server/core/src/*_ui.cpp`, `server/core/static/*`, explicitly including the in-product fleet visualization (`viz_page_ui.cpp`, `viz_host_page_ui.cpp`, `yuzu-viz*.js` — product despite the name). Product UI stays HTMX-first, server-rendered, dark-theme-only.
