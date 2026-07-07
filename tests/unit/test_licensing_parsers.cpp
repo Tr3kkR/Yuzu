@@ -11,7 +11,8 @@
  *     (unknown-preserving, closed-vocabulary discipline, §3.2),
  *   - the FlexLM INCREMENT parser (dates, permanent, uncounted, malformed),
  *   - key_hint derivation NEVER echoing raw key material (ADR-0024 D2),
- *   - grace countdown → ABSOLUTE date conversion (blob stability, D3),
+ *   - grace countdown → ABSOLUTE midnight-epoch conversion (blob stability, D3),
+ *   - the expires_at wire encoding (UTC-midnight epoch decimal, §3.1 pins),
  *   - the §3.3 layer-1 record sanitiser (byte set + 1024 B clamp),
  *   - a non-ASCII fixture round-tripping through render intact (R17).
  */
@@ -160,7 +161,7 @@ TEST_CASE("FlexLM INCREMENT: dated feature", "[licensing][parsers]") {
     CHECK(inc->vendor_daemon == "MLM");
     CHECK(inc->version == "46");
     CHECK(inc->seats == 100);
-    CHECK(iso_date_from_epoch(inc->expiry_epoch) == "2026-12-31");
+    CHECK(expiry_wire_from_epoch(inc->expiry_epoch) == "1798675200"); // 2026-12-31 UTC midnight
 }
 
 TEST_CASE("FlexLM INCREMENT: permanent forms map to 0", "[licensing][parsers]") {
@@ -187,7 +188,7 @@ TEST_CASE("FlexLM INCREMENT: FEATURE keyword and case-insensitive months",
     const auto inc = parse_flexlm_increment("FEATURE ansys ansyslmd 2026.1 01-Jan-2027 25");
     REQUIRE(inc.has_value());
     CHECK(inc->feature == "ansys");
-    CHECK(iso_date_from_epoch(inc->expiry_epoch) == "2027-01-01");
+    CHECK(expiry_wire_from_epoch(inc->expiry_epoch) == "1798761600"); // 2027-01-01 UTC midnight
     CHECK(inc->seats == 25);
 }
 
@@ -239,11 +240,12 @@ TEST_CASE("key_hint never echoes raw key material", "[licensing][parsers]") {
 
 // ── grace countdown → absolute date (blob stability) ───────────────────────
 
-TEST_CASE("grace countdown converts to a stable absolute UTC date", "[licensing][parsers]") {
+TEST_CASE("grace countdown converts to a stable absolute midnight-epoch",
+          "[licensing][parsers]") {
     const long long collection = epoch_from_civil(2026, 1, 1); // 2026-01-01T00:00Z
-    SECTION("expected date math") {
-        CHECK(grace_expiry_date(collection, 10 * 24 * 60) == "2026-01-11");
-        CHECK(grace_expiry_date(collection, 1) == "2026-01-01"); // truncated to the day
+    SECTION("expected date math (midnight-epoch wire values)") {
+        CHECK(grace_expiry_date(collection, 10 * 24 * 60) == "1768089600"); // 2026-01-11 midnight
+        CHECK(grace_expiry_date(collection, 1) == "1767225600"); // truncated to the collection day
     }
     SECTION("two calls with the same collection_time are identical — a ticking "
             "counter must not change the record day-to-day") {
@@ -257,28 +259,35 @@ TEST_CASE("grace countdown converts to a stable absolute UTC date", "[licensing]
 
 // ── date helpers ────────────────────────────────────────────────────────────
 
-TEST_CASE("ISO/epoch date helpers", "[licensing][parsers]") {
-    CHECK(iso_date_from_epoch(0).empty());     // FlexLM permanent sentinel
-    CHECK(iso_date_from_epoch(-100).empty());
-    CHECK(iso_date_from_epoch(86399) == "1970-01-01");
-    CHECK(iso_date_from_epoch(epoch_from_civil(2026, 1, 1)) == "2026-01-01");
-    CHECK(iso_date_from_epoch(epoch_from_civil(2024, 2, 29)) == "2024-02-29"); // leap day
+TEST_CASE("expires_at wire encoding: UTC-midnight epoch decimal string",
+          "[licensing][parsers]") {
+    CHECK(expiry_wire_from_epoch(0).empty());     // FlexLM permanent sentinel
+    CHECK(expiry_wire_from_epoch(-100).empty());
+    CHECK(expiry_wire_from_epoch(86399) == "0");  // 1970-01-01 23:59:59 truncates to epoch 0
+    // An already-midnight epoch renders as itself; a mid-day epoch truncates.
+    CHECK(expiry_wire_from_epoch(epoch_from_civil(2026, 1, 1)) ==
+          std::to_string(epoch_from_civil(2026, 1, 1)));
+    CHECK(expiry_wire_from_epoch(epoch_from_civil(2024, 2, 29)) ==
+          std::to_string(epoch_from_civil(2024, 2, 29))); // leap day
+    CHECK(expiry_wire_from_epoch(1798675200 + 3600) == "1798675200"); // any time-of-day → midnight
+    // Pinned wire vector — the encoding must not silently drift again.
+    CHECK(expiry_wire_from_epoch(epoch_from_civil(2026, 12, 31)) == "1798675200"); // 2026-12-31
 }
 
-TEST_CASE("WMI CIM_DATETIME parses to an ISO date", "[licensing][parsers]") {
-    CHECK(parse_wmi_datetime_to_iso_date("20261231000000.000000+000") == "2026-12-31");
+TEST_CASE("WMI CIM_DATETIME parses to a midnight-epoch expiry", "[licensing][parsers]") {
+    CHECK(parse_wmi_datetime_to_expiry("20261231000000.000000+000") == "1798675200"); // 2026-12-31
     SECTION("the 1601 'unset' sentinel and junk map to empty") {
-        CHECK(parse_wmi_datetime_to_iso_date("16010101000000.000000-000").empty());
-        CHECK(parse_wmi_datetime_to_iso_date("").empty());
-        CHECK(parse_wmi_datetime_to_iso_date("not-a-date").empty());
-        CHECK(parse_wmi_datetime_to_iso_date("2026123").empty()); // too short
-        CHECK(parse_wmi_datetime_to_iso_date("20261399000000").empty()); // month 13
+        CHECK(parse_wmi_datetime_to_expiry("16010101000000.000000-000").empty());
+        CHECK(parse_wmi_datetime_to_expiry("").empty());
+        CHECK(parse_wmi_datetime_to_expiry("not-a-date").empty());
+        CHECK(parse_wmi_datetime_to_expiry("2026123").empty()); // too short
+        CHECK(parse_wmi_datetime_to_expiry("20261399000000").empty()); // month 13
     }
 }
 
 TEST_CASE("openssl -enddate output parses in both date formats", "[licensing][parsers]") {
-    CHECK(parse_openssl_enddate("notAfter=2027-03-04 12:00:00Z") == "2027-03-04");
-    CHECK(parse_openssl_enddate("notAfter=Mar  4 12:00:00 2027 GMT") == "2027-03-04");
+    CHECK(parse_openssl_enddate("notAfter=2027-03-04 12:00:00Z") == "1804118400");    // 2027-03-04
+    CHECK(parse_openssl_enddate("notAfter=Mar  4 12:00:00 2027 GMT") == "1804118400"); // 2027-03-04
     CHECK(parse_openssl_enddate("notBefore=2020-01-01 00:00:00Z").empty());
     CHECK(parse_openssl_enddate("garbage").empty());
     CHECK(parse_openssl_enddate("notAfter=banana").empty());

@@ -360,7 +360,7 @@ void interpret_flexlm(ProbeHost& host, const ProbeSpec& spec, const std::string&
         r.product = inc->feature;
         r.vendor = inc->vendor_daemon;
         r.version = inc->version;
-        r.expires_at = iso_date_from_epoch(inc->expiry_epoch);
+        r.expires_at = expiry_wire_from_epoch(inc->expiry_epoch);
         if (inc->expiry_epoch == 0) {
             r.status = "licensed";
             r.license_type = "perpetual";

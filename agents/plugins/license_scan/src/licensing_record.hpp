@@ -11,11 +11,13 @@
  *   - license_type / status / source / confidence come from the CLOSED
  *     vocabularies in roadmap §3.2 — the plugin never fabricates a value it
  *     cannot justify; "don't know" is `unknown` (or empty for channel).
- *   - expires_at is an absolute UTC date `YYYY-MM-DD`, or empty when there is
- *     no expiry (perpetual / unknown). Countdowns (e.g. KMS grace minutes)
- *     are converted to an absolute date BEFORE emission so a ticking counter
- *     cannot change the record day-to-day and defeat the blob hash-skip
- *     (ADR-0024 Decision 3 blob-stability rule).
+ *   - expires_at is UTC epoch seconds truncated to midnight, rendered as a
+ *     decimal string (the store column is BIGINT epoch and the evaluator
+ *     compares epochs — roadmap §3.1 field-encoding pins), or empty
+ *     ("" / "0" = no expiry / perpetual / unknown). Countdowns (e.g. KMS
+ *     grace minutes) are converted to an absolute midnight-epoch BEFORE
+ *     emission so a ticking counter cannot change the record day-to-day and
+ *     defeat the blob hash-skip (ADR-0024 Decision 3 blob-stability rule).
  *   - key_hint is an OS-provided partial key verbatim, or a 12-hex SHA-256
  *     prefix of key material — NEVER raw key bytes (ADR-0024 Decision 2).
  *   - user_ref is a local profile name or EMPTY — never a SID, email, or
@@ -110,7 +112,7 @@ struct LicRecord {
     std::string license_type{"unknown"};
     std::string channel;                // kms|mak|oem|retail|"" — empty = unknown
     std::string status{"unknown"};
-    std::string expires_at;             // "YYYY-MM-DD" UTC, or "" = no expiry
+    std::string expires_at;             // UTC midnight-epoch seconds (decimal), "" = no expiry
     std::string source{"heuristic"};
     std::string confidence{"heuristic"};
     std::string key_hint;               // partial key or 12-hex hash prefix; NEVER raw key

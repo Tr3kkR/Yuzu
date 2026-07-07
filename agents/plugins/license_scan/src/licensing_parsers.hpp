@@ -239,42 +239,35 @@ inline long long epoch_from_civil(long long year, unsigned month, unsigned day) 
     return parse_detail::days_from_civil(year, month, day) * 86400LL;
 }
 
-/// Epoch seconds → "YYYY-MM-DD" (UTC), or "" for epoch <= 0 (no expiry /
-/// permanent — the FlexLM parser's `expiry_epoch == 0` sentinel).
-inline std::string iso_date_from_epoch(long long epoch) {
+/// Epoch seconds → the `expires_at` wire encoding: the epoch truncated to UTC
+/// midnight, rendered as a decimal string (roadmap §3.1 field-encoding pins —
+/// the store column is BIGINT epoch and the evaluator compares epochs, NOT a
+/// YYYY-MM-DD string). "" for epoch <= 0 (no expiry / perpetual / unknown —
+/// e.g. the FlexLM parser's `expiry_epoch == 0` sentinel). Truncating to
+/// midnight keeps a grace countdown converted to an absolute time stable
+/// across collects on a fixed collection day (ADR-0024 D3 blob-stability).
+inline std::string expiry_wire_from_epoch(long long epoch) {
     if (epoch <= 0)
         return {};
-    const auto cd = parse_detail::civil_from_days(epoch / 86400);
-    char out[11];
-    out[0] = static_cast<char>('0' + (cd.y / 1000) % 10);
-    out[1] = static_cast<char>('0' + (cd.y / 100) % 10);
-    out[2] = static_cast<char>('0' + (cd.y / 10) % 10);
-    out[3] = static_cast<char>('0' + cd.y % 10);
-    out[4] = '-';
-    out[5] = static_cast<char>('0' + cd.m / 10);
-    out[6] = static_cast<char>('0' + cd.m % 10);
-    out[7] = '-';
-    out[8] = static_cast<char>('0' + cd.d / 10);
-    out[9] = static_cast<char>('0' + cd.d % 10);
-    out[10] = '\0';
-    return std::string(out, 10);
+    return std::to_string(epoch - (epoch % 86400));
 }
 
-/// Grace countdown → ABSOLUTE date (ADR-0024 D3 blob-stability rule):
-/// expires_at = collection_time + remaining_minutes, truncated to a UTC date.
-/// Deterministic for a fixed collection_epoch — two calls with the same
-/// collection_time yield the identical string, so a ticking minute counter
-/// cannot change the record between syncs.
+/// Grace countdown → the ABSOLUTE `expires_at` wire value (ADR-0024 D3
+/// blob-stability rule): expires_at = collection_time + remaining_minutes,
+/// truncated to UTC midnight. Deterministic for a fixed collection_epoch —
+/// two calls with the same collection_time yield the identical midnight-epoch
+/// string, so a ticking minute counter cannot change the record between syncs.
 inline std::string grace_expiry_date(long long collection_epoch, long long remaining_minutes) {
     if (remaining_minutes <= 0 || collection_epoch <= 0)
         return {};
-    return iso_date_from_epoch(collection_epoch + remaining_minutes * 60);
+    return expiry_wire_from_epoch(collection_epoch + remaining_minutes * 60);
 }
 
-/// CIM_DATETIME ("20261231000000.000000+000") → "YYYY-MM-DD". Returns "" for
-/// malformed input or the 1601-01-01 "no date" sentinel WMI uses for unset
+/// CIM_DATETIME ("20261231000000.000000+000") → the `expires_at` wire value
+/// (UTC-midnight epoch seconds, decimal string). Returns "" for malformed
+/// input or the 1601-01-01 "no date" sentinel WMI uses for unset
 /// EvaluationEndDate.
-inline std::string parse_wmi_datetime_to_iso_date(std::string_view cim) {
+inline std::string parse_wmi_datetime_to_expiry(std::string_view cim) {
     if (cim.size() < 8)
         return {};
     for (int i = 0; i < 8; ++i) {
@@ -287,13 +280,14 @@ inline std::string parse_wmi_datetime_to_iso_date(std::string_view cim) {
     const int day = (cim[6] - '0') * 10 + (cim[7] - '0');
     if (year <= 1601 || month < 1 || month > 12 || day < 1 || day > 31)
         return {};
-    return iso_date_from_epoch(
+    return expiry_wire_from_epoch(
         epoch_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)));
 }
 
-/// `openssl x509 -noout -enddate` output → "YYYY-MM-DD". Accepts both the
-/// `-dateopt iso_8601` form ("notAfter=2027-03-04 12:00:00Z") and the default
-/// form ("notAfter=Mar  4 12:00:00 2027 GMT"). Returns "" when unparsable.
+/// `openssl x509 -noout -enddate` output → the `expires_at` wire value
+/// (UTC-midnight epoch seconds, decimal string). Accepts both the `-dateopt
+/// iso_8601` form ("notAfter=2027-03-04 12:00:00Z") and the default form
+/// ("notAfter=Mar  4 12:00:00 2027 GMT"). Returns "" when unparsable.
 inline std::string parse_openssl_enddate(std::string_view line) {
     line = parse_detail::trim(line);
     constexpr std::string_view prefix = "notAfter=";
@@ -305,8 +299,13 @@ inline std::string parse_openssl_enddate(std::string_view line) {
         bool digits = true;
         for (std::size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u})
             digits = digits && value[i] >= '0' && value[i] <= '9';
-        if (digits)
-            return std::string(value.substr(0, 10));
+        if (digits) {
+            const long long y = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
+                                (value[2] - '0') * 10 + (value[3] - '0');
+            const unsigned mo = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
+            const unsigned d = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
+            return expiry_wire_from_epoch(epoch_from_civil(y, mo, d));
+        }
     }
     // Default form: "Mon dd HH:MM:SS yyyy GMT"
     static constexpr std::array<std::string_view, 12> months = {
@@ -338,7 +337,7 @@ inline std::string parse_openssl_enddate(std::string_view line) {
     }
     if (year < 1900 || day < 1 || day > 31)
         return {};
-    return iso_date_from_epoch(epoch_from_civil(year, month, static_cast<unsigned>(day)));
+    return expiry_wire_from_epoch(epoch_from_civil(year, month, static_cast<unsigned>(day)));
 }
 
 // ── SLP LicenseStatus → §3.2 status (ADR-0024 D2; surface table row 1) ─────
