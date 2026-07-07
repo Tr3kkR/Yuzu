@@ -9,6 +9,12 @@
 // safety + UB, not json type-mismatch throws. If a future audit confirms an
 // uncaught-throw path from a handler, tighten this to let it crash.
 //
+// The three dangerous_enforce_* chokepoints are called UNGUARDED — deliberately.
+// They run on stored rows at the push chokepoint (guardian_push_builder) with no
+// REST-layer guard above them, so they are contractually total: no exception on
+// any byte string (#1946). A throw escaping one of them here is a real finding,
+// not noise — let it crash.
+//
 // Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh — keep
 // the two in sync when adding sources.
 
@@ -26,7 +32,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const std::string_view in(reinterpret_cast<const char*>(data), size);
     const std::string as_str(in);
 
-    // The three chokepoints take raw strings — feed them the input directly.
+    // The three chokepoints take raw strings — feed them the input directly,
+    // unguarded (no-throw contract, see header comment).
     (void)gd::dangerous_enforce_registry_key(in);
     (void)gd::dangerous_enforce_service_stop(in);
     (void)gd::dangerous_enforce_in_spec(as_str);

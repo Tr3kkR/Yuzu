@@ -1,0 +1,1 @@
+{"spark": {"type":"service-status"},"assertion":{"type":"service-stopped","params":{"service_name":"WinDefend"}},"remediation":{"params":{"mode":"backoff"}}}
