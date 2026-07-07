@@ -3,16 +3,16 @@ status: proposed
 date: 2026-07-06
 owner: Alex Young
 deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06
-scope: capability §27 — agent licence detection, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, and the per-user privacy carve-out
+scope: capability §27 — agent licence discovery, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, and the per-user privacy carve-out
 context-refs: capability §27 issues #264–#267; #266 (entitlement-register reversal); ADR-0017 flip-wave (#1634, #1715); superseded standalone ADR PR #1870 (rev 1–5 review history); deferred — #1921 (KEK operator surface), #1922 (oidc_client_secret gap), #1923 (round-3 review items)
 ---
 
-# 0024 — Software Licensing & Entitlements (SLE: agent-detected licences + multi-source entitlements)
+# 0024 — Software Licensing & Entitlements (SLE: agent-discovered licences + multi-source entitlements)
 
 Supersedes the roadmap Phase 10 sketch of capability §27 (a SQLite `CatalogStore`, a
 hand-maintained entitlement register, a `software_usage` agent plugin, software tags,
 and a compliance dashboard) with the design recorded here: born-on-Postgres stores,
-agent-detected licences on the ADR-0016 daily-sync framework, multi-source
+agent-discovered licences on the ADR-0016 daily-sync framework, multi-source
 entitlements, server-side compliance evaluation, and a new top-level SLE page. It also
 renames the capability from the map's "Software Catalog & Licensing" to **"Software
 Licensing & Entitlements" (SLE)** — the capability-map §27 entry is retitled
@@ -41,11 +41,11 @@ ingestion substrate now exists:** ADR-0016's daily-sync framework is live with t
 sources (`installed_software`, `app_perf`, `device_ci`), a shared server ingest seam
 used by both the direct gRPC path and the Erlang gateway proxy, and typed Postgres
 projections — and it explicitly anticipated "a future `last_used` usage source for
-SAM/entitlement," which this design fulfils alongside licence detection. **The product
+SAM/entitlement," which this design fulfils alongside licence discovery. **The product
 decision changed:** the manual entitlement register drafted in issue #266 was first
-rejected — licence data must be agent-detected — then, at rev 2 (2026-07-04),
+rejected — licence data must be agent-discovered — then, at rev 2 (2026-07-04),
 entitlements returned to scope as a *separate, multi-source* plane measured alongside
-detected licences, and the owner directed a brand-new top-level "SLE" page rather than
+discovered licences, and the owner directed a brand-new top-level "SLE" page rather than
 a tab on `/inventory`.
 
 Name collisions constrain the design. `LicenseStore` and the `License` securable
@@ -61,38 +61,38 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
 
 ## Terminology
 
-- **Software licence** / **detected licence** — endpoint software licensing state
+- **Software licence** / **discovered licence** — endpoint software licensing state
   (product, type, channel, status, expiry) as observed by an agent. Always qualify:
   a **Yuzu licence** is the product's own licence (§22.3), a different thing.
 - **SLE** — "Software Licensing & Entitlements," the §27 capability and the new page.
 - **ProductRegistry** — canonical software-identity master data (deterministic
   matching of raw names → one product). Distinct from the `/inventory` "software
   catalog," which keeps its existing meaning.
-- **Detection plane** vs **entitlement plane** — the two data planes: what is
+- **Discovery plane** vs **entitlement plane** — the two data planes: what is
   *observed on endpoints* vs what is *purchased*.
 - **Effective licence state** — the state (including lapse) the server *derives* from
   agent-reported facts against server-now; not a raw agent field.
 - **Entitlement** — a purchased right (seats, type, term, renewal, cost) from a
   manual, CSV, connector, or agent source.
-- **Unentitled** — a product with detected licences but no entitlement data; never
+- **Unentitled** — a product with discovered licences but no entitlement data; never
   reported as "compliant." **Unreported** — an asset with no usage data; never
   reported as "unused."
 
 ## Decisions
 
-1. **Two data planes, kept deliberately distinct.** Licence *detection* is
-   **agent-only** — there is no manual path to edit detected state, so "truth on the
+1. **Two data planes, kept deliberately distinct.** Licence *discovery* is
+   **agent-only** — there is no manual path to edit discovered state, so "truth on the
    endpoint" is never hand-massaged. *Entitlements* (what was purchased) accept
    **manual, CSV, and automated** input. Purchased-vs-deployed math is computed only
-   where entitlement data exists; detected-only products stay honestly `unentitled`.
+   where entitlement data exists; discovered-only products stay honestly `unentitled`.
    The two planes never merge into one editable record. A consequence, stated as a
-   gap rather than hidden: **a wrong detection has no operator override** — the
-   remedy is a corrected probe in the next agent release; detection confidence is
+   gap rather than hidden: **a wrong reading has no operator override** — the
+   remedy is a corrected probe in the next agent release; each record's confidence is
    surfaced precisely so operators can weight `heuristic` rows accordingly, and
    Decision 8's worsening-only/hold-down semantics bound the alert noise a misfiring
    heuristic can cause.
 
-2. **Agent detection is a new `license_scan` plugin that probes every available
+2. **Agent discovery is a new `license_scan` plugin that probes every available
    surface.** Per-OS translation units with pure parsers split out; actions `list`
    (emit records) and `surfaces` (diagnostics — which surfaces are available and why
    not). Surfaces v1: Windows WMI `SoftwareLicensingProduct` (own bounded COM, never
@@ -123,7 +123,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    rides `InventoryReport.plugin_data` — **no proto change, no gateway regen** (opaque
    `map<string,bytes>`). Interval 24 h; hash-skip is meaningful because licence
    estates are stable day-to-day. **Blob-stability rule:** the canonical blob contains
-   only facts that change when detected state changes — no collection timestamps, and
+   only facts that change when discovered state changes — no collection timestamps, and
    countdowns (e.g. KMS grace minutes) are converted to an absolute UTC date so a
    ticking counter cannot defeat hash-skip. **Empty-vs-error:** zero rows is a
    legitimate state (a valid empty blob full-replaces to empty); the cycle is skipped
@@ -138,7 +138,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    either direction.
 
 4. **Canonical state lives in born-on-Postgres stores.** `ProductRegistryStore`
-   (canonical identities + match links), `SoftwareLicensingStore` (per-agent detected
+   (canonical identities + match links), `SoftwareLicensingStore` (per-agent discovered
    rows + posture rollups + alert dedup), `SoftwareEntitlementStore` (purchased state
    from five sources), and `SoftwareUsageStore` (usage facts). No new SQLite (ADR-0006/
    0007), full store contract (ADR-0012): migrate-at-construction on a pinned lease,
@@ -148,7 +148,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    (a degrade returns nullopt → 503/banner, never a silent empty list, which on a
    compliance surface would be a fail-open lie); ingest writes are fail-soft, retried
    next cycle. *Rejected: extending `SoftwareInventoryStore` with licence columns —
-   installed software and detected licences have different lifecycles and postures;
+   installed software and discovered licences have different lifecycles and postures;
    one-store-per-typed-domain is the established precedent.*
 
 5. **One ingest seam per source, shared by the gRPC and gateway paths, with a
@@ -179,11 +179,11 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    completion-spaced cadence, keep-last-good, stop/join before teardown) re-derives
    **effective licence state including lapse against server-now** — so a device that
    *stopped syncing* before its licence lapsed still shows `expired`. Non-negotiable
-   honesty rules: detected-only products stay `unentitled`, **never** "compliant";
+   honesty rules: discovered-only products stay `unentitled`, **never** "compliant";
    reclamation's absent-usage state is **Unreported, not Unused**; unknown seat counts
    are `NULL`, never a fabricated zero; multi-source seat sums keep the **per-source
    breakdown visible** (double-counting is shown, not hidden); the "installed but
-   licence-unreported" delta is shown, not hidden; and detection `confidence` and
+   licence-unreported" delta is shown, not hidden; and discovery `confidence` and
    `unknown` states are first-class throughout. Verdict *freshness* is part of the same
    posture: compliance surfaces carry the rollup's as-of time and evaluator staleness is
    observable rather than silent — a wedged keep-last-good evaluator serving stale
@@ -256,7 +256,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     to replace, and PR-A is not implemented yet (the `#1716` forward-references in
     `server/core` point at a closed doc-honesty PR, not the gate).*
 
-11. **Per-user detection is a contained ADR-0016 deviation, pseudonymous by default.**
+11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default.**
     At the owner's explicit direction ("probe everything"), the `software_licensing`
     source probes per-user surfaces and records may carry `user_scope=user` +
     `user_ref`, deviating from ADR-0016's machine-scope/no-PII posture — confined to
@@ -270,7 +270,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     an unsalted `sha256/12`, which a low-entropy name like `jsmith` makes trivially
     reversible). `collect` sends the raw name (opt-in); `omit` suppresses the
     *identifier*, not the *probe* (`user_scope` still distinguishes per-user
-    detections). GDPR posture stated plainly: a hashed `user_ref` is still personal data
+    discoverys). GDPR posture stated plainly: a hashed `user_ref` is still personal data
     (Recital 26); erasure is knob-flip to `omit` (full-replaced within one 24 h cycle
     for syncing agents; offline agents purge on reconnect or via decommission) plus the
     **agent-decommission cascade — the per-store `delete_agent`
@@ -386,10 +386,10 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
   types and channels, what has lapsed, and what expires or renews within N days —
   with notifications — how purchases compare with deployment for entitled products,
   and what paid software is going unused.
-- Licence detection has **no manual path**; entitlements do (form, CSV, connector,
-  and agent-derived records). The two planes stay distinct so detected "truth on the
+- Licence discovery has **no manual path**; entitlements do (form, CSV, connector,
+  and agent-derived records). The two planes stay distinct so discovered "truth on the
   endpoint" is never hand-edited, and purchased-vs-deployed math is claimed only
-  where entitlement data exists — detected-only products stay honestly `unentitled`.
+  where entitlement data exists — discovered-only products stay honestly `unentitled`.
 - Multi-source seat sums keep the per-source breakdown visible; unknown seats are
   `NULL`, not a fabricated zero; absent usage is *Unreported*, never *Unused*.
 - Four born-on-Postgres stores join the ladder; the server refuses to boot if their
