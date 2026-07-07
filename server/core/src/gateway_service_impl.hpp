@@ -31,6 +31,7 @@ class InventoryStore;
 class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
+class SoftwareLicensingStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -60,6 +61,11 @@ public:
     void set_app_perf_daily_store(AppPerfDailyStore* store) { app_perf_daily_store_ = store; }
     void set_device_inventory_store(DeviceInventoryStore* store) {
         device_inventory_store_ = store;
+    }
+    /// Typed detected-licence projection (ADR-0024) — receives the
+    /// software_licensing daily-sync source via ProxyInventory.
+    void set_software_licensing_store(SoftwareLicensingStore* store) {
+        software_licensing_store_ = store;
     }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
@@ -149,6 +155,7 @@ private:
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
+    SoftwareLicensingStore* software_licensing_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};

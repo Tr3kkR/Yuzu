@@ -433,6 +433,7 @@ yuzu_server_core_lib = static_library(
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
     'src/software_licensing_store.cpp',
+    'src/software_licensing_ingestion.cpp',
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/offline_endpoint_store.cpp',
