@@ -10097,6 +10097,20 @@ private:
                 if (!software_licensing_store_)
                     return std::unexpected(LicensingReadError::kDegraded);
                 return software_licensing_store_->effective_user_ref_mode(agent_id);
+            },
+            // D-10 live surfaces dispatch: the SHARED command dispatch closure
+            // (same 6-param shape — passed verbatim, zero adapter) + a thin
+            // ResponseStore adapter (nullopt = store closed/degraded → 503).
+            command_dispatch_fn,
+            [this](const std::string& command_id)
+                -> std::optional<std::vector<SleCommandResponseRow>> {
+                if (!response_store_ || !response_store_->is_open())
+                    return std::nullopt;
+                std::vector<SleCommandResponseRow> out;
+                for (const auto& r : response_store_->query(command_id))
+                    out.push_back(SleCommandResponseRow{r.agent_id, r.status, r.output,
+                                                        r.error_detail});
+                return out;
             });
         // The /sle PAGE (guardian shell + the Licences fragment, PR1b). The shell
         // is auth-only chrome; the fragment gates on the same fail-closed

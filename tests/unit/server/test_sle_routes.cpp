@@ -88,6 +88,11 @@ struct SleHarness {
     std::optional<std::int64_t> meta_stamp;
     bool degrade_user_ref_mode = false;       // D-10 read-back degrade
     std::optional<std::string> user_ref_mode; // nullopt = never synced (JSON null)
+    // Live surfaces dispatch (D-10 second half).
+    int dispatch_sent = 1;                   // agents reached; 0 = offline
+    std::vector<std::string> dispatch_calls; // "plugin|action|agent_id"
+    std::vector<SleCommandResponseRow> canned_rows;
+    bool responses_degrade = false;
 
     std::vector<LicensePostureRow> posture_rows;
     std::vector<SleLicenseDeviceRow> device_rows;
@@ -160,8 +165,22 @@ struct SleHarness {
                 return std::unexpected(LicensingReadError::kDegraded);
             return user_ref_mode;
         };
+        auto dispatch_fn = [this](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> std::pair<std::string, int> {
+            dispatch_calls.push_back(plugin + "|" + action + "|" +
+                                     (agent_ids.empty() ? "" : agent_ids[0]));
+            return {"cmd-test-1", dispatch_sent};
+        };
+        auto responses_fn = [this](const std::string&)
+            -> std::optional<std::vector<SleCommandResponseRow>> {
+            if (responses_degrade)
+                return std::nullopt;
+            return canned_rows;
+        };
         routes.register_routes(sink, perm, scoped, posture_fn, devices_fn, agents_fn, audit,
-                               meta_fn, mode_fn);
+                               meta_fn, mode_fn, dispatch_fn, responses_fn);
         auto auth = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             if (!authed)
@@ -822,4 +841,183 @@ TEST_CASE("sle/agents/{id}: a degraded mode read is the drill's 503, never a fab
     REQUIRE(res);
     REQUIRE(res->status == 503);
     CHECK_FALSE(contains(res->body, "Reader")); // no partial body alongside the error
+}
+
+// ─────────────── live surfaces dispatch (D-10 second half, PR1b) ────────────────
+
+namespace {
+SleCommandResponseRow resp_row(std::string agent, int status, std::string output,
+                               std::string error_detail = "") {
+    SleCommandResponseRow r;
+    r.agent_id = std::move(agent);
+    r.status = status;
+    r.output = std::move(output);
+    r.error_detail = std::move(error_detail);
+    return r;
+}
+} // namespace
+
+TEST_CASE("sle surfaces: both scoped gates asked; out-of-scope never dispatches",
+          "[sle_routes][sle_live]") {
+    SleHarness h; // allow_scoped_all = false → deny
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    CHECK(h.dispatch_calls.empty());
+    // The FIRST gate asked was the SLE read scope for exactly this agent.
+    REQUIRE_FALSE(h.scoped_calls.empty());
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Read|agent-9");
+}
+
+TEST_CASE("sle surfaces: Execute is gated separately after the read scope",
+          "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.canned_rows = {resp_row("agent-9", 1, "probe_status|slp_wmi|ok|3")};
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(h.scoped_calls.size() >= 2);
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Read|agent-9");
+    CHECK(h.scoped_calls[1] == "Execution|Execute|agent-9");
+    REQUIRE(h.dispatch_calls.size() == 1);
+    CHECK(h.dispatch_calls[0] == "license_scan|surfaces|agent-9");
+}
+
+TEST_CASE("sle surfaces: offline device → honest 503, never fabricated diagnostics",
+          "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.dispatch_sent = 0;
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    CHECK(contains(res->body, "offline"));
+    CHECK_FALSE(contains(res->body, "surfaces\""));
+}
+
+TEST_CASE("sle surfaces: happy path parses probe_status lines into the live shape",
+          "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.canned_rows = {resp_row("agent-9", 1,
+                              "probe_status|slp_wmi|ok|3\n"
+                              "probe_status|per_user_hives|error|privilege_missing\n")};
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body)["data"];
+    CHECK(j["agent_id"] == "agent-9");
+    CHECK(j["live"] == true);
+    CHECK(j["count"] == 2);
+    REQUIRE(j["surfaces"].size() == 2);
+    CHECK(j["surfaces"][0]["surface"] == "slp_wmi");
+    CHECK(j["surfaces"][0]["status"] == "ok");
+    CHECK(j["surfaces"][0]["rows"] == 3);
+    CHECK(j["surfaces"][1]["surface"] == "per_user_hives");
+    CHECK(j["surfaces"][1]["status"] == "error");
+    CHECK(j["surfaces"][1]["detail"] == "privilege_missing");
+}
+
+TEST_CASE("sle surfaces: failure wins over partial output (502)", "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.canned_rows = {resp_row("agent-9", 2, "probe_status|slp_wmi|ok|3", "plugin crashed")};
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 502);
+    CHECK(contains(res->body, "plugin crashed"));
+}
+
+TEST_CASE("sle surfaces: another agent's rows are never rendered; poll budget → 504",
+          "[sle_routes][sle_live]") {
+    // Shrink the poll budget so the miss path resolves fast; restore after.
+    auto& polls = sle_detail::sle_live_poll_max_polls();
+    auto& interval = sle_detail::sle_live_poll_interval_ms();
+    const int old_polls = polls.exchange(2);
+    const int old_interval = interval.exchange(1);
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.canned_rows = {resp_row("someone-else", 1, "probe_status|slp_wmi|ok|3")};
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 504);
+        CHECK_FALSE(contains(res->body, "slp_wmi"));
+    }
+    polls.store(old_polls);
+    interval.store(old_interval);
+}
+
+TEST_CASE("sle surfaces: in-flight cap → 429 with no dispatch", "[sle_routes][sle_live]") {
+    auto& cap = sle_detail::sle_live_max_inflight();
+    const int old_cap = cap.exchange(0);
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 429);
+        CHECK(h.dispatch_calls.empty());
+    }
+    cap.store(old_cap);
+}
+
+TEST_CASE("sle surfaces: degraded response store → 503", "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.responses_degrade = true;
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    CHECK(contains(res->body, "response store"));
+}
+
+TEST_CASE("sle surfaces: hostile lic| lines can never reflect user_ref through the live "
+          "route (whitelist parser)",
+          "[sle_routes][sle_live]") {
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.canned_rows = {resp_row("agent-9", 1,
+                                  "lic|Reader|Acme|1.0|subscription|licensed|0|||wmi|probable||"
+                                  "user|alice|0\n"
+                                  "probe_status|slp_wmi|ok|3\n")};
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK_FALSE(contains(res->body, "alice"));
+        CHECK_FALSE(contains(res->body, "user_ref"));
+        auto j = json::parse(res->body)["data"];
+        CHECK(j["count"] == 1); // only the probe_status line survived
+    }
+    {
+        SleHarness h; // output with ZERO valid lines is malformed, not empty
+        h.allow_scoped_all = true;
+        h.canned_rows = {resp_row("agent-9", 1, "lic|Reader|Acme|only|garbage")};
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 502);
+        CHECK(contains(res->body, "malformed"));
+    }
+}
+
+TEST_CASE("sle surfaces: audited set-and-proceed BEFORE dispatch (deliberate contrast with "
+          "the drill's fail-closed tier)",
+          "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.audit_should_fail = true; // a dropped audit row must NOT block the machine-health read
+    h.canned_rows = {resp_row("agent-9", 1, "probe_status|slp_wmi|ok|3")};
+    auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(h.audited("sle.agent.surfaces|requested"));
+}
+
+TEST_CASE("sle surfaces: GET is not routed (POST-only side effect)", "[sle_routes][sle_live]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    auto res = h.sink.Get("/api/v1/sle/agents/agent-9/surfaces");
+    CHECK_FALSE(res); // no GET handler matches — the dispatch is POST-only
 }

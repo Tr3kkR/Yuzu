@@ -32,6 +32,7 @@ extern const char* const kGuardianDetailPageHtml;
 #include <format>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -127,6 +128,67 @@ bool icontains(const std::string& hay, const std::string& needle) {
     return lower(hay).find(needle) != std::string::npos;
 }
 
+/// One parsed `probe_status|<surface>|ok|<rows>` / `probe_status|<surface>|
+/// error|<reason>` line from the agent's `license_scan surfaces` output.
+struct ParsedSurface {
+    std::string surface;
+    std::string status; ///< whitelisted to "ok" | "error"
+    std::int64_t rows{0};
+    std::string detail; ///< the error reason token (e.g. privilege_missing)
+};
+
+/// Parse the surfaces command output DEFENSIVELY: accept ONLY lines starting
+/// `probe_status|` with a whitelisted status token; drop everything else.
+/// This is also the guarantee that a hostile/buggy agent cannot reflect
+/// `lic|` licence rows (which carry user_ref personal data) through the
+/// unaudited-for-PII live route — non-probe_status lines never reach the
+/// response. Returns nullopt when a NON-EMPTY output yields zero valid lines
+/// (malformed device output → the caller 502s, never a false empty).
+std::optional<std::vector<ParsedSurface>> parse_probe_status_lines(const std::string& output) {
+    std::vector<ParsedSurface> out;
+    std::size_t pos = 0;
+    bool any_content = false;
+    while (pos <= output.size()) {
+        const std::size_t nl = output.find('\n', pos);
+        std::string line = output.substr(pos, nl == std::string::npos ? std::string::npos
+                                                                      : nl - pos);
+        pos = nl == std::string::npos ? output.size() + 1 : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        any_content = true;
+        // probe_status|<surface>|<status>|<rest>
+        if (line.rfind("probe_status|", 0) != 0)
+            continue;
+        const std::size_t p1 = 13; // past "probe_status|"
+        const std::size_t p2 = line.find('|', p1);
+        if (p2 == std::string::npos)
+            continue;
+        const std::size_t p3 = line.find('|', p2 + 1);
+        ParsedSurface s;
+        s.surface = line.substr(p1, p2 - p1);
+        s.status = p3 == std::string::npos ? line.substr(p2 + 1)
+                                           : line.substr(p2 + 1, p3 - p2 - 1);
+        if (s.surface.empty() || (s.status != "ok" && s.status != "error"))
+            continue;
+        const std::string rest = p3 == std::string::npos ? "" : line.substr(p3 + 1);
+        if (s.status == "ok") {
+            try {
+                s.rows = std::stoll(rest);
+            } catch (...) {
+                s.rows = 0;
+            }
+        } else {
+            s.detail = rest;
+        }
+        out.push_back(std::move(s));
+    }
+    if (any_content && out.empty())
+        return std::nullopt; // malformed device output
+    return out;
+}
+
 json posture_to_json(const LicensePostureRow& r) {
     json j;
     j["product_key"] = r.product_key;
@@ -171,6 +233,57 @@ json agent_license_to_json(const AgentLicenseRow& r) {
     j["last_seen"] = r.last_seen;
     return j;
 }
+
+} // namespace
+
+namespace sle_detail {
+// SLE-local live-dispatch seams (see the header). Defaults mirror the
+// rest_api_v1 live seams: cap 4 (strictly below the worker pool), 40 polls ×
+// 500 ms ≈ 20 s budget. NOTE: a WMI-degraded Windows host can legitimately
+// take up to the plugin's 60 s enumeration deadline — such a host 504s
+// honestly here (the stored drill stays available); do NOT raise the budget,
+// it pins an httplib worker.
+std::atomic<int>& sle_live_max_inflight() {
+    static std::atomic<int> v{4};
+    return v;
+}
+std::atomic<int>& sle_live_poll_max_polls() {
+    static std::atomic<int> v{40};
+    return v;
+}
+std::atomic<int>& sle_live_poll_interval_ms() {
+    static std::atomic<int> v{500};
+    return v;
+}
+} // namespace sle_detail
+
+namespace {
+
+/// RAII in-flight slot for the live surfaces dispatch (the rest_api_v1
+/// LiveInflightGuard shape, SLE-local counter).
+class SleLiveInflightGuard {
+public:
+    SleLiveInflightGuard() {
+        const int cap = sle_detail::sle_live_max_inflight().load(std::memory_order_relaxed);
+        acquired_ = count().fetch_add(1, std::memory_order_acq_rel) < cap;
+        if (!acquired_)
+            count().fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ~SleLiveInflightGuard() {
+        if (acquired_)
+            count().fetch_sub(1, std::memory_order_acq_rel);
+    }
+    SleLiveInflightGuard(const SleLiveInflightGuard&) = delete;
+    SleLiveInflightGuard& operator=(const SleLiveInflightGuard&) = delete;
+    [[nodiscard]] bool acquired() const { return acquired_; }
+
+private:
+    static std::atomic<int>& count() {
+        static std::atomic<int> v{0};
+        return v;
+    }
+    bool acquired_{false};
+};
 
 } // namespace
 
@@ -219,17 +332,20 @@ void sle_apply_posture_meta(SlePostureAggregates& agg, std::int64_t refreshed_at
 void SleRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
-                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn) {
+                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(perm_fn), std::move(scoped_perm_fn), std::move(posture_fn),
                     std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn),
-                    std::move(posture_meta_fn), std::move(user_ref_mode_fn));
+                    std::move(posture_meta_fn), std::move(user_ref_mode_fn),
+                    std::move(dispatch_fn), std::move(responses_fn));
 }
 
 void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
-                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn) {
+                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     posture_fn_ = std::move(posture_fn);
@@ -238,6 +354,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
     audit_fn_ = std::move(audit_fn);
     posture_meta_fn_ = std::move(posture_meta_fn);
     user_ref_mode_fn_ = std::move(user_ref_mode_fn);
+    dispatch_fn_ = std::move(dispatch_fn);
+    responses_fn_ = std::move(responses_fn);
 
     // ── GET /api/v1/sle/summary — fleet posture headline (GLOBAL SoftwareLicensing:Read) ──
     // Reads the precomputed posture rollup and derives honest aggregates. In PR1a
@@ -526,6 +644,164 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                  }
                  send_json(res, 200, ok_json(std::move(data)));
              });
+
+    // ── POST /api/v1/sle/agents/{agent_id}/surfaces — LIVE surface diagnostics (D-10) ──
+    // The flappy per-surface diagnostics are LIVE-ONLY (ADR-0024 Decision 10):
+    // this dispatches the agent's `license_scan surfaces` action over the
+    // command path and returns the parsed probe_status lines — which detection
+    // surfaces ran, how many rows each yielded, and the failure reason token
+    // (e.g. privilege_missing) for the ones that didn't. POST, not GET: the
+    // handler dispatches a real command to the device (the dex-live
+    // architect-B1 precedent, test-locked there). The agent-side action ships
+    // with the plugin and emits ONLY probe_status lines — per-user outcomes
+    // aggregate per surface, so no profile name / user_ref / SID can appear —
+    // and the whitelist parser below makes that a served guarantee, not a
+    // trust assumption: non-probe_status lines (e.g. a hostile `lic|` row that
+    // would otherwise reflect user_ref through this route) never reach the
+    // response.
+    //
+    // GATES: the drill's per-device scoped SoftwareLicensing:Read AND
+    // Execution:Execute (everything that dispatches gates Execute — the
+    // dex-live / /api/command posture), both fail-closed when unwired.
+    // AUDIT: set-and-proceed `sle.agent.surfaces` BEFORE dispatch. This is
+    // deliberately NOT the drill's fail-closed behavioural tier (G-2): that
+    // tier binds to rendering individual-identifying data, and the surfaces
+    // payload carries none (reason tokens only, verified end-to-end +
+    // enforced by the parser); the posture matches preflight's machine-health
+    // reads. The daily sync runs the identical collection unaudited.
+    sink.Post(
+        R"(/api/v1/sle/agents/([^/]+)/surfaces)",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            const auto cid = make_cid();
+            res.set_header("X-Correlation-Id", cid);
+            const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+            if (!scoped_perm_fn_) {
+                send_json(res, 503, a4_error(503, "scope gate not configured", cid));
+                return;
+            }
+            if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Read", agent_id))
+                return;
+            if (!scoped_perm_fn_(req, res, "Execution", "Execute", agent_id))
+                return;
+            if (!dispatch_fn_ || !responses_fn_) {
+                send_json(res, 503,
+                          a4_error(503, "live surface diagnostics unavailable", cid, 5000));
+                return;
+            }
+            SleLiveInflightGuard slot;
+            if (!slot.acquired()) {
+                send_json(res, 429,
+                          a4_error(429, "too many concurrent live queries; retry shortly", cid,
+                                   2000, "retry the request"));
+                return;
+            }
+            (void)detail::try_persist_audit(audit_fn_, req, "sle.agent.surfaces", "requested",
+                                            "Agent", agent_id,
+                                            "live surface diagnostics dispatch cid=" + cid);
+            const auto [command_id, sent] =
+                dispatch_fn_("license_scan", "surfaces", {agent_id}, "", {}, "");
+            if (sent == 0) {
+                send_json(res, 503,
+                          a4_error(503,
+                                   "device offline — live surface diagnostics need a "
+                                   "connected agent",
+                                   cid, 5000));
+                return;
+            }
+            const int max_polls =
+                sle_detail::sle_live_poll_max_polls().load(std::memory_order_relaxed);
+            const auto interval = std::chrono::milliseconds(
+                sle_detail::sle_live_poll_interval_ms().load(std::memory_order_relaxed));
+            // Cap the device output we parse (a runaway agent must not make a
+            // worker hold a multi-MB blob); surfaces output is tiny by design.
+            constexpr std::size_t kMaxSurfacesOutputBytes = 64 * 1024;
+            for (int i = 0; i < max_polls; ++i) {
+                if (i > 0)
+                    std::this_thread::sleep_for(interval); // query first; back off on miss
+                auto rows = responses_fn_(command_id);
+                if (!rows) {
+                    send_json(res, 503,
+                              a4_error(503, "response store unavailable — read failed", cid,
+                                       5000, "retry the request"));
+                    return;
+                }
+                std::string output, error_detail;
+                int terminal = -1;
+                bool have_output = false;
+                for (const auto& r : *rows) {
+                    if (r.agent_id != agent_id)
+                        continue; // never render another agent's row
+                    if (!r.output.empty()) {
+                        output = r.output;
+                        have_output = true;
+                    }
+                    if (r.status >= 1) {
+                        terminal = r.status;
+                        error_detail = r.error_detail;
+                    }
+                }
+                // FAILURE WINS: a terminal-failure row 502s even alongside a
+                // partial-output row (a failed command must not read as data).
+                if (terminal >= 2) {
+                    send_json(res, 502,
+                              a4_error(502,
+                                       "device query failed: " + error_detail.substr(0, 200),
+                                       cid));
+                    return;
+                }
+                if (have_output) {
+                    if (output.rfind("error|", 0) == 0) {
+                        send_json(res, 502,
+                                  a4_error(502,
+                                           "device reported an error: " + output.substr(6, 200),
+                                           cid));
+                        return;
+                    }
+                    if (output.size() > kMaxSurfacesOutputBytes) {
+                        send_json(res, 502, a4_error(502, "device output too large", cid));
+                        return;
+                    }
+                    const auto parsed = parse_probe_status_lines(output);
+                    if (!parsed) {
+                        send_json(res, 502, a4_error(502, "malformed device output", cid));
+                        return;
+                    }
+                    json surfaces = json::array();
+                    for (const auto& s : *parsed) {
+                        json j;
+                        j["surface"] = s.surface;
+                        j["status"] = s.status;
+                        if (s.status == "ok")
+                            j["rows"] = s.rows;
+                        else
+                            j["detail"] = s.detail;
+                        surfaces.push_back(std::move(j));
+                    }
+                    json data;
+                    data["agent_id"] = agent_id;
+                    data["live"] = true;
+                    data["as_of"] = epoch_now_secs();
+                    data["count"] = static_cast<std::int64_t>(surfaces.size());
+                    data["surfaces"] = std::move(surfaces);
+                    send_json(res, 200, ok_json(std::move(data)));
+                    return;
+                }
+                if (terminal == 1) {
+                    // Success terminal with no output: honest empty (not a 504).
+                    json data;
+                    data["agent_id"] = agent_id;
+                    data["live"] = true;
+                    data["as_of"] = epoch_now_secs();
+                    data["count"] = 0;
+                    data["surfaces"] = json::array();
+                    send_json(res, 200, ok_json(std::move(data)));
+                    return;
+                }
+            }
+            send_json(res, 504,
+                      a4_error(504, "device did not respond in time", cid, 3000,
+                               "retry the request"));
+        });
 }
 
 void SleRoutes::register_page_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,

@@ -49,10 +49,13 @@
 
 #include <httplib.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -70,6 +73,25 @@ struct SleLicenseDeviceRow {
     std::string state;         ///< effective licence state (closed §3.2 vocabulary)
     std::int64_t expiry_at{0}; ///< agent-observed expiry epoch; 0 = none
 };
+
+/// One command-path response row for the live surfaces dispatch — a
+/// route-level DTO (NOT the ResponseStore type; server.cpp adapts).
+struct SleCommandResponseRow {
+    std::string agent_id;
+    int status{0}; ///< CommandResponse enum: >=1 terminal, >=2 failure
+    std::string output;
+    std::string error_detail;
+};
+
+namespace sle_detail {
+/// Test seams for the live surfaces dispatch (the rest_api_v1 `live_poll_*`
+/// pattern, kept SLE-LOCAL per this file's self-contained discipline — and so
+/// one knob never spans unrelated routes). Meyers singletons; tests override
+/// then restore.
+std::atomic<int>& sle_live_max_inflight();   // default 4
+std::atomic<int>& sle_live_poll_max_polls(); // default 40
+std::atomic<int>& sle_live_poll_interval_ms(); // default 500 (≈20s budget)
+} // namespace sle_detail
 
 /// Headline aggregates over the posture rollup — the SINGLE source of the
 /// `/sle/summary` REST body, the `/sle` page KPI tiles, and the MCP summary
@@ -181,17 +203,35 @@ public:
     using UserRefModeFn = std::function<std::expected<std::optional<std::string>,
                                                       LicensingReadError>(const std::string&)>;
 
+    /// Command dispatch for the live surfaces probe — the SHARED
+    /// `command_dispatch_fn` shape (6 params) so server.cpp passes it
+    /// verbatim, zero adapter (the PreflightRoutes::DispatchFn precedent).
+    /// Returns {command_id, agents_reached}; 0 reached = the honest "agent
+    /// offline" signal. Unwired (`= {}`) → the POST answers 503.
+    using DispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
+
+    /// Command-response poll for one command_id. `std::nullopt` = the
+    /// response store is degraded (→ 503, never silence). Unwired → 503.
+    using ResponsesFn =
+        std::function<std::optional<std::vector<SleCommandResponseRow>>(const std::string&)>;
+
     void register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
-                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {});
+                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {},
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
-                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {});
+                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {},
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
 
     /// The `/sle` PAGE (guardian shell + the Licences fragment). Separate from
     /// `register_routes` so PR1a's REST registration signature and its tests
@@ -216,6 +256,8 @@ private:
     AuditFn audit_fn_;
     PostureMetaFn posture_meta_fn_;
     UserRefModeFn user_ref_mode_fn_;
+    DispatchFn dispatch_fn_;
+    ResponsesFn responses_fn_;
     // Page-route closures (register_page_routes).
     AuthFn page_auth_fn_;
     PermFn page_perm_fn_;
