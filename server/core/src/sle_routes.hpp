@@ -171,17 +171,27 @@ public:
     /// falls back to the row-derived as-of (the PR1a behaviour).
     using PostureMetaFn = std::function<std::optional<std::int64_t>()>;
 
+    /// The agent's effective user-ref mode as the last stored blob's
+    /// `cfg|user_ref` record declared it (roadmap D-10 read-back — lets an
+    /// operator verify a `--license-scan-user-ref` knob flip actually landed).
+    /// `kDegraded` on a store failure (→ the drill's 503 path — same store,
+    /// same request); a value holding `std::nullopt` = the agent never synced
+    /// this source (rendered as JSON null). Unwired (`= {}`) → the field is
+    /// omitted (test affordance; production wires it).
+    using UserRefModeFn = std::function<std::expected<std::optional<std::string>,
+                                                      LicensingReadError>(const std::string&)>;
+
     void register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
-                         PostureMetaFn posture_meta_fn = {});
+                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
-                         PostureMetaFn posture_meta_fn = {});
+                         PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {});
 
     /// The `/sle` PAGE (guardian shell + the Licences fragment). Separate from
     /// `register_routes` so PR1a's REST registration signature and its tests
@@ -205,6 +215,7 @@ private:
     AgentLicensesFn agent_licenses_fn_;
     AuditFn audit_fn_;
     PostureMetaFn posture_meta_fn_;
+    UserRefModeFn user_ref_mode_fn_;
     // Page-route closures (register_page_routes).
     AuthFn page_auth_fn_;
     PermFn page_perm_fn_;

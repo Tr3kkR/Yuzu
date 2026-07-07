@@ -10089,6 +10089,14 @@ private:
                 if (!software_licensing_store_)
                     return std::nullopt;
                 return software_licensing_store_->posture_refreshed_at();
+            },
+            // D-10 read-back: the drill echoes the effective user-ref mode the
+            // device's last stored blob declared (kDegraded → 503).
+            [this](const std::string& agent_id)
+                -> std::expected<std::optional<std::string>, LicensingReadError> {
+                if (!software_licensing_store_)
+                    return std::unexpected(LicensingReadError::kDegraded);
+                return software_licensing_store_->effective_user_ref_mode(agent_id);
             });
         // The /sle PAGE (guardian shell + the Licences fragment, PR1b). The shell
         // is auth-only chrome; the fragment gates on the same fail-closed

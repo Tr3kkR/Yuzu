@@ -86,6 +86,8 @@ struct SleHarness {
     // refreshed_at over posture_rows) so the PR1a summary assertions hold
     // while the production wiring (meta ALWAYS consulted) is exercised.
     std::optional<std::int64_t> meta_stamp;
+    bool degrade_user_ref_mode = false;       // D-10 read-back degrade
+    std::optional<std::string> user_ref_mode; // nullopt = never synced (JSON null)
 
     std::vector<LicensePostureRow> posture_rows;
     std::vector<SleLicenseDeviceRow> device_rows;
@@ -152,8 +154,14 @@ struct SleHarness {
                 derived = std::max(derived, r.refreshed_at);
             return derived;
         };
+        auto mode_fn = [this](const std::string&)
+            -> std::expected<std::optional<std::string>, LicensingReadError> {
+            if (degrade_user_ref_mode)
+                return std::unexpected(LicensingReadError::kDegraded);
+            return user_ref_mode;
+        };
         routes.register_routes(sink, perm, scoped, posture_fn, devices_fn, agents_fn, audit,
-                               meta_fn);
+                               meta_fn, mode_fn);
         auto auth = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             if (!authed)
@@ -776,4 +784,42 @@ TEST_CASE("sle/summary: the G-4 meta stamp distinguishes evaluated-but-empty fro
         REQUIRE(res->status == 503);
         CHECK(h.audited("sle.summary|failure"));
     }
+}
+
+// ───────────────── effective_user_ref_mode read-back (D-10, PR1b) ───────────────
+
+TEST_CASE("sle/agents/{id}: echoes the stored effective_user_ref_mode; null = never synced",
+          "[sle_routes]") {
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.user_ref_mode = "hash";
+        auto res = h.sink.Get("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto j = json::parse(res->body)["data"];
+        CHECK(j["effective_user_ref_mode"] == "hash");
+    }
+    {
+        SleHarness h; // default: value holding nullopt = the agent never synced this source
+        h.allow_scoped_all = true;
+        auto res = h.sink.Get("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto j = json::parse(res->body)["data"];
+        REQUIRE(j.contains("effective_user_ref_mode"));
+        CHECK(j["effective_user_ref_mode"].is_null());
+    }
+}
+
+TEST_CASE("sle/agents/{id}: a degraded mode read is the drill's 503, never a fabricated null",
+          "[sle_routes]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.agent_rows = {lic("Reader", "licensed")};
+    h.degrade_user_ref_mode = true;
+    auto res = h.sink.Get("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    CHECK_FALSE(contains(res->body, "Reader")); // no partial body alongside the error
 }

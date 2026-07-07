@@ -219,17 +219,17 @@ void sle_apply_posture_meta(SlePostureAggregates& agg, std::int64_t refreshed_at
 void SleRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
-                                PostureMetaFn posture_meta_fn) {
+                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(perm_fn), std::move(scoped_perm_fn), std::move(posture_fn),
                     std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn),
-                    std::move(posture_meta_fn));
+                    std::move(posture_meta_fn), std::move(user_ref_mode_fn));
 }
 
 void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
-                                PostureMetaFn posture_meta_fn) {
+                                PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn) {
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     posture_fn_ = std::move(posture_fn);
@@ -237,6 +237,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
     agent_licenses_fn_ = std::move(agent_licenses_fn);
     audit_fn_ = std::move(audit_fn);
     posture_meta_fn_ = std::move(posture_meta_fn);
+    user_ref_mode_fn_ = std::move(user_ref_mode_fn);
 
     // ── GET /api/v1/sle/summary — fleet posture headline (GLOBAL SoftwareLicensing:Read) ──
     // Reads the precomputed posture rollup and derives honest aggregates. In PR1a
@@ -503,6 +504,26 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                  data["agent_id"] = agent_id;
                  data["licenses"] = std::move(licenses);
                  data["count"] = static_cast<std::int64_t>(rows->size());
+                 // D-10 read-back: the effective user-ref mode as the device's
+                 // LAST STORED blob declared it ("collect"|"hash"|"omit"; null =
+                 // never synced this source) — the operator's verification that
+                 // a --license-scan-user-ref knob flip landed. Same store, same
+                 // authoritative posture: a degraded read is the drill's 503,
+                 // never a fabricated null.
+                 if (user_ref_mode_fn_) {
+                     auto mode = user_ref_mode_fn_(agent_id);
+                     if (!mode) {
+                         send_json(res, 503,
+                                   a4_error(503,
+                                            "detected-licence store unavailable — read failed",
+                                            cid, 5000, "retry the request"));
+                         return;
+                     }
+                     if (mode->has_value())
+                         data["effective_user_ref_mode"] = **mode;
+                     else
+                         data["effective_user_ref_mode"] = nullptr;
+                 }
                  send_json(res, 200, ok_json(std::move(data)));
              });
 }
