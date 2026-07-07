@@ -2,6 +2,10 @@ option('build_agent',    type: 'boolean', value: true,  description: 'Build the 
 option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
 option('build_examples', type: 'boolean', value: true,  description: 'Build example plugins')
 option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
+option('build_fuzzers',  type: 'boolean', value: false,
+       description: 'Build the libFuzzer harnesses in tests/fuzz/ (requires clang; '
+                  + 'links -fsanitize=fuzzer,address,undefined). Mirrored by '
+                  + '.clusterfuzzlite/build.sh for CI fuzzing.')
 option('systemd_guard',  type: 'feature', value: 'enabled',
        description: 'Linux systemd service guard (libsystemd / sd-bus). '
                   + 'enabled (default): require libsystemd so the shipped agent always offers the guard. '

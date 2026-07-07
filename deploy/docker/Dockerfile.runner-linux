@@ -20,7 +20,6 @@ FROM ghcr.io/actions/actions-runner:latest@sha256:08c30b0a7105f64bddfc485d2487a2
 
 USER root
 
-ARG MESON_VERSION=1.11.1
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 
 # ── Build tools (mirrors Dockerfile.ci-linux) ─────────────────────────
@@ -41,7 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # job that runs `meson setup` before any pip install step.
 
 # ── Meson ─────────────────────────────────────────────────────────────
-RUN pip3 install --break-system-packages meson==${MESON_VERSION}
+COPY deploy/docker/requirements-meson-runner.txt /tmp/requirements-meson.txt
+RUN pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt
 
 # ── Default compiler symlinks ─────────────────────────────────────────
 RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \

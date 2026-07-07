@@ -19,6 +19,12 @@ docs/
 
 # Tests (excluded from production builds)
 tests/
+# …except the libFuzzer harnesses + seed corpora: .clusterfuzzlite/Dockerfile
+# does `COPY . $SRC/Yuzu`, and the blanket tests/ exclusion silently emptied
+# the fuzz build (CFLite run 28711283993: "no such file …/tests/fuzz/…").
+# A few KB of context for the production image builds is the whole cost.
+!tests/fuzz
+!tests/fuzz/**
 
 # Node / Puppeteer
 node_modules/

@@ -230,6 +230,17 @@ public:
     /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
     void delete_agent(std::string_view agent_id);
 
+    /// KEYSET-paged enumeration of the agent_ids that have reported a given
+    /// `source` (`inventory_state.source`). Returns up to `limit` ids with
+    /// `agent_id > after_id`, ascending. The PK (agent_id, source) makes agent_id
+    /// unique per source, so NO DISTINCT is needed. The caller loops with
+    /// `after_id = ` the last returned id until it gets a short page. Bounded
+    /// lease; returns an empty vector on a degrade (a caller that must distinguish
+    /// end-of-pages from degrade should check the page length vs `limit`). The
+    /// PR-4 CAVM backfill trigger walks the fleet through this.
+    [[nodiscard]] std::vector<std::string>
+    list_agent_ids(std::string_view source, std::string_view after_id, int limit);
+
     /// Count agents whose `installed_software` inventory has not been refreshed
     /// since `stale_before_secs` (epoch seconds) — i.e. `last_seen <
     /// stale_before_secs`. Feeds the `yuzu_inventory_stale_agents` freshness

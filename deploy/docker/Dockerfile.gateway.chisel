@@ -18,7 +18,7 @@
 #   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
 
 # ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
-ARG ERLANG_IMAGE=erlang:28
+ARG ERLANG_IMAGE=erlang:28@sha256:dc7e60b050b1c8f5ac25cef3f15cac0a7bec200b51158634c259e8a371118aae
 FROM ${ERLANG_IMAGE} AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
@@ -48,7 +48,7 @@ RUN rebar3 as prod release \
     && ldd _build/prod/rel/yuzu_gw/erts-*/bin/beam.smp || true
 
 # ── Stage 3: chisel — cut Ubuntu 26.04 rootfs + lay down the release ──────
-FROM ubuntu:26.04 AS chisel
+FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS chisel
 
 ARG TARGETARCH
 ARG CHISEL_VERSION=v1.4.1

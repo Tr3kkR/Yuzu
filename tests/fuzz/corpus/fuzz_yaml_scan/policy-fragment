@@ -1,0 +1,10 @@
+apiVersion: yuzu.io/v1alpha1
+kind: PolicyFragment
+metadata:
+  name: sample
+spec:
+  scope:
+    expression: ostype == "windows" AND tag:env == "prod"
+  checks:
+    - service-running
+    - registry-value-equals

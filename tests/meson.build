@@ -401,6 +401,8 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_vuln_finding_store.cpp',
+      'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',

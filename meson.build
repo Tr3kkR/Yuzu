@@ -414,6 +414,11 @@ if build_tests
   subdir('tests')
 endif
 
+# ── Fuzzers (libFuzzer harnesses; clang-only, see tests/fuzz/meson.build) ────
+if get_option('build_fuzzers')
+  subdir('tests/fuzz')
+endif
+
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)
 if _rebar3.found()
