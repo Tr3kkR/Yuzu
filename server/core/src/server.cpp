@@ -54,6 +54,8 @@
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "product_registry_store.hpp"
+#include "sle_routes.hpp"
 #include "agent_decommission.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
@@ -2426,12 +2428,11 @@ public:
         // already carry the set_software_licensing_store() setter + the ingest
         // call, but skip it while the store pointer is null.
         //
-        // MINIMAL SLE wiring (PR1a step 7): this constructs ONLY the licensing
-        // store — the reference the agent-decommission cascade needs (below).
-        // ProductRegistryStore, the entitlement/usage stores, the compliance
-        // evaluator, the posture-rollup thread, and the /api/v1/sle/* routes are
-        // deliberately NOT wired here; they land with the SLE REST/evaluator PR
-        // steps.
+        // SLE wiring (PR1a): the detected-licence store (step 7) + the canonical
+        // ProductRegistryStore (step 8), both born-on-PG and fail-closed. The
+        // entitlement/usage stores, the compliance evaluator, and the posture-rollup
+        // thread land in later PR steps; the /api/v1/sle/* READ routes are registered
+        // below (in the route-wiring block) against these two stores.
         if (pg_pool_ && !startup_failed_) {
             software_licensing_store_ = std::make_unique<SoftwareLicensingStore>(*pg_pool_);
             if (!software_licensing_store_->is_open()) {
@@ -2444,6 +2445,22 @@ public:
                 agent_service_.set_software_licensing_store(software_licensing_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_software_licensing_store(software_licensing_store_.get());
+            }
+        }
+        // ProductRegistryStore — SLE canonical product identities + match links
+        // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
+        // own fail-closed open. The PR1b compliance evaluator writes it (matcher
+        // pass); PR1a constructs it so the store ladder + /readyz probe are complete
+        // (roadmap G-10) and the SLE routes can share the pool-guarded lifetime.
+        if (pg_pool_ && !startup_failed_) {
+            product_registry_store_ = std::make_unique<ProductRegistryStore>(*pg_pool_);
+            if (!product_registry_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: product_registry store migration/open "
+                              "failed (database reachable but the product_registry_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                product_registry_store_->set_metrics(&metrics_);
             }
         }
 
@@ -3547,6 +3564,12 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_licensing_store(nullptr);
         software_licensing_store_.reset();
+        // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
+        // and dereference this store only at request time; the gRPC + HTTP drains
+        // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
+        // destruct-before-pool). Nothing borrows it long-lived (the PR1b evaluator
+        // that writes it is not yet wired), so no unwire step precedes the reset.
+        product_registry_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -5350,6 +5373,15 @@ private:
                 // software_inventory_store row above (silent no-ingest ack if dead).
                 {"device_inventory_store",
                  device_inventory_store_ && device_inventory_store_->is_open()},
+                // ADR-0024 SLE born-on-Pg stores (roadmap G-10, HC-1 Pattern E). Same
+                // rationale as the inventory stores: fail-closed at boot, but a not-open
+                // state post-boot makes ReportInventory silently ack the licensing blob
+                // with no ingest (software_licensing_store) and the /api/v1/sle/* reads
+                // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
+                {"software_licensing_store",
+                 software_licensing_store_ && software_licensing_store_->is_open()},
+                {"product_registry_store",
+                 product_registry_store_ && product_registry_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -9991,6 +10023,77 @@ private:
                 return device_inventory_store_->get_device_ci(id);
             });
 
+        // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
+        // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
+        // (roadmap G-1 / Decision 10). The shared require_permission /
+        // require_scoped_permission use the is_rbac_enabled() shape, which on a
+        // corrupt / load-failed rbac.db (is_rbac_enabled()==false) falls through to a
+        // legacy-open Read — the #1717 fail-open. rbac_enforcement_in_effect() is true
+        // for a null / !is_open() store as well as an enabled one, so this guard only
+        // permits the legacy-open path when the store is loaded AND explicitly disabled;
+        // a null/corrupt store is REFUSED (503), never served a legacy-open (and, for
+        // the drill, UNSCOPED) Read of licence data incl. user_ref PII. This closes
+        // #1717 for the SLE gates now, without waiting on the global-gate fix.
+        auto sle_gate_usable = [this](const httplib::Request& req, httplib::Response& res) -> bool {
+            if (rbac_enforcement_in_effect(rbac_store_.get()) &&
+                !(rbac_store_ && rbac_store_->is_open())) {
+                // Resolve auth first so an unauthenticated caller sees 401 (and never
+                // learns the store state) before the fail-closed 503.
+                if (require_auth(req, res)) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"authorization subsystem )"
+                        R"(unavailable","correlation_id":"","retry_after_ms":5000},)"
+                        R"("meta":{"api_version":"v1"}})",
+                        "application/json");
+                }
+                return false;
+            }
+            return true;
+        };
+        auto sle_perm_fn = [this, sle_gate_usable](const httplib::Request& req,
+                                                   httplib::Response& res, const std::string& type,
+                                                   const std::string& op) -> bool {
+            if (!sle_gate_usable(req, res))
+                return false;
+            return require_permission(req, res, type, op);
+        };
+        auto sle_scoped_perm_fn = [this, sle_gate_usable](
+                                      const httplib::Request& req, httplib::Response& res,
+                                      const std::string& type, const std::string& op,
+                                      const std::string& agent_id) -> bool {
+            if (!sle_gate_usable(req, res))
+                return false;
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        sle_routes_ = std::make_unique<SleRoutes>();
+        sle_routes_->register_routes(
+            *web_server_, sle_perm_fn, sle_scoped_perm_fn,
+            // Posture rollup (summary + licenses). nullopt on degrade → 503; empty in
+            // PR1a until the PR1b compliance evaluator populates it.
+            [this]() -> std::optional<std::vector<LicensePostureRow>> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->posture_rollup();
+            },
+            // Fan-out (devices carrying a product key) — ADR-0017 PR-A flip-wave
+            // consumer (#1634/#1715), global-gated NOW. PR1a has no per-device posture
+            // breakdown yet, so return an HONEST EMPTY list (a real value, NOT a
+            // degrade — there is no store read here that could degrade); the PR1b
+            // evaluator supplies the rows, and the admit-then-filter "filters before
+            // LIMIT" completeness test lands at the flip.
+            [](const std::string& /*product_key*/, int /*limit*/)
+                -> std::optional<std::vector<SleLicenseDeviceRow>> {
+                return std::vector<SleLicenseDeviceRow>{};
+            },
+            // Single-agent drill — REAL data in PR1a. nullopt on degrade → 503.
+            [this](const std::string& agent_id) -> std::optional<std::vector<AgentLicenseRow>> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->agent_licenses(agent_id);
+            },
+            audit_fn);
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
@@ -11186,6 +11289,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
+    std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
@@ -11276,6 +11380,10 @@ private:
     // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
+    // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
+    // so it destructs before the pool; the /api/v1/sle/* routes read it (PR1b evaluator
+    // writes it).
+    std::unique_ptr<ProductRegistryStore> product_registry_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;

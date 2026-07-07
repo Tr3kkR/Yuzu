@@ -450,6 +450,7 @@ yuzu_server_core_lib = static_library(
     'src/inventory_routes.cpp',
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
+    'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
