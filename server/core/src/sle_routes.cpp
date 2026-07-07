@@ -128,6 +128,43 @@ bool icontains(const std::string& hay, const std::string& needle) {
     return lower(hay).find(needle) != std::string::npos;
 }
 
+/// Constrain a device-supplied token to a safe reflected charset — lowercase
+/// the input, keep only `[a-z0-9_.-]`, replace every other byte (spaces,
+/// backslashes, `@`, non-ASCII, control bytes) with `_`, collapse runs, and
+/// hard-cap the length. The surface name and the error reason from the
+/// `surfaces` command are reflected in the 200 body, so the real bounded
+/// plugin reason tokens (`privilege_missing`, `wmi_query_failed_<hex>`, …)
+/// survive intact, while a hypothetical buggy plugin's free-text OS error
+/// (`access denied for DOMAIN\jdoe`) is stripped of its structured form — the
+/// backslash-joined `DOMAIN\jdoe` composite, the spaces, and any path / email
+/// / non-ASCII cannot be reflected verbatim through a route that (unlike the
+/// drill) is set-and-proceed audited and off the PII tier. This makes the
+/// route's "the payload carries no per-user data" claim a server-enforced
+/// property, not a trust assumption on the agent. Empty input (or all-invalid)
+/// yields "" so the caller drops the surface line.
+std::string sanitize_token(const std::string& raw, std::size_t cap) {
+    std::string out;
+    out.reserve(std::min(raw.size(), cap));
+    bool last_us = false;
+    for (unsigned char c : raw) {
+        if (out.size() >= cap)
+            break;
+        const char lc = static_cast<char>(std::tolower(c));
+        const bool ok = (lc >= 'a' && lc <= 'z') || (lc >= '0' && lc <= '9') || lc == '_' ||
+                        lc == '.' || lc == '-';
+        if (ok) {
+            out.push_back(lc);
+            last_us = false;
+        } else if (!last_us && !out.empty()) {
+            out.push_back('_'); // collapse runs of invalid bytes to one '_'
+            last_us = true;
+        }
+    }
+    while (!out.empty() && out.back() == '_')
+        out.pop_back();
+    return out;
+}
+
 /// One parsed `probe_status|<surface>|ok|<rows>` / `probe_status|<surface>|
 /// error|<reason>` line from the agent's `license_scan surfaces` output.
 struct ParsedSurface {
@@ -138,12 +175,15 @@ struct ParsedSurface {
 };
 
 /// Parse the surfaces command output DEFENSIVELY: accept ONLY lines starting
-/// `probe_status|` with a whitelisted status token; drop everything else.
-/// This is also the guarantee that a hostile/buggy agent cannot reflect
-/// `lic|` licence rows (which carry user_ref personal data) through the
-/// unaudited-for-PII live route — non-probe_status lines never reach the
-/// response. Returns nullopt when a NON-EMPTY output yields zero valid lines
-/// (malformed device output → the caller 502s, never a false empty).
+/// `probe_status|` with a whitelisted status token, AND reflect the surface
+/// name + error reason only through `sanitize_token` (safe charset + length
+/// cap). Two layers of the same guarantee — a hostile/buggy agent cannot
+/// reflect user_ref personal data through this unaudited-for-PII live route:
+/// non-probe_status lines (e.g. whole `lic|` rows) never reach the response,
+/// and a per-user identifier smuggled inside a well-formed error line's free
+/// text is charset-stripped before it is echoed. Returns nullopt when a
+/// NON-EMPTY output yields zero valid lines (malformed device output → the
+/// caller 502s, never a false empty).
 std::optional<std::vector<ParsedSurface>> parse_probe_status_lines(const std::string& output) {
     std::vector<ParsedSurface> out;
     std::size_t pos = 0;
@@ -167,7 +207,15 @@ std::optional<std::vector<ParsedSurface>> parse_probe_status_lines(const std::st
             continue;
         const std::size_t p3 = line.find('|', p2 + 1);
         ParsedSurface s;
-        s.surface = line.substr(p1, p2 - p1);
+        // The surface name and the error reason are reflected in the 200 body,
+        // so they are SERVER-CONSTRAINED to a safe token charset + a hard
+        // length cap (sanitize_token) — NOT trusted verbatim from the device.
+        // This is what makes the route's "the payload carries no per-user
+        // data" claim a served guarantee rather than a trust assumption: even
+        // a buggy plugin that puts an OS error like `access denied for
+        // DOMAIN\jdoe` in the reason token cannot reflect that identifier
+        // through this (set-and-proceed-audited, non-PII-tier) route.
+        s.surface = sanitize_token(line.substr(p1, p2 - p1), 64);
         s.status = p3 == std::string::npos ? line.substr(p2 + 1)
                                            : line.substr(p2 + 1, p3 - p2 - 1);
         if (s.surface.empty() || (s.status != "ok" && s.status != "error"))
@@ -180,7 +228,7 @@ std::optional<std::vector<ParsedSurface>> parse_probe_status_lines(const std::st
                 s.rows = 0;
             }
         } else {
-            s.detail = rest;
+            s.detail = sanitize_token(rest, 64);
         }
         out.push_back(std::move(s));
     }
@@ -493,6 +541,27 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                 continue;
             }
             licenses.push_back(posture_to_json(r));
+        }
+
+        // as_of is the SAME field, with the SAME meaning, as /sle/summary's:
+        // the first-class posture meta stamp (G-4) when wired — so an
+        // evaluated-but-empty estate reports as_of=<stamp> here too, not the
+        // row-derived 0, which would otherwise read as "never evaluated" and
+        // contradict summary/the page/MCP. A degraded stamp read is a 503,
+        // like summary (never a fabricated 0). Unwired → the row-derived
+        // fallback (PR1a behaviour).
+        if (posture_meta_fn_) {
+            const auto stamp = posture_meta_fn_();
+            if (!stamp) {
+                (void)detail::try_persist_audit(audit_fn_, req, "sle.licenses.query", "failure",
+                                                "SoftwareLicensing", "fleet",
+                                                "posture meta degraded; cid=" + cid);
+                send_json(res, 503,
+                          a4_error(503, "SLE posture rollup unavailable — read failed", cid, 5000,
+                                   "retry the request"));
+                return;
+            }
+            as_of = *stamp;
         }
 
         (void)detail::try_persist_audit(

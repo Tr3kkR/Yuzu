@@ -130,6 +130,17 @@ std::string render_sle_licenses_fragment(
          "licence scan, evaluated against the product registry (ADR-0024). Detection is "
          "agent-observed — this page never edits detected state.</div>";
 
+    // Store degrade: the banner speaks ALONE. Do NOT render the KPI tiles here
+    // — on a degrade `agg` is default-zero, so tiles would show a fabricated
+    // "Lapsed: 0 / Expiring: 0 / not yet evaluated" that reads as a healthy
+    // empty estate above the red banner, reintroducing exactly the
+    // "empty-reads-as-nothing-lapsed" lie the REST 503 avoids (gov up-1).
+    if (!rollup) {
+        h += degrade_banner();
+        h += "</div>";
+        return h;
+    }
+
     // KPI tiles from the UNFILTERED aggregates + the G-4 as-of stamp. The
     // as-of tile warns past 2× the hourly evaluator cadence (a keep-last-good
     // rollup must age visibly, gov UP-3).
@@ -190,12 +201,6 @@ std::string render_sle_licenses_fragment(
          "\" hx-get=\"/fragments/sle/licenses?expiring_within_days=30\" "
          "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Expiring &le;30d</button>"
          "</div></div>";
-
-    if (!rollup) {
-        h += degrade_banner();
-        h += "</div>";
-        return h;
-    }
 
     const bool filtered_view = !state_filter.empty() || !q.empty() || expiring_days >= 0;
     if (rollup->empty()) {

@@ -639,6 +639,13 @@ SoftwareLicensingStore::license_devices(const std::vector<DetectedProduct>& pair
         return std::nullopt;
     }
     const int n = PQntuples(res.get());
+    if (n == row_cap)
+        // Truncated fan-out: the devices list for this product is capped, so
+        // the caller's page may drop agents (matches the posture_inputs cap
+        // warn — a silent truncation reads as "these are all the devices").
+        spdlog::warn("SoftwareLicensingStore: license_devices hit the row cap ({}) — the "
+                     "per-device fan-out for this product is TRUNCATED",
+                     row_cap);
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         AgentLicenseDeviceRow r;

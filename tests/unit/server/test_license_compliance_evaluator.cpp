@@ -16,6 +16,7 @@
 
 #include <yuzu/metrics.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -82,6 +83,11 @@ struct EvalHarness {
     std::vector<UpsertedProduct> upserted_products;
     std::vector<UpsertedAlias> upserted_aliases;
     std::vector<std::vector<LicensePostureRow>> replaced;
+    // Cross-thread cycle counter: the ONE lifecycle test drives the real
+    // background thread, so it polls THIS atomic instead of reading `replaced`
+    // across threads (a plain-vector cross-thread read is a TSan-flagged data
+    // race). Every other test calls tick() synchronously on the main thread.
+    std::atomic<int> replace_count{0};
     std::vector<SleAlert> emitted;
     std::map<std::string, LicenseAlertState> alert_states; // key \x1f kind
     std::int64_t next_product_id{100};
@@ -146,6 +152,7 @@ struct EvalHarness {
             if (fail_replace)
                 return false;
             replaced.push_back(rows);
+            replace_count.fetch_add(1, std::memory_order_release);
             return true;
         };
         d.alert_state =
@@ -663,14 +670,16 @@ TEST_CASE("evaluator thread: immediate first tick, idempotent start, double stop
     auto deps = h.deps();
     deps.interval = std::chrono::seconds{3600};
 
+    int ticks = 0;
     {
         LicenseComplianceEvaluator ev{std::move(deps)};
         ev.start();
         ev.start(); // idempotent
-        // One immediate tick runs; poll briefly for it.
-        for (int i = 0; i < 200 && h.replaced.empty(); ++i)
+        // One immediate tick runs; poll the ATOMIC counter (never `replaced`
+        // cross-thread — that read/push_back pair is a TSan data race).
+        for (int i = 0; i < 200 && h.replace_count.load(std::memory_order_acquire) == 0; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds{10});
-        REQUIRE_FALSE(h.replaced.empty());
+        REQUIRE(h.replace_count.load(std::memory_order_acquire) >= 1);
         // The liveness gauge exists (seeded 0 before the tick, then set on
         // success — either way the series exists, gov UP-2).
         CHECK(h.metrics.gauge("yuzu_server_sle_evaluator_last_success_timestamp").value() >=
@@ -680,11 +689,13 @@ TEST_CASE("evaluator thread: immediate first tick, idempotent start, double stop
                   .value() >= 1.0);
         ev.stop();
         ev.stop(); // idempotent
+        ticks = h.replace_count.load(std::memory_order_acquire);
     } // dtor joins (already stopped)
 
-    const auto ticks = h.replaced.size();
     std::this_thread::sleep_for(std::chrono::milliseconds{50});
-    CHECK(h.replaced.size() == ticks); // genuinely stopped
+    // Genuinely stopped: no further ticks after stop()+join. Safe to read the
+    // vector here — the thread is joined, so this is single-threaded again.
+    CHECK(static_cast<int>(h.replaced.size()) == ticks);
 }
 
 // ── End-to-end smoke over real stores ───────────────────────────────────────

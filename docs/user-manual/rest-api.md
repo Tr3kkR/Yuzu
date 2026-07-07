@@ -2400,7 +2400,7 @@ Create a new webhook subscription.
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 | `software_license.expiring` | A product's detected software licence enters an expiry bucket (30/14/7/1 days to expiry; re-fires only on a worsening bucket or after a 7-day re-arm — see [Software licence detection](software-licensing.md)) | `event`, `product_key`, `vendor`, `title`, `device_count`, `next_expiry_at`, `days_left`, `bucket` |
-| `software_license.expired` | A product has expired or unlicensed detections (the first evaluation of an estate fires once per product in-condition; thereafter dedup + 7-day re-arm apply) | same as `software_license.expiring`, with `bucket` = 0 and `days_left` = 0 |
+| `software_license.expired` | A product has one or more **expired** detections (the server-now lapse rule; the first evaluation of an estate fires once per product in-condition, then dedup + 7-day re-arm apply). Unlicensed-only and over-deployment deliberately do **not** fire in v1 (R11) | same as `software_license.expiring`, with `bucket` = 0 and `days_left` = 0 |
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
@@ -3489,7 +3489,7 @@ things it is **not**: the `License` securable above (Yuzu's **own** product
 licence), the `/inventory` installed-software catalogue (`Inventory:Read` —
 installations regardless of licensing), and an editable record (detection is
 agent-observed; there is no operator override). Gated on the
-**`SoftwareLicensing`** securable (Viewer/PolicyEditor Read; Operator
+**`SoftwareLicensing`** securable (Viewer/PlatformEngineer Read; Operator
 Read+Write; IT Service Owner full CRUD; ApiTokenManager none). See
 [Software licence detection](software-licensing.md) for the collection and
 privacy model, and [MCP tools](mcp.md) 52/53 for the agentic twins.

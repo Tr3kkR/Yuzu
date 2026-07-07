@@ -2499,7 +2499,7 @@ public:
                                               : "Software licence expiring: " + what;
                 std::string message;
                 if (a.kind == "expired") {
-                    message = a.vendor + " " + what + " has expired or unlicensed detections on " +
+                    message = a.vendor + " " + what + " has expired licence detections on " +
                               std::to_string(a.device_count) +
                               " device(s). See /sle for the licence posture.";
                 } else {

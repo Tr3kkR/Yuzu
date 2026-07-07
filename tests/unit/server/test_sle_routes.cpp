@@ -1007,6 +1007,56 @@ TEST_CASE("sle surfaces: hostile lic| lines can never reflect user_ref through t
         REQUIRE(res->status == 502);
         CHECK(contains(res->body, "malformed"));
     }
+    {
+        // A WELL-FORMED error line whose reason smuggles a structured identifier
+        // in free text (a hypothetical buggy plugin passing an OS error through
+        // — the real plugin only emits bounded reason tokens like
+        // privilege_missing / wmi_query_failed_<hex>). The token sanitizer
+        // constrains the reflected surface + reason to the safe [a-z0-9_.-]
+        // charset with a length cap, so the structured `DOMAIN\jdoe` form
+        // (backslash + spaces = a recoverable AD identity) can never be
+        // reflected verbatim (sec-M1: the guarantee is server-enforced, not a
+        // trust assumption on the agent).
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.canned_rows = {resp_row(
+            "agent-9", 1, "probe_status|hkcu_per_user|error|access denied for DOMAIN\\jdoe\n")};
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        // No structured-identifier form survives: no backslash, no whitespace,
+        // and the `DOMAIN\jdoe` composite is broken apart into safe tokens.
+        CHECK_FALSE(contains(res->body, "\\"));
+        CHECK_FALSE(contains(res->body, "DOMAIN\\jdoe"));
+        CHECK_FALSE(contains(res->body, "access denied")); // the raw free-text form is gone
+        auto j = json::parse(res->body)["data"];
+        REQUIRE(j["surfaces"].size() == 1);
+        CHECK(j["surfaces"][0]["surface"] == "hkcu_per_user"); // a clean name survives intact
+        CHECK(j["surfaces"][0]["status"] == "error");
+        // Only the safe charset (lowercased, invalid-byte runs collapsed to '_').
+        const std::string detail = j["surfaces"][0]["detail"].get<std::string>();
+        for (char c : detail) {
+            const bool safe = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+                              c == '.' || c == '-';
+            CHECK(safe);
+        }
+    }
+    {
+        // The real bounded reason tokens survive intact (incl. the
+        // variable-suffix wmi_query_failed_<hex> form — all safe charset).
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.canned_rows = {resp_row("agent-9", 1,
+                                  "probe_status|slp_wmi|error|wmi_query_failed_80041003\n"
+                                  "probe_status|per_user_hives|error|privilege_missing\n")};
+        auto res = h.sink.Post("/api/v1/sle/agents/agent-9/surfaces", "", "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto j = json::parse(res->body)["data"];
+        REQUIRE(j["surfaces"].size() == 2);
+        CHECK(j["surfaces"][0]["detail"] == "wmi_query_failed_80041003");
+        CHECK(j["surfaces"][1]["detail"] == "privilege_missing");
+    }
 }
 
 TEST_CASE("sle surfaces: audited set-and-proceed BEFORE dispatch (deliberate contrast with "
