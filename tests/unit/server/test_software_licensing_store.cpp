@@ -310,6 +310,17 @@ TEST_CASE("SoftwareLicensingStore persists the effective user-ref mode on the st
     // stored replace updates the persisted mode.
     REQUIRE(store.replace_agent_licenses("agent-m", {small_row("P", "licensed")}, "h2", "omit"));
     CHECK(read_mode() == "omit");
+
+    // The D-10 READ-BACK (PR1b): the store getter returns the persisted mode
+    // VERBATIM; an agent that never synced this source reads as absent (a
+    // value holding nullopt), not a degrade.
+    auto mode = store.effective_user_ref_mode("agent-m");
+    REQUIRE(mode.has_value());
+    REQUIRE(mode->has_value());
+    CHECK(**mode == "omit");
+    auto absent = store.effective_user_ref_mode("agent-never-synced");
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(absent->has_value());
 }
 
 TEST_CASE("SoftwareLicensingStore distinct_products dedups (product, vendor) across the fleet",
@@ -483,6 +494,132 @@ TEST_CASE("SoftwareLicensingStore posture rollup replaces atomically and reads b
     }
 }
 
+TEST_CASE("SoftwareLicensingStore posture meta stamp: same-txn with the replace (G-4)",
+          "[pg][software_licensing]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Never evaluated → 0 (a successful read, not a degrade).
+    auto before = store.posture_refreshed_at();
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // A replace stamps the singleton with the same as-of.
+    REQUIRE(store.replace_posture_rollup({posture_row("k", 1)}, 777));
+    auto stamped = store.posture_refreshed_at();
+    REQUIRE(stamped.has_value());
+    CHECK(*stamped == 777);
+
+    // An EMPTY replace still stamps — this is exactly what distinguishes an
+    // evaluated-but-empty estate from a never-run one (the sle_routes summary
+    // promise).
+    REQUIRE(store.replace_posture_rollup({}, 900));
+    auto empty_stamped = store.posture_refreshed_at();
+    REQUIRE(empty_stamped.has_value());
+    CHECK(*empty_stamped == 900);
+    auto rollup = store.posture_rollup();
+    REQUIRE(rollup.has_value());
+    CHECK(rollup->empty());
+
+    // KEEP-LAST-GOOD covers the stamp: a failed replace (duplicate PK inside
+    // one batch) rolls back rows AND stamp.
+    CHECK_FALSE(store.replace_posture_rollup({posture_row("dup", 1), posture_row("dup", 2)}, 999));
+    auto after_fail = store.posture_refreshed_at();
+    REQUIRE(after_fail.has_value());
+    CHECK(*after_fail == 900);
+}
+
+TEST_CASE("SoftwareLicensingStore posture_inputs groups fleet rows and counts distinct devices",
+          "[pg][software_licensing]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // agent-1 reports Alpha twice (two per-user rows, same group) + Beta;
+    // agent-2 reports Alpha once (same group as agent-1's pair) and Alpha in
+    // a DIFFERENT state (its own group).
+    AgentLicenseRow a1 = small_row("Alpha", "licensed");
+    AgentLicenseRow a2 = small_row("Alpha", "licensed");
+    a2.user_scope = "user"; // same group key — user_scope is not a group column
+    REQUIRE(store.replace_agent_licenses("agent-1", {a1, a2, small_row("Beta", "trial", 5000)},
+                                         "h1", "hash"));
+    REQUIRE(store.replace_agent_licenses(
+        "agent-2", {small_row("Alpha", "licensed"), small_row("Alpha", "expired")}, "h2", "hash"));
+
+    auto in = store.posture_inputs();
+    REQUIRE(in.has_value());
+    // Groups sorted (product, vendor, state, license_type, expiry_at):
+    // Alpha/expired, Alpha/licensed, Beta/trial.
+    REQUIRE(in->groups.size() == 3);
+    CHECK(in->groups[0].product == "Alpha");
+    CHECK(in->groups[0].state == "expired");
+    CHECK(in->groups[0].row_count == 1);
+    CHECK(in->groups[0].device_count == 1);
+    CHECK(in->groups[1].product == "Alpha");
+    CHECK(in->groups[1].state == "licensed");
+    CHECK(in->groups[1].row_count == 3);    // two rows on agent-1 + one on agent-2
+    CHECK(in->groups[1].device_count == 2); // distinct agents within the group
+    CHECK(in->groups[2].product == "Beta");
+    CHECK(in->groups[2].expiry_at == 5000);
+    CHECK(in->groups[2].row_count == 1);
+    // Per-pair distinct device counts (the posture device_count input).
+    REQUIRE(in->pair_device_counts.size() == 2);
+    CHECK(in->pair_device_counts[0].product == "Alpha");
+    CHECK(in->pair_device_counts[0].device_count == 2); // both agents, despite 4 rows
+    CHECK(in->pair_device_counts[1].product == "Beta");
+    CHECK(in->pair_device_counts[1].device_count == 1);
+}
+
+TEST_CASE("SoftwareLicensingStore license_devices reads raw per-device rows for alias pairs",
+          "[pg][software_licensing]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.replace_agent_licenses(
+        "agent-1", {small_row("Alpha", "licensed", 4000), small_row("Alpha", "expired")}, "h1",
+        "hash"));
+    REQUIRE(store.replace_agent_licenses("agent-2", {small_row("Alpha", "licensed", 3000)}, "h2",
+                                         "hash"));
+    REQUIRE(store.replace_agent_licenses("agent-3", {small_row("Other", "licensed")}, "h3",
+                                         "hash"));
+
+    using yuzu::server::DetectedProduct;
+    SECTION("rows for the matched pairs only, one per (agent, licence row)") {
+        auto rows = store.license_devices({DetectedProduct{"Alpha", "V"}}, 100);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 3); // agent-1 ×2 + agent-2 ×1; agent-3's Other excluded
+        CHECK((*rows)[0].agent_id == "agent-1");
+        CHECK((*rows)[1].agent_id == "agent-1");
+        CHECK((*rows)[2].agent_id == "agent-2");
+        CHECK((*rows)[2].expiry_at == 3000);
+    }
+
+    SECTION("an unknown pair or an empty pair list is a genuine empty, not a degrade") {
+        auto unknown = store.license_devices({DetectedProduct{"NoSuch", "V"}}, 100);
+        REQUIRE(unknown.has_value());
+        CHECK(unknown->empty());
+        auto none = store.license_devices({}, 100);
+        REQUIRE(none.has_value());
+        CHECK(none->empty());
+    }
+
+    SECTION("the row cap clamps deterministically (agent_id order)") {
+        auto rows = store.license_devices({DetectedProduct{"Alpha", "V"}}, 2);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 2);
+        CHECK((*rows)[0].agent_id == "agent-1");
+        CHECK((*rows)[1].agent_id == "agent-1");
+    }
+}
+
 TEST_CASE("SoftwareLicensingStore alert state: PK(product_key, kind), upsert/get, closed kinds",
           "[pg][software_licensing]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -609,12 +746,19 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         CHECK_FALSE(store.agent_licenses("agent-a").has_value());
         CHECK_FALSE(store.distinct_products().has_value());
         CHECK_FALSE(store.posture_rollup().has_value());
+        CHECK_FALSE(store.posture_inputs().has_value());     // F4: the evaluator skips the cycle
+        CHECK_FALSE(store.posture_refreshed_at().has_value()); // never a false "never evaluated"
+        CHECK_FALSE(
+            store.license_devices({yuzu::server::DetectedProduct{"P", "V"}}, 10).has_value());
         auto s = store.alert_state("k", "expiring");
         REQUIRE_FALSE(s.has_value());
         CHECK(s.error() == LicensingReadError::kDegraded);
         auto h = store.stored_hash("agent-a");
         REQUIRE_FALSE(h.has_value()); // degrade → the seam nacks kError, NOT need_full
         CHECK(h.error() == LicensingReadError::kDegraded);
+        auto m = store.effective_user_ref_mode("agent-a");
+        REQUIRE_FALSE(m.has_value()); // degrade ≠ "never synced"
+        CHECK(m.error() == LicensingReadError::kDegraded);
         CHECK_FALSE(store.count_stale_agents(1'000'000).has_value()); // never a false 0
         // Writes fail SOFT — false, never a throw across the API.
         CHECK_FALSE(store.replace_agent_licenses("agent-a", {small_row("P", "licensed")}, "h2",
@@ -622,12 +766,12 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         CHECK_FALSE(store.touch("agent-a"));
         CHECK_FALSE(store.replace_posture_rollup({posture_row("k", 1)}, 1));
         CHECK_FALSE(store.upsert_alert_state("k", "expiring", "fp", 30, 1));
-        // The four sampled authoritative reads above bumped the shared
+        // The eight sampled authoritative reads above bumped the shared
         // read-degrade counter under this source's label (#1675 convention).
         CHECK(metrics
                   .counter("yuzu_inventory_read_degrade_total",
                            {{"reason", "query_error"}, {"source", "software_licensing"}})
-                  .value() == 4.0);
+                  .value() == 8.0);
     }
 }
 
@@ -657,8 +801,12 @@ TEST_CASE("SoftwareLicensingStore store_not_open: constructor failure degrades e
     CHECK_FALSE(store.agent_licenses("agent-a").has_value());
     CHECK_FALSE(store.distinct_products().has_value());
     CHECK_FALSE(store.posture_rollup().has_value());
+    CHECK_FALSE(store.posture_inputs().has_value());
+    CHECK_FALSE(store.posture_refreshed_at().has_value());
+    CHECK_FALSE(store.license_devices({yuzu::server::DetectedProduct{"P", "V"}}, 10).has_value());
     CHECK_FALSE(store.alert_state("k", "expiring").has_value());
     CHECK_FALSE(store.stored_hash("agent-a").has_value());
+    CHECK_FALSE(store.effective_user_ref_mode("agent-a").has_value());
     CHECK_FALSE(store.count_stale_agents(1).has_value());
     CHECK_FALSE(store.replace_agent_licenses("agent-a", {}, "h", "hash"));
     CHECK_FALSE(store.touch("agent-a"));

@@ -11,9 +11,11 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -45,6 +47,15 @@ constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 constexpr int kAgentRowCap = 20000;
 constexpr int kDistinctRowCap = 20000;
 constexpr int kPostureRowCap = 20000;
+// Rollup-input groups are bounded by products × states × distinct expiry
+// dates — realistically thousands; the ceiling is deep headroom. Hitting it
+// truncates a deterministic sorted tail, so the evaluator's rollup would be
+// silently partial for the products sorting last — hence the warn on cap.
+constexpr int kPostureInputRowCap = 50000;
+// Alias fan-out for ONE product_key (the devices read's pair list) is small
+// by construction — a registry product rarely has more than a handful of raw
+// spellings per source.
+constexpr std::size_t kDevicePairCap = 64;
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -136,6 +147,17 @@ const std::vector<pg::PgMigration>& migrations() {
          "  bucket        BIGINT NOT NULL DEFAULT 0,"
          "  last_fired_at BIGINT NOT NULL DEFAULT 0,"
          "  PRIMARY KEY (product_key, kind));"},
+        {2,
+         // First-class posture as-of stamp (roadmap G-4), seeded 0 ("never
+         // evaluated") so an evaluated-but-empty estate (refreshed_at > 0,
+         // zero rollup rows) is distinguishable from a never-run one — the
+         // read promised at sle_routes.cpp's summary handler.
+         // replace_posture_rollup stamps it in the SAME transaction as the
+         // row replace, so keep-last-good covers the stamp too.
+         "CREATE TABLE license_posture_meta ("
+         "  singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),"
+         "  refreshed_at BIGINT NOT NULL DEFAULT 0);"
+         "INSERT INTO license_posture_meta (singleton, refreshed_at) VALUES (TRUE, 0);"},
     };
     return kMigrations;
 }
@@ -476,6 +498,48 @@ SoftwareLicensingStore::agent_licenses(std::string_view agent_id) {
     return out;
 }
 
+std::expected<std::optional<std::string>, LicensingReadError>
+SoftwareLicensingStore::effective_user_ref_mode(std::string_view agent_id) {
+    // Drill read (roadmap D-10 read-back), same authoritative posture as the
+    // sibling single-row reads: kDegraded on failure, a value holding nullopt
+    // when the agent never synced this source.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: effective_user_ref_mode degraded — store not "
+                         "open (occurrence {})",
+                         d.occurrence);
+        return std::unexpected(LicensingReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return std::optional<std::string>{}; // precondition miss → absent, not a degrade
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: effective_user_ref_mode degraded — no "
+                         "connection ({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::unexpected(LicensingReadError::kDegraded);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT effective_user_ref_mode FROM software_licensing_store.agent_license_state "
+        "WHERE agent_id = $1",
+        std::vector<std::string>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: effective_user_ref_mode degraded — query "
+                         "failed: {} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::unexpected(LicensingReadError::kDegraded);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<std::string>{}; // agent never synced this source
+    return std::optional<std::string>{PQgetvalue(res.get(), 0, 0)};
+}
+
 std::optional<std::vector<DetectedProduct>> SoftwareLicensingStore::distinct_products() {
     if (!open_) {
         static DegradeSampler sampler;
@@ -519,6 +583,154 @@ std::optional<std::vector<DetectedProduct>> SoftwareLicensingStore::distinct_pro
     return out;
 }
 
+std::optional<std::vector<AgentLicenseDeviceRow>>
+SoftwareLicensingStore::license_devices(const std::vector<DetectedProduct>& pairs, int limit) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: license_devices degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<AgentLicenseDeviceRow> out;
+    if (pairs.empty())
+        return out; // no alias pairs → genuinely no devices, not a degrade
+    // Deterministic truncation of an oversized pair list (see kDevicePairCap
+    // rationale): the caller passes the registry's alias order.
+    const std::size_t n_pairs = std::min(pairs.size(), kDevicePairCap);
+    if (n_pairs < pairs.size())
+        spdlog::warn("SoftwareLicensingStore: license_devices pair list truncated ({} -> {})",
+                     pairs.size(), n_pairs);
+    const int row_cap = std::clamp(limit, 1, kAgentRowCap);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: license_devices degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    // Pair list as parallel text arrays (#1664 pattern): constant 3 params
+    // regardless of pair count.
+    std::vector<std::string_view> prod_views;
+    std::vector<std::string_view> vend_views;
+    prod_views.reserve(n_pairs);
+    vend_views.reserve(n_pairs);
+    for (std::size_t i = 0; i < n_pairs; ++i) {
+        prod_views.emplace_back(pairs[i].product);
+        vend_views.emplace_back(pairs[i].vendor);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, state, expiry_at FROM software_licensing_store.agent_licenses "
+        "WHERE (product, vendor) IN "
+        "(SELECT p, v FROM unnest($1::text[], $2::text[]) AS t(p, v)) "
+        "ORDER BY agent_id, expiry_at, id LIMIT $3::bigint",
+        std::vector<std::string>{pg::to_text_array(prod_views), pg::to_text_array(vend_views),
+                                 std::to_string(row_cap)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: license_devices degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        AgentLicenseDeviceRow r;
+        r.agent_id = PQgetvalue(res.get(), i, 0);
+        r.state = PQgetvalue(res.get(), i, 1);
+        r.expiry_at = result_i64(res, i, 2);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<LicensePostureInputs> SoftwareLicensingStore::posture_inputs() {
+    // The evaluator rollup pass's ONE authoritative input read (two grouped
+    // aggregates on one lease). Any failure → nullopt → the evaluator skips
+    // the cycle (F4 keep-last-good) — never a partial rollup.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_inputs degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_inputs degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    LicensePostureInputs inputs;
+    pg::PgResult groups = pg::exec_params(
+        lease.get(),
+        "SELECT product, vendor, state, license_type, expiry_at, "
+        "count(*), count(DISTINCT agent_id) "
+        "FROM software_licensing_store.agent_licenses "
+        "GROUP BY product, vendor, state, license_type, expiry_at "
+        "ORDER BY product, vendor, state, license_type, expiry_at LIMIT $1::bigint",
+        std::vector<std::string>{std::to_string(kPostureInputRowCap)});
+    if (groups.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_inputs degraded — group query failed: "
+                         "{} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int gn = PQntuples(groups.get());
+    if (gn == kPostureInputRowCap)
+        spdlog::warn("SoftwareLicensingStore: posture_inputs hit the group cap ({}) — the "
+                     "posture rollup will be PARTIAL for products sorting last",
+                     kPostureInputRowCap);
+    inputs.groups.reserve(static_cast<std::size_t>(gn));
+    for (int i = 0; i < gn; ++i) {
+        LicensePostureInputGroup g;
+        g.product = PQgetvalue(groups.get(), i, 0);
+        g.vendor = PQgetvalue(groups.get(), i, 1);
+        g.state = PQgetvalue(groups.get(), i, 2);
+        g.license_type = PQgetvalue(groups.get(), i, 3);
+        g.expiry_at = result_i64(groups, i, 4);
+        g.row_count = result_i64(groups, i, 5);
+        g.device_count = result_i64(groups, i, 6);
+        inputs.groups.push_back(std::move(g));
+    }
+    pg::PgResult pairs = pg::exec_params(
+        lease.get(),
+        "SELECT product, vendor, count(DISTINCT agent_id) "
+        "FROM software_licensing_store.agent_licenses "
+        "GROUP BY product, vendor ORDER BY product, vendor LIMIT $1::bigint",
+        std::vector<std::string>{std::to_string(kPostureInputRowCap)});
+    if (pairs.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_inputs degraded — pair query failed: "
+                         "{} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int pn = PQntuples(pairs.get());
+    inputs.pair_device_counts.reserve(static_cast<std::size_t>(pn));
+    for (int i = 0; i < pn; ++i) {
+        LicensePairDeviceCount p;
+        p.product = PQgetvalue(pairs.get(), i, 0);
+        p.vendor = PQgetvalue(pairs.get(), i, 1);
+        p.device_count = result_i64(pairs, i, 2);
+        inputs.pair_device_counts.push_back(std::move(p));
+    }
+    return inputs;
+}
+
 bool SoftwareLicensingStore::replace_posture_rollup(const std::vector<LicensePostureRow>& rows,
                                                     std::int64_t refreshed_at) {
     if (!open_)
@@ -540,6 +752,18 @@ bool SoftwareLicensingStore::replace_posture_rollup(const std::vector<LicensePos
             c, "SELECT pg_advisory_xact_lock(hashtextextended('sle_license_posture_rollup', 0))",
             std::vector<std::string>{});
         if (lk.status() != PGRES_TUPLES_OK)
+            return false;
+        // Stamp the singleton meta row in the SAME transaction (roadmap G-4):
+        // a rollback rolls the stamp back with the rows, and an empty estate
+        // still records "evaluated at <refreshed_at>". RETURNING carries the
+        // row-hit result — a missing singleton (broken migration) fails the
+        // replace rather than silently un-stamping.
+        pg::PgResult meta = pg::exec_params(
+            c,
+            "UPDATE software_licensing_store.license_posture_meta "
+            "SET refreshed_at = $1::bigint RETURNING singleton",
+            std::vector<std::string>{std::to_string(refreshed_at)});
+        if (meta.status() != PGRES_TUPLES_OK || PQntuples(meta.get()) != 1)
             return false;
         if (pg::exec_params(c, "DELETE FROM software_licensing_store.license_posture_rollup",
                             std::vector<std::string>{})
@@ -636,6 +860,40 @@ std::optional<std::vector<LicensePostureRow>> SoftwareLicensingStore::posture_ro
         out.push_back(std::move(r));
     }
     return out;
+}
+
+std::optional<std::int64_t> SoftwareLicensingStore::posture_refreshed_at() {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_refreshed_at degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_refreshed_at degraded — no connection "
+                         "({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT refreshed_at FROM software_licensing_store.license_posture_meta",
+        std::vector<std::string>{});
+    // The migration seeds the singleton, so zero rows = a broken schema, not
+    // "never evaluated" — that is a degrade (never a false 0/never-run).
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareLicensingStore: posture_refreshed_at degraded — query failed "
+                         "or singleton missing: {} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    return result_i64(res, 0, 0);
 }
 
 std::expected<std::optional<LicenseAlertState>, LicensingReadError>
