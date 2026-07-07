@@ -239,7 +239,7 @@ void run_slp_surface(long long now_epoch, std::vector<LicRecord>& records,
         r.status = status_raw.empty() ? "unknown" : slp_status_to_status(status_code);
         r.channel = classify_channel(row_get(row, "ProductKeyChannel"), row_get(row, "Description"));
 
-        const std::string eval_end = parse_wmi_datetime_to_iso_date(row_get(row, "EvaluationEndDate"));
+        const std::string eval_end = parse_wmi_datetime_to_expiry(row_get(row, "EvaluationEndDate"));
         if (!eval_end.empty()) {
             r.license_type = "trial";
             r.expires_at = eval_end;
@@ -252,8 +252,8 @@ void run_slp_surface(long long now_epoch, std::vector<LicRecord>& records,
         } // else stays "unknown" — unknown-preserving, never guessed
 
         if (r.status == "grace") {
-            // Countdown → ABSOLUTE date (D3 blob-stability): a ticking minute
-            // counter must not change the record between daily syncs.
+            // Countdown → ABSOLUTE midnight-epoch (D3 blob-stability): a
+            // ticking minute counter must not change the record between syncs.
             const std::string grace_raw = row_get(row, "GracePeriodRemaining");
             const long long minutes = grace_raw.empty() ? 0 : std::strtoll(grace_raw.c_str(), nullptr, 10);
             const std::string until = grace_expiry_date(now_epoch, minutes);

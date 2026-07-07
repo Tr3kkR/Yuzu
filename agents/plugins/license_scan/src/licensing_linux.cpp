@@ -212,11 +212,15 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
         r.vendor = "Red Hat";
         r.license_type = "subscription";
         r.expires_at = not_after;
-        // Compare against collection time on whole days (expires_at is a
-        // date); the server-side evaluator re-derives lapse against its own
-        // clock — this is the agent-observed state.
-        const std::string today = iso_date_from_epoch(now);
-        r.status = (!today.empty() && not_after < today) ? "expired" : "subscription_active";
+        // not_after is a UTC-midnight epoch string; compare it numerically to
+        // the collection day (whole-day granularity — epoch decimal strings do
+        // not lexicographically sort across widths). The server-side evaluator
+        // re-derives lapse against its own clock — this is the agent-observed
+        // state.
+        const long long expiry_epoch = std::strtoll(not_after.c_str(), nullptr, 10);
+        const long long today_epoch = now - (now % 86400);
+        r.status = (expiry_epoch > 0 && expiry_epoch < today_epoch) ? "expired"
+                                                                    : "subscription_active";
         r.source = "entitlement_cert";
         r.confidence = "authoritative";
         records.push_back(std::move(r));
