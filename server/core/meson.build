@@ -430,6 +430,7 @@ yuzu_server_core_lib = static_library(
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/software_inventory_store.cpp',
+    'src/product_normalize.cpp',
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/offline_endpoint_store.cpp',
