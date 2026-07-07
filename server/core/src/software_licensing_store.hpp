@@ -63,10 +63,12 @@ namespace yuzu::server {
 /// the store persists what it is given). `expiry_at` is the agent-observed
 /// expiry epoch (0 = none); `collected_at` is the agent-supplied collection
 /// time (proto-carried; drives NO persisted freshness — see the state row).
-/// `exe_hints` persists from migration v1 (roadmap R6): hash-skip suppresses
-/// re-sync exactly when nothing changes, so a column added later would stay
-/// empty forever on stable estates — and it is the authoritative product↔exe
-/// bridge for the PR3 usage join. `first_seen`/`last_seen` are store-stamped
+/// `confidence` and `exe_hints` persist from migration v1: hash-skip
+/// suppresses re-sync exactly when nothing changes, so a column added later
+/// would stay empty forever on stable estates. Operators weight `heuristic`
+/// rows via `confidence` (ADR-0024 Decisions 1/2/7); `exe_hints` (roadmap R6)
+/// is the authoritative product↔exe bridge for the PR3 usage join.
+/// `first_seen`/`last_seen` are store-stamped
 /// (server receipt time of the storing replace); values supplied on write are
 /// ignored.
 struct AgentLicenseRow {
@@ -79,6 +81,7 @@ struct AgentLicenseRow {
     std::string channel;       ///< e.g. KMS/MAK/OEM/retail
     std::string key_hint;      ///< OS-provided partial key — never full key material
     std::string detector;      ///< which probe produced the row
+    std::string confidence;    ///< closed §3.2 set: authoritative|probable|heuristic|unknown
     std::string exe_hints;     ///< product↔exe bridge (roadmap R6)
     std::string user_scope;    ///< "machine" | "user"
     std::string user_ref;      ///< per ADR-0024 Decision 11 (pseudonym/raw/empty)

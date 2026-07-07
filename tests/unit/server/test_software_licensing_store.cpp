@@ -55,6 +55,7 @@ AgentLicenseRow full_row() {
     r.channel = "KMS";
     r.key_hint = "XXXXX-B7GJQ";
     r.detector = "wmi_slp";
+    r.confidence = "probable"; // closed §3.2 set — stored from migration v1
     r.exe_hints = "winword.exe;excel.exe";
     r.user_scope = "user";
     r.user_ref = "a1b2c3d4e5f60718"; // keyed-HMAC pseudonym form
@@ -135,7 +136,8 @@ TEST_CASE("SoftwareLicensingStore replace + read-back round-trips every §7.2 co
     CHECK(g.channel == in.channel);
     CHECK(g.key_hint == in.key_hint);
     CHECK(g.detector == in.detector);
-    CHECK(g.exe_hints == in.exe_hints); // persisted from migration v1 (R6)
+    CHECK(g.confidence == in.confidence); // persisted from migration v1 (ADR-0024 D1/2/7)
+    CHECK(g.exe_hints == in.exe_hints);   // persisted from migration v1 (R6)
     CHECK(g.user_scope == in.user_scope);
     CHECK(g.user_ref == in.user_ref);
     CHECK(g.collected_at == in.collected_at);
