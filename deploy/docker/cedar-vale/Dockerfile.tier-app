@@ -22,9 +22,12 @@ COPY --from=agentsrc /usr/lib/yuzu/plugins/               /usr/lib/yuzu/plugins/
 RUN ldconfig
 
 WORKDIR /app
-# package.json first so `npm install` layer caches independently of app code.
-COPY deploy/docker/cedar-vale/app/package.json /app/package.json
-RUN npm install --omit=dev --no-audit --no-fund
+# Manifest + lockfile first so the `npm ci` layer caches independently of app
+# code. `npm ci` (not `npm install`) so the image gets exactly the committed,
+# Dependabot-audited tree — a drifted package.json fails the build loudly.
+COPY deploy/docker/cedar-vale/app/package.json \
+     deploy/docker/cedar-vale/app/package-lock.json /app/
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # App source (server.js, public/deck.css). node_modules from the install above
 # survives because the host app/ has no node_modules dir to clobber it.
