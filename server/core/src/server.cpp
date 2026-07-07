@@ -3300,10 +3300,13 @@ public:
     /// per-agent store this server owns, durably erasing the machine's stored
     /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
     /// `delete_agent` methods had no production caller before this). Best-effort
-    /// and null-tolerant: a store that is not configured (e.g. no Postgres, so
-    /// only the SQLite `InventoryStore` is live) is skipped, and one store's
-    /// failure never aborts the others; the returned `DecommissionResult` records
-    /// the per-store outcome for the caller to audit.
+    /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
+    /// not configured (e.g. no Postgres, so only the SQLite `InventoryStore` is
+    /// live) is skipped, and one store's failure never aborts the others — but
+    /// each `delete_agent` now reports its commit status, so a delete that did
+    /// NOT commit is recorded `Failed` (not `Deleted`) and
+    /// `DecommissionResult::ok()` confirms erasure across every configured store.
+    /// A caller relying on this as Art.17 erasure evidence MUST check `ok()`.
     ///
     /// The cascade is built HERE from the LIVE store pointers on each call
     /// (never a long-lived borrow), so it is inherently safe against the store
@@ -3320,7 +3323,7 @@ public:
     /// paths (registry session teardown, enrollment deny/remove, cert revocation)
     /// are all non-durable-data by design and deliberately do NOT auto-erase
     /// (a revoked-for-compromise agent's forensic rows must survive).
-    DecommissionResult decommission_agent(std::string_view agent_id) {
+    [[nodiscard]] DecommissionResult decommission_agent(std::string_view agent_id) {
         AgentDecommission cascade{AgentDecommissionStores{
             .inventory = inventory_store_.get(),
             .software_inventory = software_inventory_store_.get(),

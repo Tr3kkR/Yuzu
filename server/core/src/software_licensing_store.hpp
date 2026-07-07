@@ -248,12 +248,15 @@ public:
                                           std::int64_t last_fired_at);
 
     /// Drop an agent's detected rows AND its state row (the roadmap D-3
-    /// agent-decommission cascade calls this per store). Best-effort,
-    /// like the sibling stores: both deletes run in one transaction so a
-    /// removal can't leave a parent state row without children or vice versa;
-    /// a failure is logged and the next decommission (or the FK cascade on a
-    /// later parent delete) self-heals.
-    void delete_agent(std::string_view agent_id);
+    /// agent-decommission cascade calls this per store). Both deletes run in one
+    /// transaction so a removal can't leave a parent state row without children
+    /// or vice versa. Returns true iff that transaction committed; false on a
+    /// closed store, a lock/lease timeout, or a SQL failure. The failure is
+    /// surfaced to the caller (the decommission cascade logs it and records the
+    /// store Failed) rather than swallowed, so a silently-rolled-back erasure can
+    /// never be reported as a completed Art.17 delete; the next decommission (or
+    /// the FK cascade on a later parent delete) self-heals.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// Count agents whose licensing state has not been refreshed since
     /// `stale_before_secs` (epoch seconds), i.e. `last_seen <

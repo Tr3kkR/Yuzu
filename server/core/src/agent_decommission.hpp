@@ -3,20 +3,27 @@
 /// @file agent_decommission.hpp
 /// The agent-decommission cascade (ADR-0024 Decision 11 / roadmap D-3): a single
 /// entry point that fans `delete_agent(agent_id)` across EVERY per-agent store,
-/// so an operator decommission durably erases a machine's stored rows. This is
-/// the GDPR-erasure half the per-store `delete_agent` methods could not deliver
-/// on their own: those methods exist on each store but had ZERO production
-/// callers before this seam (they were invoked only from unit tests), which made
-/// the ADR's "offline agents purge ... via decommission" story fictional. §27
-/// builds the fan-out and registers its stores with it.
+/// so that an operator decommission CAN durably erase a machine's stored rows.
+/// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
+/// exist on each store but had ZERO production callers before this seam (they
+/// were invoked only from unit tests). NOTE: the fan-out is built here, but its
+/// PRODUCTION TRIGGER is DEFERRED — the gated/audited operator decommission route
+/// that would call it lands with a later SLE PR (see `server.cpp`'s
+/// `decommission_agent` "PRODUCTION TRIGGER — DEFERRED" note). Until that route
+/// ships, the ADR's "offline agents purge ... via decommission" story is the
+/// mechanism-ready-but-not-yet-operator-triggerable state, not yet operationally
+/// realizable. §27 builds the fan-out and registers its stores with it.
 ///
-/// BEST-EFFORT, aggregated. Each per-store `delete_agent` is individually "best
-/// effort on agent removal": it swallows its own transient failure (a PG lease
-/// it cannot acquire in time, a SQL error) at debug level and returns void. This
-/// cascade preserves that posture across the fan-out — it attempts EVERY
-/// registered store even when an earlier one throws, aggregates the outcomes,
-/// and returns a structured result the caller can audit (which stores were
-/// deleted / skipped / failed).
+/// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
+/// status: true iff the delete actually committed, false on a transient failure
+/// (a PG lease it cannot acquire in time, a rolled-back transaction, a SQL
+/// error). This cascade attempts EVERY registered store even when an earlier one
+/// throws or reports failure, aggregates the outcomes, and returns a structured
+/// result the caller can audit (which stores were deleted / skipped / failed).
+/// A store that returns false — a delete that did NOT happen — is recorded
+/// `Failed`, never `Deleted`, so a `DecommissionResult` can never claim erasure
+/// that a silently-rolled-back DELETE did not achieve (the ADR-0024 Decision 11
+/// Art.17 evidence must be truthful).
 ///
 /// LEASE DISCIPLINE (ADR-0012). Each `delete_agent` acquires and releases its
 /// OWN lease/lock inside the call and returns before the cascade moves on, so
@@ -46,11 +53,13 @@ class SoftwareLicensingStore;
 
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
-    Deleted, ///< delete_agent was invoked and returned normally. Best-effort:
-             ///< the store may itself have logged+swallowed a transient failure,
-             ///< which is invisible here (delete_agent returns void).
+    Deleted, ///< delete_agent was invoked and reported success (returned true):
+             ///< the delete committed. This is confirmed erasure, not merely
+             ///< "invoked".
     Skipped, ///< the store was not configured on this deployment (null pointer).
-    Failed,  ///< delete_agent threw — every OTHER store was still attempted.
+    Failed,  ///< delete_agent reported failure (returned false — e.g. a transient
+             ///< PG outage rolled the DELETE back) OR threw. Either way the delete
+             ///< did NOT commit; every OTHER store was still attempted.
 };
 
 /// Human-readable outcome tag for logs/audit ("deleted"|"skipped"|"failed").
@@ -72,10 +81,20 @@ struct DecommissionResult {
     std::size_t skipped{0};
     std::size_t failed{0};
 
-    /// True iff no registered store threw. A cascade of only Skipped/Deleted
-    /// stores is `ok()`. Because each `delete_agent` swallows its own transient
-    /// PG failure, `ok()` does NOT assert every row is gone — it asserts the
-    /// fan-out completed without an exception escaping any store.
+    /// True iff no registered store's delete FAILED. Now that each `delete_agent`
+    /// reports its commit status, a configured store whose delete did not commit
+    /// (a transient PG failure that rolls the DELETE back, or a throw) counts as
+    /// `failed` and flips `ok()` to false — so for a decommission that did real
+    /// work (`deleted > 0`), `ok()` means "erasure confirmed across every
+    /// configured store", not merely "no exception".
+    ///
+    /// CAVEAT — `ok()` is NOT by itself proof that anything was erased. An
+    /// all-`Skipped` result is also `ok()`: an empty `agent_id` short-circuits
+    /// to every-store-`Skipped` (see `decommission`), and a
+    /// deployment that configured no stores skips them all. A caller using this
+    /// as Art.17 erasure evidence must therefore confirm the `agent_id` was a
+    /// real, non-empty id AND check `deleted` (or the per-store outcomes), not
+    /// `ok()` alone.
     [[nodiscard]] bool ok() const noexcept { return failed == 0; }
 };
 
@@ -109,14 +128,16 @@ public:
     AgentDecommission() = default;
 
     /// Register an additional decommission target by name. Used by tests (to
-    /// inject a store that throws, or a null/unconfigured target) and as the
-    /// forward-compat seam for a per-agent store not yet modelled by
-    /// AgentDecommissionStores. A null `deleter` is registered as an
-    /// always-Skipped target.
-    void add_store(std::string name, std::function<void(std::string_view)> deleter);
+    /// inject a store that throws, or returns false, or a null/unconfigured
+    /// target) and as the forward-compat seam for a per-agent store not yet
+    /// modelled by AgentDecommissionStores. The `deleter` returns true iff the
+    /// delete committed; a false return is recorded `Failed`. A null `deleter`
+    /// is registered as an always-Skipped target.
+    void add_store(std::string name, std::function<bool(std::string_view)> deleter);
 
     /// Fan `delete_agent(agent_id)` across every registered store. Best-effort:
-    /// attempts every store even if one throws. Returns the per-store outcomes.
+    /// attempts every store even if one throws OR reports failure (a delete that
+    /// did not commit). Returns the per-store outcomes.
     /// An empty `agent_id` is a no-op that logs and reports every target Skipped
     /// (mirrors each store's own empty-id guard; a `WHERE agent_id = ''` DELETE
     /// would be a footgun, never a fleet wipe).
@@ -128,7 +149,8 @@ public:
 private:
     struct Target {
         std::string name;
-        std::function<void(std::string_view)> deleter; ///< null ⇒ always Skipped
+        std::function<bool(std::string_view)> deleter; ///< null ⇒ always Skipped;
+                                                       ///< returns true iff committed
     };
     std::vector<Target> targets_;
 };

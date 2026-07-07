@@ -6,8 +6,10 @@
 //
 // Two layers:
 //   * pure fan-out logic ([decommission]) — order, counts, null-skip,
-//     best-effort continue-on-throw, empty-id guard — driven through the
-//     `add_store` seam with recording/throwing fakes (no database needed);
+//     best-effort continue-on-throw AND continue-on-false (a non-throwing delete
+//     that did not commit is Failed, not Deleted), empty-id guard — driven
+//     through the `add_store` seam with recording/throwing/failing fakes (no
+//     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
 //     all five stores (four born-on-PG + the SQLite InventoryStore), decommission
 //     one agent, and assert its rows are gone from EVERY store while a bystander
@@ -66,8 +68,14 @@ TEST_CASE("AgentDecommission fans delete_agent across every registered target, i
     std::vector<std::string> seen_b;
 
     AgentDecommission cascade;
-    cascade.add_store("alpha", [&](std::string_view id) { seen_a.emplace_back(id); });
-    cascade.add_store("beta", [&](std::string_view id) { seen_b.emplace_back(id); });
+    cascade.add_store("alpha", [&](std::string_view id) {
+        seen_a.emplace_back(id);
+        return true;
+    });
+    cascade.add_store("beta", [&](std::string_view id) {
+        seen_b.emplace_back(id);
+        return true;
+    });
 
     const auto result = cascade.decommission("agent-x");
 
@@ -96,9 +104,15 @@ TEST_CASE("AgentDecommission skips a null/unconfigured store without failing the
     int live_calls = 0;
 
     AgentDecommission cascade;
-    cascade.add_store("live-before", [&](std::string_view) { ++live_calls; });
+    cascade.add_store("live-before", [&](std::string_view) {
+        ++live_calls;
+        return true;
+    });
     cascade.add_store("unconfigured", nullptr); // e.g. a store not present on this deployment
-    cascade.add_store("live-after", [&](std::string_view) { ++live_calls; });
+    cascade.add_store("live-after", [&](std::string_view) {
+        ++live_calls;
+        return true;
+    });
 
     const auto result = cascade.decommission("agent-x");
 
@@ -120,9 +134,13 @@ TEST_CASE("AgentDecommission reports a single store failure but does not abort t
 
     SECTION("a std::exception is captured, later stores still run") {
         AgentDecommission cascade;
-        cascade.add_store("ok-before", [](std::string_view) {});
-        cascade.add_store("boom", [](std::string_view) { throw std::runtime_error("kaboom"); });
-        cascade.add_store("ok-after", [&](std::string_view) { ++after_calls; });
+        cascade.add_store("ok-before", [](std::string_view) { return true; });
+        cascade.add_store("boom",
+                          [](std::string_view) -> bool { throw std::runtime_error("kaboom"); });
+        cascade.add_store("ok-after", [&](std::string_view) {
+            ++after_calls;
+            return true;
+        });
 
         const auto result = cascade.decommission("agent-x");
 
@@ -140,8 +158,11 @@ TEST_CASE("AgentDecommission reports a single store failure but does not abort t
 
     SECTION("a non-std throw is captured as an unknown exception") {
         AgentDecommission cascade;
-        cascade.add_store("boom", [](std::string_view) { throw 42; });
-        cascade.add_store("ok-after", [&](std::string_view) { ++after_calls; });
+        cascade.add_store("boom", [](std::string_view) -> bool { throw 42; });
+        cascade.add_store("ok-after", [&](std::string_view) {
+            ++after_calls;
+            return true;
+        });
 
         const auto result = cascade.decommission("agent-x");
 
@@ -156,13 +177,53 @@ TEST_CASE("AgentDecommission reports a single store failure but does not abort t
     }
 }
 
+// The failure mode the void-returning interface structurally could NOT express
+// (and so had no test): a store whose delete_agent returns WITHOUT throwing but
+// reports that the delete did not commit — the real-world transient-PG case,
+// where `with_txn_for` rolls back and returns false. It MUST record Failed, not
+// Deleted, so a DecommissionResult can never claim erasure that never happened.
+TEST_CASE("AgentDecommission records a non-throwing false return as Failed, not Deleted",
+          "[decommission]") {
+    int after_calls = 0;
+
+    AgentDecommission cascade;
+    cascade.add_store("ok-before", [](std::string_view) { return true; });
+    // No throw — just a truthful "the delete did not commit" (e.g. a rolled-back
+    // transaction / a lease it never acquired). Under the old void interface this
+    // returned normally and was unconditionally recorded Deleted.
+    cascade.add_store("silent-fail", [](std::string_view) { return false; });
+    cascade.add_store("ok-after", [&](std::string_view) {
+        ++after_calls;
+        return true;
+    });
+
+    const auto result = cascade.decommission("agent-x");
+
+    CHECK(result.deleted == 2);
+    CHECK(result.failed == 1);
+    CHECK(result.skipped == 0);
+    CHECK_FALSE(result.ok()); // a store that did not commit flips ok() to false
+    CHECK(after_calls == 1);  // the false return did NOT abort the fan-out
+
+    const auto* sf = find_store(result, "silent-fail");
+    REQUIRE(sf != nullptr);
+    CHECK(sf->outcome == DecommissionOutcome::Failed); // NOT Deleted
+    CHECK_FALSE(sf->error.empty());                    // a diagnostic is recorded
+}
+
 TEST_CASE("AgentDecommission treats an empty agent_id as a no-op — nothing is invoked",
           "[decommission]") {
     int calls = 0;
 
     AgentDecommission cascade;
-    cascade.add_store("a", [&](std::string_view) { ++calls; });
-    cascade.add_store("b", [&](std::string_view) { ++calls; });
+    cascade.add_store("a", [&](std::string_view) {
+        ++calls;
+        return true;
+    });
+    cascade.add_store("b", [&](std::string_view) {
+        ++calls;
+        return true;
+    });
 
     const auto result = cascade.decommission("");
 
@@ -196,6 +257,30 @@ TEST_CASE("DecommissionOutcome renders stable audit tags", "[decommission]") {
     CHECK(std::string_view(to_string(DecommissionOutcome::Deleted)) == "deleted");
     CHECK(std::string_view(to_string(DecommissionOutcome::Skipped)) == "skipped");
     CHECK(std::string_view(to_string(DecommissionOutcome::Failed)) == "failed");
+}
+
+// Directly exercise InventoryStore::delete_agent's new empty-id guard and bool
+// commit-status return (SQLite, no Postgres). The cascade short-circuits an empty
+// id to all-Skipped before any deleter runs, so this guard is the store-level
+// belt-and-braces that is otherwise reached by no test.
+TEST_CASE("InventoryStore::delete_agent guards an empty id and reports commit status",
+          "[decommission][inventory]") {
+    yuzu::test::TempDbFile inv_db;
+    yuzu::server::InventoryStore inv{inv_db.path};
+    REQUIRE(inv.is_open());
+    inv.upsert("agent-x", "installed_software", R"({"seed":"1"})", 1000);
+
+    // Empty id: guarded — never a `WHERE agent_id = ''` — reports false (no
+    // commit), and the real row is untouched.
+    CHECK_FALSE(inv.delete_agent(""));
+    CHECK_FALSE(inv.get_agent_inventory("agent-x").empty());
+
+    // A real delete commits → true, and the row is gone.
+    CHECK(inv.delete_agent("agent-x"));
+    CHECK(inv.get_agent_inventory("agent-x").empty());
+
+    // Idempotent: a 0-row delete of an already-erased agent still commits → true.
+    CHECK(inv.delete_agent("agent-x"));
 }
 
 // ── Real-store fan-out (Postgres + SQLite) ───────────────────────────────────

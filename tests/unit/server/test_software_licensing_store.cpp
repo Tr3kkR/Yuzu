@@ -345,7 +345,7 @@ TEST_CASE("SoftwareLicensingStore delete_agent removes child rows AND the state 
     REQUIRE(store.replace_agent_licenses("agent-bystander", {small_row("Keep", "licensed")}, "hb",
                                          "hash"));
 
-    store.delete_agent("agent-del");
+    CHECK(store.delete_agent("agent-del")); // committed → true
 
     auto post = store.agent_licenses("agent-del");
     REQUIRE(post.has_value()); // store open + query OK → empty VALUE, not a degrade
@@ -363,8 +363,9 @@ TEST_CASE("SoftwareLicensingStore delete_agent removes child rows AND the state 
     REQUIRE(bh->has_value());
     CHECK(**bh == "hb");
 
-    // Deleting an unknown agent is a best-effort no-op, not a throw.
-    store.delete_agent("agent-never-existed");
+    // Deleting an unknown agent is a best-effort no-op, not a throw — a 0-row
+    // DELETE still commits, so it reports success.
+    CHECK(store.delete_agent("agent-never-existed"));
 }
 
 TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight ingest via the "
@@ -399,7 +400,10 @@ TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight i
 
     std::atomic<bool> done{false};
     std::thread eraser([&] {
-        store.delete_agent("agent-erase");
+        // Return value deliberately ignored here: Catch2 assertion macros are not
+        // thread-safe off the main thread, and this test asserts the LOCK-BLOCKING
+        // behaviour via `done`, not the commit status.
+        (void)store.delete_agent("agent-erase");
         done.store(true, std::memory_order_release);
     });
 

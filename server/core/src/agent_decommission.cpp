@@ -29,31 +29,32 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // Fixed registration order: the SQLite generic store first, then each
     // born-on-PG typed projection. Every store is registered even when null so
     // the result reports it as Skipped. The lambdas bind the raw store pointer
-    // by value (non-owning). InventoryStore takes `const std::string&`; the four
+    // by value (non-owning) and RETURN delete_agent's commit status (true iff
+    // the delete committed). InventoryStore takes `const std::string&`; the four
     // PG stores take `std::string_view` — the adapter unifies them under one
-    // `void(std::string_view)` deleter signature.
-    using Fn = std::function<void(std::string_view)>;
+    // `bool(std::string_view)` deleter signature.
+    using Fn = std::function<bool(std::string_view)>;
 
     targets_.push_back({"inventory", stores.inventory
                                          ? Fn([p = stores.inventory](std::string_view id) {
-                                               p->delete_agent(std::string(id));
+                                               return p->delete_agent(std::string(id));
                                            })
                                          : nullptr});
     targets_.push_back({"software_inventory",
                         stores.software_inventory
                             ? Fn([p = stores.software_inventory](std::string_view id) {
-                                  p->delete_agent(id);
+                                  return p->delete_agent(id);
                               })
                             : nullptr});
     targets_.push_back({"app_perf_daily",
                         stores.app_perf_daily ? Fn([p = stores.app_perf_daily](std::string_view id) {
-                            p->delete_agent(id);
+                            return p->delete_agent(id);
                         })
                                               : nullptr});
     targets_.push_back({"device_inventory",
                         stores.device_inventory
                             ? Fn([p = stores.device_inventory](std::string_view id) {
-                                  p->delete_agent(id);
+                                  return p->delete_agent(id);
                               })
                             : nullptr});
     // The Decision 11 store: its agent_licenses / agent_license_state rows carry
@@ -61,12 +62,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     targets_.push_back({"software_licensing",
                         stores.software_licensing
                             ? Fn([p = stores.software_licensing](std::string_view id) {
-                                  p->delete_agent(id);
+                                  return p->delete_agent(id);
                               })
                             : nullptr});
 }
 
-void AgentDecommission::add_store(std::string name, std::function<void(std::string_view)> deleter) {
+void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
     targets_.push_back({std::move(name), std::move(deleter)});
 }
 
@@ -96,14 +97,24 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
             result.stores.push_back(std::move(r));
             continue;
         }
-        // Best-effort: an exception from one store must not abort the fan-out —
-        // the remaining stores are still attempted. delete_agent itself already
-        // swallows transient PG failures internally; a throw here is the
-        // exceptional case (an unexpected bug/bad_alloc), reported not fatal.
+        // Best-effort: neither a false return nor an exception from one store
+        // aborts the fan-out — the remaining stores are still attempted.
+        // delete_agent reports a transient PG failure as `false` (the DELETE did
+        // not commit); that is recorded `Failed`, NOT `Deleted`, so the result
+        // never claims an erasure that did not happen. A throw is the additional
+        // exceptional case (an unexpected bug/bad_alloc), likewise Failed.
         try {
-            t.deleter(agent_id);
-            r.outcome = DecommissionOutcome::Deleted;
-            ++result.deleted;
+            if (t.deleter(agent_id)) {
+                r.outcome = DecommissionOutcome::Deleted;
+                ++result.deleted;
+            } else {
+                r.outcome = DecommissionOutcome::Failed;
+                r.error = "delete_agent reported failure (delete did not commit)";
+                ++result.failed;
+                spdlog::error("AgentDecommission: store '{}' delete_agent reported failure for "
+                              "agent={} (delete did not commit — recorded Failed, not Deleted)",
+                              t.name, agent_id);
+            }
         } catch (const std::exception& e) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = e.what();

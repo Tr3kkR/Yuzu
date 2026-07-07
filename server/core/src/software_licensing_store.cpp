@@ -720,17 +720,18 @@ bool SoftwareLicensingStore::upsert_alert_state(std::string_view product_key,
     return true;
 }
 
-void SoftwareLicensingStore::delete_agent(std::string_view agent_id) {
+bool SoftwareLicensingStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
-        return;
+        return false;
     const std::string id{agent_id};
     // Both deletes in one transaction so an agent removal can't leave a parent
     // state row without its child rows or vice versa (the sibling's Gate-2
     // rationale). The child DELETE is explicit even though the FK cascades —
-    // the intent stays visible and survives an FK refactor. Best-effort: a
-    // failure is logged by with_txn_for's caller contract; the next
-    // decommission pass self-heals.
-    pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+    // the intent stays visible and survives an FK refactor. The commit result is
+    // RETURNED to the caller (the decommission cascade), which logs and records a
+    // false as Failed — a rolled-back erasure is never reported as a completed
+    // Art.17 delete; the next decommission pass self-heals.
+    const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         // Take the SAME per-agent advisory lock replace_agent_licenses holds,
         // with the IDENTICAL key derivation ('software_licensing:' || agent_id).
         // Without it a decommission and an in-flight full-replace ingest for THIS
@@ -752,6 +753,10 @@ void SoftwareLicensingStore::delete_agent(std::string_view agent_id) {
             std::vector<std::string>{id});
         return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
     });
+    if (!committed)
+        spdlog::debug("SoftwareLicensingStore: delete_agent did not commit for agent={} ({})",
+                      agent_id, pool_.last_error());
+    return committed;
 }
 
 std::optional<std::int64_t>

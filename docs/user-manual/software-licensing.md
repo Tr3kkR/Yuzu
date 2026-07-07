@@ -164,13 +164,19 @@ enabling the SLE sources — deny-override wins).
   continues (so `user_scope` counts stay honest) but no `user_ref` is recorded.
 - **Erase an already-collected `user_ref`:** flip the knob to `omit` (or `--inventory-disable`).
   Because each sync **full-replaces** the device's rows, the identifier is purged
-  **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect,
-  or when it is decommissioned via the agent-decommission cascade that clears all of its
-  per-device stores).
+  **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
+  This knob-flip full-replace is the erasure path available today.
+- **Decommission cascade — built, not yet operator-triggerable.** This release adds the
+  agent-decommission cascade that clears **all** of a removed device's per-device stores
+  (including its licence rows), but **no operator action triggers it yet**: the gated,
+  audited decommission route that invokes it lands with the next SLE PR. Until that route
+  ships, the cascade cannot be used to erase a specific device on demand — the knob-flip
+  full-replace above is the working mechanism.
 - **Stated gap:** there is **no row-level erasure API** — you cannot delete a single
-  `user_ref` row while keeping the device's other rows. The knob-flip full-replace and
-  the decommission cascade are the erasure mechanisms; a targeted per-subject (DSAR)
-  delete is a tracked platform follow-up, not shipped here.
+  `user_ref` row while keeping the device's other rows. The knob-flip full-replace is the
+  erasure mechanism shipped and usable today (the decommission cascade is built but not yet
+  operator-triggerable, per the note above); a targeted per-subject (DSAR) delete is a
+  tracked platform follow-up, not shipped here.
 
 ## Agent privilege (per-user hive probing)
 
