@@ -402,6 +402,8 @@ if build_server
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_product_normalize.cpp',
+      'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
