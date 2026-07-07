@@ -90,6 +90,7 @@
 #include "preflight_routes.hpp"
 #include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
+#include "vuln_finding_store.hpp"
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -1299,6 +1300,19 @@ public:
             if (!deployment_run_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: deployment-run store migration/open failed "
                               "(database reachable but the deployment_run_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // VulnFindingStore — born-on-PG CAVM findings + coverage projection.
+        // Same fail-CLOSED construction posture as the run stores (ADR-0012 §1).
+        // DORMANT: no matching engine writes to it yet (PR 4).
+        if (pg_pool_ && !startup_failed_) {
+            vuln_finding_store_ = std::make_unique<VulnFindingStore>(*pg_pool_);
+            if (!vuln_finding_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
+                              "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -3340,6 +3354,10 @@ public:
         // (no background thread in slice 1, but keep the ADR-0012 teardown
         // discipline so a future DeploymentRunner can't UAF).
         deployment_run_store_.reset();
+        // VulnFindingStore borrows pg_pool_ — drop before the pool (no background
+        // thread this PR; keep the ADR-0012 teardown discipline so a future engine
+        // can't UAF).
+        vuln_finding_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -4908,6 +4926,7 @@ private:
                 offline_endpoint_store_ && offline_endpoint_store_->is_open();
             bool software_inventory_ok =
                 software_inventory_store_ && software_inventory_store_->is_open();
+            bool vuln_finding_ok = vuln_finding_store_ && vuln_finding_store_->is_open();
             bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
@@ -4918,8 +4937,9 @@ private:
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && app_perf_daily_ok &&
-                                 app_perf_fleet_ok && device_inventory_ok && approval_ok;
+                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
+                                 approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -4937,6 +4957,7 @@ private:
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
+                  {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
@@ -5104,6 +5125,11 @@ private:
                 // ingest and no readiness signal — surface it (gov Pattern E).
                 {"software_inventory_store",
                  software_inventory_store_ && software_inventory_store_->is_open()},
+                // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
+                // not-open post-boot state means the PR-4 matching engine would
+                // silently no-op findings persistence — surface it (Pattern E).
+                {"vuln_finding_store",
+                 vuln_finding_store_ && vuln_finding_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
@@ -10758,6 +10784,10 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
+    std::unique_ptr<VulnFindingStore> vuln_finding_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
