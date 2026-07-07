@@ -93,6 +93,9 @@ struct SleHarness {
     std::vector<std::string> dispatch_calls; // "plugin|action|agent_id"
     std::vector<SleCommandResponseRow> canned_rows;
     bool responses_degrade = false;
+    // Decommission cascade (D-3): the canned per-store result + a recorder.
+    DecommissionResult decommission_result;
+    std::vector<std::string> decommission_calls;
 
     std::vector<LicensePostureRow> posture_rows;
     std::vector<SleLicenseDeviceRow> device_rows;
@@ -179,8 +182,12 @@ struct SleHarness {
                 return std::nullopt;
             return canned_rows;
         };
+        auto decommission_fn = [this](const std::string& agent_id) -> DecommissionResult {
+            decommission_calls.push_back(agent_id);
+            return decommission_result;
+        };
         routes.register_routes(sink, perm, scoped, posture_fn, devices_fn, agents_fn, audit,
-                               meta_fn, mode_fn, dispatch_fn, responses_fn);
+                               meta_fn, mode_fn, dispatch_fn, responses_fn, decommission_fn);
         auto auth = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             if (!authed)
@@ -1020,4 +1027,105 @@ TEST_CASE("sle surfaces: GET is not routed (POST-only side effect)", "[sle_route
     h.allow_scoped_all = true;
     auto res = h.sink.Get("/api/v1/sle/agents/agent-9/surfaces");
     CHECK_FALSE(res); // no GET handler matches — the dispatch is POST-only
+}
+
+// ──────────── DELETE /sle/agents/{id} — the erasure cascade trigger (D-3) ────────
+
+TEST_CASE("sle DELETE: gated on scoped SoftwareLicensing:Delete; denied never erases",
+          "[sle_routes][sle_delete]") {
+    SleHarness h; // scoped gate denies by default
+    h.decommission_result.agent_id = "agent-9";
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-9");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    CHECK(h.decommission_calls.empty());
+    REQUIRE_FALSE(h.scoped_calls.empty());
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-9");
+    // No erasure audit of any kind was written for a denied request.
+    CHECK_FALSE(h.audited("sle.agent.decommission|attempt"));
+}
+
+TEST_CASE("sle DELETE: audit-before-erase FAILS CLOSED — 503 + Sec-Audit-Failed, no cascade",
+          "[sle_routes][sle_delete]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.audit_should_fail = true;
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-9");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.decommission_calls.empty()); // the load-bearing assertion: nothing was erased
+}
+
+TEST_CASE("sle DELETE: happy path — ordered attempt then success audits + per-store breakdown",
+          "[sle_routes][sle_delete]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.decommission_result.agent_id = "agent-9";
+    h.decommission_result.stores = {{"inventory", DecommissionOutcome::Deleted, ""},
+                                    {"software_licensing", DecommissionOutcome::Deleted, ""},
+                                    {"app_perf_daily", DecommissionOutcome::Skipped, ""}};
+    h.decommission_result.deleted = 2;
+    h.decommission_result.skipped = 1;
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-9");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body)["data"];
+    CHECK(j["decommissioned"] == true);
+    CHECK(j["stores"]["inventory"] == "deleted");
+    CHECK(j["stores"]["software_licensing"] == "deleted");
+    CHECK(j["stores"]["app_perf_daily"] == "skipped");
+    CHECK(j["deleted"] == 2);
+    CHECK(j["skipped"] == 1);
+    CHECK(j["failed"] == 0);
+    REQUIRE(h.decommission_calls.size() == 1);
+    CHECK(h.decommission_calls[0] == "agent-9");
+    // Ordered evidence chain: attempt BEFORE the cascade, outcome after.
+    REQUIRE(h.audits.size() >= 2);
+    CHECK(h.audited("sle.agent.decommission|attempt"));
+    CHECK(h.audited("sle.agent.decommission|success"));
+    std::size_t attempt_at = 999, success_at = 999;
+    for (std::size_t i = 0; i < h.audits.size(); ++i) {
+        if (h.audits[i] == "sle.agent.decommission|attempt")
+            attempt_at = i;
+        if (h.audits[i] == "sle.agent.decommission|success")
+            success_at = i;
+    }
+    CHECK(attempt_at < success_at);
+}
+
+TEST_CASE("sle DELETE: a store that threw → 500 + partial audit (idempotent retry story)",
+          "[sle_routes][sle_delete]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.decommission_result.stores = {{"inventory", DecommissionOutcome::Deleted, ""},
+                                    {"software_licensing", DecommissionOutcome::Failed, "boom"}};
+    h.decommission_result.deleted = 1;
+    h.decommission_result.failed = 1;
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-9");
+    REQUIRE(res);
+    REQUIRE(res->status == 500);
+    CHECK(contains(res->body, "incomplete"));
+    CHECK(contains(res->body, "re-issue"));
+    CHECK(h.audited("sle.agent.decommission|partial"));
+}
+
+TEST_CASE("sle DELETE: unwired cascade → 503 fail-closed, no attempt audit",
+          "[sle_routes][sle_delete]") {
+    // A bare registration with every trailing dep defaulted: the DELETE must
+    // refuse (fail-closed) rather than pretend to erase — and must not write
+    // an attempt audit for an operation it cannot perform.
+    yuzu::server::test::TestRouteSink sink;
+    SleRoutes routes;
+    routes.register_routes(
+        sink,
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) { return true; },
+        [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&,
+           const std::string&) { return true; },
+        {}, {}, {});
+    auto res = sink.Delete("/api/v1/sle/agents/agent-9");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    CHECK(res->body.find("not configured") != std::string::npos);
 }

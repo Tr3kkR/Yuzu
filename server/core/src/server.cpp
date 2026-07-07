@@ -3359,16 +3359,15 @@ public:
     /// teardown ordering in `stop()` — a store already reset to null is simply
     /// skipped.
     ///
-    /// PRODUCTION TRIGGER — DEFERRED (documented, not forgotten): this is the
-    /// injectable entry point; no in-scope caller invokes it yet. The operator
-    /// decommission surface that should call it (a `DELETE /api/v1/sle/agents/{id}`
-    /// / reconciled agent-management action, gated + audited per Decision 9, and
-    /// optionally the offline-agent purge-on-reconnect the ADR mentions) lands
-    /// with the SLE REST PR step — its route lives in settings_routes.cpp /
-    /// rest_api_v1.cpp, out of scope for this cascade step. Today's agent-removal
-    /// paths (registry session teardown, enrollment deny/remove, cert revocation)
-    /// are all non-durable-data by design and deliberately do NOT auto-erase
-    /// (a revoked-for-compromise agent's forensic rows must survive).
+    /// PRODUCTION TRIGGER: `DELETE /api/v1/sle/agents/{agent_id}` (sle_routes.cpp,
+    /// PR1b) — scoped SoftwareLicensing:Delete, audit-before-erase fail-closed
+    /// (`sle.agent.decommission` attempt + outcome events; the durable GDPR
+    /// Art.17 evidence spdlog alone could not provide). The optional
+    /// offline-agent purge-on-reconnect the ADR mentions remains future work.
+    /// Today's other agent-removal paths (registry session teardown, enrollment
+    /// deny/remove, cert revocation) are all non-durable-data by design and
+    /// deliberately do NOT auto-erase (a revoked-for-compromise agent's
+    /// forensic rows must survive).
     DecommissionResult decommission_agent(std::string_view agent_id) {
         AgentDecommission cascade{AgentDecommissionStores{
             .inventory = inventory_store_.get(),
@@ -10111,7 +10110,10 @@ private:
                     out.push_back(SleCommandResponseRow{r.agent_id, r.status, r.output,
                                                         r.error_detail});
                 return out;
-            });
+            },
+            // D-3: the decommission cascade's FIRST production trigger (built
+            // on-demand from live store pointers — see decommission_agent).
+            [this](const std::string& agent_id) { return decommission_agent(agent_id); });
         // The /sle PAGE (guardian shell + the Licences fragment, PR1b). The shell
         // is auth-only chrome; the fragment gates on the same fail-closed
         // SoftwareLicensing:Read composite as the REST routes (G-1).

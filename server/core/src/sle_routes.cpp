@@ -333,19 +333,21 @@ void SleRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPerm
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
                                 PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                DecommissionFn decommission_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(perm_fn), std::move(scoped_perm_fn), std::move(posture_fn),
                     std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn),
                     std::move(posture_meta_fn), std::move(user_ref_mode_fn),
-                    std::move(dispatch_fn), std::move(responses_fn));
+                    std::move(dispatch_fn), std::move(responses_fn), std::move(decommission_fn));
 }
 
 void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
                                 AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
                                 PostureMetaFn posture_meta_fn, UserRefModeFn user_ref_mode_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn) {
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
+                                DecommissionFn decommission_fn) {
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     posture_fn_ = std::move(posture_fn);
@@ -356,6 +358,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
     user_ref_mode_fn_ = std::move(user_ref_mode_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
+    decommission_fn_ = std::move(decommission_fn);
 
     // ── GET /api/v1/sle/summary — fleet posture headline (GLOBAL SoftwareLicensing:Read) ──
     // Reads the precomputed posture rollup and derives honest aggregates. In PR1a
@@ -801,6 +804,101 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
             send_json(res, 504,
                       a4_error(504, "device did not respond in time", cid, 3000,
                                "retry the request"));
+        });
+
+    // ── DELETE /api/v1/sle/agents/{agent_id} — operator decommission (D-3 / GDPR Art.17) ──
+    // The cascade's FIRST production trigger: fans delete_agent across every
+    // registered per-agent store, durably erasing the machine's stored rows
+    // (including the Decision-11 user_ref personal data — the reason this
+    // route exists). Gate: SCOPED SoftwareLicensing:Delete (D-9: only
+    // Administrator + ITServiceOwner hold Delete; Operator/Viewer 403) — the
+    // scope stops a group-confined ITSO erasing an out-of-scope device, while
+    // require_scoped_permission's global step still admits global holders
+    // fleet-wide.
+    //
+    // TWO durable audit events (the PR1b-note requirement — spdlog alone is
+    // not GDPR Art.17 evidence):
+    //   1. AUDIT-BEFORE-ERASE, FAIL-CLOSED (`sle.agent.decommission|attempt`):
+    //      when the attempt row is KNOWN to have failed to persist, do NOT
+    //      erase — an unaudited erasure destroys the very data that would
+    //      evidence what was erased (503 + Sec-Audit-Failed). If the process
+    //      dies mid-cascade, the attempt row still evidences who initiated it.
+    //   2. OUTCOME (`sle.agent.decommission|success/partial`), set-and-proceed
+    //      with the per-store breakdown — the erasure already happened; the
+    //      attempt row above is the fail-closed anchor.
+    //
+    // HONESTY (#1947): each store's delete_agent returns void and swallows its
+    // own transient failure, so "deleted" here means "the store's delete was
+    // invoked without an exception" — ATTEMPTED, not row-level-confirmed,
+    // erasure. A store that THREW is `failed` → 500 (the cascade is
+    // idempotent; re-issue the DELETE). Stated in the OpenAPI + manual.
+    sink.Delete(
+        R"(/api/v1/sle/agents/([^/]+))",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            const auto cid = make_cid();
+            res.set_header("X-Correlation-Id", cid);
+            const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+            if (!scoped_perm_fn_) {
+                send_json(res, 503, a4_error(503, "scope gate not configured", cid));
+                return;
+            }
+            if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Delete", agent_id))
+                return; // the gate wrote its own 401/403
+            if (!decommission_fn_) {
+                send_json(res, 503,
+                          a4_error(503, "decommission cascade not configured", cid, 5000));
+                return;
+            }
+            if (!detail::emit_behavioral_audit(
+                    audit_fn_, req, res, "sle.agent.decommission", "attempt", "Agent", agent_id,
+                    "durable-erasure cascade requested cid=" + cid)) {
+                send_json(res, 503,
+                          a4_error(503,
+                                   "audit subsystem unavailable; refusing to erase without "
+                                   "durable evidence",
+                                   cid, 5000, "retry the request"));
+                spdlog::warn("sle.agent.decommission audit fail-closed (503, no erase) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+
+            const DecommissionResult r = decommission_fn_(agent_id);
+
+            std::string breakdown;
+            json stores = json::object();
+            for (const auto& s : r.stores) {
+                stores[s.store] = to_string(s.outcome);
+                breakdown += s.store;
+                breakdown += '=';
+                breakdown += to_string(s.outcome);
+                breakdown += ' ';
+            }
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "sle.agent.decommission", r.ok() ? "success" : "partial",
+                "Agent", agent_id,
+                breakdown + "deleted=" + std::to_string(r.deleted) +
+                    " skipped=" + std::to_string(r.skipped) +
+                    " failed=" + std::to_string(r.failed) + " cid=" + cid);
+
+            if (!r.ok()) {
+                send_json(res, 500,
+                          a4_error(500,
+                                   "agent decommission incomplete — one or more stores failed "
+                                   "(" + std::to_string(r.failed) +
+                                       " failed); re-issue the DELETE (the cascade is "
+                                       "idempotent)",
+                                   cid, 5000, "retry the request"));
+                return;
+            }
+            json data;
+            data["agent_id"] = agent_id;
+            data["decommissioned"] = true;
+            data["stores"] = std::move(stores);
+            data["deleted"] = static_cast<std::int64_t>(r.deleted);
+            data["skipped"] = static_cast<std::int64_t>(r.skipped);
+            data["failed"] = static_cast<std::int64_t>(r.failed);
+            send_json(res, 200, ok_json(std::move(data)));
         });
 }
 

@@ -43,6 +43,7 @@
 /// NEVER a silent empty 200 — an empty compliance surface reads as "nothing
 /// detected / nothing lapsed", the fail-open lie the store contract forbids.
 
+#include "agent_decommission.hpp"      // DecommissionResult (the DELETE route)
 #include "software_licensing_store.hpp" // LicensePostureRow / AgentLicenseRow
 
 #include <yuzu/server/auth.hpp>
@@ -219,11 +220,19 @@ public:
     using ResponsesFn =
         std::function<std::optional<std::vector<SleCommandResponseRow>>(const std::string&)>;
 
+    /// The operator-facing decommission trigger (roadmap D-3 / the PR1b-note):
+    /// runs the full per-agent erasure cascade and returns the per-store
+    /// outcomes. server.cpp binds it to `ServerImpl::decommission_agent` —
+    /// the cascade's FIRST production caller. Unwired (`= {}`) → the DELETE
+    /// answers 503 (fail-closed).
+    using DecommissionFn = std::function<DecommissionResult(const std::string& agent_id)>;
+
     void register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
                          PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {},
-                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         DecommissionFn decommission_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
@@ -231,7 +240,8 @@ public:
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
                          AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
                          PostureMetaFn posture_meta_fn = {}, UserRefModeFn user_ref_mode_fn = {},
-                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {});
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         DecommissionFn decommission_fn = {});
 
     /// The `/sle` PAGE (guardian shell + the Licences fragment). Separate from
     /// `register_routes` so PR1a's REST registration signature and its tests
@@ -258,6 +268,7 @@ private:
     UserRefModeFn user_ref_mode_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
+    DecommissionFn decommission_fn_;
     // Page-route closures (register_page_routes).
     AuthFn page_auth_fn_;
     PermFn page_perm_fn_;
