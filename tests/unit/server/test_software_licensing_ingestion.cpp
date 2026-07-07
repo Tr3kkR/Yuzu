@@ -112,6 +112,7 @@ TEST_CASE("parse: lic| records project the §3.1 field order", "[sle_ingest][par
     CHECK(r.state == "subscription_active");
     CHECK(r.expiry_at == 1893456000);
     CHECK(r.detector == "os_licensing_api"); // wire `source` → store `detector`
+    CHECK(r.confidence == "authoritative");  // field 9 of lic| — projected (ADR-0024 D1/2/7)
     CHECK(r.key_hint == "XXXXX-B7GJQ");
     CHECK(r.exe_hints == "winword.exe;excel.exe");
     CHECK(r.user_scope == "user");
@@ -134,6 +135,7 @@ TEST_CASE("parse: missing trailing fields stay empty; extra fields are dropped",
         CHECK(p.rows[0].license_type == "unknown");
         CHECK(p.rows[0].state == "unknown");
         CHECK(p.rows[0].detector == "unknown");
+        CHECK(p.rows[0].confidence == "unknown"); // missing trailing field → unknown
         CHECK(p.rows[0].expiry_at == 0);
         CHECK(p.rows[0].user_scope == "machine");
         CHECK(p.rows[0].user_ref.empty());
@@ -209,6 +211,7 @@ TEST_CASE("parse: §3.2 enum whitelist at projection (C-7) — unrecognised → 
     CHECK(p.rows[0].license_type == "unknown");
     CHECK(p.rows[0].state == "unknown");
     CHECK(p.rows[0].detector == "unknown");
+    CHECK(p.rows[0].confidence == "unknown"); // "certain" is outside the closed set
     CHECK(p.rows[0].user_scope == "machine"); // its own closed pair: machine|user
     CHECK(p.rows[0].channel == "KMS");        // free-text fields untouched
 }
@@ -300,7 +303,8 @@ TEST_CASE("ingest: full payload stores rows + the RAW-byte hash, never the claim
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].product == "Office 365 ProPlus");
-    CHECK((*rows)[0].collected_at == 1751000000); // proto millis → seconds
+    CHECK((*rows)[0].confidence == "authoritative"); // whitelisted + stored (D1/2/7)
+    CHECK((*rows)[0].collected_at == 1751000000);    // proto millis → seconds
 
     auto stored = store.stored_hash("agent-a");
     REQUIRE(stored.has_value());

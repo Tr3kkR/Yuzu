@@ -108,6 +108,8 @@ constexpr std::array<std::string_view, 7> kStatuses = {
 constexpr std::array<std::string_view, 7> kSources = {
     "os_licensing_api", "entitlement_cert", "registry_probe", "license_file",
     "package_metadata", "app_receipt",      "heuristic"};
+constexpr std::array<std::string_view, 3> kConfidences = {"authoritative", "probable",
+                                                          "heuristic"};
 constexpr std::array<std::string_view, 3> kUserRefModes = {"collect", "hash", "omit"};
 
 } // namespace
@@ -203,11 +205,12 @@ SoftwareLicensingParse parse_software_licensing_blob(const std::string& blob) {
                     if (r.expiry_at < 0 || r.expiry_at > max_expiry)
                         r.expiry_at = 0;
                     r.detector = whitelist(std::move(f[7]), kSources);
-                    // f[8] (`confidence` — authoritative|probable|heuristic) is
-                    // wire-carried but NOT projected: §7.2 v1 `agent_licenses`
-                    // has no confidence column. A future column is a
-                    // projection-only change here (stable estates then need the
-                    // G-8 need_full lever to re-project).
+                    // confidence: closed §3.2 set (authoritative|probable|
+                    // heuristic), anything else → "unknown". Stored from
+                    // migration v1 (ADR-0024 Decisions 1/2/7) — operators
+                    // weight heuristic rows via it, and hash-skip would
+                    // freeze a later-added column empty on stable estates.
+                    r.confidence = whitelist(std::move(f[8]), kConfidences);
                     r.key_hint = std::move(f[9]);
                     r.exe_hints = std::move(f[10]);
                     // user_scope is its own closed pair — an unrecognised scope

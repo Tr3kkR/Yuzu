@@ -71,9 +71,11 @@ const std::vector<pg::PgMigration>& migrations() {
          // Detected licence rows, replaced wholesale per agent on each stored
          // sync. Same-schema FK ON DELETE CASCADE onto the parent (cross-
          // schema FKs are banned — ADR-0024 Decision 4; within one store they
-         // are the normal tool). exe_hints ships in migration v1 (roadmap
-         // R6): hash-skip means a column added later would stay empty forever
-         // on stable estates. expiry_at is the agent-observed epoch (0 =
+         // are the normal tool). confidence and exe_hints ship in migration
+         // v1: hash-skip means a column added later would stay empty forever
+         // on stable estates — confidence is how operators weight heuristic
+         // rows (ADR-0024 Decisions 1/2/7); exe_hints is the R6 product↔exe
+         // bridge. expiry_at is the agent-observed epoch (0 =
          // none); the partial index serves the evaluator's expiry sweep
          // without indexing the expiry-less majority.
          "CREATE TABLE agent_licenses ("
@@ -88,6 +90,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  channel      TEXT NOT NULL DEFAULT '',"
          "  key_hint     TEXT NOT NULL DEFAULT '',"
          "  detector     TEXT NOT NULL DEFAULT '',"
+         "  confidence   TEXT NOT NULL DEFAULT '',"
          "  exe_hints    TEXT NOT NULL DEFAULT '',"
          "  user_scope   TEXT NOT NULL DEFAULT '',"
          "  user_ref     TEXT NOT NULL DEFAULT '',"
@@ -190,7 +193,7 @@ std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
 // fill_license_row (id/agent_id are query keys, not row fields).
 constexpr const char* kLicenseCols =
     "product, vendor, version, license_type, state, expiry_at, channel, key_hint, "
-    "detector, exe_hints, user_scope, user_ref, collected_at, first_seen, last_seen";
+    "detector, confidence, exe_hints, user_scope, user_ref, collected_at, first_seen, last_seen";
 
 void fill_license_row(const pg::PgResult& res, int row, AgentLicenseRow& out) {
     out.product = PQgetvalue(res.get(), row, 0);
@@ -202,12 +205,13 @@ void fill_license_row(const pg::PgResult& res, int row, AgentLicenseRow& out) {
     out.channel = PQgetvalue(res.get(), row, 6);
     out.key_hint = PQgetvalue(res.get(), row, 7);
     out.detector = PQgetvalue(res.get(), row, 8);
-    out.exe_hints = PQgetvalue(res.get(), row, 9);
-    out.user_scope = PQgetvalue(res.get(), row, 10);
-    out.user_ref = PQgetvalue(res.get(), row, 11);
-    out.collected_at = result_i64(res, row, 12);
-    out.first_seen = result_i64(res, row, 13);
-    out.last_seen = result_i64(res, row, 14);
+    out.confidence = PQgetvalue(res.get(), row, 9);
+    out.exe_hints = PQgetvalue(res.get(), row, 10);
+    out.user_scope = PQgetvalue(res.get(), row, 11);
+    out.user_ref = PQgetvalue(res.get(), row, 12);
+    out.collected_at = result_i64(res, row, 13);
+    out.first_seen = result_i64(res, row, 14);
+    out.last_seen = result_i64(res, row, 15);
 }
 
 constexpr const char* kPostureCols =
@@ -354,14 +358,14 @@ bool SoftwareLicensingStore::replace_agent_licenses(std::string_view agent_id,
         if (del.status() != PGRES_COMMAND_OK)
             return false;
         // Batched insert (#1664 pattern): one statement, per-row columns as
-        // parallel arrays, so the parameter count is a constant 15 regardless
+        // parallel arrays, so the parameter count is a constant 16 regardless
         // of row count (up to the R5 10k-record cap arrives here). Skip when
         // empty — a legitimate replace-to-empty; the DELETE above cleared the
         // rows.
         if (!rows.empty()) {
-            // 11 text columns as string_view arrays over the caller's rows;
+            // 12 text columns as string_view arrays over the caller's rows;
             // the 2 BIGINT columns need owned decimal strings first.
-            std::vector<std::string_view> text_cols[11];
+            std::vector<std::string_view> text_cols[12];
             for (auto& col : text_cols)
                 col.reserve(rows.size());
             std::vector<std::string> expiry_strs;
@@ -377,9 +381,10 @@ bool SoftwareLicensingStore::replace_agent_licenses(std::string_view agent_id,
                 text_cols[5].emplace_back(r.channel);
                 text_cols[6].emplace_back(r.key_hint);
                 text_cols[7].emplace_back(r.detector);
-                text_cols[8].emplace_back(r.exe_hints);
-                text_cols[9].emplace_back(r.user_scope);
-                text_cols[10].emplace_back(r.user_ref);
+                text_cols[8].emplace_back(r.confidence);
+                text_cols[9].emplace_back(r.exe_hints);
+                text_cols[10].emplace_back(r.user_scope);
+                text_cols[11].emplace_back(r.user_ref);
                 expiry_strs.push_back(std::to_string(r.expiry_at));
                 collected_strs.push_back(std::to_string(r.collected_at));
             }
@@ -388,9 +393,9 @@ bool SoftwareLicensingStore::replace_agent_licenses(std::string_view agent_id,
                                                           collected_strs.end());
             // push_back (not a braced init-list) so each to_text_array prvalue
             // is MOVED into params (the sibling's cpp-expert note). Constant
-            // 15 params: $1 agent_id, $2 receipt time, $3..$15 arrays.
+            // 16 params: $1 agent_id, $2 receipt time, $3..$16 arrays.
             std::vector<std::string> params;
-            params.reserve(15);
+            params.reserve(16);
             params.push_back(agent_id_s);
             params.push_back(std::to_string(ts));
             for (const auto& col : text_cols)
@@ -401,14 +406,14 @@ bool SoftwareLicensingStore::replace_agent_licenses(std::string_view agent_id,
                 c,
                 "INSERT INTO software_licensing_store.agent_licenses "
                 "(agent_id, product, vendor, version, license_type, state, channel, key_hint, "
-                "detector, exe_hints, user_scope, user_ref, expiry_at, collected_at, "
+                "detector, confidence, exe_hints, user_scope, user_ref, expiry_at, collected_at, "
                 "first_seen, last_seen) "
-                "SELECT $1, p, v, ver, lt, st, ch, kh, det, eh, us, ur, ex, ca, "
+                "SELECT $1, p, v, ver, lt, st, ch, kh, det, conf, eh, us, ur, ex, ca, "
                 "$2::bigint, $2::bigint "
                 "FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], "
                 "$8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], "
-                "$14::bigint[], $15::bigint[]) "
-                "AS t(p, v, ver, lt, st, ch, kh, det, eh, us, ur, ex, ca)",
+                "$14::text[], $15::bigint[], $16::bigint[]) "
+                "AS t(p, v, ver, lt, st, ch, kh, det, conf, eh, us, ur, ex, ca)",
                 params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return false;
