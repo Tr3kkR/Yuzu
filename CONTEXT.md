@@ -113,6 +113,29 @@ A directed chain through the reachability graph from an **entry point** to a **c
 
 A node or edge lying on many high-value attack paths, such that removing it — patching/isolating the host, or closing the port/flow — severs the most at-risk value for the least defender effort. Ranked by **defender ROI**: the sum of `crown-jewel value × path probability` over the attack paths the removal would break, **not** by generic graph centrality. The minimum-effort set of removals that fully severs a trust zone from crown jewels it should not reach is a **segmentation recommendation** (a cost-weighted min-cut). Because the graph is observed-grounded, a chokepoint severs *observed* paths; policy-permitted-but-unobserved paths are out of scope until host-firewall potential-reachability enrichment lands.
 
+## Component inventory
+
+The per-endpoint census of individual software *components* — including ones no package manager
+or OS registry enumerates as a discrete product: a library bundled inside an installed
+application, an embedded Electron/Chromium runtime, or a filesystem-resident language dependency
+(`node_modules`, a venv, an on-disk JAR, a Go/Rust module graph). Distinct from **installed
+software inventory** (the package-manager/registry-level, top-level-product census
+`installed_software` already collects, ADR-0016) — a component inventory reaches one layer deeper,
+into what a top-level product actually bundles or depends on. Stored in Yuzu's own relational
+schema (ADR-0028); not the same thing as an **SBOM**.
+_Avoid_: SBOM (as the name of the internal capability), dependency tree, software inventory (ambiguous with the top-level census).
+
+## SBOM (Software Bill of Materials)
+
+A standardized export/import **document format** (CycloneDX or SPDX) describing a software
+component inventory. Yuzu does not store data natively in either format — SBOM names the interop
+artifact a **component inventory** can be projected into (export) or parsed from (import), not the
+internal collection capability or its storage format (ADR-0028 §Decision 6). Roadmap Issue 18.5
+("SBOM Ingest") imports externally-produced SBOMs; ADR-0028 generates a component inventory
+first-party; a future export feature would project ADR-0028's data into an SBOM document for the
+first time.
+_Avoid_: using "SBOM" loosely to mean the internal component inventory itself.
+
 ## Demo
 
 A demonstration of Yuzu run **live against a real fleet** — never against fabricated findings. Yuzu's cornerstone is that it never invents data ("a metric nobody reported is absent, never a fabricated zero"); that rule holds **in demos too**. Realism comes from constructing a real **environment** that genuinely exhibits a condition (a device with a real pending reboot, a really-degraded link, a really-crashing service), then **observing it live and remediating it live**. Remediation runs through the **real approval and tier/RBAC gates** — the agentic worker executes only **after a human approves**, via the same `execute_instruction`/`execute_bundle` path a customer uses; there is **no demo bypass** (a demo-only write path would violate agentic-first the same way a fabricated read does). "Take the risk" means accepting that a live run may not behave exactly like a canned script would — **not** relaxing any safety gate. A "demo" is therefore a *staged environment plus a live, fully-gated operator/agentic-worker flow over the real tools*, not a special data path: there is **no fabricated-finding mode**. Distinct from the **golden-prompt pack** (`enterprise-it-v1`), which is a prompt-evaluation fixture set, not demo output. Cuts against the retired curated/`DEMO DATA` mode (PR #1653).
