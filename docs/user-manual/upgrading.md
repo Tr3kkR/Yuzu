@@ -591,6 +591,38 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
+
+This release adds the **SLE** (Software Licensing & Entitlements) surface — a new `/sle`
+dashboard page and the read-only `/api/v1/sle/*` REST endpoints — gated on a new
+**`SoftwareLicensing`** RBAC securable. Because RBAC role defaults are seeded with
+`INSERT OR IGNORE` on **every** boot, an upgrading deployment **silently auto-grants**
+the new securable to the built-in roles the first time it starts the new build:
+
+| Role | Grant |
+|---|---|
+| Viewer, PlatformEngineer | Read |
+| Operator | Read + Write |
+| ITServiceOwner, Administrator | full CRUD |
+| ApiTokenManager | none |
+
+**No action is required** if that matches your intent — the securable gates only the SLE
+page and `/api/v1/sle/*`; the `/inventory` software catalog is unchanged and remains
+under `Inventory:Read`.
+
+**But** detected-licence (and, in later releases, entitlement) data can include
+**cost / entitlement metadata visible to every Read holder, including `Viewer`**. **A
+deployment that must restrict entitlement-cost visibility should deny or remove the
+`SoftwareLicensing` Read grant from `Viewer` (and any other broad role) BEFORE enabling
+the SLE sources.** A **deny rule wins** over the seeded allow (deny-override), so an
+explicit deny is the durable control — re-seeding on the next boot cannot re-open it.
+
+The SLE detection source also collects a new, suppressible **per-user identifier**
+(`user_ref`) on per-user licence surfaces. It defaults to a per-device keyed-HMAC
+pseudonym; see [Software licence detection](software-licensing.md) for the
+`--license-scan-user-ref` flag, the honest limits of that default, and the
+`--inventory-disable` source-level opt-out.
+
 ### Gateway distribution cookie now required (#659) — **BREAKING**
 
 The Erlang gateway shipped a hardcoded default distribution cookie

@@ -21,6 +21,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Audit Log](audit-log.md) | Structured audit events -- who did what, when, on which devices |
 | [Response Store](response-store.md) | Persistent, filterable, aggregatable instruction response data |
 | [Installed-Software Inventory](inventory.md) | Daily machine-scope installed-software sync to central Postgres (hash-skip, fleet-wide queries); first source of the agent daily-sync framework |
+| [Software Licence Detection (SLE)](software-licensing.md) | Daily detection of installed software licences — type, channel, status, expiry — across Windows/Linux/macOS; the SLE dashboard + `/api/v1/sle/*` read surface; per-user `user_ref` privacy controls |
 | [Agent Plugins](agent-plugins.md) | Plugin architecture, available plugins, and plugin development |
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
