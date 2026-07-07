@@ -147,6 +147,19 @@ BoundedQueryResult run_bounded_wmi_query(const std::string& wmi_namespace, const
             result.truncated = true;
             break;
         }
+        // Whole-enumeration deadline (C-8), checked UNCONDITIONALLY at the top of
+        // every iteration. The WBEM_S_TIMEDOUT retry branch below only bounds a
+        // Next() that STALLS; a misbehaving provider that dribbles rows just under
+        // the per-Next timeout keeps returning WBEM_S_NO_ERROR and never trips
+        // that branch — so without this check it could run unbounded. A partial
+        // enumeration is not a structurally-successful probe (ADR-0024 D3): clear
+        // the rows and fail with a reason distinct from the per-Next stall token.
+        if (GetTickCount64() - start_ticks >=
+            static_cast<ULONGLONG>(opts.enumeration_deadline_ms)) {
+            result.error = "wmi_deadline_exceeded";
+            result.rows.clear();
+            return result;
+        }
         IWbemClassObject* obj = nullptr;
         ULONG count = 0;
         hr = enumerator->Next(opts.next_timeout_ms, 1, &obj, &count);

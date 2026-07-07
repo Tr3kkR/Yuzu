@@ -9863,10 +9863,19 @@ private:
                 // learns the store state) before the fail-closed 503.
                 if (require_auth(req, res)) {
                     res.status = 503;
+                    // Carry the route's REAL correlation id (already stamped on the
+                    // response as X-Correlation-Id by the SLE handler before the gate
+                    // ran) into the A4 body, matching every other SLE 503 — never a
+                    // hardcoded empty id. The cid is the grep-safe `req-<hex>-<hex>`
+                    // shape (no JSON metacharacters), so plain interpolation is safe;
+                    // an unset header falls back to "" (the prior behaviour).
+                    const std::string cid = res.get_header_value("X-Correlation-Id");
                     res.set_content(
-                        R"({"error":{"code":503,"message":"authorization subsystem )"
-                        R"(unavailable","correlation_id":"","retry_after_ms":5000},)"
-                        R"("meta":{"api_version":"v1"}})",
+                        std::string(
+                            R"({"error":{"code":503,"message":"authorization subsystem )"
+                            R"(unavailable","correlation_id":")") +
+                            cid +
+                            R"(","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                         "application/json");
                 }
                 return false;

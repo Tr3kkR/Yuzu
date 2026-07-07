@@ -2,8 +2,9 @@
 // test-matrix row test_licensing_sync). Covers the user_ref knob (default hash;
 // collect pass-through; omit), HMAC pseudonym stability + distinctness, the
 // k_agent no-leak guarantee (blob AND logs — roadmap R16), the empty-vs-error
-// structural guard (primary-surface error skips; per-user hives never primary;
-// all-ok zero rows is a valid empty blob — ADR-0024 D3 / R15), the cfg| config
+// structural guard (primary- AND authoritative-surface errors skip; probable/
+// heuristic surfaces incl. per-user hives do not; all-ok zero rows is a valid
+// empty blob — ADR-0024 D3 / R15), the cfg| config
 // record (D-10), blob stability, skip-unknown-kinds tolerance, and the R5
 // over-cap skips. Plugin output is injected through a fake descriptor whose
 // `list` action writes canned lines (mirrors test_inventory_sync's bulk
@@ -97,10 +98,12 @@ collect_with(const std::string& list_output, FakeKv& kv, UserRefMode mode) {
     return src.collect();
 }
 
-// A fully-populated per-user lic line for `profile`.
+// A fully-populated per-user lic line for `profile`. expires_at is a midnight-UTC
+// epoch (§3.1 wire contract: BIGINT epoch seconds, NOT a YYYY-MM-DD string) —
+// 1798675200 = 2026-12-31T00:00:00Z.
 std::string user_lic_line(std::string_view profile) {
     return std::string("lic|JetBrains IDEA|JetBrains|2024.1|subscription||subscription_active|"
-                       "2026-12-31|license_file|probable|ABCD|idea64.exe|user|") +
+                       "1798675200|license_file|probable|ABCD|idea64.exe|user|") +
            std::string(profile);
 }
 
@@ -323,17 +326,17 @@ TEST_CASE("two collects of identical state → identical hash", "[licensing_sync
 TEST_CASE("parse flags a primary-surface error, not a per-user-hive error",
           "[licensing_sync][guard]") {
     CHECK(parse_license_scan_output("probe_status|slp_wmi|error|access_denied\n")
-              .primary_surface_error);
+              .blocking_surface_error);
     CHECK(parse_license_scan_output("probe_status|pkg_metadata|error|rpm_query_failed\n")
-              .primary_surface_error);
-    CHECK(parse_license_scan_output("probe_status|mas_receipt|error|io\n").primary_surface_error);
+              .blocking_surface_error);
+    CHECK(parse_license_scan_output("probe_status|mas_receipt|error|io\n").blocking_surface_error);
     // Per-user hives are NEVER primary (R15) — their error does not skip.
     CHECK_FALSE(parse_license_scan_output("probe_status|per_user_hives|error|privilege_missing\n")
-                    .primary_surface_error);
+                    .blocking_surface_error);
     CHECK_FALSE(parse_license_scan_output("probe_status|per_user_files|error|enum_failed\n")
-                    .primary_surface_error);
+                    .blocking_surface_error);
     // An OK primary surface is not an error.
-    CHECK_FALSE(parse_license_scan_output("probe_status|slp_wmi|ok|0\n").primary_surface_error);
+    CHECK_FALSE(parse_license_scan_output("probe_status|slp_wmi|ok|0\n").blocking_surface_error);
 }
 
 TEST_CASE("collect skips the cycle when a primary surface errors", "[licensing_sync][guard]") {
@@ -350,6 +353,53 @@ TEST_CASE("a per-user-hive error alone does NOT skip the cycle", "[licensing_syn
                             "\nprobe_status|slp_wmi|ok|1\n"
                             "probe_status|per_user_hives|error|privilege_missing\n";
     CHECK(collect_with(out, kv, UserRefMode::omit).has_value());
+}
+
+TEST_CASE("parse flags an AUTHORITATIVE-surface error, not a probable-surface error (F4)",
+          "[licensing_sync][guard]") {
+    // Authoritative SECONDARY surfaces block the cycle just like a primary surface
+    // — dropping their records via full-replace on a transient error reads as
+    // "licence gone" (ADR-0024 D3). entitlement_certs (RHEL subscription expiry)
+    // and flexlm_lic (feature expiry) are authoritative.
+    CHECK(parse_license_scan_output("probe_status|entitlement_certs|error|cert_parse_failed\n")
+              .blocking_surface_error);
+    CHECK(parse_license_scan_output("probe_status|flexlm_lic|error|read_failed\n")
+              .blocking_surface_error);
+    // Probable/heuristic secondary surfaces erroring do NOT block: their records
+    // are not authoritative, so a transient error must not wipe stored state.
+    CHECK_FALSE(parse_license_scan_output("probe_status|office_c2r|error|read_failed\n")
+                    .blocking_surface_error);
+    CHECK_FALSE(parse_license_scan_output("probe_status|per_user_files|error|enum_failed\n")
+                    .blocking_surface_error);
+    // OK on an authoritative surface is not an error.
+    CHECK_FALSE(
+        parse_license_scan_output("probe_status|entitlement_certs|ok|2\n").blocking_surface_error);
+}
+
+TEST_CASE("collect skips on an authoritative-surface error but proceeds on a probable one (F4)",
+          "[licensing_sync][guard]") {
+    const std::string lic =
+        "lic|RHEL sub|Red Hat|9|subscription||subscription_active||entitlement_cert|"
+        "authoritative|||machine|\n";
+    {
+        FakeKv kv;
+        // entitlement_certs errors even though the primary pkg_metadata surface is
+        // fine → keep last good, skip (don't full-replace the authoritative rows away).
+        const std::string out = lic +
+                                "probe_status|pkg_metadata|ok|1\n"
+                                "probe_status|entitlement_certs|error|cert_parse_failed\n";
+        CHECK_FALSE(collect_with(out, kv, UserRefMode::hash).has_value());
+    }
+    {
+        FakeKv kv;
+        // A probable surface (per-user files) errors with every blocking surface ok
+        // → proceed (valid state, full-replace).
+        const std::string out = lic +
+                                "probe_status|pkg_metadata|ok|1\n"
+                                "probe_status|entitlement_certs|ok|1\n"
+                                "probe_status|per_user_files|error|enum_failed\n";
+        CHECK(collect_with(out, kv, UserRefMode::hash).has_value());
+    }
 }
 
 TEST_CASE("zero rows with all surfaces ok is a VALID empty blob (full-replace-to-empty)",
@@ -372,7 +422,7 @@ TEST_CASE("parse keeps lic| only and tolerates unknown/blank kinds",
           "[licensing_sync][forward-compat]") {
     const std::string out =
         "lic|Prod A|VendA|1|perpetual||licensed||registry_probe|probable|K|a.exe|machine|\n"
-        "ent|Prod|Vend|feature|10|3|subscription|2027-01-01|flexlm|host:27000\n" // PR2 kind
+        "ent|Prod|Vend|feature|10|3|subscription|1798761600|flexlm|host:27000\n" // PR2 kind; term_end epoch 2027-01-01T00:00:00Z
         "cfg|user_ref|collect\n"    // config kind (source-emitted, not from plugin)
         "junk|whatever|stuff\n"     // unknown kind
         "\n"                        // blank
@@ -382,7 +432,7 @@ TEST_CASE("parse keeps lic| only and tolerates unknown/blank kinds",
     REQUIRE(parsed.records.size() == 2);
     CHECK(parsed.records[0].product == "Prod A");
     CHECK(parsed.records[1].product == "Prod B");
-    CHECK_FALSE(parsed.primary_surface_error);
+    CHECK_FALSE(parsed.blocking_surface_error);
 }
 
 TEST_CASE("parse drops a lic row with an empty product (no identity)",

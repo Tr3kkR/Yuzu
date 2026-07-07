@@ -86,16 +86,25 @@ struct SleHarness {
 
     std::vector<std::string> audits;     // "action|result"
     std::vector<std::string> audit_full; // "action|result|target_type|target_id"
+    // The (securable_type, operation[, agent_id]) each gate was ASKED to check —
+    // recorded so a wrong-securable / wrong-op / wrong-scope regression in
+    // sle_routes.cpp is caught (the args used to be discarded, so any securable
+    // passed every test).
+    std::vector<std::string> perm_calls;   // "type|op" per GLOBAL-gate check
+    std::vector<std::string> scoped_calls; // "type|op|agent_id" per SCOPED-gate check
 
     SleHarness() {
-        auto perm = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                           const std::string&) {
+        auto perm = [this](const httplib::Request&, httplib::Response& res,
+                           const std::string& type, const std::string& op) {
+            perm_calls.push_back(type + "|" + op);
             if (!allow_perm)
                 res.status = perm_deny_status;
             return allow_perm;
         };
-        auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                             const std::string&, const std::string& agent_id) {
+        auto scoped = [this](const httplib::Request&, httplib::Response& res,
+                             const std::string& type, const std::string& op,
+                             const std::string& agent_id) {
+            scoped_calls.push_back(type + "|" + op + "|" + agent_id);
             bool ok = allow_scoped_all;
             for (const auto& a : scoped_agents)
                 if (a == agent_id)
@@ -179,6 +188,30 @@ TEST_CASE("sle/licenses + fan-out + drill: denied without the securable", "[sle_
         REQUIRE(res);
         CHECK(res->status == 403);
     }
+}
+
+// ── F3: each route demands EXACTLY the SoftwareLicensing:Read securable, and the
+// drill hands the agent id to the SCOPED gate. Without asserting the recorded
+// (type, op[, agent_id]), a wrong-securable/wrong-op regression would pass silently.
+TEST_CASE("each SLE route demands exactly SoftwareLicensing:Read (drill via the scoped gate)",
+          "[sle_routes]") {
+    SleHarness h;
+    h.allow_scoped_all = true; // let the drill reach + record the scoped check
+
+    h.sink.Get("/api/v1/sle/summary");
+    h.sink.Get("/api/v1/sle/licenses");
+    h.sink.Get("/api/v1/sle/licenses/chrome/devices");
+    // The three GLOBAL-gated reads each checked exactly SoftwareLicensing:Read.
+    REQUIRE(h.perm_calls.size() == 3);
+    for (const auto& c : h.perm_calls)
+        CHECK(c == "SoftwareLicensing|Read");
+    CHECK(h.scoped_calls.empty()); // none of the aggregates touched the scoped gate
+
+    h.sink.Get("/api/v1/sle/agents/agent-77");
+    // The drill uses the SCOPED gate ONLY (never the global one) and passes the id.
+    CHECK(h.perm_calls.size() == 3); // unchanged — drill did not hit the global gate
+    REQUIRE(h.scoped_calls.size() == 1);
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Read|agent-77");
 }
 
 // ── [sle][adr0017] — aggregates are pinned global-only: a group-confined principal
