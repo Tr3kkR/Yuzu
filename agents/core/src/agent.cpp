@@ -39,6 +39,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
 #include "sync_source_device_ci.hpp"          // ADR-0016 device-CI inventory source
+#include "sync_source_software_licensing.hpp" // SLE (ADR-0024) software_licensing source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -1462,6 +1463,8 @@ public:
                     const YuzuPluginDescriptor* devid_descriptor = nullptr;
                     const YuzuPluginDescriptor* osinfo_descriptor = nullptr;
                     const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
+                    // SLE (ADR-0024): the software_licensing source's backing plugin.
+                    const YuzuPluginDescriptor* license_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         if (pname == "installed_apps")
@@ -1476,6 +1479,8 @@ public:
                             osinfo_descriptor = handle.descriptor();
                         else if (pname == "network_config")
                             netcfg_descriptor = handle.descriptor();
+                        else if (pname == "license_scan")
+                            license_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
@@ -1483,13 +1488,14 @@ public:
                         // or pushes (installed_software, app_perf, device_ci device identity).
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
                                      "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
-                                     "pushed (sources: installed_software, app_perf, device_ci)");
+                                     "pushed (sources: installed_software, app_perf, device_ci, "
+                                     "software_licensing)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
-                                                netcfg_descriptor,
+                                                netcfg_descriptor, license_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -1553,8 +1559,30 @@ public:
                         scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
                                                                    osinfo_descriptor,
                                                                    netcfg_descriptor));
-                        spdlog::info("Daily-sync thread started (sources=3: installed_software, "
-                                     "app_perf, device_ci)");
+                        // SLE (ADR-0024): detected software licences. Idles when the
+                        // license_scan plugin isn't loaded (null descriptor). The
+                        // per-user user_ref knob (Decision 11) and its persisted
+                        // k_agent (roadmap R16, `license_scan` KvStore namespace) are
+                        // injected here; the HMAC key never leaves that namespace.
+                        {
+                            SoftwareLicensingConfig lic_cfg;
+                            lic_cfg.user_ref_mode =
+                                parse_user_ref_mode(cfg_.license_scan_user_ref)
+                                    .value_or(UserRefMode::hash);
+                            lic_cfg.kv_get = [this](std::string_view key) -> std::string {
+                                auto v = kv_store_ ? kv_store_->get("license_scan", key)
+                                                   : std::nullopt;
+                                return v ? *v : std::string{};
+                            };
+                            lic_cfg.kv_set = [this](std::string_view key, std::string_view value) {
+                                if (kv_store_)
+                                    kv_store_->set("license_scan", key, value);
+                            };
+                            scheduler.add_source(make_software_licensing_source(
+                                license_descriptor, std::move(lic_cfg)));
+                        }
+                        spdlog::info("Daily-sync thread started (sources=4: installed_software, "
+                                     "app_perf, device_ci, software_licensing)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())

@@ -167,6 +167,7 @@ agent_test_exe = executable(
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
+    'unit/test_licensing_sync.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
