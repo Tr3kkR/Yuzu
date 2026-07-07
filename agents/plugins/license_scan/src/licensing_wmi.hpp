@@ -57,7 +57,7 @@ struct BoundedQueryResult {
     std::string error;       // reason token when !ok: com_init_failed |
                              // wbem_locator_failed | wmi_connect_failed_<hr> |
                              // wmi_query_failed_<hr> | wmi_next_timeout |
-                             // wmi_next_failed_<hr>
+                             // wmi_deadline_exceeded | wmi_next_failed_<hr>
     std::vector<WmiRow> rows;
 };
 

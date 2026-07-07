@@ -19,10 +19,12 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AgentLicenseRow;
@@ -363,6 +365,71 @@ TEST_CASE("SoftwareLicensingStore delete_agent removes child rows AND the state 
 
     // Deleting an unknown agent is a best-effort no-op, not a throw.
     store.delete_agent("agent-never-existed");
+}
+
+TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight ingest via the "
+          "SAME per-agent advisory lock (erasure race, D-11)",
+          "[pg][software_licensing][decommission]") {
+    // ADR-0024 Decision-11 erasure guarantee: a decommission racing an in-flight
+    // full-replace ingest for the SAME agent must not let the ingest re-insert the
+    // just-erased user_ref PII. delete_agent and replace_agent_licenses both take
+    // the identical per-agent advisory lock ('software_licensing:' || agent_id);
+    // this test holds that EXACT lock on a peer session and proves delete_agent
+    // blocks on it. A drift in the key derivation — or a missing lock — would let
+    // delete race past the peer and this assertion would flip.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Seed an agent carrying user_ref PII (full_row(): user_scope=user).
+    REQUIRE(store.replace_agent_licenses("agent-erase", {full_row()}, "h1", "hash"));
+
+    // Peer session holds the EXACT advisory lock replace_agent_licenses / delete_agent
+    // derive. A session-level advisory lock conflicts across sessions with
+    // delete_agent's transaction-level lock on the same key.
+    auto holder = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(holder);
+    REQUIRE(pg::exec_params(
+                holder.get(),
+                "SELECT pg_advisory_lock(hashtextextended('software_licensing:' || $1, 0))",
+                std::vector<std::string>{"agent-erase"})
+                .status() == PGRES_TUPLES_OK);
+
+    std::atomic<bool> done{false};
+    std::thread eraser([&] {
+        store.delete_agent("agent-erase");
+        done.store(true, std::memory_order_release);
+    });
+
+    // While the peer holds the lock, delete_agent MUST block on the same key — it
+    // has not run any DELETE yet, so the PII is still present. If delete took no
+    // lock it would have erased and finished immediately (done == true here).
+    std::this_thread::sleep_for(std::chrono::milliseconds{400});
+    CHECK_FALSE(done.load(std::memory_order_acquire));
+    {
+        auto mid = store.agent_licenses("agent-erase");
+        REQUIRE(mid.has_value());
+        CHECK(mid->size() == 1); // not yet erased — the delete is waiting on the lock
+    }
+
+    // Release the peer lock → delete_agent unblocks and completes the erasure.
+    REQUIRE(pg::exec_params(
+                holder.get(),
+                "SELECT pg_advisory_unlock(hashtextextended('software_licensing:' || $1, 0))",
+                std::vector<std::string>{"agent-erase"})
+                .status() == PGRES_TUPLES_OK);
+    eraser.join();
+    CHECK(done.load(std::memory_order_acquire));
+
+    // Erasure complete and deterministic: child PII rows gone, state row gone.
+    auto gone = store.agent_licenses("agent-erase");
+    REQUIRE(gone.has_value());
+    CHECK(gone->empty());
+    auto h = store.stored_hash("agent-erase");
+    REQUIRE(h.has_value());
+    CHECK_FALSE(h->has_value());
 }
 
 TEST_CASE("SoftwareLicensingStore posture rollup replaces atomically and reads back",

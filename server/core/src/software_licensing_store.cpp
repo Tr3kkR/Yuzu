@@ -731,6 +731,19 @@ void SoftwareLicensingStore::delete_agent(std::string_view agent_id) {
     // failure is logged by with_txn_for's caller contract; the next
     // decommission pass self-heals.
     pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        // Take the SAME per-agent advisory lock replace_agent_licenses holds,
+        // with the IDENTICAL key derivation ('software_licensing:' || agent_id).
+        // Without it a decommission and an in-flight full-replace ingest for THIS
+        // agent interleave under READ COMMITTED: the ingest's INSERT can land
+        // AFTER the delete's DELETE, resurrecting the just-erased user_ref PII and
+        // breaking the ADR-0024 Decision-11 erasure guarantee. Serialising the two
+        // on this lock closes that race — the loser waits, then runs cleanly.
+        // Blocking (not try_) on purpose, bounded by the pool's lock_timeout.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('software_licensing:' || $1, 0))",
+            std::vector<std::string>{id});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_licensing_store.agent_licenses WHERE agent_id = $1",
             std::vector<std::string>{id});

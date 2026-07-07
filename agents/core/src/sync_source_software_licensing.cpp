@@ -65,6 +65,31 @@ bool is_primary_surface(std::string_view s) {
     return std::find(kPrimarySurfaces.begin(), kPrimarySurfaces.end(), s) != kPrimarySurfaces.end();
 }
 
+// AUTHORITATIVE surfaces (ADR-0024 Decision 2 confidence `authoritative`; roadmap
+// §5 PR1 surface table). These are not necessarily the platform PRIMARY
+// enumeration surface, but they carry authoritative licence / expiry state, so
+// dropping their records via full-replace on a transient error reads as "licence
+// gone" (the exact silent-erasure failure the empty-vs-error guard exists to
+// prevent). An error on one of these therefore skips the cycle (keep last good)
+// just like a primary-surface error — see LicenseScanParse::blocking_surface_error.
+// Kept in step with the plugin's confidence="authoritative" assignments and the
+// per-OS surface tokens in licensing_{win,linux}.cpp:
+//   slp_wmi           — Windows WMI SoftwareLicensingProduct (also primary)
+//   entitlement_certs — Linux RHEL entitlement certs (subscription expiry)
+//   flexlm_lic        — FlexLM .lic feature expiry (ProbeSpec surface token)
+// Heuristic/probable surfaces (per-user hives/files, package metadata, ProbeSpec
+// vendor probes) are deliberately ABSENT: their errors must NOT wipe state (R15).
+constexpr std::array<std::string_view, 3> kAuthoritativeSurfaces = {
+    "slp_wmi",
+    "entitlement_certs",
+    "flexlm_lic",
+};
+
+bool is_authoritative_surface(std::string_view s) {
+    return std::find(kAuthoritativeSurfaces.begin(), kAuthoritativeSurfaces.end(), s) !=
+           kAuthoritativeSurfaces.end();
+}
+
 // Split `line` on '|' into at most `max_tokens` pieces. The plugin's §3.3
 // layer-1 sanitiser strips '|' from every field, so a simple split recovers
 // the exact fields; a would-be (max_tokens+1)-th field is dropped, never
@@ -239,8 +264,9 @@ LicenseScanParse parse_license_scan_output(const std::string& out) {
             // diagnostics — consumed ONLY for the empty-vs-error structural guard
             // (ADR-0024 D3), never added to the blob.
             std::vector<std::string_view> tok = split_pipe(line, 4);
-            if (tok.size() >= 3 && tok[2] == "error" && is_primary_surface(tok[1]))
-                result.primary_surface_error = true;
+            if (tok.size() >= 3 && tok[2] == "error" &&
+                (is_primary_surface(tok[1]) || is_authoritative_surface(tok[1])))
+                result.blocking_surface_error = true;
         }
         // else: `ent|` (PR2), `cfg|`, blank, or any newer kind — SKIP without
         // error (ADR-0024 D3 forward-compat).
@@ -336,14 +362,16 @@ SyncSource make_software_licensing_source(const YuzuPluginDescriptor* descriptor
         }
         LicenseScanParse parsed = parse_license_scan_output(r.captured);
 
-        // Empty-vs-error structural guard (ADR-0024 D3): a primary-surface error
-        // means the enumeration itself failed — DON'T full-replace stored state
-        // to empty; keep the last good state and retry next cycle. Zero records
-        // with all primary surfaces ok is a VALID empty state and proceeds
-        // (full-replace-to-empty).
-        if (parsed.primary_surface_error) {
-            spdlog::warn("sync: license_scan primary surface reported an error — skipping this "
-                         "cycle (keeping last good state, not wiping stored licences)");
+        // Empty-vs-error structural guard (ADR-0024 D3): a primary-OR-authoritative
+        // surface error means detection is unreliable this cycle — the enumeration
+        // itself failed, or an authoritative surface's records would be wrongly
+        // dropped. DON'T full-replace stored state to empty; keep the last good
+        // state and retry next cycle. Zero records with all blocking surfaces ok is
+        // a VALID empty state and proceeds (full-replace-to-empty).
+        if (parsed.blocking_surface_error) {
+            spdlog::warn("sync: license_scan primary/authoritative surface reported an error — "
+                         "skipping this cycle (keeping last good state, not wiping stored "
+                         "licences)");
             return std::nullopt;
         }
         if (parsed.records.size() >= kMaxRecords) {

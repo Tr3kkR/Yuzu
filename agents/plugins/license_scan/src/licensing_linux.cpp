@@ -66,6 +66,26 @@ bool command_exists(const char* cmd) {
     return std::system(check.c_str()) == 0;
 }
 
+// POSIX shell single-quote escaping for a value interpolated into a run_command_rc
+// (popen → /bin/sh -c) command string. Wrap in single quotes and rewrite each
+// embedded single quote as '\'' so a crafted filename under the globbed cert dir
+// (e.g. one containing `$(...)`, `;`, or a quote) cannot break out of its argument
+// and inject shell. run_command_rc has no argv-style variant, so escaping at the
+// call site is the fix.
+std::string shell_single_quote(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out += '\'';
+    for (char c : s) {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += '\'';
+    return out;
+}
+
 std::vector<std::string> split_lines(const std::string& text) {
     std::vector<std::string> lines;
     std::size_t pos = 0;
@@ -194,13 +214,16 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
     bool any_parse_failure = false;
     for (const auto& cert : certs) {
         // -dateopt iso_8601 where supported; parse_openssl_enddate also
-        // accepts the older default date format.
+        // accepts the older default date format. The cert path is globbed from
+        // /etc/pki/entitlement (attacker-influenceable filenames) → shell-escape
+        // it before interpolation (no argv-style popen variant here).
+        const std::string cert_q = shell_single_quote(cert);
         auto res = run_command_rc(
-            ("openssl x509 -noout -enddate -dateopt iso_8601 -in \"" + cert + "\" 2>/dev/null")
+            ("openssl x509 -noout -enddate -dateopt iso_8601 -in " + cert_q + " 2>/dev/null")
                 .c_str());
         if (!res.ok)
             res = run_command_rc(
-                ("openssl x509 -noout -enddate -in \"" + cert + "\" 2>/dev/null").c_str());
+                ("openssl x509 -noout -enddate -in " + cert_q + " 2>/dev/null").c_str());
         const std::string not_after =
             res.ok ? parse_openssl_enddate(res.output) : std::string{};
         if (not_after.empty()) {

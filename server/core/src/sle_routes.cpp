@@ -44,6 +44,12 @@ std::int64_t epoch_now_secs() {
         .count();
 }
 
+// Upper bound on the `expiring_within_days` filter (~100 years). The filter
+// computes `now + days*86400`; an unclamped value (std::stoll reaches ~9.2e18)
+// would overflow int64 in that multiply/add — signed-overflow UB. 100 years is
+// far past any real expiry horizon, so clamping here changes no legitimate query.
+constexpr std::int64_t kMaxExpiringWithinDays = 36500;
+
 /// grep-token correlation id, `req-<hex-ms>-<hex-seq>` — same shape as
 /// rest_api_v1.cpp's make_correlation_id (echoed in X-Correlation-Id + every A4
 /// body). Process-global monotonic sequence so two ids minted in the same ms differ.
@@ -300,8 +306,13 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
         std::int64_t expiring_days = -1; // -1 = no expiry filter
         if (req.has_param("expiring_within_days")) {
             try {
-                expiring_days = std::max<std::int64_t>(0, std::stoll(req.get_param_value(
-                                                              "expiring_within_days")));
+                // Clamp to [0, kMaxExpiringWithinDays] BEFORE the days*86400 multiply
+                // below — an unclamped value overflows int64 (signed-overflow UB). A
+                // negative clamps to 0 (filter active, today-only), preserving the
+                // prior std::max(0, …) behaviour.
+                expiring_days = std::clamp<std::int64_t>(
+                    std::stoll(req.get_param_value("expiring_within_days")), 0,
+                    kMaxExpiringWithinDays);
             } catch (...) {
                 expiring_days = -1; // non-integer → no filter (lenient)
             }

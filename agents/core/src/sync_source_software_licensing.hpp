@@ -74,11 +74,17 @@ struct LicRecord {
 /// Result of parsing one `license_scan list` capture.
 struct LicenseScanParse {
     std::vector<LicRecord> records; ///< `lic|` rows only, fields §3.3-clamped
-    /// True iff a platform *primary* surface reported `probe_status|<s>|error`
-    /// (ADR-0024 D3 / roadmap R15). Per-user hives are NEVER primary, so their
-    /// errors do not set this. When true the collect cycle is skipped (keep last
+    /// True iff a CYCLE-BLOCKING surface reported `probe_status|<s>|error`. Two
+    /// classes block: a platform *primary* enumeration surface (slp_wmi /
+    /// pkg_metadata / mas_receipt — ADR-0024 D3) and an *authoritative* surface
+    /// whose records would wrongly read as "licence gone" if full-replaced away on
+    /// a transient error (entitlement_certs, flexlm_lic; slp_wmi is both). An
+    /// authoritative secondary surface therefore keeps last-good exactly like a
+    /// primary failure. Heuristic/probable secondary surfaces — per-user
+    /// hives/files (R15), ProbeSpec vendor probes — do NOT set this: their errors
+    /// never wipe stored state. When true the collect cycle is skipped (keep last
     /// good state); when false a zero-record parse is a VALID empty state.
-    bool primary_surface_error{false};
+    bool blocking_surface_error{false};
 };
 
 /// Parse `license_scan` `list` output: keep `lic|` records (fields clamped via
