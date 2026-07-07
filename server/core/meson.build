@@ -498,6 +498,7 @@ yuzu_server_core_lib = static_library(
     'src/software_licensing_ingestion.cpp',
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
+    'src/agent_decommission.cpp',
     'src/offline_endpoint_store.cpp',
     'src/notification_store.cpp',
     'src/webhook_store.cpp',

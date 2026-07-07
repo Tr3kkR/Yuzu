@@ -53,6 +53,8 @@
 #include "pg/pg_pool.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
+#include "software_licensing_store.hpp"
+#include "agent_decommission.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -2416,6 +2418,35 @@ public:
             }
         }
 
+        // Typed detected-licence projection — born-on-Postgres (ADR-0024 Decision
+        // 4, SLE `software_licensing` source). Independent of the stores above
+        // (its own schema, its own fail-closed). Wires BOTH server entry points
+        // (direct ReportInventory + gateway ProxyInventory) to the licensing
+        // ingest seam, which is otherwise dead: agent_service_/gateway_service_
+        // already carry the set_software_licensing_store() setter + the ingest
+        // call, but skip it while the store pointer is null.
+        //
+        // MINIMAL SLE wiring (PR1a step 7): this constructs ONLY the licensing
+        // store — the reference the agent-decommission cascade needs (below).
+        // ProductRegistryStore, the entitlement/usage stores, the compliance
+        // evaluator, the posture-rollup thread, and the /api/v1/sle/* routes are
+        // deliberately NOT wired here; they land with the SLE REST/evaluator PR
+        // steps.
+        if (pg_pool_ && !startup_failed_) {
+            software_licensing_store_ = std::make_unique<SoftwareLicensingStore>(*pg_pool_);
+            if (!software_licensing_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software_licensing store migration/open "
+                              "failed (database reachable but the software_licensing_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                software_licensing_store_->set_metrics(&metrics_);
+                agent_service_.set_software_licensing_store(software_licensing_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_software_licensing_store(software_licensing_store_.get());
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -3248,6 +3279,41 @@ public:
         agent_server_->Wait();
     }
 
+    /// Decommission an agent for good: fan `delete_agent(agent_id)` across every
+    /// per-agent store this server owns, durably erasing the machine's stored
+    /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
+    /// `delete_agent` methods had no production caller before this). Best-effort
+    /// and null-tolerant: a store that is not configured (e.g. no Postgres, so
+    /// only the SQLite `InventoryStore` is live) is skipped, and one store's
+    /// failure never aborts the others; the returned `DecommissionResult` records
+    /// the per-store outcome for the caller to audit.
+    ///
+    /// The cascade is built HERE from the LIVE store pointers on each call
+    /// (never a long-lived borrow), so it is inherently safe against the store
+    /// teardown ordering in `stop()` — a store already reset to null is simply
+    /// skipped.
+    ///
+    /// PRODUCTION TRIGGER — DEFERRED (documented, not forgotten): this is the
+    /// injectable entry point; no in-scope caller invokes it yet. The operator
+    /// decommission surface that should call it (a `DELETE /api/v1/sle/agents/{id}`
+    /// / reconciled agent-management action, gated + audited per Decision 9, and
+    /// optionally the offline-agent purge-on-reconnect the ADR mentions) lands
+    /// with the SLE REST PR step — its route lives in settings_routes.cpp /
+    /// rest_api_v1.cpp, out of scope for this cascade step. Today's agent-removal
+    /// paths (registry session teardown, enrollment deny/remove, cert revocation)
+    /// are all non-durable-data by design and deliberately do NOT auto-erase
+    /// (a revoked-for-compromise agent's forensic rows must survive).
+    DecommissionResult decommission_agent(std::string_view agent_id) {
+        AgentDecommission cascade{AgentDecommissionStores{
+            .inventory = inventory_store_.get(),
+            .software_inventory = software_inventory_store_.get(),
+            .app_perf_daily = app_perf_daily_store_.get(),
+            .device_inventory = device_inventory_store_.get(),
+            .software_licensing = software_licensing_store_.get(),
+        }};
+        return cascade.decommission(agent_id);
+    }
+
     void stop() noexcept override {
         // Guard against re-entrant calls from repeated signals.
         // The signal handler calls stop() directly, so a second Ctrl+C
@@ -3474,6 +3540,13 @@ public:
         if (gateway_service_)
             gateway_service_->set_device_inventory_store(nullptr);
         device_inventory_store_.reset();
+        // SLE detected-licence store: same discipline. The decommission cascade
+        // is built on-demand from the live store pointers (never a long-lived
+        // borrow), so there is nothing else to unwire here before the reset.
+        agent_service_.set_software_licensing_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_software_licensing_store(nullptr);
+        software_licensing_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -11200,6 +11273,9 @@ private:
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
     std::unique_ptr<DeviceInventoryStore> device_inventory_store_;
+    // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
+    // so it destructs before the pool.
+    std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
