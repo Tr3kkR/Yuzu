@@ -381,6 +381,7 @@ extern const char* const kDashboardIndexHtml =
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/sle" class="nav-link">SLE</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
@@ -997,11 +998,23 @@ extern const char* const kDashboardIndexHtml =
       navEntries: [
         { name: 'Dashboard', desc: 'Main dashboard view', url: '/', type: 'Navigation' },
         { name: 'Instructions', desc: 'Browse instruction definitions', url: '/instructions', type: 'Navigation' },
+        { name: 'Compliance', desc: 'Policy compliance posture', url: '/compliance', type: 'Navigation' },
+        { name: 'Guardian', desc: 'Guaranteed-state baselines & guards', url: '/guardian', type: 'Navigation' },
+        { name: 'DEX', desc: 'Digital employee experience signals', url: '/dex', type: 'Navigation' },
+        { name: 'TAR', desc: 'Threat & anomaly response', url: '/tar', type: 'Navigation' },
         { name: 'Inventory', desc: 'Installed software & device inventory', url: '/inventory', type: 'Navigation' },
+        { name: 'SLE', desc: 'Software licence posture & entitlements', url: '/sle', type: 'Navigation' },
+        { name: 'Fleet Viz', desc: 'Fleet topology visualisation', url: '/viz/fleet', type: 'Navigation' },
+        { name: 'Result Sets', desc: 'Saved instruction result sets', url: '/result-sets', type: 'Navigation' },
         { name: 'Settings', desc: 'Server settings', url: '/settings', type: 'Navigation' },
         { name: 'About', desc: 'About Yuzu', url: '#about', type: 'Navigation' }
       ],
-
+)HTM"
+    // Split here: the PR1b nav-drift reconciliation grew navEntries to full
+    // nav parity (+ the SLE entry), pushing this chunk over MSVC's C2026
+    // 16380-byte raw-string-literal limit. Adjacent string literals
+    // concatenate at compile time, so the runtime HTML is byte-identical.
+    R"HTM(
       showDefault: function() {
         /* Show navigation and a hint when palette first opens */
         var results = [];

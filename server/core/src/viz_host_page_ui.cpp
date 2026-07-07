@@ -40,9 +40,16 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
   <nav class="nav-bar">
     <a href="/" class="nav-brand">Yuzu</a>
     <a href="/" class="nav-link">Dashboard</a>
+    <a href="/instructions" class="nav-link">Instructions</a>
+    <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
+    <a href="/tar" class="nav-link">TAR</a>
+    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/sle" class="nav-link">SLE</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
+    <a href="/result-sets" class="nav-link">Result Sets</a>
+    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
   </nav>
 
   <!-- Mount root carries agent_id via data-attribute so the renderer can

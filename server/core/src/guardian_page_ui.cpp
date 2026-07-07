@@ -238,7 +238,9 @@ extern const char* const kGuardianDetailPageHtml =
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/sle" class="nav-link">SLE</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
+    <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>
