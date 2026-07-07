@@ -50,6 +50,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "product_registry_store.hpp"
+#include "product_normalize.hpp" // effective_license_state (the SLE devices provider)
 #include "license_compliance_evaluator.hpp"
 #include "sle_routes.hpp"
 #include "agent_decommission.hpp"
@@ -10065,14 +10066,94 @@ private:
                 return software_licensing_store_->posture_rollup();
             },
             // Fan-out (devices carrying a product key) — ADR-0017 PR-A flip-wave
-            // consumer (#1634/#1715), global-gated NOW. PR1a has no per-device posture
-            // breakdown yet, so return an HONEST EMPTY list (a real value, NOT a
-            // degrade — there is no store read here that could degrade); the PR1b
-            // evaluator supplies the rows, and the admit-then-filter "filters before
-            // LIMIT" completeness test lands at the flip.
-            [](const std::string& /*product_key*/, int /*limit*/)
+            // consumer (#1634/#1715), global-gated NOW (the admit-then-filter
+            // "filters before LIMIT" completeness test lands at the flip). REAL
+            // data since PR1b: product_key → the registry's software_licensing
+            // alias pairs → raw per-device licence rows → collapsed to one row
+            // per agent in C++ (worst EFFECTIVE state wins — the Decision 7
+            // lapse rule lives in product_normalize, not SQL), hostname-enriched
+            // from the offline-endpoint roster. nullopt on any store degrade;
+            // an unknown key (or the '' unmatched bucket, which has no registry
+            // identity) is an honest empty.
+            [this](const std::string& product_key, int limit)
                 -> std::optional<std::vector<SleLicenseDeviceRow>> {
-                return std::vector<SleLicenseDeviceRow>{};
+                if (!software_licensing_store_ || !product_registry_store_)
+                    return std::nullopt;
+                if (product_key.empty())
+                    return std::vector<SleLicenseDeviceRow>{};
+                auto product = product_registry_store_->get_product(product_key);
+                if (!product)
+                    return std::nullopt; // kDegraded
+                if (!product->has_value())
+                    return std::vector<SleLicenseDeviceRow>{}; // unknown key
+                auto aliases = product_registry_store_->list_aliases((*product)->product_id);
+                if (!aliases)
+                    return std::nullopt;
+                std::vector<DetectedProduct> pairs;
+                for (const auto& a : *aliases)
+                    if (a.source == "software_licensing")
+                        pairs.push_back(DetectedProduct{a.raw_name, a.raw_publisher});
+                auto raw = software_licensing_store_->license_devices(pairs, 20000);
+                if (!raw)
+                    return std::nullopt;
+                // Collapse per agent: worst effective state wins; on a rank tie
+                // keep the earliest future expiry (the actionable date).
+                const auto rank = [](const std::string& s) {
+                    if (s == "expired")
+                        return 6;
+                    if (s == "unlicensed")
+                        return 5;
+                    if (s == "grace")
+                        return 4;
+                    if (s == "trial")
+                        return 3;
+                    if (s == "subscription_active")
+                        return 2;
+                    if (s == "licensed")
+                        return 1;
+                    return 0; // unknown / out-of-vocabulary
+                };
+                const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                std::map<std::string, SleLicenseDeviceRow> per_agent; // ordered: stable output
+                for (const auto& r : *raw) {
+                    const std::string eff =
+                        effective_license_state(r.state, "", r.expiry_at, now);
+                    auto [it, inserted] = per_agent.try_emplace(r.agent_id);
+                    SleLicenseDeviceRow& d = it->second;
+                    if (inserted) {
+                        d.agent_id = r.agent_id;
+                        d.state = eff;
+                        d.expiry_at = r.expiry_at;
+                        continue;
+                    }
+                    const int nr = rank(eff), or_ = rank(d.state);
+                    if (nr > or_) {
+                        d.state = eff;
+                        d.expiry_at = r.expiry_at;
+                    } else if (nr == or_ && r.expiry_at > 0 &&
+                               (d.expiry_at == 0 || r.expiry_at < d.expiry_at)) {
+                        d.expiry_at = r.expiry_at;
+                    }
+                }
+                // Hostname enrichment from the persisted endpoint roster (the
+                // inventory devices-tab precedent; missing → "").
+                std::unordered_map<std::string, std::string> hostnames;
+                if (offline_endpoint_store_)
+                    for (const auto& e :
+                         offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30)))
+                        hostnames.emplace(e.agent_id, e.hostname);
+                std::vector<SleLicenseDeviceRow> out;
+                out.reserve(per_agent.size());
+                for (auto& [id, d] : per_agent) {
+                    if (static_cast<int>(out.size()) >= limit)
+                        break; // the route's clamp (1..1000) is the page size
+                    const auto h = hostnames.find(id);
+                    d.hostname = h != hostnames.end() ? h->second : "";
+                    out.push_back(std::move(d));
+                }
+                return out;
             },
             // Single-agent drill — REAL data in PR1a. nullopt on degrade → 503.
             [this](const std::string& agent_id) -> std::optional<std::vector<AgentLicenseRow>> {
