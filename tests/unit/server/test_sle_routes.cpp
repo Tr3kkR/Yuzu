@@ -28,6 +28,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -79,6 +80,12 @@ struct SleHarness {
     bool degrade_devices = false;
     bool degrade_agent = false;
     bool audit_should_fail = false;
+    bool authed = true;         // /sle page-shell session gate
+    bool degrade_meta = false;  // posture meta stamp (G-4) degrade
+    // Explicit G-4 meta stamp; unset = mimic the row-derived as-of (max
+    // refreshed_at over posture_rows) so the PR1a summary assertions hold
+    // while the production wiring (meta ALWAYS consulted) is exercised.
+    std::optional<std::int64_t> meta_stamp;
 
     std::vector<LicensePostureRow> posture_rows;
     std::vector<SleLicenseDeviceRow> device_rows;
@@ -135,7 +142,25 @@ struct SleHarness {
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             return !audit_should_fail;
         };
-        routes.register_routes(sink, perm, scoped, posture_fn, devices_fn, agents_fn, audit);
+        auto meta_fn = [this]() -> std::optional<std::int64_t> {
+            if (degrade_meta)
+                return std::nullopt;
+            if (meta_stamp)
+                return *meta_stamp;
+            std::int64_t derived = 0;
+            for (const auto& r : posture_rows)
+                derived = std::max(derived, r.refreshed_at);
+            return derived;
+        };
+        routes.register_routes(sink, perm, scoped, posture_fn, devices_fn, agents_fn, audit,
+                               meta_fn);
+        auto auth = [this](const httplib::Request&,
+                           httplib::Response&) -> std::optional<auth::Session> {
+            if (!authed)
+                return std::nullopt;
+            return auth::Session{};
+        };
+        routes.register_page_routes(sink, auth, perm, posture_fn, meta_fn, audit);
     }
 
     bool audited(const std::string& tok) const {
@@ -590,4 +615,165 @@ TEST_CASE("sle/agents/{id}: end-to-end through a real SoftwareLicensingStore ren
         if (a == "sle.agent.view|success")
             audited = true;
     CHECK(audited);
+}
+
+// ───────────────────────── /sle page + Licences fragment (PR1b) ─────────────────
+
+TEST_CASE("/sle page: unauthenticated redirects to /login; authenticated serves the shell "
+          "with the SLE nav active",
+          "[sle_routes][sle_page]") {
+    {
+        SleHarness h;
+        h.authed = false;
+        auto res = h.sink.Get("/sle");
+        REQUIRE(res);
+        REQUIRE(res->status == 302);
+        CHECK(res->get_header_value("Location") == "/login");
+    }
+    {
+        SleHarness h;
+        auto res = h.sink.Get("/sle");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        // Active-nav pair: SLE on, the shell's Guardian default off.
+        CHECK(contains(res->body, "<a href=\"/sle\" class=\"nav-link active\">SLE</a>"));
+        CHECK(contains(res->body, "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>"));
+        CHECK_FALSE(contains(res->body, "nav-link active\">Guardian"));
+        // Token substitution: title + the fragment mount.
+        CHECK(contains(res->body, "Yuzu \xE2\x80\x94 SLE"));
+        CHECK(contains(res->body, "/fragments/sle/licenses"));
+        CHECK_FALSE(contains(res->body, "{{TITLE}}"));
+        CHECK_FALSE(contains(res->body, "{{FRAGMENT}}"));
+        CHECK(res->get_header_value("Cache-Control") == "no-cache, no-store, must-revalidate");
+    }
+}
+
+TEST_CASE("sle fragment: gates on SoftwareLicensing:Read; denied renders no data",
+          "[sle_routes][sle_page]") {
+    SleHarness h;
+    h.posture_rows = {posture("acme:reader", "Reader", "Acme")};
+    h.allow_perm = false;
+    auto res = h.sink.Get("/fragments/sle/licenses");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "Reader"));
+    // The gate was asked for exactly the SLE securable.
+    bool asked = false;
+    for (const auto& c : h.perm_calls)
+        if (c == "SoftwareLicensing|Read")
+            asked = true;
+    CHECK(asked);
+}
+
+TEST_CASE("sle fragment: store degrade renders the banner, NEVER an empty table",
+          "[sle_routes][sle_page]") {
+    SleHarness h;
+    h.degrade_posture = true;
+    auto res = h.sink.Get("/fragments/sle/licenses");
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // fragment swaps in-page; the banner carries the honesty
+    CHECK(contains(res->body, "Licence posture unavailable"));
+    CHECK_FALSE(contains(res->body, "<table"));
+    CHECK(h.audited("sle.licenses.view|failure"));
+}
+
+TEST_CASE("sle fragment: never-evaluated vs evaluated-but-empty render DISTINCT copy (G-4)",
+          "[sle_routes][sle_page]") {
+    {
+        SleHarness h; // empty rollup, meta derives 0 → never evaluated
+        auto res = h.sink.Get("/fragments/sle/licenses");
+        REQUIRE(res);
+        CHECK(contains(res->body, "has not produced a posture rollup yet"));
+        CHECK(contains(res->body, "not yet evaluated"));
+    }
+    {
+        SleHarness h;
+        h.meta_stamp = epoch_now(); // evaluated recently — but the estate is empty
+        auto res = h.sink.Get("/fragments/sle/licenses");
+        REQUIRE(res);
+        CHECK(contains(res->body, "found no detected software licences"));
+        CHECK_FALSE(contains(res->body, "has not produced a posture rollup yet"));
+    }
+}
+
+TEST_CASE("sle fragment: KPI tiles carry the summary aggregates; table renders posture rows",
+          "[sle_routes][sle_page]") {
+    SleHarness h;
+    auto a = posture("acme:reader", "Reader", "Acme");
+    a.device_count = 4;
+    a.install_count = 7;
+    a.expired_count = 2;
+    a.refreshed_at = epoch_now(); // fresh — no stale flag
+    auto b = posture("", "", ""); // the unmatched bucket renders honestly
+    b.device_count = 1;
+    b.unknown_count = 1;
+    b.refreshed_at = a.refreshed_at;
+    h.posture_rows = {a, b};
+    auto res = h.sink.Get("/fragments/sle/licenses");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // KPI parity with /sle/summary: same helper, same numbers.
+    auto sum = h.sink.Get("/api/v1/sle/summary");
+    REQUIRE(sum);
+    auto sj = json::parse(sum->body)["data"];
+    CHECK(sj["products"] == 2);
+    CHECK(sj["lapsed_products"] == 1);
+    CHECK(contains(res->body, "Reader"));
+    CHECK(contains(res->body, "acme:reader"));
+    CHECK(contains(res->body, "(unmatched)"));
+    CHECK(contains(res->body, "2 expired"));
+    CHECK(h.audited("sle.licenses.view|success"));
+}
+
+TEST_CASE("sle fragment: state filter + cap note; KPI tiles stay unfiltered",
+          "[sle_routes][sle_page]") {
+    SleHarness h;
+    auto a = posture("acme:reader", "Reader", "Acme");
+    a.expired_count = 1;
+    auto b = posture("acme:writer", "Writer", "Acme");
+    b.licensed_count = 1;
+    h.posture_rows = {a, b};
+    {
+        auto res = h.sink.Get("/fragments/sle/licenses?state=expired");
+        REQUIRE(res);
+        CHECK(contains(res->body, "Reader"));
+        CHECK_FALSE(contains(res->body, "Writer"));
+        // Products KPI still counts the UNFILTERED rollup.
+        CHECK(contains(res->body, ">2</div><div class=\"s2\">with detected licences"));
+    }
+    {
+        auto res = h.sink.Get("/fragments/sle/licenses?limit=1");
+        REQUIRE(res);
+        CHECK(contains(res->body, "list capped"));
+    }
+}
+
+TEST_CASE("sle/summary: the G-4 meta stamp distinguishes evaluated-but-empty from never-run",
+          "[sle_routes]") {
+    {
+        SleHarness h; // empty rollup, derived stamp 0 → never evaluated
+        auto res = h.sink.Get("/api/v1/sle/summary");
+        REQUIRE(res);
+        auto j = json::parse(res->body)["data"];
+        CHECK(j["evaluated"] == false);
+        CHECK(j["as_of"] == 0);
+    }
+    {
+        SleHarness h;
+        h.meta_stamp = 900; // the evaluator ran; the estate rolled up empty
+        auto res = h.sink.Get("/api/v1/sle/summary");
+        REQUIRE(res);
+        auto j = json::parse(res->body)["data"];
+        CHECK(j["evaluated"] == true);
+        CHECK(j["as_of"] == 900);
+        CHECK(j["products"] == 0);
+    }
+    {
+        SleHarness h;
+        h.degrade_meta = true; // a degraded stamp read is a 503, never a false never-run
+        auto res = h.sink.Get("/api/v1/sle/summary");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        CHECK(h.audited("sle.summary|failure"));
+    }
 }

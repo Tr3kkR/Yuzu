@@ -10081,6 +10081,30 @@ private:
                     return std::nullopt;
                 return software_licensing_store_->agent_licenses(agent_id);
             },
+            audit_fn,
+            // First-class posture as-of stamp (G-4, license_posture_meta): 0 =
+            // never evaluated, > 0 = last successful replace (even over an empty
+            // estate); nullopt on degrade → 503.
+            [this]() -> std::optional<std::int64_t> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->posture_refreshed_at();
+            });
+        // The /sle PAGE (guardian shell + the Licences fragment, PR1b). The shell
+        // is auth-only chrome; the fragment gates on the same fail-closed
+        // SoftwareLicensing:Read composite as the REST routes (G-1).
+        sle_routes_->register_page_routes(
+            *web_server_, auth_fn, sle_perm_fn,
+            [this]() -> std::optional<std::vector<LicensePostureRow>> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->posture_rollup();
+            },
+            [this]() -> std::optional<std::int64_t> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->posture_refreshed_at();
+            },
             audit_fn);
 
         // PreflightRoutes — /auto pre-flight page. A config section (per-check

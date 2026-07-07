@@ -18,6 +18,9 @@
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#1647)
 
+// Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
+extern const char* const kGuardianDetailPageHtml;
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -124,30 +127,6 @@ bool icontains(const std::string& hay, const std::string& needle) {
     return lower(hay).find(needle) != std::string::npos;
 }
 
-/// A posture row matches `state` when the corresponding per-effective-state count
-/// is non-zero (the rollup carries per-state counts, not one state per product).
-/// `lapsed` is the §3.2 lapse union (expired ∪ unlicensed). An unrecognised token
-/// matches nothing (honest — no product is in a nonexistent state).
-bool state_matches(const LicensePostureRow& r, const std::string& state) {
-    if (state == "licensed")
-        return r.licensed_count > 0;
-    if (state == "subscription_active")
-        return r.subscription_active_count > 0;
-    if (state == "trial")
-        return r.trial_count > 0;
-    if (state == "grace")
-        return r.grace_count > 0;
-    if (state == "expired")
-        return r.expired_count > 0;
-    if (state == "unlicensed")
-        return r.unlicensed_count > 0;
-    if (state == "unknown")
-        return r.unknown_count > 0;
-    if (state == "lapsed")
-        return (r.expired_count + r.unlicensed_count) > 0;
-    return false;
-}
-
 json posture_to_json(const LicensePostureRow& r) {
     json j;
     j["product_key"] = r.product_key;
@@ -195,23 +174,69 @@ json agent_license_to_json(const AgentLicenseRow& r) {
 
 } // namespace
 
+bool sle_state_matches(const LicensePostureRow& r, const std::string& state) {
+    if (state == "licensed")
+        return r.licensed_count > 0;
+    if (state == "subscription_active")
+        return r.subscription_active_count > 0;
+    if (state == "trial")
+        return r.trial_count > 0;
+    if (state == "grace")
+        return r.grace_count > 0;
+    if (state == "expired")
+        return r.expired_count > 0;
+    if (state == "unlicensed")
+        return r.unlicensed_count > 0;
+    if (state == "unknown")
+        return r.unknown_count > 0;
+    if (state == "lapsed")
+        return (r.expired_count + r.unlicensed_count) > 0;
+    return false;
+}
+
+SlePostureAggregates sle_aggregate_posture(const std::vector<LicensePostureRow>& rollup) {
+    SlePostureAggregates agg;
+    agg.products = static_cast<std::int64_t>(rollup.size());
+    for (const auto& r : rollup) {
+        agg.installs += r.install_count;
+        if ((r.expired_count + r.unlicensed_count) > 0)
+            ++agg.lapsed_products;
+        agg.expiring_soon += r.expiring_soon_count;
+        agg.as_of = std::max(agg.as_of, r.refreshed_at);
+        if (r.next_expiry_at > 0 &&
+            (agg.next_expiry_at == 0 || r.next_expiry_at < agg.next_expiry_at))
+            agg.next_expiry_at = r.next_expiry_at;
+    }
+    agg.evaluated = agg.as_of > 0;
+    return agg;
+}
+
+void sle_apply_posture_meta(SlePostureAggregates& agg, std::int64_t refreshed_at) {
+    agg.as_of = refreshed_at;
+    agg.evaluated = refreshed_at > 0;
+}
+
 void SleRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn) {
+                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
+                                PostureMetaFn posture_meta_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(perm_fn), std::move(scoped_perm_fn), std::move(posture_fn),
-                    std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn));
+                    std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn),
+                    std::move(posture_meta_fn));
 }
 
 void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                                 PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn) {
+                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn,
+                                PostureMetaFn posture_meta_fn) {
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     posture_fn_ = std::move(posture_fn);
     devices_fn_ = std::move(devices_fn);
     agent_licenses_fn_ = std::move(agent_licenses_fn);
     audit_fn_ = std::move(audit_fn);
+    posture_meta_fn_ = std::move(posture_meta_fn);
 
     // ── GET /api/v1/sle/summary — fleet posture headline (GLOBAL SoftwareLicensing:Read) ──
     // Reads the precomputed posture rollup and derives honest aggregates. In PR1a
@@ -244,28 +269,34 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
             return;
         }
 
-        std::int64_t as_of = 0, installs = 0, lapsed = 0, expiring = 0, next_expiry = 0;
-        for (const auto& r : *rollup) {
-            installs += r.install_count;
-            if ((r.expired_count + r.unlicensed_count) > 0)
-                ++lapsed;
-            expiring += r.expiring_soon_count;
-            as_of = std::max(as_of, r.refreshed_at);
-            if (r.next_expiry_at > 0 && (next_expiry == 0 || r.next_expiry_at < next_expiry))
-                next_expiry = r.next_expiry_at;
+        SlePostureAggregates agg = sle_aggregate_posture(*rollup);
+        // The first-class posture meta stamp (G-4, license_posture_meta) is
+        // authoritative for as_of/evaluated when wired: it distinguishes an
+        // evaluated-but-empty estate (stamp > 0, zero rows) from a never-run
+        // one. A degraded stamp read is a 503 like the rollup itself — never
+        // a false "never evaluated". Unwired (older tests) → the row-derived
+        // fallback above.
+        if (posture_meta_fn_) {
+            const auto stamp = posture_meta_fn_();
+            if (!stamp) {
+                (void)detail::try_persist_audit(audit_fn_, req, "sle.summary", "failure",
+                                                "SoftwareLicensing", "fleet",
+                                                "posture meta degraded; cid=" + cid);
+                send_json(res, 503,
+                          a4_error(503, "SLE posture rollup unavailable — read failed", cid, 5000,
+                                   "retry the request"));
+                return;
+            }
+            sle_apply_posture_meta(agg, *stamp);
         }
         json data;
-        data["as_of"] = as_of;
-        // evaluated derives from the rollup's as-of stamp (per-row refreshed_at). An
-        // empty rollup reads as evaluated=false — correct in PR1a (no evaluator yet);
-        // PR1b adds a first-class rollup as-of stamp to distinguish an
-        // evaluated-but-empty estate from a never-run one (roadmap G-4).
-        data["evaluated"] = as_of > 0;
-        data["products"] = static_cast<std::int64_t>(rollup->size());
-        data["installs"] = installs;
-        data["lapsed_products"] = lapsed;
-        data["expiring_soon"] = expiring;
-        data["next_expiry_at"] = next_expiry;
+        data["as_of"] = agg.as_of;
+        data["evaluated"] = agg.evaluated;
+        data["products"] = agg.products;
+        data["installs"] = agg.installs;
+        data["lapsed_products"] = agg.lapsed_products;
+        data["expiring_soon"] = agg.expiring_soon;
+        data["next_expiry_at"] = agg.next_expiry_at;
 
         (void)detail::try_persist_audit(
             audit_fn_, req, "sle.summary", "success", "SoftwareLicensing", "fleet",
@@ -326,7 +357,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
         bool hit_cap = false;
         for (const auto& r : *rollup) {
             as_of = std::max(as_of, r.refreshed_at);
-            if (!state.empty() && !state_matches(r, state))
+            if (!state.empty() && !sle_state_matches(r, state))
                 continue;
             if (expiring_days >= 0 &&
                 !(r.next_expiry_at > 0 && r.next_expiry_at <= now + expiring_days * 86400))
@@ -473,6 +504,139 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                  data["licenses"] = std::move(licenses);
                  data["count"] = static_cast<std::int64_t>(rows->size());
                  send_json(res, 200, ok_json(std::move(data)));
+             });
+}
+
+void SleRoutes::register_page_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                     PostureFn posture_fn, PostureMetaFn posture_meta_fn,
+                                     AuditFn audit_fn) {
+    HttplibRouteSink sink(svr);
+    register_page_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(posture_fn),
+                         std::move(posture_meta_fn), std::move(audit_fn));
+}
+
+void SleRoutes::register_page_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                     PostureFn posture_fn, PostureMetaFn posture_meta_fn,
+                                     AuditFn audit_fn) {
+    page_auth_fn_ = std::move(auth_fn);
+    page_perm_fn_ = std::move(perm_fn);
+    page_posture_fn_ = std::move(posture_fn);
+    page_meta_fn_ = std::move(posture_meta_fn);
+    page_audit_fn_ = std::move(audit_fn);
+
+    // ── GET /sle — the page shell (auth-only static chrome; data gates on the fragment) ──
+    // Clones the /inventory page exactly: the shared guardian shell + token
+    // substitution + the Guardian-off / SLE-on active-nav swap (the SLE link
+    // exists in the shell nav since the PR1b nav sweep).
+    sink.Get("/sle", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!page_auth_fn_) {
+            res.status = 503;
+            return;
+        }
+        auto session = page_auth_fn_(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        std::string html(kGuardianDetailPageHtml);
+        auto sub = [&](const std::string& tok, const std::string& val) {
+            for (auto p = html.find(tok); p != std::string::npos; p = html.find(tok, p + val.size()))
+                html.replace(p, tok.size(), val);
+        };
+        sub("{{TITLE}}", "Yuzu \xE2\x80\x94 SLE");
+        sub("{{FRAGMENT}}", "/fragments/sle/licenses");
+        // Mark the SLE nav item active, Guardian (the shell default) inactive.
+        sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
+            "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
+        sub("<a href=\"/sle\" class=\"nav-link\">SLE</a>",
+            "<a href=\"/sle\" class=\"nav-link active\">SLE</a>");
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(std::move(html), "text/html; charset=utf-8");
+    });
+
+    // ── GET /fragments/sle/licenses — the Licences view (SoftwareLicensing:Read) ──
+    // Server-rendered posture table + KPI tiles (D-7: tables + tiles only, no
+    // charts). Filter semantics mirror the REST /sle/licenses route exactly
+    // (sle_state_matches / case-insensitive q / expiring window / limit clamp);
+    // the KPI tiles aggregate the UNFILTERED rollup + the G-4 meta stamp so a
+    // filter never shrinks the headline. Machine-scope aggregate (no user_ref)
+    // → set-and-proceed audit, the inventory.software.catalog tier.
+    sink.Get("/fragments/sle/licenses",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!page_perm_fn_) {
+                     res.status = 503;
+                     return;
+                 }
+                 if (!page_perm_fn_(req, res, "SoftwareLicensing", "Read"))
+                     return; // the gate wrote 401/403/503 (fail-closed, G-1)
+
+                 const std::string state =
+                     req.has_param("state") ? req.get_param_value("state") : "";
+                 const std::string q = req.has_param("q") ? lower(req.get_param_value("q")) : "";
+                 std::int64_t expiring_days = -1;
+                 if (req.has_param("expiring_within_days")) {
+                     try {
+                         expiring_days = std::clamp<std::int64_t>(
+                             std::stoll(req.get_param_value("expiring_within_days")), 0,
+                             kMaxExpiringWithinDays);
+                     } catch (...) {
+                         expiring_days = -1;
+                     }
+                 }
+                 const int limit = clamp_limit(req, 200, 1000);
+                 const std::int64_t now = epoch_now_secs();
+
+                 std::optional<std::vector<LicensePostureRow>> rollup;
+                 if (page_posture_fn_)
+                     rollup = page_posture_fn_();
+
+                 SlePostureAggregates agg;
+                 bool meta_degraded = false;
+                 if (rollup) {
+                     agg = sle_aggregate_posture(*rollup);
+                     if (page_meta_fn_) {
+                         const auto stamp = page_meta_fn_();
+                         if (stamp)
+                             sle_apply_posture_meta(agg, *stamp);
+                         else
+                             meta_degraded = true; // treat as a store degrade below
+                     }
+                 }
+
+                 std::optional<std::vector<LicensePostureRow>> filtered;
+                 bool capped = false;
+                 if (rollup && !meta_degraded) {
+                     filtered.emplace();
+                     for (const auto& r : *rollup) {
+                         if (!state.empty() && !sle_state_matches(r, state))
+                             continue;
+                         if (expiring_days >= 0 &&
+                             !(r.next_expiry_at > 0 &&
+                               r.next_expiry_at <= now + expiring_days * 86400))
+                             continue;
+                         if (!q.empty() && !(icontains(r.title, q) || icontains(r.vendor, q) ||
+                                             icontains(r.product_key, q)))
+                             continue;
+                         if (static_cast<int>(filtered->size()) >= limit) {
+                             capped = true;
+                             break;
+                         }
+                         filtered->push_back(r);
+                     }
+                 }
+
+                 (void)detail::try_persist_audit(
+                     page_audit_fn_, req, "sle.licenses.view", filtered ? "success" : "failure",
+                     "SoftwareLicensing", state.empty() ? "fleet" : ("state=" + state),
+                     filtered ? ("rows=" + std::to_string(filtered->size()))
+                              : "posture rollup degraded");
+
+                 res.set_content(render_sle_licenses_fragment(filtered, agg, state,
+                                                              req.has_param("q")
+                                                                  ? req.get_param_value("q")
+                                                                  : "",
+                                                              expiring_days, capped, now),
+                                 "text/html; charset=utf-8");
              });
 }
 

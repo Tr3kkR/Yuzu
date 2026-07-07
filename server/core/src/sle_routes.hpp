@@ -45,6 +45,8 @@
 
 #include "software_licensing_store.hpp" // LicensePostureRow / AgentLicenseRow
 
+#include <yuzu/server/auth.hpp>
+
 #include <httplib.h>
 
 #include <cstdint>
@@ -68,6 +70,53 @@ struct SleLicenseDeviceRow {
     std::string state;         ///< effective licence state (closed §3.2 vocabulary)
     std::int64_t expiry_at{0}; ///< agent-observed expiry epoch; 0 = none
 };
+
+/// Headline aggregates over the posture rollup — the SINGLE source of the
+/// `/sle/summary` REST body, the `/sle` page KPI tiles, and the MCP summary
+/// tool, so the three surfaces can never drift (they all call
+/// `sle_aggregate_posture` over the same rows). `as_of`/`evaluated` derive
+/// from the rows' `refreshed_at`; when the first-class posture meta stamp is
+/// available (G-4) the caller overrides them via `sle_apply_posture_meta` —
+/// that is what distinguishes an evaluated-but-empty estate from a never-run
+/// one.
+struct SlePostureAggregates {
+    std::int64_t as_of{0};
+    bool evaluated{false};
+    std::int64_t products{0};
+    std::int64_t installs{0};
+    std::int64_t lapsed_products{0};
+    std::int64_t expiring_soon{0};
+    std::int64_t next_expiry_at{0};
+};
+
+/// Aggregate the UNFILTERED rollup rows (pure).
+[[nodiscard]] SlePostureAggregates
+sle_aggregate_posture(const std::vector<LicensePostureRow>& rollup);
+
+/// Override as_of/evaluated with the first-class posture meta stamp (G-4):
+/// 0 = never evaluated (even if row-derived as_of said otherwise); > 0 = the
+/// last successful replace, even over an empty estate.
+void sle_apply_posture_meta(SlePostureAggregates& agg, std::int64_t refreshed_at);
+
+/// Whether a posture row matches a `state` filter token: the corresponding
+/// per-effective-state count is non-zero (the rollup carries per-state counts,
+/// not one state per product). `lapsed` is the §3.2 lapse union (expired ∪
+/// unlicensed). An unrecognised token matches nothing (honest — no product is
+/// in a nonexistent state). Shared by the REST route, the page fragment, and
+/// the MCP query tool.
+[[nodiscard]] bool sle_state_matches(const LicensePostureRow& r, const std::string& state);
+
+/// The `/fragments/sle/licenses` renderer (implemented in sle_ui.cpp; PURE —
+/// the caller passes `now_secs`). `rollup` holds the FILTERED rows (nullopt =
+/// store degrade → banner, never an empty table); `agg` is computed over the
+/// UNFILTERED rollup (+ meta override) so the KPI tiles never shrink under a
+/// filter. `state_filter`/`q`/`expiring_days` echo into the controls;
+/// `capped` flags a truncated table. Tables + KPI tiles only — charts are
+/// deliberately out of SLE v1 (roadmap D-7).
+std::string render_sle_licenses_fragment(
+    const std::optional<std::vector<LicensePostureRow>>& rollup,
+    const SlePostureAggregates& agg, const std::string& state_filter, const std::string& q,
+    std::int64_t expiring_days, bool capped, std::int64_t now_secs);
 
 /// `/api/v1/sle/*` read routes. Providers are injected closures; see the file
 /// header for the per-route auth posture.
@@ -109,15 +158,44 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// Session-only page chrome gate (the InventoryRoutes::AuthFn shape): the
+    /// `/sle` page shell is auth-only; the data-bearing fragment gates on the
+    /// securable.
+    using AuthFn =
+        std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
+
+    /// The first-class posture as-of stamp (`license_posture_meta`, G-4):
+    /// `std::nullopt` on a store degrade (→ 503); 0 = never evaluated; > 0 =
+    /// the last successful replace (even over an empty estate). Trailing +
+    /// defaulted so PR1a call sites/tests compile unchanged; unwired, summary
+    /// falls back to the row-derived as-of (the PR1a behaviour).
+    using PostureMetaFn = std::function<std::optional<std::int64_t>()>;
+
     void register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                         AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {});
+                         AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
+                         PostureMetaFn posture_meta_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
                          PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                         AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {});
+                         AgentLicensesFn agent_licenses_fn, AuditFn audit_fn = {},
+                         PostureMetaFn posture_meta_fn = {});
+
+    /// The `/sle` PAGE (guardian shell + the Licences fragment). Separate from
+    /// `register_routes` so PR1a's REST registration signature and its tests
+    /// stay byte-untouched; order-independent of it. The page shell is
+    /// auth-only chrome (redirect → /login); `/fragments/sle/licenses` gates
+    /// on the fail-closed `SoftwareLicensing:Read` composite (G-1) and audits
+    /// set-and-proceed (`sle.licenses.view` — machine-scope aggregate, the
+    /// inventory.software.catalog tier; no user_ref rendered).
+    void register_page_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                              PostureFn posture_fn, PostureMetaFn posture_meta_fn,
+                              AuditFn audit_fn = {});
+    void register_page_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                              PostureFn posture_fn, PostureMetaFn posture_meta_fn,
+                              AuditFn audit_fn = {});
 
 private:
     PermFn perm_fn_;
@@ -126,6 +204,13 @@ private:
     LicenseDevicesFn devices_fn_;
     AgentLicensesFn agent_licenses_fn_;
     AuditFn audit_fn_;
+    PostureMetaFn posture_meta_fn_;
+    // Page-route closures (register_page_routes).
+    AuthFn page_auth_fn_;
+    PermFn page_perm_fn_;
+    PostureFn page_posture_fn_;
+    PostureMetaFn page_meta_fn_;
+    AuditFn page_audit_fn_;
 };
 
 } // namespace yuzu::server
