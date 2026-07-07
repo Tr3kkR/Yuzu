@@ -151,6 +151,7 @@ agent_test_exe = executable(
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
+    'unit/test_licensing_sync.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -161,7 +162,7 @@ agent_test_exe = executable(
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
   cpp_args: test_partial_init_args,
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep, spdlog_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
