@@ -50,6 +50,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "product_registry_store.hpp"
+#include "license_compliance_evaluator.hpp"
 #include "sle_routes.hpp"
 #include "agent_decommission.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
@@ -425,6 +426,35 @@ public:
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
                           "gauge");
+        metrics_.describe("yuzu_server_sle_evaluator_runs_total",
+                          "SLE compliance evaluator cycles by outcome (success / degraded = an "
+                          "authoritative input degraded so the cycle skipped and kept the last-good "
+                          "posture rollup / error = the rollup replace failed or the tick threw)",
+                          "counter");
+        metrics_.describe("yuzu_server_sle_evaluator_duration_seconds",
+                          "Wall-clock of the last SLE evaluator cycle (matcher + posture rollup + "
+                          "alert pass, off the request path)",
+                          "gauge");
+        metrics_.describe("yuzu_server_sle_evaluator_last_success_timestamp",
+                          "Epoch seconds of the last successful posture-rollup replace; seeded 0 at "
+                          "thread start ('building'); alert when now - this exceeds the 1h cadence "
+                          "(keep-last-good keeps /sle serving with a visibly aging as-of stamp)",
+                          "gauge");
+        metrics_.describe("yuzu_server_sle_alert_fired_total",
+                          "software_license.expiring/expired alerts fired, by kind — worsening-"
+                          "bucket (30/14/7/1 day) or 7-day re-arm transitions only (ADR-0024 "
+                          "Decision 8)",
+                          "counter");
+        metrics_.describe("yuzu_server_sle_alert_suppressed_total",
+                          "SLE alert conditions evaluated but not fired, by kind and reason "
+                          "(holddown = dedup held it; state_degraded = the dedup-state read "
+                          "degraded, which must never re-fire as 'never fired')",
+                          "counter");
+        metrics_.describe("yuzu_server_sle_alert_delivery_failed_total",
+                          "SLE alert sink deliveries that threw (notification/webhook/offload). "
+                          "Dedup is armed BEFORE delivery, so a failed delivery is a lost "
+                          "notification, not a re-fire",
+                          "counter");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
                           "rather than a result, by reason "
@@ -2356,11 +2386,11 @@ public:
         // already carry the set_software_licensing_store() setter + the ingest
         // call, but skip it while the store pointer is null.
         //
-        // SLE wiring (PR1a): the detected-licence store (step 7) + the canonical
+        // SLE wiring: the detected-licence store (step 7) + the canonical
         // ProductRegistryStore (step 8), both born-on-PG and fail-closed. The
-        // entitlement/usage stores, the compliance evaluator, and the posture-rollup
-        // thread land in later PR steps; the /api/v1/sle/* READ routes are registered
-        // below (in the route-wiring block) against these two stores.
+        // PR1b compliance evaluator is constructed just below them; the
+        // entitlement/usage stores land in later PRs; the /api/v1/sle/* routes
+        // are registered below (in the route-wiring block) against these stores.
         if (pg_pool_ && !startup_failed_) {
             software_licensing_store_ = std::make_unique<SoftwareLicensingStore>(*pg_pool_);
             if (!software_licensing_store_->is_open()) {
@@ -2390,6 +2420,130 @@ public:
             } else {
                 product_registry_store_->set_metrics(&metrics_);
             }
+        }
+
+        // SLE compliance evaluator (PR1b, ADR-0024 Decisions 6/7/8): the hourly
+        // matcher → posture-rollup → alert background thread. Borrows the two SLE
+        // stores above plus the software-inventory store (install_count join) —
+        // stop() resets it before ANY of them tears down. Every provider lambda
+        // runs on the evaluator thread only, which is joined before the stores
+        // reset, so the [this] captures cannot dangle. Alerts ride the same
+        // dual-sink discipline as the DEX router closure above (notification +
+        // webhook/offload); the §3.4 payload and the operator copy live with the
+        // evaluator's pure helpers. R10: copy says "software licence" (British
+        // "licence") — this is never about Yuzu's own product licence.
+        if (software_licensing_store_ && product_registry_store_ && software_inventory_store_ &&
+            !startup_failed_) {
+            LicenseComplianceEvaluator::Deps deps;
+            deps.list_products = [this]() -> std::optional<std::vector<ProductRow>> {
+                if (!product_registry_store_)
+                    return std::nullopt;
+                return product_registry_store_->list_products(20000);
+            };
+            deps.distinct_products = [this]() -> std::optional<std::vector<DetectedProduct>> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->distinct_products();
+            };
+            deps.posture_inputs = [this]() -> std::optional<LicensePostureInputs> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->posture_inputs();
+            };
+            deps.software_catalog = [this]() -> std::optional<std::vector<SoftwareCatalogRow>> {
+                if (!software_inventory_store_)
+                    return std::nullopt;
+                return software_inventory_store_->software_catalog(
+                    SoftwareCatalogQuery{.name_filter = "", .limit = 20000});
+            };
+            deps.upsert_product = [this](std::string_view nk, std::string_view v,
+                                         std::string_view t, std::string_view e,
+                                         std::string_view p) -> std::optional<std::int64_t> {
+                if (!product_registry_store_)
+                    return std::nullopt;
+                return product_registry_store_->upsert_product(nk, v, t, e, p);
+            };
+            deps.upsert_alias = [this](std::string_view src, std::string_view rn,
+                                       std::string_view rp, std::int64_t pid,
+                                       std::string_view method, double conf) -> bool {
+                if (!product_registry_store_)
+                    return false;
+                return product_registry_store_->upsert_alias(src, rn, rp, pid, method, conf);
+            };
+            deps.replace_posture_rollup = [this](const std::vector<LicensePostureRow>& rows,
+                                                 std::int64_t refreshed_at) -> bool {
+                if (!software_licensing_store_)
+                    return false;
+                return software_licensing_store_->replace_posture_rollup(rows, refreshed_at);
+            };
+            deps.alert_state =
+                [this](std::string_view key, std::string_view kind)
+                -> std::expected<std::optional<LicenseAlertState>, LicensingReadError> {
+                if (!software_licensing_store_)
+                    return std::unexpected(LicensingReadError::kDegraded);
+                return software_licensing_store_->alert_state(key, kind);
+            };
+            deps.upsert_alert_state = [this](std::string_view key, std::string_view kind,
+                                             std::string_view fp, std::int64_t bucket,
+                                             std::int64_t fired_at) -> bool {
+                if (!software_licensing_store_)
+                    return false;
+                return software_licensing_store_->upsert_alert_state(key, kind, fp, bucket,
+                                                                     fired_at);
+            };
+            deps.on_alert = [this](const SleAlert& a) {
+                const std::string& what = a.title.empty() ? a.product_key : a.title;
+                const std::string title = a.kind == "expired"
+                                              ? "Software licence expired: " + what
+                                              : "Software licence expiring: " + what;
+                std::string message;
+                if (a.kind == "expired") {
+                    message = a.vendor + " " + what + " has expired or unlicensed detections on " +
+                              std::to_string(a.device_count) +
+                              " device(s). See /sle for the licence posture.";
+                } else {
+                    message = a.vendor + " " + what + " on " + std::to_string(a.device_count) +
+                              " device(s): the next licence expiry is in " +
+                              std::to_string(a.days_left) + " day(s) (" +
+                              std::to_string(a.bucket) + "-day threshold). See /sle.";
+                }
+                spdlog::info("SLE alert: {} ({})", title, a.product_key);
+                // Per-sink guards so one failing sink never starves the other;
+                // failures count as lost deliveries (dedup armed pre-delivery).
+                try {
+                    if (notification_store_)
+                        notification_store_->create("warn", title, message);
+                } catch (...) {
+                    spdlog::warn("SLE alert: notification sink failed for {}", a.product_key);
+                    metrics_.counter("yuzu_server_sle_alert_delivery_failed_total").increment();
+                }
+                if ((webhook_store_ && webhook_store_->is_open()) ||
+                    (offload_target_store_ && offload_target_store_->is_open())) {
+                    const std::string event = sle_alert_event_type(a.kind);
+                    const std::string body = sle_alert_payload(a).dump();
+                    try {
+                        if (webhook_store_ && webhook_store_->is_open())
+                            webhook_store_->fire_event(event, body);
+                    } catch (...) {
+                        spdlog::warn("SLE alert: webhook sink failed for {}", a.product_key);
+                        metrics_.counter("yuzu_server_sle_alert_delivery_failed_total")
+                            .increment();
+                    }
+                    try {
+                        if (offload_target_store_ && offload_target_store_->is_open())
+                            offload_target_store_->fire_event(event, body);
+                    } catch (...) {
+                        spdlog::warn("SLE alert: offload sink failed for {}", a.product_key);
+                        metrics_.counter("yuzu_server_sle_alert_delivery_failed_total")
+                            .increment();
+                    }
+                }
+            };
+            deps.metrics = &metrics_;
+            deps.interval = std::chrono::hours{1};
+            license_compliance_evaluator_ =
+                std::make_unique<LicenseComplianceEvaluator>(std::move(deps));
+            license_compliance_evaluator_->start();
         }
 
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
@@ -3429,6 +3583,10 @@ public:
         // pool resets (no UAF today since the gRPC drain has quiesced every ingest
         // handler, but it matches the offline-store contract and is safe if the store
         // ever gains a pool-touching dtor).
+        // Stop the SLE compliance evaluator FIRST: its thread borrows the two SLE
+        // stores AND software_inventory_store_ (the earliest of its borrows to
+        // reset below) — the dtor signals stop + joins. Idempotent.
+        license_compliance_evaluator_.reset();
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
         // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
         software_catalog_rollup_.reset();
@@ -3458,8 +3616,8 @@ public:
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
-        // destruct-before-pool). Nothing borrows it long-lived (the PR1b evaluator
-        // that writes it is not yet wired), so no unwire step precedes the reset.
+        // destruct-before-pool). Its only long-lived borrower — the compliance
+        // evaluator — was stopped and joined at the top of this block.
         product_registry_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -11123,9 +11281,13 @@ private:
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
-    // so it destructs before the pool; the /api/v1/sle/* routes read it (PR1b evaluator
-    // writes it).
+    // so it destructs before the pool; the /api/v1/sle/* routes read it, the
+    // compliance evaluator writes it (matcher pass).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
+    // SLE compliance evaluator (ADR-0024 Decisions 6/7/8): borrows the two SLE
+    // stores above + software_inventory_store_; stop() resets it before any of
+    // them (thread joined first).
+    std::unique_ptr<LicenseComplianceEvaluator> license_compliance_evaluator_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
