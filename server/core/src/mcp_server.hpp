@@ -20,6 +20,7 @@
 #include "response_store.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
+#include "software_licensing_store.hpp" // LicensePostureRow (the SLE read tools)
 #include "tag_store.hpp"
 
 #include <httplib.h>
@@ -173,6 +174,27 @@ public:
     /// nullopt if the CRL could not be (re)built/persisted.
     using PublishCrlFn = std::function<std::optional<std::vector<std::uint8_t>>()>;
 
+    /// SLE posture-rollup provider (ADR-0024) — backs `query_software_licenses`
+    /// + `get_license_compliance_summary`. `std::nullopt` on a store degrade →
+    /// the tools answer a JSON-RPC error, NEVER success+[] (authoritative-read
+    /// honesty). Unwired (`= {}`) → kInternalError "unavailable" (fail-closed
+    /// test affordance; the SOLE production caller always wires it).
+    using SlePostureFn = std::function<std::optional<std::vector<LicensePostureRow>>()>;
+
+    /// The SLE first-class posture as-of stamp (G-4; license_posture_meta): 0 =
+    /// never evaluated, > 0 = last successful replace. `std::nullopt` on a
+    /// degrade → error. Unwired → the tools fall back to the row-derived as-of
+    /// (test affordance; production wires it).
+    using SlePostureMetaFn = std::function<std::optional<std::int64_t>()>;
+
+    /// FAIL-CLOSED gate for the two SLE tools (roadmap G-1): production wires
+    /// the same `rbac_enforcement_in_effect`-based composite the /api/v1/sle/*
+    /// routes use — the plain `perm_fn` carries the #1717 corrupt-rbac.db
+    /// fail-open shape the SLE surface must not inherit. Unwired (`= {}`) →
+    /// the handlers fall back to the global `perm_fn` (test affordance; do NOT
+    /// add a production registration without wiring it).
+    using SlePermFn = PermFn;
+
     /// Type of the POST /mcp/v1/ handler — same shape as httplib::Server's Post handler
     /// but exposed independently so tests can dispatch in-process without spinning
     /// up an httplib::Server (see #438 for the TSan-vs-httplib-thread-acceptor bug
@@ -212,7 +234,11 @@ public:
                             yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
                             // H1 (PR #1796): per-device scope gate for the
                             // device-targeted write tools; see ScopedPermFn above.
-                            ScopedPermFn scoped_perm_fn = {});
+                            ScopedPermFn scoped_perm_fn = {},
+                            // SLE read tools (ADR-0024 PR1b); see the typedefs above.
+                            SlePostureFn sle_posture_fn = {},
+                            SlePostureMetaFn sle_posture_meta_fn = {},
+                            SlePermFn sle_perm_fn = {});
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -236,7 +262,8 @@ public:
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
-                         ScopedPermFn scoped_perm_fn = {});
+                         ScopedPermFn scoped_perm_fn = {}, SlePostureFn sle_posture_fn = {},
+                         SlePostureMetaFn sle_posture_meta_fn = {}, SlePermFn sle_perm_fn = {});
 };
 
 } // namespace yuzu::server::mcp

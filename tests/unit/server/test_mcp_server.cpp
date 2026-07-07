@@ -663,6 +663,14 @@ struct McpTestServer {
     /// to the global perm_fn (the pre-H1 behavior every existing test relies on).
     yuzu::server::mcp::McpServer::ScopedPermFn scoped_perm_fn_for_test{};
 
+    /// ADR-0024 PR1b: optionally wire the SLE posture providers + fail-closed
+    /// gate so query_software_licenses / get_license_compliance_summary can be
+    /// exercised. Defaults keep existing tests on the "SLE posture rollup
+    /// unavailable" path with the plain perm_fn fallback.
+    yuzu::server::mcp::McpServer::SlePostureFn sle_posture_fn_for_test{};
+    yuzu::server::mcp::McpServer::SlePostureMetaFn sle_posture_meta_fn_for_test{};
+    yuzu::server::mcp::McpServer::SlePermFn sle_perm_fn_for_test{};
+
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
     /// the bundle collate IDOR path (dispatch as owner, collate as a stranger).
@@ -798,7 +806,10 @@ private:
                 tag_pushes.emplace_back(agent_id, key);
             },
             /*agent_registry=*/agent_registry_for_test,
-            /*scoped_perm_fn=*/scoped_perm_fn_for_test);
+            /*scoped_perm_fn=*/scoped_perm_fn_for_test,
+            /*sle_posture_fn=*/sle_posture_fn_for_test,
+            /*sle_posture_meta_fn=*/sle_posture_meta_fn_for_test,
+            /*sle_perm_fn=*/sle_perm_fn_for_test);
     }
 };
 
@@ -4043,6 +4054,141 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── SLE read tools (ADR-0024 PR1b): query_software_licenses + summary ─────────
+
+namespace {
+yuzu::server::LicensePostureRow mk_posture(std::string key, std::string title,
+                                           std::string vendor) {
+    yuzu::server::LicensePostureRow r;
+    r.product_key = std::move(key);
+    r.title = std::move(title);
+    r.vendor = std::move(vendor);
+    r.refreshed_at = 5000;
+    return r;
+}
+} // namespace
+
+TEST_CASE("MCP SLE tools: provider unwired → internal error, never success", "[mcp][sle]") {
+    McpTestServer ts; // no sle_posture_fn wired
+    ts.start();
+    for (const char* tool : {"query_software_licenses", "get_license_compliance_summary"}) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":90,)") +
+                           R"("params":{"name":")" + tool + R"(","arguments":{}}})");
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("SLE posture rollup unavailable") != std::string::npos);
+        CHECK(res->body.find("\"result\"") == std::string::npos);
+    }
+}
+
+TEST_CASE("MCP SLE tools: fail-closed gate runs INSTEAD of the plain perm_fn; a 503 gate "
+          "stops the read (G-1)",
+          "[mcp][sle]") {
+    McpTestServer ts;
+    bool provider_called = false;
+    ts.sle_posture_fn_for_test =
+        [&]() -> std::optional<std::vector<yuzu::server::LicensePostureRow>> {
+        provider_called = true;
+        return std::vector<yuzu::server::LicensePostureRow>{};
+    };
+    // The wired sle gate refuses (a corrupt rbac.db posture) — the provider
+    // must never be consulted, and the plain perm_fn must not be the decider.
+    ts.sle_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                 const std::string&, const std::string&) -> bool {
+        res.status = 503;
+        res.set_content(R"({"error":"authorization subsystem unavailable"})", "application/json");
+        return false;
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{}}})");
+    REQUIRE(res->status == 503);
+    CHECK_FALSE(provider_called);
+}
+
+TEST_CASE("MCP SLE tools: a degraded rollup errors + failure audit, never success+[]",
+          "[mcp][sle]") {
+    McpTestServer ts;
+    ts.sle_posture_fn_for_test =
+        []() -> std::optional<std::vector<yuzu::server::LicensePostureRow>> {
+        return std::nullopt; // store degrade
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("SLE posture rollup degraded") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP query_software_licenses: filters + cap + success audit; rows carry no agent id "
+          "(R8 pinned-global)",
+          "[mcp][sle]") {
+    McpTestServer ts;
+    auto reader = mk_posture("acme:reader", "Reader", "Acme");
+    reader.expired_count = 2;
+    reader.device_count = 4;
+    auto writer = mk_posture("acme:writer", "Writer", "Acme");
+    writer.licensed_count = 3;
+    ts.sle_posture_fn_for_test =
+        [&]() -> std::optional<std::vector<yuzu::server::LicensePostureRow>> {
+        return std::vector<yuzu::server::LicensePostureRow>{reader, writer};
+    };
+    ts.sle_posture_meta_fn_for_test = []() -> std::optional<std::int64_t> { return 5000; };
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+                       R"("params":{"name":"query_software_licenses",)"
+                       R"("arguments":{"state":"lapsed"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    auto rows = nlohmann::json::parse(
+        envelope.at("result").at("content").at(0).at("text").get<std::string>());
+    REQUIRE(rows.is_array());
+    REQUIRE(rows.size() == 1); // only the lapsed product
+    CHECK(rows.at(0).at("product_key") == "acme:reader");
+    CHECK(rows.at(0).at("expired") == 2);
+    CHECK(rows.at(0).at("device_count") == 4);
+    CHECK_FALSE(rows.at(0).contains("agent_id")); // R8: no per-device rows on this tool
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|success")
+            saw_success = true;
+    CHECK(saw_success);
+
+    // limit clamps and flags truncation.
+    auto capped = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+                          R"("params":{"name":"query_software_licenses",)"
+                          R"("arguments":{"limit":1}}})");
+    REQUIRE(capped->status == 200);
+    CHECK(capped->body.find("result_truncated_by_cap") != std::string::npos);
+}
+
+TEST_CASE("MCP get_license_compliance_summary: shared aggregates + the G-4 meta stamp",
+          "[mcp][sle]") {
+    McpTestServer ts;
+    ts.sle_posture_fn_for_test =
+        []() -> std::optional<std::vector<yuzu::server::LicensePostureRow>> {
+        return std::vector<yuzu::server::LicensePostureRow>{}; // evaluated-but-empty estate
+    };
+    ts.sle_posture_meta_fn_for_test = []() -> std::optional<std::int64_t> { return 900; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+                       R"("params":{"name":"get_license_compliance_summary","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(
+        envelope.at("result").at("content").at(0).at("text").get<std::string>());
+    CHECK(payload.at("evaluated") == true); // the meta stamp, not the empty rows, decides
+    CHECK(payload.at("as_of") == 900);
+    CHECK(payload.at("products") == 0);
+    CHECK(payload.at("lapsed_products") == 0);
 }
 
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──

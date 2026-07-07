@@ -10880,7 +10880,24 @@ private:
                        const std::string& type, const std::string& op,
                        const std::string& agent_id) -> bool {
                     return require_scoped_permission(req, res, type, op, agent_id);
-                });
+                },
+                // ADR-0024 PR1b: the SLE read tools' posture providers + the
+                // FAIL-CLOSED SoftwareLicensing gate. The posture/meta closures
+                // are the SAME reads the /api/v1/sle/* routes use; sle_perm_fn
+                // is the SAME rbac_enforcement_in_effect composite (G-1) — the
+                // plain perm_fn above carries the #1717 fail-open shape the SLE
+                // surface must not inherit.
+                [this]() -> std::optional<std::vector<LicensePostureRow>> {
+                    if (!software_licensing_store_)
+                        return std::nullopt;
+                    return software_licensing_store_->posture_rollup();
+                },
+                [this]() -> std::optional<std::int64_t> {
+                    if (!software_licensing_store_)
+                        return std::nullopt;
+                    return software_licensing_store_->posture_refreshed_at();
+                },
+                sle_perm_fn);
         }
 
         // -- Listen -----------------------------------------------------------

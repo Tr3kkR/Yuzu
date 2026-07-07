@@ -8,6 +8,7 @@
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
+#include "sle_routes.hpp" // sle_aggregate_posture / sle_state_matches (SLE read tools, ADR-0024)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -705,6 +706,36 @@ static const ToolDef kTools[] = {
      "before acting.",
      R"({"type":"object","properties":{}})", kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
+
+    // ── SLE read tools (ADR-0024 PR1b) — appended at the VERY END of kTools[]
+    // (same governance note as the discovery block above). Both read the
+    // PRECOMPUTED per-product posture rollup the compliance evaluator
+    // replaces hourly; rows carry NO agent id, so both tools are pinned
+    // GLOBAL like their REST twins (roadmap R8 / ADR-0017): a management-
+    // group-confined principal is denied at the gate, never served a partial
+    // rollup. Per-device drill: REST GET /api/v1/sle/agents/{id}. Requires
+    // SoftwareLicensing:Read — DISTINCT from query_installed_software's
+    // Inventory:Read and from Yuzu's own product licence (License:*).
+    {"query_software_licenses",
+     "Fleet software-licence posture rows (detected third-party licences, ADR-0024 SLE): one row "
+     "per product with per-state counts (licensed/subscription_active/trial/grace/expired/"
+     "unlicensed/unknown), device/install counts, and expiry outlook, from the precomputed "
+     "posture rollup (as_of = the evaluator's last run; empty until it first runs). Pinned "
+     "GLOBAL (rows carry no agent id — the per-device drill is REST "
+     "GET /api/v1/sle/agents/{id}). A degraded store is an ERROR, never an empty success. "
+     "Requires SoftwareLicensing:Read (distinct from Inventory:Read and from Yuzu's own "
+     "product licence).",
+     R"({"type":"object","properties":{"state":{"type":"string","enum":["licensed","subscription_active","trial","grace","expired","unlicensed","unknown","lapsed"],"description":"Keep rows whose count for this effective state is non-zero; lapsed = expired OR unlicensed"},"q":{"type":"string","description":"Case-insensitive substring over title/vendor/product_key"},"expiring_within_days":{"type":"integer","minimum":0,"description":"Keep rows whose next expiry falls within N days"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Query software licences","safety":"posture rollup read only; no endpoint execution"})"},
+    {"get_license_compliance_summary",
+     "Fleet software-licence compliance headline (ADR-0024 SLE): products with detected "
+     "licences, matched install count, lapsed products, licences expiring within 30 days, next "
+     "expiry, and the posture as-of stamp. evaluated:false with as_of:0 means the compliance "
+     "evaluator has not produced a rollup yet (honest empty, not a zero estate). Same numbers "
+     "as GET /api/v1/sle/summary (shared aggregation). Requires SoftwareLicensing:Read.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema,
+     R"({"readOnlyHint":true,"title":"Get licence compliance summary","safety":"posture rollup read only"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -745,6 +776,10 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read"}},
+    // SLE read tools (ADR-0024 PR1b): the NEW SoftwareLicensing securable —
+    // NOT Inventory (the catalogue) and NOT License (Yuzu's own licence).
+    {"query_software_licenses", {"SoftwareLicensing", "Read"}},
+    {"get_license_compliance_summary", {"SoftwareLicensing", "Read"}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -916,7 +951,8 @@ McpServer::HandlerFn McpServer::build_handler(
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
-    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn) {
+    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
+    SlePostureFn sle_posture_fn, SlePostureMetaFn sle_posture_meta_fn, SlePermFn sle_perm_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
@@ -2222,6 +2258,158 @@ McpServer::HandlerFn McpServer::build_handler(
                 // installed anywhere" — the partial- and all-out-of-scope false-negative
                 // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
                 result_obj.raw("devices_omitted", std::to_string(dropped_agents));
+                res.set_content(success_response(id, result_obj.str()), "application/json");
+                return;
+            }
+
+            // ── query_software_licenses / get_license_compliance_summary ─────
+            // SLE read tools (ADR-0024 PR1b). Gate on the FAIL-CLOSED composite
+            // when wired (sle_perm_fn — the same rbac_enforcement_in_effect
+            // shape the /api/v1/sle/* routes use, G-1); the plain perm_fn
+            // fallback is a test-only affordance. Rows carry NO agent id →
+            // pinned GLOBAL (R8), so there is deliberately NO per-agent scope
+            // filter here (a confined principal is denied at the gate, never
+            // served a partial rollup). Degrade → error, never success+[].
+            if (tool_name == "query_software_licenses" ||
+                tool_name == "get_license_compliance_summary") {
+                if (!tier_allows(tier, "SoftwareLicensing", "Read")) {
+                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
+                                             kTierRemediation),
+                                    "application/json");
+                    return;
+                }
+                if (sle_perm_fn) {
+                    if (!sle_perm_fn(req, res, "SoftwareLicensing", "Read"))
+                        return;
+                } else if (!perm_fn(req, res, "SoftwareLicensing", "Read")) {
+                    return;
+                }
+                if (!sle_posture_fn) {
+                    res.set_content(
+                        error_response(id, kInternalError, "SLE posture rollup unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto rollup = sle_posture_fn();
+                if (!rollup) {
+                    // Store degraded — surface it, never success+[] (an empty
+                    // compliance answer reads as "nothing detected / nothing
+                    // lapsed", the ADR-0024 Decision 4 fail-open lie).
+                    mcp_audit("failure", "posture rollup degraded");
+                    res.set_content(error_response(id, kInternalError,
+                                                   "SLE posture rollup degraded — query failed"),
+                                    "application/json");
+                    return;
+                }
+                SlePostureAggregates agg = sle_aggregate_posture(*rollup);
+                if (sle_posture_meta_fn) {
+                    const auto stamp = sle_posture_meta_fn();
+                    if (!stamp) {
+                        mcp_audit("failure", "posture meta degraded");
+                        res.set_content(
+                            error_response(id, kInternalError,
+                                           "SLE posture rollup degraded — query failed"),
+                            "application/json");
+                        return;
+                    }
+                    sle_apply_posture_meta(agg, *stamp);
+                }
+
+                if (tool_name == "get_license_compliance_summary") {
+                    const bool audit_ok = mcp_audit("success", "summary");
+                    JObj payload;
+                    payload.raw("as_of", std::to_string(agg.as_of));
+                    payload.raw("evaluated", agg.evaluated ? "true" : "false");
+                    payload.raw("products", std::to_string(agg.products));
+                    payload.raw("installs", std::to_string(agg.installs));
+                    payload.raw("lapsed_products", std::to_string(agg.lapsed_products));
+                    payload.raw("expiring_soon", std::to_string(agg.expiring_soon));
+                    payload.raw("next_expiry_at", std::to_string(agg.next_expiry_at));
+                    JObj result_obj;
+                    result_obj.raw(
+                        "content",
+                        JArr().add(JObj().add("type", "text").add("text", payload.str())).str());
+                    if (!audit_ok)
+                        result_obj.raw("audit_persisted", "false");
+                    res.set_content(success_response(id, result_obj.str()), "application/json");
+                    return;
+                }
+
+                // query_software_licenses — the REST /sle/licenses filter
+                // semantics exactly (shared sle_state_matches; case-insensitive
+                // q over title/vendor/product_key; expiry window; clamp 1..1000).
+                const std::string state = param_str(args, "state");
+                std::string q_lower = param_str(args, "q");
+                std::transform(q_lower.begin(), q_lower.end(), q_lower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const auto icontains = [&](const std::string& hay) {
+                    if (q_lower.empty())
+                        return true;
+                    std::string h = hay;
+                    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                    return h.find(q_lower) != std::string::npos;
+                };
+                // Clamp the day window before the *86400 multiply (signed-
+                // overflow UB otherwise) — the sle_routes kMaxExpiringWithinDays
+                // posture.
+                const std::int64_t expiring_days =
+                    args.contains("expiring_within_days")
+                        ? std::clamp<std::int64_t>(param_int(args, "expiring_within_days", 0), 0,
+                                                   36500)
+                        : -1;
+                const int limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                const std::string audit_key = !state.empty() ? ("state=" + state)
+                                              : !q_lower.empty() ? ("q=" + q_lower)
+                                                                 : std::string("fleet");
+                JArr arr;
+                int emitted = 0;
+                bool hit_cap = false;
+                for (const auto& r : *rollup) {
+                    if (!state.empty() && !sle_state_matches(r, state))
+                        continue;
+                    if (expiring_days >= 0 &&
+                        !(r.next_expiry_at > 0 &&
+                          r.next_expiry_at <= now + expiring_days * 86400))
+                        continue;
+                    if (!icontains(r.title) && !icontains(r.vendor) && !icontains(r.product_key))
+                        continue;
+                    if (emitted >= limit) {
+                        hit_cap = true;
+                        break;
+                    }
+                    ++emitted;
+                    arr.add(JObj()
+                                .add("product_key", r.product_key)
+                                .add("vendor", r.vendor)
+                                .add("title", r.title)
+                                .raw("device_count", std::to_string(r.device_count))
+                                .raw("install_count", std::to_string(r.install_count))
+                                .raw("licensed", std::to_string(r.licensed_count))
+                                .raw("subscription_active",
+                                     std::to_string(r.subscription_active_count))
+                                .raw("trial", std::to_string(r.trial_count))
+                                .raw("grace", std::to_string(r.grace_count))
+                                .raw("expired", std::to_string(r.expired_count))
+                                .raw("unlicensed", std::to_string(r.unlicensed_count))
+                                .raw("unknown", std::to_string(r.unknown_count))
+                                .raw("next_expiry_at", std::to_string(r.next_expiry_at))
+                                .raw("expiring_soon", std::to_string(r.expiring_soon_count))
+                                .raw("refreshed_at", std::to_string(r.refreshed_at)));
+                }
+                const bool audit_ok = mcp_audit("success", audit_key);
+                JObj result_obj;
+                result_obj.raw("content",
+                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                if (!audit_ok)
+                    result_obj.raw("audit_persisted", "false");
+                if (hit_cap)
+                    result_obj.raw("result_truncated_by_cap", "true");
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -5062,7 +5250,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
-                                ScopedPermFn scoped_perm_fn) {
+                                ScopedPermFn scoped_perm_fn, SlePostureFn sle_posture_fn,
+                                SlePostureMetaFn sle_posture_meta_fn, SlePermFn sle_perm_fn) {
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -5075,7 +5264,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry,
-                           std::move(scoped_perm_fn)));
+                           std::move(scoped_perm_fn), std::move(sle_posture_fn),
+                           std::move(sle_posture_meta_fn), std::move(sle_perm_fn)));
 
     spdlog::info(
         "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",
