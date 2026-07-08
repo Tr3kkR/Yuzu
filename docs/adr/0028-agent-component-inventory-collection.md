@@ -10,12 +10,17 @@ related: >-
   0029 (CVE source catalog and ingestion — sibling document from the same split, no direct
   dependency in either direction; ADR-0028's own Relationship table below is the authoritative
   statement of that relationship). The CVE-matching content that consumes this ADR's output
-  (proposed as an amendment to PR 1914 / ADR-0023, see CVE_MATCHING_ADR0023_AMENDMENT.md).
+  (proposed as an amendment to PR 1914 / ADR-0023 — PR 1914 merged 2026-07-07; ADR-0023 itself
+  remains `status: proposed` on `dev` (a separate attempt to accept it, PR #1985, was closed
+  unmerged) — status corrected following adversarial review, 2026-07-08, which had wrongly
+  claimed ADR-0023 was already accepted; see CVE_MATCHING_ADR0023_AMENDMENT.md for the amendment
+  content itself).
   0018/0019 (server-authoritative vulnerability matching / tri-state findings — downstream
   consumer, language-ecosystem regime). 0024-software-licensing-entitlements (PR 1920, open —
   downstream consumer for license/entitlement matching). docs/roadmap.md Issue 18.5 ("SBOM
-  Ingest" — companion, import-side of the same capability) and proposed Issue 18.7 (this
-  capability, generation-side). 0022-headless-platform-use-case-engines (open PR 1918/1926 —
+  Ingest" — companion, import-side of the same capability) and Issue 18.7 (this capability,
+  generation-side; added to `docs/roadmap.md` Phase 18, status: Proposed, 2026-07-08).
+  0022-headless-platform-use-case-engines (PR 1918/1926, merged 2026-07-07/08 —
   this capability is mechanism under that ADR's Decision-2 test, and stays core/agent-side
   regardless of how the use-case-engine question resolves). The existing vuln_scan plugin
   (agents/plugins/vuln_scan/ — considered and rejected as a host for this capability, Decision 2;
@@ -24,9 +29,12 @@ related: >-
   both pending an unscheduled retirement cleanup per ADR-0018). docs/agent-privilege-model.md
   (load-bearing for Decision 1 — the reason per-user-directory collection is rejected in favor
   of machine-scope-only: the agent is designed to run unprivileged, and both a broad and a
-  narrow cross-user file-read grant were considered and rejected against that model). The tar
-  plugin (agents/plugins/tar/ — the better precedent for this plugin's internal streaming/
-  collector conventions than installed_apps, per Decision 2's build-ordering note).
+  narrow cross-user file-read grant were considered and rejected against that model). The
+  filesystem plugin (agents/plugins/filesystem/ — the better precedent for this plugin's internal
+  bounded-synchronous-walk conventions than installed_apps, per Decision 2; corrected from an
+  earlier, false citation to tar's ProcStreamCollector during a fix pass, 2026-07-08 — this
+  frontmatter line was the one place that fix pass missed, caught during governance re-review of
+  the fix itself).
   docs/postgres-store-playbook.md and docs/postgres-migration-ladder.md (cited in Decision 8 for
   whoever designs the deferred store schema). docs/roadmap.md Issue 18.1 (Vulnerability Lifecycle
   — the named future home for findings-side history, Decision 7).
@@ -307,8 +315,12 @@ tracked issue with no document of record.
 is explicit that the agent is *designed* to run under a dedicated **unprivileged** account (`yuzu`
 on Linux; the intended `NT SERVICE\YuzuAgent` on Windows, though currently LocalSystem only due to
 a tracked bug, #1442) specifically so a compromised agent or plugin has a small, auditable blast
-radius; macOS currently runs as root, but that is flagged in the same doc as a state the team wants
-to close (#1455), not a foundation to build on. Reaching another logged-in user's home directory
+radius; macOS currently runs as root, which `docs/agent-privilege-model.md` itself flags as a state
+the team wants to close, not a foundation to build on (that doc cites #1455 for this; verified during
+adversarial review, 2026-07-08, that #1455's own scope is actually the macOS TAR Endpoint-Security
+entitlement/notarization pipeline, not de-rooting the agent — the substantive claim here, that macOS
+runs as root today and shouldn't be built on, holds regardless; `agent-privilege-model.md` is the
+citation to correct, not this ADR's reliance on it). Reaching another logged-in user's home directory
 (typically `700`/`750` permissions on Unix, owner-only) is not just a policy question but a
 **technical one** — the unprivileged service account cannot read those bytes without a new grant.
 
@@ -341,7 +353,9 @@ reuse, and not free reuse (sharpened following Gate 3 plugin-architecture review
 `agents/plugins/filesystem/src/filesystem_plugin.cpp` already implements the kind of
 budget-respecting walk safety this tier needs, but **no shared home for these constants exists
 today, and `filesystem`'s own values are inconsistent between actions** (`max_depth` clamped to 20
-in one action, 10 in another, per-action private `constexpr` locals, not a single source of truth).
+in one action, 10 in another — per-action local bounds, plain runtime `int`s clamped by an `if`
+check, not `constexpr` as an earlier draft claimed (corrected following adversarial review,
+2026-07-08) — not a single source of truth).
 "Reuse" therefore requires a prerequisite step: extracting and reconciling `filesystem`'s clamps
 into one real shared location (`sdk/include/yuzu/` or `agents/shared/`, not a plugin-to-plugin
 `#include`, which would create exactly the awkward coupling this split is meant to avoid) and
@@ -511,16 +525,26 @@ definition, and `content/definitions/vuln_scan.yaml` needs more than a two-field
    findings) has no remaining inputs once those two are retired and is **retired** with them. This
    is an explicit disposition for all five, not an assumption that "the plugin retirement" silently
    handles the other four.
-2. **`result.columns` and the `visualization` block are not incidental metadata — they gate
-   parsing.** `vuln_scan.yaml`'s `scan` definition currently declares a CVE-finding result shape
-   (severity/category/title/detail-style columns, a severity-keyed pie chart), which
-   `server/core/src/result_envelope.cpp` uses to build a type map and parse the plugin's raw
-   delimited output *positionally* against. `component_inventory`'s actual output (Decision 2's
-   `kind`/identity/`dependency_origin`-tagged component-record shape) does not match that schema at
-   all. **The repointed `scan` definition's `result.columns` and `visualization` block must be
-   fully rewritten to match `component_inventory`'s real field list, not left as-is** — this is
-   tracked as part of Decision 8's deferred exact-field-list work, not a detail this ADR can defer
-   past acknowledging it's required.
+2. **`result.columns` and the `visualization` block are not incidental metadata — they gate display
+   and charting, not JSON parsing (re-attributed following adversarial review, 2026-07-08 — the
+   original wording named the wrong mechanism).** `vuln_scan.yaml`'s `scan` definition currently
+   declares a CVE-finding result shape (severity/category/title/detail-style columns, a
+   severity-keyed pie chart). Checked directly against code: `server/core/src/result_envelope.cpp`'s
+   `parse_result` parses agent output as **JSON** (a `{"columns":[...], "rows":[...]}` shape,
+   falling back to wrapping non-JSON output into a single raw-text `output` column) and its
+   `build_type_map` is consumed only by `validate_types` for post-hoc type checking — neither does
+   positional delimited parsing, and `parse_result`'s only caller in the codebase is
+   `policy_evaluator.cpp`, not any vuln_scan display path. The actual positional coupling lives in
+   `server/core/src/visualization_engine.cpp`: `split_fields` splits the plugin's pipe-delimited
+   output line-by-line, and `labelField`/`valueField` (and their siblings) index into the result **by
+   numeric position** (`field_or_empty(fields, idx)`) — so a different field order silently breaks
+   the chart. `component_inventory`'s actual output (Decision 2's `kind`/identity/
+   `dependency_origin`-tagged component-record shape) does not match `vuln_scan.yaml`'s current
+   schema or field order at all. **The repointed `scan` definition's `result.columns`
+   (naming/typing/export) and `visualization` block (`labelField`/`valueField` positional indices)
+   must both be fully rewritten to match `component_inventory`'s real field list, not left as-is** —
+   this is tracked as part of Decision 8's deferred exact-field-list work, not a detail this ADR can
+   defer past acknowledging it's required.
 3. **`compatibility.requiredPlugins: [vuln_scan]` must also be updated to `[component_inventory]`**
    on the repointed `scan` definition — otherwise the definition nominally requires a plugin that
    no longer exists once retirement completes.
@@ -609,6 +633,63 @@ daily-floor) firing close together for one agent (a related, lower-stakes instan
 missing-guarantee class) — no separate mechanism is needed for that case once the write path enforces
 monotonicity.
 
+**This must be an atomic conditional write, not an application-level check-then-act (sharpened
+following Gate 2 re-review, 2026-07-08 — every prior description of this guard, including this
+one, stated it as a "check," which under two genuinely concurrent writes for the same agent is a
+SELECT-then-write race: last-committer-wins, not newest-timestamp-wins, silently reproducing the
+exact stale-write-wins failure this guard exists to prevent).** The write must be a single atomic
+conditional statement — e.g. `ON CONFLICT (agent_id) DO UPDATE ... WHERE stored.collection_ts <
+excluded.collection_ts`, or an equivalent single-statement compare-and-swap — never a separate
+read followed by a conditional write. This is the same class of anti-race idiom this codebase
+already uses elsewhere (`complete_run`'s CAS, `claim_for_exec`'s execute-once claim) and is not
+optional implementation detail: this ADR already pulled an equivalent correctness contract out of
+Decision 8's deferral bucket once (the delete-then-insert-vs-upsert fix, Decision 7) specifically
+because leaving a guarantee like this unspecified is how it silently breaks; the guard's atomicity
+is the same class of thing and is decided here, not deferred.
+
+**This ordering key is a different clock from Decision 7's `first_seen`/`last_seen`, and the two
+must not be conflated (named following Gate 2 security re-review, 2026-07-08, of the Decision 7
+fix).** The "collection timestamp" here is the **agent-supplied** time the walk ran — deliberately,
+since this check exists to prefer a genuinely fresher write over one that merely *arrived* later,
+which server-receipt-time ordering cannot distinguish. But an agent-supplied clock is also,
+therefore, an agent-influenceable one: without a bound, a single transiently-compromised agent
+could submit one future-dated write that permanently wins this monotonic guard against every
+subsequent honest write, freezing the stored state past remediation. **This ordering key must
+reject or clamp a collection timestamp that is implausibly far in the future — with a concrete
+bound, not just a named principle (sharpened following Gate 2 re-review, 2026-07-08, which found
+the requirement stated without a number is indistinguishable from no requirement at all).** This
+ADR commits to the bound: **reject any collection timestamp more than 24 hours ahead of server
+receipt time — reject, not clamp-to-boundary (sharpened following Gate 2 re-review, 2026-07-08,
+which found "clamp" ambiguous between two materially different behaviors).** Clamping a rejected
+timestamp *to* the 24-hour boundary would pin the malicious write at that boundary and make every
+subsequent honest write lose the monotonic guard for a rolling ≤24h window while the attacker keeps
+resubmitting — reject is unambiguous: the write is dropped (silently, per the existing "an older
+write loses silently" posture — this is the same failure shape, just triggered by an implausible
+future date instead of a genuinely stale one), and the currently-stored value stays authoritative
+until a legitimately-timestamped write supersedes it. **A rejection this far in the future is itself
+a compromise/clock-skew signal, not routine noise, and must not be silently absorbed — named as a
+concrete observability requirement, not bare prose, following Gate 2 re-review, 2026-07-08, which
+found "an audit or metrics event" too vague to implement consistently.** Implementation must emit
+**both** a named audit event (`component_inventory.future_dated_rejected`, following the
+`inventory.component.*` audit-verb convention this ADR already commits to for the read surface,
+Ratification) and a Prometheus counter, per `docs/observability-conventions.md` — audit and metrics
+serve different consumers here (a compliance-facing trail vs. an alertable signal), and a
+compromise/clock-skew event plausibly needs both, not either. The exact 24-hour number is
+implementation-tunable and is added to Decision 8's list of deferred constants (alongside the
+decompression-bomb ceilings) — but unlike that earlier
+omission, this one is named as deferred explicitly, not silently left unstated. **The cited precedent needed correcting too
+(found during the same re-review): `software_inventory_store.cpp`'s migration v3 is a one-time,
+zero-tolerance backfill clamp for pre-existing data, not an ongoing runtime bound for a live write
+path — it does not structurally transfer to this check as directly as the original wording implied.
+The real precedent this bound is consistent with is `app_perf_daily_store.cpp`'s `kFutureSlackDays`,
+which clamps an agent-supplied value on every write, the same shape of problem this ordering key
+has.** `first_seen`/`last_seen` themselves (Decision 7) are the opposite: **server receipt time**,
+per this codebase's own hardened invariant (`software_inventory_store.cpp`, issue #1685 — "a
+skewed/hostile agent must not hide a dark endpoint" by pinning a timestamp into the future). The two
+clocks serve different purposes and must stay distinct: agent-collection-time orders writes against
+a race, now with its own bound; server-receipt-time is the durable, agent-untrusted record of when
+this store actually observed the component.
+
 **The ordering guarantee must be completeness-aware, not recency-only — a compound risk the
 recency fix itself creates, found during hardening-round re-review, 2026-07-07.** A pure
 "newer-timestamp-wins" rule interacts badly with Decision 4's `truncated` flag: a fresher-but-
@@ -640,13 +721,39 @@ needed, would invalidate the existing capture-cap sizing math tuned for `install
 fixed-width rows, and doesn't fit a flat YAML `result.columns` list, which the on-demand action's
 InstructionDefinition will need per Decision 8). Records are delimited the same way as
 `installed_software` (`0x1F` between fields, `0x1E` terminating a record), with a `kind` field
-taking values `bundled_lib` / `electron_runtime` / `go_buildinfo` / `lockfile_dep`; a shared
+taking values `bundled_lib` / `electron_runtime` / `go_buildinfo` / `lockfile_dep` / `unreadable`
+(the fifth value, added below, for per-item unreadability); a shared
 identity/attribution prefix (parent app or package identity, per Decision 1's anchoring); a
 `dependency_origin` field (`public_registry` / `private_or_internal`, per Decision 1(d)) that is
 honest-empty outside `kind=lockfile_dep`; and every other per-`kind` field present as an
 honest-empty column on every row regardless of `kind` — mirroring `installed_software`'s convention
 exactly, not a variant of it. This settles the wire-format *shape*; Decision 8 still defers the
 exact field list and action name(s).
+
+**A fifth `kind` value is required for per-item unreadability — a gap closed following adversarial
+review, 2026-07-08.** Decision 4 commits that a symlink-contained-off path, or any other per-item
+unreadable entry, is "emitted as UNKNOWN/needs-review, never a silent skip" — but the four-value
+`kind` set above has no row shape for an item with no recoverable component identity at all (no
+name, no version, nothing that fits `bundled_lib`/`electron_runtime`/`go_buildinfo`/`lockfile_dep`).
+This ADR adds a fifth value, **`kind=unreadable`**, whose per-`kind` identity fields are
+honest-empty except the shared identity/attribution prefix, which carries the anchoring/attribution
+path only (the parent app, or the excluded/unreadable path itself) — giving Decision 4's per-item
+commitment an actual row to land in, on the same fixed-arity shape as every other `kind`. This is a
+different signal from the walk-level `truncated` flag below: `kind=unreadable` is a per-row fact
+about one item; `truncated` is metadata about the sync report as a whole, and the two must not be
+conflated (consistent with Decision 4's own truncated-vs-per-item distinction).
+
+**This attribution path must be the logical, as-anchored path — never a resolved `realpath()`
+target (a security gap closed following Gate 2 re-review, 2026-07-08).** For the
+symlink-containment-exclusion case specifically, the whole point of containment (Decision 1) is
+that an escaping symlink's *resolved target* may be exactly the per-user path that section exists
+to keep uncollected. Logging that resolved target here — even as apparently-harmless diagnostic
+value ("show what it pointed at") — would make this one row type the channel that silently ships
+out-of-scope data into central storage, defeating containment's own guarantee. The
+`openat()`/`O_NOFOLLOW`-per-segment walk mechanism Decision 1 already mandates holds both the
+logical (as-anchored) and resolved paths at the point of rejection; this ADR commits to recording
+only the former, here and anywhere else an anchoring path is captured (including `component_key`,
+Decision 7 below).
 
 **Version-skew/mixed-rollout contract (added following architect review, 2026-07-07).** ADR-0016
 itself has an explicit mixed-version-rollout contract (old-server/new-agent and new-server/old-agent
@@ -659,7 +766,12 @@ the same is true for the flagged `InstallLocation`/bundle-path addition to `inst
 server simply doesn't parse the new fields until it upgrades, per that mechanism's existing
 contract. **No proto or gateway `gpb` regeneration is implied** — per ADR-0016 §6/CLAUDE.md's own
 routed-concern row, a new sync source is a new key in the existing `plugin_data`/`content_hashes`
-maps, not a new proto field, and this ADR introduces no exception to that.
+maps, not a new proto field, and this ADR introduces no exception to that. **This includes Decision
+3's chunk-reassembly metadata** (sequence number, total-chunk count, cycle id) — named here
+explicitly following adversarial review, 2026-07-08, since chunking and "no proto change" are both
+committed elsewhere in this document but were never previously linked: that metadata rides as
+additional `plugin_data`/`content_hashes` map keys scoped to the sync cycle, not a new proto field,
+consistent with this same mechanism.
 
 ### 3. How it is scheduled: a new, separately-governed sync source — and why this isn't a command-only capability
 
@@ -716,16 +828,21 @@ change to retrofit.
 explicitly, not left implicit (found during Gate 6 SRE review; the row-count math itself corrected
 following adversarial review, 2026-07-08, which found it looser than the cited numbers support).**
 ADR-0016's own numbers (`installed_software`'s ~20k-row/2.8MB blob) bound a single report under the
-transport this ADR reuses, against two different ceilings that must not be conflated: the
-**actually-enforced** `kMaxBlobBytes` cap (3 MiB, not the previously-stated "3.5MiB" — a second
-small inaccuracy corrected here) caps a single report at roughly **22k rows** at this measured byte
-rate (~140 bytes/row); the looser, **unenforced** raw gRPC frame ceiling (4 MiB) is where the
-"~30k rows" figure this section previously used actually comes from. Decision 3 already states
-component-inventory cardinality runs "well past" the enforced cap; Decision 4 commits to **never
-silently dropping** an item. A single endpoint whose transitive dependency tree exceeds roughly
-**22k rows** — the cap this ADR's wire transport actually enforces, not the looser gRPC ceiling —
-would blow the single-blob-per-report wire model this ADR otherwise reuses unchanged from
-ADR-0016 — at that point it is not "reuse," it needs a mechanism change. **This ADR resolves the
+transport this ADR reuses, against two different ceilings that must not be conflated — and a third
+correction, following adversarial review, 2026-07-08, which found the derived row-count figure
+itself looser than the code's own binding constraint: the **actually-enforced, tighter** cap is
+`kMaxEntries = 20,000` rows, enforced on both the agent and server seams — the codebase's own
+comment names this as the deliberately-chosen binding constraint. The `kMaxBlobBytes` cap (3 MiB,
+not the previously-stated "3.5MiB" — a second small inaccuracy corrected here) sits **above**
+`kMaxEntries` as headroom (20k rows × ~140 bytes/row ≈ 2.8 MiB, reached before the 3 MiB byte
+ceiling) — it is not itself the binding constraint. The looser, **unenforced** raw gRPC frame
+ceiling (4 MiB) is where the "~30k rows" figure this section previously used actually comes from.
+Decision 3 already states component-inventory cardinality runs "well past" the enforced cap;
+Decision 4 commits to **never silently dropping** an item. A single endpoint whose transitive
+dependency tree exceeds **20,000 rows (`kMaxEntries`)** — the tighter of the two enforced caps, and
+the one this ADR's wire transport actually enforces — would blow the single-blob-per-report wire
+model this ADR otherwise reuses unchanged from ADR-0016 — at that point it is not "reuse," it needs
+a mechanism change. **This ADR resolves the
 tension as follows, rather than leaving it to be discovered during implementation:** an oversized
 inventory is sent as **multiple chunked reports** (a bounded sequence of blobs for one sync cycle,
 reassembled server-side by sequence number), not as a single ever-larger blob and not as a silent
@@ -755,14 +872,27 @@ before the first walk's reassembly completes are staged under that walk's own se
 by the same monotonic check once each completes.
 
 **Store-write atomicity for the replace-on-change swap (found during unhappy-path review) —
-required, not assumed.** Current-state-only, replace-on-change retention (Decision 7) combined with
-this tier's cardinality means a single dependency change can force a full multi-thousand-row
-resend (an accepted cost, above); the store-side replace of an agent's prior rows with the new set
-must be a single atomic transaction, matching the existing `installed_software`/`device_ci` pattern
-of replacing all of an agent's child rows in one transaction — never a partial swap visible
-mid-transaction, which would otherwise let a reader observe components from two different points in
-time simultaneously if a transport interruption lands mid-replace. This is the same atomic-replace
-step the chunk-reassembly paragraph above triggers exactly once per completed cycle, not a separate
+required, not assumed. The correct mechanism, not an existing pattern to copy, corrected following
+governance re-review of the Decision 7 fix, 2026-07-08.** Current-state-only, replace-on-change
+retention (Decision 7) combined with this tier's cardinality means a single dependency change can
+force a full multi-thousand-row resend (an accepted cost, above); the store-side replace of an
+agent's prior rows with the new set must be a single atomic transaction — never a partial swap
+visible mid-transaction, which would otherwise let a reader observe components from two different
+points in time simultaneously if a transport interruption lands mid-replace. **This must NOT be
+implemented as "matching `installed_software`/`device_ci`'s pattern of replacing all of an agent's
+child rows"** — an earlier draft of this paragraph said exactly that, but `installed_software`'s
+actual pattern (`software_inventory_store.cpp`) is an unconditional `DELETE FROM ... WHERE
+agent_id=$1` followed by a bulk `INSERT`, and `device_ci` has no child-row pattern at all (a single
+flat table, corrected in Decision 7 above). Implementing this swap as delete-then-bulk-insert would
+silently defeat Decision 7's whole preserve-`first_seen` mechanism: `ON CONFLICT (agent_id,
+component_key)` never fires against a row that was just deleted, so every component's `first_seen`
+would silently reset to "now" on every sync cycle after the first, with no error surfaced. **The
+correct shape, consistent with Decision 7's own upsert design:** a staged per-row `ON CONFLICT ...
+DO UPDATE` (preserving `first_seen`, advancing `last_seen`) for every component in the new set,
+plus a targeted `DELETE` scoped to components present in the prior stored set but absent from the
+new one — all inside one transaction, so a reader never observes a partial mix, but the pre-existing
+rows are updated in place rather than destroyed and recreated. This is the same atomic-replace step
+the chunk-reassembly paragraph above triggers exactly once per completed cycle, not a separate
 mechanism.
 
 **Explicitly out of scope for this ADR: operator-configured scheduled scans** (e.g., "scan the
@@ -904,11 +1034,123 @@ preserve-on-conflict upsert, not a novel invention — this codebase's existing 
 need it today, since none of them tracks freshness below the whole-sync grain: the component-table
 write path is an `INSERT ... ON CONFLICT (agent_id, component_key) DO UPDATE` that refreshes every
 column **except** `first_seen` (preserved from the existing row, `first_seen = <table>.first_seen`,
-never overwritten) while `last_seen` always advances to the current sync's timestamp. A component
+never overwritten) while `last_seen` always advances to **server receipt time** — a different clock
+from the agent-supplied collection timestamp Decision 2's write-guard uses as its ordering key; see
+that section for why the two must not be conflated. A component
 genuinely absent from the current sync (not merely unwritten) is deleted in the same replace
 transaction, consistent with the wholesale-replace-on-change posture above — its absence is not
 itself a tracked row. This mechanism, not "reused precedent," is what Decision 8's deferred store
 schema must actually implement.
+
+**`component_key`'s required invariant, named as a constraint on Decision 8 rather than left
+implicit (found during adversarial review, 2026-07-08).** The entire write-guard above — the
+preserve-`first_seen` upsert, the delete-absent step, and Decision 2's monotonic write-guard — is
+correct only if `component_key` is **stable across syncs and unique within an agent**; Decision 8
+still defers its exact composition, but not this constraint. In particular, `component_key` must
+incorporate the anchoring path (not just name+version), or two distinct co-named components (e.g.
+two vendored `libcrypto.so` copies at different paths inside different apps) would collide and one
+would silently overwrite the other's row.
+
+**Two further constraints on that path component, sharpened following Gate 2/3 re-review,
+2026-07-08 — sound in principle, underspecified enough in the original wording to reintroduce the
+exact bug class this ADR exists to prevent.** (a) **The path must be the logical, as-anchored path,
+never a resolved `realpath()`** — the same rule Decision 2's `kind=unreadable` value now states
+explicitly, and it matters here for a different, equally real reason: Decision 1 already names two
+*legitimate*, routinely-rotating in-root symlinks (Linux's `update-alternatives` system, macOS
+Framework `Versions/Current ->` links) that are followed and resolved normally, not contained off.
+If `component_key` used the resolved target, a routine package update through either mechanism would
+silently change the key for every affected component — firing the "relocation resets `first_seen`"
+trade-off below on **ordinary maintenance**, not the rare relocation case that trade-off was framed
+around. The logical/as-anchored path stays stable across exactly this kind of routine retarget,
+which is the intended behavior. (b) **The path component is the full, root-anchored path, not a
+path relative to the component's own parent app (sharpened following Gate 3 re-review, 2026-07-08)**
+— a relative path would let two different apps that happen to share an internal layout (e.g. two
+Electron apps both bundling `Contents/Frameworks/Electron Framework.framework`) collide under an
+otherwise-correct key; anchoring to the full path (or equivalently, the parent app's own identity
+plus the within-app relative path) rules this out. (c) **The composition must be collision-safe, not
+naive string concatenation, and a hash-based composition specifically must be collision-resistant at
+this store's real scale, not just "a hash"** — `name + version + path` concatenated as plain text
+risks an incidental (or adversarially-crafted) path segment producing the same byte string as a
+different, genuinely-distinct component's key, silently merging two rows. **Preferred: a
+length-prefixed field encoding**, which is collision-free by construction (injective), not merely
+low-probability. If a hash of the structured `(name, version, path)` tuple is used instead, it must
+have negligible collision probability at this ADR's own stated cardinality (thousands of rows per
+agent, Decision 3) — an unqualified "a hash," with no stated strength requirement, is exactly the
+kind of choice that could reintroduce engineered-collision risk in a document that already treats
+path segments as adversarially-crafted input elsewhere (the naive-concatenation rejection just
+above). The exact choice is still Decision 8's to make; "plain concatenation" and "an unqualified
+hash with no stated collision bound" are both ruled out here, not left to be discovered as a bug
+later.
+
+The accepted trade-off this creates: an in-place relocation of a component to a genuinely new
+anchoring path (not a routine symlink retarget, per (a) above) resets that component's `first_seen`,
+since it becomes a new `component_key` rather than an update to the existing row — named here as a
+known cost, not an oversight for Decision 8 to rediscover.
+
+**Noted for Decision 8 to confirm, not resolved here:** a path whose `kind` changes across syncs
+(e.g. a previously-readable component that becomes contained-off, or vice versa, at a stable
+`component_key`) is expected to behave as an ordinary upsert — the row's `kind` and identity fields
+update in place, `first_seen` is preserved — but this ADR does not design a dedicated test for that
+transition; Decision 8's implementation should confirm it rather than discover a gap late.
+
+**The walk-level `truncated` flag's storage location, left unstated until now (found during
+adversarial review, 2026-07-08).** Decision 3 commits that a `truncated=true` result is written as
+a *parallel* needs-review signal that does not retire an older, complete stored result — but the
+one-row-per-component table described above, as stated, has no field to hold that signal alongside
+retained rows. This ADR resolves it as a small, **agent-scoped walk-metadata sidecar** (a single row
+per agent — not per component — recording the most recent sync cycle's `truncated` boolean and its
+collection timestamp), a grain analogous to `installed_software`'s existing `inventory_state`
+parent row. Decision 8 still designs this sidecar's exact columns; this ADR commits to its
+existence and its per-agent (not per-component) grain, so Decision 3's and Decision 4's
+already-decided commitments have a concrete place to be implemented.
+
+**The sidecar's write path, restated as one coherent mechanism rather than patched case-by-case
+(rewritten following two further rounds of Gate 2/3 re-review, 2026-07-08, after the first
+decoupling fix itself introduced a fresh gap — the exact "narrow fix, new problem" pattern this
+ADR's own review history repeatedly names).** An earlier draft coupled the sidecar to "the same
+transaction as the component replace," which doesn't exist for a cycle that never fully reassembles.
+A later draft decoupled it into "its own single-row upsert... exactly one of the two always fires
+per cycle," which over-corrected: it dropped the transaction pairing for the case that *does* have
+one, missed that a cycle can fully reassemble yet still lose Decision 3's monotonic write-guard (not
+covered by either stated case), missed total silence (a cycle that never gets even its first chunk
+to the server), and gave the sidecar the future-dating rejection rule but not the same monotonic-ordering
+guard as the component table — reopening, on the sidecar, the identical stale-write-wins race the
+component table's guard was built to close (a slow, stale cycle's timeout-write landing after a
+fast cycle's success-write, reverting the sidecar to a stale `truncated=true` beside correct,
+complete data). **The mechanism, stated once, covering every case:**
+
+1. **A cycle that fully reassembles and wins the monotonic write-guard** (its collection timestamp
+   is newer than the currently-stored value): the sidecar upsert (`truncated=false`) executes
+   **inside the same transaction as the component replace** — that transaction genuinely exists for
+   this case; there is no reason to split it, and splitting it is what reopened the inconsistent-read
+   window.
+2. **A cycle that fully reassembles but loses the monotonic write-guard** (a stale, out-of-order
+   cycle relative to already-stored, newer data): this is a **non-event for the sidecar**, the same
+   as it already is for the component table — Decision 2's write-guard already establishes "an older
+   write loses silently... rather than clobbering newer data," and a losing cycle is, by definition,
+   not the most current information for this agent. No sidecar write fires; the currently-stored
+   sidecar row (from whichever cycle it last legitimately reflected) stays authoritative.
+3. **A cycle that times out or otherwise fails reassembly before its final chunk arrives**: the
+   sidecar upsert (`truncated=true`) is its own standalone atomic conditional write — the one case
+   with no replace transaction to ride on — gated on the sidecar's **own** stored collection
+   timestamp, not merely the future-dating rejection: `ON CONFLICT (agent_id) DO UPDATE ... WHERE
+   sidecar.collection_ts < excluded.collection_ts`. **This must compare against the sidecar's own
+   prior value, not only the component table's (sharpened following Gate 3 re-review, 2026-07-08 —
+   comparing only against the component table closes an older timeout overwriting a newer success,
+   but leaves a timeout-vs-timeout race open: two cycles that both fail reassembly, both newer than
+   the last successful sync, where the older one's write lands second would otherwise regress the
+   sidecar's own recorded timestamp even though its `truncated` boolean stays correct either way).**
+   Exactly one of cases 1–3 fires for any cycle whose first chunk reaches the server.
+4. **A cycle whose first chunk never reaches the server at all (agent crash, network failure before
+   any chunk is sent) is explicitly NOT covered by this mechanism** — no reassembly is ever armed, so
+   none of cases 1–3 fire, and the sidecar silently retains whatever it last held. This ADR does not
+   claim otherwise: closing this gap is the job of the per-source freshness/staleness gauge already
+   named as a Decision 8 deferral, not a case this sidecar design can detect on its own (a gauge
+   observes "no report arrived in expected window" independent of what any single report's own
+   metadata says).
+
+The sidecar's own collection timestamp is agent-supplied and subject to the same future-dating
+rejection rule as Decision 2's write-guard ordering key (below) in all cases that write it.
 
 **This is a stronger case for current-state-only than `installed_software`'s own, not a weaker
 one.** The same cardinality/cost reasoning that justified giving this its own sync source
@@ -959,16 +1201,37 @@ principle, and shared-schema intent. It explicitly **does not** fully specify:
   that trigger out by staying machine-scope.
 - The dedicated **store schema** in relational detail (columns, indices) and read-surface
   (REST/MCP/dashboard) design — retention is settled (Decision 7), the schema's exact shape is not.
+  **`component_key`'s exact column composition is likewise deferred** (added following docs
+  re-review, 2026-07-08, so this bullet doesn't read as if the whole key were still open): its
+  **uniqueness-within-agent, path-inclusion, logical-not-resolved-path, and collision-safe-encoding
+  requirements are settled** (Decision 7) and constrain, not are designed by, this deferred work.
 - **The CycloneDX/SPDX export/import projection feature** itself (Decision 6 commits only to the
   storage-format principle that makes it possible later, not its design).
 - The **`component_inventory` plugin's exact action name(s) and full field list** (Decision 2 settles
   the wire-format *shape* — flat, delimited, honest-empty, `kind`-discriminated, matching
   `installed_software`'s convention — but not the specific action name or the complete per-`kind`
   field enumeration), and the **YAML `InstructionDefinition`** for its on-demand action (a required
-  deliverable per Decision 2, not optional).
+  deliverable per Decision 2, not optional). **The `kind=unreadable` fifth value added tonight is
+  part of this same enumeration and needs the same agent-emits/server-parses cross-check discipline
+  this codebase already applies to published schema enums elsewhere** (e.g. the Guardian
+  published-schema-enum ↔ per-type-support-array H2/G9 cross-check) — named here so it isn't added
+  agent-side only, or server-side only, and drift silently.
 - **The decompression-bomb ceilings** (max-decompressed-size, max-entry-count, compression-ratio)
   for JAR/`.asar` parsing named in Decision 2 as required budgets, alongside the filesystem-walk
   depth/size/time budget — the exact numbers are deferred, their necessity is not.
+- **The future-dating rejection threshold's exact bound** (Decision 2's write-guard ordering key,
+  and the matching bound on the Decision 7 walk-metadata sidecar's own timestamp) — this ADR commits
+  to a 24-hour starting figure, that a violation is rejected (not clamped-to-boundary), and that
+  crossing it emits **both** a named audit event (`component_inventory.future_dated_rejected`) and a
+  Prometheus counter per `docs/observability-conventions.md`; final tuning of the number is
+  implementation-stage work, same treatment as the decompression-bomb ceilings above. **This audit
+  event is part of the same Ratification binding condition as the read-surface audit verb** (added
+  following Gate 2 re-review, 2026-07-08, so it isn't left as unenforced prose) — see Ratification.
+- **`component_key`'s path canonicalization** (Decision 7) — normalization of `.`/`..` segments,
+  trailing separators, and OS-appropriate case handling before the path enters the key, so the
+  same logical file doesn't produce two different key strings across syncs and spuriously reset
+  `first_seen`. A data-quality concern, not a security one; exact rules are implementation-stage
+  work.
 - **Fuzz-harness coverage** for each new binary/archive parser (Decision 2) — named as a ship
   precondition, with the specific harnesses/targets left to implementation.
 - The **prerequisite `filesystem`-plugin bound-checking-constants refactor** (Decision 2) —
@@ -1137,8 +1400,8 @@ retirement PR itself.
 | `vuln_scan` plugin (existing, not an ADR) | Considered and rejected as the host for this capability (Decision 2) — carries legacy pre-ADR-0018 code pending an unscheduled retirement; a new `component_inventory` plugin is built instead. **The name survives, the plugin doesn't:** the `security.vuln_scan.scan` instruction definition is kept and re-pointed at `component_inventory`'s action, so the operator-facing command an owner already associates with this capability keeps working through the plugin's retirement (Decision 2). |
 | `filesystem` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* bounded-synchronous-walk conventions (Decision 2, citation corrected following adversarial review, 2026-07-08) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only; `tar`'s `ProcStreamCollector` was incorrectly cited here in an earlier draft, but it is a persistent async collector, never invoked synchronously inside one command dispatch, so it doesn't address the command-timeout-budget/partial-result problem this plugin's walk actually faces. `filesystem_plugin.cpp`'s own bounded, synchronous walk is the real precedent for that. |
 | 0018 / 0019 (server-authoritative matching / tri-state findings) | Downstream consumer — this ADR's output feeds the language-ecosystem regime of CVE matching. |
-| CVE_MATCHING_ADR0023_AMENDMENT.md / ADR-0023 (vuln correlation engine, PR #1914, open) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
-| 0022 (headless platform / use-case engines, PR #1918/#1926, open) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |
+| CVE_MATCHING_ADR0023_AMENDMENT.md / ADR-0023 (vuln correlation engine, PR #1914, merged 2026-07-07; ADR-0023 itself remains `status: proposed` on `dev` — a prior claim here that it was already accepted was wrong, corrected 2026-07-08) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
+| 0022 (headless platform / use-case engines, PR #1918/#1926, merged 2026-07-07/08 — status corrected following adversarial review, 2026-07-08) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |
 | 0024 (SLE, PR #1920, open) | Downstream consumer — license/entitlement matching needs the same per-endpoint component data. |
 | roadmap Issue 18.1 (Vulnerability Lifecycle) | Named future home (Decision 7) for the *findings*-side history (open→remediated→re-opened, SLA tracking) this ADR deliberately excludes from the component inventory itself. |
 | roadmap Issue 18.5 (SBOM Ingest) | Companion, not duplicate — import-side of the same capability; shares one internal schema across generate/ingest/export (Decisions 5–6). |
@@ -1175,7 +1438,13 @@ inheriting "the same reviewer bar as ADR-0016/0018" in general.** The concrete r
 This condition exists because every comparable behavioral-adjacent surface in this codebase
 (`device_ci`, DEX, Guardian device-view) was built with this pattern from day one, not bolted on
 under implementation time pressure, and a bare deferral to "Issue 18.7" risked exactly that outcome
-without a named gate.
+without a named gate. **The same binding condition covers the write-path's own observability
+(added following Gate 2 re-review, 2026-07-08):** the `component_inventory.future_dated_rejected`
+audit event and its paired Prometheus counter (Decision 2/8) must exist before this store's
+implementation PR merges, checked by the same security-guardian gate as the read-surface audit
+verb above — a compromise/clock-skew signal that's merely described in prose, with no reviewer
+checking it actually shipped, is the same unenforced-deferral risk this condition already exists
+to close for the read surface.
 
 **Binding condition: the `installed_apps`/`InstallLocation` sequencing dependency (Decision 1) MUST
 be confirmed landed before `component_inventory`'s Windows/macOS anchoring goes live, not merely
