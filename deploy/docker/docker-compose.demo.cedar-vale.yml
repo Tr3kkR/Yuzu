@@ -1,0 +1,81 @@
+# Yuzu demo — Cedar & Vale three-tier app overlay (Envoy → node → Postgres).
+#
+# Layered ON TOP of docker-compose.demo.yml by scripts/start-demo.sh when
+# DEMO_FULL=1. Models the fictional Cedar & Vale company's three-tier web app:
+#
+#   client agents ─▶ cv-frontend (Envoy :8080) ─▶ cv-app (node :3000) ─▶ cv-db (Postgres :5432)
+#
+# Each tier co-hosts a yuzu-agent (deploy/docker/cedar-vale/tier-entrypoint.sh)
+# in its own net+PID namespace, so the agent natively sees that tier's
+# listeners + connections. In /viz/fleet the three render as a stack —
+# frontend on top (Envoy :8080 is a web port), app in the middle (node :3000
+# is deliberately NOT a web port), db at the bottom (Postgres :5432) — with two
+# persistent blue tubes (Envoy→node health check, node→Postgres pool keepalive).
+# The 25 demo client agents drive client→Envoy traffic via the http_client
+# fire-instruction (scripts/demo-fire-traffic.sh), completing the full
+# client→envoy→node→postgres path of blue tubes.
+#
+# Images (yuzu-cv-{frontend,app,db}:latest) are built from
+# deploy/docker/cedar-vale/Dockerfile.tier-* — they COPY the agent binary from
+# yuzu-agent-viz-uat:latest (start-demo.sh / P3 tag the chiselled agent there).
+# Lifted from the cedar-vale-app profile of docker-compose.viz-uat.yml, minus
+# the profile gate so these come up by default in the merged demo stack.
+#
+# ⚠ DEMO/UAT ONLY — baked Postgres creds (cedar/vale), no TLS. Never prod.
+
+services:
+  # ── db tier: Postgres holding the impress.js slide content ───────────────
+  cv-db:
+    image: yuzu-cv-db:latest
+    container_name: yuzu-demo-cv-db
+    hostname: yuzu-db
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?start-demo.sh sets this after issuing a token}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      POSTGRES_USER: cedar
+      POSTGRES_PASSWORD: vale
+      POSTGRES_DB: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── app tier: node serving the impress.js deck, pulling slides from cv-db ─
+  cv-app:
+    image: yuzu-cv-app:latest
+    container_name: yuzu-demo-cv-app
+    hostname: yuzu-app
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?start-demo.sh sets this after issuing a token}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      PGHOST: cv-db
+      PGPORT: "5432"
+      PGUSER: cedar
+      PGPASSWORD: vale
+      PGDATABASE: cedarvale
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-db:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── frontend tier: Envoy reverse-proxying to cv-app (operator-facing :8088)
+  cv-frontend:
+    image: yuzu-cv-frontend:latest
+    container_name: yuzu-demo-cv-frontend
+    hostname: yuzu-frontend
+    environment:
+      YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?start-demo.sh sets this after issuing a token}"
+      NO_PROXY: "*"
+      no_proxy: "*"
+    ports:
+      - "8088:8080"   # the impress.js deck (Envoy listener) — operator-facing
+    depends_on:
+      gateway:
+        condition: service_healthy
+      cv-app:
+        condition: service_started
+    restart: unless-stopped
