@@ -18,6 +18,33 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Reserved on-behalf-of headers rejected + `principal_class` metric label (ADR-0022 Phase 1)
+
+Two operator-visible changes ship together:
+
+**1. Reserved headers now 403.** Five header names are reserved and rejected
+on every HTTP endpoint before authentication (`On-Behalf-Of`,
+`X-On-Behalf-Of`, `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact`, case-insensitive; the equivalent gRPC metadata
+keys cause the call to be cancelled). Nothing previously consumed these
+headers, so a correctly-built integration is unaffected — but **pre-flight
+check any proxy, service mesh, or SSO gateway in front of Yuzu**: some
+API-gateway products stamp an on-behalf-of/OBO convention header on every
+upstream request (the name is Microsoft's Entra OBO term), which would 403
+**all** REST/MCP/dashboard traffic after upgrade. Health probes (`/livez`,
+`/readyz`, `/health`, `/api/health`) are exempt, so the pod stays in rotation
+— a green probe with a 100% 403 rate is the signature (see
+`docs/operations/troubleshooting.md`). Rejections are visible in
+`yuzu_onbehalf_rejected_total` and throttled `[ADR-0022]` warn lines.
+
+**2. `yuzu_http_requests_total` gains a `principal_class` label**
+(`human`/`agent`/`none`; `engine` reserved). This is a Prometheus
+series-identity change on a long-shipped metric: old `{method,status}` series
+freeze at upgrade and new `{method,status,principal_class}` series start at
+zero. Plain selector queries and `sum by (method, status)` keep working;
+re-baseline any dashboard or alert that matches the exact label set or joins
+on series identity.
+
 ## ⚠️ Breaking: account lockout is ON by default
 
 This release adds account lockout for failed **local-password** logins (SOC 2

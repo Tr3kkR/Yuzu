@@ -1055,6 +1055,61 @@ for the IdP cert in this release.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
+## On-behalf-of assertions rejected (ADR-0022 Interim rules)
+
+Until server-verifiable delegation ships (ADR-0022 auth follow-up), the server
+accepts **no** on-behalf-of assertion on **any** ingress surface — any such
+header or metadata key is **rejected, not ignored**. Five names are reserved
+(case-insensitive; source of truth `server/core/src/on_behalf_guard.hpp`, and
+the list only ever grows): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact`.
+
+Enforcement: **HTTP** — checked in the pre-routing chokepoint (`server.cpp`)
+before auth, the allowlist, and the rate limiter, so REST, MCP, dashboard
+fragments, and static files all reject with `403` + the A4 error envelope.
+**Recorded exception (the only one):** the four liveness/readiness probe
+paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
+mesh/SSO proxy that stamps a reserved header on every request must not be
+able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
+probe performs no identity-bearing action and nothing consumes the header on
+that path. This exception is recorded in ADR-0022's exception ledger on
+acceptance. **gRPC** — a single server interceptor on the
+one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
+management, and gateway-upstream services and every future RPC method by
+construction; a call carrying a reserved metadata key is cancelled via
+`ServerContext::TryCancel()` (client observes `CANCELLED`). `TryCancel()`
+alone does not stop a handler from running, so it is paired with an
+enforcement seam (`grpc_on_behalf_enforce.hpp`): the first statement of every
+RPC handler on `AgentServiceImpl` and `GatewayUpstreamServiceImpl`
+independently re-derives the same reserved-key check from
+`context->client_metadata()` (not `ServerContext::IsCancelled()` — its
+propagation from `TryCancel()` is not synchronous with handler dispatch,
+confirmed by an end-to-end test) — the call is a true no-op on that surface,
+not merely a wrong status code on an already-committed side effect. **Gateway
+note:** the Erlang gateway's
+own agent-facing listener reads only its known metadata keys and mints fresh
+upstream calls, so a reserved key sent to the gateway is dropped rather than
+rejected — tracked as a follow-up (Erlang-side reject, #1974) rather than an
+exception. **Consequence for `GatewayUpstreamServiceImpl`'s own enforcement:**
+today's gateway never forwards the agent's original gRPC metadata onward, so
+an agent cannot smuggle a reserved key through it — the `ProxyRegister`/etc.
+handlers' `onbehalf::enforce()` guard is currently defense-in-depth against
+the gateway's own client, not a proven end-to-end control against relayed
+agent metadata. If a future change adds metadata passthrough (e.g. for
+tracing), it must re-derive the reserved-key check against the forwarded
+metadata explicitly — the guard does not do this automatically. Rejections
+are counted in
+`yuzu_onbehalf_rejected_total{surface,event="security"}`; there is
+deliberately **no audit row** (the rejection fires pre-auth, so there is no
+resolved principal to attribute — the metric is the signal). **Accepted
+evidence limit:** the warn log is sampled (1 per 100 rejections per surface,
+a deliberate pre-rate-limiter flood defence), so the counter proves *how
+many* attempts occurred while only ~1% carry a forensic log line with
+timestamp/source — state this plainly if asked "can you show every attempt". When delegation
+ships it will use a **server-issued artifact**, never a client-asserted
+header, so these names stay rejected on client ingress permanently.
+
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).

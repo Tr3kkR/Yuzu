@@ -28,6 +28,8 @@ Every new `/fragments/*` route ships with either (a) a parallel JSON variant via
 
 **Enforced by.** `consistency-auditor` agent — A1 is added to its trigger list as a post-merge invariant check on any new `/fragments/*` route.
 
+**Hardened by ADR-0022.** The headless-platform decision (`docs/adr/0022-headless-platform-use-case-engines.md`) promotes A1 from a fragments rule to a platform-wide invariant: every behavior of every **new or changed** capability must be reachable via versioned REST **and** MCP, or carry a recorded exception in ADR-0022's exception ledger — prospective from acceptance; this section's existing grandfather scope clause remains in force. Under that reading, option (a) alone — a JSON variant on a fragment endpoint — is not a twin: a fragment URL is not a versioned, discoverable API surface. New capabilities need both the REST and MCP twins; the standing review question is wired into the governance pipeline by execution-plan PR 0.1 (Gate 4 consistency-auditor preamble). Phase status: `docs/adr-0022-execution-plan.md`.
+
 ## A2 — Discovery
 
 Every MCP tool, REST route, plugin action, scope kind, RBAC permission, and instruction definition is enumerable through a documented, authenticated discovery endpoint. An agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch.

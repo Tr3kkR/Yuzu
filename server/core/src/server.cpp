@@ -36,7 +36,11 @@
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
+#include "grpc_on_behalf_interceptor.hpp"
 #include "instruction_store.hpp"
+#include "on_behalf_guard.hpp"
+#include "principal_class.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -326,8 +330,32 @@ public:
                           "histogram");
         metrics_.describe("yuzu_grpc_requests_total", "Total gRPC requests by method and status",
                           "counter");
-        metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
+        metrics_.describe("yuzu_http_requests_total",
+                          "Total HTTP requests by method, status, and principal_class",
                           "counter");
+        // Pre-seed the closed principal_class dimension (docs/observability-
+        // conventions.md — every value of a closed-set label is initialised at
+        // startup, matching yuzu_onbehalf_rejected_total below). method/status
+        // are NOT closed sets, so a single representative GET/200 point per
+        // class is the seed — not a cross-product, which would be unbounded.
+        // "engine" is deliberately excluded: it is Phase-4-reserved and never
+        // emitted today (principal_class.hpp), so pre-seeding it now would
+        // advertise a series that cannot occur until that phase ships.
+        for (auto pc : {"human", "agent", "none"}) {
+            metrics_.counter("yuzu_http_requests_total",
+                             {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
+        }
+        // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
+        // assertions, by ingress surface. Pre-seeded to 0 per
+        // docs/observability-conventions.md so absent() alerts stay meaningful.
+        metrics_.describe("yuzu_onbehalf_rejected_total",
+                          "Requests rejected for carrying a reserved on-behalf-of "
+                          "header/metadata key (ADR-0022) by surface",
+                          "counter");
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "http"}, {"event", "security"}});
+        metrics_.counter("yuzu_onbehalf_rejected_total",
+                         {{"surface", "grpc"}, {"event", "security"}});
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
         // live by the pool's observer hooks wired at pool construction.
@@ -2761,6 +2789,16 @@ public:
         }
 
         grpc::ServerBuilder builder;
+        // ADR-0022 Interim rules (execution-plan PR 1.1): one interceptor on the
+        // ONE builder — covers agent, management, and gateway-upstream services
+        // and every future RPC method by construction (never a per-method check).
+        {
+            std::vector<std::unique_ptr<grpc::experimental::ServerInterceptorFactoryInterface>>
+                interceptor_factories;
+            interceptor_factories.push_back(
+                std::make_unique<OnBehalfRejectInterceptorFactory>(&metrics_));
+            builder.experimental().SetInterceptorCreators(std::move(interceptor_factories));
+        }
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
@@ -2788,6 +2826,9 @@ public:
             return;
         }
 
+        spdlog::info("[ADR-0022] on-behalf-of guard active: reserved headers rejected on "
+                     "HTTP (excl. health probes) and gRPC ingress; see "
+                     "docs/auth-architecture.md");
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
                      cfg_.listen_address, cfg_.management_address);
         if (gateway_service_) {
@@ -4658,9 +4699,58 @@ private:
             // sharing a source-IP bucket with authed REST traffic cannot
             // 429-starve the health probe. The endpoints themselves are
             // strictly read-only and documented as unauthenticated.
+            // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
+            // below — a RECORDED ADR-0022 exception (documented in
+            // docs/auth-architecture.md; ledger entry lands with the ADR).
+            // Governance Gate 5 (CH-3/UP-5): a mesh/SSO proxy that stamps a
+            // reserved header on every request must not be able to 403 the
+            // probes and crash-loop the pod — a probe performs no
+            // identity-bearing action, nothing consumes the header on this
+            // path, and a bricked orchestrator hides the misconfiguration the
+            // guard exists to surface. Every other path rejects below.
             if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
                 req.path == "/api/health") {
                 return httplib::Server::HandlerResponse::Unhandled;
+            }
+
+            // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
+            // NO on-behalf-of assertion on any surface until server-verifiable
+            // delegation ships (Phase 5) — and client-asserted delegation stays
+            // rejected permanently even then. Reject (not ignore) before auth,
+            // the unauthenticated allowlist, and the rate limiter, so REST, MCP
+            // (same httplib instance), fragments, and static all reject; the four
+            // probe paths above are the single recorded exception.
+            // Pre-limiter placement means a reserved-header flood gets per-request
+            // 403s, not 429s — the scan is cheaper than the limiter lookup, and
+            // the warn is throttled in note_rejection so the flood can't fill the
+            // disk; the counter records every event. Log lines carry the CANONICAL
+            // reserved spelling plus sanitized method/path (httplib percent-decodes
+            // req.path, so raw control chars would otherwise forge security-log
+            // lines). Reserved names + rationale: on_behalf_guard.hpp; the agent
+            // gRPC channel gets the same guard via grpc_on_behalf_interceptor.hpp.
+            if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
+                if (onbehalf::note_rejection(metrics_, "http")) {
+                    spdlog::warn(
+                        "[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
+                        "header '{}' from {} (1 log per {} rejections; counter "
+                        "records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path), *reserved,
+                        onbehalf::sanitize_for_log(req.remote_addr, 64),
+                        onbehalf::kLogEvery);
+                }
+                res.status = 403;
+                res.set_content(
+                    detail::a4_denial(
+                        res, 403,
+                        "on-behalf-of assertions are not accepted on any surface (ADR-0022); "
+                        "remove the reserved header",
+                        detail::A4ErrorOpts{
+                            .remediation = "remove the reserved header; see "
+                                           "docs/auth-architecture.md 'On-behalf-of "
+                                           "assertions rejected' (ADR-0022)"}),
+                    "application/json");
+                return httplib::Server::HandlerResponse::Handled;
             }
 
             // Rate limiting — check before auth to protect against brute force.
@@ -4823,9 +4913,14 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
+            // principal_class: bounded presentation-level actor class (ADR-0022,
+            // execution-plan PR 1.2) — human / agent / none today, engine reserved for
+            // Phase 4. See principal_class.hpp for the classification contract.
             metrics_
                 .counter("yuzu_http_requests_total",
-                         {{"method", req.method}, {"status", std::to_string(res.status)}})
+                         {{"method", req.method},
+                          {"status", std::to_string(res.status)},
+                          {"principal_class", std::string(principal_class_of(req))}})
                 .increment();
         });
 
@@ -10556,6 +10651,9 @@ private:
             listen_port = cfg_.https_port;
 
             // Start HTTP→HTTPS redirect server
+            // No on_behalf_guard here (ADR-0022): this instance routes nothing —
+            // every request gets a 301 and the re-request hits the guarded main
+            // listener, so this is not a bypass of the pre-routing chokepoint.
             if (cfg_.https_redirect) {
                 redirect_server_ = std::make_unique<httplib::Server>();
                 auto https_port = cfg_.https_port;

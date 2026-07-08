@@ -27,6 +27,20 @@ struct AuditEvent {
     std::string session_id;
     std::string result;   // "success", "failure", "denied"
     std::string mcp_tool; // MCP tool name if action was MCP-initiated (empty otherwise)
+    // Actor class (ADR-0022 Decision 9 / execution-plan Phase 3a), mirroring
+    // principal_class.hpp's HTTP request-metric label: "human" (session
+    // cookie), "agent" (bearer/API token), "none" (unauthenticated — a failed
+    // login, a probe-adjacent request; honest label, not a guess at human vs.
+    // agent), or "" for any row this program cannot attribute to an HTTP
+    // session/token principal at all (the agent-daemon's own gRPC channel,
+    // gateway-proxied calls, server-internal/background writers — a different
+    // kind of actor `principal_class_of` was never meant to classify; see its
+    // own header comment). "engine" is reserved, live once Phase 4 engine-token
+    // sessions exist. Populated at `AuthRoutes::make_audit_event`/
+    // `audit_log_for_principal` (the two HTTP-request-shaped constructors) via
+    // `principal_class_of(req)`; every other AuditEvent construction leaves it
+    // at its default "".
+    std::string principal_class;
 };
 
 struct AuditQuery {

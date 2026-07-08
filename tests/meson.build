@@ -385,6 +385,9 @@ if build_server
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_on_behalf_guard.cpp', # ADR-0022 PR 1.1 reserved-key guard
+      'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-0022 PR 1.1 gRPC end-to-end enforcement
+      'unit/server/test_principal_class.cpp', # ADR-0022 PR 1.2 actor-class label
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',

@@ -116,3 +116,23 @@ A node or edge lying on many high-value attack paths, such that removing it — 
 ## Demo
 
 A demonstration of Yuzu run **live against a real fleet** — never against fabricated findings. Yuzu's cornerstone is that it never invents data ("a metric nobody reported is absent, never a fabricated zero"); that rule holds **in demos too**. Realism comes from constructing a real **environment** that genuinely exhibits a condition (a device with a real pending reboot, a really-degraded link, a really-crashing service), then **observing it live and remediating it live**. Remediation runs through the **real approval and tier/RBAC gates** — the agentic worker executes only **after a human approves**, via the same `execute_instruction`/`execute_bundle` path a customer uses; there is **no demo bypass** (a demo-only write path would violate agentic-first the same way a fabricated read does). "Take the risk" means accepting that a live run may not behave exactly like a canned script would — **not** relaxing any safety gate. A "demo" is therefore a *staged environment plus a live, fully-gated operator/agentic-worker flow over the real tools*, not a special data path: there is **no fabricated-finding mode**. Distinct from the **golden-prompt pack** (`enterprise-it-v1`), which is a prompt-evaluation fixture set, not demo output. Cuts against the retired curated/`DEMO DATA` mode (PR #1653).
+
+## Engine principal
+
+A long-lived service principal representing an external consumer of the Yuzu server — a use-case engine or an agentic worker acting as a service (ADR-0022). Authenticates with its own credentials and carries its own least-privilege RBAC grants; an engine principal holding the union of its users' permissions is a design defect. Always written "engine principal", never bare "engine" — *engine* alone is already load-bearing in this codebase for internal components (Instruction Engine, Policy Engine, Scope Engine, SparkEngine, …). Distinct from the **agent daemon** (a managed endpoint) and from a human operator's session; audited as its own `principal_class`. Acting on a specific operator's initiative requires server-issued delegation, never an engine-asserted header.
+
+## Use-case engine host (UCE)
+
+The first-party deployable that hosts use-case modules (vulnerability management first; software asset management and others later) — auth/delegation plumbing, server-sync, and a UI shell shared by all modules (ADR-0022 Decision 6). Consumes the Yuzu server exclusively through the versioned REST/MCP surface as one or more engine principals — no shared database, no co-deployment assumption, no private seam. Ships as a separate artifact from `yuzu-server` (target ship shape); customers may take, replace, or omit it. "UCE" is the execution plan's shorthand (`docs/adr-0022-execution-plan.md`); the ADR itself spells out "use-case engine host". Stores only derived domain state — findings, license positions — never a fleet copy (execution-plan Decision 6).
+
+## First-party UI
+
+Collectively, the use-case engine host's UI and the in-server admin console (ADR-0022). First-party status confers no privilege: both compose the same public, versioned APIs as any external consumer — if our UI needs a capability, it becomes an API first. The existing full dashboard is a grandfathered surface, not first-party UI in this sense.
+
+## Admin console
+
+The thin in-server surface retained under the headless-platform direction (ADR-0022 Decision 7): the bootstrap/break-glass set — enrollment and device liveness, health/readiness, RBAC and principal management, settings, audit view. The list is **closed**; adding a console surface requires amending ADR-0022. Distinct from the existing full dashboard, which remains supported and shrinks toward the console via a strangler migration, never a forced one. Must function with zero dependency on any engine being reachable.
+
+## Operator
+
+The initiating principal of an action — human **or** agentic (ADR-0022 terminology). Where a rule applies only to humans, docs say "human operator". Complements the three-way "agent" disambiguation above (agent daemon / governance agent / agentic worker): an agentic worker acting through MCP/REST is an operator; the agent daemon is never one.
