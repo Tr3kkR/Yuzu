@@ -140,7 +140,11 @@ Engine principal ids live in a reserved namespace: `engine:<slug>` (e.g.
   with a human username. This matters because `session->username` is the
   key for audit rows, the self-target guard, token ownership, and RBAC
   lookups; a collision would silently merge two identities across every one
-  of those surfaces.
+  of those surfaces. The same rejection applies to **locally created RBAC
+  group names** (groups feed role collection too); IdP-sourced group names
+  cannot be rejected at our boundary, but `principal_type` disambiguates
+  them structurally — a group named `engine:x` can never be *an engine
+  principal*, only an oddly-named group.
 - The prefix makes audit rows and access-review exports self-describing
   without a join.
 
@@ -231,27 +235,45 @@ don't need reshaping later:
 1. **Grant:** an operator, authenticated to Yuzu normally (session or
    token), requests a delegation to a named engine principal for a named
    purpose. The server issues a **delegation artifact**:
-   - opaque handle (not a self-contained JWT the engine could inspect or
-     mint against) — server-side state keyed by `jti`;
+   - opaque handle (not a self-contained JWT the engine host could inspect
+     or mint against) — server-side state keyed by `jti`;
    - **audience-bound** to one engine principal id;
    - **purpose-bound** (requested operation class recorded at issuance);
    - **short-lived** (minutes-scale TTL; single-digit default, operator
      cannot extend past a server ceiling);
    - single-use for mutating operations (`jti` consumed on redemption);
    - revocable (operator or admin can void it before expiry).
-2. **Exchange:** the engine presents *its own credential* + the artifact
-   (RFC 8693 `subject_token` = artifact, `actor_token` = engine credential
-   — the standard delegation, not impersonation, composition). The server
-   verifies both, checks the audience binding, and mints a bounded
-   delegated context.
+2. **Exchange:** the engine module presents *its own credential* + the
+   artifact (RFC 8693 `subject_token` = artifact, `actor_token` = engine
+   credential — the standard delegation, not impersonation, composition).
+   The server verifies both, checks the audience binding, re-checks the
+   engine principal's `lifecycle_state` **fail-closed**, and evaluates the
+   delegated operation. The resulting delegated context is **non-bearer**
+   — bound to the engine credential presented at exchange, never a
+   free-standing secret an attacker could exfiltrate from the engine host
+   independently — and lives at most per-request / within the artifact's
+   TTL; nothing delegated outlives the artifact.
+   **Operator authority is resolved fresh at redemption** through the
+   §4 chokepoint — never frozen at issuance time — and disabling,
+   demoting, or de-scoping the operator voids their outstanding artifacts.
+   Failed redemptions (bad audience, consumed `jti`, expired, revoked
+   operator or principal) each write a denied audit row — the primary
+   detection signal for artifact theft.
 3. **Effective authority of a delegated operation:**
 
    ```
-   engine's assignments ∩ operator's assignments ∩ operator's scope
+   engine principal's assignments ∩ operator's assignments ∩ operator's scope
    ```
 
    — an intersection, never a union; computed through the same ADR-0017
-   chokepoint (§4.3). A delegation can only ever *narrow*.
+   chokepoint (§4.3). A delegation can only ever *narrow*. The
+   intersection is taken at the **effective-decision level** — an
+   operation is permitted iff it is permitted for the engine principal
+   AND permitted for the operator, each side independently evaluated
+   under ADR-0017's (frozen-by-#1715) deny-precedence rules — never by
+   intersecting allow-assignment *rows*, which would silently drop a deny
+   row one side carries and widen the delegated decision past the
+   operator's real effective authority.
 4. **Self-asserted delegation stays rejected forever.** The Phase-1
    on-behalf-of guard (reserved header/metadata rejection) is permanent —
    ADR-0022's Interim rule survives as a standing invariant; the only
@@ -311,6 +333,14 @@ for non-HTTP writers is unaffected).
      confirm) — the window is a ceiling, not a promise.
   - At most **two** active credentials per engine principal at any moment —
     a third mint is rejected until the overlap resolves. Every step audits.
+  - **Revocation during overlap is defined, not emergent:** revoking a
+    *single* credential mid-overlap immediately invalidates that credential
+    and resolves the rotation state (the survivor is simply the principal's
+    one active credential; a fresh rotation may then begin). The
+    **compromise runbook is principal-level revoke** — one operation kills
+    *both* credentials and flips the principal's `lifecycle_state`, so an
+    operator responding to a leak never has to reason about which of two
+    credentials was the stolen one.
 - This is the platform's first rotation workflow (the gap matrix in
   `.claude/skills/auth-and-authz/SKILL.md` lists token rotation as missing
   for all types); the design is deliberately credential-generic so the
@@ -320,7 +350,7 @@ for non-HTTP writers is unaffected).
 
 **Reused, hard-locked `readonly` for v1.** Engine credentials carry
 `mcp_tier=readonly` — the creation API *rejects* any other tier while
-Decision 1's read-only/autonomous scoping holds. Rationale: the two-gate
+plan Decision 1's read-only/autonomous scoping holds. Rationale: the two-gate
 (tier-then-RBAC) ordering at ~28 MCP sites is exactly the defense-in-depth
 this principal class most needs; discarding tier for engines ("defer to
 RBAC") would remove the second gate from the widest-read-scope principal,
@@ -338,9 +368,12 @@ mutations.
   on principal-lifecycle routes, and the engine-principal lifecycle surface
   itself (create/rotate/revoke/transfer-owner) requires a **human admin
   session + MFA step-up** (same posture as the existing 11 step-up
-  surfaces). One defensive addition: those routes deny any
-  `auth_source="engine_token"` session outright (fail-closed belt to the
-  structural braces), audited as `denied`.
+  surfaces). One defensive addition: those routes deny any engine-classed
+  session outright (fail-closed belt to the structural braces), audited as
+  `denied` — keyed on the session's **principal kind** (the persisted
+  discriminator, §6), with `auth_source="engine_token"` as a second belt,
+  so a future second engine authentication path cannot silently bypass a
+  string-keyed deny.
 - **Phase 5 — re-key on effective identity.** Once delegated mutations
   exist, the guard's comparison re-keys on the **effective delegated
   identity** (ADR-0022 Decision 5's named extension): a delegated operation

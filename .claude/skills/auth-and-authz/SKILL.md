@@ -354,6 +354,11 @@ For every feature in Section 3:
 ## 5. Cross-references
 
 - **Routed reference doc:** `docs/auth-architecture.md`
+- **Engine principals & delegation design (ADR-0022 item 2b):**
+  `docs/auth-engine-principals-design.md` — third principal class, scoped
+  role assignments, RFC 8693 delegation, credential rotation/lifetime
+  ceilings; the most detailed reference for the token-rotation and
+  service-account-governance gaps in the matrix above.
 - **AuthDB review agent:** `.claude/agents/authdb.md`
 - **Security review agent:** `.claude/agents/security-guardian.md`
 - **MCP token + tier policy:** `docs/mcp-server.md`

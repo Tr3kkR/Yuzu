@@ -1079,7 +1079,9 @@ for the IdP cert in this release.
   from `admin`.
 - Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
   opaque, audience-bound, short-TTL artifact; effective authority = engine
-  ∩ operator ∩ scope; self-asserted delegation stays rejected permanently.
+  principal's assignments ∩ operator's assignments ∩ operator's scope
+  (decision-level intersection — a delegation only ever narrows);
+  self-asserted delegation stays rejected permanently.
 - Engine credentials: 90-day ceiling, overlap-pair rotation (≤2 active),
   MCP tier hard-locked `readonly` for v1.
 
