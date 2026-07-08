@@ -4103,6 +4103,20 @@ private:
 
     // -- HTML helpers ---------------------------------------------------------
 
+    // Sanitize an operator-supplied value (definition id, approval id) before
+    // it goes into a server log line: control characters — CR/LF especially —
+    // would otherwise let a caller forge additional log lines (Gate 8 LOW).
+    // Truncates for good measure; callers already substr to bound length.
+    static std::string log_safe(const std::string& s, std::size_t max = 64) {
+        std::string out;
+        out.reserve(std::min(s.size(), max));
+        for (std::size_t i = 0; i < s.size() && i < max; ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            out += (c < 0x20 || c == 0x7f) ? '?' : s[i];
+        }
+        return out;
+    }
+
     static std::string html_escape(const std::string& s) {
         std::string out;
         out.reserve(s.size());
@@ -8126,7 +8140,7 @@ private:
                 (void)audit_log(req, "approval.approve", "denied", "approval", id,
                                 result.error());
                 spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
-                             id.substr(0, 64), reviewer, result.error());
+                             log_safe(id), reviewer, result.error());
                 // htmx doesn't swap a non-2xx response, so without a trigger
                 // the denial (e.g. the self-approval block) is a silent no-op
                 // in the dashboard (#1821). HX-Trigger headers ARE processed
@@ -8177,7 +8191,7 @@ private:
                 (void)audit_log(req, "approval.reject", "denied", "approval", id,
                                 result.error());
                 spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
-                             id.substr(0, 64), reviewer, result.error());
+                             log_safe(id), reviewer, result.error());
                 nlohmann::json trigger = {
                     {"showToast", {{"message", result.error()}, {"level", "error"}}}};
                 res.set_header("HX-Trigger",
@@ -8307,14 +8321,23 @@ private:
                                 "</td>"
                                 "<td>";
                         // d.id is operator-chosen since #402 (JSON create) /
-                        // #1993 (YAML metadata.id) — attribute-encode it at
-                        // every interpolation. The store now also bounds new
-                        // ids to [A-Za-z0-9._-]{1,128}; escaping covers rows
-                        // that predate the charset gate (governance sec-M1).
+                        // #1993 (YAML metadata.id). The store now bounds NEW
+                        // ids to [A-Za-z0-9._-]{1,128}, but a row that predates
+                        // that gate may hold arbitrary text — so encode it for
+                        // the DOM at every interpolation (governance sec-M1).
+                        // The Edit control carries the id in a data-attribute
+                        // (html_escape makes it a safe attribute value) and
+                        // reads it back via this.dataset.defId, NOT string-
+                        // interpolated into the onclick JS: the browser
+                        // entity-decodes an attribute BEFORE the JS parser runs,
+                        // so a bare html_escape inside onclick="openEditor('…')"
+                        // would still let a legacy id break out of the string
+                        // and execute in the admin's session (Gate 8 SEC-1).
                         if (can_author) {
                             html += "<button class=\"btn btn-secondary btn-sm\" "
-                                    "onclick=\"openEditor('" +
-                                    html_escape(d.id) + "')\">Edit</button> ";
+                                    "data-def-id=\"" +
+                                    html_escape(d.id) +
+                                    "\" onclick=\"openEditor(this.dataset.defId)\">Edit</button> ";
                         }
                         html += "<button class=\"btn btn-danger btn-sm\" "
                                 "hx-delete=\"/api/instructions/" +
@@ -8506,7 +8529,7 @@ private:
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
                     spdlog::warn("instruction yaml update failed: id={} error={}",
-                                 def_id.substr(0, 64), result.error());
+                                 log_safe(def_id), result.error());
                     respond("Update failed: " + result.error(), false);
                     return;
                 }
@@ -8528,7 +8551,7 @@ private:
                     // denied-audit trace for duplicate-id probing.
                     bool is_conflict = is_conflict_error(result.error());
                     spdlog::warn("instruction yaml create failed: id={} error={}",
-                                 def.id.substr(0, 64), result.error());
+                                 log_safe(def.id), result.error());
                     if (is_conflict) {
                         res.status = 409;
                         (void)audit_log(req, "instruction.create", "denied",

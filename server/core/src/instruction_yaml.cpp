@@ -176,8 +176,8 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
             if (eol == std::string::npos)
                 eol = yaml_source.size();
             std::string_view line{yaml_source.data() + pos, eol - pos};
-            while (!line.empty() && (line.back() == ' ' || line.back() == '\t' ||
-                                     line.back() == '\r'))
+            while (!line.empty() &&
+                   (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
                 line.remove_suffix(1);
             if (line == "---") {
                 if (seen_content) {

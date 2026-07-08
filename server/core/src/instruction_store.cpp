@@ -399,6 +399,14 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
 std::optional<std::string> validate_definition_scope(const std::string& yaml_source) {
     if (yaml_source.empty())
         return std::nullopt;
+    // A NUL truncates the stored blob (sqlite3_bind_text(-1) stops at the
+    // first NUL), so the persisted yaml_source would silently diverge from the
+    // extracted columns and, on the signed-import path, from the
+    // signature-verified bytes. Reject at this shared create+update chokepoint
+    // so every surface (dashboard Save, JSON create/PUT, signed import) is
+    // covered, not just the dashboard validator (governance UP-2 / Gate 8).
+    if (yaml_source.find('\0') != std::string::npos)
+        return "yaml_source contains a NUL byte";
     if (yaml_source.size() > 1048576)
         return "yaml_source too large (max 1MB)";
     auto raw_scope = yaml_scan::extract_yaml_value(yaml_source, "scope");

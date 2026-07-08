@@ -142,6 +142,28 @@ TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instru
     }
 }
 
+TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepoint",
+          "[instruction_store]") {
+    // sqlite3_bind_text(-1) truncates at the first NUL, so a NUL-bearing
+    // source would persist a blob that diverges from the extracted columns
+    // (and, on the signed-import path, from the signature-verified bytes).
+    // The store rejects it for every surface, not just the dashboard
+    // validator (governance UP-2 / Gate 8).
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "Nul Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+    def.yaml_source = std::string("apiVersion: yuzu.io/v1alpha1\n") + '\0' + "kind: x\n";
+
+    auto result = store.create_definition(def);
+    REQUIRE(!result.has_value());
+    CHECK(result.error() == "yaml_source contains a NUL byte");
+}
+
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
 
 namespace {
@@ -196,9 +218,8 @@ TEST_CASE("InstructionStore: update_definition enforces the same scope validatio
     // not silently stored (the bypass governance arch-B1/UP-4 closed).
     InstructionDefinition edit = def;
     edit.id = created.value();
-    edit.yaml_source =
-        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
-        "  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: dynamic\n";
+    edit.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
+                       "  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: dynamic\n";
     auto updated = store.update_definition(edit);
     REQUIRE_FALSE(updated.has_value());
     CHECK(updated.error().find("requires assignment.mode: static") != std::string::npos);
