@@ -8140,7 +8140,7 @@ private:
                 (void)audit_log(req, "approval.approve", "denied", "approval", id,
                                 result.error());
                 spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, result.error());
+                             log_safe(id), reviewer, log_safe(result.error(), 256));
                 // htmx doesn't swap a non-2xx response, so without a trigger
                 // the denial (e.g. the self-approval block) is a silent no-op
                 // in the dashboard (#1821). HX-Trigger headers ARE processed
@@ -8191,7 +8191,7 @@ private:
                 (void)audit_log(req, "approval.reject", "denied", "approval", id,
                                 result.error());
                 spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, result.error());
+                             log_safe(id), reviewer, log_safe(result.error(), 256));
                 nlohmann::json trigger = {
                     {"showToast", {{"message", result.error()}, {"level", "error"}}}};
                 res.set_header("HX-Trigger",
