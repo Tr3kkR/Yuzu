@@ -1058,7 +1058,7 @@ Not implemented. Agent-side application usage metering (launch tracking, run tim
 
 ### 27.3 License Entitlements & Compliance :x: `T2`
 
-Not implemented. Entitlement records (product, purchased_seats, license_type). Compliance calculation: installed vs. entitled with over/under-licensed reporting.
+Not implemented. Entitlement records (product, metric-typed quantity — seats in v1 — license_type, term/renewal, cost) from five sources. Compliance calculation: installed vs. entitled with over/under-licensed reporting (ADR-0024 Decision 12; non-seat metrics stored faithfully, evaluated per the ADR's Direction ladder).
 
 ### 27.4 Software Tags :x: `T2`
 

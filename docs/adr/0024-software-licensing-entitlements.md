@@ -2,8 +2,8 @@
 status: proposed
 date: 2026-07-06
 owner: Alex Young
-deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06
-scope: capability §27 — agent licence discovery, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, and the per-user privacy carve-out
+deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06; industry-direction review 2026-07-08 (metric-typed quantities, Java/SWID surfaces, Direction section)
+scope: capability §27 — agent licence discovery, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, the per-user privacy carve-out, and the recorded target-state direction
 context-refs: capability §27 issues #264–#267; #266 (entitlement-register reversal); ADR-0017 flip-wave (#1634, #1715); superseded standalone ADR PR #1870 (rev 1–5 review history); deferred — #1921 (KEK operator surface), #1922 (oidc_client_secret gap), #1923 (round-3 review items)
 ---
 
@@ -72,8 +72,12 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
   *observed on endpoints* vs what is *purchased*.
 - **Effective licence state** — the state (including lapse) the server *derives* from
   agent-reported facts against server-now; not a raw agent field.
-- **Entitlement** — a purchased right (seats, type, term, renewal, cost) from a
-  manual, CSV, connector, or agent source.
+- **Entitlement** — a purchased right (a metric-typed quantity — seats in v1 —
+  plus type, term, renewal, cost) from a manual, CSV, connector, or agent source.
+- **Licence metric** — the unit an entitlement is denominated in (`seat`, `core`,
+  `processor`, `employee`, `token`, …). The industry is moving off device-install
+  counts; the schema is metric-typed from birth (Decision 12) even though the v1
+  evaluator computes seat math only.
 - **Unentitled** — a product with discovered licences but no entitlement data; never
   reported as "compliant." **Unreported** — an asset with no usage data; never
   reported as "unused."
@@ -98,10 +102,18 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    not). Surfaces v1: Windows WMI `SoftwareLicensingProduct` (own bounded COM, never
    `WBEM_INFINITE`), Office ClickToRun registry, an extensible `ProbeSpec` table (MS
    server products, Autodesk, security/backup agents, VMware, open-source
-   classification), and **per-user hives** (incl. `RegLoadKey` of offline
+   classification, and **Java runtimes** — vendor/distribution/version, Oracle JDK
+   vs the OpenJDK builds, the single most audit-relevant probe in the current
+   climate: the per-employee Java metric plus download-log enforcement makes "which
+   Java is on which machine" the first question every audited estate is asked), and
+   **per-user hives** (incl. `RegLoadKey` of offline
    `NTUSER.DAT`); Linux `rpm`/dpkg DEP-5 declared licence, RHEL entitlement certs,
-   FlexLM `.lic` expiry; macOS `_MASReceipt` + machine-scope vendor plists. Adding a
-   vendor later is one `ProbeSpec` row. Vocabularies are **closed and
+   FlexLM `.lic` expiry; macOS `_MASReceipt` + machine-scope vendor plists; and on
+   all three OSes **ISO 19770-2 SWID tag files** (`*.swidtag` in the standard tag
+   directories) — a cheap, standards-based surface whose parsed vendor artefacts
+   qualify for `authoritative` confidence and which the leading commercial suites
+   ingest as first-class recognition evidence. Adding a vendor later is one
+   `ProbeSpec` row. Vocabularies are **closed and
    unknown-preserving** (the plugin never fabricates): `license_type`, `status`,
    `source`, and a `confidence` of `authoritative | probable | heuristic`
    (`authoritative` only from an OS/vendor licensing API or a parsed vendor artefact).
@@ -180,10 +192,12 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    **effective licence state including lapse against server-now** — so a device that
    *stopped syncing* before its licence lapsed still shows `expired`. Non-negotiable
    honesty rules: discovered-only products stay `unentitled`, **never** "compliant";
-   reclamation's absent-usage state is **Unreported, not Unused**; unknown seat counts
-   are `NULL`, never a fabricated zero; multi-source seat sums keep the **per-source
-   breakdown visible** (double-counting is shown, not hidden); the "installed but
-   licence-unreported" delta is shown, not hidden; and discovery `confidence` and
+   reclamation's absent-usage state is **Unreported, not Unused**; unknown quantities
+   (seats, cores, …) are `NULL`, never a fabricated zero; a non-seat-metric
+   entitlement is **never coerced into seat math** (Decision 12 — its compliance is
+   `unknown` until an evaluator for that metric exists); multi-source seat sums keep
+   the **per-source breakdown visible** (double-counting is shown, not hidden); the
+   "installed but licence-unreported" delta is shown, not hidden; and discovery `confidence` and
    `unknown` states are first-class throughout. Verdict *freshness* is part of the same
    posture: compliance surfaces carry the rollup's as-of time and evaluator staleness is
    observable rather than silent — a wedged keep-last-good evaluator serving stale
@@ -270,7 +284,14 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     an unsalted `sha256/12`, which a low-entropy name like `jsmith` makes trivially
     reversible). `collect` sends the raw name (opt-in); `omit` suppresses the
     *identifier*, not the *probe* (`user_scope` still distinguishes per-user
-    discoverys). GDPR posture stated plainly: a hashed `user_ref` is still personal data
+    discoveries). The per-agent key is a deliberate privacy property with a stated
+    capability limit: pseudonyms **do not correlate across devices** (the same human
+    on two machines yields two unrelated `user_ref`s), so `hash` mode can never feed
+    fleet-wide named-user seat math — the `assigned_vs_purchased` basis stays
+    connector-fed at tenant level (Decision 13), and any future cross-device user
+    dimension (IdP-anchored identity for named-user metrics, see Direction) is a new
+    decision with its own privacy review, never a quiet reuse of `user_ref`.
+    GDPR posture stated plainly: a hashed `user_ref` is still personal data
     (Recital 26); erasure is knob-flip to `omit` (full-replaced within one 24 h cycle
     for syncing agents; offline agents purge on reconnect or via decommission) plus the
     **agent-decommission cascade — the per-store `delete_agent`
@@ -298,13 +319,27 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     identity keys derive deterministically from the wire. Identity/upsert per source
     (manual = server UUID; csv = external_id or content hash, **upsert-by-key**;
     graph = `skuId` full-set upsert with soft-retire; flexlm/kms = host-derived keys).
+    **Quantity model — metric-typed from birth, never a bare seat column.** Every
+    entitlement row carries a `metric` (closed, unknown-preserving vocabulary, the
+    same treatment as Decision 2's discovery enums) plus a numeric `quantity`. v1
+    ships the vocabulary the market has already moved to — `seat | core | processor |
+    employee | token | unknown` — but the **v1 evaluator computes compliance for
+    `seat` entitlements only**; a non-seat row is stored, listed, and summed
+    faithfully with compliance basis `none` and verdict `unknown` until an evaluator
+    for that metric exists (per-core needs the hardware-fact join, per-employee needs
+    an operator-supplied headcount — both recorded in Direction). A core count is
+    never coerced into seats; that is the Decision 7 honesty rule applied at the
+    schema. This is deliberately a schema-birth decision on a born-on-PG store:
+    adding non-seat *evaluation* later is evaluator work, while retrofitting a
+    metric-typed quantity under a shipped `purchased_seats` integer would be a
+    breaking migration of the capability's central table.
     **Field ownership:** connector/agent writes touch only observed fields and **never
     clobber operator annotations** (`cost_*`, `contract_ref`, `po_ref`, `notes`);
     connector-owned rows are immutable in GUI/REST (409) *except* those annotation
     fields. Compliance vocabulary `compliant | over_deployed | under_used | unentitled |
     unknown` with the comparison **basis recorded per product**
     (`installed_vs_purchased | assigned_vs_purchased | inuse_vs_total | none`); NULL
-    seats ⇒ compliance `unknown`. *Rejected: replace-by-import CSV semantics —
+    quantity ⇒ compliance `unknown`. *Rejected: replace-by-import CSV semantics —
     overlapping files would duplicate rows and destroy annotations; imports never
     delete.*
 
@@ -379,6 +414,86 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     excluded in v1 (Decision 6). MFA step-up on §27 endpoints is excluded (Decision 9).
     Explicit source **precedence** for double-counted seats is excluded — the per-source
     breakdown is shown, not resolved, and explicit precedence can layer on later.
+    Exclusions that are *out of v1 but inside the capability's aim* — non-seat metric
+    evaluation, product use rights, catalog content operations, SaaS discovery
+    breadth, closed-loop reclamation, audit-evidence export — are recorded with their
+    rationale and layering seams in the **Direction** section below, so the v1
+    boundary is a stated waypoint, not a silent ceiling.
+
+## Direction — the target state this v1 is the foundation for
+
+The aim of this capability is a **first-class software licensing & entitlement
+product measured against the leading commercial SAM suites** (deliberately unnamed,
+per the parity plan's convention), not a checkbox feature. Four industry through-lines
+(2024–2026) shape the ladder: licence metrics are **decoupling from device installs**
+(per-employee, named-user, per-core, consumption credits); the **audit climate is the
+buying trigger** (a majority of estates audited annually, with the sharpest activity
+on Java, virtualization, and the largest desktop/datacenter publishers); analysts attribute the SAM tool
+market's stagnation to **data-quality disappointment** — which makes Decision 7's
+honesty commitments this product's wedge, not a nicety; and SAM, SaaS management, and
+FinOps are **converging into one spend-and-compliance discipline**. Each item below
+names the v1 seam it layers onto. These are recorded aims with rationale — each
+becomes its own decision (ADR or issue) when picked up, and none licenses scope creep
+into the v1 slices.
+
+- **Non-seat metric evaluation** — the evaluator ladder over Decision 12's
+  metric-typed schema: `core`/`processor` first (joins the hardware facts the
+  inventory planes already collect; datacenter sub-capacity additionally needs a
+  VM→host topology answer), then `employee` (an operator-supplied headcount input —
+  the Java-style metric is an HR number, not an endpoint fact), then `token`
+  consumption with burn-down. Schema work: none — that is what Decision 12 bought.
+- **Product use rights** — downgrade, second-use, licence-mobility, virtualization
+  and DR rights applied as curated content at evaluation time (registry + evaluator
+  seam). Until this lands, verdicts on enterprise-agreement estates are conservative
+  approximations and SLE surfaces must present them as such — the leading suites
+  carry use-rights libraries at ~10⁶ scale, and this is the largest single gap
+  between v1 math and a defensible enterprise ELP.
+- **Catalog content operations** — the commercial moat is curated content (millions
+  of products/SKUs, daily updates), not matching algorithms. Decision 6's alias layer
+  (`method` + `confidence`) is the import seam: shareable curation packs, alias
+  feeds, and SKU→product mappings (which also upgrade CSV/PO ingestion from
+  product-key matching to purchase-order automation) layer on without redesign.
+- **SaaS connector breadth and shadow-SaaS discovery** — further connectors under
+  Decision 12's per-source identity pattern, and **SSO/IdP sign-in-log discovery**
+  as a new source class (the discovery method the SaaS-management market
+  standardised on). The analyst category has folded SaaS management into SAM;
+  tenant-level M365 is the correct v1 anchor, not the destination.
+- **An IdP-anchored user dimension for named-user metrics** — Decision 11's
+  per-agent pseudonyms deliberately cannot correlate across devices, so fleet-wide
+  named-user math requires a directory-sourced identity plane. Explicitly a future
+  decision with its own privacy review and works-council posture; never a quiet
+  extension of `user_ref`.
+- **Licence-server live usage and denials** — v1 reads FlexLM `.lic` statics;
+  the engineering-software segment expects checkout/denial telemetry (FlexLM-class,
+  then RLM/Sentinel) feeding `inuse_vs_total` — denial events are the renegotiation
+  evidence buyers act on. Extends the `agent_*` entitlement sources and the usage
+  plane; no new transport.
+- **EOL/EOS and vulnerability correlation** — end-of-support dates and advisory
+  joins on `ProductRegistryStore` rows, converging with the vulnerability-scan
+  engine design (PR #1206) rather than duplicating it. The converged
+  asset-intelligence category treats this as table stakes; the registry is the
+  natural join point.
+- **Closed-loop reclamation** — the structural beat: incumbent suites *integrate
+  outward* to third-party deployment tools to act on reclamation candidates; Yuzu
+  **is** the execution plane. Candidates feed the existing instruction/approval
+  machinery (operator-gated, preflight-checked) to uninstall or downgrade — and
+  `prohibited` product tags (§27.4) become Guardian-enforceable policy, which no
+  standalone SAM product can do. v1's stop-at-candidates scope is deliberate
+  sequencing, not the end state.
+- **Audit-evidence export** — a signed, timestamped licence-position snapshot with
+  its evidence chain (discovery records, entitlement provenance, evaluator inputs),
+  built on the existing audit-log machinery. The audit climate makes "regenerate
+  what we told the auditor, as of that date" a first-class artefact.
+- **FinOps alignment** — cost rollups over the `cost_*` annotations and a
+  FOCUS-format export so licence spend joins cloud spend in the customer's existing
+  FinOps tooling, following the SAM/FinOps convergence rather than building a
+  parallel cost product.
+
+Sequencing signal (not a commitment): the metric ladder and use rights are what
+unblock enterprise datacenter estates; closed-loop reclamation and Guardian
+enforcement are where Yuzu beats rather than meets. The agentic surface needs no
+direction entry — Decision 9 ships MCP parity from day one, which the incumbents are
+still retrofitting.
 
 ## Consequences
 
@@ -390,8 +505,13 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
   and agent-derived records). The two planes stay distinct so discovered "truth on the
   endpoint" is never hand-edited, and purchased-vs-deployed math is claimed only
   where entitlement data exists — discovered-only products stay honestly `unentitled`.
-- Multi-source seat sums keep the per-source breakdown visible; unknown seats are
-  `NULL`, not a fabricated zero; absent usage is *Unreported*, never *Unused*.
+- Multi-source seat sums keep the per-source breakdown visible; unknown quantities
+  are `NULL`, not a fabricated zero; absent usage is *Unreported*, never *Unused*.
+- Entitlement quantities are metric-typed from schema birth (`seat | core |
+  processor | employee | token | unknown`), so the market's shift off
+  device-install metrics lands as evaluator work on the Direction ladder, never as
+  a breaking migration of the capability's central table. The v1 evaluator claims
+  seat math only, and says so.
 - Four born-on-Postgres stores join the ladder; the server refuses to boot if their
   migrations fail, consistent with the substrate posture.
 - A new top-level SLE nav entry costs edits to the hand-duplicated nav copies
