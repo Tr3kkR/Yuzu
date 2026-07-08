@@ -85,11 +85,11 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
-| **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
+| **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` §7 specs overlap-pair rotation (bounded idempotent mint, window-floor, last-used tracking); scoped to engine credentials first (plan PR 4.3), deliberately credential-generic for later human-token adoption. |
 | **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
-| **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
+| **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` specs the `engine` principal type: dedicated identity store, no login surface, credential-only auth, mandatory rotation, default-deny scoped grants. Implementation lands via plan PRs 4.1–4.5. |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
 | **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **SHIPPED** — `GET /api/v1/audit/auth-sample` (`rest_api_v1.cpp`); `AuditQuery.action_prefixes` + `random_sample` (`audit_store.{hpp,cpp}`); scoped to `auth.`/`mfa.`/`session.`; `AuditLog:Read`; export audited as `audit.auth_sample.exported` |
 | **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. CSR API, lifecycle (issue / renew / revoke), audit chain. Today operators must bring their own PKI for both surfaces. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **MISSING** |
@@ -285,18 +285,21 @@ matches the customer ask.
 
 ### Priority 2 — long-tail polish
 
-10. **API token rotation workflow** — pair-of-tokens overlap window in the
-    dashboard; "Rotate" creates a new token while the old keeps working
-    until the operator confirms cutover.
+10. ~~**API token rotation workflow**~~ **DESIGNED** — `docs/auth-engine-principals-design.md`
+    §7 (overlap-pair, engine credentials first, plan PR 4.3); not yet built.
 11. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
     (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
     (`rest_api_v1.cpp`) both surface owner / created / last-used columns from
     `api_token_store.cpp:325-345`. (The skill matrix previously listed this
     as PARTIAL — it has in fact shipped.)
 12. **Periodic access-review export** — JSON/CSV of `(user, role, last_login)`
-    triples plus an attestation upload endpoint.
-13. **Service-account principal type** — distinct from human users, no
-    login surface, only token auth, mandatory rotation.
+    triples plus an attestation upload endpoint. Must enumerate
+    `principal_type IN (user, group, engine)` once the engine-principal
+    design ships — see `docs/auth-engine-principals-design.md` §10.
+13. ~~**Service-account principal type**~~ **DESIGNED** — the `engine`
+    principal class in `docs/auth-engine-principals-design.md` (dedicated
+    identity store, no login surface, credential-only auth, mandatory
+    rotation); not yet built.
 
 ### Priority 3 — defer
 
