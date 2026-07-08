@@ -37,6 +37,14 @@ COMPOSE_FILE="deploy/docker/docker-compose.demo.yml"
 PROJECT="yuzu-demo"
 DEMO_DIR="${YUZU_DEMO_DIR:-/tmp/yuzu-demo}"
 
+# DEMO_FULL=1 layers the observability stack (Prometheus/ClickHouse/Grafana)
+# and the Cedar & Vale three-tier app (Envoy→node→Postgres) onto the base
+# sales demo — turning it into the full UAT-grade observability + fleet-viz
+# stack. Overlays are applied via extra `-f` files in dc().
+DEMO_FULL="${DEMO_FULL:-0}"
+OBS_OVERLAY="deploy/docker/docker-compose.demo.observability.yml"
+CV_OVERLAY="deploy/docker/docker-compose.demo.cedar-vale.yml"
+
 # ── Defaults / config ─────────────────────────────────────────────────────
 ADMIN_USER="admin"
 ADMIN_PASS="adminpassword1"
@@ -58,11 +66,11 @@ derive_owner() {
 }
 REGISTRY="${YUZU_REGISTRY:-ghcr.io/$(derive_owner)}"
 
-# Host arch -> vcpkg triplet (for --build).
+# Host arch -> vcpkg triplet + buildx platform (for --build).
 case "$(uname -m)" in
-  arm64|aarch64) TRIPLET="arm64-linux" ;;
-  x86_64|amd64)  TRIPLET="x64-linux" ;;
-  *) TRIPLET="x64-linux" ;;
+  arm64|aarch64) TRIPLET="arm64-linux"; PLATFORM="linux/arm64" ;;
+  x86_64|amd64)  TRIPLET="x64-linux";   PLATFORM="linux/amd64" ;;
+  *) TRIPLET="x64-linux"; PLATFORM="linux/amd64" ;;
 esac
 
 # ── Pretty output ─────────────────────────────────────────────────────────
@@ -77,13 +85,17 @@ fail() { printf "${C_R}[xx]${C_0} %s\n" "$*"; }
 # parses every service (incl. agent) on any subcommand, so it must be set even
 # for `up server gateway`, `down`, and `ps`.
 dc() {
+  local fargs=(-f "$COMPOSE_FILE")
+  if [ "$DEMO_FULL" = "1" ]; then
+    fargs+=(-f "$OBS_OVERLAY" -f "$CV_OVERLAY")
+  fi
   DEMO_SERVER_CONFIG="$DEMO_DIR/yuzu-server.cfg" \
   DEMO_GATEWAY_CONFIG="$REPO_ROOT/deploy/docker/demo-gateway-sys.config" \
   YUZU_VERSION="$YUZU_VERSION" \
   YUZU_REGISTRY="$REGISTRY" \
   DEMO_AGENT_COUNT="$DEMO_AGENT_COUNT" \
   YUZU_ENROLLMENT_TOKEN="${YUZU_ENROLLMENT_TOKEN:-stub}" \
-    docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+    docker compose -p "$PROJECT" "${fargs[@]}" "$@"
 }
 
 # Chiselled demo images are published under a -chisel repo suffix so they never
@@ -96,20 +108,37 @@ img_pg() { printf '%s/yuzu-postgres:%s' "$REGISTRY" "$YUZU_VERSION"; }
 
 # ── Image acquisition ──────────────────────────────────────────────────────
 build_images() {
-  info "Building chiselled Ubuntu 26.04 images ($TRIPLET) tagged $YUZU_VERSION..."
-  DOCKER_BUILDKIT=1 docker build -t "$(img server)"  --build-arg TRIPLET="$TRIPLET" \
+  info "Building chiselled Ubuntu 26.04 images ($PLATFORM) tagged $YUZU_VERSION via buildx..."
+  docker buildx build --platform "$PLATFORM" --load -t "$(img server)" --build-arg TRIPLET="$TRIPLET" \
     -f deploy/docker/Dockerfile.server.chisel  .
-  DOCKER_BUILDKIT=1 docker build -t "$(img agent)"   --build-arg TRIPLET="$TRIPLET" \
+  docker buildx build --platform "$PLATFORM" --load -t "$(img agent)" --build-arg TRIPLET="$TRIPLET" \
     -f deploy/docker/Dockerfile.agent.chisel   .
-  DOCKER_BUILDKIT=1 docker build -t "$(img gateway)" \
+  docker buildx build --platform "$PLATFORM" --load -t "$(img gateway)" \
     -f deploy/docker/Dockerfile.gateway.chisel .
-  DOCKER_BUILDKIT=1 docker build -t "$(img_pg)" \
+  docker buildx build --platform "$PLATFORM" --load -t "$(img_pg)" \
     -f deploy/docker/Dockerfile.postgres       .
   ok "Built $(img server), $(img gateway), $(img agent), $(img_pg)"
+
+  if [ "$DEMO_FULL" = "1" ]; then
+    info "Building Cedar & Vale tier images (Envoy/node/Postgres)..."
+    # The tier Dockerfiles COPY the agent binary from yuzu-agent-viz-uat:latest.
+    # Reuse the chiselled agent we just built (same trixie glibc, same
+    # /usr/local/bin/yuzu-agent + lib + plugins layout) instead of a separate
+    # full agent build.
+    docker tag "$(img agent)" yuzu-agent-viz-uat:latest
+    DOCKER_BUILDKIT=1 docker build -t yuzu-cv-db:latest       -f deploy/docker/cedar-vale/Dockerfile.tier-db       .
+    DOCKER_BUILDKIT=1 docker build -t yuzu-cv-app:latest      -f deploy/docker/cedar-vale/Dockerfile.tier-app      .
+    DOCKER_BUILDKIT=1 docker build -t yuzu-cv-frontend:latest -f deploy/docker/cedar-vale/Dockerfile.tier-frontend .
+    ok "Built yuzu-cv-db, yuzu-cv-app, yuzu-cv-frontend"
+  fi
 }
 
 images_present_locally() {
-  docker image inspect "$(img server)" "$(img gateway)" "$(img agent)" "$(img_pg)" >/dev/null 2>&1
+  docker image inspect "$(img server)" "$(img gateway)" "$(img agent)" "$(img_pg)" >/dev/null 2>&1 || return 1
+  if [ "$DEMO_FULL" = "1" ]; then
+    docker image inspect yuzu-cv-db:latest yuzu-cv-app:latest yuzu-cv-frontend:latest >/dev/null 2>&1 || return 1
+  fi
+  return 0
 }
 
 ensure_images() {
@@ -202,9 +231,15 @@ cmd_start() {
     ok "Reusing existing server config (--keep)"
   fi
 
-  # Phase 1: server + gateway (stub token).
-  info "Starting server + gateway..."
-  dc up -d server gateway
+  # Phase 1: server + gateway (stub token). depends_on pulls in postgres
+  # (+ clickhouse under DEMO_FULL); prometheus/grafana are independent.
+  if [ "$DEMO_FULL" = "1" ]; then
+    info "Starting server + gateway + observability (Prometheus/ClickHouse/Grafana)..."
+    dc up -d server gateway prometheus grafana
+  else
+    info "Starting server + gateway..."
+    dc up -d server gateway
+  fi
   wait_for_url "http://localhost:8080/login"    "server dashboard" 120
   wait_for_url "http://localhost:8081/healthz"  "gateway health"   90
 
@@ -227,9 +262,16 @@ cmd_start() {
   chmod 600 "$DEMO_DIR/enrollment-token" "$DEMO_DIR/cookies.txt" 2>/dev/null || true
   ok "Enrollment token issued"
 
-  # Phase 3: agents (scaled). deploy.replicas honours DEMO_AGENT_COUNT.
-  info "Starting $DEMO_AGENT_COUNT agent client(s)..."
-  YUZU_ENROLLMENT_TOKEN="$token" dc up -d agent
+  # Phase 3: agents (scaled) + Cedar & Vale tiers, all with the real token.
+  # deploy.replicas honours DEMO_AGENT_COUNT; the three tiers each co-host an
+  # agent so they register as yuzu-frontend / yuzu-app / yuzu-db.
+  if [ "$DEMO_FULL" = "1" ]; then
+    info "Starting $DEMO_AGENT_COUNT client agent(s) + Cedar & Vale tiers..."
+    YUZU_ENROLLMENT_TOKEN="$token" dc up -d agent cv-db cv-app cv-frontend
+  else
+    info "Starting $DEMO_AGENT_COUNT agent client(s)..."
+    YUZU_ENROLLMENT_TOKEN="$token" dc up -d agent
+  fi
 
   info "Waiting for agent registration..."
   local waited=0 reg=0
@@ -254,6 +296,13 @@ cmd_start() {
   echo "  Gateway:    http://localhost:8081/healthz | http://localhost:9568/metrics"
   echo "  Join more:  point a native yuzu-agent at  <host>:50051  with token in"
   echo "              $DEMO_DIR/enrollment-token"
+  if [ "$DEMO_FULL" = "1" ]; then
+    echo "  Fleet Viz:  http://localhost:8080/viz/fleet   (blue-tube topology)"
+    echo "  Cedar&Vale: http://localhost:8088            (impress.js deck via Envoy)"
+    echo "  Grafana:    http://localhost:3000            (admin / admin)"
+    echo "  Prometheus: http://localhost:9090"
+    echo "  Fire curl:  bash scripts/demo-fire-traffic.sh   (light client→envoy tubes)"
+  fi
   echo ""
 }
 
