@@ -265,7 +265,10 @@ std::string dangerous_enforce_in_spec(const std::string& spec_json) {
     if (!spec.is_object() || !spec.contains("assertion") || !spec["assertion"].is_object())
         return {};
     const auto& assertion = spec["assertion"];
-    const std::string atype = assertion.value("type", std::string{});
+    // str_param, not json::value(): value() throws type_error.302 on a PRESENT
+    // non-string "type", and this gate must be total over arbitrary bytes — it
+    // runs unguarded at the push chokepoint (#1946).
+    const std::string atype = str_param(assertion, "type");
     if (!assertion.contains("params") || !assertion["params"].is_object())
         return {};
     const auto& params = assertion["params"];

@@ -122,6 +122,16 @@ stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret
 (fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
 returns false and self-hosted jobs are skipped with a clear reason.
 
+As of #1978, preflight also emits a `code_changed` output (from
+`scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
+`&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
+matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
+`macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
+(a top-level-skipped matrix job emits none of its inner check names), so a
+`docs-required-checks` stub emits those exact names as success when
+`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
+the `push:` trigger keeps its docs `paths-ignore`.
+
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
 ADR-0006 decision 8: every tier that runs server tests gets a real

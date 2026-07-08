@@ -64,6 +64,10 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 // registry), keeping this function pure. Without M4's filtering, every agent
 // received every enabled rule, so a Linux box was handed Windows registry guards
 // (wasted bandwidth + G11 "errored" noise).
+//
+// Total over arbitrary stored bytes: a rule row with a malformed (present but
+// non-string) spark/assertion/remediation `type` marshals to an inert empty
+// type rather than throwing — the fan-out never aborts on one bad row (#1946).
 ::yuzu::guardian::v1::GuaranteedStatePush
 build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_view agent_os,
                  const std::function<bool(const std::string& scope_expr)>& in_scope,

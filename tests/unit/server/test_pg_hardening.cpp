@@ -41,6 +41,31 @@ std::string setting(PGconn* conn, const char* name) {
     return PQgetvalue(r.get(), 0, 0);
 }
 
+// A PgPool connects lazily on the first acquire() (pg/pg_pool.hpp lazy-connect
+// design); valid() only proves the DSN parsed and carries no connectivity
+// guarantee. On a shared CI Postgres cluster a transient connect blip
+// (max_connections pressure, loopback refusal) makes that first acquire() return
+// an empty lease and arm the connect breaker (~200ms..5s), which then fails fast
+// the next attempt. For tests whose subject is pool SEMANTICS — not connect
+// reliability — ride out a transient blip with a bounded retry; on final failure
+// surface the real libpq reason (pool.last_error()) so a genuine outage is
+// self-explaining instead of a bare empty-lease assertion. Deliberate-failure
+// tests (unreachable endpoint, throwing observer) keep the raw acquire(). (#1961)
+[[nodiscard]] PgPool::Lease acquire_or_explain(PgPool& pool,
+                                               std::chrono::seconds budget = 10s) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    PgPool::Lease lease = pool.acquire();
+    while (!lease && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(250ms); // let the connect-breaker window lapse
+        lease = pool.acquire();
+    }
+    if (!lease)
+        UNSCOPED_INFO("PgPool::acquire failed after ~"
+                      << budget.count() << "s of retries — last_error: " << pool.last_error()
+                      << " (connect_breaker_open=" << pool.connect_breaker_open() << ")");
+    return lease;
+}
+
 } // namespace
 
 TEST_CASE("PgPool injects statement_timeout and lock_timeout GUCs", "[pg][hardening]") {
@@ -50,7 +75,7 @@ TEST_CASE("PgPool injects statement_timeout and lock_timeout GUCs", "[pg][harden
                  .statement_timeout_ms = 7000,
                  .lock_timeout_ms = 3000}};
     REQUIRE(pool.valid());
-    auto lease = pool.acquire();
+    auto lease = acquire_or_explain(pool);
     REQUIRE(static_cast<bool>(lease));
     // Postgres renders integer-ms settings in a human unit.
     CHECK(setting(lease.get(), "statement_timeout") == "7s");
@@ -61,7 +86,7 @@ TEST_CASE("PgPool injects TCP keepalives", "[pg][hardening]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 1, .keepalives_idle_s = 45}};
     REQUIRE(pool.valid());
-    auto lease = pool.acquire();
+    auto lease = acquire_or_explain(pool);
     REQUIRE(static_cast<bool>(lease));
     // libpq exposes the negotiated keepalive via PQparameterStatus only for
     // server params; assert the connection is live (keepalive is a socket
@@ -118,8 +143,8 @@ TEST_CASE("PgPool acquire-wait observer fires on a successful checkout", "[pg][h
     };
     PgPool pool{std::move(opts)};
     REQUIRE(pool.valid());
-    { auto l = pool.acquire(); REQUIRE(static_cast<bool>(l)); }
-    { auto l = pool.acquire(); REQUIRE(static_cast<bool>(l)); }
+    { auto l = acquire_or_explain(pool); REQUIRE(static_cast<bool>(l)); }
+    { auto l = acquire_or_explain(pool); REQUIRE(static_cast<bool>(l)); }
     CHECK(waits.load() == 2);
     // A reachable database never arms the breaker, so /readyz stays ready even
     // while the pool is busy (gov UP-2: saturation must not evict a healthy
@@ -158,15 +183,36 @@ TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][c
         auto pool = std::make_unique<PgPool>(PgPool::Options{.conninfo = db.dsn(), .size = 2});
         REQUIRE(pool->valid());
         std::atomic<bool> released{false};
+        std::atomic<bool> holding{false};
         std::thread holder([&] {
-            auto lease = pool->acquire(); // holds a connection...
-            REQUIRE(static_cast<bool>(lease));
-            std::this_thread::sleep_for(200ms); // ...then returns it
-            released.store(true);
+            // Assertions stay on the MAIN thread — Catch2 macros are not
+            // thread-safe; the holder only SIGNALS state through atomics.
+            auto lease = acquire_or_explain(*pool);
+            if (lease) {
+                holding.store(true);                // lease is now HELD...
+                std::this_thread::sleep_for(200ms); // ...across the reset()...
+                released.store(true);               // ...then returns at scope exit
+            }
         });
-        std::this_thread::sleep_for(50ms); // ensure the holder has the lease
-        pool.reset();                      // dtor blocks until the lease returns
-        holder.join();
+        // Barrier, NOT a bare sleep: destroy the pool only once the holder
+        // genuinely HOLDS a lease. A fixed sleep raced two ways — if
+        // acquire_or_explain retried past a transient connect blip, or the holder
+        // thread merely scheduled late, the pool could be reset while the holder
+        // holds NO lease and is about to call acquire() again: a use-after-free on
+        // the freed pool. Waiting on `holding` guarantees leased_==1 at reset time,
+        // which is the exact precondition CH-9 exists to test. Cap the wait above
+        // acquire_or_explain's 10s budget but under the 15s watchdog; the fixture
+        // connect-probe makes a genuine miss almost impossible. WALL-CLOCK bounded,
+        // never an iteration count: on Windows the ~15.6ms default timer resolution
+        // stretches each 5ms sleep, so an N-iteration loop would overrun the
+        // watchdog (the MSVC steady_clock-granularity class behind flake #473).
+        const auto barrier_end = std::chrono::steady_clock::now() + 12s;
+        while (!holding.load() && std::chrono::steady_clock::now() < barrier_end)
+            std::this_thread::sleep_for(5ms);
+        if (holding.load())
+            pool.reset();          // lease held → the dtor MUST block until it returns
+        holder.join();             // always join before scope exit — never a dangling thread
+        REQUIRE(holding.load());   // (main-thread assert) the holder did hold a lease
         CHECK(released.load());
     });
     // Watchdog: a correct pool completes well under the deadline; a deadlock

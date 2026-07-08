@@ -1,15 +1,15 @@
 # Test Coverage Tracking
 
-Last updated: 2026-07-03
+Last updated: 2026-07-06
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 20 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
-**Totals:** 49 test files (+1: `test_installed_apps_inventory.cpp`, blob contract v2). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
+**Totals:** 52 test files (+3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
 
 Run all tests: `meson test -C build-linux --print-errorlogs`
 
@@ -28,6 +28,9 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_filesystem_read.cpp` | Filesystem plugin | validate_path, read parameters, CRLF stripping, binary detection, pagination |
 | `test_string_utils.cpp` | Shared utilities | icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line |
 | `test_vuln_rules.cpp` | Vuln scan rules | compare_versions, CveRule data integrity, CVE matching logic |
+| `test_spark_engine.cpp` | SparkEngine core (ADR-0021) | timer wheel + multi-due-tick no-double-lock regression, arm-dedup fan-out, per-subscriber startup one-shot, stuck-consumer isolation, bounded-queue drop-oldest + drop identity, bounded-shutdown detach (UP-1), inline duration watchdog + throw-survival, disarm, disk breach/recovery edges, lifecycle, register_consumer-vs-stop() race — deterministic hook-forced interleaving (Tr3kkR finding, PR #1927 review) + a real-concurrency stress complement (quality-engineer finding, PR #1927 review) |
+| `test_spark_disk.cpp` | Disk spark decision fns | latch breach/recovery, invalid-reading-keeps-latch (UP-5), threshold + min-free logic |
+| `test_spark_mechanism.cpp` | `ISparkMechanism` seam + File/Registry/Service | arm/dedup/fan-out/disarm-teardown via a FakeMechanism, watch-failure whole-key rollback (B1), pre-start-replay fault, fault-channel transitions (B1), inline re-arm no-deadlock (TRAP 2), unregister_consumer unwatches a watch its removal empties (Tr3kkR finding, PR #1927 review); Windows-only (`#ifdef _WIN32`) real-mechanism smoke for File/Registry + delete/recreate resilience + inline µs-dispatch latency + disarm-then-rearm watch retention (PR #1927 review) + ancestor-walk termination on a nonexistent drive root (PR #1927 review); real-mechanism smoke for Service on both Windows (SCM) and Linux with libsystemd (`#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)`) — fd/thread collapse, churn, live-transition, inline latency, key-coalescing (two engine keys folding onto one unit/service each still emit independently) |
 | `test_kv_store.cpp` | KV storage | Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases) |
 | `test_trigger_engine.cpp` | Trigger engine | Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases) |
 | `test_new_plugins.cpp` | Plugin runtime | Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases) |

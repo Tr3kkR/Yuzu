@@ -7,9 +7,9 @@ option('build_fuzzers',  type: 'boolean', value: false,
                   + 'links -fsanitize=fuzzer,address,undefined). Mirrored by '
                   + '.clusterfuzzlite/build.sh for CI fuzzing.')
 option('systemd_guard',  type: 'feature', value: 'enabled',
-       description: 'Linux systemd service guard (libsystemd / sd-bus). '
-                  + 'enabled (default): require libsystemd so the shipped agent always offers the guard. '
-                  + 'auto: use libsystemd if present, else build a no-op stub. disabled: always stub. '
+       description: 'Linux systemd service guard AND Service spark mechanism (libsystemd / sd-bus). '
+                  + 'enabled (default): require libsystemd so the shipped agent always offers both. '
+                  + 'auto: use libsystemd if present, else build no-op stubs. disabled: always stub. '
                   + 'Use auto/disabled for musl/Alpine/minimal images without libsystemd.')
 option('enable_enterprise', type: 'boolean', value: false,
        description: 'Build commercial enterprise modules from enterprise/. '

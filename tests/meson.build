@@ -138,6 +138,9 @@ agent_test_exe = executable(
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
+    'unit/test_spark_disk.cpp',
+    'unit/test_spark_engine.cpp',
+    'unit/test_spark_mechanism.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
@@ -158,7 +161,10 @@ agent_test_exe = executable(
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
-  cpp_args: test_partial_init_args,
+  # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
+  # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
+  # as agents/core/meson.build gates guard_systemd.cpp/spark_service.cpp.
+  cpp_args: test_partial_init_args + agent_platform_args,
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.

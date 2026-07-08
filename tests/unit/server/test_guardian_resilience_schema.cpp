@@ -447,6 +447,18 @@ TEST_CASE("H1: dangerous_enforce_in_spec inspects the stored spec_json",
     CHECK(dangerous_enforce_in_spec("").empty());
     CHECK(dangerous_enforce_in_spec("not json").empty());
     CHECK(dangerous_enforce_in_spec("{}").empty());
+
+    // #1946: a present-but-non-string assertion.type used to throw
+    // json::type_error.302 out of the gate (nlohmann value() only defaults on an
+    // ABSENT key). The gate runs unguarded at the push chokepoint on stored rows,
+    // so it must treat this shape as not-dangerous junk, never throw.
+    CHECK(dangerous_enforce_in_spec(R"({"assertion":{"type":5}})").empty());
+    CHECK(dangerous_enforce_in_spec(R"({"assertion":{"type":null}})").empty());
+    CHECK(dangerous_enforce_in_spec(R"({"assertion":{"type":true}})").empty());
+    CHECK(dangerous_enforce_in_spec(R"({"assertion":{"type":["service-stopped"]}})").empty());
+    CHECK(dangerous_enforce_in_spec(
+              R"({"assertion":{"type":{},"params":{"key":"currentversion\\run"}}})")
+              .empty());
 }
 
 TEST_CASE("PR5: enforce service-stopped on a security service is denied at every promote path",
