@@ -50,9 +50,6 @@ supersedes: >-
 > internal collection capability or its storage format. See the `CONTEXT.md` glossary entries for
 > both terms.
 
-> **Not yet committed.** This file exists on disk only, pending review by @lesault. Do not push,
-> commit, or open a PR from this file until that review is complete.
-
 ## Context
 
 CVE-matching research (see `input-documents`) surfaced that a large, modern CVE surface is
@@ -413,20 +410,29 @@ ADR follows the same shape at the agent-core/plugin boundary: a new plugin, **`c
 does the actual filesystem walking, binary parsing, and Electron/buildinfo detection from Decision
 1; a new, thin `sync_source_component_inventory.cpp` (agent-core) schedules it and reports results.
 
-**Internal-conventions precedent: model this plugin on `tar`, not on `installed_apps` (corrected
-following Gate 3 plugin-architecture review, 2026-07-07).** `installed_apps` is the right precedent
-for the agent-core/plugin *boundary* shape above (thin sync-source glue calling into a plugin
-action), but the wrong precedent for this plugin's *internal* conventions — `installed_apps` is a
-simple buffer-and-return collector, while this plugin's actual engineering risk is closer to what
-`tar`'s `ProcStreamCollector` pattern (`docs/tar-module-loads.md`) already solves: `write_output` is
-synchronous with no progress/cancellation hook, so a multi-thousand-file walk needs to fit inside
-whatever command-timeout budget applies, the same way a streaming collector has to reason about
-long-running work; and `sync_source_installed_software.cpp`'s existing behavior of dropping the
-**entire cycle** on capture-cap truncation (line ~306 in that file) is a materially bigger risk here
-given this tier's higher cardinality and heterogeneity — a truncated component-inventory cycle
-should not silently look like a small, complete one (see Decision 4's failure posture, which now
-names this explicitly). Whoever implements Decision 8 should read `tar`'s streaming-collector
-conventions before `installed_apps`'s simpler ones.
+**Internal-conventions precedent: model this plugin's bounded-walk safety on `filesystem`, not on
+`installed_apps` (corrected following Gate 3 plugin-architecture review, 2026-07-07; the citation
+itself corrected following adversarial review, 2026-07-08, which found the original `tar`
+citation below doesn't actually solve the problem it was cited for).** `installed_apps` is the
+right precedent for the agent-core/plugin *boundary* shape above (thin sync-source glue calling
+into a plugin action), but the wrong precedent for this plugin's *internal* conventions —
+`installed_apps` is a simple buffer-and-return collector, while this plugin's actual engineering
+risk is a `write_output` call that is synchronous with no progress/cancellation hook, so a
+multi-thousand-file walk needs to fit inside whatever command-timeout budget applies. **`tar`'s
+`ProcStreamCollector` (`docs/tar-module-loads.md`) does not solve this**, and is not the right
+precedent for it: checked directly against `tar_proc_stream.hpp`, it is a persistent, event-driven
+collector that runs continuously and is drained on a tick, never invoked synchronously inside one
+command dispatch — the synchronous-timeout-budget problem this plugin actually faces doesn't arise
+for it by construction. The right precedent is `filesystem_plugin.cpp`
+(`agents/plugins/filesystem/src/`), which already does exactly this: a bounded, synchronous
+recursive walk returning through `write_output` within depth/size/time budgets (see the
+bound-checking-primitives reuse discussion below) — the shape this plugin's own walk needs, not
+`tar`'s streaming model. Separately, `sync_source_installed_software.cpp`'s existing behavior of
+dropping the **entire cycle** on capture-cap truncation (line ~306 in that file) is a materially
+bigger risk here given this tier's higher cardinality and heterogeneity — a truncated
+component-inventory cycle should not silently look like a small, complete one (see Decision 4's
+failure posture, which now names this explicitly). Whoever implements Decision 8 should read
+`filesystem`'s bounded-walk conventions before `installed_apps`'s simpler ones.
 
 **Considered and rejected: extend the existing `vuln_scan` plugin instead of creating a new one.**
 Domain proximity makes this the obvious first instinct — this data feeds CVE matching, same as
@@ -684,8 +690,11 @@ clock; **(b)** independent of any trigger, a **daily** floor guarantees an upper
 staleness (tightened from an initial "weekly" instinct — the real target is daily at minimum,
 matching `installed_software`'s own cadence, even though the walk itself is heavier per run). Own
 phase-offset, own `KvStore` namespace, own store — a new sync source, following the
-`os_patch_state`-class precedent (a new source added because the entity/cadence differs, not
-because the mechanism does).
+`device_ci`-class precedent (a new source added because the entity/cadence differs, not
+because the mechanism does) — corrected following adversarial review, 2026-07-08: the
+original citation was to a source class (`os_patch_state`) that does not exist anywhere in
+this codebase; the three real agent-core sync sources today are `installed_software`,
+`device_ci`, and `app_perf`, and `device_ci` is the closest real fit for this argument.
 
 **The event-linked trigger needs its own dampening, distinct from the daily floor's phase-spread —
 a real capacity gap found during Gate 6 SRE review, 2026-07-07, and BLOCKING as an architectural
@@ -704,11 +713,17 @@ to Decision 8 to discover only after the wire contract has shipped and jitter be
 change to retrofit.
 
 **Wire-size bound vs. the never-drop guarantee (Decision 4) are in tension and must be reconciled
-explicitly, not left implicit (found during Gate 6 SRE review).** ADR-0016's own numbers
-(`installed_software`'s ~20k-row/2.8MB blob against a 3.5MiB capture cap and a 4MiB gRPC frame
-ceiling) bound a single report under the transport this ADR reuses. Decision 3 already states
-component-inventory cardinality runs "well past" those caps; Decision 4 commits to **never silently
-dropping** an item. A single endpoint whose transitive dependency tree exceeds roughly 30k rows
+explicitly, not left implicit (found during Gate 6 SRE review; the row-count math itself corrected
+following adversarial review, 2026-07-08, which found it looser than the cited numbers support).**
+ADR-0016's own numbers (`installed_software`'s ~20k-row/2.8MB blob) bound a single report under the
+transport this ADR reuses, against two different ceilings that must not be conflated: the
+**actually-enforced** `kMaxBlobBytes` cap (3 MiB, not the previously-stated "3.5MiB" — a second
+small inaccuracy corrected here) caps a single report at roughly **22k rows** at this measured byte
+rate (~140 bytes/row); the looser, **unenforced** raw gRPC frame ceiling (4 MiB) is where the
+"~30k rows" figure this section previously used actually comes from. Decision 3 already states
+component-inventory cardinality runs "well past" the enforced cap; Decision 4 commits to **never
+silently dropping** an item. A single endpoint whose transitive dependency tree exceeds roughly
+**22k rows** — the cap this ADR's wire transport actually enforces, not the looser gRPC ceiling —
 would blow the single-blob-per-report wire model this ADR otherwise reuses unchanged from
 ADR-0016 — at that point it is not "reuse," it needs a mechanism change. **This ADR resolves the
 tension as follows, rather than leaving it to be discovered during implementation:** an oversized
@@ -867,11 +882,33 @@ it. Does not design the export/import feature itself (tracked alongside the Deci
 kept centrally.** This follows the same precedent every other daily-sync store already
 established: ADR-0016 explicitly rejected full version history for `installed_software` in central
 Postgres ("history is TAR's edge concern," per ADR-0004's current-state-central /
-history-on-edge boundary), and `device_ci`/`app_perf` both use the same generic `inventory_state`
-parent shape (`agent_id, source, content_hash, first_seen, last_seen`) plus a typed child table,
-replaced wholesale each sync — never row-level history. Component inventory follows the identical
-shape: a per-component `first_seen`/`last_seen` pair (answering "is this still present, and when
-did we last confirm it") is enough; no past-version rows are retained.
+history-on-edge boundary).
+
+**Correcting an inaccurate precedent claim (found during adversarial review, 2026-07-08): no
+existing store actually does what an earlier draft of this section claimed.** Checked directly
+against the schema code: `device_ci` (`device_inventory_store.cpp`) is a single flat table,
+`PRIMARY KEY (agent_id)`, written via a plain 1:1 `ON CONFLICT (agent_id) DO UPDATE` — not a
+parent/child split at all. `app_perf_daily` (`app_perf_daily_store.cpp`) is genuinely historical,
+`PRIMARY KEY (agent_id, app_name, version, day)`, pruned only past a per-agent TTL — the *opposite*
+of "never row-level history." The real `inventory_state` parent/child pattern
+(`agent_id, source, content_hash, first_seen, last_seen` parent + a typed child, `software_inventory_store.cpp`)
+exists only for `installed_software`, and its child table carries **zero timestamp columns** —
+`first_seen`/`last_seen` live only on the parent, at `(agent_id, source)` grain (one pair per agent
+per sync source, answering "when did this agent's `installed_software` sync first/last land"),
+never per individual software item. No store in this codebase preserves a per-component
+`first_seen`/`last_seen` across a bulk child-row replace today.
+
+**So a per-component `first_seen`/`last_seen` pair is a new mechanism this ADR must design
+explicitly, not an existing pattern it can reuse unchanged.** The design is a standard
+preserve-on-conflict upsert, not a novel invention — this codebase's existing stores simply don't
+need it today, since none of them tracks freshness below the whole-sync grain: the component-table
+write path is an `INSERT ... ON CONFLICT (agent_id, component_key) DO UPDATE` that refreshes every
+column **except** `first_seen` (preserved from the existing row, `first_seen = <table>.first_seen`,
+never overwritten) while `last_seen` always advances to the current sync's timestamp. A component
+genuinely absent from the current sync (not merely unwritten) is deleted in the same replace
+transaction, consistent with the wholesale-replace-on-change posture above — its absence is not
+itself a tracked row. This mechanism, not "reused precedent," is what Decision 8's deferred store
+schema must actually implement.
 
 **This is a stronger case for current-state-only than `installed_software`'s own, not a weaker
 one.** The same cardinality/cost reasoning that justified giving this its own sync source
@@ -906,7 +943,7 @@ findings) — but it does mean Issue 18.1's findings-history is a hard evidentia
 just a topical one: no "we detected this exposure by date X" claim is evidence-backed until that
 history exists, and this ADR's boundary should not be read as implying otherwise.
 
-### 8. Explicitly deferred (tracked as roadmap Issue 18.7, "Agent-Side Component Inventory Collection")
+### 8. Explicitly deferred (tracked as roadmap Issue 18.7, "Agent-Side Component Inventory Collection" — status: Proposed, added to `docs/roadmap.md` Phase 18 following adversarial review, 2026-07-08; it did not previously exist there, and this heading's earlier "tracked as" phrasing overclaimed a settled fact)
 
 This ADR commits to the collection tier's existence, its plugin/mechanism placement, storage-format
 principle, and shared-schema intent. It explicitly **does not** fully specify:
@@ -961,9 +998,10 @@ principle, and shared-schema intent. It explicitly **does not** fully specify:
   rather than left implicit, since there is no server-side reconstruction option for this store.
 - Citing **`docs/postgres-store-playbook.md`** and **`docs/postgres-migration-ladder.md`** (per
   architect review) for whoever designs the deferred store schema — this ADR names the store's
-  shape (current-state-only, `inventory_state`-style parent/child) but does not walk through the
-  playbook's own "decide up front" checklist (posture, schema name, secrets), which the
-  implementation PR should do explicitly.
+  shape (current-state-only, with the new per-component preserve-on-conflict upsert designed in
+  Decision 7 — not an existing `inventory_state`-style precedent, corrected following adversarial
+  review, 2026-07-08) but does not walk through the playbook's own "decide up front" checklist
+  (posture, schema name, secrets), which the implementation PR should do explicitly.
 - **A first-activation rollout plan for existing large fleets, distinct from steady-state
   phase-offset** (per enterprise-readiness review) — Decision 3's phase-offset addresses ongoing
   cadence spread, not the one-time cost of an entire existing fleet gaining this capability on the
@@ -1097,14 +1135,14 @@ retirement PR itself.
 | 0016 (agent daily-sync framework) | Mechanism reused (SyncSource/scheduler/hash-skip); a new, separately-governed source (Decision 3) — independent budget/store even though its floor cadence is daily too, plus an event-linked trigger keyed to `installed_software`'s own change detection. **Open dependency (Decision 1):** `installed_apps`/`sync_source_installed_software` needs a small addition (capture `InstallLocation`/`.app` bundle path) to anchor this ADR's walk roots — must land before or alongside implementation (recommended: a dated ADR-0016 amendment section, matching the `device_ci`/blob-v2 precedent), not after. |
 | 0029 (CVE source catalog & ingestion) | **Sibling, not a dependency in either direction** (corrected during governance review, 2026-07-07 — an earlier draft of 0029 incorrectly claimed this ADR as its consumer). Neither document depends on the other; the actual consumer of both is `CVE_MATCHING_ADR0023_AMENDMENT.md`'s matching engine, routed by regime. |
 | `vuln_scan` plugin (existing, not an ADR) | Considered and rejected as the host for this capability (Decision 2) — carries legacy pre-ADR-0018 code pending an unscheduled retirement; a new `component_inventory` plugin is built instead. **The name survives, the plugin doesn't:** the `security.vuln_scan.scan` instruction definition is kept and re-pointed at `component_inventory`'s action, so the operator-facing command an owner already associates with this capability keeps working through the plugin's retirement (Decision 2). |
-| `tar` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* streaming-collector conventions (Decision 2) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only, not for reasoning about command-timeout budgets or partial-result handling under this tier's higher cardinality. |
+| `filesystem` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* bounded-synchronous-walk conventions (Decision 2, citation corrected following adversarial review, 2026-07-08) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only; `tar`'s `ProcStreamCollector` was incorrectly cited here in an earlier draft, but it is a persistent async collector, never invoked synchronously inside one command dispatch, so it doesn't address the command-timeout-budget/partial-result problem this plugin's walk actually faces. `filesystem_plugin.cpp`'s own bounded, synchronous walk is the real precedent for that. |
 | 0018 / 0019 (server-authoritative matching / tri-state findings) | Downstream consumer — this ADR's output feeds the language-ecosystem regime of CVE matching. |
 | CVE_MATCHING_ADR0023_AMENDMENT.md / ADR-0023 (vuln correlation engine, PR #1914, open) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
 | 0022 (headless platform / use-case engines, PR #1918/#1926, open) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |
 | 0024 (SLE, PR #1920, open) | Downstream consumer — license/entitlement matching needs the same per-endpoint component data. |
 | roadmap Issue 18.1 (Vulnerability Lifecycle) | Named future home (Decision 7) for the *findings*-side history (open→remediated→re-opened, SLA tracking) this ADR deliberately excludes from the component inventory itself. |
 | roadmap Issue 18.5 (SBOM Ingest) | Companion, not duplicate — import-side of the same capability; shares one internal schema across generate/ingest/export (Decisions 5–6). |
-| roadmap Issue 18.7 (proposed) | Tracks this ADR's deferred items (Decision 8), including the export/import projection feature anticipated but not designed by Decision 6. |
+| roadmap Issue 18.7 (`docs/roadmap.md` Phase 18, status: Proposed — entry added following adversarial review, 2026-07-08) | Tracks this ADR's deferred items (Decision 8), including the export/import projection feature anticipated but not designed by Decision 6. |
 
 ## Ratification
 
@@ -1166,5 +1204,4 @@ architecture named in Alternatives considered), that decision would need to re-o
 on its own terms.
 
 Route via the normal review / `/governance` path. Record the accepting reviewer(s) + date here on
-acceptance. **This file must not be committed, pushed, or opened as a PR until @lesault has
-reviewed it.**
+acceptance.
