@@ -1060,6 +1060,29 @@ for the IdP cert in this release.
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
+## Engine principals & delegation (ADR-0022 — design)
+
+- **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
+  2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped
+  surface.
+- Third principal class (`engine`) for use-case-engine hosts: dedicated
+  born-on-Postgres `EnginePrincipalStore` (named human owner, justification,
+  soft-retained after revoke), reserved `engine:` id namespace, per-module
+  granularity.
+- Token sessions branch on a persisted `ApiToken.principal_kind`
+  (`human`|`engine`) — an engine token attributes to the engine principal
+  itself (`auth_source="engine_token"`), never to its creating human.
+- Authorization model: scoped role assignments `(principal, role, scope)`
+  for **all** principal classes, evaluated permissions ∩ scope through
+  ADR-0017's `authorize_list_read` chokepoint (ADR-0017 PR-A is a named
+  prerequisite). Engine principals are default-deny, structurally barred
+  from `admin`.
+- Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
+  opaque, audience-bound, short-TTL artifact; effective authority = engine
+  ∩ operator ∩ scope; self-asserted delegation stays rejected permanently.
+- Engine credentials: 90-day ceiling, overlap-pair rotation (≤2 active),
+  MCP tier hard-locked `readonly` for v1.
+
 ## Agent enrollment (3 tiers)
 
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
