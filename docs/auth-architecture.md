@@ -1074,9 +1074,11 @@ for the IdP cert in this release.
   itself (`auth_source="engine_token"`), never to its creating human.
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
-  ADR-0017's `authorize_list_read` chokepoint (ADR-0017 PR-A is a named
-  prerequisite). Engine principals are default-deny, structurally barred
-  from `admin`.
+  ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
+  the per-device scoped-permission path for single-target operations
+  (ADR-0017 PR-A is a named prerequisite, its charter to be amended or
+  extended for the `engine` principal type). Engine principals are
+  default-deny, structurally barred from `admin`.
 - Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
   opaque, audience-bound, short-TTL artifact; effective authority = engine
   principal's assignments ∩ operator's assignments ∩ operator's scope

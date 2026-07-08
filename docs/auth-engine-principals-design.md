@@ -87,13 +87,14 @@ The gaps this design closes, with their exact locations:
   (`ApiTokenStore::create_token`), but a plain API token may be perpetual
   (`expires_at = 0`). No token type has a rotation workflow — only create
   and revoke.
-- **Interim rules already enforced (Phase 1, PR #1972 branch):** on-behalf-of
+- **Interim rules already enforced (Phase 1, merged via PR #1972):** on-behalf-of
   assertions are rejected (not ignored) at the HTTP pre-routing chokepoint
   and via a gRPC interceptor (`on_behalf_guard.hpp`,
-  `grpc_on_behalf_interceptor.hpp`); the presentation-level
+  `grpc_on_behalf_interceptor.hpp` — the gRPC side is enforced deterministically
+  per-RPC-handler, not merely best-effort cancellation); the presentation-level
   `principal_class` label exists for HTTP metrics (`principal_class.hpp`)
-  and the additive `AuditStore.principal_class` column (plan item 3a) is
-  built on the same branch.
+  and the additive `AuditStore.principal_class` column (plan item 3a) merged
+  in the same PR.
 
 ## 3. Identity model — every actor is a first-class principal
 
@@ -107,17 +108,43 @@ describes an *identity* that outlives any one credential:
 |---|---|
 | `principal_id` | Stable, immutable. Reserved namespace — see §3.3. |
 | `display_name` | UI/audit label. |
-| `owner_username` | **Named responsible human** — must reference an existing user; re-pointed (never orphaned) when that user is deleted, via an explicit transfer step in the lifecycle surface. |
+| `owner_username` | **Named responsible human** — must reference an existing user. **Enforced, not aspirational:** the user-delete route fails closed (409) while the user owns any `active` engine principal — transfer-owner is a prerequisite step, itself audited and step-up-gated, never an implicit side effect of deleting the owner. |
 | `justification` | Grant justification captured at creation (cloud-IAM service-account norm; feeds access reviews). |
-| `classification` | `internal` \| `external`. **Unset/ambiguous ⇒ `external`** — the stricter, Phase-8-gated treatment (plan PR 4.3's fail-toward-rechecking rule). The classification *mechanics* remain PR 4.3's named deliverable; this store just persists the answer. |
-| `lifecycle_state` | `active` \| `revoked`. **Soft-retained forever** — a revoked row is never hard-deleted, so audit attribution stays resolvable after credential revocation (plan Decision 9). |
-| `created_at`, `revoked_at`, `created_by` | Lifecycle audit anchors. |
+| `classification` | `internal` \| `external`, **required at creation — the creation API rejects an unset value.** `external` is the fallback only for pre-existing/backfilled rows (there are none at Phase 4 launch) and for any future write path that omits it; that fallback is itself audited and metered, not silent, so an internal module never loses Phase-8 capability without an operator-visible signal. |
+| `lifecycle_state` | `active` \| `revoked`. **Terminal, not reversible** — a false-positive compromise response does not "un-revoke"; recovery mints a successor principal whose row records `superseded_by` (the predecessor's id) so audit trails join across the swap. **Soft-retained forever** — a revoked row is never hard-deleted, so audit attribution stays resolvable after credential revocation (plan Decision 9). |
+| `created_at`, `revoked_at`, `created_by`, `superseded_by` | Lifecycle audit anchors. |
 
 Substrate: born-on-Postgres per ADR-0006 (no new server SQLite stores) and
-ADR-0012's author contract; it naturally accompanies plan PR 4.1's
-pulled-forward `ApiTokenStore` Postgres migration. No secret material lives
-in this store (credentials stay in `ApiTokenStore`, hash-only), so no
-ADR-0010 SecretCodec involvement.
+ADR-0012's author contract, **declared authoritative (fail-hard)**: a runtime
+read failure at session synthesis or delegation redemption is treated as a
+deny, exactly like a genuinely missing/revoked row — **but the two cases
+must be observably distinct**, because they demand different operator
+responses. A store-unreachable read returns a retryable, 503-class signal
+(the module should back off and retry — this is not a credential problem);
+a missing-or-revoked row returns a terminal 401-class signal (the module
+should stop and alert — the credential is dead). Conflating them risks a
+transient PG blip reading as "credential revoked," which could make an
+autonomous module abandon a healthy credential. The Phase-5 delegation-artifact
+store (`jti` state, §5) adopts the same substrate and the same authoritative
+posture — no Phase-5 exception-ADR needed for either store.
+
+`EnginePrincipalStore` lands in **plan PR 4.2**, immediately alongside (not
+inside) PR 4.1's `ApiTokenStore` Postgres migration + `principal_kind`
+column — the two migrations are sequenced back-to-back but are separate
+PRs, since 4.2 also introduces the `principal_type='engine'` RBAC value and
+the `synthesize_token_session` branch (§6) that depend on 4.1's column
+existing first. No secret material lives in `EnginePrincipalStore`
+(credentials stay in `ApiTokenStore`, hash-only), so no ADR-0010 SecretCodec
+involvement.
+
+**Upgrade migration hazard:** the reserved-namespace rejection (§3.3) binds
+only *new* creations. The PR 4.2 migration itself must scan existing
+`users` and locally-created RBAC groups for the `engine:` prefix and refuse
+to proceed (surfacing the exact colliding names to the admin) rather than
+silently letting a pre-existing `engine:vuln`-named user coexist with a
+newly minted engine principal of the same id — that silent coexistence is
+precisely the identity-merge hazard §3.3 exists to prevent, and it is worse
+undetected than loud at migration time.
 
 ### 3.2 Granularity: one principal per module
 
@@ -129,6 +156,15 @@ granularity. A compromised or misbehaving module is revocable without
 severing its host siblings. (Per-host was rejected: it recreates a
 mini-union-of-permissions across modules — the ServiceNow-admin-token
 shape at smaller scale.)
+
+Per-module identity is defeated by an ops error that hands module B a
+credential provisioned for module A — a host-level misconfiguration, not a
+protocol gap, but worth a cheap check: the request declares which module
+slug it believes it's authenticating as (e.g. a header set by the module's
+own config), and a mismatch against the credential's actual principal is
+denied and audited as an anomaly rather than silently accepted. This is
+advisory defense-in-depth, not a security boundary the design otherwise
+depends on.
 
 ### 3.3 Identity namespace — collisions must be impossible
 
@@ -150,12 +186,12 @@ Engine principal ids live in a reserved namespace: `engine:<slug>` (e.g.
 
 ### 3.4 Operators viewing through a UCE keep their own identity
 
-Decision 14's requirement plus the maintainer's end-to-end-identity
+Plan Decision 14's requirement plus the maintainer's end-to-end-identity
 direction means: the UCE findings view must never serve operator reads on
-the engine's own fleet-wide credential. The mechanism *choice* is 2c's
-(§10), but this design fixes the invariant: **any read rendered to an
-individual operator is authorized as that operator** — the engine's
-autonomous-sync identity is for autonomous sync only.
+the engine principal's own fleet-wide credential. The mechanism *choice* is
+2c's (§10), but this design fixes the invariant: **any read rendered to an
+individual operator is authorized as that operator** — the engine
+principal's autonomous-sync identity is for autonomous sync only.
 
 ## 4. Grant model — scoped role assignments, one model for every principal class
 
@@ -181,6 +217,25 @@ rather than inventing an engine-only parallel path. The maintainer's
 worked example — `Vuln → Read → management group X` — is exactly one
 assignment row: `(engine:vuln-viewer-role-holder, role-with-Vuln:Read,
 scope=MG-X)`.
+
+**Named PR-4.2 deliverable — the assignment *authoring* surface.** Something
+must let an admin write an `(engine principal, role, scope)` row in the
+first place; §11's PR mapping previously left this implicit inside "the
+existing role-assignment mechanism." It is not implicit: extending
+whatever surface creates `PrincipalRole`/`GroupRoleAssignment` rows today to
+accept an `engine:`-namespaced principal target is a named PR 4.2
+deliverable, alongside the resolution-side fix below.
+
+**Named PR-4.2 deliverable — the resolution side.** `RbacStore`'s
+role-collection query resolves `principal_type = 'user'` (direct) or
+`'group'` (via membership) today — it does not know about a third value.
+Adding `principal_type='engine'` rows without extending this query would
+make Phase 4's "fleet-wide grants are expressible in the current global
+model" claim (§4.3) false in a particularly bad way: an engine assignment
+would silently resolve to nothing, fail-closed but *inert* — a real grant
+that never takes effect, discovered only when someone asks why the module
+isn't reading anything. This resolution-site extension is therefore an
+explicit PR 4.2 task, not an assumed side effect of adding the enum value.
 
 **One model for all classes.** Humans, agentic workers (API/MCP tokens),
 and engine principals resolve effective authority identically:
@@ -211,7 +266,7 @@ authorization change two places to forget.
 
 ### 4.3 ADR-0017 is hereby on the critical path — named dependency
 
-Phase 5's effective-authority intersection and Decision 14's confinement
+Phase 5's effective-authority intersection and plan Decision 14's confinement
 outcome both cite `authorize_list_read` — which **does not exist in code**.
 This design makes the dependency explicit rather than inherited silently:
 
@@ -222,10 +277,28 @@ This design makes the dependency explicit rather than inherited silently:
 > are expressible in the current global model), but the maintainer's
 > three-dimensional-RBAC direction is only real once ADR-0017 PR-A lands.
 
+**Charter delta, stated so it isn't discovered mid-implementation:**
+ADR-0017 PR-A as chartered resolves scope for **users and groups** — it was
+never scoped to a third principal type, because `engine` didn't exist when
+PR-A was designed. This design's use of `authorize_list_read` for engine
+and delegated reads therefore either (a) requires ADR-0017 PR-A's own
+charter to be amended to resolve on `principal_type` generally (all three
+classes through one chokepoint, consistent with §4.1's one-model claim), or
+(b) requires a small named follow-on PR that extends the chokepoint for
+`principal_type='engine'` once PR-A ships for users/groups. This design
+does not choose between (a) and (b) — that is the maintainer's ladder to
+resequence — but it names the choice explicitly rather than letting an
+implementer assume PR-A already covers engine principals because this
+design cites it.
+
 Sequencing and resourcing of the ADR-0017 ladder (PR-A..E, plus the #1715
-deny-precedence decision that gates PR-A) is the maintainer's call — this
-doc's job is to ensure that call is made consciously, not discovered at
-Phase-5 kickoff.
+deny-precedence decision that gates PR-A, plus the charter-delta choice
+above) is the maintainer's call — this doc's job is to ensure that call is
+made consciously, not discovered at Phase-5 kickoff. **Follow-up:** file an
+issue against the exec plan noting its Phase 5 gating (currently 3b + Phase
+4 only, no ADR-0017 edge in the program-ladder diagram) needs amending to
+match this design's §4.3/§11 dependency — the same kind of fold-back the
+plan's own Round-4 M3(d)-edge fix already modeled.
 
 ## 5. Delegation — OAuth 2.0 Token Exchange shape (RFC 8693)
 
@@ -235,14 +308,38 @@ don't need reshaping later:
 1. **Grant:** an operator, authenticated to Yuzu normally (session or
    token), requests a delegation to a named engine principal for a named
    purpose. The server issues a **delegation artifact**:
-   - opaque handle (not a self-contained JWT the engine host could inspect
+   - opaque handle (not a self-contained JWT the UCE host could inspect
      or mint against) — server-side state keyed by `jti`;
    - **audience-bound** to one engine principal id;
    - **purpose-bound** (requested operation class recorded at issuance);
    - **short-lived** (minutes-scale TTL; single-digit default, operator
-     cannot extend past a server ceiling);
-   - single-use for mutating operations (`jti` consumed on redemption);
+     cannot extend past a server ceiling); **all TTL/expiry evaluation is
+     server-clock authoritative** — consumption/revocation are recorded as
+     state transitions, not time comparisons, so a clock step (server NTP
+     correction or engine-host skew) can never resurrect a consumed or
+     revoked artifact, only misjudge a not-yet-expired one's remaining
+     window;
+   - single-use for **mutating** operations (`jti` consumed on redemption) —
+     **and idempotent per consumption**: a retry presenting the *same*
+     `jti` from the *same* engine credential within a short grace window
+     after a first successful redemption replays the cached outcome rather
+     than denying, so an ordinary network retry (lost response, timeout)
+     never masquerades as artifact theft on the audit trail; a retry
+     presenting a consumed `jti` from a *different* credential is the
+     actual theft signal;
+   - capped outstanding-artifact count per operator and per engine
+     principal, with expiry-driven pruning, so a scripted/looping issuer
+     cannot grow unbounded server-side state;
    - revocable (operator or admin can void it before expiry).
+   - **Transport is explicitly in scope here, not deferred to plan
+     Decision 13** (which is itself an unspecced placeholder, not a
+     document that could receive this hand-off): the artifact travels from
+     the operator's authenticated Yuzu context to the engine module over
+     the same channel the module already uses to poll/receive its assigned
+     work (plan Decision 13's future write-back-orchestration surface) —
+     this design fixes the artifact's *shape and validity rules*, not the
+     orchestration transport itself, which remains plan Decision 13's to
+     design when write-back orchestration is scoped.
 2. **Exchange:** the engine module presents *its own credential* + the
    artifact (RFC 8693 `subject_token` = artifact, `actor_token` = engine
    credential — the standard delegation, not impersonation, composition).
@@ -250,7 +347,7 @@ don't need reshaping later:
    engine principal's `lifecycle_state` **fail-closed**, and evaluates the
    delegated operation. The resulting delegated context is **non-bearer**
    — bound to the engine credential presented at exchange, never a
-   free-standing secret an attacker could exfiltrate from the engine host
+   free-standing secret an attacker could exfiltrate from the UCE host
    independently — and lives at most per-request / within the artifact's
    TTL; nothing delegated outlives the artifact.
    **Operator authority is resolved fresh at redemption** through the
@@ -279,14 +376,48 @@ don't need reshaping later:
    ADR-0022's Interim rule survives as a standing invariant; the only
    delegation the server honors is one it issued itself.
 5. **Audit:** every delegated operation writes both identities — the full
-   plan-Decision-9 shape (engine principal id, `is_delegated`, delegated
+   audit shape ADR-0022's own Decision 5 specifies and plan Decision 9
+   restates (engine principal id, `is_delegated`, delegated
    operator identity, delegation artifact id,
    `delegation_verification_status`), landing with AuditStore's Postgres
    Wave-1 migration (plan 3b). Until Phase 5 produces real values these
    columns carry defaults; pre-enforcement rows use
    `delegation_verification_status=unverified` per ADR-0022's
    incremental-shipping rule. The already-built 3a `principal_class` column
-   is the early, delegation-independent half of this shape.
+   is the early, delegation-independent half of this shape. **Delegated
+   mutations are audit-fail-closed**, not set-and-proceed: if the audit row
+   cannot be persisted, the mutation does not execute — the platform's
+   set-and-proceed posture elsewhere (machine-scope, low-sensitivity reads)
+   does not extend to a delegated write acting under someone else's
+   authority, and a denied-redemption audit-write failure additionally
+   trips a dedicated metric, since that row is this design's primary
+   theft-detection signal (§5 step 1) and cannot be allowed to fail silently
+   during exactly the outage window an attacker would prefer.
+6. **Quota** (Phase 8's full mechanism; the minimum per-principal cap is
+   plan PR 4.4) **is debited on both sides of a delegated operation** — the
+   engine principal's cap and the delegating operator's own action budget,
+   where the operator has one. Debiting only the engine principal would let
+   any one operator exhaust a shared module's budget and starve its
+   autonomous sync; debiting only the operator would let the engine
+   principal amplify past its own cap under delegation. The
+   quota-exhaustion counter (PR 4.4) names which side was exhausted.
+7. **Long-running delegated mutations re-authorize per dispatch tick**,
+   not once at redemption — the same pattern the existing DeploymentEngine
+   already uses for its own multi-device fan-out (re-resolving
+   `devices_fn(viewer)∩cohort` every tick, skipping a target that lost
+   scope mid-run). A delegation redeemed at the start of a long fan-out
+   must not carry frozen authority across an operator de-scoping event that
+   happens while the operation is still running; §5 step 2's
+   fresh-at-redemption rule covers the *start* of the operation, this rule
+   covers its *duration*.
+
+**Wire surface: none.** Every mechanism above — issuance, exchange,
+redemption, audit — is server-HTTP-surface only. No `.proto` change is
+implied anywhere in this design: the agent-daemon's gRPC channel and the
+gateway's `ProxyRegister`/upstream path are untouched (the Phase-1
+gRPC on-behalf-of interceptor, already shipped, is a separate, unrelated
+control). If a future module needs a gRPC bulk-egress surface, that falls
+under ADR-0022's deferred streaming-egress decision, not this design.
 
 ## 6. Token-session attribution — branch on persisted kind, never inference
 
@@ -297,7 +428,11 @@ adopted verbatim: session synthesis branches on the stored field, **never**
 on the shape of the `principal_id` string (the reserved namespace in §3.3
 is defense-in-depth and readability, not the discriminator).
 
-`synthesize_token_session` becomes a two-branch function:
+`synthesize_token_session` becomes a two-branch function. The carrier is an
+in-memory `Session` field only — no `auth.db` sessions-schema change, since
+token sessions are already synthesized fresh per request rather than
+persisted, so `principal_kind` needs no storage beyond the `ApiToken` row
+it was read from:
 
 - `principal_kind=human` (all existing rows): exactly today's behavior —
   attribute to the creating user, re-resolve their current role.
@@ -308,7 +443,26 @@ is defense-in-depth and readability, not the discriminator).
   engine's scoped assignments (§4) — `get_user_role` is never consulted
   (there is no user row to consult), and the legacy `Role` enum slot is
   pinned to `user` (floor; real authority comes from assignments). A
-  **revoked or missing engine-principal row fails closed** — no session.
+  **revoked or missing engine-principal row fails closed** — no session —
+  distinct from a store-unreachable read (§3.1: retryable, not terminal).
+
+**Named PR-4.2/4.3 sweep deliverable.** Six sites compare `auth_source`
+today (`mfa_step_up.cpp`, `auth_routes.cpp`, `auth_db.cpp` storage-only).
+One is instructive: `mfa_step_up.cpp`'s bearer-token step-up exemption
+checks for `api_token`/`mcp_token` and falls through to a `mfa_status()`
+lookup for anything else — `engine_token` hits that fallthrough today by
+accident of the default branch, which happens to be the *correct* posture
+(an engine session has no MFA-enrolled user to step up, so it fails closed
+via `UserNotFound`, consistent with §9's structural denial). The design
+requires this to stop being accidental: PR 4.2 (introducing the value) or
+4.3 (building on it) must sweep all six `auth_source` comparison sites and
+record, per site, that its default-branch behavior for `engine_token` is
+the intended one — not merely that it happens not to crash.
+
+Creation-time referential integrity: minting an `ApiToken` with
+`principal_kind=engine` validates that `principal_id` names an `active`
+row in `EnginePrincipalStore` — a token can never be issued against a
+principal that doesn't exist or has already been revoked.
 
 `principal_class` then reports `engine` truthfully at both consumers: the
 HTTP request metric (plan PR 4.5 flips the reserved value live) and the
@@ -321,26 +475,54 @@ for non-HTTP writers is unaffected).
   credentials can never be perpetual. `create` for `principal_kind=engine`
   rejects `expires_at = 0` or > 90 days, same enforcement point as the
   existing MCP cap in `ApiTokenStore::create_token`.
+- **Secret hand-off (both initial mint and rotation), stated explicitly:**
+  `create`/`rotate` return the raw credential value to the caller **exactly
+  once**, in the API response — the same contract `ApiTokenStore::create_token`
+  already uses for every token type today (the store persists only the
+  hash). Getting that value into the running module's actual configuration
+  (an env var, a mounted secret, a config push, an operator paste — this
+  design is deliberately silent on *which*) is an operational step the
+  operator performs, same as onboarding any first API token today; this
+  design fixes the server-side contract (one-time reveal, hash-only
+  storage), not the module's deployment/secret-management mechanism.
 - **Rotation: overlap-pair, designed here, built in plan PR 4.3.** An
   autonomous host cannot tolerate a hard cutover the way a human clicking
   "new token" can, so `rotate` is:
   1. mint the successor credential (same principal, same expiry rules) —
-     **both credentials valid** from this moment;
+     **both credentials valid** from this moment, secret handed off as
+     above. **Idempotent per rotation window**: if the caller never
+     receives the response (timeout, dropped connection) and the ≤2-active
+     ceiling then blocks a naive re-mint, `rotate` called again while an
+     unconfirmed successor exists **returns the same successor's value
+     again** rather than erroring — the one-time-reveal contract's "once"
+     means once per rotation, not once ever, precisely to make this retry
+     safe;
   2. bounded overlap window (default 7 days, admin-configurable downward;
-     never past either credential's own expiry) for the module to pick up
-     and verify the successor;
+     never past either credential's own expiry — **and rotation itself is
+     rejected, not silently truncated, if the resulting window would fall
+     below a stated floor**, e.g. 24h, since a truncated window the module
+     never gets a chance to act within is a worse failure than a rejected
+     rotate call) for the module to pick up and verify the successor. The
+     server tracks each credential's last-used timestamp; if the successor
+     has **never been presented** as the overlap window nears its end, the
+     predecessor's scheduled auto-revoke is preceded by a warning (audit +
+     metric) — auto-revoke still fires (a window is a ceiling, not a
+     promise, and a silently-extended overlap defeats the point of having
+     one), but the operator is alerted *before* the module goes dark, not
+     after;
   3. predecessor **auto-revokes** at window end (or immediately on operator
-     confirm) — the window is a ceiling, not a promise.
+     confirm).
   - At most **two** active credentials per engine principal at any moment —
-    a third mint is rejected until the overlap resolves. Every step audits.
+    a third mint is rejected until the overlap resolves (see the
+    idempotency carve-out above for the retry case). Every step audits.
   - **Revocation during overlap is defined, not emergent:** revoking a
     *single* credential mid-overlap immediately invalidates that credential
     and resolves the rotation state (the survivor is simply the principal's
     one active credential; a fresh rotation may then begin). The
     **compromise runbook is principal-level revoke** — one operation kills
-    *both* credentials and flips the principal's `lifecycle_state`, so an
-    operator responding to a leak never has to reason about which of two
-    credentials was the stolen one.
+    *both* credentials and flips the principal's `lifecycle_state` to
+    `revoked` (terminal — see §3.1), so an operator responding to a leak
+    never has to reason about which of two credentials was the stolen one.
 - This is the platform's first rotation workflow (the gap matrix in
   `.claude/skills/auth-and-authz/SKILL.md` lists token rotation as missing
   for all types); the design is deliberately credential-generic so the
@@ -352,9 +534,9 @@ for non-HTTP writers is unaffected).
 `mcp_tier=readonly` — the creation API *rejects* any other tier while
 plan Decision 1's read-only/autonomous scoping holds. Rationale: the two-gate
 (tier-then-RBAC) ordering at ~28 MCP sites is exactly the defense-in-depth
-this principal class most needs; discarding tier for engines ("defer to
-RBAC") would remove the second gate from the widest-read-scope principal,
-and allowing `operator|supervised` now would hand a read-only-by-design
+this principal class most needs; discarding tier for engine principals
+("defer to RBAC") would remove the second gate from the widest-read-scope
+principal, and allowing `operator|supervised` now would hand a read-only-by-design
 principal a write-capable tier the moment an assignment slips. Unlocking
 higher tiers is a **Phase 5 decision**, taken together with delegation —
 where `supervised`'s approval-ticket flow is the natural fit for delegated
@@ -382,10 +564,10 @@ mutations.
   The §3.3 reserved namespace guarantees the string comparison stays
   collision-free across classes.
 
-## 10. Hand-off to 2c — Decision-14 confinement candidates
+## 10. Hand-off to 2c — plan Decision 14 confinement candidates
 
 2c owns the choice; 2b supplies the candidates and the evaluation criteria.
-The invariant to satisfy (Decision 14): a group-confined operator's
+The invariant to satisfy (plan Decision 14): a group-confined operator's
 findings view shows the same device set `/devices` would show them — never
 more — and per §3.4, authorized *as that operator*.
 
@@ -393,7 +575,7 @@ more — and per §3.4, authorized *as that operator*.
 |---|---|---|
 | (a) View-time scoped read-through | Findings page render triggers per-operator reads to the Yuzu server, carrying a short-lived operator-bound artifact (the §5 primitive, read-purpose variant); server evaluates confinement via ADR-0017 | Server stays authoritative; zero staleness; per-view latency + server load; needs the §5 artifact early |
 | (b) Identity assertion / session exchange | Operator's browser obtains an operator-bound artifact from Yuzu; UCE backend exchanges it for a scoped read context covering the view session | Same authority + freshness as (a) with fewer round-trips; more moving parts (exchange endpoint, context lifetime) |
-| (c) Synced confinement predicate | Per-operator scope predicate synced alongside findings, re-validated on short TTL | No view-time server dependency; but confinement is evaluated *by the UCE* against a cached predicate — weakest fit for both "server authoritative" and the never-stale requirement (Decision 14 itself warns the shared access layer is explicitly a cache) |
+| (c) Synced confinement predicate | Per-operator scope predicate synced alongside findings, re-validated on short TTL | No view-time server dependency; but confinement is evaluated *by the UCE* against a cached predicate — weakest fit for both "server authoritative" and the never-stale requirement (plan Decision 14 itself warns the shared access layer is explicitly a cache). It also fails ADR-0022's own mechanism-vs-interpretation boundary test: confinement is authorization *mechanism*, and (c) relocates that mechanism's evaluation into the UCE — an interpretation-layer component — rather than keeping it server-core, which (a)/(b) both preserve by construction. |
 
 Evaluation criteria (in order): server remains the confinement authority;
 staleness window ≈ 0 (a scope change takes effect at next view); per-view
@@ -413,36 +595,67 @@ ladder sequencing + #1715 deny-precedence decision (maintainer).
 | Piece (this doc) | Ships in | Notes |
 |---|---|---|
 | `ApiTokenStore` → Postgres, + `principal_kind` column | plan PR 4.1 | Backfill `human`; hash-only, no SecretCodec needed |
-| `EnginePrincipalStore` (§3.1) + reserved namespace (§3.3) | plan PR 4.2 | With `principal_type='engine'` RBAC value + `synthesize_token_session` branch (§6) + `auth_source="engine_token"` |
-| Lifecycle surface: create/rotate/revoke/transfer-owner, REST + MCP + admin-console page; §7 rotation; §9 Phase-4 guard posture; §4.2 structural bars | plan PR 4.3 | Human-admin + step-up gated; classification mechanics decided here |
-| Per-principal quota cap + exhaustion counter | plan PR 4.4 | Closes #1973 |
+| `EnginePrincipalStore` (§3.1) + reserved namespace (§3.3) + upgrade-migration collision scan | plan PR 4.2 | With `principal_type='engine'` RBAC value, the assignment-authoring surface extension AND the role-collection resolution-site extension (both §4.1, both named PR 4.2 deliverables, not assumed side effects), `synthesize_token_session` branch (§6) + `auth_source="engine_token"` + the six-site sweep (§6) |
+| Lifecycle surface: create/rotate/revoke/transfer-owner, REST + MCP + admin-console page; §7 rotation (incl. secret hand-off contract, idempotent mint, window-floor rejection, last-used tracking); §9 Phase-4 guard posture; §4.2 structural bars; owner-delete blocking (§3.1) | plan PR 4.3 | Human-admin + step-up gated; classification mechanics decided here (required-at-creation per §3.1) |
+| Per-principal quota cap + exhaustion counter, dual-side debit under delegation (§5) | plan PR 4.4 | Closes #1973 |
 | `principal_class=engine` live on metrics | plan PR 4.5 | 3a audit column already receives it |
-| Scoped role assignments resolution (§4.1) at the chokepoint | **ADR-0017 PR-A** (prerequisite, see §4.3) | Gates Phase 5 and real 3-D confinement |
-| Delegation artifact issue/exchange/verify (§5); guard re-key (§9); full audit shape producers | Phase 5 PRs | Gated on 3b (audit schema) + Phase 4 + ADR-0017 PR-A |
+| Scoped role assignments resolution (§4.1) at the chokepoint | **ADR-0017 PR-A**, charter amended or a named follow-on PR to cover `principal_type='engine'` — maintainer's choice, see §4.3 | Gates Phase 5 and real 3-D confinement; exec-plan Phase-5 gating needs a matching amendment (§4.3 follow-up) |
+| Delegation artifact issue/exchange/verify incl. idempotent redemption + per-tick re-auth (§5); guard re-key (§9); full audit shape producers, audit-fail-closed on mutations (§5) | Phase 5 PRs | Gated on 3b (audit schema) + Phase 4 + ADR-0017 PR-A |
 
 ## 12. Decision log
 
 1. Dedicated `EnginePrincipalStore` over token-row columns or `users`-table
    reuse — identity outlives credentials; soft-retain + owner/justification
-   don't fit either alternative.
-2. Per-module principal granularity — least-privilege blast radius.
-3. Reserved `engine:` namespace with user-creation rejection — identity
-   collision made impossible rather than unlikely.
+   don't fit either alternative. Declared authoritative/fail-hard (ADR-0012),
+   with store-unreachable kept observably distinct from missing/revoked
+   (retryable vs terminal) — conflating them risks a transient outage
+   reading as credential death. `EnginePrincipalStore` lands in PR 4.2,
+   sequenced immediately after PR 4.1's `ApiTokenStore` migration.
+2. Per-module principal granularity — least-privilege blast radius; a
+   defensive advisory slug-binding check guards against host-level
+   credential misconfiguration across co-located modules.
+3. Reserved `engine:` namespace with creation-time rejection at every
+   identity-surface (users AND locally created RBAC groups) — identity
+   collision made impossible rather than unlikely. The PR 4.2 migration
+   itself scans for pre-existing colliding names rather than allowing
+   silent coexistence.
 4. One scoped-assignment model for all principal classes (no engine-only
    grant table) — a second resolution path is a standing consistency bug.
-5. ADR-0017 PR-A promoted to named critical-path prerequisite.
+   Two PR-4.2 deliverables named explicitly so this doesn't ship inert:
+   the assignment-*authoring* surface, and the role-*resolution* query's
+   extension to a third `principal_type` (today hardcoded to user/group).
+5. ADR-0017 PR-A promoted to named critical-path prerequisite — with the
+   charter delta stated explicitly (PR-A as chartered resolves user/group
+   only; extending to `engine` is either PR-A's own amendment or a named
+   follow-on PR, maintainer's call) and a follow-up filed to align the
+   exec plan's Phase-5 gating with this dependency.
 6. RFC 8693 delegation shape; artifact is opaque, audience/purpose-bound,
-   short-lived, single-use for mutations; authority intersects, never
-   unions.
+   short-lived, single-use-and-idempotent for mutations (a same-credential
+   retry replays the cached outcome; a different credential is the theft
+   signal), capped in outstanding count; authority intersects at the
+   decision level (never row-level, to respect #1715 deny precedence),
+   never unions; operator authority resolved fresh at redemption and
+   re-checked per dispatch tick for long-running operations; quota debited
+   on both sides; delegated mutations are audit-fail-closed.
 7. Attribution branches on persisted `principal_kind` only (plan Decision 9
-   adopted); `auth_source="engine_token"` added; revoked principal ⇒ fail
-   closed.
-8. 90-day ceiling + overlap-pair rotation (≤2 active credentials); rotation
-   designed credential-generic.
+   adopted); `auth_source="engine_token"` added with a named six-site sweep
+   requirement; revoked principal ⇒ fail closed, distinct from
+   store-unreachable; creation-time referential check against an active
+   `EnginePrincipalStore` row.
+8. 90-day ceiling + overlap-pair rotation (≤2 active credentials, idempotent
+   per rotation window, window-floor enforced, last-used tracked with a
+   pre-auto-revoke warning); one-time-reveal secret hand-off contract
+   matching `ApiTokenStore::create_token`'s existing shape; principal-level
+   revoke is the compromise runbook and is terminal (recovery mints a
+   `superseded_by`-linked successor); rotation designed credential-generic.
 9. MCP tier reused, hard-locked `readonly` until Phase 5 revisits with
    delegation.
 10. Self-target guard: structural denial in Phase 4, effective-identity
     re-key in Phase 5.
-11. Decision-14 recommendation to 2c: operator-bound-artifact family
+11. Plan Decision 14 recommendation to 2c: operator-bound-artifact family
     ((a)/(b)); synced-predicate (c) only under a stated, TTL-bounded
-    constraint.
+    constraint, and noted as the weaker fit against ADR-0022's own
+    mechanism-vs-interpretation boundary test.
+12. Classification (`internal`/`external`) required at creation, not
+    silently defaulted — `external` is a backfill/omission fallback only,
+    itself audited and metered when exercised.
