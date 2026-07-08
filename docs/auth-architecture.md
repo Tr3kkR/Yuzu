@@ -1060,7 +1060,7 @@ for the IdP cert in this release.
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
-## Engine principals & delegation (ADR-0022 — design)
+## Engine principals & delegation (ADR-1005 — design)
 
 - **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
   2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped

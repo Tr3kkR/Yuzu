@@ -1,15 +1,15 @@
-# Engine principals & delegation — auth-architecture follow-up design (ADR-0022 item 2b)
+# Engine principals & delegation — auth-architecture follow-up design (ADR-1005 item 2b)
 
 Status: **Draft for governance review** — this is the execution plan's item 2b
-(`docs/adr-0022-execution-plan.md`, Phase 2), the program's critical-path
+(`docs/adr-1005-execution-plan.md`, Phase 2), the program's critical-path
 deliverable. Phase 4 (engine principal class) is gated on this design being
 accepted; Phase 5 (delegation/write-back) and 2c's Decision-14 confinement
 choice consume it. Nothing here ships code; every mechanism below lands via
 the Phase-4/5 PR ladder mapped in §11.
 
-Companion docs: `docs/adr/0022-headless-platform-use-case-engines.md` (the
+Companion docs: `docs/adr/1005-headless-platform-use-case-engines.md` (the
 ADR; its Decision 5 is the trust-tier/delegation decision this design
-elaborates), `docs/adr-0022-execution-plan.md` (phases + its own Decision log
+elaborates), `docs/adr-1005-execution-plan.md` (phases + its own Decision log
 — cited below as "plan Decision N", distinct from the ADR's Decisions 1–7),
 `docs/auth-architecture.md` (shipped auth surface),
 `docs/adr/0017-management-group-confinement-list-reads.md` (the scoped
@@ -144,7 +144,7 @@ the underlying PG-outage response — an on-call engineer seeing "engine
 session synthesis failing" needs a path to that playbook, not just the
 client-visible 503/401 split. Both stores are server-core (not
 agent-control-plane) Postgres stores — separate from the shared `PgPool`
-ADR-0022 already flags as a pre-GA capacity follow-up (engines and the
+ADR-1005 already flags as a pre-GA capacity follow-up (engines and the
 agent control plane sharing one bounded pool); this design adds no new
 pressure to that specific shared pool, but the cross-reference is worth
 carrying forward so whoever resources that follow-up has the full list of
@@ -436,16 +436,16 @@ don't need reshaping later:
    operator's real effective authority.
 4. **Self-asserted delegation stays rejected forever.** The Phase-1
    on-behalf-of guard (reserved header/metadata rejection) is permanent —
-   ADR-0022's Interim rule survives as a standing invariant; the only
+   ADR-1005's Interim rule survives as a standing invariant; the only
    delegation the server honors is one it issued itself.
 5. **Audit:** every delegated operation writes both identities — the full
-   audit shape ADR-0022's own Decision 5 specifies and plan Decision 9
+   audit shape ADR-1005's own Decision 5 specifies and plan Decision 9
    restates (engine principal id, `is_delegated`, delegated
    operator identity, delegation artifact id,
    `delegation_verification_status`), landing with AuditStore's Postgres
    Wave-1 migration (plan 3b). Until Phase 5 produces real values these
    columns carry defaults; pre-enforcement rows use
-   `delegation_verification_status=unverified` per ADR-0022's
+   `delegation_verification_status=unverified` per ADR-1005's
    incremental-shipping rule. The already-built 3a `principal_class` column
    is the early, delegation-independent half of this shape. **Delegated
    mutations are audit-fail-closed**, not set-and-proceed: if the audit row
@@ -490,7 +490,7 @@ implied anywhere in this design: the agent-daemon's gRPC channel and the
 gateway's `ProxyRegister`/upstream path are untouched (the Phase-1
 gRPC on-behalf-of interceptor, already shipped, is a separate, unrelated
 control). If a future module needs a gRPC bulk-egress surface, that falls
-under ADR-0022's deferred streaming-egress decision, not this design.
+under ADR-1005's deferred streaming-egress decision, not this design.
 
 ## 6. Token-session attribution — branch on persisted kind, never inference
 
@@ -648,7 +648,7 @@ mutations.
   string-keyed deny.
 - **Phase 5 — re-key on effective identity.** Once delegated mutations
   exist, the guard's comparison re-keys on the **effective delegated
-  identity** (ADR-0022 Decision 5's named extension): a delegated operation
+  identity** (ADR-1005 Decision 5's named extension): a delegated operation
   targeting the *delegating operator's own* account or the *acting engine
   principal itself* is rejected exactly as a human self-target is today.
   The §3.3 reserved namespace guarantees the string comparison stays
@@ -665,7 +665,7 @@ more — and per §3.4, authorized *as that operator*.
 |---|---|---|
 | (a) View-time scoped read-through | Findings page render triggers per-operator reads to the Yuzu server, carrying a short-lived operator-bound artifact (the §5 primitive, read-purpose variant); server evaluates confinement via ADR-0017 | Server stays authoritative; zero staleness; per-view latency + server load; needs the §5 artifact early |
 | (b) Identity assertion / session exchange | Operator's browser obtains an operator-bound artifact from Yuzu; UCE backend exchanges it for a scoped read context covering the view session | Same authority + freshness as (a) with fewer round-trips; more moving parts (exchange endpoint, context lifetime) |
-| (c) Synced confinement predicate | Per-operator scope predicate synced alongside findings, re-validated on short TTL | No view-time server dependency; but confinement is evaluated *by the UCE* against a cached predicate — weakest fit for both "server authoritative" and the never-stale requirement (plan Decision 14 itself warns the shared access layer is explicitly a cache). It also fails ADR-0022's own mechanism-vs-interpretation boundary test: confinement is authorization *mechanism*, and (c) relocates that mechanism's evaluation into the UCE — an interpretation-layer component — rather than keeping it server-core, which (a)/(b) both preserve by construction. |
+| (c) Synced confinement predicate | Per-operator scope predicate synced alongside findings, re-validated on short TTL | No view-time server dependency; but confinement is evaluated *by the UCE* against a cached predicate — weakest fit for both "server authoritative" and the never-stale requirement (plan Decision 14 itself warns the shared access layer is explicitly a cache). It also fails ADR-1005's own mechanism-vs-interpretation boundary test: confinement is authorization *mechanism*, and (c) relocates that mechanism's evaluation into the UCE — an interpretation-layer component — rather than keeping it server-core, which (a)/(b) both preserve by construction. |
 
 Evaluation criteria (in order): server remains the confinement authority;
 staleness window ≈ 0 (a scope change takes effect at next view); per-view
@@ -798,7 +798,7 @@ ladder sequencing + #1715 deny-precedence decision (maintainer).
     re-key in Phase 5.
 11. Plan Decision 14 recommendation to 2c: operator-bound-artifact family
     ((a)/(b)); synced-predicate (c) only under a stated, TTL-bounded
-    constraint, and noted as the weaker fit against ADR-0022's own
+    constraint, and noted as the weaker fit against ADR-1005's own
     mechanism-vs-interpretation boundary test.
 12. Classification (`internal`/`external`) required at creation, not
     silently defaulted — `external` is a backfill/omission fallback only,
