@@ -333,6 +333,7 @@ yuzu_server_core_lib = static_library(
     'src/data_export.cpp',
     'src/instruction_db_pool.cpp',
     'src/instruction_store.cpp',
+    'src/instruction_yaml.cpp',
     'src/execution_tracker.cpp',
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',

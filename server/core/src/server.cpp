@@ -38,6 +38,7 @@
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
 #include "instruction_store.hpp"
+#include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp"
@@ -4228,18 +4229,9 @@ private:
     }
 
     static std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
-        std::vector<std::string> errors;
-        if (yaml_source.empty())
-            errors.push_back("YAML source is empty");
-        if (yaml_source.find("apiVersion:") == std::string::npos)
-            errors.push_back("Missing apiVersion field");
-        if (yaml_source.find("kind:") == std::string::npos)
-            errors.push_back("Missing kind field");
-        if (yaml_source.find("plugin:") == std::string::npos)
-            errors.push_back("Missing spec.plugin field");
-        if (yaml_source.find("action:") == std::string::npos)
-            errors.push_back("Missing spec.action field");
-        return errors;
+        // Shared with the POST /api/instructions/yaml save path so validate
+        // and save can never diverge on what a complete definition is (#1993).
+        return instruction_yaml::validate_definition_yaml(yaml_source);
     }
 
     // -- Auth helpers for HTTP ------------------------------------------------
@@ -8395,61 +8387,43 @@ private:
             auto yaml_source = req.get_param_value("yaml_source");
             auto def_id = req.get_param_value("id");
 
-            if (yaml_source.empty()) {
-                res.set_content(
-                    "<div class=\"alert alert-error\">YAML source cannot be empty</div>",
-                    "text/html");
+            // Save shares one contract with /api/instructions/validate-yaml
+            // (#1993): YAML that passes validation always carries what Save
+            // needs, and a failing Save names the actual missing field
+            // instead of a blanket "Missing required fields" for all three.
+            auto errors = validate_yaml_source(yaml_source);
+            if (!errors.empty()) {
+                std::string html =
+                    "<div class=\"alert alert-error\"><strong>Cannot save:</strong><ul>";
+                for (const auto& e : errors)
+                    html += "<li>" + html_escape(e) + "</li>";
+                html += "</ul></div>";
+                res.set_content(html, "text/html");
                 return;
             }
 
-            // Minimal YAML field extraction (name, plugin, action from the YAML text).
-            // Full yaml-cpp parsing is deferred; for now we extract fields via simple
-            // line scanning — the YAML source is stored verbatim as source of truth.
-            auto extract = [&](const std::string& key) -> std::string {
-                auto needle = key + ": ";
-                auto pos = yaml_source.find(needle);
-                if (pos == std::string::npos)
-                    return {};
-                auto start = pos + needle.size();
-                auto end = yaml_source.find('\n', start);
-                auto val = yaml_source.substr(start, end - start);
-                // Strip quotes
-                if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
-                    val = val.substr(1, val.size() - 2);
-                return val;
-            };
+            // Schema-aware extraction of the denormalized columns — accepts
+            // both the canonical nested schema (metadata.id,
+            // spec.execution.plugin/action — what the docs, validate-yaml,
+            // and every bundled definition use) and the flat schema the New
+            // Definition panel's structured form generates (metadata.name,
+            // spec.plugin/action). The YAML source stays the verbatim source
+            // of truth; absent optional fields get the same defaults the
+            // bundled importer applies (embed_content.py::def_envelope).
+            auto fields = instruction_yaml::parse_definition_yaml(yaml_source);
 
             InstructionDefinition def;
-            def.name = extract("name");
-            def.version = extract("version");
-            def.plugin = extract("plugin");
-            def.action = extract("action");
-            // Normalize action to lowercase — agent plugins match case-sensitively
-            for (auto& c : def.action)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            def.type = extract("type");
-            def.description = extract("description");
-            def.concurrency_mode = extract("concurrency");
-            def.approval_mode = extract("approval");
-            // Validate approval_mode — reject unknown values at creation time
-            if (!def.approval_mode.empty() && def.approval_mode != "auto" &&
-                def.approval_mode != "role-gated" && def.approval_mode != "always") {
-                res.set_content("<div class=\"alert alert-error\">Invalid approval mode: &quot;" +
-                                    html_escape(def.approval_mode) +
-                                    "&quot;. Must be auto, role-gated, or always.</div>",
-                                "text/html");
-                return;
-            }
+            def.name = fields.name;
+            def.version = fields.version.empty() ? "1.0.0" : fields.version;
+            def.plugin = fields.plugin;
+            def.action = fields.action; // lowercased by the parser
+            def.type = fields.type.empty() ? "question" : fields.type;
+            def.description = fields.description;
+            def.concurrency_mode = fields.concurrency.empty() ? "per-device" : fields.concurrency;
+            def.approval_mode = fields.approval.empty() ? "auto" : fields.approval;
             def.yaml_source = yaml_source;
             def.created_by = session->username;
             def.enabled = true;
-
-            if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
-                res.set_content("<div class=\"alert alert-error\">Missing required fields: "
-                                "name, plugin, action</div>",
-                                "text/html");
-                return;
-            }
 
             std::string msg;
             if (!def_id.empty()) {
@@ -8457,6 +8431,10 @@ private:
                 auto result = instruction_store_->update_definition(def);
                 msg = result ? "Definition updated" : "Update failed: " + result.error();
             } else {
+                // A canonical definition names itself via metadata.id — honor
+                // it (the store 409s on conflict), matching bundled-importer
+                // semantics; without one the store generates an id.
+                def.id = fields.id;
                 auto result = instruction_store_->create_definition(def);
                 msg = result ? "Definition created" : "Create failed: " + result.error();
             }

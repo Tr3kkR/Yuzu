@@ -299,6 +299,7 @@ if build_server
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
+      'unit/server/test_instruction_yaml.cpp',
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
