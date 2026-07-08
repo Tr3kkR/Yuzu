@@ -8111,6 +8111,13 @@ private:
             auto result = approval_manager_->approve(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
+                // htmx doesn't swap a non-2xx response, so without a trigger
+                // the denial (e.g. the self-approval block) is a silent no-op
+                // in the dashboard (#1821). HX-Trigger headers ARE processed
+                // on error responses — surface the reason as a toast.
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
+                res.set_header("HX-Trigger", trigger.dump());
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
                 return;
@@ -8142,6 +8149,12 @@ private:
             auto result = approval_manager_->reject(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
+                // Same as the approve branch: surface the denial as a toast
+                // (#1821) — htmx swallows non-2xx bodies but processes
+                // HX-Trigger on them.
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
+                res.set_header("HX-Trigger", trigger.dump());
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
                 return;
@@ -8528,19 +8541,29 @@ private:
                                 "</code></td>"
                                 "<td>";
                         if (a.status == "pending") {
-                            html += "<button class=\"btn btn-primary\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem "
-                                    "0.5rem;margin-right:0.3rem\" "
-                                    "hx-post=\"/api/approvals/" +
-                                    a.id +
-                                    "/approve\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Approve</button>"
-                                    "<button class=\"btn btn-danger\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
-                                    "hx-post=\"/api/approvals/" +
-                                    a.id +
-                                    "/reject\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Reject</button>";
+                            if (a.submitted_by == session->username) {
+                                // Self-review is denied server-side
+                                // (ApprovalManager: "reviewer cannot be the
+                                // same as the submitter") — don't render
+                                // buttons that can only silently fail (#1821).
+                                html += "<span style=\"font-size:0.65rem;color:var(--muted)\">"
+                                        "You submitted this — another reviewer must "
+                                        "approve</span>";
+                            } else {
+                                html += "<button class=\"btn btn-primary\" "
+                                        "style=\"font-size:0.65rem;padding:0.15rem "
+                                        "0.5rem;margin-right:0.3rem\" "
+                                        "hx-post=\"/api/approvals/" +
+                                        a.id +
+                                        "/approve\" hx-target=\"#tab-approvals\" "
+                                        "hx-swap=\"innerHTML\">Approve</button>"
+                                        "<button class=\"btn btn-danger\" "
+                                        "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                        "hx-post=\"/api/approvals/" +
+                                        a.id +
+                                        "/reject\" hx-target=\"#tab-approvals\" "
+                                        "hx-swap=\"innerHTML\">Reject</button>";
+                            }
                         }
                         html += "</td></tr>";
                     }
