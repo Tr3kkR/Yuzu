@@ -383,8 +383,6 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
     return create_definition_impl(def);
 }
 
-namespace {
-
 // Shared spec.scope validation for the create AND update paths (PR-E governance
 // arch-B1/UP-4): validating only at create was bypassable via update_definition
 // (reachable from the dashboard YAML-edit PUT and the response-template persist
@@ -395,6 +393,9 @@ namespace {
 // Resolution is deferred to dispatch — a since-expired fromResultSet is still
 // valid here. Also caps oversize input (UP-3, mirrors PolicyStore) and rejects
 // the inline flow-mapping form the block-form line-scanners cannot see (UP-6).
+// Namespace-scope (declared in instruction_store.hpp) so the dashboard
+// validate-yaml/preview endpoints can run the SAME store gates ahead of Save —
+// validate must never pass a document the store then rejects (#1993 / UP-3).
 std::optional<std::string> validate_definition_scope(const std::string& yaml_source) {
     if (yaml_source.empty())
         return std::nullopt;
@@ -410,8 +411,6 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
                                 !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
 }
 
-} // namespace
-
 std::expected<std::string, std::string>
 InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     if (!db_)
@@ -425,6 +424,23 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
 
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+
+    // Explicit ids are operator-controlled (JSON create #402, YAML Save
+    // honouring metadata.id, product-pack install). Bound them to a safe
+    // charset before they reach HTML fragments, route paths, and audit rows
+    // (governance sec-M1: an unconstrained id is an attribute-breakout /
+    // unroutable-record vector). Store-generated ids are hex — always pass.
+    if (!def.id.empty()) {
+        if (def.id.size() > 128)
+            return std::unexpected("definition id too long (max 128 characters)");
+        for (char c : def.id) {
+            const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+            if (!ok)
+                return std::unexpected(
+                    "definition id may only contain letters, digits, '.', '_', and '-'");
+        }
+    }
 
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();

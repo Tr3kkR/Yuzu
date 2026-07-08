@@ -4231,7 +4231,15 @@ private:
     static std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
         // Shared with the POST /api/instructions/yaml save path so validate
         // and save can never diverge on what a complete definition is (#1993).
-        return instruction_yaml::validate_definition_yaml(yaml_source);
+        auto errors = instruction_yaml::validate_definition_yaml(yaml_source);
+        // Also run the store-level gates (scope-walking combos, flow-mapping
+        // scope) that create/update enforce — same contract, one verdict
+        // (governance UP-3). Skip when byte-level errors already fired.
+        if (errors.empty()) {
+            if (auto err = validate_definition_scope(yaml_source))
+                errors.push_back(*err);
+        }
+        return errors;
     }
 
     // -- Auth helpers for HTTP ------------------------------------------------
@@ -8111,14 +8119,28 @@ private:
             auto result = approval_manager_->approve(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
+                // A denied review is an access-control decision (e.g. the
+                // self-approval segregation-of-duties block) — leave an audit
+                // trace like the other denial paths in this file (governance
+                // compliance CC6.1/CC6.3), and a greppable server-side line.
+                (void)audit_log(req, "approval.approve", "denied", "approval", id,
+                                result.error());
+                spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
+                             id.substr(0, 64), reviewer, result.error());
                 // htmx doesn't swap a non-2xx response, so without a trigger
                 // the denial (e.g. the self-approval block) is a silent no-op
                 // in the dashboard (#1821). HX-Trigger headers ARE processed
-                // on error responses — surface the reason as a toast.
+                // on error responses — surface the reason as a toast. dump()
+                // uses `replace`: the error can echo the raw URL id, and the
+                // default handler throws on invalid UTF-8 (governance UP-5).
                 nlohmann::json trigger = {
                     {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger", trigger.dump());
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content(nlohmann::json({{"error", result.error()}})
+                                    .dump(-1, ' ', false,
+                                          nlohmann::json::error_handler_t::replace),
                                 "application/json");
                 return;
             }
@@ -8149,13 +8171,21 @@ private:
             auto result = approval_manager_->reject(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
-                // Same as the approve branch: surface the denial as a toast
-                // (#1821) — htmx swallows non-2xx bodies but processes
-                // HX-Trigger on them.
+                // Same as the approve branch: audit the denial, log it, and
+                // surface it as a toast (#1821) — htmx swallows non-2xx
+                // bodies but processes HX-Trigger on them.
+                (void)audit_log(req, "approval.reject", "denied", "approval", id,
+                                result.error());
+                spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
+                             id.substr(0, 64), reviewer, result.error());
                 nlohmann::json trigger = {
                     {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger", trigger.dump());
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content(nlohmann::json({{"error", result.error()}})
+                                    .dump(-1, ' ', false,
+                                          nlohmann::json::error_handler_t::replace),
                                 "application/json");
                 return;
             }
@@ -8276,14 +8306,19 @@ private:
                                                 : d.instruction_set_id.substr(0, 8)) +
                                 "</td>"
                                 "<td>";
+                        // d.id is operator-chosen since #402 (JSON create) /
+                        // #1993 (YAML metadata.id) — attribute-encode it at
+                        // every interpolation. The store now also bounds new
+                        // ids to [A-Za-z0-9._-]{1,128}; escaping covers rows
+                        // that predate the charset gate (governance sec-M1).
                         if (can_author) {
                             html += "<button class=\"btn btn-secondary btn-sm\" "
                                     "onclick=\"openEditor('" +
-                                    d.id + "')\">Edit</button> ";
+                                    html_escape(d.id) + "')\">Edit</button> ";
                         }
                         html += "<button class=\"btn btn-danger btn-sm\" "
                                 "hx-delete=\"/api/instructions/" +
-                                d.id +
+                                html_escape(d.id) +
                                 "\" hx-target=\"#tab-definitions\" hx-swap=\"innerHTML\" "
                                 "hx-confirm=\"Delete definition '" +
                                 html_escape(d.name) + "'?\">Delete</button></td></tr>";
@@ -8438,29 +8473,82 @@ private:
             def.created_by = session->username;
             def.enabled = true;
 
-            std::string msg;
+            // Toast + inline alert for every outcome. dump() uses the
+            // `replace` error handler: failure messages can embed
+            // operator-supplied ids, and the default handler would throw on
+            // invalid UTF-8, degrading the feedback to a bare httplib 500
+            // (governance cpp-S1 / UP-4).
+            auto respond = [&](const std::string& msg, bool ok) {
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", msg}, {"level", ok ? "success" : "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content("<div class=\"alert alert-" +
+                                    std::string(ok ? "success" : "error") + "\">" +
+                                    html_escape(msg) + "</div>",
+                                "text/html");
+            };
+
             if (!def_id.empty()) {
+                // Route id is authoritative on update — but a yaml_source
+                // self-declaring a DIFFERENT metadata.id would be stored
+                // verbatim and fork the definition on any later re-import
+                // (governance UP-8/cons-N1). Reject the divergence outright.
+                if (!fields.id.empty() && fields.id != def_id) {
+                    respond("YAML metadata.id '" + fields.id +
+                                "' does not match the definition being edited ('" + def_id +
+                                "') — correct or remove metadata.id",
+                            false);
+                    return;
+                }
                 def.id = def_id;
                 auto result = instruction_store_->update_definition(def);
-                msg = result ? "Definition updated" : "Update failed: " + result.error();
+                if (!result) {
+                    spdlog::warn("instruction yaml update failed: id={} error={}",
+                                 def_id.substr(0, 64), result.error());
+                    respond("Update failed: " + result.error(), false);
+                    return;
+                }
+                (void)audit_log(req, "instruction.update", "success", "InstructionDefinition",
+                                def_id);
+                emit_event("instruction.updated", req, {}, {{"instruction_id", def_id}});
+                respond("Definition updated", true);
             } else {
                 // A canonical definition names itself via metadata.id — honor
                 // it (the store 409s on conflict), matching bundled-importer
                 // semantics; without one the store generates an id.
                 def.id = fields.id;
                 auto result = instruction_store_->create_definition(def);
-                msg = result ? "Definition created" : "Create failed: " + result.error();
+                if (!result) {
+                    // #402 pattern (mirrors the JSON create route): strip the
+                    // internal store↔route conflict token before it reaches
+                    // the operator, map to 409 so scripted re-runs of the
+                    // getting-started import see a real status, and leave a
+                    // denied-audit trace for duplicate-id probing.
+                    bool is_conflict = is_conflict_error(result.error());
+                    spdlog::warn("instruction yaml create failed: id={} error={}",
+                                 def.id.substr(0, 64), result.error());
+                    if (is_conflict) {
+                        res.status = 409;
+                        (void)audit_log(req, "instruction.create", "denied",
+                                        "InstructionDefinition", def.id, "duplicate_id");
+                        respond("Create failed: " +
+                                    std::string(strip_conflict_prefix(result.error())),
+                                false);
+                    } else {
+                        respond("Create failed: " + result.error(), false);
+                    }
+                    return;
+                }
+                (void)audit_log(req, "instruction.create", "success", "InstructionDefinition",
+                                *result, def.name);
+                emit_event("instruction.created", req,
+                           {{"name", def.name}, {"plugin", def.plugin}, {"action", def.action},
+                            {"type", def.type}},
+                           {{"instruction_id", *result}});
+                respond("Definition created", true);
             }
-
-            std::string cls =
-                msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
-            {
-                auto level = msg.find("failed") == std::string::npos ? "success" : "error";
-                nlohmann::json trigger = {{"showToast", {{"message", msg}, {"level", level}}}};
-                res.set_header("HX-Trigger", trigger.dump());
-            }
-            res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
-                            "text/html");
         });
 
         // -- YAML validate endpoint --

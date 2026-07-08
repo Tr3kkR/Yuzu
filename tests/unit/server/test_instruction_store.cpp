@@ -97,6 +97,51 @@ TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_stor
     CHECK(!result.has_value());
 }
 
+TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instruction_store]") {
+    // Explicit ids are operator-controlled (JSON create #402, YAML Save
+    // metadata.id #1993) and are interpolated into dashboard fragments,
+    // route paths, and audit rows — the store is the single chokepoint that
+    // bounds them (governance sec-M1).
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "Charset Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+
+    SECTION("dotted canonical id is accepted") {
+        def.id = "tutorial.service.inspect_v2-a";
+        auto result = store.create_definition(def);
+        REQUIRE(result.has_value());
+        CHECK(*result == "tutorial.service.inspect_v2-a");
+    }
+    SECTION("quote/attribute-breakout characters are rejected") {
+        def.id = "x' onmouseover='alert(1)";
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() ==
+              "definition id may only contain letters, digits, '.', '_', and '-'");
+    }
+    SECTION("path separators are rejected") {
+        def.id = "a/b";
+        CHECK(!store.create_definition(def).has_value());
+    }
+    SECTION("overlong id is rejected") {
+        def.id = std::string(129, 'a');
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() == "definition id too long (max 128 characters)");
+    }
+    SECTION("empty id still store-generates") {
+        def.id = "";
+        auto result = store.create_definition(def);
+        REQUIRE(result.has_value());
+        CHECK(!result->empty());
+    }
+}
+
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
 
 namespace {

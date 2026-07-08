@@ -229,6 +229,154 @@ TEST_CASE("instruction_yaml: validate names the specific missing field", "[instr
                                                "  action: a\n"
                                                "  approval: sometimes\n");
         REQUIRE(errors.size() == 1);
-        CHECK(errors[0].find("Invalid approval mode") == 0);
+        // Byte-identical to the JSON-create/PUT routes' denial — one denial,
+        // one string shape everywhere (governance cons-S3).
+        CHECK(errors[0] == "invalid approval_mode: sometimes (must be auto, role-gated, or "
+                           "always)");
     }
+    SECTION("invalid type enum is caught at validate time") {
+        auto errors = validate_definition_yaml("apiVersion: yuzu.io/v1alpha1\n"
+                                               "kind: InstructionDefinition\n"
+                                               "metadata:\n"
+                                               "  id: x\n"
+                                               "spec:\n"
+                                               "  type: gather\n"
+                                               "  plugin: p\n"
+                                               "  action: a\n");
+        REQUIRE(errors.size() == 1);
+        // Byte-identical to InstructionStore::create_definition_impl's
+        // rejection so validate-pass always implies save-pass.
+        CHECK(errors[0] == "type must be 'question' or 'action'");
+    }
+}
+
+TEST_CASE("instruction_yaml: byte-level malformations are rejected outright",
+          "[instruction_yaml]") {
+    SECTION("NUL byte") {
+        std::string doc = "apiVersion: yuzu.io/v1alpha1\n"
+                          "kind: InstructionDefinition\n";
+        doc.push_back('\0');
+        doc += "metadata:\n  id: x\nspec:\n  plugin: p\n  action: a\n";
+        auto errors = validate_definition_yaml(doc);
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == "YAML source contains a NUL byte");
+    }
+    SECTION("oversize source mirrors the store cap") {
+        std::string doc = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n";
+        doc.append(1048577, '#');
+        auto errors = validate_definition_yaml(doc);
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == "yaml_source too large (max 1MB)");
+    }
+}
+
+TEST_CASE("instruction_yaml: multi-document paste is rejected, lead-ins are not",
+          "[instruction_yaml]") {
+    const std::string doc_body = "apiVersion: yuzu.io/v1alpha1\n"
+                                 "kind: InstructionDefinition\n"
+                                 "metadata:\n"
+                                 "  id: solo.def\n"
+                                 "spec:\n"
+                                 "  plugin: p\n"
+                                 "  action: a\n";
+    SECTION("comment header + leading separator is a single document") {
+        CHECK(validate_definition_yaml("## Shipped definition header\n---\n" + doc_body).empty());
+    }
+    SECTION("a second document separator is rejected") {
+        auto errors = validate_definition_yaml(doc_body + "---\n" + doc_body);
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == "YAML source contains multiple documents (--- separator) — save one "
+                           "definition at a time");
+    }
+}
+
+TEST_CASE("instruction_yaml: duplicate sibling keys — first one wins", "[instruction_yaml]") {
+    auto f = parse_definition_yaml("apiVersion: yuzu.io/v1alpha1\n"
+                                   "kind: InstructionDefinition\n"
+                                   "metadata:\n"
+                                   "  id: first.id\n"
+                                   "  id: second.id\n"
+                                   "spec:\n"
+                                   "  plugin: p\n"
+                                   "  action: a\n");
+    // Top-down first-match, consistent with how an operator reads yaml_source.
+    CHECK(f.id == "first.id");
+}
+
+TEST_CASE("instruction_yaml: mixed tab/space sibling indentation drops the off-level key",
+          "[instruction_yaml]") {
+    // A tab counts as ONE column, so a tab-indented line sits at a different
+    // indent level than its 2-space siblings; only minimum-indent keys are
+    // consulted. The dropped key must degrade to a fallback or a validation
+    // error — never to an invented value (governance qe-S2). Here the tab
+    // line (indent 1) is the child level: id resolves, the 2-space
+    // displayName is out of scope, and name falls back to the id.
+    auto f = parse_definition_yaml("apiVersion: yuzu.io/v1alpha1\n"
+                                   "kind: InstructionDefinition\n"
+                                   "metadata:\n"
+                                   "\tid: tab.id\n"
+                                   "  displayName: Two Space Name\n"
+                                   "spec:\n"
+                                   "  plugin: p\n"
+                                   "  action: a\n");
+    CHECK(f.id == "tab.id");
+    CHECK(f.name == "tab.id");
+}
+
+TEST_CASE("instruction_yaml: sibling key-prefix does not shadow", "[instruction_yaml]") {
+    // The `line[key.size()] == ':'` guard is the PR's namesake anti-shadowing
+    // mechanism — pin it directly (governance qe-S3).
+    auto f = parse_definition_yaml("apiVersion: yuzu.io/v1alpha1\n"
+                                   "kind: InstructionDefinition\n"
+                                   "metadata:\n"
+                                   "  id: x\n"
+                                   "spec:\n"
+                                   "  action_type: custom\n"
+                                   "  action: real_action\n"
+                                   "  plugin_home: /opt\n"
+                                   "  plugin: real_plugin\n");
+    CHECK(f.action == "real_action");
+    CHECK(f.plugin == "real_plugin");
+}
+
+TEST_CASE("instruction_yaml: line-ending and EOF edges", "[instruction_yaml]") {
+    SECTION("no trailing newline — key on the final line") {
+        auto f = parse_definition_yaml("metadata:\n  id: eof.id\nspec:\n  execution:\n"
+                                       "    plugin: p\n    action: a"); // no trailing \n
+        CHECK(f.id == "eof.id");
+        CHECK(f.action == "a");
+    }
+    SECTION("CRLF line endings") {
+        auto f = parse_definition_yaml("apiVersion: yuzu.io/v1alpha1\r\n"
+                                       "kind: InstructionDefinition\r\n"
+                                       "metadata:\r\n"
+                                       "  id: crlf.id\r\n"
+                                       "spec:\r\n"
+                                       "  plugin: p\r\n"
+                                       "  action: a\r\n");
+        CHECK(f.id == "crlf.id");
+        CHECK(f.plugin == "p");
+    }
+}
+
+TEST_CASE("instruction_yaml: block-scalar indicators and comment-only openers are absent",
+          "[instruction_yaml]") {
+    // `>-` / `|+` / `|2` are block-scalar indicators, not values; a
+    // comment-only value is a mapping opener with an annotation. Both must
+    // extract as absent, never as literal text (governance dsl-S3).
+    auto f = parse_definition_yaml("metadata:\n"
+                                   "  id: blocks.id\n"
+                                   "  description: >-\n"
+                                   "    folded and chomped text\n"
+                                   "spec:\n"
+                                   "  approval:  # role gate configured below\n"
+                                   "    mode: role-gated\n"
+                                   "  execution:\n"
+                                   "    plugin: p\n"
+                                   "    action: a\n"
+                                   "  notes: |+\n"
+                                   "    keep\n");
+    CHECK(f.description.empty());
+    CHECK(f.approval == "role-gated"); // comment-only opener fell through to mode
+    CHECK(f.plugin == "p");
 }

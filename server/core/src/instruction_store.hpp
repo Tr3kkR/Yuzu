@@ -66,6 +66,13 @@ struct InstructionSet {
     int64_t created_at{0};
 };
 
+/// Store-level yaml_source gates shared by create AND update (size cap,
+/// scope-walking `fromResultSet` combos, inline flow-mapping rejection).
+/// Exposed so the dashboard validate-yaml/preview endpoints can run the same
+/// gates ahead of Save — validate must never pass a document the store then
+/// rejects (#1993 / governance UP-3). Returns the error, or nullopt when OK.
+std::optional<std::string> validate_definition_scope(const std::string& yaml_source);
+
 class InstructionStore {
 public:
     explicit InstructionStore(const std::filesystem::path& db_path);

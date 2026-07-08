@@ -76,7 +76,9 @@ Expected response:
 
 The server uses `metadata.id` (`hello.system.info`) as the definition's ID, takes its display name from `metadata.displayName`, and records an audit event: who created it, when, and from where.
 
-> **Note:** there is also a JSON import endpoint, `POST /api/instructions/import`, meant for distributing definitions as signed envelopes (an Ed25519 `signature` + `publicKey` pair over the `yaml_source` bytes). On a default server, **unsigned** imports through that endpoint are rejected — you would need to start the server with `--allow-unsigned-definitions` (or `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1`) to use it without signing. The endpoint used above is the authoring surface instead: it trusts your authenticated session's `InstructionDefinition:Write` permission, so it works on a default server.
+> **Note:** there is also a JSON import endpoint, `POST /api/instructions/import`, meant for distributing definitions as signed envelopes (an Ed25519 `signature` + `publicKey` pair over the `yaml_source` bytes). On a default server, **unsigned** imports through that endpoint are rejected. Bypassing that with `--allow-unsigned-definitions` (or `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1`) is **dangerous** — unsigned instruction content is a fleet arbitrary-code-execution surface, the server emits a `server.unsigned_definitions_allowed` audit event at startup when it is set, and it should not be used outside isolated labs (see [Server Administration](user-manual/server-admin.md)). The endpoint used above is the authoring surface instead: it trusts your authenticated session's `InstructionDefinition:Write` permission, so it works on a default server with no signing bypass.
+>
+> Re-running the same import is safe: because the definition's ID comes from `metadata.id`, a second attempt returns **HTTP 409** with `Create failed: instruction definition 'hello.system.info' already exists` rather than creating a duplicate.
 
 ### Verify the definition exists
 
@@ -450,9 +452,17 @@ Expected response:
 
 ### Walk through the approval flow
 
+> **You need two accounts for this section.** A reviewer cannot approve or
+> reject their own submission — the server rejects self-review with HTTP 400
+> (`"reviewer cannot be the same as the submitter"`), and the dashboard shows
+> "You submitted this — another reviewer must approve" instead of buttons on
+> your own requests. If you have been following along as a single admin,
+> create a second operator account now and use it for the approve/reject
+> steps below.
+
 **1. Submit the action.**
 
-An operator submits the instruction for execution. Because the approval mode is `role-gated`, it does not execute immediately -- it enters the pending queue.
+An operator submits the instruction for execution. Because the approval mode is `role-gated`, it does not execute immediately -- it enters the pending queue. (`role-gated` queues *non-admin* submitters for approval; admins execute directly. To watch the queue while testing as an admin, use a definition with `approval.mode: always` instead.)
 
 **2. Check pending approvals.**
 

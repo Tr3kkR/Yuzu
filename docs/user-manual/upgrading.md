@@ -18,6 +18,30 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: dashboard YAML Save is schema-aware and stricter (#1993)
+
+`POST /api/instructions/yaml` (the New Definition panel's Save endpoint) and
+`POST /api/instructions/validate-yaml` now share one schema-aware parser that
+accepts the canonical nested InstructionDefinition schema (`metadata.id`,
+`spec.execution.plugin/action` — the documented format every shipped
+definition uses), which the old substring scanner rejected. In exchange, the
+endpoint is stricter about malformed input:
+
+**Who this affects:** automation POSTing YAML to `/api/instructions/yaml`
+that (a) omits `apiVersion:`/`kind:` lines, (b) relied on a stray `name:`
+substring anywhere in the document being picked up as the definition name,
+(c) re-creates a definition whose `metadata.id` already exists (now **409**
+with a denied audit row instead of a silent second copy under a generated
+id), (d) supplies an explicit id outside `[A-Za-z0-9._-]{1,128}`, or
+(e) pastes multi-document (`---`-separated) files (now rejected; save one
+definition at a time). Interactive panel users are unaffected — the
+structured form's output stays accepted.
+
+**Verify:** re-run your automation against a test server; failures surface as
+specific per-field messages (e.g. `Missing metadata.id (or metadata.name)
+field`), and successful saves now emit `instruction.create` /
+`instruction.update` audit rows.
+
 ## ⚠️ Reserved on-behalf-of headers rejected + `principal_class` metric label (ADR-0022 Phase 1)
 
 Two operator-visible changes ship together:

@@ -4606,11 +4606,40 @@ A failed signature ALWAYS rejects, even when enforcement is off — `--allow-uns
 
 #### `POST /api/instructions/yaml`
 
-Store raw YAML source for an instruction definition.
+Create or update an instruction definition from raw YAML source (the dashboard
+New Definition panel's Save endpoint). Form-encoded: `yaml_source` carries the
+document verbatim (stored as the definition's source of truth); an optional
+`id` parameter switches to update mode. Responses are HTML fragments (this is
+a dashboard surface), plus an `HX-Trigger` toast header. Requires
+`InstructionDefinition:Write`.
+
+The queryable columns are derived schema-aware from the YAML — both the
+canonical nested schema and the flat form the panel's structured form
+generates are accepted, with this precedence:
+
+| Column | Canonical | Fallback |
+|---|---|---|
+| id | `metadata.id` (create only; honoured, **409** on conflict) | store-generated |
+| name | `metadata.displayName` | `metadata.name`, then `metadata.id` |
+| plugin / action | `spec.execution.plugin` / `.action` | `spec.plugin` / `spec.action` |
+| approval | `spec.approval.mode` | scalar `spec.approval` (default `auto`) |
+| version / type / concurrency | `metadata.version` / `spec.type` / `spec.execution.concurrency` | defaults `1.0.0` / `question` / `per-device` |
+
+On update, a `yaml_source` whose `metadata.id` differs from the `id` parameter
+is rejected. Explicit ids must match `[A-Za-z0-9._-]{1,128}`. Save and
+validate-yaml share one validation contract — YAML that passes validation
+always saves.
+
+**Audit:** emits `instruction.create` / `instruction.update` (`result=success`),
+and `instruction.create` with `result=denied` / `duplicate_id` on conflict.
 
 #### `POST /api/instructions/validate-yaml`
 
 Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
+Requires `InstructionDefinition:Read`. Runs the same validation contract as
+the Save endpoint above (required fields, `type`/`approval` enums, size cap,
+scope-walking gates), so a document that validates green is guaranteed to
+save.
 
 #### `POST /api/instructions/{id}/execute`
 

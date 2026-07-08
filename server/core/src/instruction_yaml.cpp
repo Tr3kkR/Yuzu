@@ -62,6 +62,11 @@ std::string child_value(const std::string& block, std::string_view key) {
                     if (close != std::string_view::npos)
                         val = val.substr(1, close - 1);
                 } else {
+                    // A comment-only value (`key:  # note`) is a mapping
+                    // opener with an annotation, not a scalar — treat as
+                    // absent so callers fall through to the nested form.
+                    if (!val.empty() && val.front() == '#')
+                        return {};
                     // Strip an inline comment (YAML requires whitespace
                     // before '#').
                     for (std::size_t i = 0; i < val.size(); ++i) {
@@ -72,11 +77,23 @@ std::string child_value(const std::string& block, std::string_view key) {
                             break;
                         }
                     }
+                    // A block-scalar indicator — bare `>`/`|` or with
+                    // chomping/indent modifiers (`>-`, `|+`, `|2-`) — means
+                    // "not a plain scalar"; treat as absent rather than
+                    // storing the indicator text as the value.
+                    if (!val.empty() && (val.front() == '>' || val.front() == '|')) {
+                        bool indicator = true;
+                        for (std::size_t i = 1; i < val.size(); ++i) {
+                            if (val[i] != '+' && val[i] != '-' &&
+                                !std::isdigit(static_cast<unsigned char>(val[i]))) {
+                                indicator = false;
+                                break;
+                            }
+                        }
+                        if (indicator)
+                            return {};
+                    }
                 }
-                // A block-scalar indicator means "not a plain scalar" — treat
-                // as absent, same as yaml_scan::extract_yaml_value.
-                if (val == ">" || val == "|")
-                    return {};
                 return std::string{val};
             }
         }
@@ -134,6 +151,50 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
         errors.push_back("YAML source is empty");
         return errors;
     }
+    // Byte-level malformations first — these make text extraction and the
+    // stored blob diverge, so nothing else is worth reporting alongside them.
+    // NUL: sqlite3_bind_text(-1) would truncate the stored yaml_source at the
+    // first NUL while the scanner reads past it (governance UP-2).
+    if (yaml_source.find('\0') != std::string::npos) {
+        errors.push_back("YAML source contains a NUL byte");
+        return errors;
+    }
+    // Size: mirror the store's create/update cap so validate can never pass
+    // a document Save then rejects (governance UP-3).
+    if (yaml_source.size() > 1048576) {
+        errors.push_back("yaml_source too large (max 1MB)");
+        return errors;
+    }
+    // Multiple documents: the Save path persists ONE definition; a pasted
+    // multi-doc file (every shipped content/definitions/*.yaml) would save
+    // doc 1 and silently drop the rest (governance dsl-S2). A separator on
+    // the first content line is a lead-in, not a second document.
+    {
+        bool seen_content = false;
+        for (std::size_t pos = 0; pos < yaml_source.size();) {
+            auto eol = yaml_source.find('\n', pos);
+            if (eol == std::string::npos)
+                eol = yaml_source.size();
+            std::string_view line{yaml_source.data() + pos, eol - pos};
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t' ||
+                                     line.back() == '\r'))
+                line.remove_suffix(1);
+            if (line == "---") {
+                if (seen_content) {
+                    errors.push_back("YAML source contains multiple documents (--- separator) "
+                                     "— save one definition at a time");
+                    return errors;
+                }
+            } else if (!line.empty()) {
+                // Comment-only lines don't count: a comment header followed
+                // by a `---` lead-in is still a single document.
+                auto first = line.find_first_not_of(" \t");
+                if (first != std::string_view::npos && line[first] != '#')
+                    seen_content = true;
+            }
+            pos = eol + 1;
+        }
+    }
     const auto f = parse_definition_yaml(yaml_source);
     if (!f.has_api_version)
         errors.push_back("Missing apiVersion field");
@@ -145,10 +206,14 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
         errors.push_back("Missing spec.execution.plugin (or spec.plugin) field");
     if (f.action.empty())
         errors.push_back("Missing spec.execution.action (or spec.action) field");
+    // Enum checks match the store/JSON-route error strings byte-for-byte so
+    // one denial has one shape everywhere (governance cons-S3).
+    if (!f.type.empty() && f.type != "question" && f.type != "action")
+        errors.push_back("type must be 'question' or 'action'");
     if (!f.approval.empty() && f.approval != "auto" && f.approval != "role-gated" &&
         f.approval != "always") {
-        errors.push_back("Invalid approval mode: \"" + f.approval +
-                         "\" — must be auto, role-gated, or always");
+        errors.push_back("invalid approval_mode: " + f.approval +
+                         " (must be auto, role-gated, or always)");
     }
     return errors;
 }
