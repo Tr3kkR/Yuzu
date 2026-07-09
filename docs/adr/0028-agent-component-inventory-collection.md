@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-07
 owner: "@lesault (Andy Younie)"
 depends-on: >-
@@ -1409,8 +1409,10 @@ retirement PR itself.
 
 ## Ratification
 
-**Status: proposed.** Needs the same reviewer bar as ADR-0016/0018 for a new plugin touching
-endpoint filesystem scanning:
+**Status: accepted** (2026-07-09, per @Tr3kkR's standing convention: an ADR submitted for review in
+a PR carries `status: accepted` so `dev` shows the correct status once reviewed and merged).
+Otherwise needs the same reviewer bar as ADR-0016/0018 for a new plugin touching endpoint filesystem
+scanning — this status flip doesn't stand in for that review actually happening:
 
 - **Maintainer** — @Tr3kkR (merge gate).
 - **Platform lead** — @NathanDornbrook (storage/fleet-scale implications of a new, potentially
