@@ -275,6 +275,7 @@ if build_server
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
+      'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
