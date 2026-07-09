@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-01
 owner: "@lesault (Andy Younie)"
 decided-with: "@Tr3kkR (maintainer)"
@@ -86,5 +86,6 @@ Move to **potential reachability** as `observed ∪ potential`, built in accurac
 
 ## Ratification
 
-**Status: proposed.** Decided by the vuln_scan owner with the maintainer. Route through the normal
-review / `/governance` path; record accepting reviewer + date on acceptance.
+**Status: accepted** (2026-07-09), per @Tr3kkR's standing convention: an ADR merged via reviewed PR
+carries `status: accepted` on `dev`. Already decided by the vuln_scan owner with the maintainer per
+the original text below.
