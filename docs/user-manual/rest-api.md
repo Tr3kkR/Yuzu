@@ -8,6 +8,8 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
 
 The Yuzu REST API uses path-based versioning. Understanding the distinction between versioned and legacy endpoints is important for building stable integrations.
 
+> **Formal policy:** the binding cross-surface versioning & deprecation policy — covering REST **and** MCP tools, the additive-vs-breaking test, the deprecation cycle (announcement channels + minimum window), and MCP tool naming on breaking changes — is [`docs/api-versioning-policy.md`](../api-versioning-policy.md). This section is the REST summary.
+
 ### Versioned API (`/api/v1/`)
 
 All endpoints under the `/api/v1/` prefix are the **stable, versioned API**. These endpoints:
@@ -25,7 +27,7 @@ Endpoints under `/api/` without the `v1` prefix are **legacy endpoints** that pr
 - Remain available for backward compatibility
 - Do **not** use the standard v1 JSON envelope
 - May return inconsistent error formats
-- Are **deprecated** and will be removed in a future major release
+- Are **deprecated** and will be removed per the deprecation cycle in [`docs/api-versioning-policy.md`](../api-versioning-policy.md) (a feature release, after the announced window)
 - Should be migrated to their v1 equivalents where available
 
 ### Migration Guidance
@@ -122,6 +124,17 @@ Every request must be authenticated using one of three methods:
 Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
+
+**Reserved headers — do not send.** Five header names are reserved for future
+server-verifiable delegation and are **rejected on every endpoint** (sole
+exception: the four unauthenticated health-probe paths, which ignore them —
+see `docs/auth-architecture.md`) with `403` + the standard error envelope
+(ADR-0022): `On-Behalf-Of`, `X-On-Behalf-Of`,
+`X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
+`X-Yuzu-Delegation-Artifact` (case-insensitive). A client must never assert
+that it acts on another principal's behalf via a header; see
+`docs/auth-architecture.md` ("On-behalf-of assertions rejected") for rationale
+and the evolution path.
 
 ---
 

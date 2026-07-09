@@ -217,8 +217,11 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | Raw resource/process/cast APIs in C++ (`popen`, `system`, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`) | **cpp-safety** |
 | Background thread or callback storing pointer/reference | **cpp-safety**, **sre** |
 | Packaging, systemd units, Dockerfiles, installer scripts | **release-deploy** |
+| New/changed REST route, MCP tool, dashboard fragment/page, or any other capability-adding operator surface | **architect**, **security-guardian** — both apply the ADR-0022 standing question (below) |
 
 **Always include architect** when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.
+
+**Always apply the ADR-0022 standing question** on any capability-adding diff: is every behavior of this capability reachable by an authenticated external principal via versioned REST *and* MCP, or a recorded exception in ADR-0022's exception ledger; is it discoverable (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`); does it carry the A4 error envelope; is there no in-process-only behavior; are RBAC and audit enforced at the API layer (not only in the UI)? A dashboard fragment is not an API twin. (Policy: `docs/adr/0022-headless-platform-use-case-engines.md`; current phase status: `docs/adr-0022-execution-plan.md` — both land with PRs #1918/#1926; do not merge this wiring before them.)
 
 **Always include quality-engineer** when new features or fixes land — it's the only agent that flags fixture races, bad error-string substring asserts, and REST-handler-untested-through-store-tests, which are the three highest-ROI test gaps.
 
@@ -399,6 +402,15 @@ state, schema, and contract consistency. Check:
    paths are a parallel-test race.
 
 7. **CHANGELOG reverse-chronological order invariant** preserved?
+
+8. **ADR-0022 headless-platform parity** — for any capability this PR
+   adds or changes: is every behavior reachable by an authenticated
+   external principal via versioned REST *and* MCP, or a recorded
+   exception in ADR-0022's exception ledger; is it discoverable
+   (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`);
+   does it carry the A4 error envelope; is there no in-process-only
+   behavior; are RBAC and audit enforced at the API layer (not only
+   in the UI)? A dashboard fragment is not an API twin.
 
 ## Output format
 
