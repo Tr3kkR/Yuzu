@@ -213,6 +213,40 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return extracted && *extracted == strip_default_port(std::string(host));
 }
 
+/// The unauthenticated-allowlist decision for the server's pre-routing
+/// handler (H1, 2026-07-08 SCIM review) — extracted from `server.cpp`'s
+/// `set_pre_routing_handler` lambda so the login/SSO/health/PKI/SCIM
+/// exemption list has direct unit coverage instead of only being exercised
+/// by booting a real server. Every existing exempt path is unchanged; the
+/// only addition is the `/scim/v2/` prefix (see below).
+///
+/// Caller contract: this MUST be consulted AFTER the rate limiter and
+/// (once it lands) any on-behalf-of/ADR-0022 rejection in the pre-routing
+/// handler, never wired in as an earlier early-return — those controls
+/// must stay in effect for every path this allows through unauthenticated.
+/// Returns true iff `path` should skip session/bearer resolution entirely.
+inline bool is_login_exempt_path(std::string_view path) {
+    return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
+           path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
+           path == "/auth/callback" || path == "/api/v1/openapi.json" ||
+           path == "/auth/saml/start" || path == "/saml/acs" ||
+           // PKI PR4: the CA root cert + CRL are public by design — clients
+           // and browsers need them to establish trust / check revocation
+           // before they have any session. Exact-match only; /api/v1/ca/issued
+           // and /api/v1/ca/revoke remain Security-gated below.
+           path == "/api/v1/ca/root" || path == "/api/v1/ca/crl" ||
+           path.starts_with("/static/") ||
+           // H1 (2026-07-08 SCIM review): /scim/v2/* authenticates itself via
+           // a static Bearer token validated against ScimStore
+           // (scim_routes.cpp `require_bearer`) — there is no session cookie
+           // on this surface at all. Without this exemption every IdP call
+           // (even one carrying a valid SCIM bearer token) was 302-redirected
+           // to /login before ScimRoutes ever saw the request — 0 SCIM audit
+           // rows, the feature never ran. Prefix match: every /scim/v2/*
+           // route (Users CRUD + the discovery documents) needs it.
+           path.starts_with("/scim/v2/");
+}
+
 /// Extract a value from a URL-encoded form body by key name.
 inline std::string extract_form_value(const std::string& body, const std::string& key) {
     auto needle = key + "=";

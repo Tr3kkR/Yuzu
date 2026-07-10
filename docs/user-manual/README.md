@@ -12,6 +12,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 |---|---|
 | [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs |
 | [Authentication](authentication.md) | Login, session management, mTLS, and Windows certificate store integration |
+| [SCIM v2 Provisioning](scim-provisioning.md) | Auto-provision and auto-deprovision operators from an enterprise IdP (Okta/Entra/OneLogin) via SCIM 2.0 (SOC 2 CC6.2/CC6.8); Users-only, Groups→role mapping deferred |
 | [RBAC](rbac.md) | Role-based access control -- principals, roles, securable types, per-operation permissions |
 | [Asset Tagging](../asset-tagging-guide.md) | Structured tags (role, environment, location, service), categories, and tag compliance |
 | [Management Groups](management-groups.md) | Hierarchical device grouping for access scoping and policy inheritance |

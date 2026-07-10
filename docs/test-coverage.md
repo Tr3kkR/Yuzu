@@ -6,10 +6,10 @@ Last updated: 2026-07-06
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 20 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 21 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
-**Totals:** 52 test files (+3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
+**Totals:** 53 test files (+1: `test_thread_pool.cpp` — the #2037 dispatch-pool exception firewall; +3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
 
 Run all tests: `meson test -C build-linux --print-errorlogs`
 
@@ -95,6 +95,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_auth.cpp` | Auth manager | Crypto primitives, user CRUD, sessions, enrollment tokens, pending agents, config persistence |
 | `test_auto_approve.cpp` | Auto-approve | Hostname glob, CIDR subnet, CA fingerprints, rule evaluation (any/all mode), config persistence |
 | `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules, assess() coverage-aware matching, vendor composite index (EXPLAIN plans), products_for_cves CVE→product inversion, upsert_cves changed_ids delta |
+| `test_cpe_identity_resolver.cpp` | CPE identity resolver (PR 3) | Lane gate (os-native / unsupported ecosystem, case-insensitive), no-identity / no-version decision ordering, curated exact-High hit + global-vs-distro-override precedence, `normalize_product` table (interpreter-prefix, SAFE-suffix, lib-dot soname, prefix-then-no-suffix, prefix floor), display-only vendor contract, fail-closed floor (12 vs 13 exact boundary), and adversarial regressions (13-malformed-lines → 0 rows, empty-product row dropped, uncurated dotted-lib e2e dot-strip). Untested / PR-4-owed: seed cpe_product-vs-NVD-mirror validation (DB-free in PR 3 — a wrong token silently yields zero coverage until PR 4 asserts each seed product hits ≥ 1 real `cve_match` row). |
 | `test_update_registry.cpp` | OTA registry | Package CRUD, latest_for version selection, rollout eligibility, binary_path |
 | `test_https_config.cpp` | HTTPS config | Default values, cookie security attributes (Secure, HttpOnly, SameSite), retention config |
 | `test_response_store.cpp` | Response store | Store/retrieve, query filters (agent_id, status, time range), pagination, TTL, ordering |

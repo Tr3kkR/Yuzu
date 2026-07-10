@@ -7,6 +7,7 @@
 #include <yuzu/version.hpp>
 
 #include "insecure_tls_gate.hpp"
+#include "scim_routes.hpp"
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
@@ -323,6 +324,18 @@ int main(int argc, char* argv[]) {
         // clear of SQLite's overflow-to-NULL range (Hermes INFO).
         ->check(CLI::Range(1, 2592000))
         ->envname("YUZU_BREAK_GLASS_WINDOW_SECS");
+
+    // SCIM v2 provisioning (`/scim/v2/*`) — enterprise IdP (Okta/Entra)
+    // auto-provisioning + auto-deprovisioning. Disabled by default; fail-closed
+    // checks (token required, HTTPS required) run just before serving — see below.
+    app.add_flag("--scim-enable", cfg.scim_enable,
+                "Enable the SCIM v2 provisioning surface (/scim/v2/*). Requires "
+                "--scim-token and HTTPS; refuses to start otherwise.")
+        ->envname("YUZU_SCIM_ENABLE");
+    app.add_option("--scim-token", cfg.scim_token,
+                  "Bearer credential IdPs present on every /scim/v2/* request. "
+                  "Required when --scim-enable is set; stored as a sha256 hash only.")
+        ->envname("YUZU_SCIM_TOKEN");
 
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
     app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,
@@ -1247,6 +1260,24 @@ int main(int argc, char* argv[]) {
         spdlog::warn("--break-glass-user='{}' is set but --auth-mode is 'standard' — the "
                      "break-glass exemption only applies under --auth-mode=sso-only; ignoring.",
                      cfg.break_glass_user);
+    }
+
+    // ── SCIM v2 provisioning fail-closed guard (CC6.2) ──────────────────────
+    // An unauthenticated /scim/v2/* provisioning surface would be catastrophic
+    // (any anonymous caller could mint/deactivate operator accounts), so refuse
+    // to start rather than boot it half-configured. The token/HTTPS
+    // preconditions live in the testable `scim_boot_guard_ok` (S-BOOTGUARD-TEST,
+    // scim_routes.cpp) — this is the thin main-side wrapper, mirroring
+    // `break_glass_user_valid` above.
+    if (cfg.scim_enable) {
+        std::string err;
+        if (!yuzu::server::scim_boot_guard_ok(cfg, err)) {
+            spdlog::error("{}", err);
+            return EXIT_FAILURE;
+        }
+        spdlog::warn("SCIM v2 provisioning ACTIVE (--scim-enable): /scim/v2/* accepts a "
+                     "bearer-token-authenticated IdP push that can provision AND deprovision "
+                     "operator accounts (read-only 'user' role only).");
     }
 
     std::signal(SIGINT, on_signal);
