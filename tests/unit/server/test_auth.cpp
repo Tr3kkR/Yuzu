@@ -22,6 +22,7 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::server::auth;
+using yuzu::server::AuthDB;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -159,6 +160,85 @@ TEST_CASE("remove_user", "[auth][user]") {
 TEST_CASE("remove_user returns false for nonexistent user", "[auth][user]") {
     auto mgr = make_temp_auth();
     REQUIRE_FALSE(mgr->remove_user("nonexistent"));
+}
+
+// ── remove_user: cold-cache DB truth (CC6.8, PR #2018 review response) ─────
+//
+// AuthManager::remove_user historically returned `users_.erase(username) > 0`
+// — the in-memory cache's own erase result — even on the AuthDB-backed path,
+// where the DB write is what actually matters. Nothing bulk-preloads `users_`
+// at construction, so a freshly-booted server (or, as here, a second
+// AuthManager wired to the same AuthDB, standing in for one) has an empty
+// cache for any user it never itself upserted. Removing a pre-existing DB row
+// through that cold manager did the soft-delete successfully but reported
+// failure, because the erase against the never-populated cache trivially
+// returned 0. SCIM's deprovision path treated that false as a hard failure
+// (fail-closed 500), and — since the DB write already happened — a client
+// retry re-hit the same false-failure every time. The fix returns the DB's
+// own `std::expected<bool, AuthDBError>` truth instead of the cache-erase
+// bool, with cache/session cleanup demoted to a best-effort side effect.
+TEST_CASE("remove_user returns true for a cold-cache DB hit (CC6.8 cold cache)",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    // Seed the row directly through AuthDB, bypassing AuthManager entirely —
+    // no AuthManager instance ever caches this username.
+    auto salt = AuthManager::random_bytes(16);
+    auto salt_hex = AuthManager::bytes_to_hex(salt);
+    REQUIRE(auth_db
+                .upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
+                             salt_hex, Role::user)
+                .has_value());
+
+    // A fresh AuthManager over the SAME AuthDB, modeling a cold-booted
+    // process: its in-memory users_ map has never seen "cora".
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(&auth_db);
+
+    REQUIRE(cold_mgr.remove_user("cora"));
+
+    // The DB row is now soft-deleted (is_active = 0) — get_user filters
+    // is_active = 1, so it now reports not-found.
+    REQUIRE_FALSE(auth_db.get_user("cora").has_value());
+}
+
+TEST_CASE("remove_user returns false for a DB miss, no error (cold cache)",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(&auth_db);
+
+    REQUIRE_FALSE(cold_mgr.remove_user("nonexistent"));
+}
+
+TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    AuthManager mgr;
+    mgr.set_auth_db(&auth_db);
+
+    // upsert_user goes through AuthManager, so it warms the cache too.
+    REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
+    auto token = mgr.authenticate("dana", "password1234");
+    REQUIRE(token.has_value());
+    REQUIRE(mgr.validate_session(*token).has_value());
+
+    REQUIRE(mgr.remove_user("dana"));
+
+    // Sessions belonging to the removed user are invalidated (CHAOS-T1-001).
+    REQUIRE_FALSE(mgr.validate_session(*token).has_value());
+    REQUIRE_FALSE(auth_db.get_user("dana").has_value());
 }
 
 // ── Authentication ───────────────────────────────────────────────────────────

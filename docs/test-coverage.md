@@ -6,10 +6,10 @@ Last updated: 2026-07-06
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 20 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 21 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
-**Totals:** 52 test files (+3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
+**Totals:** 53 test files (+1: `test_thread_pool.cpp` — the #2037 dispatch-pool exception firewall; +3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
 
 Run all tests: `meson test -C build-linux --print-errorlogs`
 

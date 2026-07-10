@@ -651,6 +651,20 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
             ALTER TABLE users ADD COLUMN display_name TEXT;
             ALTER TABLE users ADD COLUMN last_seen_at DATETIME;
         )"},
+        // v7: SCIM v2 provisioning provenance (slice 1 — storage layer only,
+        // no routes yet). Distinct from v6's `identity_source` (which marks
+        // *how a user authenticates* — local password vs SSO): this column
+        // marks *who created/manages the account's lifecycle* so a future
+        // SCIM deprovisioning sweep can refuse to deactivate/delete a
+        // locally-created admin it did not provision. One defaulted NOT NULL
+        // column so existing rows survive without backfill — every pre-v7
+        // row is correctly classified 'local' with zero migration work.
+        // RENUMBERED: the spec that authored this task assumed kMigrations
+        // ended at v5; v6 (durable SSO identity, #1852) landed on dev first,
+        // so this lands as v7 (see v5's own renumber note for precedent).
+        {7, R"(
+            ALTER TABLE users ADD COLUMN provisioning_source TEXT NOT NULL DEFAULT 'local';
+        )"},
     };
 
     if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
@@ -2438,6 +2452,146 @@ std::expected<bool, AuthDBError> AuthDB::is_elevation_eligible(const std::string
     // rc == SQLITE_DONE → no active row → fail-closed (not eligible).
     sqlite3_finalize(stmt);
     return eligible;
+}
+
+std::expected<void, AuthDBError> AuthDB::set_provisioning_source(const std::string& username,
+                                                                  const std::string& source) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Single UPDATE ... RETURNING (no sqlite3_changes() — #1033). The RETURNING
+    // row confirms a live row matched (UserNotFound otherwise). Touches ONLY the
+    // provenance column — never credentials or role.
+    static const char* sql = R"(
+        UPDATE users SET provisioning_source = ?1, updated_at = CURRENT_TIMESTAMP
+        WHERE username = ?2 AND is_active = 1
+        RETURNING provisioning_source
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare set_provisioning_source statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, source.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        return {};
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::error("set_provisioning_source failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
+}
+
+std::expected<std::string, AuthDBError>
+AuthDB::get_provisioning_source(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Deliberately NO `is_active = 1` filter (unlike get_user/lockout_status/
+    // etc.): provisioning_source is provenance metadata, not current status,
+    // and the SCIM provenance guard (scim_routes.cpp `provenance_ok`) MUST be
+    // able to read it on a currently-soft-deleted row — that's precisely the
+    // state a resource is in right before a PATCH/PUT active=true
+    // reactivation, and the guard has to approve reactivation BEFORE the row
+    // becomes active again. A truly-absent username still UserNotFounds.
+    static const char* sql = R"(
+        SELECT provisioning_source FROM users WHERE username = ?
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare get_provisioning_source statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const unsigned char* text = sqlite3_column_text(stmt, 0);
+        std::string source = text ? reinterpret_cast<const char*>(text) : "";
+        sqlite3_finalize(stmt);
+        return source;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        spdlog::error("get_provisioning_source query failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::QueryFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
+}
+
+std::expected<void, AuthDBError> AuthDB::set_identity_source(const std::string& username,
+                                                              const std::string& source) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Single UPDATE ... RETURNING (no sqlite3_changes() — #1033). Touches
+    // ONLY identity_source — never credentials, role, or provisioning_source.
+    static const char* sql = R"(
+        UPDATE users SET identity_source = ?1, updated_at = CURRENT_TIMESTAMP
+        WHERE username = ?2 AND is_active = 1
+        RETURNING identity_source
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare set_identity_source statement: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, source.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        return {};
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::error("set_identity_source failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
+}
+
+std::expected<void, AuthDBError> AuthDB::reactivate_user(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // No `is_active = 1` filter — that's the whole point: this is the ONLY
+    // writer that revives a soft-deleted row. Clears lockout state (a
+    // returning user must not inherit a stale lock); deliberately leaves
+    // mfa_totp_secret/mfa_enrolled_at/provisioning_source/role untouched —
+    // see the header doc comment for the full semantics contract.
+    static const char* sql = R"(
+        UPDATE users SET
+            is_active = 1,
+            updated_at = CURRENT_TIMESTAMP,
+            failed_login_count = 0,
+            last_failed_login_at = NULL,
+            locked_until = NULL
+        WHERE username = ?1
+        RETURNING id
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare reactivate_user statement: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        spdlog::info("User reactivated: {}", username);
+        return {};
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::error("reactivate_user failed: {}", sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return std::unexpected(AuthDBError::UserNotFound);
 }
 
 // ── Pending Agent Operations ────────────────────────────────────────────────
