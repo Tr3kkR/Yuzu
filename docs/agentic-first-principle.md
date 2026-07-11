@@ -1,12 +1,12 @@
 # Agentic-First Principle
 
-**Version:** 1.0 | **Date:** 2026-05-01 | **Status:** Architectural rule (proposed)
+**Version:** 1.1 | **Date:** 2026-05-01 (A1–A4), 2026-07-11 (A5 added) | **Status:** Architectural rule (proposed)
 
 ## What this document is
 
-A four-rule architectural principle. Every operation an authorised human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface. Every signal a human can see must be available to that worker. Every error must be machine-actionable.
+A five-rule architectural principle. Every operation an authorised human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface. Every signal a human can see must be available to that worker. Every error must be machine-actionable.
 
-This is the canonical reference for the A1–A4 invariants. The audit at `docs/capability-agentic-audit-2026-05.md` references and applies these rules.
+This is the canonical reference for the A1–A5 invariants. The audit at `docs/capability-agentic-audit-2026-05.md` references and applies these rules.
 
 ## Glossary
 
@@ -16,7 +16,7 @@ The word "agent" is overloaded in Yuzu. To stay precise:
 - **Governance agent** — the `.claude/agents/*.md` review actors run during the `/governance` pipeline.
 - **Agentic worker** — an external LLM-driven client (Claude, GPT, in-house) that drives Yuzu through MCP, REST, or the dashboard.
 
-The four invariants below apply to **agentic workers** consuming Yuzu's surfaces.
+The five invariants below apply to **agentic workers** consuming Yuzu's surfaces.
 
 ## A1 — Dashboard parity
 
@@ -85,6 +85,32 @@ Two specialisations:
 
 **Enforced by.** `security-guardian` and `consistency-auditor` on any change to error-emitting code paths.
 
+## A5 — Agentic context contract
+
+Every machine-consumer surface carries gold-standard, **machine-readable** context — an agentic worker relying on spec metadata (annotations, schemas, handshake instructions) must learn as much as one that parses the English prose. Adopted by ADR-0022 execution-plan Decision 16; delivered/backfilled by track 2g.
+
+**The contract.** A new or materially changed in-scope surface (an MCP tool, or a capability whose ADR-0022 twin includes an MCP tool) ships with ALL of:
+
+1. **Standard spec annotations** — `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` (spec keys, not house-invented ones). Destructiveness and idempotency are machine-readable, never prose-only: a client that renders a confirmation UI off `destructiveHint` must catch `quarantine_device`-class tools.
+2. **Decision-grade description** — what it does, when to use it (and when not), workflow chaining (what should precede/follow it — e.g. the poll target for an async dispatch), the meaning of an empty/ambiguous result (the `query_responses` "empty may mean still running" pattern is the bar), and — once the Phase 0.3 cross-surface versioning policy lands — any deprecation/succession state, stated in machine-checkable form, not prose alone.
+3. **Bounded, documented input schema** — per-property `description`; `maxLength` on every free-text string; `minimum`/`maximum`/`enum`/`default` where applicable.
+4. **Typed output schema** for structured results — the generic `{"type":"object","additionalProperties":true}` placeholder does not satisfy this for a tool whose result shape is stable.
+5. **Self-recovering errors** — the A4 envelope on every error path with honest `retry_after_ms` (populated whenever a retry hint genuinely exists — e.g. result-not-ready polling — not hardcoded null; values are server-controlled with a minimum floor, never derived from client input — a too-small value fans out to a fleet of spec-obedient clients as a poll storm), `remediation` on denials, `approval_id`/`status_url` on approval gates.
+6. **Handshake orientation maintained** — the server's `initialize` result carries an `instructions` blob orienting a fresh client (what Yuzu is, the operating model, where discovery starts); a change that adds a tool family or reshapes the operating model updates it in the same PR. The blob is operator/developer-authored **static** content only — fleet-derived or agent-reported data (hostnames, tag names, device strings) is never interpolated into it; templating untrusted data into the handshake would be a prompt-injection channel into every fresh client, bypassing the `untrusted_prompt_argument` discipline.
+7. **Specs as resources** — machine-readable references an agent needs (OpenAPI document, scope-DSL catalog, capability summary) are enumerable via `resources/list`, not reachable only by already knowing the right tool to call.
+
+Items 1–5 bind per-tool; items 6–7 bind per-capability (the PR that changes the surface owns the update). The same bar extends to the other MCP primitives: prompts carry decision-grade descriptions and complete argument metadata (`name`/`description`/`required`); resources carry a description and a correct `mimeType`. Dashboards and human-only surfaces are out of scope; the REST twin's OpenAPI entry is covered by A2's existing requirements.
+
+**Materiality.** A tool is "materially changed" — re-triggering the full contract check, annotations first — whenever its tier, securable/operation mapping, dispatch behavior, or side-effect set changes, or its `tools/list`/`initialize` spec-visible output changes; a byte-identical refactor is not material. This is per-se, not arguable case-by-case: a tool that silently gains a mutating side effect under an unchanged name is the #1 stale-`readOnlyHint` hazard.
+
+**Today (2026-07-11 survey).** Prose is strong (chaining hints, blast-radius warnings, A4 `remediation`/`status_url`); machine metadata is thin: `initialize.instructions` unused; `destructiveHint`/`idempotentHint` absent everywhere (destructive tools signal danger in prose only); ~40 core tools carry no annotations and no output schema; the ~10 annotated tools use a non-standard `"safety"` key; `retry_after_ms` is hardcoded null on the MCP tool gate; OpenAPI/scope-DSL specs sit behind tools, invisible to `resources/list`; `protocolVersion` is pinned to 2025-03-26 while 2025-06-18 output schemas are already served.
+
+**Enforced by.** `consistency-auditor` on every capability-adding PR (same wiring as A1–A4 and the ADR-0022 standing question — the governance Gate 4 preamble asks the A5 conformance question on any new/changed MCP tool); `security-guardian` co-checks item 1's truthfulness across `readOnlyHint`, `destructiveHint`, **and `idempotentHint`** against the tool's tier and dispatch behavior. A false safe-direction hint — `readOnlyHint: true` or `destructiveHint: false` on a mutating/destructive tool, or `idempotentHint: true` on a non-idempotent dispatch (it invites the blind re-POST Decision 15(g) forbids) — is a **BLOCKING (HIGH) finding**: clients build confirmation UIs and retry policy off these flags. Annotations are advisory client UX (the MCP spec says clients should not rely on them) — the tier/approval/RBAC gate is the only enforcement; an annotation is never accepted as mitigation for weakening a server-side gate. A pure wording fix that changes no annotation, schema, tier, or behavior re-triggers only item 2's description review, not the full seven-item pass.
+
+**Exceptions.** A5 exceptions are recorded here, in this section's own ledger — deliberately distinct from ADR-0022's twin-existence exception ledger (one control question per ledger: that one answers "does the twin exist", this one answers "is the metadata gold-standard"). Each entry names the surface, the waived item(s), an issue number, and a revisit-by date; `enterprise-readiness` reviews this list at every Gate 6 pass and flags stale or undated entries. *Ledger: no entries yet.*
+
+**Backfill.** A5 applies forward from adoption, per this doc's standing backfill policy. The existing ~50-tool backlog is owned by execution-plan track 2g (annotations sweep, typed schemas, instructions blob, specs-as-resources); PRs touching a non-compliant tool for other reasons should backfill that tool rather than perpetuate the gap.
+
 ## Where these invariants are referenced
 
 - The audit at `docs/capability-agentic-audit-2026-05.md` cites this doc and applies the invariants to current state.
@@ -93,4 +119,4 @@ Two specialisations:
 
 ## Open question — backfill policy
 
-A1–A4 apply forward from adoption. The audit identifies a backlog of existing surfaces that do not satisfy them (most dashboard fragments, most error sites, the existing `/events` SSE). Backfill is tracked as proposed Phase 17 issues 17.1–17.5; this principle doc does not mandate retroactive compliance, but agents reviewing PRs that touch existing non-compliant code should encourage a partial backfill of the touched paths rather than perpetuating the gap.
+A1–A4 apply forward from adoption. The audit identifies a backlog of existing surfaces that do not satisfy them (most dashboard fragments, most error sites, the existing `/events` SSE). Backfill is tracked as proposed Phase 17 issues 17.1–17.5; this principle doc does not mandate retroactive compliance, but agents reviewing PRs that touch existing non-compliant code should encourage a partial backfill of the touched paths rather than perpetuating the gap. A5's backlog (adopted 2026-07-11, after the audit) is tracked separately — see A5 §Backfill and execution-plan track 2g.
