@@ -140,6 +140,48 @@ TEST_CASE("MCP JSON-RPC: null id error response", "[mcp][jsonrpc]") {
     CHECK(parsed["error"]["code"] == kParseError);
 }
 
+// Direct contract test for the shared A4 transport-denial builders (the 8
+// /mcp/v1/ transport denials route through these). Locks the error.data shape
+// and the json_quoted escaping independent of any handler wiring.
+TEST_CASE("MCP JSON-RPC: A4 transport error builder", "[mcp][jsonrpc][a4]") {
+    nlohmann::json id = 7;
+
+    SECTION("correlation_id + null retry + remediation present") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kMcpSessionCap, "Session limit reached", "req-abc-1", "do the thing"));
+        CHECK(p["id"] == 7);
+        CHECK(p["error"]["code"] == kMcpSessionCap);
+        CHECK(p["error"]["data"]["correlation_id"] == "req-abc-1");
+        REQUIRE(p["error"]["data"].contains("retry_after_ms"));
+        CHECK(p["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(p["error"]["data"]["remediation"] == "do the thing");
+    }
+    SECTION("remediation omitted when empty; retry_after_ms still a present null key") {
+        auto p = nlohmann::json::parse(
+            error_response_a4(id, kMcpOriginRejected, "Origin not allowed", "req-abc-2"));
+        REQUIRE(p["error"]["data"].contains("retry_after_ms"));
+        CHECK(p["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(p["error"]["data"].contains("remediation")); // §A4: omit when empty
+    }
+    SECTION("concrete retry_after_ms is emitted as a number") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kMcpSessionCap, "Session limit reached", "req-abc-3", "wait", 5000));
+        CHECK(p["error"]["data"]["retry_after_ms"] == 5000);
+    }
+    SECTION("null-id variant echoes id:null") {
+        auto p = nlohmann::json::parse(error_response_null_a4(
+            kMcpOriginRejected, "Origin not allowed", "req-abc-4", "fix origin"));
+        CHECK(p["id"].is_null());
+        CHECK(p["error"]["data"]["correlation_id"] == "req-abc-4");
+    }
+    SECTION("data strings are JSON-escaped (a future non-literal caller can't inject)") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kInternalError, "boom", "req-\"x\"\\", "quote \" and backslash \\"));
+        CHECK(p["error"]["data"]["correlation_id"] == "req-\"x\"\\");
+        CHECK(p["error"]["data"]["remediation"] == "quote \" and backslash \\");
+    }
+}
+
 // ── MCP tier policy ───────────────────────────────────────────────────────
 
 TEST_CASE("MCP Policy: empty tier allows everything", "[mcp][policy]") {
@@ -1935,7 +1977,7 @@ TEST_CASE("MCP Integration: unauthenticated returns 401", "[mcp][integration]") 
 }
 
 // ── 8. Notification (no id) — verify 202 response ──────────────────────────
-// MCP Streamable HTTP (ADR-0022 Decision 15, 2f) flips this from 204 → 202
+// MCP Streamable HTTP (ADR-1005 Decision 15, 2f) flips this from 204 → 202
 // (spec MUST), unconditionally. See the "[mcp][transport][2f]" cases below.
 
 TEST_CASE("MCP Integration: notification returns 202", "[mcp][integration]") {
@@ -4928,7 +4970,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     fs::remove_all(tmp_dir, ec);
 }
 
-// ── MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f) ──────────
+// ── MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f) ──────────
 //
 // Session lifecycle + transport pre-checks, driven through the same in-process
 // build_handler / build_get_handler / build_delete_handler seams. Chaos gates
@@ -5077,6 +5119,10 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
         auto body = nlohmann::json::parse(res->body);
         CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
         CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        // Full A4 shape locked at a non-cap site too (shared-builder contract):
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].is_string());
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
               ts.audit_log.end());
     }
@@ -5093,6 +5139,9 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
         auto res = ts.call_raw("DELETE", "", {{"Origin", "https://evil.example.com"},
                                               {"Mcp-Session-Id", std::string(32, 'a')}});
         CHECK(res->status == 403);
+        // A4 error.data present on the DELETE-origin denial path too
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     }
     SECTION("hostile Origin rejected on GET too (403 precedes the 405 placeholder)") {
         auto res = ts.call_raw("GET", "", {{"Origin", "https://evil.example.com"}});

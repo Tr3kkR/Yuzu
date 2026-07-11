@@ -285,7 +285,7 @@ struct Config {
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
-    // MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f)
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
     /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
     /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is

@@ -4,7 +4,7 @@
 #include <string_view>
 #include <vector>
 
-// MCP Streamable HTTP transport helpers (ADR-0022 Decision 15, track 2f).
+// MCP Streamable HTTP transport helpers (ADR-1005 Decision 15, track 2f).
 //
 // Pure, dependency-free predicates used by the /mcp/v1/ POST/GET/DELETE
 // handlers for spec-mandated transport pre-checks. Deliberately free of

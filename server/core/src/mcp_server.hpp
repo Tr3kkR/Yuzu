@@ -214,7 +214,7 @@ public:
                             // H1 (PR #1796): per-device scope gate for the
                             // device-targeted write tools; see ScopedPermFn above.
                             ScopedPermFn scoped_perm_fn = {},
-                            // MCP Streamable HTTP transport (ADR-0022 Decision 15, 2f).
+                            // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f).
                             // sessions == nullptr ⇒ streaming disabled ⇒ pre-2f behaviour
                             // (no minting, no session/Origin checks) — every legacy caller
                             // and test stays byte-identical except the unconditional 202.
@@ -260,7 +260,7 @@ public:
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
                          ScopedPermFn scoped_perm_fn = {},
-                         // MCP Streamable HTTP transport (ADR-0022 Decision 15, 2f).
+                         // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f).
                          // Pointer (not const bool&) so a nullptr default cannot bind a
                          // temporary that would dangle once build_handler captures its address.
                          McpSessionRegistry* sessions = nullptr,

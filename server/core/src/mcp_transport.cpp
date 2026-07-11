@@ -28,6 +28,14 @@ bool accept_wants_sse(std::string_view accept_header) {
     // (a prefix), so each range is split off, its `;`-delimited parameters are
     // dropped, OWS is trimmed, and the remaining media type is compared exactly
     // (case-insensitive per RFC 9110 — media types are case-insensitive).
+    // Limitation (acceptable while this has no production caller — SSE gating is
+    // 2f PR 2/3): the split is naive over `,` and does NOT honour RFC 9110
+    // quoted-strings, so a `,` inside a quoted parameter value (e.g.
+    // `application/json;x=",text/event-stream,"`) could mis-split into a false
+    // match. Harden with quoted-string-aware tokenisation before the GET/SSE
+    // channel branches on this (tracked follow-up).
+    // Wildcards (`*/*`, `text/*`) deliberately do NOT match — SSE requires an
+    // explicit `text/event-stream` opt-in, so this fails closed to JSON.
     constexpr std::string_view needle = "text/event-stream";
     const auto lower = [](char c) {
         return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

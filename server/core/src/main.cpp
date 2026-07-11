@@ -404,7 +404,7 @@ int main(int argc, char* argv[]) {
     app.add_flag("--mcp-read-only", cfg.mcp_read_only,
                  "Restrict MCP to read-only tools only (no write/execute)")
         ->envname("YUZU_MCP_READ_ONLY");
-    // MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f)
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     app.add_flag("--mcp-no-streaming", cfg.mcp_streaming_disable,
                  "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
                  "JSON-RPC POST only")

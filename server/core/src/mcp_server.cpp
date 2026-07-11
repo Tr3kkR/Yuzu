@@ -932,7 +932,7 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool* const p_read_only = &read_only_mode;
     const bool* const p_disabled = &mcp_disabled;
 
-    // MCP Streamable HTTP (ADR-0022 Decision 15, 2f). Streaming is ON only when a
+    // MCP Streamable HTTP (ADR-1005 Decision 15, 2f). Streaming is ON only when a
     // session registry is wired AND the --mcp-no-streaming kill switch is off.
     // sessions == nullptr (legacy build_handler callers / most tests) ⇒ streaming
     // off ⇒ the pre-2f stateless path, byte-identical except the unconditional 202.
@@ -998,6 +998,10 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // Runtime kill switch check (G4-UHP-MCP-003) — evaluated on every request
         if (*p_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
             res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
                             "application/json");
             return;
@@ -1015,11 +1019,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // required); present → must match the configured allowlist (CH-9).
             if (!transport::origin_allowed(req.get_header_value("Origin"),
                                            mcp_allowed_origins)) {
-                session_audit("mcp.session.reject", "failure", "", "reason=origin");
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
                 res.status = 403;
                 res.set_content(
-                    error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
-                                           yuzu::server::detail::make_correlation_id(),
+                    error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
                                            "remove the Origin header or add this origin to "
                                            "--mcp-allowed-origin"),
                     "application/json");
@@ -1028,11 +1032,13 @@ McpServer::HandlerFn McpServer::build_handler(
             // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
             const auto pv = req.get_header_value("MCP-Protocol-Version");
             if (!pv.empty() && !transport::protocol_version_supported(pv)) {
-                session_audit("mcp.session.reject", "failure", "", "reason=protocol_version");
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                session_audit("mcp.session.reject", "failure", "",
+                              "reason=protocol_version cid=" + cid);
                 res.status = 400;
                 res.set_content(
                     error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
-                                           yuzu::server::detail::make_correlation_id(),
+                                           cid,
                                            "send MCP-Protocol-Version: 2025-06-18 (or omit the "
                                            "header to accept the 2025-03-26 default)"),
                     "application/json");
@@ -1064,14 +1070,14 @@ McpServer::HandlerFn McpServer::build_handler(
             if (!sid.empty() && rpc.method != "initialize") {
                 if (mcp_sessions->validate_and_touch(sid, session->username) !=
                     McpSessionRegistry::ValidateResult::kValid) {
+                    const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
-                                  "reason=unknown_session");
+                                  "reason=unknown_session cid=" + cid);
                     res.status = 404;
                     // Echo the request id — this is a post-parse error with a known
                     // id, and JSON-RPC 2.0 SHOULD echo it (governance CONS-S3).
                     res.set_content(
-                        error_response_a4(id, kMcpUnknownSession, "Unknown or expired session",
-                                          yuzu::server::detail::make_correlation_id(),
+                        error_response_a4(id, kMcpUnknownSession, "Unknown or expired session", cid,
                                           "re-initialize: send an initialize request to obtain a "
                                           "fresh Mcp-Session-Id"),
                         "application/json");
@@ -1111,18 +1117,19 @@ McpServer::HandlerFn McpServer::build_handler(
             // with an A4-shaped JSON-RPC error (correlation_id + nullable
             // retry_after_ms + remediation, via the shared error_response_a4
             // builder) — a live session is never evicted to make room
-            // (ADR-0022 exec-plan Decision 15(j); chaos-design CH-5, a PR-1 gate).
+            // (ADR-1005 exec-plan Decision 15(j); chaos-design CH-5, a PR-1 gate).
             // A client-supplied Mcp-Session-Id is never adopted here (no
             // fixation, 15(a)/CH-8).
             if (streaming_on) {
                 auto mint = mcp_sessions->mint(session->username);
                 if (!mint.ok) {
-                    session_audit("mcp.session.reject", "failure", "", "reason=" + mint.reject_reason);
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    session_audit("mcp.session.reject", "failure", "",
+                                  "reason=" + mint.reject_reason + " cid=" + cid);
                     res.status = 429;
                     res.set_content(
                         error_response_a4(
-                            id, kMcpSessionCap, "Session limit reached",
-                            yuzu::server::detail::make_correlation_id(),
+                            id, kMcpSessionCap, "Session limit reached", cid,
                             "end an unused session via DELETE /mcp/v1/ or wait for idle timeout"),
                         "application/json");
                     return;
@@ -5194,6 +5201,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                           target_id, detail);
         };
         if (mcp_disabled && *mcp_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
             res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
                             "application/json");
             return;
@@ -5206,11 +5217,11 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         }
         // Origin before auth so a hostile Origin is rejected even unauthenticated (CH-9).
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
-            session_audit("mcp.session.reject", "failure", "", "reason=origin");
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
             res.status = 403;
             res.set_content(
-                error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
-                                       yuzu::server::detail::make_correlation_id(),
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
                                        "remove the Origin header or add this origin to "
                                        "--mcp-allowed-origin"),
                 "application/json");
@@ -5238,6 +5249,10 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                                                           target_id, detail);
         };
         if (mcp_disabled && *mcp_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
             res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
                             "application/json");
             return;
@@ -5249,11 +5264,11 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
             return;
         }
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
-            session_audit("mcp.session.reject", "failure", "", "reason=origin");
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
             res.status = 403;
             res.set_content(
-                error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
-                                       yuzu::server::detail::make_correlation_id(),
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
                                        "remove the Origin header or add this origin to "
                                        "--mcp-allowed-origin"),
                 "application/json");
@@ -5266,11 +5281,12 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         if (sid.empty()) {
             // Audit the malformed-request denial too so a SIEM watching DELETE
             // rejects sees it (governance sec-LOW).
-            session_audit("mcp.session.reject", "failure", "", "reason=missing_session_header");
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "",
+                          "reason=missing_session_header cid=" + cid);
             res.status = 400;
             res.set_content(
-                error_response_null_a4(kInvalidRequest, "Mcp-Session-Id header required",
-                                       yuzu::server::detail::make_correlation_id(),
+                error_response_null_a4(kInvalidRequest, "Mcp-Session-Id header required", cid,
                                        "include the Mcp-Session-Id header naming the session to "
                                        "terminate"),
                 "application/json");
@@ -5280,12 +5296,12 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
             session_audit("mcp.session.close", "success", sid.substr(0, 8), "");
             res.status = 200;
         } else {
+            const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
-                          "reason=unknown_session");
+                          "reason=unknown_session cid=" + cid);
             res.status = 404;
             res.set_content(
-                error_response_null_a4(kMcpUnknownSession, "Unknown or expired session",
-                                       yuzu::server::detail::make_correlation_id(),
+                error_response_null_a4(kMcpUnknownSession, "Unknown or expired session", cid,
                                        "the session does not exist or is already terminated; no "
                                        "action needed"),
                 "application/json");

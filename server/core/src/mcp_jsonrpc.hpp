@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstdio>   // std::snprintf in detail::json_escape (was transitively included)
 #include <expected>
 #include <optional>
 #include <string>
@@ -21,7 +22,7 @@ constexpr int kPermissionDenied = -32003;
 constexpr int kTierDenied       = -32004;
 constexpr int kMcpDisabled      = -32005;
 constexpr int kApprovalRequired = -32006;
-// MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f)
+// MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
 constexpr int kMcpUnknownSession     = -32007;  // unknown/expired/wrong-principal id  → HTTP 404
 constexpr int kMcpOriginRejected     = -32008;  // Origin not in allowlist             → HTTP 403
 constexpr int kMcpBadProtocolVersion = -32009;  // MCP-Protocol-Version unsupported     → HTTP 400
@@ -148,7 +149,7 @@ inline std::string error_response_null(int code, std::string_view message) {
 /// §A4 convention — absence carries the "no recovery hint" meaning). This is the
 /// SINGLE builder for every transport denial's error.data, keeping the shape
 /// uniform with the REST A4 envelope (docs/agentic-first-principle.md §A4;
-/// ADR-0022 exec-plan Decision 15(j) makes the A4 shape the cap-hit merge gate).
+/// ADR-1005 exec-plan Decision 15(j) makes the A4 shape the cap-hit merge gate).
 ///
 /// The correlation id is minted by the caller
 /// (yuzu::server::detail::make_correlation_id()) and passed in, so this header

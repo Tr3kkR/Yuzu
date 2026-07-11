@@ -1,5 +1,5 @@
 /**
- * test_mcp_session.cpp — McpSessionRegistry (ADR-0022 Decision 15, track 2f).
+ * test_mcp_session.cpp — McpSessionRegistry (ADR-1005 Decision 15, track 2f).
  *
  * Covers the security-critical session invariants: 128-bit CSPRNG ids, the
  * principal-bound / no-cross-principal-oracle rule (CH-8), reject-not-evict cap

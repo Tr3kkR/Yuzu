@@ -10760,7 +10760,7 @@ private:
                        const std::string& agent_id) -> bool {
                     return require_scoped_permission(req, res, type, op, agent_id);
                 },
-                // MCP Streamable HTTP transport (ADR-0022 Decision 15, 2f): the
+                // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f): the
                 // session registry, the --mcp-no-streaming kill switch (by live
                 // pointer into cfg_), and the Origin allowlist.
                 mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins);

@@ -7,7 +7,7 @@
 #include <string>
 #include <unordered_map>
 
-// MCP Streamable HTTP session registry (ADR-0022 Decision 15, track 2f).
+// MCP Streamable HTTP session registry (ADR-1005 Decision 15, track 2f).
 namespace yuzu::server::mcp {
 
 // In-memory registry of `Mcp-Session-Id` sessions.

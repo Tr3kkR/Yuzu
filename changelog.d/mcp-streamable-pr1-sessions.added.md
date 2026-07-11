@@ -1,4 +1,4 @@
-- **MCP Streamable HTTP transport — session lifecycle (ADR-0022 Decision 15, track 2f, PR 1).**
+- **MCP Streamable HTTP transport — session lifecycle (ADR-1005 Decision 15, track 2f, PR 1).**
   The `/mcp/v1/` endpoint now mints a principal-bound `Mcp-Session-Id` on
   `initialize` (a ≥128-bit CSPRNG value; never required — plain-POST clients are
   unaffected), validates it when presented (unknown/expired/foreign → `404`, the
