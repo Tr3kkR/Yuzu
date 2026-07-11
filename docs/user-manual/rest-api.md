@@ -130,7 +130,7 @@ API tokens are created via `POST /api/v1/tokens` and can be scoped to the creati
 server-verifiable delegation and are **rejected on every endpoint** (sole
 exception: the four unauthenticated health-probe paths, which ignore them —
 see `docs/auth-architecture.md`) with `403` + the standard error envelope
-(ADR-0022): `On-Behalf-Of`, `X-On-Behalf-Of`,
+(ADR-1005): `On-Behalf-Of`, `X-On-Behalf-Of`,
 `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
 `X-Yuzu-Delegation-Artifact` (case-insensitive). A client must never assert
 that it acts on another principal's behalf via a header; see

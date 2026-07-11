@@ -1338,9 +1338,9 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
-## On-behalf-of assertions rejected (ADR-0022 Interim rules)
+## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
-Until server-verifiable delegation ships (ADR-0022 auth follow-up), the server
+Until server-verifiable delegation ships (ADR-1005 auth follow-up), the server
 accepts **no** on-behalf-of assertion on **any** ingress surface — any such
 header or metadata key is **rejected, not ignored**. Five names are reserved
 (case-insensitive; source of truth `server/core/src/on_behalf_guard.hpp`, and
@@ -1356,7 +1356,7 @@ paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
 mesh/SSO proxy that stamps a reserved header on every request must not be
 able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
 probe performs no identity-bearing action and nothing consumes the header on
-that path. This exception is recorded in ADR-0022's exception ledger on
+that path. This exception is recorded in ADR-1005's exception ledger on
 acceptance. **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by

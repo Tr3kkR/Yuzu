@@ -1266,20 +1266,20 @@ TEST_CASE("scim_boot_guard_ok: 23 chars fails the floor by one (M1)",
 // 302-redirected to /login before ScimRoutes ever ran) because the sink has
 // no pre-routing middleware at all (#438's whole reason for existing). This
 // section spins up a REAL httplib::Server with a pre-routing handler that
-// mirrors server.cpp's production wiring (the ADR-0022 on-behalf-of guard
+// mirrors server.cpp's production wiring (the ADR-1005 on-behalf-of guard
 // FIRST, then the rate limiter, THEN `is_login_exempt_path`, THEN a
 // no-session-cookie 401/redirect fallback for everything else), registers
 // ScimRoutes against it, and drives it over the wire with httplib::Client —
 // the only way to prove the exemption + ordering holds on a real request.
 //
-// UPDATE (post PR #2018 review, dev merge landed the ADR-0022 guard on this
+// UPDATE (post PR #2018 review, dev merge landed the ADR-1005 guard on this
 // branch): the on-behalf-of guard shipped in server.cpp (~line 4781, guarded
 // by `on_behalf_guard.hpp`'s `onbehalf::find_reserved_key`) since the note
 // below was written. This harness now wires the SAME production helper —
 // not a re-implementation — into the mock pre-routing handler, positioned
 // exactly where server.cpp runs it: before the rate limiter and before
 // `is_login_exempt_path`. That proves the SCIM login-exemption (H1's whole
-// point) does NOT also exempt /scim/v2/* from ADR-0022 — a reserved
+// point) does NOT also exempt /scim/v2/* from ADR-1005 — a reserved
 // on-behalf-of header still 403s even with an otherwise-valid SCIM bearer
 // token, and even though the request never reaches the login-redirect
 // fallback this exemption softened.
@@ -1304,7 +1304,7 @@ namespace {
 
 /// Wires ScimRoutes against a REAL httplib::Server whose pre-routing
 /// handler mirrors server.cpp's `set_pre_routing_handler` lambda closely
-/// enough to reproduce H1: the ADR-0022 on-behalf-of guard runs FIRST
+/// enough to reproduce H1: the ADR-1005 on-behalf-of guard runs FIRST
 /// (production helper, `onbehalf::find_reserved_key` — not a
 /// re-implementation), then a configurable RateLimiter, then
 /// `is_login_exempt_path` gates the login-redirect fallback (same ordering
@@ -1342,7 +1342,7 @@ struct ScimIntegrationServer {
         REQUIRE(audit_store->is_open());
 
         // Mirrors server.cpp's pre-routing lambda ordering (server.cpp
-        // ~4743-4830): the ADR-0022 on-behalf-of guard FIRST (using the
+        // ~4743-4830): the ADR-1005 on-behalf-of guard FIRST (using the
         // real production helper, not a reimplementation — the whole point
         // is exercising the shipped reserved-key detection), then the rate
         // limiter, then the login-exempt-path decision, then a 401
@@ -1357,7 +1357,7 @@ struct ScimIntegrationServer {
                     (void)onbehalf::note_rejection(metrics, "http");
                     res.status = 403;
                     res.set_content(
-                        R"({"error":{"code":403,"message":"on-behalf-of assertion rejected per ADR-0022"}})",
+                        R"({"error":{"code":403,"message":"on-behalf-of assertion rejected per ADR-1005"}})",
                         "application/json");
                     (void)reserved;
                     return httplib::Server::HandlerResponse::Handled;
@@ -1503,9 +1503,9 @@ TEST_CASE("H1 integration: rate limiting is RETAINED for /scim/v2/* despite the 
 }
 
 TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 403 per "
-         "ADR-0022, even with an otherwise-valid SCIM bearer token (the SCIM login-exemption "
+         "ADR-1005, even with an otherwise-valid SCIM bearer token (the SCIM login-exemption "
          "does not strip the on-behalf-of guard)",
-         "[scim][routes][integration][h1][adr0022][onbehalf]") {
+         "[scim][routes][integration][h1][adr1005][onbehalf]") {
     ScimIntegrationServer ts;
     ts.start();
 

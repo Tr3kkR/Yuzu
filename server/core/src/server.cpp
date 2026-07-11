@@ -346,12 +346,12 @@ public:
             metrics_.counter("yuzu_http_requests_total",
                              {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
         }
-        // ADR-0022 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
+        // ADR-1005 Interim rules (execution-plan PR 1.1): rejected on-behalf-of
         // assertions, by ingress surface. Pre-seeded to 0 per
         // docs/observability-conventions.md so absent() alerts stay meaningful.
         metrics_.describe("yuzu_onbehalf_rejected_total",
                           "Requests rejected for carrying a reserved on-behalf-of "
-                          "header/metadata key (ADR-0022) by surface",
+                          "header/metadata key (ADR-1005) by surface",
                           "counter");
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "http"}, {"event", "security"}});
@@ -2819,7 +2819,7 @@ public:
         }
 
         grpc::ServerBuilder builder;
-        // ADR-0022 Interim rules (execution-plan PR 1.1): one interceptor on the
+        // ADR-1005 Interim rules (execution-plan PR 1.1): one interceptor on the
         // ONE builder — covers agent, management, and gateway-upstream services
         // and every future RPC method by construction (never a per-method check).
         {
@@ -2856,7 +2856,7 @@ public:
             return;
         }
 
-        spdlog::info("[ADR-0022] on-behalf-of guard active: reserved headers rejected on "
+        spdlog::info("[ADR-1005] on-behalf-of guard active: reserved headers rejected on "
                      "HTTP (excl. health probes) and gRPC ingress; see "
                      "docs/auth-architecture.md");
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
@@ -4750,7 +4750,7 @@ private:
             // 429-starve the health probe. The endpoints themselves are
             // strictly read-only and documented as unauthenticated.
             // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
-            // below — a RECORDED ADR-0022 exception (documented in
+            // below — a RECORDED ADR-1005 exception (documented in
             // docs/auth-architecture.md; ledger entry lands with the ADR).
             // Governance Gate 5 (CH-3/UP-5): a mesh/SSO proxy that stamps a
             // reserved header on every request must not be able to 403 the
@@ -4763,7 +4763,7 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // ADR-0022 Interim rules (execution-plan PR 1.1): the server accepts
+            // ADR-1005 Interim rules (execution-plan PR 1.1): the server accepts
             // NO on-behalf-of assertion on any surface until server-verifiable
             // delegation ships (Phase 5) — and client-asserted delegation stays
             // rejected permanently even then. Reject (not ignore) before auth,
@@ -4781,7 +4781,7 @@ private:
             if (auto reserved = onbehalf::find_reserved_key(req.headers)) {
                 if (onbehalf::note_rejection(metrics_, "http")) {
                     spdlog::warn(
-                        "[ADR-0022] rejected {} {} carrying reserved on-behalf-of "
+                        "[ADR-1005] rejected {} {} carrying reserved on-behalf-of "
                         "header '{}' from {} (1 log per {} rejections; counter "
                         "records all)",
                         onbehalf::sanitize_for_log(req.method, 16),
@@ -4793,12 +4793,12 @@ private:
                 res.set_content(
                     detail::a4_denial(
                         res, 403,
-                        "on-behalf-of assertions are not accepted on any surface (ADR-0022); "
+                        "on-behalf-of assertions are not accepted on any surface (ADR-1005); "
                         "remove the reserved header",
                         detail::A4ErrorOpts{
                             .remediation = "remove the reserved header; see "
                                            "docs/auth-architecture.md 'On-behalf-of "
-                                           "assertions rejected' (ADR-0022)"}),
+                                           "assertions rejected' (ADR-1005)"}),
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
             }
@@ -4957,7 +4957,7 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded presentation-level actor class (ADR-0022,
+            // principal_class: bounded presentation-level actor class (ADR-1005,
             // execution-plan PR 1.2) — human / agent / none today, engine reserved for
             // Phase 4. See principal_class.hpp for the classification contract.
             metrics_
@@ -10765,7 +10765,7 @@ private:
             listen_port = cfg_.https_port;
 
             // Start HTTP→HTTPS redirect server
-            // No on_behalf_guard here (ADR-0022): this instance routes nothing —
+            // No on_behalf_guard here (ADR-1005): this instance routes nothing —
             // every request gets a 301 and the re-request hits the guarded main
             // listener, so this is not a bypass of the pre-routing chokepoint.
             if (cfg_.https_redirect) {

@@ -1,6 +1,6 @@
 - **`yuzu_http_requests_total` gains a `principal_class` label** (`human` =
   session cookie, `agent` = bearer/API token, `none` = no credential;
-  `engine` reserved for ADR-0022 engine principals). Classification is by
+  `engine` reserved for ADR-1005 engine principals). Classification is by
   credential presentation, not validated session — it is a traffic-shape
   label, never an authorization signal.
 

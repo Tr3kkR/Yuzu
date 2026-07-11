@@ -451,7 +451,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | `config_scan` | Audit system configuration against security baselines. |
 | `summary` | Return counts of critical, high, medium, and low findings. |
 
-> **Deprecated rule source (ADR-0022).** The plugin's embedded static CVE rule
+> **Deprecated rule source (ADR-1005).** The plugin's embedded static CVE rule
 > list is **frozen — it receives no further rule updates** — and its use as an
 > authoritative finding source via `scan`/`cve_scan` is deprecated. Inventory
 > collection is unaffected. Authoritative CVE matching moves to the
