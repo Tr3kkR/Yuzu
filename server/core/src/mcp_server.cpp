@@ -1104,7 +1104,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (streaming_on) {
                 auto mint = mcp_sessions->mint(session->username);
                 if (!mint.ok) {
-                    session_audit("mcp.session.reject", "failure", "", "reason=cap:" + mint.reject_reason);
+                    session_audit("mcp.session.reject", "failure", "", "reason=" + mint.reject_reason);
                     res.status = 429;
                     res.set_content(
                         error_response(

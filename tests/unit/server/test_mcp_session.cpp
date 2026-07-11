@@ -122,18 +122,22 @@ TEST_CASE("MCP session: concurrent access is race-free (TSan regression net)", "
     McpSessionRegistry reg({.per_principal_cap = 1000, .global_cap = 100000});
     constexpr int kThreads = 8;
     constexpr int kOpsPerThread = 400;
+    // Catch2 assertion macros are NOT multithread-safe, so worker threads only
+    // accumulate into atomics; every CHECK runs after join (cpp-safety SAFE-RE-S2).
     std::atomic<int> minted{0};
+    std::atomic<int> own_invalid{0}; // a thread's own just-minted session read back != kValid
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&reg, &minted, t] {
+        threads.emplace_back([&reg, &minted, &own_invalid, t] {
             const std::string principal = "p" + std::to_string(t);
             std::vector<std::string> mine;
             for (int i = 0; i < kOpsPerThread; ++i) {
                 auto m = reg.mint(principal);
                 if (m.ok) {
                     ++minted;
-                    CHECK(reg.validate_and_touch(m.session_id, principal) ==
-                          Validate::kValid); // our own session is always valid
+                    if (reg.validate_and_touch(m.session_id, principal) != Validate::kValid) {
+                        ++own_invalid; // must stay 0 — asserted after join
+                    }
                     mine.push_back(m.session_id);
                 }
                 if (!mine.empty() && (i % 3 == 0)) {
@@ -152,6 +156,7 @@ TEST_CASE("MCP session: concurrent access is race-free (TSan regression net)", "
         th.join();
     }
     CHECK(minted.load() > 0);
+    CHECK(own_invalid.load() == 0); // no thread ever failed to read back its own session
     CHECK(reg.active_count() <= static_cast<std::size_t>(kThreads * kOpsPerThread));
 }
 
