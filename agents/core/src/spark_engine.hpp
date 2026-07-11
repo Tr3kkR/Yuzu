@@ -365,7 +365,13 @@ private:
     /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
     /// std::mutex& obtained via .at(type) is safe to hold across the blocking
     /// mechanism call for the same structural-stability reason a raw mechanism
-    /// pointer is (see mechanisms_ below).
+    /// pointer is (see mechanisms_ below). The map is moreover FROZEN after
+    /// start(): register_mechanism() is rejected once running_ (all under mu_),
+    /// while every .at() read site runs only when running_ — so the lock-free
+    /// .at() tree-walks are strictly disjoint in time from the sole mutator
+    /// across the start() mu_ barrier, never a concurrent read/write race (that
+    /// frozen-after-start fact, not node-stability alone, is what makes the
+    /// unsynchronized .at() reads sound).
     mutable std::map<SparkType, std::mutex> mech_ops_mu_by_type_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key

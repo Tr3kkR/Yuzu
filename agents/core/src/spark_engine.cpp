@@ -91,13 +91,20 @@ SparkEngine::register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism>
     std::lock_guard lk(mu_);
     if (running_ || stopped_)
         return std::unexpected("mechanisms must be registered before start()");
+    // Populate the per-type mech-ops lock FIRST, then mechanisms_ — both under
+    // the same mu_ so they stay in lockstep (#2011). Order matters for the
+    // .at()-can't-throw invariant every call site relies on: if the second
+    // try_emplace throws std::bad_alloc, the surviving state must never be
+    // "mechanisms_ has the type but mech_ops_mu_by_type_ does not" (which would
+    // make a later arm/disarm reach .at(type) → std::out_of_range on a live
+    // path). Emplacing the lock first means a throw leaves at most an unused
+    // mutex entry for a type with no mechanism — harmless, since arm() of a
+    // type with no mechanism is rejected before any .at() (cpp-safety Gate 3).
+    mech_ops_mu_by_type_.try_emplace(type);
     auto [it, inserted] = mechanisms_.try_emplace(type, std::move(mechanism));
     if (!inserted)
         return std::unexpected(std::string("a mechanism is already registered for spark type '") +
                                spark_type_token(type) + "'");
-    // Populate the per-type mech-ops lock in lockstep with mechanisms_, under
-    // the same mu_, so the two maps can never drift out of sync (#2011).
-    mech_ops_mu_by_type_.try_emplace(type);
     return {};
 }
 

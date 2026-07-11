@@ -655,7 +655,12 @@ TEST_CASE("SparkEngine: a blocking watch() on one mechanism type does not delay 
     // Arm a File spark whose watch() blocks (holding File's per-type lock) — on
     // a background thread, since arm() will not return until watch() does.
     std::thread blocker([&] { (void)engine.arm(*consumer, file_spec("/etc/hosts")); });
-    REQUIRE(eventually([&] { return bwm->watching_now(); }));
+    // NB: a non-throwing CHECK, not REQUIRE — `blocker` is joinable here, and a
+    // REQUIRE that threw would run ~std::thread on it → std::terminate (aborting
+    // the whole binary) instead of a clean red. Capture the outcome and assert
+    // it after the joins below.
+    const bool file_watch_entered = eventually([&] { return bwm->watching_now(); });
+    CHECK(file_watch_entered);
 
     // Disarm the Registry subscription on its own thread while File's watch() is
     // still blocked. Under per-type locks this returns immediately; under the
@@ -666,18 +671,61 @@ TEST_CASE("SparkEngine: a blocking watch() on one mechanism type does not delay 
         engine.disarm(*reg_sub);
         disarm_done.store(true, std::memory_order_release);
     });
-    const bool completed = eventually([&] { return disarm_done.load(std::memory_order_acquire); },
-                                      2000ms);
+    const bool completed = eventually([&] { return disarm_done.load(std::memory_order_acquire); });
     CHECK(completed); // the whole point of #2011: File's stall did not block Registry
     CHECK(reg_fake->unwatch_calls() == 1);
 
     // Cleanup: release the blocked File watch, then join everything. (Even under
     // a regression where `completed` is false, release() unblocks File's watch,
     // which frees the old shared lock so the pending disarm can finish — so the
-    // test fails cleanly rather than hanging.)
+    // test fails cleanly rather than hanging. No REQUIRE runs between the thread
+    // spawns and these joins, so no throw can bypass them.)
     bwm->release();
     disarmer.join();
     blocker.join();
+    engine.stop();
+}
+
+TEST_CASE("SparkEngine: a blocking watch() DOES still serialise a second arm within "
+          "the SAME mechanism type (#2011 per-type control)",
+          "[spark][mechanism]") {
+    // Converse control for the cross-type test above. Together they pin the lock
+    // granularity to exactly per-type: the cross-type test rules out a per-ENGINE
+    // lock (File no longer blocks Registry); this one rules out a per-KEY lock
+    // (two File keys still share File's lock). Without this, mech_ops_mu_by_type_
+    // could be accidentally always-uncontended and the cross-type test alone
+    // would still pass — this asserts the per-type lock is REAL.
+    SparkEngine engine;
+    auto blocking = std::make_unique<BlockingWatchMechanism>();
+    BlockingWatchMechanism* bwm = blocking.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(blocking)).has_value());
+    auto consumer = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(consumer.has_value());
+    engine.start();
+
+    // File spark A: its watch() blocks, holding File's per-type lock.
+    std::thread armA([&] { (void)engine.arm(*consumer, file_spec("/tmp/a")); });
+    const bool a_entered = eventually([&] { return bwm->watching_now(); });
+    CHECK(a_entered);
+
+    // File spark B (a DIFFERENT key, so no dedup — a fresh watch()): its arm must
+    // take the SAME File lock, so it cannot complete while A's watch() holds it.
+    std::atomic<bool> b_done{false};
+    std::thread armB([&] {
+        (void)engine.arm(*consumer, file_spec("/tmp/b"));
+        b_done.store(true, std::memory_order_release);
+    });
+    // Over a window, B must NOT complete — it is queued on File's lock behind A.
+    // (Under a per-key regression B would take a different lock and finish here.)
+    const bool b_completed_early = eventually([&] { return b_done.load(std::memory_order_acquire); },
+                                              300ms);
+    CHECK_FALSE(b_completed_early);
+
+    // Release A → both File watches drain; join. No REQUIRE between the spawns and
+    // the joins, so no throw can bypass them.
+    bwm->release();
+    armB.join();
+    armA.join();
     engine.stop();
 }
 
