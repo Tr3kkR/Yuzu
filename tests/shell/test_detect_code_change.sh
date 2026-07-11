@@ -30,7 +30,7 @@ expect() {
 }
 
 # --- docs-only: skip the build ---
-expect false "adr + nested docs (docs/**)"        2 $'docs/adr/0022-headless.md\ndocs/adr-0022-execution-plan.md'
+expect false "adr + nested docs (docs/**)"        2 $'docs/adr/1005-headless.md\ndocs/adr-1005-execution-plan.md'
 expect false "root markdown README.md"            1 $'README.md'
 expect false "root LICENSE"                        1 $'LICENSE'
 expect false "root .gitignore"                     1 $'.gitignore'

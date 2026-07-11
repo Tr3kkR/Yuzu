@@ -223,12 +223,12 @@ Metrics carry a standard set of labels for filtering and grouping in queries.
 | `status` | HTTP status code or outcome | `200`, `500`, `success`, `failure` |
 | `os` | Agent operating system | `windows`, `linux`, `darwin` |
 | `arch` | Agent CPU architecture | `x64`, `arm64` |
-| `principal_class` | Credential presentation class on HTTP request counts (closed set; `engine` reserved for ADR-0022 engine principals). Traffic-shape only — never an authorization signal. | `human`, `agent`, `none` |
+| `principal_class` | Credential presentation class on HTTP request counts (closed set; `engine` reserved for ADR-1005 engine principals). Traffic-shape only — never an authorization signal. | `human`, `agent`, `none` |
 
-## On-behalf-of rejection metric (ADR-0022)
+## On-behalf-of rejection metric (ADR-1005)
 
 ```
-# HELP yuzu_onbehalf_rejected_total Requests rejected for carrying a reserved on-behalf-of header/metadata key (ADR-0022) by surface
+# HELP yuzu_onbehalf_rejected_total Requests rejected for carrying a reserved on-behalf-of header/metadata key (ADR-1005) by surface
 # TYPE yuzu_onbehalf_rejected_total counter
 yuzu_onbehalf_rejected_total{surface="http",event="security"} 0
 yuzu_onbehalf_rejected_total{surface="grpc",event="security"} 0

@@ -248,7 +248,7 @@ under the ops lock (`spark_engine.hpp:358-361` warns a hung SCM RPC stalls it
 
 ## Health / status surface — the #1939 checklist
 
-Per ADR-0022 (headless platform) a new capability lands on REST **and** MCP, or
+Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or
 records an exception. The spark/guard health signal lands on both, carries the A4
 error envelope and A2/A3 discovery metadata (enumerable via `/api/v1/openapi.json`
 and MCP `tools/list`), and enforces RBAC + audit at the API layer — not a

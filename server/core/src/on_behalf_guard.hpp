@@ -1,4 +1,4 @@
-// On-behalf-of assertion guard (ADR-0022 Interim rules, execution-plan PR 1.1).
+// On-behalf-of assertion guard (ADR-1005 Interim rules, execution-plan PR 1.1).
 //
 // Until server-verifiable delegation ships (execution-plan Phase 5), the server
 // accepts NO on-behalf-of assertion on ANY ingress surface — any such

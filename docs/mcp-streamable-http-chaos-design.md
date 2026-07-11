@@ -1,11 +1,11 @@
 ---
 status: accepted (Gate 5 output, governance run 2026-07-11)
-scope: chaos test design for ADR-0022 execution-plan track 2f (MCP Streamable HTTP transport, Decision 15)
+scope: chaos test design for ADR-1005 execution-plan track 2f (MCP Streamable HTTP transport, Decision 15)
 ---
 
 # Chaos Test Design — MCP Streamable HTTP (track 2f)
 
-Gate 5 synthesis from the 2026-07-11 governance run on the Decision 15 docs commit. Each track 2f implementation PR **must carry the automated reproductions mapped to it below** (P0 = blocks that PR's merge); the letters refer to Decision 15's pre-commitments (a)–(k) in `docs/adr-0022-execution-plan.md`.
+Gate 5 synthesis from the 2026-07-11 governance run on the Decision 15 docs commit. Each track 2f implementation PR **must carry the automated reproductions mapped to it below** (P0 = blocks that PR's merge); the letters refer to Decision 15's pre-commitments (a)–(k) in `docs/adr-1005-execution-plan.md`.
 
 ## Scenarios
 

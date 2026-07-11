@@ -1,5 +1,5 @@
 // gRPC server interceptor rejecting on-behalf-of assertions at agent-service
-// ingress (ADR-0022 Interim rules, execution-plan PR 1.1).
+// ingress (ADR-1005 Interim rules, execution-plan PR 1.1).
 //
 // A single interceptor — NOT a per-RPC-method check — so a future new RPC
 // method cannot be added without this guard, silently reopening the gap
@@ -68,7 +68,7 @@ public:
                                onbehalf::note_rejection(*metrics_, "grpc");
                     if (log) {
                         spdlog::warn(
-                            "[ADR-0022] rejected gRPC call carrying reserved "
+                            "[ADR-1005] rejected gRPC call carrying reserved "
                             "on-behalf-of metadata key '{}' (method={}, peer={}); "
                             "on-behalf-of assertions are not accepted on any surface "
                             "(1 log per {} rejections; counter records all)",

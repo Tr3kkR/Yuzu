@@ -1,4 +1,4 @@
-// ADR-0022 Interim rules (execution-plan PR 1.1) — reserved on-behalf-of key
+// ADR-1005 Interim rules (execution-plan PR 1.1) — reserved on-behalf-of key
 // guard. These tests pin the reserved-name set, the case-insensitive exact
 // match the HTTP pre-routing chokepoint and the gRPC interceptor both rely
 // on, the name-vs-value distinction, the log sanitizer, and the rejection
@@ -22,7 +22,7 @@ using yuzu::server::onbehalf::match_reserved_key;
 using yuzu::server::onbehalf::note_rejection;
 using yuzu::server::onbehalf::sanitize_for_log;
 
-TEST_CASE("every reserved key matches itself and its uppercase form", "[onbehalf][adr0022]") {
+TEST_CASE("every reserved key matches itself and its uppercase form", "[onbehalf][adr1005]") {
     for (auto key : kReservedKeys) {
         CHECK(is_reserved_key(key));
         std::string upper{key};
@@ -35,7 +35,7 @@ TEST_CASE("every reserved key matches itself and its uppercase form", "[onbehalf
     }
 }
 
-TEST_CASE("non-reserved names do not match", "[onbehalf][adr0022]") {
+TEST_CASE("non-reserved names do not match", "[onbehalf][adr1005]") {
     CHECK_FALSE(is_reserved_key("authorization"));
     CHECK_FALSE(is_reserved_key("x-yuzu-token"));
     CHECK_FALSE(is_reserved_key("x-correlation-id"));
@@ -47,7 +47,7 @@ TEST_CASE("non-reserved names do not match", "[onbehalf][adr0022]") {
 }
 
 TEST_CASE("find_reserved_key scans httplib headers case-insensitively",
-          "[onbehalf][adr0022]") {
+          "[onbehalf][adr1005]") {
     httplib::Headers clean{{"Authorization", "Bearer tok"}, {"Accept", "application/json"}};
     CHECK_FALSE(find_reserved_key(clean).has_value());
 
@@ -59,7 +59,7 @@ TEST_CASE("find_reserved_key scans httplib headers case-insensitively",
     CHECK(*hit == "x-yuzu-on-behalf-of");
 }
 
-TEST_CASE("reserved string in a header VALUE does not trigger", "[onbehalf][adr0022]") {
+TEST_CASE("reserved string in a header VALUE does not trigger", "[onbehalf][adr1005]") {
     // The scan matches NAMES only — a future refactor to substring/regex
     // scanning must not silently widen this to values.
     httplib::Headers h{{"X-Custom", "on-behalf-of=alice"},
@@ -69,7 +69,7 @@ TEST_CASE("reserved string in a header VALUE does not trigger", "[onbehalf][adr0
 }
 
 TEST_CASE("duplicate and empty-valued reserved headers still match",
-          "[onbehalf][adr0022]") {
+          "[onbehalf][adr1005]") {
     httplib::Headers dup{{"On-Behalf-Of", "a"}, {"On-Behalf-Of", "b"}};
     CHECK(find_reserved_key(dup).has_value());
     httplib::Headers empty_val{{"x-yuzu-delegated-operator", ""}};
@@ -77,7 +77,7 @@ TEST_CASE("duplicate and empty-valued reserved headers still match",
 }
 
 TEST_CASE("find_reserved_key catches the bare and generic spellings",
-          "[onbehalf][adr0022]") {
+          "[onbehalf][adr1005]") {
     for (auto name : {"On-Behalf-Of", "x-on-behalf-of", "X-Yuzu-Delegated-Operator",
                       "x-yuzu-delegation-artifact"}) {
         httplib::Headers h{{name, "someone"}};
@@ -87,7 +87,7 @@ TEST_CASE("find_reserved_key catches the bare and generic spellings",
 }
 
 TEST_CASE("sanitize_for_log strips control chars and caps length",
-          "[onbehalf][adr0022]") {
+          "[onbehalf][adr1005]") {
     CHECK(sanitize_for_log("/api/v1/devices") == "/api/v1/devices");
     // Percent-decoded newline / CR / NUL must not survive into a log line.
     CHECK(sanitize_for_log("/a\nFORGED: line") == "/a?FORGED: line");
@@ -99,7 +99,7 @@ TEST_CASE("sanitize_for_log strips control chars and caps length",
 }
 
 TEST_CASE("note_rejection counts every event and throttles logging",
-          "[onbehalf][adr0022]") {
+          "[onbehalf][adr1005]") {
     yuzu::MetricsRegistry reg;
     // Pre-seeded-then-incremented: counter records every call regardless of
     // the log decision. (The throttle counters are process-global statics, so
