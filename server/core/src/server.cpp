@@ -26,6 +26,7 @@
 #include "ca_store.hpp"
 #include "default_certs.hpp"
 #include "key_provider.hpp"
+#include "scim_routes.hpp"
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -763,6 +764,35 @@ public:
         // independently of ordinary login volume.
         metrics_.describe("yuzu_auth_sso_provision_total",
                           "Total durable SSO identity provision/refresh upserts, by source",
+                          "counter");
+        // SCIM v2 provisioning observability (governance hardening round,
+        // M-METRICS). Registered unconditionally (like every other describe()
+        // in this constructor) even when --scim-enable is off, so Prometheus
+        // alert rules can be authored up front; the series simply never
+        // increments on a disabled surface.
+        metrics_.describe("yuzu_scim_requests_total",
+                          "Total /scim/v2/Users requests, by op "
+                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "counter");
+        metrics_.describe("yuzu_scim_auth_failures_total",
+                          "Total /scim/v2/* requests rejected by the bearer gate — a "
+                          "credential-guess/replay signal against a surface that can "
+                          "provision/deprovision operator accounts",
+                          "counter");
+        metrics_.describe("yuzu_scim_audit_write_failures_total",
+                          "Total SCIM audit rows that failed to persist, by action. Every "
+                          "action on this surface, including the three termination actions "
+                          "(deactivated/deleted/reactivated), is set-and-proceed: the mutation "
+                          "already committed, so a lost audit row does not roll it back. This "
+                          "metric is the CC6.8 evidence-integrity alert signal — a sustained "
+                          "non-zero rate means the SCIM audit trail has gaps, not that the "
+                          "mutation itself failed",
+                          "counter");
+        metrics_.describe("yuzu_scim_provenance_denied_total",
+                          "Total SCIM mutations refused because the target account's "
+                          "provisioning_source is not 'scim' (or its role was elevated outside "
+                          "SCIM's ownership) — SCIM attempting to touch an account it does not "
+                          "own is a misconfigured-IdP or compromised-IdP signal",
                           "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
@@ -2851,6 +2881,26 @@ public:
 
         start_web_server();
 
+        // M/H3 follow-up (2026-07-10 review): start_web_server() can set
+        // startup_failed_ (SCIM boot failure) and return before launching
+        // the web listener, but by this point the agent/management gRPC
+        // listeners are already live (BuildAndStart above). Re-check here,
+        // before spinning up any more threads or reaching
+        // agent_server_->Wait() below, so a SCIM boot failure genuinely
+        // halts the process instead of serving on the gRPC ports with a
+        // broken web/SCIM surface. stop() is safe to call this early — every
+        // thread/store it joins or resets is joinable()/nullptr-guarded, and
+        // it also runs from ~ServerImpl (guarded against double-entry by
+        // stop_entered_), so calling it here and letting the destructor run
+        // again afterward is a deliberate no-op the second time.
+        if (startup_failed_) {
+            spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
+                         "(SCIM boot failure); stopping the already-started agent/management "
+                         "gRPC listeners.");
+            stop();
+            return;
+        }
+
         // Start certificate hot-reload watcher
         if (cfg_.cert_reload_enabled && cfg_.https_enabled && web_server_) {
             CertReloader::Params reload_params;
@@ -4818,17 +4868,11 @@ private:
             // rationale to /auth/oidc/start + /auth/callback).  Without these
             // exemptions, a non-authenticated user trying to start SSO would be
             // redirected to /login before the SAML flow handler runs.
-            if (req.path == "/login" || req.path == "/login/mfa" ||
-                req.path == "/login/mfa/enroll" || req.path == "/health" ||
-                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
-                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
-                req.path == "/auth/saml/start" || req.path == "/saml/acs" ||
-                // PKI PR4: the CA root cert + CRL are public by design — clients
-                // and browsers need them to establish trust / check revocation
-                // before they have any session. Exact-match only; /api/v1/ca/issued
-                // and /api/v1/ca/revoke remain Security-gated below.
-                req.path == "/api/v1/ca/root" || req.path == "/api/v1/ca/crl" ||
-                req.path.starts_with("/static/")) {
+            // The exact exempt-path decision lives in `is_login_exempt_path`
+            // (web_utils.hpp) so it has direct unit coverage (H1, 2026-07-08
+            // SCIM review) — this call site runs AFTER the rate limiter
+            // above, so rate-limiting stays in effect for every exempt path.
+            if (is_login_exempt_path(req.path)) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -5255,6 +5299,19 @@ private:
                 // it is not on the request path, so report ok.
                 {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
                 {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
+                // SRE Gate 6 HC-1: ScimStore is only constructed when
+                // --scim-enable is set (opt-in, mirrors the ca_store pattern
+                // above); a failed open/migration would otherwise silently
+                // reject every /scim/v2/* request while /readyz reported
+                // "ready". H3 (2026-07-08 review, defense-in-depth): also
+                // requires has_token() — the primary fix is that a failed
+                // set_token() at boot now sets startup_failed_ (server never
+                // reaches run()'s serve loop at all), but this term keeps
+                // /readyz honest on its own terms too, independent of that
+                // guard.
+                {"scim_store", !cfg_.scim_enable ||
+                                   (scim_store_ && scim_store_->is_open() &&
+                                    scim_store_->has_token())},
             };
 
             std::string failed_list;
@@ -10187,6 +10244,63 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
+        // Entirely inert when disabled: no store, no routes, no route table
+        // entries at all. main.cpp already refuses to start if --scim-enable is
+        // set without --scim-token or without HTTPS (CC6.2 fail-closed).
+        if (cfg_.scim_enable) {
+            scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
+            if (!scim_store_->is_open()) {
+                // H3 (2026-07-08 review): previously logged-and-continued,
+                // which left /scim/v2/* permanently rejecting every request
+                // (require_bearer always fails against a closed store)
+                // while /readyz's "scim_store" check (below) reported
+                // green — an operator would have no signal that the
+                // surface never came up. Set startup_failed_ instead; the
+                // guard immediately below this block aborts start_web_server()
+                // before the web listener launches, and run() (after its
+                // start_web_server() call) stops the already-started
+                // agent/management gRPC listeners and returns, so main.cpp
+                // exits non-zero on startup_failed() — matching main.cpp's
+                // own "refuses to start without a token" fail-closed posture
+                // for this same feature.
+                spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
+                             "refusing to start.");
+                startup_failed_ = true;
+            } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
+                // H3: same reasoning — a persist failure here is just as
+                // fatal to the surface as a closed store (require_bearer
+                // has no token to validate against), but is_open() alone
+                // would still read true, so this branch needs its own
+                // fail-closed guard rather than relying on the store-open
+                // check above. See the comment on the is_open() branch above
+                // for how startup_failed_ actually halts serving.
+                spdlog::error("SCIM: failed to store the configured --scim-token — "
+                             "refusing to start.");
+                startup_failed_ = true;
+            }
+            scim_routes_ = std::make_unique<ScimRoutes>();
+            scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
+                                          audit_store_.get());
+        }
+
+        // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
+        // startup_failed_, but nothing checked it here — start_web_server()
+        // continued registering every other route and unconditionally
+        // launched the web listener thread below, and run() went on to
+        // agent_server_->Wait() with no re-check. The server ended up
+        // SERVING (agent gRPC + web) despite "refusing to start". Abort now:
+        // skip the rest of route registration and never launch the web
+        // listener. run() re-checks startup_failed_ immediately after its
+        // start_web_server() call and stops the already-started agent/
+        // management gRPC listeners before reaching agent_server_->Wait().
+        if (startup_failed_) {
+            spdlog::critical(
+                "start_web_server(): aborting — SCIM boot failure above set startup_failed_; "
+                "the web listener will not be started.");
+            return;
+        }
+
         // -- A2 discovery surface (roadmap Issue 17.1): /api/v1/discover/* --------
         // Agentic-first (A1/A2, docs/agentic-first-principle.md) — RBAC permission
         // catalog, published instruction definitions, REST route catalog (subset of
@@ -11024,6 +11138,12 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    // SCIM v2 provisioning (/scim/v2/*) — only constructed when --scim-enable.
+    // ScimStore opens its OWN connection to the SAME auth.db AuthDB manages
+    // (see scim_store.hpp); scim_routes_ borrows non-owning ScimStore*/
+    // AuthManager*/AuditStore* pointers, all of which outlive it.
+    std::unique_ptr<ScimStore> scim_store_;
+    std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)

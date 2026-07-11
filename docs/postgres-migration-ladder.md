@@ -87,6 +87,15 @@ Migrate last because they require `SecretCodec` (or a verify-only-hash schema) i
   review doesn't read the ladder as silently non-compliant. The normalized header/match split
   maps directly onto the eventual two PG tables, so this reduces migration debt rather than
   adding it.
+- **`scim_resources`/`scim_tokens` — deliberate SQLite exception, riding `auth.db` (2026-07-08).**
+  SCIM v2 provisioning's two tables are a new server-side surface, but were **not** born on
+  Postgres: they live inside the existing `auth.db` SQLite file (own `"scim"` `MigrationRunner`
+  component, independent of `AuthDB`'s own `"auth_db"` track) rather than standing up a fresh
+  Postgres store, so identity state (accounts, sessions, provenance, and now SCIM's id/token
+  mapping) stays on one substrate until the `auth DB` row above makes its own cutover. Recorded
+  here as the exception ADR-0006 requires for a new server SQLite store, mirroring the
+  eyes-open-override style of the `NvdDatabase` note above. Detail: `docs/auth-architecture.md`
+  "SCIM v2 provisioning" § Storage.
 - The count is ~27 `*Store` classes + the auth DB; the exact set is whatever currently opens a
   `sqlite3*` under `server/core/src/`. Re-derive before declaring the ladder complete:
   `grep -rl "sqlite3_open" server/core/src`.

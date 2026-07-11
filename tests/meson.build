@@ -38,8 +38,16 @@ if host_os == 'windows'
     # Catch2 satisfies the leftover refs.
     dependencies: [_libcatch2main, _libcatch2],
   )
+  # No-main variant for yuzu_agent_tests (#1648 diagnostic): the suite
+  # supplies its own main() via unit/test_runner_main.cpp so it can log
+  # Catch2's real return code, so it must NOT also pull in Catch2Main.
+  catch2_nomain_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: [_libcatch2],
+  )
 else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+  catch2_nomain_dep = dependency('Catch2', modules: ['Catch2::Catch2'], method: 'cmake', required: true, include_type: 'system')
 endif
 
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
@@ -110,6 +118,10 @@ endif
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
+    # Custom Catch2 entry point (#1648 diagnostic) — logs Session::run()'s
+    # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
+    # above.
+    'unit/test_runner_main.cpp',
     'unit/test_plugin_loader.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
@@ -138,6 +150,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
+    'unit/test_thread_pool.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_mechanism.cpp',
@@ -165,7 +178,11 @@ agent_test_exe = executable(
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
   # as agents/core/meson.build gates guard_systemd.cpp/spark_service.cpp.
   cpp_args: test_partial_init_args + agent_platform_args,
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
+  # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
+  # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
+  # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
@@ -420,6 +437,9 @@ if build_server
       'unit/server/test_app_perf_group_reader.cpp',
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
+      'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_json.cpp',
+      'unit/server/test_scim_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

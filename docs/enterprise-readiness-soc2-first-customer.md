@@ -249,6 +249,7 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 - Pen-test executive summary and remediation statement.
 - DPA/security addendum templates.
 - Shared responsibility matrix (vendor vs customer responsibilities).
+- Forward pointer: the MCP surface gains a session concept (in-memory only, principal-bound ≥128-bit ids, TTL/caps, revocation cuts live streams) via ADR-0022 execution-plan Decision 15 / track 2f — fold its security pre-commitments into the questionnaire/whitepaper once 2f ships.
 
 ### First-Customer Readiness Milestones
 
