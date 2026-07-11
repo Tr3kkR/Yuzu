@@ -28,21 +28,28 @@ execution.
 ## Overview
 
 The MCP server is **enabled by default** when the Yuzu server starts. It
-registers a single HTTP endpoint at `POST /mcp/v1/` that speaks the
+serves the `/mcp/v1/` endpoint that speaks the
 [Model Context Protocol](https://modelcontextprotocol.io/) -- a JSON-RPC 2.0
 based protocol designed for AI tool use.
 
 Key characteristics:
 
-- **Protocol**: JSON-RPC 2.0 over HTTP POST.
-- **Endpoint**: `POST /mcp/v1/`
-- **Protocol version**: `2025-03-26`
+- **Protocol**: JSON-RPC 2.0 over HTTP.
+- **Endpoint**: `POST /mcp/v1/` for all JSON-RPC calls. `GET`/`DELETE /mcp/v1/`
+  are also registered for the MCP Streamable HTTP transport (see
+  [Streamable HTTP sessions](#streamable-http-sessions) below); `GET` is a `405`
+  placeholder until the SSE channel ships (track 2f PR 2).
+- **Protocol version**: negotiated on `initialize` — `2025-03-26` (default) or
+  `2025-06-18`. A client that requests neither is answered `2025-03-26`; a
+  present-but-unsupported `MCP-Protocol-Version` header is rejected with `400`.
 - **Authentication**: Same as all Yuzu API endpoints -- session cookie, Bearer
-  token, or `X-Yuzu-Token` header.
+  token, or `X-Yuzu-Token` header. Auth is per-request on every method; an
+  `Mcp-Session-Id` is transport affinity only, never a credential.
 - **Authorization**: Two layers -- MCP tier (checked first) then RBAC
   (checked second). A token must pass both.
 - **Audit**: Every tool invocation is recorded in the audit log with an
-  `mcp.<tool_name>` action.
+  `mcp.<tool_name>` action. Session lifecycle emits `mcp.session.open` /
+  `mcp.session.close` / `mcp.session.reject` (`target_type = McpSession`).
 - **Capabilities**: the authoritative tool/resource/prompt list is the
   server's own `tools/list` / `resources/list` / `prompts/list` responses
   (and the startup log line) — counts in this document are illustrative.
@@ -120,8 +127,10 @@ results.
 
 | Flag | Environment Variable | Default | Description |
 |---|---|---|---|
-| `--mcp-disable` | `YUZU_MCP_DISABLE` | `false` | Disable the MCP endpoint entirely. All requests to `/mcp/v1/` return an error. |
+| `--mcp-disable` | `YUZU_MCP_DISABLE` | `false` | Disable the MCP endpoint entirely. All requests to `/mcp/v1/` (POST/GET/DELETE) return an error. |
 | `--mcp-read-only` | `YUZU_MCP_READ_ONLY` | `false` | Restrict MCP to read-only tools only. Write and execute operations are rejected regardless of the token's tier. |
+| `--mcp-no-streaming` | `YUZU_MCP_NO_STREAMING` | `false` | Disable the Streamable HTTP transport: no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` → `405`, plain JSON-RPC POST only. The `202`-on-notification status still applies. |
+| `--mcp-allowed-origin` | `YUZU_MCP_ALLOWED_ORIGINS` | *(none)* | **Repeatable.** Allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/`. An absent `Origin` is always allowed (the endpoint requires a credential); an empty allowlist rejects any *present* `Origin` — browser-based MCP clients must be listed explicitly. |
 
 ### Examples
 
@@ -143,6 +152,40 @@ Allow MCP but restrict to read-only operations:
 ```bash
 yuzu-server --mcp-read-only
 ```
+
+---
+
+## Streamable HTTP sessions
+
+Yuzu serves the [MCP Streamable HTTP](https://modelcontextprotocol.io/) transport
+on `/mcp/v1/`. Sessions are **optional** — a client that never sends
+`Mcp-Session-Id` gets the same plain JSON-RPC behavior as before (only visible
+change: a notification POST now answers `202` instead of `204`).
+
+- **`initialize`** returns an `Mcp-Session-Id` response header (a ≥128-bit
+  server-generated value, bound to the authenticated principal). A client-supplied
+  `Mcp-Session-Id` on `initialize` is ignored — the server always mints a fresh
+  one (no session fixation).
+- **Presenting the header** on a later request validates it: unknown, expired,
+  `DELETE`d, or another principal's id all return `-32007` / HTTP `404` (no
+  cross-principal oracle) — re-run `initialize`. Sessions are in-memory, so a
+  server restart drops them (re-initialize).
+- **`DELETE /mcp/v1/`** with the `Mcp-Session-Id` header ends a session (`200`; a
+  second `DELETE` of the same id → `404`).
+- **`Origin`** is validated on every method (`-32008` / `403` if a present Origin
+  is not allowlisted — see `--mcp-allowed-origin`); **`MCP-Protocol-Version`** is
+  negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
+  session cap returns `-32010` / `429` on `initialize` when full.
+- **`GET /mcp/v1/`** returns `405` today — the SSE channel (`Last-Event-ID`
+  resume) and `notifications/progress` for long-running tools ship in the next 2f
+  rungs (see `docs/mcp-server.md`).
+- The session id is **transport affinity only** — never an auth credential;
+  per-request token auth runs on every method regardless.
+
+The `--mcp-no-streaming` kill switch disables all of the above (no minting;
+`GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
+Session open/close and every denial are audited (`mcp.session.open` /
+`mcp.session.close` / `mcp.session.reject`).
 
 ---
 
@@ -675,6 +718,51 @@ client configuration.
 
 **Fix**: Remove the flag or unset the environment variable and restart the
 server.
+
+### -32007: Unknown or expired session (HTTP 404)
+
+**Symptom**: A request presenting an `Mcp-Session-Id` header returns `-32007` /
+HTTP `404`.
+
+**Cause**: The session id is unknown, has idled out, was `DELETE`d, or belongs
+to a different principal (all collapse to the same response — no cross-principal
+oracle). Sessions are in-memory, so a **server restart** also drops them.
+
+**Fix**: Re-run `initialize` to mint a fresh `Mcp-Session-Id` and retry. Sessions
+are never required — a client may also simply omit the header and use plain POST.
+
+### -32008: Origin not allowed (HTTP 403)
+
+**Symptom**: A request carrying an `Origin` header returns `-32008` / HTTP `403`.
+
+**Cause**: The `Origin` is not in the configured allowlist. An empty allowlist
+rejects **any** present `Origin` (the secure default); non-browser clients send
+no `Origin` and are unaffected.
+
+**Fix**: Add the browser client's origin via `--mcp-allowed-origin
+scheme://host:port` (repeatable) and restart, or call from a non-browser client
+that sends no `Origin`.
+
+### -32009: Unsupported MCP-Protocol-Version (HTTP 400)
+
+**Symptom**: A request with an `MCP-Protocol-Version` header returns `-32009` /
+HTTP `400`.
+
+**Cause**: The header names a revision the server does not support. Supported:
+`2025-03-26`, `2025-06-18`.
+
+**Fix**: Send a supported `MCP-Protocol-Version`, or omit the header (the server
+assumes `2025-03-26`).
+
+### -32010: Session limit reached (HTTP 429)
+
+**Symptom**: `initialize` returns `-32010` / HTTP `429`.
+
+**Cause**: The per-principal or global session cap is full. A live session is
+never evicted to make room.
+
+**Fix**: End an unused session with `DELETE /mcp/v1/` (presenting its
+`Mcp-Session-Id`), or wait for an idle session to time out.
 
 ### -32004: MCP tier does not allow this operation
 

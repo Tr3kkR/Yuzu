@@ -5091,6 +5091,12 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
                                               {"Mcp-Session-Id", std::string(32, 'a')}});
         CHECK(res->status == 403);
     }
+    SECTION("hostile Origin rejected on GET too (403 precedes the 405 placeholder)") {
+        auto res = ts.call_raw("GET", "", {{"Origin", "https://evil.example.com"}});
+        CHECK(res->status == 403); // Origin check runs before the PR-1 405 placeholder
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
+    }
 }
 
 TEST_CASE("MCP 2f: unsupported MCP-Protocol-Version → 400", "[mcp][transport][2f]") {
@@ -5104,11 +5110,36 @@ TEST_CASE("MCP 2f: unsupported MCP-Protocol-Version → 400", "[mcp][transport][
     CHECK(bad->status == 400);
     auto body = nlohmann::json::parse(bad->body);
     CHECK(body["error"]["code"] == mcp::kMcpBadProtocolVersion);
+    // the denial is audited (governance COMP-NICE)
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+          ts.audit_log.end());
 
     // a supported version is accepted
     auto ok = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":3})",
                           {{"MCP-Protocol-Version", "2025-06-18"}});
     CHECK(ok->status == 200);
+}
+
+TEST_CASE("MCP 2f: protocolVersion negotiation is independent of streaming (HP-S1)",
+          "[mcp][transport][2f]") {
+    // Streaming OFF (no registry): negotiation still clamps to the supported set.
+    // This is the intentional THIRD additive change vs pre-2f, documented in the
+    // changelog + server-admin Upgrade Notes. Legacy clients (which send
+    // 2025-03-26 or no version) are unaffected — the byte-compat gate holds.
+    McpTestServer ts; // session_registry_for_test == nullptr → streaming off
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Mcp-Session-Id").empty()); // no minting when streaming off
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["result"]["protocolVersion"] == "2025-06-18"); // negotiated even with streaming off
+
+    // legacy default-version client unchanged
+    auto legacy = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+    auto lbody = nlohmann::json::parse(legacy->body);
+    CHECK(lbody["result"]["protocolVersion"] == "2025-03-26");
 }
 
 TEST_CASE("MCP 2f: initialize negotiates protocolVersion (clamp to supported)",

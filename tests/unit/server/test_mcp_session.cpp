@@ -12,8 +12,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <set>
+#include <string>
+#include <thread>
+#include <vector>
 
 using yuzu::server::mcp::McpSessionRegistry;
 using Validate = McpSessionRegistry::ValidateResult;
@@ -108,6 +112,47 @@ TEST_CASE("MCP session: terminate is principal-bound; reuse 404s", "[mcp][sessio
     CHECK(reg.validate_and_touch(a.session_id, "alice") == Validate::kUnknown); // gone
     CHECK_FALSE(reg.terminate(a.session_id, "alice")); // double-delete is a no-op
     CHECK(reg.active_count() == 0);
+}
+
+TEST_CASE("MCP session: concurrent access is race-free (TSan regression net)", "[mcp][session]") {
+    // The registry claims thread-safety (httplib dispatches across workers). This
+    // hammers mint/validate_and_touch/terminate/gc from many threads so TSan/ASan
+    // catch a future method that forgets the lock (governance cpp-safety-SHOULD).
+    // No socket/httplib → no #438 TSan-acceptor hazard.
+    McpSessionRegistry reg({.per_principal_cap = 1000, .global_cap = 100000});
+    constexpr int kThreads = 8;
+    constexpr int kOpsPerThread = 400;
+    std::atomic<int> minted{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&reg, &minted, t] {
+            const std::string principal = "p" + std::to_string(t);
+            std::vector<std::string> mine;
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                auto m = reg.mint(principal);
+                if (m.ok) {
+                    ++minted;
+                    CHECK(reg.validate_and_touch(m.session_id, principal) ==
+                          Validate::kValid); // our own session is always valid
+                    mine.push_back(m.session_id);
+                }
+                if (!mine.empty() && (i % 3 == 0)) {
+                    reg.terminate(mine.back(), principal);
+                    mine.pop_back();
+                }
+                // foreign / unknown probes must never crash or leak across threads
+                (void)reg.validate_and_touch(std::string(32, 'e'), "intruder");
+                if (i % 7 == 0) {
+                    reg.gc();
+                }
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    CHECK(minted.load() > 0);
+    CHECK(reg.active_count() <= static_cast<std::size_t>(kThreads * kOpsPerThread));
 }
 
 TEST_CASE("MCP session: idle GC reclaims cap room on mint", "[mcp][session]") {

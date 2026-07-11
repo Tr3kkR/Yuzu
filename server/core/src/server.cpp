@@ -10587,7 +10587,10 @@ private:
         } else {
             mcp_server_ = std::make_unique<mcp::McpServer>();
             // In-memory session registry for Streamable HTTP (2f). Bounded,
-            // non-durable; destroyed after web_server_ stops (member order).
+            // non-durable. Safe as a raw borrow in the /mcp/v1/ handlers because
+            // stop() joins the web server's worker threads (~ServerImpl → stop()
+            // → web_server_->stop()) before any member destructs — no handler
+            // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
             mcp_server_->register_routes(
                 *web_server_,

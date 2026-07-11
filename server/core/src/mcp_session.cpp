@@ -55,11 +55,21 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
     // 16 CSPRNG bytes → 32 lowercase hex chars = 128-bit id. Regenerate on the
     // (astronomically unlikely) collision rather than overwrite a live session.
     std::string id;
+    bool free_slot = false;
     for (int attempt = 0; attempt < 4; ++attempt) {
         id = auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
         if (sessions_.find(id) == sessions_.end()) {
+            free_slot = true;
             break;
         }
+    }
+    if (!free_slot) {
+        // Four consecutive 128-bit CSPRNG collisions is impossible with a healthy
+        // RNG; a degenerate/constant RNG is the only way here. Reject rather than
+        // emplace onto an existing key (which would no-op yet report success,
+        // binding the caller to a foreign entry) — keeps mint total (governance
+        // CPP-I1 / UP-7).
+        return {false, {}, "id_generation"};
     }
     const auto t = now();
     sessions_.emplace(id, Entry{principal, t, t});

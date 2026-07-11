@@ -189,7 +189,7 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track
-2f, PR 1). Two changes are visible to existing clients:
+2f, PR 1). Three changes are visible to existing clients:
 
 1. **A JSON-RPC *notification* POST (a request with no `id`, e.g.
    `notifications/initialized`) now returns `HTTP 202 Accepted` instead of
@@ -205,6 +205,13 @@ The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track
    an unknown/expired/foreign id returns `404`, at which point the client
    re-initializes (sessions are in-memory, so a server restart has the same
    effect). `DELETE /mcp/v1/` ends a session.
+3. **`initialize` now negotiates the protocol revision** instead of always
+   returning `2025-03-26`. A client that sends `params.protocolVersion` of a
+   *supported* revision (`2025-03-26` or `2025-06-18`) gets that value echoed;
+   anything else (including no `protocolVersion`) still returns `2025-03-26`.
+   **Affected:** only a newer client that requests `2025-06-18` — a legacy client
+   requesting `2025-03-26` (or nothing) sees no change. Negotiation is independent
+   of the `--mcp-no-streaming` kill switch.
 
 New CLI flags (all optional):
 
