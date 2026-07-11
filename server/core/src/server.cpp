@@ -10572,15 +10572,23 @@ private:
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
-            // C8: Return a proper JSON-RPC error instead of a generic 404
-            web_server_->Post("/mcp/v1/", [](const httplib::Request&, httplib::Response& res) {
+            // C8: Return a proper JSON-RPC error instead of a generic 404.
+            // CH-7(c): the disabled stub must ANSWER GET/DELETE too (not a bare
+            // 404), so Streamable HTTP probes get the same honest disabled error.
+            auto mcp_disabled_stub = [](const httplib::Request&, httplib::Response& res) {
                 res.set_header("Content-Type", "application/json");
                 res.set_content(
                     mcp::error_response_null(mcp::kMcpDisabled, "MCP is disabled on this server"),
                     "application/json");
-            });
+            };
+            web_server_->Post("/mcp/v1/", mcp_disabled_stub);
+            web_server_->Get("/mcp/v1/", mcp_disabled_stub);
+            web_server_->Delete("/mcp/v1/", mcp_disabled_stub);
         } else {
             mcp_server_ = std::make_unique<mcp::McpServer>();
+            // In-memory session registry for Streamable HTTP (2f). Bounded,
+            // non-durable; destroyed after web_server_ stops (member order).
+            mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
             mcp_server_->register_routes(
                 *web_server_,
                 [this](const httplib::Request& req, httplib::Response& res)
@@ -10748,7 +10756,11 @@ private:
                        const std::string& type, const std::string& op,
                        const std::string& agent_id) -> bool {
                     return require_scoped_permission(req, res, type, op, agent_id);
-                });
+                },
+                // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f): the
+                // session registry, the --mcp-no-streaming kill switch (by live
+                // pointer into cfg_), and the Origin allowlist.
+                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -11088,6 +11100,10 @@ private:
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
+    // MCP Streamable HTTP session registry (2f). Captured by raw pointer into the
+    // /mcp/v1/ handlers; safe because stop() joins web_server_ before members
+    // destruct (see ~ServerImpl → stop() → web_server_->stop()).
+    std::unique_ptr<mcp::McpSessionRegistry> mcp_sessions_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;

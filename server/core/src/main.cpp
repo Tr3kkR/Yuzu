@@ -404,6 +404,15 @@ int main(int argc, char* argv[]) {
     app.add_flag("--mcp-read-only", cfg.mcp_read_only,
                  "Restrict MCP to read-only tools only (no write/execute)")
         ->envname("YUZU_MCP_READ_ONLY");
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    app.add_flag("--mcp-no-streaming", cfg.mcp_streaming_disable,
+                 "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
+                 "JSON-RPC POST only")
+        ->envname("YUZU_MCP_NO_STREAMING");
+    app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
+                   "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
+                   "repeatable). Empty rejects any present Origin (absent is always allowed).")
+        ->envname("YUZU_MCP_ALLOWED_ORIGINS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,

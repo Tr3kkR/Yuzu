@@ -21,6 +21,11 @@ constexpr int kPermissionDenied = -32003;
 constexpr int kTierDenied       = -32004;
 constexpr int kMcpDisabled      = -32005;
 constexpr int kApprovalRequired = -32006;
+// MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+constexpr int kMcpUnknownSession     = -32007;  // unknown/expired/wrong-principal id  → HTTP 404
+constexpr int kMcpOriginRejected     = -32008;  // Origin not in allowlist             → HTTP 403
+constexpr int kMcpBadProtocolVersion = -32009;  // MCP-Protocol-Version unsupported     → HTTP 400
+constexpr int kMcpSessionCap         = -32010;  // per-principal/global session cap hit → HTTP 429
 
 // ── Request ───────────────────────────────────────────────────────────────
 
