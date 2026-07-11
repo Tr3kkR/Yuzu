@@ -324,50 +324,49 @@ private:
 
     // armed sparks + subscription index + wheel state, all under mu_.
     mutable std::mutex mu_;
-    /// Serializes every mechanism watch()/unwatch() call engine-wide (#1994
-    /// M2). Without this, a disarm()'s pending unwatch(key) and a concurrent
-    /// re-arm's watch(key) for an equal spec can interleave out of order —
-    /// the late unwatch tears down the fresh watch while armed_ still shows
-    /// the key armed. Each call site re-checks armed_'s current state for the
-    /// key WHILE HOLDING this lock, immediately before issuing the mechanism
-    /// call, so the mechanism call always reflects the freshest armed_ state.
-    /// Lock order: mech_ops_mu_ → mu_, NEVER reversed; mechanism worker
-    /// threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with their
-    /// own internal lock released and never touch mech_ops_mu_, so there is no
-    /// cycle. REQUIRES (Stage-2 trap, enforced by convention): a mechanism must
-    /// deliver emit()/fault() ASYNCHRONOUSLY — off the watch()/unwatch() call
-    /// stack, from its own thread. A mechanism that fired emit() synchronously
-    /// from inside watch(), reaching an inline consumer that re-arms, would
-    /// re-enter arm_impl → mech_ops_mu_ and self-deadlock this non-recursive
-    /// lock. All shipped mechanisms emit from worker threads, so this holds
-    /// today; a future mechanism author must preserve it (cpp-safety Gate 3).
-    /// Coarsened to per-engine (not per-key): arm/disarm are rare
-    /// control-plane operations, so a mechanism call briefly blocking another
-    /// unrelated key's arm/disarm is an acceptable trade for not needing
-    /// per-key generation tokens. KNOWN COUPLING (accepted, tracked): because
-    /// this is ONE engine-wide lock rather than per-mechanism, a slow
-    /// watch() on one mechanism blocks a concurrent unwatch() on a DIFFERENT
-    /// mechanism (e.g. File blocking Registry) that was fully independent
-    /// before. The "acceptable" defence rests on a BOUNDED worst-case watch(),
-    /// but that bound is WEAK and FILE-ONLY: spark_file's arm_ancestor deadline
-    /// (#1980) checks the 500ms budget BETWEEN probes, and fs::is_directory is
-    /// uninterruptible — so a single hung probe on a dead UNC/network path
-    /// holds this lock for the full OS network timeout (tens of seconds), not
-    /// ~500ms; the deadline bounds the NUMBER of slow probes to ~one, not the
-    /// wall-clock of any one probe (unhappy-path UP-1). Registry (TP_WAIT) and
-    /// Service (SCM query) watch latencies are entirely UNCHARACTERISED — a hung
-    /// SCM RPC in Service::watch() would stall this engine-wide lock with no
-    /// bound at all (architect Gate 3). Truly bounding this needs the
-    /// walk-off-mu_ (probe on a separate thread) restructure — the deferred
-    /// follow-up below.
-    /// Only same-mechanism watch/unwatch were serialised previously (by each
-    /// mechanism's own internal lock); this adds cross-mechanism serialisation
-    /// that Stage 2's simultaneous File+Registry+Service guards will exercise.
-    /// Correctness needs only same-KEY ordering; per-mechanism-type granularity
-    /// drops the cross-mechanism coupling for modest extra bookkeeping — this
-    /// is a HARD GATE before Stage 2 wires the SECOND live mechanism under
-    /// load, not an open-ended backlog item.
-    mutable std::mutex mech_ops_mu_;
+    /// Serializes every mechanism watch()/unwatch() call PER MECHANISM TYPE
+    /// (#1994 M2; per-type granularity #2011). Without this, a disarm()'s
+    /// pending unwatch(key) and a concurrent re-arm's watch(key) for an equal
+    /// spec can interleave out of order — the late unwatch tears down the fresh
+    /// watch while armed_ still shows the key armed. Each call site re-checks
+    /// armed_'s current state for the key WHILE HOLDING this lock, immediately
+    /// before issuing the mechanism call, so the mechanism call always reflects
+    /// the freshest armed_ state. Correctness needs only same-KEY ordering, and
+    /// a key encodes its SparkType (spark_key) — so a lock per mechanism type is
+    /// sufficient: two keys that could collide always share a type.
+    /// Lock order: mech_ops_mu_by_type_[type] → mu_, NEVER reversed; mechanism
+    /// worker threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with
+    /// their own internal lock released and never touch these locks, so there is
+    /// no cycle. REQUIRES (Stage-2 trap, enforced by convention): a mechanism
+    /// must deliver emit()/fault() ASYNCHRONOUSLY — off the watch()/unwatch()
+    /// call stack, from its own thread. A mechanism that fired emit()
+    /// synchronously from inside watch(), reaching an inline consumer that
+    /// re-arms, would re-enter arm_impl → the same type's lock and self-deadlock
+    /// this non-recursive lock. All shipped mechanisms emit from worker threads,
+    /// so this holds today; a future mechanism author must preserve it
+    /// (cpp-safety Gate 3). Coarsened to per-TYPE (not per-key): arm/disarm are
+    /// rare control-plane operations, so a mechanism call briefly blocking
+    /// another same-type key's arm/disarm is an acceptable trade for not needing
+    /// per-key generation tokens.
+    /// RESOLVED cross-mechanism coupling (#2011): a slow watch() on one
+    /// mechanism no longer blocks a concurrent arm/disarm on a DIFFERENT
+    /// mechanism (e.g. File no longer blocks Registry/Service) — the HARD GATE
+    /// closed before Stage 2 wires the second live mechanism under load. STILL
+    /// OPEN (distinct follow-up, NOT closed by #2011): a slow watch() still
+    /// stalls its OWN type's arm/disarm queue for the full duration, and that
+    /// duration is unbounded — spark_file's arm_ancestor deadline (#1980) bounds
+    /// the NUMBER of slow probes to ~one, not the wall-clock of any one probe
+    /// (fs::is_directory is uninterruptible, so a hung probe on a dead UNC path
+    /// holds File's lock for the full OS network timeout); Registry (TP_WAIT)
+    /// and Service (SCM query) watch latencies are entirely UNCHARACTERISED.
+    /// Truly bounding the per-type stall needs the walk-off-mu_ (probe on a
+    /// separate thread) restructure — a deferred follow-up, unscheduled.
+    /// Populated in register_mechanism() under mu_, in lockstep with
+    /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
+    /// std::mutex& obtained via .at(type) is safe to hold across the blocking
+    /// mechanism call for the same structural-stability reason a raw mechanism
+    /// pointer is (see mechanisms_ below).
+    mutable std::map<SparkType, std::mutex> mech_ops_mu_by_type_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key
     std::map<SubscriptionId, std::string> sub_keys_;

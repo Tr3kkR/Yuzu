@@ -198,6 +198,38 @@ private:
     bool release_{false};
 };
 
+/// A mechanism whose watch() blocks until released — for #2011, proves the
+/// per-mechanism-type mech_ops_mu_by_type_ (not the old engine-wide
+/// mech_ops_mu_) no longer couples a stalled watch() on ONE mechanism type to
+/// arm/disarm on a DIFFERENT type.
+class BlockingWatchMechanism final : public ISparkMechanism {
+public:
+    void start(SparkEmitFn emit, SparkFaultFn) override { emit_ = std::move(emit); }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        watching_now_.store(true, std::memory_order_release);
+        std::unique_lock lk(gate_mu_);
+        gate_cv_.wait(lk, [&] { return release_; });
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {}
+    bool watching_now() const { return watching_now_.load(std::memory_order_acquire); }
+    void release() {
+        {
+            std::lock_guard lk(gate_mu_);
+            release_ = true;
+        }
+        gate_cv_.notify_all();
+    }
+
+private:
+    SparkEmitFn emit_;
+    std::atomic<bool> watching_now_{false};
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    bool release_{false};
+};
+
 SparkSpec file_spec(const std::string& path) {
     return SparkSpec{SparkType::File, FileSparkParams{path}};
 }
@@ -550,8 +582,10 @@ TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent
     // This twin runs the two ops on real threads with no seam: it does NOT
     // reliably hit the nanosecond race window (measured ~0.11s for 500 trials
     // on an idle runner — the window is almost never hit), so its value is
-    // exercising the cross-thread memory-ordering of mech_ops_mu_/mu_ under
-    // TSan, not interleaving coverage. Mirrors the M1 stress twin's framing.
+    // exercising the cross-thread memory-ordering of mech_ops_mu_by_type_/mu_
+    // under TSan, not interleaving coverage. Mirrors the M1 stress twin's
+    // framing. (Single-type here, so per-type vs engine-wide is behaviourally
+    // identical — only the identifier changed with #2011.)
     for (int trial = 0; trial < 500; ++trial) {
         SparkEngine engine;
         FakeMechanism* fake = wire_fake(engine, SparkType::File);
@@ -592,6 +626,59 @@ TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent
         engine.stop();
     }
     SUCCEED("500 concurrent disarm()/arm() trials completed with no torn-down fresh watch");
+}
+
+TEST_CASE("SparkEngine: a blocking watch() on one mechanism type does not delay "
+          "unwatch() on a DIFFERENT mechanism type (#2011)",
+          "[spark][mechanism]") {
+    // Acceptance test for the rung-0 HARD GATE: with the old engine-wide
+    // mech_ops_mu_, a stalled File watch() held the ONE lock every unwatch()
+    // queued behind, so a Registry disarm could not proceed until File's watch
+    // returned. Per-type locks (mech_ops_mu_by_type_) decouple them.
+    SparkEngine engine;
+    FakeMechanism* reg_fake = wire_fake(engine, SparkType::Registry);
+    auto blocking = std::make_unique<BlockingWatchMechanism>();
+    BlockingWatchMechanism* bwm = blocking.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(blocking)).has_value());
+
+    auto consumer = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(consumer.has_value());
+    engine.start();
+
+    // Arm a Registry spark first — its FakeMechanism watch() returns at once, so
+    // it is live and its later disarm has a real unwatch to issue.
+    const auto reg_spec = registry_spec("HKLM", "Software\\Foo");
+    auto reg_sub = engine.arm(*consumer, reg_spec);
+    REQUIRE(reg_sub.has_value());
+    CHECK(reg_fake->is_watching(spark_key(reg_spec)));
+
+    // Arm a File spark whose watch() blocks (holding File's per-type lock) — on
+    // a background thread, since arm() will not return until watch() does.
+    std::thread blocker([&] { (void)engine.arm(*consumer, file_spec("/etc/hosts")); });
+    REQUIRE(eventually([&] { return bwm->watching_now(); }));
+
+    // Disarm the Registry subscription on its own thread while File's watch() is
+    // still blocked. Under per-type locks this returns immediately; under the
+    // old engine-wide lock it would stay blocked behind File's watch() until we
+    // release() below — the eventually() would time out and completed==false.
+    std::atomic<bool> disarm_done{false};
+    std::thread disarmer([&] {
+        engine.disarm(*reg_sub);
+        disarm_done.store(true, std::memory_order_release);
+    });
+    const bool completed = eventually([&] { return disarm_done.load(std::memory_order_acquire); },
+                                      2000ms);
+    CHECK(completed); // the whole point of #2011: File's stall did not block Registry
+    CHECK(reg_fake->unwatch_calls() == 1);
+
+    // Cleanup: release the blocked File watch, then join everything. (Even under
+    // a regression where `completed` is false, release() unblocks File's watch,
+    // which frees the old shared lock so the pending disarm can finish — so the
+    // test fails cleanly rather than hanging.)
+    bwm->release();
+    disarmer.join();
+    blocker.join();
+    engine.stop();
 }
 
 TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][mechanism]") {
@@ -903,7 +990,8 @@ TEST_CASE("SparkEngine: a queued handler re-entering the engine while stop() is 
           "[spark][mechanism]") {
     // Pins the property this whole mechanism-call seam depends on:
     // SparkEngine::stop() calls a mechanism's stop() with NO engine lock held
-    // (mu_ / consumers_mu_ / mech_ops_mu_ all released — see stop()'s step 2).
+    // (mu_ / consumers_mu_ / every mech_ops_mu_by_type_ entry all released — see
+    // stop()'s step 2).
     // A QUEUED handler already dispatched before stop() began may therefore
     // safely call back into the engine (arm/disarm) WHILE stop() is stuck
     // inside a slow mechanism teardown: the re-entrant call must fail cleanly
