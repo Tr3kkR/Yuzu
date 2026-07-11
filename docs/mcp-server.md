@@ -126,7 +126,7 @@ The session-lifecycle + transport pre-check half of the Streamable HTTP transpor
 - **`MCP-Protocol-Version` negotiation.** Supported revisions `2025-03-26` and `2025-06-18`; `initialize` echoes the client's requested version when supported, else the `2025-03-26` baseline. A present-but-unsupported header → `400`.
 - **Notification POSTs answer `202`** (spec MUST; was `204`).
 - **Kill switch** `--mcp-no-streaming` (no minting; `GET`/`DELETE` → `405`; plain JSON-RPC POST only) and audit verbs `mcp.session.open` / `mcp.session.close` / `mcp.session.reject` (the last on every denial — origin, unknown session, cap, protocol-version).
-- New JSON-RPC error codes: `-32007` unknown session (`404`), `-32008` origin rejected (`403`), `-32009` bad protocol version (`400`), `-32010` session cap (`429`).
+- New JSON-RPC error codes: `-32007` unknown session (`404`), `-32008` origin rejected (`403`), `-32009` bad protocol version (`400`), `-32010` session cap (`429`). Each carries the shared A4 `error.data` (a `correlation_id`, the always-present nullable `retry_after_ms`, and a `remediation`), built by the single `error_response_a4` helper so the transport denials match the REST/tool-call A4 envelope.
 
 Session state is in-memory only and deliberately does **not** gate `/readyz`. Operator reference: `docs/user-manual/server-admin.md` (flags + Upgrade Notes) and `docs/user-manual/mcp.md`.
 

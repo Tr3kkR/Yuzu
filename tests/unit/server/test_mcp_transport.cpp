@@ -1,6 +1,6 @@
 /**
  * test_mcp_transport.cpp — MCP Streamable HTTP transport pre-check helpers
- * (ADR-1005 Decision 15, track 2f). Pure predicates, no httplib/auth deps.
+ * (ADR-0022 Decision 15, track 2f). Pure predicates, no httplib/auth deps.
  * Covers the CH-9 (Origin) pure core + protocol-version negotiation clamp.
  */
 
@@ -45,7 +45,14 @@ TEST_CASE("MCP transport: Accept opts into SSE (case-insensitive)", "[mcp][trans
     CHECK(accept_wants_sse("application/json, text/event-stream"));
     CHECK(accept_wants_sse("TEXT/EVENT-STREAM"));
     CHECK(accept_wants_sse("application/json,Text/Event-Stream;q=0.9"));
+    CHECK(accept_wants_sse("  text/event-stream ; charset=utf-8")); // OWS + params trimmed
+    CHECK(accept_wants_sse("text/plain, application/json, text/event-stream")); // last range
     CHECK_FALSE(accept_wants_sse("application/json"));
     CHECK_FALSE(accept_wants_sse(""));
     CHECK_FALSE(accept_wants_sse("text/event")); // partial, not the full media type
+    // Boundary: the media type must be a WHOLE range, never a bare substring —
+    // a parameter value or a prefixed type must not false-positive (PR-1 review LOW).
+    CHECK_FALSE(accept_wants_sse("application/json; q=text/event-stream")); // param value
+    CHECK_FALSE(accept_wants_sse("not-text/event-stream"));                 // prefixed type
+    CHECK_FALSE(accept_wants_sse("text/event-stream-plus"));                // suffixed type
 }

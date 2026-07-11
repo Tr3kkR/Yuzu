@@ -1935,7 +1935,7 @@ TEST_CASE("MCP Integration: unauthenticated returns 401", "[mcp][integration]") 
 }
 
 // ── 8. Notification (no id) — verify 202 response ──────────────────────────
-// MCP Streamable HTTP (ADR-1005 Decision 15, 2f) flips this from 204 → 202
+// MCP Streamable HTTP (ADR-0022 Decision 15, 2f) flips this from 204 → 202
 // (spec MUST), unconditionally. See the "[mcp][transport][2f]" cases below.
 
 TEST_CASE("MCP Integration: notification returns 202", "[mcp][integration]") {
@@ -4928,7 +4928,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     fs::remove_all(tmp_dir, ec);
 }
 
-// ── MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f) ──────────
+// ── MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f) ──────────
 //
 // Session lifecycle + transport pre-checks, driven through the same in-process
 // build_handler / build_get_handler / build_delete_handler seams. Chaos gates
@@ -5014,6 +5014,8 @@ TEST_CASE("MCP 2f: presented session validated; unknown → 404 + reject audit",
         CHECK(bad->status == 404);
         auto body = nlohmann::json::parse(bad->body);
         CHECK(body["error"]["code"] == mcp::kMcpUnknownSession);
+        // shared transport A4 error.data (correlation_id present, req- prefixed)
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
               ts.audit_log.end());
     }
@@ -5074,6 +5076,7 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
         CHECK(res->status == 403);
         auto body = nlohmann::json::parse(res->body);
         CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
               ts.audit_log.end());
     }
@@ -5096,6 +5099,7 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
         CHECK(res->status == 403); // Origin check runs before the PR-1 405 placeholder
         auto body = nlohmann::json::parse(res->body);
         CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     }
 }
 
@@ -5110,6 +5114,7 @@ TEST_CASE("MCP 2f: unsupported MCP-Protocol-Version → 400", "[mcp][transport][
     CHECK(bad->status == 400);
     auto body = nlohmann::json::parse(bad->body);
     CHECK(body["error"]["code"] == mcp::kMcpBadProtocolVersion);
+    CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     // the denial is audited (governance COMP-NICE)
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
           ts.audit_log.end());
@@ -5195,7 +5200,11 @@ TEST_CASE("MCP 2f: DELETE terminates a session; reuse 404s; missing header 400",
     ts.start();
 
     SECTION("missing Mcp-Session-Id → 400") {
-        CHECK(ts.call_raw("DELETE", "")->status == 400);
+        auto res = ts.call_raw("DELETE", "");
+        CHECK(res->status == 400);
+        // shared transport A4 error.data on the null-id (bodyless) denial path
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     }
     SECTION("terminate then reuse") {
         auto sid = mint_session(ts);
@@ -5203,8 +5212,11 @@ TEST_CASE("MCP 2f: DELETE terminates a session; reuse 404s; missing header 400",
         CHECK(del->status == 200);
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.close|success") !=
               ts.audit_log.end());
-        // reuse → 404
-        CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}})->status == 404);
+        // reuse → 404, also A4-shaped
+        auto reuse = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        CHECK(reuse->status == 404);
+        auto rbody = nlohmann::json::parse(reuse->body);
+        CHECK(rbody["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     }
     SECTION("foreign principal cannot terminate (no oracle)") {
         ts.mock_username = "alice";
@@ -5230,6 +5242,15 @@ TEST_CASE("MCP 2f/15(j): session cap hit rejects initialize with 429 (never evic
     CHECK(second->status == 429);
     auto body = nlohmann::json::parse(second->body);
     CHECK(body["error"]["code"] == mcp::kMcpSessionCap);
+    // 15(j) / CH-5 PR-1 merge gate: the cap reject is A4-shaped. error.data
+    // carries a correlation_id, the always-present nullable retry_after_ms, and
+    // a remediation — NOT the old ad-hoc {retry_after_ms, hint} shape.
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].is_string());
+    CHECK_FALSE(body["error"]["data"].contains("hint")); // the retired non-A4 field
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
           ts.audit_log.end());
     // the live session survived the cap rejection

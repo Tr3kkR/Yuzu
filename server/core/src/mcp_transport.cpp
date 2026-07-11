@@ -21,24 +21,48 @@ bool origin_allowed(std::string_view origin, const std::vector<std::string>& all
 }
 
 bool accept_wants_sse(std::string_view accept_header) {
+    // Parse the Accept header as a comma-separated list of media ranges and look
+    // for `text/event-stream` as a WHOLE media type — never a bare substring.
+    // A substring scan false-positives on `application/json; q=text/event-stream`
+    // (the token appears in a parameter value) and `not-text/event-stream`
+    // (a prefix), so each range is split off, its `;`-delimited parameters are
+    // dropped, OWS is trimmed, and the remaining media type is compared exactly
+    // (case-insensitive per RFC 9110 — media types are case-insensitive).
     constexpr std::string_view needle = "text/event-stream";
-    if (accept_header.size() < needle.size()) {
-        return false;
-    }
     const auto lower = [](char c) {
         return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     };
-    for (std::size_t i = 0; i + needle.size() <= accept_header.size(); ++i) {
-        bool match = true;
-        for (std::size_t j = 0; j < needle.size(); ++j) {
-            if (lower(accept_header[i + j]) != needle[j]) {
-                match = false;
-                break;
+    std::size_t pos = 0;
+    while (pos <= accept_header.size()) {
+        const std::size_t comma = accept_header.find(',', pos);
+        std::string_view token =
+            accept_header.substr(pos, comma == std::string_view::npos ? std::string_view::npos
+                                                                      : comma - pos);
+        // Drop any `;`-delimited parameters (q=, charset, etc.) — only the type matters.
+        if (const std::size_t semi = token.find(';'); semi != std::string_view::npos) {
+            token = token.substr(0, semi);
+        }
+        // Trim optional leading/trailing whitespace (OWS).
+        std::size_t b = 0, e = token.size();
+        while (b < e && std::isspace(static_cast<unsigned char>(token[b]))) ++b;
+        while (e > b && std::isspace(static_cast<unsigned char>(token[e - 1]))) --e;
+        token = token.substr(b, e - b);
+        if (token.size() == needle.size()) {
+            bool match = true;
+            for (std::size_t j = 0; j < needle.size(); ++j) {
+                if (lower(token[j]) != needle[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return true;
             }
         }
-        if (match) {
-            return true;
+        if (comma == std::string_view::npos) {
+            break;
         }
+        pos = comma + 1;
     }
     return false;
 }

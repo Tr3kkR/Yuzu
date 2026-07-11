@@ -21,7 +21,7 @@ constexpr int kPermissionDenied = -32003;
 constexpr int kTierDenied       = -32004;
 constexpr int kMcpDisabled      = -32005;
 constexpr int kApprovalRequired = -32006;
-// MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+// MCP Streamable HTTP transport (ADR-0022 Decision 15, track 2f)
 constexpr int kMcpUnknownSession     = -32007;  // unknown/expired/wrong-principal id  → HTTP 404
 constexpr int kMcpOriginRejected     = -32008;  // Origin not in allowlist             → HTTP 403
 constexpr int kMcpBadProtocolVersion = -32009;  // MCP-Protocol-Version unsupported     → HTTP 400
@@ -139,6 +139,51 @@ inline std::string error_response_null(int code, std::string_view message) {
     r += detail::json_quoted(message);
     r += R"(},"id":null})";
     return r;
+}
+
+/// A4-shaped JSON-RPC 2.0 error response for the /mcp/v1/ Streamable-HTTP
+/// transport denials (Origin / protocol-version / unknown-session / session-cap
+/// on POST, GET, DELETE). `error.data` always carries `correlation_id` plus the
+/// nullable `retry_after_ms`; `remediation` is emitted only when non-empty (the
+/// §A4 convention — absence carries the "no recovery hint" meaning). This is the
+/// SINGLE builder for every transport denial's error.data, keeping the shape
+/// uniform with the REST A4 envelope (docs/agentic-first-principle.md §A4;
+/// ADR-0022 exec-plan Decision 15(j) makes the A4 shape the cap-hit merge gate).
+///
+/// The correlation id is minted by the caller
+/// (yuzu::server::detail::make_correlation_id()) and passed in, so this header
+/// stays free of the rest_a4_envelope dependency. Delegates to error_response()
+/// so there is ONE wire shape; pass `id = nullptr` for the pre-parse (Origin /
+/// protocol) and bodyless (GET/DELETE) denials, or use error_response_null_a4.
+inline std::string error_response_a4(const nlohmann::json& id, int code, std::string_view message,
+                                     std::string_view correlation_id,
+                                     std::string_view remediation = {},
+                                     std::optional<std::int64_t> retry_after_ms = std::nullopt) {
+    std::string data = R"({"correlation_id":)";
+    data += detail::json_quoted(correlation_id);
+    data += R"(,"retry_after_ms":)";
+    if (retry_after_ms) {
+        data += std::to_string(*retry_after_ms);
+    } else {
+        data += "null";
+    }
+    if (!remediation.empty()) {
+        data += R"(,"remediation":)";
+        data += detail::json_quoted(remediation);
+    }
+    data += '}';
+    return error_response(id, code, message, data);
+}
+
+/// A4-shaped transport denial with a null JSON-RPC id — the pre-parse
+/// (Origin / protocol) and bodyless (GET/DELETE) sites. Byte-identical to
+/// error_response_null() plus the shared A4 `error.data`.
+inline std::string error_response_null_a4(int code, std::string_view message,
+                                          std::string_view correlation_id,
+                                          std::string_view remediation = {},
+                                          std::optional<std::int64_t> retry_after_ms = std::nullopt) {
+    return error_response_a4(nlohmann::json(nullptr), code, message, correlation_id, remediation,
+                             retry_after_ms);
 }
 
 } // namespace yuzu::server::mcp

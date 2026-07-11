@@ -756,7 +756,10 @@ assumes `2025-03-26`).
 
 ### -32010: Session limit reached (HTTP 429)
 
-**Symptom**: `initialize` returns `-32010` / HTTP `429`.
+**Symptom**: `initialize` returns `-32010` / HTTP `429`, with an A4 `error.data`
+object carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation`
+hint (the same shape as the tool-call denials below — every `/mcp/v1/` transport
+denial, `-32007` through `-32010`, carries this A4 `error.data`).
 
 **Cause**: The per-principal or global session cap is full. A live session is
 never evicted to make room.

@@ -7,7 +7,7 @@
 #include <string>
 #include <unordered_map>
 
-// MCP Streamable HTTP session registry (ADR-1005 Decision 15, track 2f).
+// MCP Streamable HTTP session registry (ADR-0022 Decision 15, track 2f).
 namespace yuzu::server::mcp {
 
 // In-memory registry of `Mcp-Session-Id` sessions.
@@ -42,7 +42,7 @@ public:
     struct MintResult {
         bool ok = false;
         std::string session_id;     // set iff ok
-        std::string reject_reason;  // set iff !ok: "per_principal_cap" | "global_cap"
+        std::string reject_reason;  // set iff !ok: "per_principal_cap" | "global_cap" | "id_generation"
     };
 
     // Mint a fresh, principal-bound session id (≥128-bit CSPRNG, lowercase hex).

@@ -932,7 +932,7 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool* const p_read_only = &read_only_mode;
     const bool* const p_disabled = &mcp_disabled;
 
-    // MCP Streamable HTTP (ADR-1005 Decision 15, 2f). Streaming is ON only when a
+    // MCP Streamable HTTP (ADR-0022 Decision 15, 2f). Streaming is ON only when a
     // session registry is wired AND the --mcp-no-streaming kill switch is off.
     // sessions == nullptr (legacy build_handler callers / most tests) ⇒ streaming
     // off ⇒ the pre-2f stateless path, byte-identical except the unconditional 202.
@@ -1017,8 +1017,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                            mcp_allowed_origins)) {
                 session_audit("mcp.session.reject", "failure", "", "reason=origin");
                 res.status = 403;
-                res.set_content(error_response_null(kMcpOriginRejected, "Origin not allowed"),
-                                "application/json");
+                res.set_content(
+                    error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
+                                           yuzu::server::detail::make_correlation_id(),
+                                           "remove the Origin header or add this origin to "
+                                           "--mcp-allowed-origin"),
+                    "application/json");
                 return;
             }
             // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
@@ -1027,7 +1031,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 session_audit("mcp.session.reject", "failure", "", "reason=protocol_version");
                 res.status = 400;
                 res.set_content(
-                    error_response_null(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version"),
+                    error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
+                                           yuzu::server::detail::make_correlation_id(),
+                                           "send MCP-Protocol-Version: 2025-06-18 (or omit the "
+                                           "header to accept the 2025-03-26 default)"),
                     "application/json");
                 return;
             }
@@ -1063,7 +1070,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Echo the request id — this is a post-parse error with a known
                     // id, and JSON-RPC 2.0 SHOULD echo it (governance CONS-S3).
                     res.set_content(
-                        error_response(id, kMcpUnknownSession, "Unknown or expired session"),
+                        error_response_a4(id, kMcpUnknownSession, "Unknown or expired session",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          "re-initialize: send an initialize request to obtain a "
+                                          "fresh Mcp-Session-Id"),
                         "application/json");
                     return;
                 }
@@ -1098,18 +1108,22 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // Mint a session (streaming only). A cap hit rejects THIS initialize
-            // with an A4-shaped JSON-RPC error — a live session is never evicted
-            // to make room (Decision 15(j)). A client-supplied Mcp-Session-Id is
-            // never adopted here (no fixation, 15(a)/CH-8).
+            // with an A4-shaped JSON-RPC error (correlation_id + nullable
+            // retry_after_ms + remediation, via the shared error_response_a4
+            // builder) — a live session is never evicted to make room
+            // (ADR-0022 exec-plan Decision 15(j); chaos-design CH-5, a PR-1 gate).
+            // A client-supplied Mcp-Session-Id is never adopted here (no
+            // fixation, 15(a)/CH-8).
             if (streaming_on) {
                 auto mint = mcp_sessions->mint(session->username);
                 if (!mint.ok) {
                     session_audit("mcp.session.reject", "failure", "", "reason=" + mint.reject_reason);
                     res.status = 429;
                     res.set_content(
-                        error_response(
+                        error_response_a4(
                             id, kMcpSessionCap, "Session limit reached",
-                            R"({"retry_after_ms":null,"hint":"close an existing session via DELETE /mcp/v1/"})"),
+                            yuzu::server::detail::make_correlation_id(),
+                            "end an unused session via DELETE /mcp/v1/ or wait for idle timeout"),
                         "application/json");
                     return;
                 }
@@ -5194,8 +5208,12 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
             session_audit("mcp.session.reject", "failure", "", "reason=origin");
             res.status = 403;
-            res.set_content(error_response_null(kMcpOriginRejected, "Origin not allowed"),
-                            "application/json");
+            res.set_content(
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
+                                       yuzu::server::detail::make_correlation_id(),
+                                       "remove the Origin header or add this origin to "
+                                       "--mcp-allowed-origin"),
+                "application/json");
             return;
         }
         auto session = auth_fn(req, res);
@@ -5233,8 +5251,12 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
             session_audit("mcp.session.reject", "failure", "", "reason=origin");
             res.status = 403;
-            res.set_content(error_response_null(kMcpOriginRejected, "Origin not allowed"),
-                            "application/json");
+            res.set_content(
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed",
+                                       yuzu::server::detail::make_correlation_id(),
+                                       "remove the Origin header or add this origin to "
+                                       "--mcp-allowed-origin"),
+                "application/json");
             return;
         }
         auto session = auth_fn(req, res);
@@ -5246,8 +5268,12 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
             // rejects sees it (governance sec-LOW).
             session_audit("mcp.session.reject", "failure", "", "reason=missing_session_header");
             res.status = 400;
-            res.set_content(error_response_null(kInvalidRequest, "Mcp-Session-Id header required"),
-                            "application/json");
+            res.set_content(
+                error_response_null_a4(kInvalidRequest, "Mcp-Session-Id header required",
+                                       yuzu::server::detail::make_correlation_id(),
+                                       "include the Mcp-Session-Id header naming the session to "
+                                       "terminate"),
+                "application/json");
             return;
         }
         if (sessions->terminate(sid, session->username)) {
@@ -5257,8 +5283,12 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
             session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
                           "reason=unknown_session");
             res.status = 404;
-            res.set_content(error_response_null(kMcpUnknownSession, "Unknown or expired session"),
-                            "application/json");
+            res.set_content(
+                error_response_null_a4(kMcpUnknownSession, "Unknown or expired session",
+                                       yuzu::server::detail::make_correlation_id(),
+                                       "the session does not exist or is already terminated; no "
+                                       "action needed"),
+                "application/json");
         }
     };
 }
