@@ -51,6 +51,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
+      # Pool gate for windows-asan (the [self-hosted, Windows, X64] job pool)
+      # — same output the script already emits for ci.yml's windows job.
+      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -454,6 +457,197 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  # ── Sanitizer (Windows ASan) ────────────────────────────────────────────
+  # ADR-0021 spark hardening batch (#1934a): the Windows-only spark
+  # mechanisms (spark_file.cpp / spark_registry.cpp / spark_service.cpp) had
+  # NO sanitizer coverage at all before this job — every real memory-safety
+  # bug in that family (UAF-class hazards on watch removal, resource leaks
+  # on reconnect) was Windows-side and caught only by manual review or a
+  # local ad-hoc TSan build. MSVC has no TSan, so this is ASan-only; the
+  # Linux TSan job above (+ the fake-mechanism cross-platform tests) carries
+  # the data-race half of the coverage.
+  #
+  # Agent-only (build_server=false): the spark mechanisms are entirely
+  # agent-side, and skipping the server halves build time + sidesteps
+  # ASan-vs-static-grpc-stack link unknowns for a component this job doesn't
+  # need to touch.
+  #
+  # KNOWN SIMPLIFICATION vs the Linux ASan job above: that job builds a
+  # fully ASan-instrumented vcpkg dependency triplet (x64-linux-asan) so the
+  # app and its deps cooperate on container-poisoning. Doing the equivalent
+  # for MSVC (a from-source x64-windows-asan triplet rebuilding grpc/
+  # protobuf/abseil/openssl under MSVC ASan) is a materially larger
+  # undertaking and its own investigation — out of scope for this hardening
+  # batch. Instead this job reuses the STANDARD x64-windows triplet
+  # (prebuilt, non-instrumented deps) and passes
+  # `-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION`, the
+  # documented MSVC workaround for the LNK2038 container-annotation mismatch
+  # between an ASan-compiled app and non-ASan-compiled static libs (spiked
+  # 2026-07-08 on DGRHP: full agent suite green, zero ASan reports, both
+  # with and without this flag pair changing anything except making the
+  # link succeed).
+  #
+  # WHAT THIS LEG CATCHES vs NOT — the annotation-disable flags are global,
+  # so they turn off MSVC's STL container-overflow annotations for OUR
+  # translation units too, not just the vendored libs. So this leg DOES
+  # catch, in Yuzu's own spark code, heap-buffer-overflow (raw allocations),
+  # stack-buffer-overflow, the DirWatch fixed-array IOCP buffer, and
+  # use-after-free (the whole UAF class this batch targets). It does NOT
+  # catch out-of-bounds into a std::vector/std::string/std::deque's
+  # reserved-but-unused capacity — that specific check rides on the
+  # container annotations, which are disabled globally by the workaround.
+  # Building a from-source Windows ASan triplet (instrumenting the vendored
+  # deps so annotations can stay on) would restore container coverage; it's
+  # a materially larger, separate undertaking, revisit if built for another
+  # reason.
+  windows-asan:
+    name: "Sanitizer (Windows ASan)"
+    needs: [preflight]
+    if: needs.preflight.outputs.windows_pool_healthy == 'true'
+    runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
+    timeout-minutes: 90
+    defaults:
+      run:
+        # See ci.yml's windows job for why this must be explicit MSYS2 bash,
+        # not the bare `bash` keyword (which resolves to WSL bash on this
+        # runner and refuses to run as the LOCAL SYSTEM service account).
+        shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+    env:
+      # halt_on_error=1 matches every other sanitizer job in this file
+      # (sanitize-asan, sanitize-tsan) and sanitizer-tests.yml — continuing
+      # past a first UAF/OOB means later reports in the same run can be
+      # noise from an already-corrupted heap rather than independent signal.
+      # windows_hook_rtl_allocators (RTL heap-API hooking, relevant to
+      # IOCP-heavy code) is deliberately NOT enabled yet: it's an
+      # upstream-experimental compiler-rt option, and the DGRHP spike that
+      # validated this job's configuration did not have it set — ship the
+      # validated baseline first, add it as a separately-tested follow-up.
+      ASAN_OPTIONS: "halt_on_error=1"
+    steps:
+      - name: Wipe build-windows-asan/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-windows-asan/"
+              rm -rf "$GITHUB_WORKSPACE/build-windows-asan"
+            fi
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Assert toolchain available
+        run: |
+          set -e
+          for tool in meson ninja cl ccache cmake python; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::$tool not on PATH on the self-hosted Windows runner"
+              exit 1
+            fi
+          done
+          meson --version
+
+      - name: Assert toolchain manifest (self-hosted, optional)
+        shell: pwsh
+        run: |
+          # Manifest-based self-test for boxes provisioned via
+          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
+          # runners that predate the manifest — the PATH check above still covers
+          # them. Same step as ci.yml's windows job.
+          $m = 'C:\actions-runner\toolchain-manifest.json'
+          if (Test-Path $m) {
+            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
+          } else {
+            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
+          }
+
+      - name: Assert runner disk (>= 45 GB free)
+        run: |
+          # This is a THIRD persistent build tree (build-windows-asan/) next
+          # to ci.yml's build-windows-{debug,release}/ on the same shared,
+          # persistent, clean:false Wee Tam disk, on top of the shared
+          # vcpkg_installed/ and ccache trees — fail fast rather than hitting
+          # "no space left on device" 30-80 minutes into a 90-minute run.
+          free_gb=$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {printf "%d", $4/1024/1024}')
+          echo "runner disk free: ${free_gb}G on $GITHUB_WORKSPACE"
+          if [[ -z "$free_gb" ]] || (( free_gb < 45 )); then
+            echo "::error::runner disk ${free_gb}G < 45 GB required"
+            exit 1
+          fi
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-windows)
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
+
+      - name: Install vcpkg packages
+        env:
+          # Shared with ci.yml's windows job's cache when both land on the
+          # same physical runner (4-runner Wee Tam pool) — same triplet, no
+          # ASan-specific vcpkg rebuild (see the job-level comment above).
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
+            --triplet x64-windows \
+            --x-manifest-root="$GITHUB_WORKSPACE"
+
+      - name: Configure (Meson + ASan)
+        env:
+          CC: ccache cl
+          CXX: ccache cl
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
+        run: |
+          reconfig=""
+          [[ -d build-windows-asan/meson-info ]] && reconfig="--reconfigure"
+          # debugoptimized -> /MD (from_buildtype), matching the vcpkg
+          # release-CRT libs and avoiding the /MDd debug-CRT+ASan interaction.
+          meson setup $reconfig build-windows-asan \
+            --buildtype=debugoptimized \
+            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
+            -Dbuild_server=false \
+            -Dbuild_tests=true \
+            -Db_sanitize=address \
+            -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"
+
+      - name: Build
+        run: meson compile -C build-windows-asan tests/yuzu_agent_tests ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+
+      - name: Test
+        run: |
+          export PATH="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin:$PATH"
+          meson test -C build-windows-asan --suite agent --print-errorlogs
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-windows-asan
+          path: |
+            build-windows-asan/meson-logs/testlog.txt
+            build-windows-asan/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
   # ── Coverage (gcov + gcovr) ────────────────────────────────────────────
   coverage:
     name: "Coverage (GCC 15)"
@@ -622,13 +816,13 @@ jobs:
           if-no-files-found: warn
 
   # ── Alert on nightly failure ───────────────────────────────────────────
-  # Opens or comments on the `nightly-broken` issue if any of the three
+  # Opens or comments on the `nightly-broken` issue if any of the four
   # jobs above failed. The discipline rule is "no merge to main while
   # `nightly-broken` is open." Mirrors runner-inventory-sentinel.yml's
   # issue-creation pattern.
   alert:
     name: "Open nightly-broken on failure"
-    needs: [sanitize-asan, sanitize-tsan, coverage]
+    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
     if: failure()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -695,14 +889,15 @@ jobs:
 
   # ── Close nightly-broken on full green ─────────────────────────────────
   # Symmetric counterpart to the `alert:` job above. Closes any open
-  # `nightly-broken` issue when all three nightly jobs (asan, tsan, coverage)
-  # succeed, so the discipline rule "no merge to main while nightly-broken
-  # is open" naturally clears as soon as the next green nightly lands.
+  # `nightly-broken` issue when all four nightly jobs (asan, tsan,
+  # windows-asan, coverage) succeed, so the discipline rule "no merge to
+  # main while nightly-broken is open" naturally clears as soon as the next
+  # green nightly lands.
   # Iterates over all matching open issues, not just the first, so a stale
   # duplicate from any prior bug doesn't linger.
   close-on-green:
     name: "Close nightly-broken on green"
-    needs: [sanitize-asan, sanitize-tsan, coverage]
+    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
     if: success()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

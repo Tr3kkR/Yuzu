@@ -1338,9 +1338,9 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
-## On-behalf-of assertions rejected (ADR-0022 Interim rules)
+## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
-Until server-verifiable delegation ships (ADR-0022 auth follow-up), the server
+Until server-verifiable delegation ships (ADR-1005 auth follow-up), the server
 accepts **no** on-behalf-of assertion on **any** ingress surface — any such
 header or metadata key is **rejected, not ignored**. Five names are reserved
 (case-insensitive; source of truth `server/core/src/on_behalf_guard.hpp`, and
@@ -1356,7 +1356,7 @@ paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
 mesh/SSO proxy that stamps a reserved header on every request must not be
 able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
 probe performs no identity-bearing action and nothing consumes the header on
-that path. This exception is recorded in ADR-0022's exception ledger on
+that path. This exception is recorded in ADR-1005's exception ledger on
 acceptance. **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by
@@ -1397,6 +1397,33 @@ header, so these names stay rejected on client ingress permanently.
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+
+## Engine principals & delegation (ADR-1005 — design)
+
+- **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
+  2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped
+  surface.
+- Third principal class (`engine`) for use-case-engine hosts: dedicated
+  born-on-Postgres `EnginePrincipalStore` (named human owner, justification,
+  soft-retained after revoke), reserved `engine:` id namespace, per-module
+  granularity.
+- Token sessions branch on a persisted `ApiToken.principal_kind`
+  (`human`|`engine`) — an engine token attributes to the engine principal
+  itself (`auth_source="engine_token"`), never to its creating human.
+- Authorization model: scoped role assignments `(principal, role, scope)`
+  for **all** principal classes, evaluated permissions ∩ scope through
+  ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
+  the per-device scoped-permission path for single-target operations
+  (ADR-0017 PR-A is a named prerequisite, its charter to be amended or
+  extended for the `engine` principal type). Engine principals are
+  default-deny, structurally barred from `admin`.
+- Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
+  opaque, audience-bound, short-TTL artifact; effective authority = engine
+  principal's assignments ∩ operator's assignments ∩ operator's scope
+  (decision-level intersection — a delegation only ever narrows);
+  self-asserted delegation stays rejected permanently.
+- Engine credentials: 90-day ceiling, overlap-pair rotation (≤2 active),
+  MCP tier hard-locked `readonly` for v1.
 
 ## Agent enrollment (3 tiers)
 

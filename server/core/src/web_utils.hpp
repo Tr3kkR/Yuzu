@@ -221,7 +221,7 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
 /// only addition is the `/scim/v2/` prefix (see below).
 ///
 /// Caller contract: this MUST be consulted AFTER the rate limiter and
-/// (once it lands) any on-behalf-of/ADR-0022 rejection in the pre-routing
+/// (once it lands) any on-behalf-of/ADR-1005 rejection in the pre-routing
 /// handler, never wired in as an earlier early-return — those controls
 /// must stay in effect for every path this allows through unauthenticated.
 /// Returns true iff `path` should skip session/bearer resolution entirely.

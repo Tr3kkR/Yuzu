@@ -2,22 +2,22 @@
 
 **Status:** working roadmap for the vuln_scan / CAVM workstream (owner: Andy / @lesault).
 **Created:** 2026-06-30.
-**Last reconciled:** 2026-07-08 — against ADR-0022 (headless platform; placement note below, extended for ADR-4001).
+**Last reconciled:** 2026-07-08 — against ADR-1005 (headless platform; placement note below, extended for ADR-4001).
 Previously 2026-07-01 — against ADR-0018 (D1 wire-format correction, no-exceptions
 KEV-pre-filter strike, Lane 1/2/3 routing) and ADR-0019 (tri-state findings + coverage dimension).
 
-> **Placement note (2026-07-07/08, ADR-0022 reconciliation).** The in-server home of this ladder's
+> **Placement note (2026-07-07/08, ADR-1005 reconciliation).** The in-server home of this ladder's
 > correlation work is **interim**: vulnerability management's long-term home is the first
-> use-case-engine module (ADR-0022 + `docs/adr-0022-execution-plan.md`), and the ADR-0023 stack
+> use-case-engine module (ADR-1005 + `docs/adr-1005-execution-plan.md`), and the ADR-0023 stack
 > (M1a/M1b scope: engine, findings store, triggers, securable, findings routes) is absorbed into
-> ADR-0022's grandfathered surface #2 — re-homed and eventually deleted by that plan's Phase-7
+> ADR-1005's grandfathered surface #2 — re-homed and eventually deleted by that plan's Phase-7
 > strangler — as is the ADR-4001 `/vuln` dashboard lens + `attack_path_engine` (2026-07-08, same
 > terms; ADR-4002's scoring substrate is NOT absorbed and faces its own boundary review). Each further in-server PR on this ladder grows that deletion scope; milestones beyond
-> M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-0022 Decision 2's boundary
+> M1a/M1b (M2 enrichment onward, M3–M6 graph/CAVM scoring) face ADR-1005 Decision 2's boundary
 > test fresh before implementation. Milestone vocabularies collide: this ladder's M1a/M1b + M2–M6
 > ≠ the execution plan's UCE M1–M4 — always qualify which ladder a bare "M-number" means.
 > Sequencing within M1a/M1b remains this roadmap's call; beyond it, scheduling is contingent on
-> the ADR-0022 Decision-2 boundary test, adjudicated by the maintainer through governance — not
+> the ADR-1005 Decision-2 boundary test, adjudicated by the maintainer through governance — not
 > by either document. Details: execution plan § "Relationship to ADR-0023 and ADR-4001"; ADR-0023's and
 > ADR-4001's own placement notes.
 

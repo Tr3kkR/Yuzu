@@ -2044,8 +2044,8 @@ std::string SettingsRoutes::render_nvd_fragment() {
 
     if (!cfg_->nvd_sync_enabled) {
         html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
-                "Start the server without <code>--no-nvd-sync</code> to enable CVE feed "
-                "synchronization.</p>";
+                "Start the server without <code>--no-nvd-sync</code> (or unset "
+                "<code>YUZU_NO_NVD_SYNC</code>) to enable CVE feed synchronization.</p>";
     }
 
     return html;

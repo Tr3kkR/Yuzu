@@ -18,6 +18,7 @@ You represent the enterprise customer's perspective. When a feature ships, you a
 - `docs/enterprise-readiness-soc2-first-customer.md` — Workstream G (Customer Assurance Package)
 - `docs/user-manual/` — Operator-facing documentation
 - `docs/user-manual/rest-api.md` — API documentation
+- `docs/agentic-first-principle.md` §A5 — agentic context contract + its exception ledger
 
 ## Responsibilities
 
@@ -27,6 +28,7 @@ You represent the enterprise customer's perspective. When a feature ships, you a
 - When deployment topology changes: update shared responsibility matrix
 - When data handling changes: verify DPA/security addendum templates remain valid
 - Flag any change that would invalidate a claim in the customer assurance package
+- Each Gate 6 pass: review the A5 exception ledger (`docs/agentic-first-principle.md` §A5 Exceptions) — confirm every entry carries an issue number + revisit-by date; flag stale or undated entries as findings
 
 ### Deployment Experience Review
 - Verify new features have operator documentation in `docs/user-manual/`

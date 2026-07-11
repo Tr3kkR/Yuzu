@@ -1,5 +1,5 @@
 // Enforces the on-behalf-of rejection OnBehalfRejectInterceptor already
-// signaled (ADR-0022 Interim rules, execution-plan PR 1.1).
+// signaled (ADR-1005 Interim rules, execution-plan PR 1.1).
 //
 // The interceptor's own doc comment names the limit: ServerContext::TryCancel()
 // cancels the client-visible RPC but does NOT stop a sync unary/streaming
@@ -80,7 +80,7 @@ namespace yuzu::server::onbehalf {
     if (context == nullptr) return grpc::Status::OK;
     if (find_reserved_key(context->client_metadata())) {
         return grpc::Status(grpc::StatusCode::CANCELLED,
-                            "on-behalf-of assertions are not accepted on any surface (ADR-0022)");
+                            "on-behalf-of assertions are not accepted on any surface (ADR-1005)");
     }
     return grpc::Status::OK;
 }
