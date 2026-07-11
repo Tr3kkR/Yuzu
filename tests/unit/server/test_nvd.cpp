@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -2006,4 +2007,103 @@ TEST_CASE("assess/products_for_cves: a DB fault THROWS, never a false absent/emp
     // throw site and is covered by inspection — it cannot be forced without a VFS shim.
     REQUIRE_THROWS_AS(db.assess({"acme", "widget", "1.0", true}), std::runtime_error);
     REQUIRE_THROWS_AS(db.products_for_cves({"CVE-REAL"}), std::runtime_error);
+}
+
+// Regression test for issue #1908: rules out parse_response()/the move-iterator
+// insert() as the source of a SIGSEGV heap-corruption crash in fetch_paginated().
+// Deliberately does not construct an httplib::Client (see the CAVEAT below the
+// JSON builders for why) — only the parse+append path is exercised here.
+namespace {
+std::string zero_pad6(int n) {
+    std::string s = std::to_string(n);
+    if (s.size() < 6) {
+        s.insert(0, 6 - s.size(), '0');
+    }
+    return s;
+}
+
+// One synthetic "vulnerabilities[i]" entry shaped like a real NVD API response:
+// cve.id, descriptions[lang=en], metrics.cvssMetricV31[0].cvssData.baseSeverity,
+// published/lastModified, and configurations[].nodes[].cpeMatch[] (2 matches) —
+// exactly the fields NvdClient::parse_response() reads.
+std::string make_synthetic_vuln_json(int n) {
+    const std::string suffix = zero_pad6(n);
+    const std::string vendor = "vendor" + std::to_string(n);
+    const std::string product = "product" + std::to_string(n);
+    std::string s;
+    s.reserve(650);
+    s += R"({"cve":{"id":"CVE-2024-)" + suffix + R"(",)";
+    s += R"("descriptions":[{"lang":"en","value":"Synthetic test vulnerability )" + suffix +
+         R"("}],)";
+    s += R"("metrics":{"cvssMetricV31":[{"cvssData":{"baseSeverity":"HIGH"}}]},)";
+    s += R"("published":"2024-01-01T00:00:00.000",)";
+    s += R"("lastModified":"2024-06-15T12:00:00.000",)";
+    s += R"("configurations":[{"nodes":[{"cpeMatch":[)";
+    s += R"({"criteria":"cpe:2.3:a:)" + vendor + ":" + product +
+         R"(:1.0.0:*:*:*:*:*:*:*","versionStartIncluding":"1.0.0",)"
+         R"("versionEndExcluding":"2.0.0","vulnerable":true},)";
+    s += R"({"criteria":"cpe:2.3:a:)" + vendor + ":" + product +
+         R"(b:2.0.0:*:*:*:*:*:*:*","versionEndExcluding":"3.0.0","vulnerable":true})";
+    s += R"(]}]}]}})";
+    return s;
+}
+
+std::string make_synthetic_page_json(int page_offset, int count, int total_results) {
+    std::string body;
+    body.reserve(static_cast<std::size_t>(count) * 650 + 64);
+    body += R"({"totalResults":)" + std::to_string(total_results) + R"(,"vulnerabilities":[)";
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) {
+            body += ",";
+        }
+        body += make_synthetic_vuln_json(page_offset + i);
+    }
+    body += "]}";
+    return body;
+}
+} // namespace
+
+// CAVEAT (macOS/AppleClang only): Apple Clang 21 / Apple libc++'s "trivial
+// relocation" vector-growth optimization desyncs ASan's container poisoning,
+// producing a false-positive "container-overflow" inside nlohmann::json::parse()
+// and independently inside httplib::Client's std::regex host:port parsing —
+// neither involves Yuzu code. Locally this test needs
+// `ASAN_OPTIONS=detect_container_overflow=0`; the checks that catch real
+// allocator corruption (heap-buffer-overflow, use-after-free, double-free) stay
+// active regardless. libstdc++ (the nightly sanitizer CI toolchain) doesn't use
+// this relocation optimization, so the FP is not expected there.
+TEST_CASE("NvdClient parse+append stays memory-clean across 2 synthetic 2000-CVE pages",
+          "[nvd][parse][sanitizer]") {
+    constexpr int kResultsPerPage = 2000; // mirrors nvd_client.cpp's kResultsPerPage
+    constexpr int kTotalResults = 26935;  // mirrors the real crash's totalResults
+
+    NvdClient client;
+    NvdFetchResult combined;
+    int start_index = 0;
+
+    for (int page = 0; page < 2; ++page) {
+        const std::string body =
+            make_synthetic_page_json(start_index, kResultsPerPage, kTotalResults);
+
+        auto page_result = client.parse_response(body);
+        REQUIRE(page_result.ok);
+        REQUIRE(page_result.records.size() == static_cast<std::size_t>(kResultsPerPage));
+
+        combined.total_results = page_result.total_results;
+        // The exact move-iterator insert fetch_paginated() uses to append a page.
+        combined.records.insert(combined.records.end(),
+                                std::make_move_iterator(page_result.records.begin()),
+                                std::make_move_iterator(page_result.records.end()));
+
+        start_index += kResultsPerPage;
+    }
+
+    REQUIRE(combined.records.size() == static_cast<std::size_t>(kResultsPerPage) * 2);
+    REQUIRE(combined.total_results == kTotalResults);
+    REQUIRE(combined.records.front().cve_id == "CVE-2024-000000");
+    REQUIRE(combined.records.back().cve_id == "CVE-2024-003999");
+    // Spot-check a match survived the parse+move+insert pipeline intact.
+    REQUIRE(combined.records[500].matches.size() == 2);
+    REQUIRE(combined.records[500].matches[0].cpe_vendor == "vendor500");
+    REQUIRE(combined.records[3000].matches[1].cpe_product == "product3000b");
 }
