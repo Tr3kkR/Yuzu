@@ -86,6 +86,15 @@ Move to **potential reachability** as `observed ∪ potential`, built in accurac
 
 ## Ratification
 
-**Status: accepted** (2026-07-09), per @Tr3kkR's standing convention: an ADR merged via reviewed PR
-carries `status: accepted` on `dev`. Already decided by the vuln_scan owner with the maintainer per
-the original text below.
+**Status: accepted** (2026-07-09), per @Tr3kkR's standing convention (2026-07-09,
+`docs/agents/domain.md` "ADR Acceptance Convention"): an ADR merged via reviewed PR carries
+`status: accepted` on `dev`. Already decided by the vuln_scan owner with the maintainer (see
+frontmatter `decided-with`).
+
+**Boundary-review status, stated explicitly:** this acceptance ratifies the observed-reachability
+MVP trade-off recorded above; it does **not** clear the scoring substrate's ADR-1005 Decision-2
+in-server-vs-engine authority. Per ADR-1005 §grandfathered-surface-2 rider (b), that boundary
+review is still owed at this ADR's own merge and is **unrecorded as of this acceptance** — any
+consumer (including ADR-4001's `attack_path_engine`) must treat the in-server placement of this
+scoring substrate as undecided until a future update to this section records the boundary review's
+outcome.

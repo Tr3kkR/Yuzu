@@ -156,6 +156,6 @@ same `/governance` path on the implementing PR.
 
 **Status: accepted** (2026-07-09). Authored by the vuln_scan domain owner. Less cross-cutting than
 ADR-0018 (it does not redraw the agent↔server boundary), but it commits the finding data model and
-the reporting surface. **Accepted per @Tr3kkR's standing convention (2026-07-09): an ADR merged via
-reviewed PR carries `status: accepted` on `dev`.** Already merged and standing on `dev` since
-2026-07-01 without objection.
+the reporting surface. **Accepted per @Tr3kkR's standing convention (2026-07-09, `docs/agents/domain.md` "ADR Acceptance
+Convention"): an ADR merged via reviewed PR carries `status: accepted` on `dev`.** Already merged
+and standing on `dev` since 2026-07-01 without objection.
