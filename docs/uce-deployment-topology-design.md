@@ -192,9 +192,12 @@ pins are 2c NF-9, not stack-ADR detail** — summarised here:
   directly (NF-9(a)).
 - **Session = bounded cache of Yuzu authority (NF-9(d)).** (1) UCE session
   max-age **≤ Yuzu's** (8 h today); re-auth is simply this redirect flow again —
-  invisible while the Yuzu session is live. (2) A failed artifact re-mint or a
-  revoked-operator result on any read is **session-terminating** (restart the
-  redirect flow → a revoked operator lands on Yuzu's login wall). **Honest scope:
+  invisible while the Yuzu session is live. (2) A **definitively denied**
+  artifact re-mint or a definitively revoked-operator result on any read is
+  **session-terminating** (restart the
+  redirect flow → a revoked operator lands on Yuzu's login wall); an
+  unreachable/timeout re-mint is indeterminate and follows the bounded
+  retry/grace below. **Honest scope:
   revocation-via-reads propagates only while reads flow**, so NF-9(d) mandates an
   **unconditional, jittered re-validation floor** (revalidate operator liveness
   against Yuzu every ≤ artifact-TTL, *not* gated on user reads — an idle-timeout
