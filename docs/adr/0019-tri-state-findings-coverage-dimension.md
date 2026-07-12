@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-01
 owner: "@lesault (Andy Younie)"
 depends-on: 0018 (server-authoritative matching — the engine that produces these findings); 0005 (two-matcher split)
@@ -154,7 +154,8 @@ same `/governance` path on the implementing PR.
 
 ## Ratification
 
-**Status: proposed.** Authored by the vuln_scan domain owner. Less cross-cutting than ADR-0018
-(it does not redraw the agent↔server boundary), but it commits the finding data model and the
-reporting surface, so route it through the normal review / `/governance` path together with
-ADR-0018 rather than self-accepting. Record the accepting reviewer + date here on acceptance.
+**Status: accepted** (2026-07-09). Authored by the vuln_scan domain owner. Less cross-cutting than
+ADR-0018 (it does not redraw the agent↔server boundary), but it commits the finding data model and
+the reporting surface. **Accepted per @Tr3kkR's standing convention (2026-07-09, `docs/agents/domain.md` "ADR Acceptance
+Convention"): an ADR merged via reviewed PR carries `status: accepted` on `dev`.** Already merged
+and standing on `dev` since 2026-07-01 without objection.
