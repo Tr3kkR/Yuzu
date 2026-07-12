@@ -38,7 +38,16 @@ std::string normalize_os(std::string_view s) {
 void fill_block(::yuzu::guardian::v1::GuardianSpecBlock* blk, const nlohmann::json& j) {
     if (!j.is_object())
         return;
-    blk->set_type(j.value("type", std::string{}));
+    // is_string guard, not json::value(): value() throws type_error.302 on a
+    // PRESENT non-string "type", and this runs on stored spec_json at the push
+    // chokepoint with no guard above it. derive_rule_spec type-checks spark.type
+    // and assertion.type before persistence but NOT remediation.type, so a rule
+    // authored with a non-string remediation.type (REST create, GuaranteedState:
+    // Write) persists and would otherwise throw here on every fan-out — a
+    // fleet-wide push DoS. A non-string type is inert (agent G11-errors an unknown
+    // type), same posture as the malformed/empty-spec header-only rows (#1946).
+    blk->set_type(j.contains("type") && j["type"].is_string() ? j["type"].get<std::string>()
+                                                              : std::string{});
     if (j.contains("params") && j["params"].is_object()) {
         const auto& params = j["params"];
         // Iterator form, not structured bindings: MSVC C3493s on a structured

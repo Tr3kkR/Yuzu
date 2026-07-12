@@ -9,10 +9,32 @@
 | **Last grilled** | 2026-06-08 (`/grill-with-docs`, fresh context — graph layer added) |
 | **Supersedes** | the static PoC matcher in `agents/plugins/vuln_scan/` |
 | **Builds on** | PR #1206 (spike — proved the rule-delivery plumbing) |
-| **Decisions of record** | ADR [0001](adr/0001-observed-grounded-reachability.md) · [0002](adr/0002-reachability-graph-data-model.md) · [0003](adr/0003-telemetry-capture-model.md) · [0004](adr/0004-server-storage-substrate.md) · [0005](adr/0005-attack-path-and-chokepoint-scoring.md) |
+| **Decisions of record** | ADR [0001](adr/0001-observed-grounded-reachability.md) · [0002](adr/0002-reachability-graph-data-model.md) · [0003](adr/0003-telemetry-capture-model.md) · [0004](adr/0004-server-storage-substrate.md) · [0005](adr/0005-attack-path-and-chokepoint-scoring.md) · [1005](adr/1005-headless-platform-use-case-engines.md) · [0023](adr/0023-vulnerability-correlation-engine.md) · [4001](adr/4001-vulnerability-dashboard-attack-path-explorer.md) (placement — see reconciliation note below) |
 | **Glossary** | `CONTEXT.md` — Reachability, Asset value (Crown jewel), Trust zone, Entry point, Attack path, Chokepoint |
 | **Plain-language version** | [`vulnerability-graph-explained.md`](vulnerability-graph-explained.md) — a non-technical intro to *why a graph*, for curious readers |
 | **Related** | `docs/capability-map.md` §9, `docs/fleet-viz-invariants.md`, `docs/scope-walking-design.md`, `docs/agent-privilege-model.md`, `docs/data-architecture.md` |
+
+> **ADR-1005 reconciliation (2026-07, updated 2026-07-08).** This document's
+> **server-side placement is interim**: vulnerability interpretation (feed ingest,
+> matching, findings, scoring) is long-term a **use-case engine module**, not a
+> server capability. The in-server vuln stack is **absorbed into ADR-1005
+> grandfathered surface #2** — placement-only, bounded to those ADRs' designed
+> scope, outside-by-default beyond it — and re-homes via the strangler migration
+> in `docs/adr-1005-execution-plan.md` § "Relationship to ADR-0023 and ADR-4001"
+> (as recorded 2026-07-08 via PR #1987). Absorbed, illustratively: the shipped
+> NVD sync/matching; the ADR-0023 correlation engine + `VulnFindingStore`; the
+> ADR-4001 `/vuln` dashboard lens and its `attack_path_engine` — the one
+> component carrying a lapse conditional, tied to ADR-4002's boundary review.
+> The full enumeration lives in that plan section. Milestone vocabularies are
+> distinct — the plan's **UCE M1–M4** vs `docs/vuln-scan-roadmap.md`'s in-server
+> M1a/M1b + M2–M6 ladder, always qualify which; UCE M4's surpass-parity criterion
+> mirrors this doc's quality bar, and the plan's pilot-readiness note cites this
+> doc as the north-star. The **domain content stands**: the matcher quality bar
+> (§ floor — parity scanner, low false positives on a patched fleet), the phased
+> matcher roadmap, and the attack-path/graph differentiator remain the north star
+> for what the module builds — the graph layer's core-vs-engine boundary analysis
+> remains owed at ADR-4002's own merge (4001's surface is absorbed; 4002's
+> scoring substrate is not).
 
 ---
 
@@ -536,3 +558,8 @@ Each phase is a shippable slice with an Andy-owned acceptance bar.
 - **ADR-0005** — Attack-path & chokepoint scoring (depth-bounded max-probability paths;
   path-set-frequency chokepoints; cost-weighted min-cut; two-matcher KEV pre-filter;
   distributed-Pregel escape hatch).
+- **ADR-1005** — Headless platform / use-case engines (this doc's server-side placement is
+  interim — grandfathered surface #2; see the reconciliation note at the top).
+- **ADR-0023** — Vulnerability correlation engine (in-server, absorbed-interim under ADR-1005).
+- **ADR-4001** — Vulnerability dashboard + Attack Path Explorer (in-server lens,
+  absorbed-interim under ADR-1005; ADR-4002's scoring substrate not absorbed).

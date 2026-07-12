@@ -1,0 +1,94 @@
+#pragma once
+
+#include <chrono>
+#include <cstddef>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+// MCP Streamable HTTP session registry (ADR-1005 Decision 15, track 2f).
+namespace yuzu::server::mcp {
+
+// In-memory registry of `Mcp-Session-Id` sessions.
+//
+// A session is transport affinity + (from PR 2) a replay cursor — it is NEVER
+// an auth credential: per-request token auth stands on every method
+// (Decision 15(a)). State is bounded and non-durable: a server restart drops
+// every session, the client gets a 404 on its next call and re-initializes,
+// exactly as the MCP spec prescribes (no Postgres, no new store).
+//
+// Thread-safe. httplib dispatches requests across worker threads; every public
+// method takes the internal mutex.
+class McpSessionRegistry {
+public:
+    struct Config {
+        std::size_t per_principal_cap = 8;      // Decision 15(d): bounded per-principal
+        std::size_t global_cap = 1024;          // Decision 15(d): bounded globally
+        std::chrono::seconds idle_ttl{1800};    // 30 min; slides on every use
+    };
+
+    // Injectable monotonic clock for deterministic tests (defaults to
+    // steady_clock::now). Only the *difference* between calls is meaningful.
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+
+    // Default ctor delegates in the .cpp (Config's default member initializers
+    // cannot be consumed by a `= {}` default argument before this enclosing class
+    // is complete — GCC rejects it; the delegation resolves Config{} where the
+    // class is complete).
+    McpSessionRegistry();
+    explicit McpSessionRegistry(Config cfg, ClockFn clock = {});
+
+    struct MintResult {
+        bool ok = false;
+        std::string session_id;     // set iff ok
+        std::string reject_reason;  // set iff !ok: "per_principal_cap" | "global_cap" | "id_generation"
+    };
+
+    // Mint a fresh, principal-bound session id (≥128-bit CSPRNG, lowercase hex).
+    // The id is ALWAYS server-generated; a client-supplied id is never adopted
+    // (the caller never passes one — no session fixation, Decision 15(a)/CH-8).
+    // On a cap hit this REJECTS (ok=false, reason set); a live session is NEVER
+    // evicted to make room (Decision 15(j)).
+    MintResult mint(const std::string& principal);
+
+    enum class ValidateResult {
+        kValid,    // id exists AND is bound to `principal`
+        kUnknown,  // id absent, expired, OR bound to a different principal
+    };
+
+    // Principal-bound validate. A valid id presented under any *other* principal
+    // returns kUnknown — the same result a never-existed id yields, so there is
+    // no cross-principal existence oracle (Decision 15(a) / CH-8). On kValid the
+    // session's last-seen is refreshed so the idle TTL slides.
+    ValidateResult validate_and_touch(const std::string& id, const std::string& principal);
+
+    // DELETE /mcp/v1/. Removes the session iff it exists AND is bound to
+    // `principal`; returns true on removal, false otherwise (same no-oracle
+    // posture as validate).
+    bool terminate(const std::string& id, const std::string& principal);
+
+    // Evict idle-expired sessions. Invoked opportunistically on mint/validate;
+    // exposed for tests.
+    void gc();
+
+    std::size_t active_count() const;
+
+private:
+    struct Entry {
+        std::string principal;
+        std::chrono::steady_clock::time_point created;
+        std::chrono::steady_clock::time_point last_seen;
+    };
+
+    std::chrono::steady_clock::time_point now() const;
+    void gc_locked();                                             // caller holds mu_
+    std::size_t principal_count_locked(const std::string& p) const;  // caller holds mu_
+
+    Config cfg_;
+    ClockFn clock_;
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, Entry> sessions_;  // session id → entry
+};
+
+}  // namespace yuzu::server::mcp

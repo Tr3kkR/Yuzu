@@ -13,6 +13,8 @@ generalised-by: ADR-0006 — the 2026-06-09 widening made Postgres the standard 
 
 > **Implementation status (2026-06-18 conformance audit):** The server-side PostgreSQL substrate this ADR introduced is **shipped** (generalised by ADR-0006/0007/0008; the server now runs on Postgres and fails closed without it — behaviorally verified). The reachability-graph–specific application (scored graph + pgvector identity matching) is **not yet built** — spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
 
+> **Superseded for the vulnerability domain (ADR-1005, 2026-07):** this ADR's application of the server-side Postgres substrate to the **vuln-scan graph** is reversed — vulnerability interpretation (feed ingest, CVE matching, findings, the scored graph's vuln dimension) re-homes into the vulnerability-management use-case engine module, whose data layer is the **use-case engine (UCE) host's own Postgres database**, never the server's pool (execution-plan Decision 11; `docs/adr-1005-execution-plan.md`). The substrate decision itself (server runs on Postgres) and the other drivers (Guardian scale, offline-endpoint state, secrets) are untouched. The vulnerability-graph differentiator (topology, trust zones, attack-path scoring) gets its own future scoping with its own core-vs-engine boundary analysis.
+
 ## Context
 
 Yuzu's stated architecture is "SQLite for embedded storage," and the server already runs

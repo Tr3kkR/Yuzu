@@ -1,0 +1,156 @@
+---
+status: proposed
+date: 2026-07-06
+owner: Dave Rae
+deciders: pending — acceptance requires at least one recorded independent review and a linked tracking issue (SOC 2 Workstream F change-management evidence; cf. ADR-0006's decision record)
+scope: platform — consumer model, principal classes, UI/API boundary, use-case engine direction
+---
+
+# 1005 — Yuzu Server is a Headless Platform; Use-Cases Live in External Engines
+
+Strengthens (does not supersede) `docs/agentic-first-principle.md`: A1's dashboard-parity invariant is hardened here to "UIs may only compose public APIs" for new capabilities. A1's existing scope clause ("existing fragments are not retroactively required to comply") remains in force via the grandfather rules below.
+
+Related: ADR-0021 (Spark/Reflex architecture), ADR-0023 (in-server vulnerability correlation engine) + ADR-4001 (in-server vulnerability dashboard) (both absorbed into grandfathered surface #2, see below), ADR-0017 (management-group confinement of list reads), ADR-0006/0008/0012 (Postgres substrate and store contract), `docs/agentic-first-principle.md` (A1–A5), `docs/auth-architecture.md`, `docs/mcp-server.md`. See also: the [execution plan](../adr-1005-execution-plan.md) (program ladder + first-module scoping).
+
+## Binding status
+
+Nothing in this ADR binds reviews or blocks PRs until its status is **accepted**. (Exception-ledger entries may be recorded before acceptance — voluntary early compliance by implementing PRs; they become binding precedent only on acceptance.) On acceptance, Decisions 1–4 **and the Interim rules** bind — the Decisions prospectively (they govern new and changed capabilities from the acceptance date and do not retroactively condemn the grandfathered surfaces inventoried below), the Interim rules immediately and until their named follow-ups ship. Decisions 5–7 describe direction whose remaining binding force arrives with those follow-ups.
+
+## Context
+
+Yuzu's goal is use-case-agnostic scaffolding for an IT estate: highly performant primitives for query, command, detection, enforcement, and inventory across a fleet. The Spark/Reflex rebuild (ADR-0021) is already re-founding the detection/action kernel on use-case-agnostic terms.
+
+Customers, however, expect a GUI and pre-packaged use-cases (vulnerability management, compliance reporting, software asset management, …). Building those into the server would pull domain semantics — vulnerability feeds, CVE matching, scoring, domain dashboards — into the C++ core, coupling its release cadence to interpretation logic that churns on a different clock, and privileging our own UI over the agentic workers the platform is designed for.
+
+The agentic-first principle (A1: dashboard parity) already requires every dashboard capability to have an API twin. This ADR takes the next step: the server is *headless by design*, and every consumer — including our own UI — is an external client of the same versioned surface.
+
+## Terminology
+
+- **Engine principal** — a long-lived service principal representing an external consumer (a use-case engine or an agentic worker acting as a service). Always written "engine principal", never bare "engine": *engine* alone is already load-bearing in this codebase for internal components (Instruction Engine, Policy Engine, Scope Engine, SparkEngine, …).
+- **Use-case engine host** — the first-party deployable that hosts use-case modules (Decision 6). The host authenticates to the server as one or more engine principals; whether modules share one principal or hold per-module principals (least-privilege and audit-attribution granularity) is decided in the delegation follow-up, not here.
+- **First-party UI** — collectively, the use-case engine host's UI (Decision 6) and the in-server admin console (Decision 7).
+- **Operator** — the initiating principal of an action, human or agentic. Where a rule applies only to humans, this ADR says "human operator".
+- **Admin console** — the thin in-server surface of Decision 7. Distinct from the existing full dashboard, which is a grandfathered surface.
+
+## Decision
+
+### 1. Agentic first is a core principle
+
+The server is designed to be driven by agentic AI as a first-class operator — MCP and REST are the primary control surfaces, not an integration afterthought. Every capability must be **discoverable, invocable, and observable** by an agentic worker without human mediation, with honest machine-readable error envelopes. This elevates the existing agentic-first invariants (A1–A4) from a per-surface checklist to a founding principle: humans with a GUI and agentic workers are peer classes of operator, and no capability may favour one over the other. New capabilities land on **both REST and MCP** or carry a recorded exception — a capability reachable on only one machine surface is a defect under this decision, not merely under A1.
+
+### 2. The Yuzu server is a headless, use-case-agnostic platform
+
+The server owns **mechanism, not interpretation**: device registry and transport, instruction/Spark/Reflex engines, scope, RBAC, audit, response and inventory stores, content plane, and the REST/MCP/event surfaces that expose them. It is *moving toward* containing no use-case domain logic — CVE analysis, compliance-framework semantics, and domain-specific scoring are being extracted over time, not asserted absent today (see Grandfathered surfaces and Consequences).
+
+**Boundary test** for any proposed feature: *does it collect/enforce/transport facts about the estate (mechanism → core), or does it interpret those facts for a purpose (interpretation → use-case engine)?*
+
+**Tiebreakers.** Interpretation whose semantics are **operator-authored content evaluated by a generic engine** (policy rules, preflight checks, scope expressions, Guards, Reflexes), and **pure aggregation of fleet-internal facts** (rollups, histograms, distinct-device counts), are *mechanism*. Interpretation whose semantics are **baked into code** (domain scoring, compliance-framework mappings) or that **joins fleet data with external domain data** (vulnerability feeds, threat intel) is *engine territory* — this classifies PolicyEvaluator, the `/auto` preflight/deploy engines, scope walking, and the DEX/software-catalogue rollups as core, matching ADR-0021. Infrastructure-supporting external fetches (NTP, CRL, OS-EOL metadata) are not "domain data". First-party-shipped content (build-time-embedded YAML) is judged by its **semantics**, not its packaging — a compliance-framework mapping does not become mechanism by shipping as bundled content. Boundary disputes are arbitrated by the maintainer; verdicts accrete into an examples appendix in this file.
+
+### 3. All consumers are external principals on the versioned API
+
+Use-case engines, agentic AI workers, automation scripts, and Yuzu's own first-party UI all consume the server through the same versioned REST/MCP surface, as authenticated principals subject to server-side authorization — **MCP tier policy and RBAC in the existing tier-before-RBAC order** (`docs/mcp-server.md`), kill switches included; engine principals get no exemption — plus audit and (future) rate limits. No consumer — first-party included — gets a **new** private seam: no shared database access, no co-deployment assumption, no linked-in shortcut. (The existing dashboard's in-process store access is a grandfathered surface, not a licence — see below.)
+
+A customer may point their own use-case engine, or their own agentic AI, at the server. Our first-party UI must therefore prove the API surface is complete: **if our UI needs a capability, it becomes an API first.**
+
+### 4. No UI-only capabilities
+
+From acceptance, prospectively: no **new or changed** capability may be reachable only through a UI. Every capability's twin must be **machine-readable** — a versioned REST/MCP surface with A2 discoverability and the A4 error envelope. An HTML fragment endpoint is itself UI and does **not** satisfy this rule, even though it is public HTTP. This strengthens A1 from "dashboard capabilities must have API twins" to "UIs may only compose public APIs" for new work; grandfathered surfaces are governed by the inventory below, and modifying one in place is maintenance, not a violation — but the capability *added* in such a modification is new work.
+
+### 5. Consumer trust tier: engine principals with on-behalf-of delegation
+
+The principal model adds **engine principals** alongside human operators and agent daemons. This is an evolution of today's service-scoped API tokens (`docs/auth-architecture.md`), not a parallel invention: the genuinely new element is **on-behalf-of delegation**, not the existence of a service principal.
+
+- Engine principals authenticate with their own credentials and carry their own RBAC grants, assigned least-privilege — an engine principal holding the union of its users' permissions is a design defect.
+- **Delegation is server-verifiable.** When an engine principal acts on a specific operator's initiative, the delegated identity must be established by a server-issued artifact (token exchange or equivalent) — never by an engine-asserted header or field. Any action serving a specific operator's request MUST be performed as delegated; autonomous mode is for engine-scheduled work only. A confused-deputy engine principal must not be able to launder an operator-initiated action through its own broader grants.
+- **Effective authority for delegated actions = intersection of permissions AND scope.** Management-group confinement (ADR-0017) applies: delegated list/fan-out reads pass through the same `authorize_list_read` chokepoint the operator would hit directly. A globally-granted engine acting for a group-confined operator reaches only that operator's groups.
+- **Audit shape.** Every engine-principal action produces an audit row carrying: the engine principal id; an explicit `is_delegated` boolean (never a nullable operator field overloaded as "autonomous"); for delegated actions, the delegated operator identity, the delegation artifact id, and a per-row `delegation_verification_status` (`verified` / `unverified` / `failed`). Autonomous actions audit as the engine alone.
+- The server's authorization (tier policy ∩ RBAC) remains the **single authority** over fleet actions. Engine-side checks may only *further restrict*, never substitute for, server authorization. Data an engine syncs and re-serves leaves the server's audit perimeter and requires the engine's own audit/compliance controls; **bulk sync of behavioral PII requires explicit security-guardian design review**, and any engine principal consuming DEX or other behavioral-PII endpoints inherits the full works-council control set (toggles, pseudonymization, retention, per-read audit — `docs/enterprise-readiness-soc2-first-customer.md` §3.5, once those controls are built) with no exception for machine consumers.
+- **Credentials.** Engine credentials reuse the existing hashed API-token store unless a review concludes otherwise; each engine principal has a named responsible human owner for revocation; credentials are rotatable and individually revocable; engine↔server transport is TLS-mandatory, mTLS recommended. Lifetime/rotation ceilings are set in the auth follow-up. The #397/#403 self-target destruction guard must be extended to the effective delegated identity.
+
+The concrete token/delegation mechanism is deferred to an auth-architecture follow-up; this ADR fixes the requirements and the audit shape.
+
+### 6. First-party use-case engine: one host, many modules
+
+Yuzu's own GUI/use-case product is a single **use-case engine host** (auth delegation, server-sync plumbing, UI shell) hosting use-cases as modules. Separate apps per use-case would reinvent that plumbing each time. "One host" is a product-packaging default only — it does not pre-decide principal granularity (see Terminology) or preclude later decomposition. The host's technology stack, internals, and delivery are out of scope and decided when the first module is scoped.
+
+The expected first module is vulnerability management (external vulnerability-feed ingest joined against Yuzu software inventory) — the concrete choice lives in `docs/roadmap.md`, not here. Note this module *re-homes* already-shipped **server-side** capability (the NVD sync + CVE matching — see Grandfathered surfaces); the agent-side `vuln_scan` collection plugin is mechanism and stays core. Scoping the first module MUST include the egress-primitive decision (how engines read fleet data at scale); its server-facing half (bulk reads, engine auth) is gated on the auth follow-up and that egress decision — only its domain-logic half can start immediately.
+
+### 7. Thin built-in admin console remains on the server
+
+Headless does not mean zero UI. The server keeps a **minimal admin console** for platform operations — the bootstrap/break-glass set: enrollment and device liveness, health/readiness, RBAC and principal management, settings, audit view. **This list is closed**: adding a console surface requires amending this ADR. The console (target state) composes the same public APIs — a posture note: HTML surfaces moving onto REST flip their behavioural-PII audit posture from set-and-proceed to fail-closed (`server/core/src/rest_audit.hpp`); this flip is intended. The admin console, `/readyz`, and `/metrics` must function with **zero dependency on any engine being reachable**.
+
+The existing full dashboard remains in place, maintained, and **fully supported for customers through any transition — no forced migration**. This ADR schedules no migration, but the direction is decided: the product UI's long-term home is the use-case engine, and the in-server dashboard shrinks toward the thin admin console (strangler, not big-bang). **Removal of an in-server dashboard surface is a breaking change requiring a full deprecation cycle once any customer depends on it** — no page disappears without notice, regardless of engine-migration progress. Content-plane authoring UI (Guards, Baselines, Reflexes, routes) is platform administration: its API is core (ADR-0021 D7); whether its UI's long-term home is the admin console or the engine host is decided with the migration plan.
+
+## Grandfathered surfaces
+
+The binding rules above are prospective. Pre-existing surfaces that do not comply are grandfathered — inventoried here so governance reviews have a citable list rather than a judgment call:
+
+1. **The in-server dashboard's in-process store access** (`*_ui.cpp`, `/fragments/*`). Grandfathered until the strangler migration reaches each surface. No NEW private seam may be added; new capability on a grandfathered surface must be API-first (Decision 4).
+2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation. **Extended 2026-07-07:** the ADR-0023 in-server correlation stack (the shipped `NvdDatabase::assess()` and `VulnFindingStore`, and the `VulnCorrelationEngine` + triggers + `Vulnerability:Scan` securable + findings routes that ADR planned — 18.1-flavoured work authored in parallel with this ADR) is **absorbed into this same grandfathered surface**: interim capability, re-homed and deleted by the same strangler sequence. The absorption is **bounded**: it covers ADR-0023's designed scope only (vuln-roadmap M1a/M1b) and it is **placement-only** — Decision 4 (API-first), full governance, ADR-0017 confinement, and ADR-0023's own securable/audit obligations apply to every further in-server vuln PR undiminished. Anything not in this enumeration is **outside the grandfather by default**, classified in governance review, not by the proposing document; for the absorbed M1a/M1b scope the 18.1 re-evaluation above is discharged by this reconciliation, while 18.1-and-beyond work outside that scope still re-evaluates against Decision 2. **Further extended 2026-07-08 — a prospective carve-out, not grandfathering of existing code:** the ADR-4001 vulnerability dashboard (the `/vuln` lens with its `/fragments/vuln/*` surface, the versioned `/api/v1/vuln/*` REST + `query_vulnerabilities` MCP read twins, the `Vulnerability` securable, and the in-server `attack_path_engine`) is absorbed on the same terms — placement-only, bounded to ADR-4001's designed scope, outside-by-default beyond it. Unlike the 0023 extension's shipped components, **every ADR-4001 item is planned/design-only** (ADR-4001 carries `status: accepted` as of 2026-07-09 per the ADR Acceptance Convention, but none of its surfaces exist in code): this section's "pre-existing surfaces" framing does not apply to them — the carve-out pre-authorizes their *future* in-server implementation, activates as each surface ships, and is void for anything ADR-4001's ratification does not carry. Two riders: (a) unlike the legacy un-versioned `/api/nvd/*` routes, 4001's read surfaces are on the **published versioned API contract from birth**, so their Phase-7 re-home requires the full Phase 0.3 deprecation cycle with module-provided equivalents; (b) ADR-4002's scoring substrate is **not** absorbed here — it faces its own Decision 2 boundary review at its own merge. Reconciliation record: execution plan § "Relationship to ADR-0023 and ADR-4001".
+3. Exceptions recorded here accrete into the "exception ledger" the standing review question refers to:
+   - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands.
+
+   - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
+     no MCP twin, and absent from route discovery (A2/A3) — a "no" on
+     Decision 1/4's twin-surface requirement. Recorded rather than fixed
+     pre-merge because:
+     - **No MCP twin — tracked follow-up, not a permanent exception.**
+       Operator-side user lifecycle (list/deactivate/reactivate a
+       SCIM-provisioned account) is a plausible MCP tool, but SCIM's own
+       wire protocol (RFC 7644) is IdP-driven push, not an operator-invoked
+       action — the *twin* to build is an MCP-shaped view/administration
+       surface over the same underlying accounts, not a literal SCIM-over-MCP
+       mirror. Scoping and building that twin is out of scope for this slice;
+       tracked as **#2021** (SCIM Groups→role mapping, slice 2 — the natural
+       place to add an MCP-visible administration surface alongside it) and
+       **#2022** (API-token revocation on deprovision, which also touches the
+       same account-lifecycle surface). Until one of those lands with an MCP
+       twin, this row stands as the open exception.
+     - **RFC 7644 `scim+json` error schema instead of the A4 envelope —
+       correct by mandate, not a gap.** SCIM is a standardized protocol
+       consumed by third-party IdP connectors (Okta, Entra ID, OneLogin) that
+       parse `urn:ietf:params:scim:api:messages:2.0:Error` bodies and
+       specific `scim_type` values; returning an A4 envelope instead would
+       break every conformant connector's error handling. This is a
+       deliberate, permanent exception for this surface — SCIM is the one
+       place in the API where an external RFC, not Yuzu's own convention,
+       owns the wire shape.
+     - **Path shape `/scim/v2/*`, not `/api/v1/...` — RFC-mandated, permanent
+       exception.** RFC 7644 §3.2 fixes the SCIM base-path convention that
+       IdP connector wizards auto-discover against; nesting it under
+       `/api/v1/` would not be a conformant SCIM endpoint. Versioning for
+       this surface instead rides SCIM's own schema/discovery mechanism
+       (`ServiceProviderConfig`/`ResourceTypes`/`Schemas`).
+     - Full design/threat-model record:
+       `docs/security-reviews/scim-provisioning-2026-07-08.md`;
+       operator-facing behavior: `docs/user-manual/scim-provisioning.md`;
+       wire reference: `docs/user-manual/rest-api.md#scim-v2-provisioning`.
+
+## Interim rules (until the named follow-ups ship)
+
+- **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
+- **No engine principal may be enabled in production until a minimum per-principal concurrency/quota cap exists.** The rate-limit mechanism is deferred; this interlock is not.
+- **No engine credentials are issued to external parties before a published API versioning/deprecation policy exists.** Otherwise the first BYO-engine customer freezes whatever surface shape exists that day.
+- If delegation ships incrementally, audit rows produced before verification is enforceable carry `delegation_verification_status=unverified` — the works-council/SOC 2 consequence below is conditional on verified delegation, and unverified rows must never be presented as attribution evidence.
+
+## Out of scope (deliberately deferred)
+
+- **Egress primitives** (durable/replayable event subscription, changed-since bulk sync for engines). Anticipated, not committed; the design lands with the first module's scoping (Decision 6) and must evaluate at least two consumer archetypes (batch join, streaming) even if only one ships. ADR-0021 work should avoid *precluding* external subscription in event-spine shapes, without building for it.
+- Use-case engine host stack, packaging, and repo layout.
+- Dashboard migration sequencing.
+- Delegation token mechanics (auth-architecture follow-up; includes principal granularity, lifetime ceilings, the self-target-guard extension).
+- Consumer rate limiting / quota design (mechanism only — the production interlock above is decided now).
+- **Server-only topology** (no first-party engine) as a distinct supported deployment — test-surface and support-matrix implications.
+- **Customer-facing integration assurance package** for BYO-engine consumers: conformance suite, sandbox/test environment, security-questionnaire language covering third-party principals.
+- Published SLO numbers per surface (availability/latency). Decision 3 commits contract *stability* (versioning, back-compat, error envelopes), not SLO publication.
+
+## Consequences
+
+- **API surface becomes a product contract.** New REST/MCP surface added from now on (including during the ADR-0021 rebuild) is designed as externally consumable: versioned, discoverable, honest error envelopes (A2–A4). Compatibility posture: additive-preferred immediately; a formal compatibility freeze and deprecation policy must be published before the first external engine credential (see Interim rules); MCP tool versioning is part of that policy.
+- **Governance gains a standing review question** for every **new or changed** server capability (grandfathered surfaces answer via the exception ledger, not ad hoc): *"Is every behavior of this capability reachable by an authenticated external principal over versioned REST **and** MCP (or a recorded exception), discoverable (A2/A3), with the A4 error envelope, no in-process-only behavior, and RBAC/audit enforced at the API?"* A "no" on any clause is a design defect.
+- **ADR-0021 reconciliation.** 0021's sovereign consumers (Guardian, DEX, Reflex) are sovereign within core *mechanism* — agent detection, event spine, compiled policy wire all sit core-side of Decision 2's test. Their read-model dashboards are strangler targets; migrating in this direction is the declared intent — new work on these consumers should move toward the boundary, not deepen coupling to core.
+- **Store ownership follows the layer.** Postgres migration under ADR-0006/0012 confers no core permanence: a store whose sole consumer is an interpretation layer moves out with that layer; until then, engines reach its data only via the versioned API (bulk egress deferred).
+- **Capacity and isolation become first-class.** The headless shift moves all UI and engine reads onto the same finite HTTP + PG-pool path as the agent control plane (one shared bounded `PgPool`, ADR-0012). API-serving capacity becomes an explicit SLO input before any engine GAs, and whether API-serving and the agent control plane need separate resource budgets (pool/thread) is a tracked follow-up before engine GA — a hot-polling engine must not be able to starve heartbeat ingest or command dispatch. Request metrics for the surface carry a low-cardinality `principal_class` label (human / agent / engine, plus `none` for unauthenticated requests as shipped — see execution plan PR 1.2); per-principal identity stays in the audit envelope per `docs/observability-conventions.md`.
+- **Ship shape (eventual):** headless `yuzu-server` (with thin admin console) as a supported standalone deploy; first-party engine as a separate artifact customers may take, replace, or omit. The first-party engine declares a min/max supported server API version and refuses to start outside it.
+- **Data-processor status:** an engine holding a synced copy of fleet or behavioral data is a data processor in its own right; retention/deletion/DPA obligations for that copy fall to the engine operator and are not discharged by this ADR — SOC 2 Workstream E tracks this.
+- **Works-council / SOC 2 posture is designed to improve** — one audit chokepoint recording every server-mediated actor (human, agent daemon, engine, engine-for-operator) — **contingent on** the delegation follow-up shipping server-verifiable delegation and the Decision 5 audit-row fields. It is not a completed control, and engine-internal redistribution of synced data remains outside this chokepoint (see Decision 5's perimeter caveat). Engine-principal credential lifecycle lands in SOC 2 Workstream B.

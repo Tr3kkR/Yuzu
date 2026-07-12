@@ -19,7 +19,10 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   sanitizers, no coverage** — those moved out (#410).
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
-  (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`). On any leg failure, the `alert` job auto-opens or comments on a
+  (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
+  leg (`windows-asan`, agent-only, Wee Tam pool, gated on
+  `windows_pool_healthy`) covering the Windows-only spark mechanisms that the
+  Linux sanitizers can't reach (#1934a). On any leg failure, the `alert` job auto-opens or comments on a
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
@@ -50,7 +53,7 @@ dormant until merged.
 | Runner | Host | Jobs |
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. |
-| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `macos-15` | GitHub-hosted | macos matrix |
 
 **Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
@@ -121,6 +124,16 @@ degraded runner skips its jobs in <30 s rather than queueing 30 min into a
 stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret
 (fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
 returns false and self-hosted jobs are skipped with a clear reason.
+
+As of #1978, preflight also emits a `code_changed` output (from
+`scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
+`&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
+matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
+`macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
+(a top-level-skipped matrix job emits none of its inner check names), so a
+`docs-required-checks` stub emits those exact names as success when
+`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
+the `push:` trigger keeps its docs `paths-ignore`.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 

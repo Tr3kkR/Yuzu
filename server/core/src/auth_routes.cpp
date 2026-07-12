@@ -15,6 +15,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 
 #include <ctime>
@@ -641,6 +642,9 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     event.result = result;
     event.source_ip = req.remote_addr;
     event.user_agent = req.get_header_value("User-Agent");
+    // Actor class (ADR-1005 Phase 3a) — by credential presentation, same basis
+    // principal_class_of already uses for the HTTP request metric.
+    event.principal_class = std::string(principal_class_of(req));
 
     // Resolve principal via cookie / Bearer token / X-Yuzu-Token (same as require_auth).
     // Without this, audit rows for API-token-authenticated requests (REST API automation
@@ -702,6 +706,10 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
+    // Actor class (ADR-1005 Phase 3a) — same basis as make_audit_event; this
+    // constructor exists precisely for the pre-session sites (login/MFA/OIDC
+    // callback), so the request itself is still the only signal available.
+    event.principal_class = std::string(principal_class_of(req));
     auto ok = audit_store_->log(event);
     if (!ok) {
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "

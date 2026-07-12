@@ -184,6 +184,34 @@ TEST_CASE("build_agent_push: a service guard reaches an agent ONLY via a deploye
         CHECK(pr.spark().type().empty());            // malformed spec → no typed blocks
         CHECK(pr.assertion().type().empty());
     }
+    SECTION("well-formed object with a non-string block 'type' -> no throw, inert type (#1946)") {
+        // Distinct from the truncated case above: this spec_json PARSES as an object
+        // (so fill_block runs) but carries a non-string "type". derive_rule_spec
+        // type-checks spark.type/assertion.type before persistence but NOT
+        // remediation.type, so a rule authored via REST create with
+        // remediation.type as a number/array/object persists and reaches here. A
+        // present-non-string type used to throw json::type_error.302 out of
+        // fill_block -> escape build_agent_push -> HTTP 500 on every push fan-out
+        // (fleet-wide guardian-convergence DoS). It must now marshal to an inert
+        // empty type, header intact, never throw.
+        GuaranteedStateRuleRow poisoned = svc;
+        poisoned.spec_json =
+            R"({"spark":{"type":"service-status-change","params":{}},)"
+            R"("assertion":{"type":"service-running","params":{"service_name":"Spooler"}},)"
+            R"("remediation":{"type":5,"params":{}}})";
+        auto deployed = guardian::filter_deployed_members({poisoned}, {"svc-spooler"});
+        REQUIRE(deployed.size() == 1);
+        // The load-bearing assertion is simply that this call returns without
+        // throwing — pre-fix it aborted with type_error.302.
+        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope, true, 1);
+        REQUIRE(push.rules_size() == 1);
+        const auto& pr = push.rules(0);
+        CHECK(pr.rule_id() == "svc-spooler");
+        CHECK(pr.enforcement_mode() == "enforce");            // header intact
+        CHECK(pr.spark().type() == "service-status-change");  // well-typed blocks still marshal
+        CHECK(pr.assertion().type() == "service-running");
+        CHECK(pr.remediation().type().empty());               // non-string type → inert empty
+    }
 }
 
 TEST_CASE("build_agent_push: legacy rule with empty spec_json is header-only",
