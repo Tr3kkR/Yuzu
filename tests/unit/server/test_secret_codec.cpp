@@ -140,6 +140,10 @@ namespace {
 // the `secrets` schema migration via a throwaway codec init, then resets
 // kek_meta to the empty first-boot state — each test still mints its own KEK
 // against a fresh keys dir, exactly as on a plain empty database.
+// Security note (governance #2091 Gate 2/6 sign-off): no key material can
+// reach the shared template — the throwaway KEK lives only in this lambda's
+// TempDir (destroyed at scope exit), the DELETE empties kek_meta before the
+// template is ever cloned, and template fingerprints are structure-only.
 yuzu::test::PgTestTemplate secrets_tpl{"secrets", [](const std::string& dsn) {
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);

@@ -5,9 +5,9 @@
 //  - testRunStarting: sweep stale yuzu_test_* databases leaked by ABNORMAL
 //    exits of earlier runs (SIGKILL / OOM / CI job-timeout kill — nothing
 //    re-runs those processes' teardown). Age comes from the epoch embedded
-//    in every test-database name; the threshold is far beyond any CI job's
-//    lifetime, so a live concurrent suite on the shared instance can never
-//    be swept.
+//    in every test-database name; the threshold is far beyond a server-
+//    suite job's lifetime, so a live concurrent suite on the shared
+//    instance can never be swept.
 //  - testRunEnded: drop this process's template databases while libpq's TLS
 //    stack is still alive. The Registry static dtor is only a backstop: its
 //    __cxa_atexit slot is claimed when the first [pg] fixture runs, so on
@@ -16,24 +16,27 @@
 //    in test_helpers.hpp).
 //
 // The TEST_CASEs below are the regression net the 2091 review asked for: a
-// change that no-ops drop_all_built(), breaks the shared-key replay
-// verification, or mis-ages database names now fails the suite itself
-// rather than only an external leftover-database check.
+// change that no-ops the drop paths, breaks the shared-key replay
+// verification, breaks the build-failure/retry contract, mis-ages database
+// names, or breaks the sweep SQL now fails the suite itself rather than
+// only an external leftover-database check.
 
 #if defined(YUZU_TEST_ENABLE_PG)
+
+#include <cstdint>
+#include <random>
+#include <stdexcept>
+#include <string>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
 
+#include <libpq-fe.h>
+
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
-
-#include <libpq-fe.h>
-
-#include <stdexcept>
-#include <string>
 
 namespace {
 
@@ -75,6 +78,36 @@ void probe_setup_divergent(const std::string& dsn) {
     probe_exec(dsn, kProbeSchema);
     probe_exec(dsn, "CREATE TABLE IF NOT EXISTS tplprobe.t2 (id INTEGER)");
 }
+// Subset divergence: builds NOTHING — on a clone-based replay this would
+// wrongly verify (every migration no-ops); the fresh-scratch replay must
+// reject it.
+void probe_setup_subset(const std::string& /*dsn*/) {}
+
+void probe_setup_throwing(const std::string& /*dsn*/) {
+    throw std::runtime_error("deliberate template build failure");
+}
+
+// Throws on the FIRST call only — the transient-failure retry probe.
+void probe_setup_flaky(const std::string& dsn) {
+    static bool first = true;
+    if (first) {
+        first = false;
+        throw std::runtime_error("simulated transient outage");
+    }
+    probe_exec(dsn, kProbeSchema);
+}
+
+// Per-process salt for every probe identifier this file creates on the
+// SHARED instance (template keys, seeded sweep names): two runner agents on
+// one box running this suite concurrently must never collide (CLAUDE.md
+// salted-identifier standing invariant; governance #2091 sec2-M2).
+std::string probe_salt() {
+    static const std::string salt = [] {
+        std::mt19937_64 rng{std::random_device{}()};
+        return std::to_string(rng() % 1'000'000'000);
+    }();
+    return salt;
+}
 
 bool database_exists(const std::string& admin_dsn, const std::string& db_name) {
     yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
@@ -85,6 +118,27 @@ bool database_exists(const std::string& admin_dsn, const std::string& db_name) {
         nullptr, 0)};
     REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
     return PQntuples(res.get()) == 1;
+}
+
+// Count databases whose name ends with the given suffix (finds a template
+// whose full epoch+salt name the test cannot predict).
+int databases_with_suffix(const std::string& admin_dsn, const std::string& suffix) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const std::string pattern = "%" + suffix;
+    const char* values[] = {pattern.c_str()};
+    yuzu::server::pg::PgResult res{PQexecParams(
+        conn.get(), "SELECT count(*) FROM pg_database WHERE datname LIKE $1", 1, nullptr, values,
+        nullptr, nullptr, 0)};
+    REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
+    return std::atoi(PQgetvalue(res.get(), 0, 0));
+}
+
+void admin_exec(const std::string& admin_dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+    REQUIRE(res.ok());
 }
 
 } // namespace
@@ -117,19 +171,24 @@ TEST_CASE("test_db_is_stale: name-embedded epoch + staleness window", "[template
         CHECK_FALSE(yuzu::test::test_db_is_stale("other_db", now));
         // charset guard: never splice a quotable name into DROP
         CHECK_FALSE(yuzu::test::test_db_is_stale("yuzu_test_" + old_epoch + "_1_a\"b", now));
+        // overflow guard: a hostile 20+-digit run must be rejected BEFORE
+        // accumulation, not wrap into a bogus epoch (UB)
+        CHECK_FALSE(yuzu::test::test_db_is_stale("yuzu_test_99999999999999999999999_x", now));
     }
 }
 
-TEST_CASE("PgTestTemplate: build, shared-key replay verification, drop_all_built",
+TEST_CASE("PgTestTemplate: build, shared-key replay verification, scoped drop",
           "[pg][template]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
     }
     const std::string admin = yuzu::test::pg_admin_dsn_env();
 
-    yuzu::test::PgTestTemplate original{"tplprobe", &probe_setup};
-    yuzu::test::PgTestTemplate twin{"tplprobe", &probe_setup_twin};
-    yuzu::test::PgTestTemplate divergent{"tplprobe", &probe_setup_divergent};
+    const std::string key = "tp" + probe_salt(); // salted: shared-instance safe
+    yuzu::test::PgTestTemplate original{key, &probe_setup};
+    yuzu::test::PgTestTemplate twin{key, &probe_setup_twin};
+    yuzu::test::PgTestTemplate divergent{key, &probe_setup_divergent};
+    yuzu::test::PgTestTemplate subset{key, &probe_setup_subset};
 
     std::string err;
     const std::string built = original.ensure(admin, err);
@@ -144,7 +203,8 @@ TEST_CASE("PgTestTemplate: build, shared-key replay verification, drop_all_built
         CHECK(twin_err.empty());
     }
 
-    SECTION("a divergent setup under the same key is rejected; the original is untouched") {
+    SECTION("an additively divergent setup under the same key is rejected; the original is "
+            "untouched") {
         std::string div_err;
         CHECK(divergent.ensure(admin, div_err).empty());
         CHECK(div_err.find("shared-key setup mismatch") != std::string::npos);
@@ -154,8 +214,19 @@ TEST_CASE("PgTestTemplate: build, shared-key replay verification, drop_all_built
         CHECK(again_err.empty());
     }
 
-    SECTION("drop_all_built removes the template (the testRunEnded contract)") {
-        yuzu::test::PgTestTemplate::drop_all_built();
+    SECTION("a SUBSET setup is rejected too (fresh-scratch replay, not clone)") {
+        std::string sub_err;
+        CHECK(subset.ensure(admin, sub_err).empty());
+        CHECK(sub_err.find("shared-key setup mismatch") != std::string::npos);
+        // and the verdict is cached: a second ensure fails identically fast
+        std::string sub_err2;
+        CHECK(subset.ensure(admin, sub_err2).empty());
+        CHECK(sub_err2 == sub_err);
+    }
+
+    SECTION("drop_built removes only this key's template (the testRunEnded drop uses the same "
+            "path per entry; scoped here so --order rand cannot wipe other files' templates)") {
+        yuzu::test::PgTestTemplate::drop_built(key);
         CHECK_FALSE(database_exists(admin, built));
         // Later ensures rebuild transparently — the registry entry is gone.
         // (The rebuilt name embeds a fresh creation epoch, so it is not
@@ -165,7 +236,67 @@ TEST_CASE("PgTestTemplate: build, shared-key replay verification, drop_all_built
         CHECK(rebuilt_err.empty());
         REQUIRE_FALSE(rebuilt.empty());
         CHECK(database_exists(admin, rebuilt));
+        yuzu::test::PgTestTemplate::drop_built(key);
     }
+}
+
+TEST_CASE("PgTestTemplate: build failure fails loudly, stays reclaimable, and is retried",
+          "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    const std::string admin = yuzu::test::pg_admin_dsn_env();
+
+    SECTION("throwing setup: error surfaces, half-built DB is registered and dropped") {
+        const std::string fail_key = "fp" + probe_salt(); // salted: shared-instance safe
+        yuzu::test::PgTestTemplate failing{fail_key, &probe_setup_throwing};
+        std::string err;
+        CHECK(failing.ensure(admin, err).empty());
+        CHECK(err.find("template setup threw") != std::string::npos);
+        // The CREATE succeeded before the throw — the database physically
+        // exists and must be registered for cleanup, not orphaned.
+        CHECK(databases_with_suffix(admin, "_" + fail_key) == 1);
+        yuzu::test::PgTestTemplate::drop_built(fail_key);
+        CHECK(databases_with_suffix(admin, "_" + fail_key) == 0);
+    }
+
+    SECTION("transient failure is retried on the next ensure, not cached for the process") {
+        const std::string flaky_key = "fk" + probe_salt(); // salted: shared-instance safe
+        yuzu::test::PgTestTemplate flaky{flaky_key, &probe_setup_flaky};
+        std::string err1;
+        CHECK(flaky.ensure(admin, err1).empty()); // first attempt: simulated outage
+        CHECK(err1.find("simulated transient outage") != std::string::npos);
+        std::string err2;
+        const std::string name = flaky.ensure(admin, err2); // retry succeeds
+        INFO("retry error: " << err2);
+        CHECK(err2.empty());
+        CHECK_FALSE(name.empty());
+        CHECK(database_exists(admin, name));
+        yuzu::test::PgTestTemplate::drop_built(flaky_key);
+    }
+}
+
+TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    const std::string admin = yuzu::test::pg_admin_dsn_env();
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    // Salted (shared-instance safe): concurrent suites seed distinct names.
+    const std::string stale =
+        "yuzu_test_" + std::to_string(now - 7 * 3600) + "_" + probe_salt() + "_swp";
+    const std::string old_format = "yuzu_test_" + probe_salt() + "_swp"; // first number < 1e9
+
+    admin_exec(admin, "CREATE DATABASE \"" + stale + "\"");
+    admin_exec(admin, "CREATE DATABASE \"" + old_format + "\"");
+
+    yuzu::test::sweep_stale_test_databases(admin);
+
+    CHECK_FALSE(database_exists(admin, stale));    // stale epoch-named: swept
+    CHECK(database_exists(admin, old_format));     // pre-epoch format: spared
+    admin_exec(admin, "DROP DATABASE IF EXISTS \"" + old_format + "\"");
 }
 
 #endif // YUZU_TEST_ENABLE_PG

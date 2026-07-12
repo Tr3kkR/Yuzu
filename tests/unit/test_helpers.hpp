@@ -37,9 +37,11 @@
 
 #if defined(YUZU_TEST_ENABLE_PG)
 #include <chrono>
+#include <expected>
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -168,7 +170,8 @@ inline const char* pg_admin_dsn_env() {
 ///
 /// Safety against concurrent suites on one shared instance (Wee Tam / Big
 /// Tam run 4 runner agents per box): the threshold is far beyond any CI
-/// job's possible lifetime (job-level timeouts are 90-120 min), so a
+/// server-suite-running job's possible lifetime (their job-level timeouts
+/// are 90-120 min; jobs without [pg] tests never own these DBs), so a
 /// swept database cannot belong to a live run. Pre-epoch-format names
 /// (`yuzu_test_<salt>_<n>` — salt < 1e9 parses as a pre-2021 "epoch") are
 /// deliberately NOT swept: during rollout a concurrent job running an
@@ -176,64 +179,134 @@ inline const char* pg_admin_dsn_env() {
 /// `DROP`; everything after this format sweeps automatically.
 inline constexpr std::int64_t kTestDbStaleAfterSeconds = 6 * 3600;
 
-/// True iff `datname` is one of ours (charset-guarded), carries a
-/// plausible creation epoch, and that epoch is older than
-/// kTestDbStaleAfterSeconds relative to `now_epoch`. Pure — unit-tested
-/// with a fixed `now_epoch`.
-inline bool test_db_is_stale(std::string_view datname, std::int64_t now_epoch) {
+/// Parse the creation epoch out of a test-database name, or nullopt when
+/// the name is not ours / malformed / not charset-safe. Charset guard
+/// matters: sweep-eligible names are spliced into a quoted DROP statement,
+/// so anything outside [a-z0-9_] is refused outright. Pure.
+inline std::optional<std::int64_t> parse_test_db_epoch(std::string_view datname) {
     constexpr std::string_view prefix = "yuzu_test_";
     if (!datname.starts_with(prefix))
-        return false;
-    // Identifier charset guard: the name is spliced into a quoted DROP
-    // statement, so refuse anything but [a-z0-9_] outright.
+        return std::nullopt;
     for (const char c : datname)
         if ((c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_')
-            return false;
+            return std::nullopt;
     std::string_view rest = datname.substr(prefix.size());
     if (rest.starts_with("tpl_"))
         rest = rest.substr(4);
     std::int64_t epoch = 0;
     std::size_t i = 0;
-    for (; i < rest.size() && rest[i] >= '0' && rest[i] <= '9'; ++i)
+    for (; i < rest.size() && rest[i] >= '0' && rest[i] <= '9'; ++i) {
+        // Bound the digit run BEFORE accumulating: a hostile co-tenant name
+        // with a 20-digit run would signed-overflow (UB). Valid epochs are
+        // 10 digits; 12 is generous slack.
+        if (i >= 12)
+            return std::nullopt;
         epoch = epoch * 10 + (rest[i] - '0');
+    }
     if (i == 0 || i == rest.size() || rest[i] != '_')
+        return std::nullopt;
+    return epoch;
+}
+
+/// True iff the parsed epoch is inside the plausibility window:
+/// pre-epoch-format salts are < 1e9 (pre-2021) and a clock-skewed future
+/// stamp must not look "aged"; both are excluded (and therefore never
+/// swept — only hand-cleaning reclaims them).
+inline bool test_db_epoch_plausible(std::int64_t epoch, std::int64_t now_epoch) {
+    return epoch >= 1'600'000'000 && epoch <= now_epoch + 86'400;
+}
+
+/// True iff `datname` is one of ours (charset-guarded), carries a
+/// plausible creation epoch, and that epoch is older than
+/// kTestDbStaleAfterSeconds relative to `now_epoch`. Pure — unit-tested
+/// with a fixed `now_epoch`.
+inline bool test_db_is_stale(std::string_view datname, std::int64_t now_epoch) {
+    const auto epoch = parse_test_db_epoch(datname);
+    if (!epoch || !test_db_epoch_plausible(*epoch, now_epoch))
         return false;
-    // Plausibility window: pre-epoch-format salts are < 1e9 (pre-2021) and
-    // a clock-skewed future stamp must not look "aged"; both are excluded.
-    if (epoch < 1'600'000'000 || epoch > now_epoch + 86'400)
-        return false;
-    return now_epoch - epoch > kTestDbStaleAfterSeconds;
+    return now_epoch - *epoch > kTestDbStaleAfterSeconds;
 }
 
 /// Best-effort sweep of stale `yuzu_test_*` databases on the shared
-/// instance. Failures are non-fatal (the fixture paths report
-/// connectivity problems loudly enough); every actual drop is announced
-/// on stderr so CI logs show what was reclaimed.
+/// instance. Failures are non-fatal but announced (a silent skip would
+/// extend the leak horizon with no signal); every drop is announced on
+/// stderr, plus one unconditional summary line so CI logs distinguish
+/// "nothing to sweep" from "sweep never ran".
 inline void sweep_stale_test_databases(const std::string& admin_dsn) {
-    yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
-    if (PQstatus(conn.get()) != CONNECTION_OK)
-        return;
-    yuzu::server::pg::PgResult res{
-        PQexec(conn.get(), "SELECT datname FROM pg_database WHERE datname LIKE 'yuzu\\_test\\_%'")};
-    if (PQresultStatus(res.get()) != PGRES_TUPLES_OK)
-        return;
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
-    for (int i = 0; i < PQntuples(res.get()); ++i) {
-        const std::string name = PQgetvalue(res.get(), i, 0);
-        if (!test_db_is_stale(name, now))
-            continue;
-        const std::string drop = "DROP DATABASE IF EXISTS \"" + name + "\" WITH (FORCE)";
-        yuzu::server::pg::PgResult d{PQexec(conn.get(), drop.c_str())};
-        try {
-            const std::string msg =
-                d.ok() ? std::format("PgTestTemplate: swept stale test database {}\n", name)
-                       : std::format("PgTestTemplate: stale sweep of {} failed: {}\n", name,
-                                     PQerrorMessage(conn.get()));
-            std::fputs(msg.c_str(), stderr);
-        } catch (...) {
+    try {
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            std::fputs("PgTestTemplate: sweep skipped — admin connect failed\n", stderr);
+            return;
         }
+        // 'now' comes from the SERVER clock, not the runner clock: names are
+        // stamped by whichever runner created them, and on the per-box CI
+        // topology (Postgres local to each runner host) the server clock IS
+        // the stamper clock — this collapses stamper-vs-sweeper skew when a
+        // second machine's suite does the sweeping.
+        std::int64_t now = 0;
+        {
+            yuzu::server::pg::PgResult t{
+                PQexec(conn.get(), "SELECT extract(epoch FROM now())::bigint")};
+            if (PQresultStatus(t.get()) == PGRES_TUPLES_OK && PQntuples(t.get()) == 1) {
+                now = std::atoll(PQgetvalue(t.get(), 0, 0));
+            } else {
+                now = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+            }
+        }
+        yuzu::server::pg::PgResult res{PQexec(
+            conn.get(), "SELECT datname FROM pg_database WHERE datname LIKE 'yuzu\\_test\\_%'")};
+        if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+            std::fputs("PgTestTemplate: sweep skipped — pg_database query failed\n", stderr);
+            return;
+        }
+        const int total = PQntuples(res.get());
+        int swept = 0;
+        int unsweepable = 0; // parse-fail or implausible epoch — NOT live fresh names
+        for (int i = 0; i < total; ++i) {
+            const std::string name = PQgetvalue(res.get(), i, 0);
+            const auto epoch = parse_test_db_epoch(name);
+            if (!epoch || !test_db_epoch_plausible(*epoch, now)) {
+                ++unsweepable;
+                continue;
+            }
+            if (now - *epoch <= kTestDbStaleAfterSeconds)
+                continue; // plausibly live — a concurrent run's database
+            const std::string drop = "DROP DATABASE IF EXISTS \"" + name + "\" WITH (FORCE)";
+            yuzu::server::pg::PgResult d{PQexec(conn.get(), drop.c_str())};
+            if (d.ok()) {
+                ++swept;
+                std::fputs(
+                    std::format("PgTestTemplate: swept stale test database {}\n", name).c_str(),
+                    stderr);
+            } else {
+                std::fputs(std::format("PgTestTemplate: stale sweep of {} failed: {} — drop it "
+                                       "manually if it persists\n",
+                                       name, PQerrorMessage(conn.get()))
+                               .c_str(),
+                           stderr);
+            }
+        }
+        std::fputs(std::format("PgTestTemplate: sweep saw {} yuzu_test_* database(s), dropped {} "
+                               "stale\n",
+                               total, swept)
+                       .c_str(),
+                   stderr);
+        // Names the sweeper can NEVER reclaim (pre-epoch format, implausible
+        // clock stamps) only accumulate — say so before it becomes an
+        // incident. Fresh live names from concurrent runs are deliberately
+        // NOT counted here (they self-clean).
+        if (unsweepable > 50)
+            std::fputs(std::format("PgTestTemplate: WARNING — {} yuzu_test_* databases can never "
+                                   "be swept (pre-epoch names or implausible clock stamps); "
+                                   "inspect and hand-clean the instance\n",
+                                   unsweepable)
+                           .c_str(),
+                       stderr);
+    } catch (...) {
+        std::fputs("PgTestTemplate: sweep aborted by exception\n", stderr);
     }
 }
 
@@ -327,6 +400,10 @@ private:
             const bool in_use = sqlstate != nullptr && std::string_view(sqlstate) == "55006";
             if (!in_use || std::chrono::steady_clock::now() >= deadline) {
                 error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+                if (in_use)
+                    error_ += " — the template stayed busy past the 5s retry window; a "
+                              "template setup callback may have leaked a connection (e.g. a "
+                              "store background thread holding a pool lease)";
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -447,8 +524,10 @@ private:
 /// clone hands every test an already-migrated schema instead).
 ///
 /// Declare one per test file (or share a name across files that need the
-/// exact same store set — the registry builds each NAME once, first setup
-/// wins):
+/// exact same store set — the registry builds each NAME once, and every
+/// further setup attaching to the key is replay-verified against a fresh
+/// scratch database, so a divergent setup — additive or subset — fails its
+/// own tests loudly instead of inheriting the wrong template):
 ///
 ///   static yuzu::test::PgTestTemplate tpl{"swinv", [](const std::string& dsn) {
 ///       yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -463,9 +542,9 @@ private:
 /// store the file's tests rely on: Postgres refuses to clone a template
 /// that still has open connections, so a pool leaked past the callback
 /// turns into a fixture error, not a hang. Keep using plain
-/// YUZU_REQUIRE_PG_DB for tests that exercise migration/fresh-database
-/// behaviour itself (pg_migration_runner, fail-closed ctors on broken
-/// schemas) — those need the empty database.
+/// YUZU_REQUIRE_PG_DB for tests that exercise migration / fresh-database /
+/// pg-substrate behaviour itself (pg_migration_runner, fail-closed ctors
+/// on broken schemas) — those need the empty database.
 ///
 /// Template databases carry their own process-random salt (an independent
 /// generator, same collision-avoidance scheme as `unique_db_name` — two
@@ -475,29 +554,66 @@ private:
 /// `yuzu_test_*` sweep pattern.
 class PgTestTemplate {
 public:
+    /// Builds the template's schema: construct (and scope-destruct) every
+    /// store the file's tests rely on. Contract:
+    ///  - MUST close all connections before returning (scope exit of
+    ///    pools/stores does it) — a leaked connection fails later clones.
+    ///  - MUST be re-runnable against both an empty database and an
+    ///    already-migrated one (true by construction for store-ctor
+    ///    setups — the migration runner skips applied versions).
+    ///  - MUST NOT construct PostgresTestDb / touch any PgTestTemplate:
+    ///    ensure() holds a non-recursive registry mutex across this
+    ///    callback, so re-entry self-deadlocks.
     using Setup = void (*)(const std::string& dsn);
 
+    /// `name` must be short lowercase [a-z0-9_] (it is spliced into a
+    /// quoted SQL identifier and must stay sweep-eligible); invalid keys
+    /// surface as a fixture error at first ensure(), never at static init.
     PgTestTemplate(std::string name, Setup setup) : name_(std::move(name)), setup_(setup) {}
+
+    PgTestTemplate(const PgTestTemplate&) = delete;
+    PgTestTemplate& operator=(const PgTestTemplate&) = delete;
+    PgTestTemplate(PgTestTemplate&&) = delete;
+    PgTestTemplate& operator=(PgTestTemplate&&) = delete;
 
     /// Build (once) and return the template database name; on failure
     /// returns an empty string and sets `error`. A database that was
     /// CREATEd before the failure stays registered (Entry::db_name) so
     /// drop_all_built() still removes it — it just is not handed out.
+    /// A FAILED build is retried on the next ensure() (the previous
+    /// half-built database is dropped first): a transient Postgres blip
+    /// during the first [pg] test must not poison the key for the whole
+    /// process — each affected test pays its own attempt, exactly the
+    /// pre-template per-test semantics.
     ///
     /// Shared-key safety (#2091 review): when a DIFFERENT setup callback
     /// attaches to an already-built key, it is verified by REPLAY — run
-    /// against a throwaway clone of the template and required to produce
-    /// the same structural fingerprint. A divergent setup (e.g. one file's
-    /// shared-key lambda edited without the others) fails ITS tests loudly
-    /// instead of silently inheriting whichever template happened to build
-    /// first; the original template and its tests are untouched. Replay
-    /// implies setups must be re-runnable against an already-migrated
-    /// database — true by construction for store-constructor setups, since
-    /// the migration runner skips applied versions.
+    /// against a FRESH scratch database (not a clone, so a setup that
+    /// builds a SUBSET of the template's stores diverges too) and required
+    /// to produce the template's structural fingerprint. A divergent setup
+    /// (e.g. one file's shared-key lambda edited without the others) fails
+    /// ITS tests loudly instead of silently inheriting whichever template
+    /// happened to build first; the original template and its tests are
+    /// untouched. Fingerprint mismatches are deterministic and cached per
+    /// setup; transient replay failures (connectivity) are retried on the
+    /// next ensure().
     std::string ensure(const std::string& admin_dsn, std::string& error) {
+        if (!key_valid()) {
+            error = "template key '" + name_ +
+                    "' invalid: keys must be 1-24 chars of [a-z0-9_] (PG 63-byte identifier "
+                    "limit + sweep-eligibility)";
+            return {};
+        }
         Registry& reg = registry();
         const std::lock_guard<std::mutex> lock(reg.mu);
         auto it = reg.entries.find(name_);
+        if (it != reg.entries.end() && !it->second.error.empty()) {
+            // Previous build failed — reclaim its half-built database (if
+            // any) and retry from scratch.
+            drop_entry(it->second);
+            reg.entries.erase(it);
+            it = reg.entries.end();
+        }
         if (it == reg.entries.end()) {
             Entry e = build(admin_dsn);
             it = reg.entries.emplace(name_, std::move(e)).first;
@@ -508,9 +624,17 @@ public:
             return {};
         }
         if (!entry.verified.contains(setup_)) {
-            const std::string mismatch = verify_replay(entry);
-            if (!mismatch.empty()) {
-                error = "template '" + name_ + "' shared-key setup mismatch: " + mismatch;
+            const auto cached = entry.mismatched.find(setup_);
+            if (cached != entry.mismatched.end()) {
+                error = cached->second;
+                return {};
+            }
+            bool deterministic = false;
+            const std::string replay_err = verify_replay(entry, deterministic);
+            if (!replay_err.empty()) {
+                error = "template '" + name_ + "' shared-key setup mismatch: " + replay_err;
+                if (deterministic)
+                    entry.mismatched.emplace(setup_, error);
                 return {};
             }
             entry.verified.insert(setup_);
@@ -527,12 +651,41 @@ public:
     /// ran first, and on Catch2-filtered runs (`"[pg]"`, a single case) the
     /// exit-time PQconnectdb finds OpenSSL already torn down and leaks every
     /// template onto the shared instance.
+    ///
+    /// Emits one summary line when anything was registered, so job logs can
+    /// distinguish "no templates this run" from "drops happened silently".
     static void drop_all_built() {
         Registry& reg = registry();
         const std::lock_guard<std::mutex> lock(reg.mu);
+        const std::size_t total = reg.entries.size();
         for (const auto& [name, e] : reg.entries)
             drop_entry(e);
         reg.entries.clear();
+        if (total > 0) {
+            try {
+                std::fputs(
+                    std::format("PgTestTemplate: dropped {} template database(s) at run end\n",
+                                total)
+                        .c_str(),
+                    stderr);
+            } catch (...) {
+            }
+        }
+    }
+
+    /// Drop ONE key's template (if built) and forget it — the key rebuilds
+    /// transparently on its next ensure(). Exists so the mechanism test can
+    /// assert drop behaviour without wiping every other file's templates
+    /// mid-suite (under `--order rand` a global wipe would silently
+    /// re-impose the per-test migration cost this machinery removes).
+    static void drop_built(const std::string& name) {
+        Registry& reg = registry();
+        const std::lock_guard<std::mutex> lock(reg.mu);
+        auto it = reg.entries.find(name);
+        if (it == reg.entries.end())
+            return;
+        drop_entry(it->second);
+        reg.entries.erase(it);
     }
 
 private:
@@ -540,13 +693,31 @@ private:
         std::string db_name; ///< empty only when CREATE DATABASE itself failed
         std::string error;   ///< nonempty = build failed (db_name may still be set)
         std::string admin_dsn; ///< for the cleanup drop
-        /// Structural fingerprint of the built template (schemas + columns).
+        /// Structural fingerprint of the built template (schemas, columns,
+        /// indexes, constraints).
         std::string fingerprint;
         /// Setup callbacks proven equivalent to the one that built this
         /// template — byte-identical lambdas in different TUs are distinct
         /// functions, so each TU sharing a key is replay-verified once.
         std::set<Setup> verified;
+        /// Deterministic replay verdicts (fingerprint mismatch) cached per
+        /// setup, so a divergent setup fails fast on every test instead of
+        /// re-paying the full replay each time. Transient replay failures
+        /// are NOT cached.
+        std::map<Setup, std::string> mismatched;
     };
+
+    [[nodiscard]] bool key_valid() const noexcept {
+        // 24 keeps the full name ("yuzu_test_tpl_" + 10-digit epoch + "_" +
+        // 9-digit salt + "_" + key = 59) under PG's 63-byte identifier
+        // limit — a longer name would silently truncate and could collide.
+        if (name_.empty() || name_.size() > 24)
+            return false;
+        for (const char c : name_)
+            if ((c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_')
+                return false;
+        return true;
+    }
 
     /// Process-lifetime registry: dedupes builds by template name. The real
     /// cleanup is drop_all_built() from the testRunEnded listener; this
@@ -566,24 +737,30 @@ private:
     /// Best-effort drop of one built template database; failures go to
     /// stderr (same philosophy as PostgresTestDb::log_leak — a silent
     /// failure piles leaked yuzu_test_tpl_* databases onto a shared
-    /// instance).
-    static void drop_entry(const Entry& e) {
-        if (e.db_name.empty())
-            return;
-        yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
-        if (PQstatus(conn.get()) != CONNECTION_OK) {
-            std::fputs("PgTestTemplate: teardown admin connect failed — leaked a "
-                       "yuzu_test_tpl_* database\n",
+    /// instance). noexcept in effect: called from ~Registry at static
+    /// destruction, where an escaping bad_alloc would std::terminate.
+    static void drop_entry(const Entry& e) noexcept {
+        try {
+            if (e.db_name.empty())
+                return;
+            yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                std::fputs("PgTestTemplate: teardown admin connect failed — leaked a "
+                           "yuzu_test_tpl_* database\n",
+                           stderr);
+                return;
+            }
+            // FORCE for the same reason as PostgresTestDb's dtor: a connection a
+            // setup callback failed to scope-close must not make the drop fail
+            // and pile template databases onto the shared instance.
+            const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+            if (!res.ok())
+                std::fputs(PQerrorMessage(conn.get()), stderr);
+        } catch (...) {
+            std::fputs("PgTestTemplate: teardown failed — leaked a yuzu_test_tpl_* database\n",
                        stderr);
-            return;
         }
-        // FORCE for the same reason as PostgresTestDb's dtor: a connection a
-        // setup callback failed to scope-close must not make the drop fail
-        // and pile template databases onto the shared instance.
-        const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
-        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
-        if (!res.ok())
-            std::fputs(PQerrorMessage(conn.get()), stderr);
     }
 
     static Registry& registry() {
@@ -631,23 +808,32 @@ private:
         } catch (const std::exception& ex) {
             e.error = std::string("template setup threw: ") + ex.what();
             return e;
+        } catch (...) {
+            e.error = "template setup threw a non-std exception";
+            return e;
         }
-        e.error = structure_fingerprint(tpl_dsn, e.fingerprint);
-        if (e.error.empty())
+        auto fp = structure_fingerprint(tpl_dsn);
+        if (fp) {
+            e.fingerprint = std::move(*fp);
             e.verified.insert(setup_);
+        } else {
+            e.error = std::move(fp.error());
+        }
         return e;
     }
 
     /// Structural fingerprint of a database: md5 over the sorted set of
-    /// non-system schemas and (schema, table, column, type) tuples.
-    /// Deliberately structure-only — a setup may reset DATA after
-    /// migrating (e.g. the secrets template clears kek_meta) and still be
-    /// equivalent. Returns an error message, or empty on success with
-    /// `out` set.
-    static std::string structure_fingerprint(const std::string& dsn, std::string& out) {
+    /// non-system schemas, (schema, table, column, type) tuples, index
+    /// definitions, and table constraints. Deliberately structure-only —
+    /// a setup may reset DATA after migrating (e.g. the secrets template
+    /// clears kek_meta) and still be equivalent. NOT covered: triggers and
+    /// functions (no store migration creates them today; extend here if
+    /// one ever does).
+    static std::expected<std::string, std::string> structure_fingerprint(const std::string& dsn) {
         yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
         if (PQstatus(conn.get()) != CONNECTION_OK)
-            return std::string("fingerprint connect failed: ") + PQerrorMessage(conn.get());
+            return std::unexpected(std::string("fingerprint connect failed: ") +
+                                   PQerrorMessage(conn.get()));
         static constexpr const char* kQuery =
             "SELECT COALESCE(md5(string_agg(t, '|' ORDER BY t)), 'empty') FROM ("
             "  SELECT nspname || ':schema' AS t FROM pg_namespace"
@@ -656,38 +842,43 @@ private:
             "  SELECT table_schema || '.' || table_name || '.' || column_name || ':' || data_type"
             "    FROM information_schema.columns"
             "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
+            "  UNION ALL"
+            "  SELECT schemaname || '.' || tablename || ':index:' || indexname || ':' || indexdef"
+            "    FROM pg_indexes"
+            "   WHERE schemaname NOT LIKE 'pg\\_%' AND schemaname <> 'information_schema'"
+            "  UNION ALL"
+            "  SELECT table_schema || '.' || table_name || ':constraint:' || constraint_name "
+            "         || ':' || constraint_type"
+            "    FROM information_schema.table_constraints"
+            "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
             ") s";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), kQuery)};
         if (PQresultStatus(res.get()) != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-            return std::string("fingerprint query failed: ") + PQerrorMessage(conn.get());
-        out = PQgetvalue(res.get(), 0, 0);
-        return {};
+            return std::unexpected(std::string("fingerprint query failed: ") +
+                                   PQerrorMessage(conn.get()));
+        return std::string{PQgetvalue(res.get(), 0, 0)};
     }
 
-    /// Replay `setup_` against a throwaway clone of the built template and
-    /// require an identical structural fingerprint. Returns the mismatch /
-    /// failure description, or empty when equivalent.
-    std::string verify_replay(const Entry& entry) const {
+    /// Replay `setup_` against a FRESH scratch database and require the
+    /// template's structural fingerprint. Fresh, not a clone: on a clone
+    /// every migration no-ops, so a setup building a SUBSET of the
+    /// template's stores would fingerprint identically and silently
+    /// inherit schema it never builds — replaying from empty makes the
+    /// fingerprint capture exactly what THIS setup produces, catching
+    /// divergence in both directions. Returns the mismatch / failure
+    /// description (empty when equivalent); `deterministic` is set when
+    /// the failure is a fingerprint mismatch (cacheable), not transient.
+    std::string verify_replay(const Entry& entry, bool& deterministic) const {
+        deterministic = false;
         const std::string scratch = PostgresTestDb::unique_db_name();
         {
             yuzu::server::pg::PgConn conn{PQconnectdb(entry.admin_dsn.c_str())};
             if (PQstatus(conn.get()) != CONNECTION_OK)
                 return std::string("replay admin connect failed: ") + PQerrorMessage(conn.get());
-            const std::string create =
-                "CREATE DATABASE \"" + scratch + "\" TEMPLATE \"" + entry.db_name + "\"";
-            // Same object-in-use retry as PostgresTestDb::init — another
-            // fixture's clone of this template may still be detaching.
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            for (;;) {
-                yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
-                if (res.ok())
-                    break;
-                const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-                const bool in_use = sqlstate != nullptr && std::string_view(sqlstate) == "55006";
-                if (!in_use || std::chrono::steady_clock::now() >= deadline)
-                    return std::string("replay clone failed: ") + PQerrorMessage(conn.get());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            const std::string create = "CREATE DATABASE \"" + scratch + "\"";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
+            if (!res.ok())
+                return std::string("replay scratch CREATE failed: ") + PQerrorMessage(conn.get());
         }
         std::string result;
         const std::string scratch_dsn = PostgresTestDb::rewrite_dbname(entry.admin_dsn, scratch);
@@ -696,15 +887,20 @@ private:
         } else {
             try {
                 setup_(scratch_dsn);
-                std::string fp;
-                result = structure_fingerprint(scratch_dsn, fp);
-                if (result.empty() && fp != entry.fingerprint)
+                auto fp = structure_fingerprint(scratch_dsn);
+                if (!fp) {
+                    result = std::move(fp.error());
+                } else if (*fp != entry.fingerprint) {
+                    deterministic = true;
                     result = "this setup produces a different schema than the one that built "
                              "the template (fingerprint " +
-                             fp + " vs " + entry.fingerprint +
+                             *fp + " vs " + entry.fingerprint +
                              ") — shared-key setups must apply the same migrations";
+                }
             } catch (const std::exception& ex) {
                 result = std::string("replay setup threw: ") + ex.what();
+            } catch (...) {
+                result = "replay setup threw a non-std exception";
             }
         }
         {
@@ -712,7 +908,15 @@ private:
             if (PQstatus(conn.get()) == CONNECTION_OK) {
                 const std::string drop = "DROP DATABASE IF EXISTS \"" + scratch + "\" WITH (FORCE)";
                 yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
-                (void)res;
+                if (!res.ok())
+                    std::fputs(std::format("PgTestTemplate: replay scratch drop of {} failed: {}\n",
+                                           scratch, PQerrorMessage(conn.get()))
+                                   .c_str(),
+                               stderr);
+            } else {
+                std::fputs("PgTestTemplate: replay scratch drop connect failed — leaked a "
+                           "yuzu_test_* database (next sweep reclaims it)\n",
+                           stderr);
             }
         }
         return result;
@@ -750,6 +954,11 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
 /// fresh ephemeral database. Requires Catch2 macros at the expansion site.
 /// Expands to an unbraced `if` plus declarations — use only as a direct
 /// statement at block scope (never as the body of an if/loop).
+///
+/// NOTE: store-BEHAVIOUR tests should use YUZU_REQUIRE_PG_DB_TPL (below)
+/// with a pre-migrated PgTestTemplate instead — this plain form re-runs
+/// every migration per test and is reserved for migration / fresh-database
+/// / pg-substrate behaviour tests.
 #define YUZU_REQUIRE_PG_DB(var)                                                                    \
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
