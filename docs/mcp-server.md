@@ -117,7 +117,7 @@ Additional task-native prompts are exposed through `prompts/list`: `ceo_demo_age
 - **Approval workflow re-dispatch shipped** — supervised-tier (and operator-tier `delete_tag`) execution after admin approval, via the ticket-then-recall flow (`kApprovalRequired` → approve → recall with `approval_id`; one-time consumption). Documented under **Error envelope** above.
 - **SSE streaming for execution progress** is available today via the shipped `GET /api/v1/events` endpoint (sprint W5.1) — an agentic worker bridges `execute_instruction`'s returned `execution_id` to that SSE stream (see the `execute_instruction` row in `docs/user-manual/mcp.md`); that bridge remains supported. **Direction change (2026-07-11):** a spec-compliant MCP **Streamable HTTP** transport (sessions, GET SSE channel, `notifications/progress` for long-running tools) is now a committed platform requirement — ADR-1005 execution plan **Decision 15 / track 2f** supersedes the earlier "no MCP-specific streaming transport is planned" stance recorded here.
 
-## Phase 2.5 (Implemented — MCP Streamable HTTP transport, track 2f PR 1)
+## Phase 2.5 (Implemented — MCP Streamable HTTP transport, track 2f PR 1 + PR 2)
 
 The session-lifecycle + transport pre-check half of the Streamable HTTP transport is **live** (ADR-1005 execution plan **Decision 15 / track 2f** PR 1). Shipped:
 
@@ -130,7 +130,20 @@ The session-lifecycle + transport pre-check half of the Streamable HTTP transpor
 
 Session state is in-memory only and deliberately does **not** gate `/readyz`. Operator reference: `docs/user-manual/server-admin.md` (flags + Upgrade Notes) and `docs/user-manual/mcp.md`.
 
+### The GET SSE channel (PR 2)
+
+`GET /mcp/v1/` is the session's server→client channel. It replaces the PR-1 `405` placeholder:
+
+- **Attach.** Requires the session's `Mcp-Session-Id` (absent → `400`; unknown / expired / another principal's → `404`) and `Accept: text/event-stream` (missing → `406`, `-32011`; wildcards like `*/*` deliberately do **not** opt in). Heartbeats every ~3 s keep intermediaries from idling the connection out; `X-Accel-Buffering: no` defeats reverse-proxy response buffering.
+- **Resume.** Each session has its own bounded replay ring and its own event-id namespace starting at 1 (ids are **never** global, so a cursor from one session can never address another's frames). A reconnect with `Last-Event-ID` replays exactly the frames it missed. If the cursor's frames have already been evicted from the ring — or the cursor is one the server never issued — the session is **terminated** and the request `404`s: the client re-initializes, and durable results remain fetchable by `execution_id`. There is no silent gap, and the GET's answer is coherent with the client's next POST (which `404`s too).
+- **Revocation.** The credential that opened a stream is re-validated on **every heartbeat tick**, so a revoked token or a signed-out session kills a *live* stream, not merely future attaches — the close frame says `credential_revoked`. An **unreachable** auth store is not a revocation: it is reported as indeterminate and buys a bounded 60 s grace window, after which the stream ends with the distinct reason `auth_unavailable`. That distinction exists so an auth-backend blip cannot cut every stream on the fleet at once, and so an operator can tell a security event from an outage.
+- **Caps.** Every held-open SSE response pins one HTTP worker for its whole life, so concurrency is admission-controlled: `--mcp-max-streams` (default 16) and `--mcp-max-streams-per-principal` (default 4). A cap hit **rejects the newcomer** with `429` (`-32012`) carrying an honest `retry_after_ms` — it never evicts a live stream. The global cap is clamped at boot to the worker pool minus a plain-REST reserve (`--http-worker-threads`, default auto), so streams cannot starve ordinary REST traffic. *(`GET /api/v1/events` and the dashboard SSE streams are not yet on this budget — issue #2056.)*
+- **Takeover.** A second GET on a session supersedes the first (the old stream closes with `superseded`) rather than being rejected: the common second GET is a client reconnecting across a zombie TCP the server has not noticed yet, and rejecting it would lock that client out for a full write-timeout.
+- **Close reasons** are wire-visible (a final `stream-closed` frame) and audited (`mcp.stream.attach` / `mcp.stream.close`): `client_disconnect`, `superseded`, `session_terminated`, `credential_revoked`, `auth_unavailable`.
+
+In PR 2 the channel carries heartbeats and replayed frames; the producers arrive with PR 3 (`notifications/progress`). Metrics: `yuzu_mcp_sessions_active`, `yuzu_mcp_sessions_opened_total`, `yuzu_mcp_streams_active`, `yuzu_mcp_stream_replay_ring_evictions_total`, `yuzu_mcp_stream_rejects_total{reason}`.
+
 ## Phase 3 (Planned)
 
 - Cross-surface / durable approval-ticket state (today the ticket lives in the shared `ApprovalManager` store, which is durable, but the MCP recall is stateless — no per-worker session).
-- **MCP Streamable HTTP — GET SSE channel + progress bridge** (the remaining 2f rungs, PR 2/3): the `GET /mcp/v1/` SSE channel with `Last-Event-ID` resume (a `405` placeholder today) and `notifications/progress` for long-running tools (`_meta.progressToken`). Same ADR-1005 Decision 15 / track 2f ladder; chaos merge-gate map: `docs/mcp-streamable-http-chaos-design.md`.
+- **MCP Streamable HTTP — progress bridge** (track 2f PR 3): `notifications/progress` for long-running tools (`_meta.progressToken`), published onto the GET channel above and onto SSE-on-POST. Same ADR-1005 Decision 15 / track 2f ladder; chaos merge-gate map: `docs/mcp-streamable-http-chaos-design.md`.
