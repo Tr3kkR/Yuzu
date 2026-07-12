@@ -1574,9 +1574,11 @@ public:
                                                    : std::nullopt;
                                 return v ? *v : std::string{};
                             };
-                            lic_cfg.kv_set = [this](std::string_view key, std::string_view value) {
-                                if (kv_store_)
-                                    kv_store_->set("license_scan", key, value);
+                            lic_cfg.kv_set = [this](std::string_view key,
+                                                    std::string_view value) -> bool {
+                                // Propagate the persist result so the sync source can skip
+                                // a cycle rather than use an unpersisted HMAC key (D-11).
+                                return kv_store_ && kv_store_->set("license_scan", key, value);
                             };
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));

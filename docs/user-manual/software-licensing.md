@@ -107,32 +107,29 @@ co-determination question; set the mode per that agreement.
 
 ## Reading detected licences
 
-Reads are served under **`/api/v1/sle/*`** (all gated on the `SoftwareLicensing`
+Per **ADR-0024's "Placement under ADR-1005"**, the server hosts the **discovery
+mechanism** only. The in-server read/erase surface (gated on the `SoftwareLicensing`
 securable — see [Access control](#access-control)):
 
-| Endpoint | Returns | Scope |
+| Surface | Returns | Scope |
 |---|---|---|
-| `GET /api/v1/sle/summary` | fleet KPI tiles (counts by state, expiring-soon) | fleet aggregate (global-gated) |
-| `GET /api/v1/sle/licenses?state=&expiring_within_days=&q=&limit=` | the detected-licence list, rolled up per product | fleet aggregate (global-gated) |
-| `GET /api/v1/sle/licenses/{key}/devices` | which devices carry a given product | fan-out list (global-gated) |
-| `GET /api/v1/sle/agents/{agent_id}` | one device's detected licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
+| `GET /api/v1/sle/agents/{agent_id}` | one device's discovered licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
+| `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` |
+| MCP `query_software_licenses` | one device's discovered-licence **facts** (machine-scope; **no `user_ref`**) | global `SoftwareLicensing:Read` |
 
-The fleet-aggregate surfaces are **pinned global-only by design** (they are precomputed
-rollups across every management group, exactly like the `/inventory` software catalog):
-a management-group-confined principal is denied with explicit guidance rather than served
-a partial rollup. The **single-agent drill** (`/sle/agents/{id}`) is the exception — it
-takes a real per-device scoped gate from day one and is **audited on every open**
-(`sle.agent.view`, fail-closed: a non-persistable audit row returns `503` and serves no
-licence data), because it can render per-user `user_ref` rows.
+The **single-agent drill** (`GET /sle/agents/{id}`) takes a real per-device scoped gate
+and is **audited on every open** (`sle.agent.view`, fail-closed: a non-persistable audit
+row returns `503` and serves no licence data), because it can render per-user `user_ref`
+rows. Its **MCP twin** (`query_software_licenses`) returns machine-scope facts only — the
+per-user `user_ref` personal data is served solely by the audited REST drill. On a store
+degradation the drill returns a **`503` degrade**, never a successful empty result — so a
+licence query can never read a transient outage as "nothing licensed".
 
-On a store degradation (Postgres unreachable after a healthy boot), the SLE surfaces
-return a **`503` degrade** (and the dashboard shows an "unavailable" banner), never a
-successful empty result — so a licence query can never read a transient outage as
-"nothing licensed".
-
-The point-and-click view of the same data is the **SLE** page (top-nav **SLE** →
-**Licences**): tables and KPI tiles, with the software **catalog** remaining on the
-`/inventory` page, cross-linked.
+**Compliance, entitlements, usage/reclamation, and the fleet posture reads** (`/sle/summary`,
+`/sle/licenses`, the per-product device fan-out, and the compliance MCP tool) **interpret**
+discovered facts against purchased rights and are the **SAM use-case-engine module's**
+surface — not built in-server. The **SLE page** (the Licences view plus the
+compliance / entitlement / reclamation views) lands with that work, not in this release.
 
 ## Access control
 
@@ -166,17 +163,18 @@ enabling the SLE sources — deny-override wins).
   Because each sync **full-replaces** the device's rows, the identifier is purged
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
   This knob-flip full-replace is the erasure path available today.
-- **Decommission cascade — built, not yet operator-triggerable.** This release adds the
-  agent-decommission cascade that clears **all** of a removed device's per-device stores
-  (including its licence rows), but **no operator action triggers it yet**: the gated,
-  audited decommission route that invokes it lands with the next SLE PR. Until that route
-  ships, the cascade cannot be used to erase a specific device on demand — the knob-flip
-  full-replace above is the working mechanism.
+- **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
+  the agent-decommission cascade to a gated (`SoftwareLicensing:Delete`), audited REST
+  route that clears **all** of a removed device's per-device stores (including its licence
+  rows). It is **audit-before-erase, fail-closed**: it records a durable
+  `sle.agent.decommission|attempt` and refuses to erase if that evidence row cannot persist,
+  then reports the per-store outcome. Because each store's delete now returns its committed
+  status, a store whose delete rolled back is reported `failed` (HTTP 500 — re-issue the
+  idempotent DELETE), never a false "decommissioned".
 - **Stated gap:** there is **no row-level erasure API** — you cannot delete a single
-  `user_ref` row while keeping the device's other rows. The knob-flip full-replace is the
-  erasure mechanism shipped and usable today (the decommission cascade is built but not yet
-  operator-triggerable, per the note above); a targeted per-subject (DSAR) delete is a
-  tracked platform follow-up, not shipped here.
+  `user_ref` row while keeping the device's other rows. The knob-flip full-replace and the
+  device-level decommission above are the erasure mechanisms shipped today; a targeted
+  per-subject (DSAR) delete is a tracked platform follow-up, not shipped here.
 
 ## Agent privilege (per-user hive probing)
 

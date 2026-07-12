@@ -75,6 +75,7 @@ const YuzuPluginDescriptor kFakeDescriptor = {
 // A fake KvStore backing the injected k_agent accessors.
 struct FakeKv {
     std::map<std::string, std::string> m;
+    bool fail_set = false; // simulate a persist failure (disk-full / SQLite-busy)
 
     SoftwareLicensingConfig config(UserRefMode mode) {
         SoftwareLicensingConfig c;
@@ -83,8 +84,11 @@ struct FakeKv {
             auto it = m.find(std::string(k));
             return it == m.end() ? std::string{} : it->second;
         };
-        c.kv_set = [this](std::string_view k, std::string_view v) {
+        c.kv_set = [this](std::string_view k, std::string_view v) -> bool {
+            if (fail_set)
+                return false; // NOT persisted → sync source must skip the cycle (D-11)
             m[std::string(k)] = std::string(v);
+            return true;
         };
         return c;
     }
@@ -145,6 +149,18 @@ TEST_CASE("user_ref knob: omit empties the identifier but keeps the record",
     CHECK(recs[0].user_ref.empty());
     CHECK(recs[0].user_scope == "user"); // scope preserved — the probe is not suppressed
     CHECK(recs.size() == 1);             // the record itself stays
+}
+
+TEST_CASE("user_ref hash: a failed key persist skips the cycle (stable pseudonym, D-11)",
+          "[licensing_sync][knob]") {
+    FakeKv kv;
+    kv.fail_set = true; // the HMAC key cannot be persisted (disk-full / SQLite-busy)
+    auto out = collect_with(user_lic_line("jsmith"), kv, UserRefMode::hash);
+    // The freshly-generated key could not persist → skip this cycle rather than emit a
+    // user_ref hashed under a key that won't survive to the next cycle (an unstable
+    // pseudonym: the same profile would map to a new user_ref next time).
+    CHECK_FALSE(out.has_value());
+    CHECK(kv.m.empty()); // nothing was persisted
 }
 
 TEST_CASE("user_ref knob: hash replaces the profile with a 16-hex pseudonym",

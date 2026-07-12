@@ -164,9 +164,16 @@ std::optional<std::string> resolve_k_agent(const SoftwareLicensingConfig& cfg) {
         return std::nullopt;
     }
     std::string raw(reinterpret_cast<const char*>(buf), sizeof(buf));
-    if (cfg.kv_set)
-        cfg.kv_set(kUserRefHmacKeyName, to_hex(raw)); // hex, never the raw bytes
-    return raw;
+    if (cfg.kv_set && !cfg.kv_set(kUserRefHmacKeyName, to_hex(raw))) {
+        // The freshly-generated key could not be PERSISTED (disk-full, SQLite-busy).
+        // Using it now and losing it means the next cycle regenerates a different key
+        // and the same profile maps to a NEW user_ref — an unstable pseudonym
+        // (Decision 11). Skip the cycle instead; retry next interval.
+        spdlog::warn("sync: software_licensing could not persist the user_ref HMAC key "
+                     "— skipping this cycle to keep the per-profile pseudonym stable");
+        return std::nullopt;
+    }
+    return raw; // key persisted (or kv_set unwired, e.g. tests) — safe to use
 }
 
 } // namespace

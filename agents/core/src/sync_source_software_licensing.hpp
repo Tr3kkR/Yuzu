@@ -123,7 +123,11 @@ struct SoftwareLicensingConfig {
     /// Read a persisted value (returns "" when absent). Namespace-scoped upstream.
     std::function<std::string(std::string_view key)> kv_get;
     /// Persist a value. Namespace-scoped upstream.
-    std::function<void(std::string_view key, std::string_view value)> kv_set;
+    // Returns true iff the value was durably persisted. A false return (e.g. a
+    // disk-full / SQLite-busy failure to persist the user_ref HMAC key) makes the
+    // sync source SKIP the cycle rather than use an unpersisted key that would
+    // regenerate next cycle — keeping the per-profile pseudonym stable (Decision 11).
+    std::function<bool(std::string_view key, std::string_view value)> kv_set;
 };
 
 /// KvStore key (within the `license_scan` namespace) holding the hex-encoded
