@@ -10938,7 +10938,11 @@ private:
                 // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f): the
                 // session registry, the --mcp-no-streaming kill switch (by live
                 // pointer into cfg_), and the Origin allowlist.
-                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins);
+                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins,
+                // ADR-0024: the SLE discovery store backs the query_software_licenses
+                // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
+                // per-user user_ref PII stays on the audited REST drill).
+                software_licensing_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
