@@ -1,8 +1,8 @@
 # API Versioning & Deprecation Policy
 
-**Status:** policy — binding on all operator-facing machine surfaces once published. **Published = this document present on `main`** (the release branch); no draft, feature-branch, or `dev`-only copy counts. This is the single checkable discharge moment for the ADR-0022 Phase 8 interlock below.
+**Status:** policy — binding on all operator-facing machine surfaces once published. **Published = this document present on `main`** (the release branch); no draft, feature-branch, or `dev`-only copy counts. This is the single checkable discharge moment for the ADR-1005 Phase 8 interlock below.
 **Scope:** REST (`/api/v1/*`) and MCP tools. The agent↔server gRPC wire protocol is governed separately (proto compatibility is enforced by the `proto-compat` CI job, not this policy). Dashboard HTML fragments are UI, not API, and carry no compatibility contract.
-**Why now:** ADR-0022 makes the API surface a product contract (its Consequences require a published compatibility posture before any external engine credential is issued — one of the two Phase 8 issuance interlocks in `docs/adr-0022-execution-plan.md`), and ADR-0021 is landing new surface that needs this posture regardless. The NVD route retirement (execution plan Phase 7) is the first deprecation to run this cycle.
+**Why now:** ADR-1005 makes the API surface a product contract (its Consequences require a published compatibility posture before any external engine credential is issued — one of the two Phase 8 issuance interlocks in `docs/adr-1005-execution-plan.md`), and ADR-0021 is landing new surface that needs this posture regardless. The NVD route retirement (execution plan Phase 7) is the first deprecation to run this cycle.
 
 ## Versioning mechanics
 
@@ -29,5 +29,5 @@ While the product is pre-1.0, the same cycle applies — pre-1.0 status does not
 
 ## What this policy gates
 
-- **External engine credentials** (ADR-0022 Interim rules): no engine credential is issued to an external party before this policy is published. Publication of this document discharges the "published API versioning/deprecation policy" half of the Phase 8 issuance interlock; the per-principal quota cap is the other half and is tracked separately.
-- **Every deprecation of a shipped operator surface** — including grandfathered legacy routes — runs the cycle above; the ADR-0022 exception ledger records any surface retired outside it (there should be none; the ledger also closes out grandfathered-surface retirements that ran the cycle, per execution-plan Phase 7 PR E — that entry closes the grandfather exception, it does not record a violation).
+- **External engine credentials** (ADR-1005 Interim rules): no engine credential is issued to an external party before this policy is published. Publication of this document discharges the "published API versioning/deprecation policy" half of the Phase 8 issuance interlock; the per-principal quota cap is the other half and is tracked separately.
+- **Every deprecation of a shipped operator surface** — including grandfathered legacy routes — runs the cycle above; the ADR-1005 exception ledger records any surface retired outside it (there should be none; the ledger also closes out grandfathered-surface retirements that ran the cycle, per execution-plan Phase 7 PR E — that entry closes the grandfather exception, it does not record a violation).

@@ -140,6 +140,48 @@ TEST_CASE("MCP JSON-RPC: null id error response", "[mcp][jsonrpc]") {
     CHECK(parsed["error"]["code"] == kParseError);
 }
 
+// Direct contract test for the shared A4 transport-denial builders (the 8
+// /mcp/v1/ transport denials route through these). Locks the error.data shape
+// and the json_quoted escaping independent of any handler wiring.
+TEST_CASE("MCP JSON-RPC: A4 transport error builder", "[mcp][jsonrpc][a4]") {
+    nlohmann::json id = 7;
+
+    SECTION("correlation_id + null retry + remediation present") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kMcpSessionCap, "Session limit reached", "req-abc-1", "do the thing"));
+        CHECK(p["id"] == 7);
+        CHECK(p["error"]["code"] == kMcpSessionCap);
+        CHECK(p["error"]["data"]["correlation_id"] == "req-abc-1");
+        REQUIRE(p["error"]["data"].contains("retry_after_ms"));
+        CHECK(p["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(p["error"]["data"]["remediation"] == "do the thing");
+    }
+    SECTION("remediation omitted when empty; retry_after_ms still a present null key") {
+        auto p = nlohmann::json::parse(
+            error_response_a4(id, kMcpOriginRejected, "Origin not allowed", "req-abc-2"));
+        REQUIRE(p["error"]["data"].contains("retry_after_ms"));
+        CHECK(p["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(p["error"]["data"].contains("remediation")); // §A4: omit when empty
+    }
+    SECTION("concrete retry_after_ms is emitted as a number") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kMcpSessionCap, "Session limit reached", "req-abc-3", "wait", 5000));
+        CHECK(p["error"]["data"]["retry_after_ms"] == 5000);
+    }
+    SECTION("null-id variant echoes id:null") {
+        auto p = nlohmann::json::parse(error_response_null_a4(
+            kMcpOriginRejected, "Origin not allowed", "req-abc-4", "fix origin"));
+        CHECK(p["id"].is_null());
+        CHECK(p["error"]["data"]["correlation_id"] == "req-abc-4");
+    }
+    SECTION("data strings are JSON-escaped (a future non-literal caller can't inject)") {
+        auto p = nlohmann::json::parse(error_response_a4(
+            id, kInternalError, "boom", "req-\"x\"\\", "quote \" and backslash \\"));
+        CHECK(p["error"]["data"]["correlation_id"] == "req-\"x\"\\");
+        CHECK(p["error"]["data"]["remediation"] == "quote \" and backslash \\");
+    }
+}
+
 // ── MCP tier policy ───────────────────────────────────────────────────────
 
 TEST_CASE("MCP Policy: empty tier allows everything", "[mcp][policy]") {
@@ -663,6 +705,15 @@ struct McpTestServer {
     /// to the global perm_fn (the pre-H1 behavior every existing test relies on).
     yuzu::server::mcp::McpServer::ScopedPermFn scoped_perm_fn_for_test{};
 
+    /// MCP Streamable HTTP transport (2f). Wire a registry to turn streaming ON
+    /// (sessions minted on initialize, GET/DELETE functional). streaming_disabled_
+    /// simulates --mcp-no-streaming (captured by pointer, like production).
+    /// allowed_origins_for_test backs the Origin allowlist (empty = reject any
+    /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
+    yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
+    bool streaming_disabled_{false};
+    std::vector<std::string> allowed_origins_for_test{};
+
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
     /// the bundle collate IDOR path (dispatch as owner, collate as a stranger).
@@ -672,6 +723,8 @@ struct McpTestServer {
 
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
+    yuzu::server::mcp::McpServer::HandlerFn get_handler;    // 2f: GET /mcp/v1/
+    yuzu::server::mcp::McpServer::HandlerFn delete_handler; // 2f: DELETE /mcp/v1/
 
     void start(const std::string& tier = "") { install_handler(tier, /*dispatch_fn=*/nullptr); }
 
@@ -699,6 +752,36 @@ struct McpTestServer {
         res->status = 200;
         REQUIRE(handler);
         handler(req, *res);
+        return res;
+    }
+
+    /// 2f: dispatch an arbitrary method (POST/GET/DELETE) with custom headers
+    /// (Mcp-Session-Id / Origin / MCP-Protocol-Version) to the matching handler.
+    std::unique_ptr<httplib::Response>
+    call_raw(const std::string& method, const std::string& body,
+             const std::vector<std::pair<std::string, std::string>>& headers = {}) {
+        httplib::Request req;
+        req.method = method;
+        req.path = "/mcp/v1/";
+        req.body = body;
+        if (!body.empty()) {
+            req.set_header("Content-Type", "application/json");
+        }
+        for (const auto& [k, v] : headers) {
+            req.set_header(k, v);
+        }
+        auto res = std::make_unique<httplib::Response>();
+        res->status = 200;
+        if (method == "GET") {
+            REQUIRE(get_handler);
+            get_handler(req, *res);
+        } else if (method == "DELETE") {
+            REQUIRE(delete_handler);
+            delete_handler(req, *res);
+        } else {
+            REQUIRE(handler);
+            handler(req, *res);
+        }
         return res;
     }
 
@@ -763,6 +846,14 @@ private:
                                            {"agent_version", "0.1.3"}}});
         };
 
+        // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
+        // build_handler std::move()s below.
+        get_handler = mcp.build_get_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
+                                            session_registry_for_test, allowed_origins_for_test);
+        delete_handler =
+            mcp.build_delete_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
+                                     session_registry_for_test, allowed_origins_for_test);
+
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
             /*rbac_store=*/rbac_store_for_test,
@@ -798,7 +889,10 @@ private:
                 tag_pushes.emplace_back(agent_id, key);
             },
             /*agent_registry=*/agent_registry_for_test,
-            /*scoped_perm_fn=*/scoped_perm_fn_for_test);
+            /*scoped_perm_fn=*/scoped_perm_fn_for_test,
+            /*sessions=*/session_registry_for_test,
+            /*mcp_streaming_disabled=*/&streaming_disabled_,
+            /*allowed_origins=*/allowed_origins_for_test);
     }
 };
 
@@ -1882,16 +1976,18 @@ TEST_CASE("MCP Integration: unauthenticated returns 401", "[mcp][integration]") 
     CHECK(res->status == 401);
 }
 
-// ── 8. Notification (no id) — verify 204 response ──────────────────────────
+// ── 8. Notification (no id) — verify 202 response ──────────────────────────
+// MCP Streamable HTTP (ADR-1005 Decision 15, 2f) flips this from 204 → 202
+// (spec MUST), unconditionally. See the "[mcp][transport][2f]" cases below.
 
-TEST_CASE("MCP Integration: notification returns 204", "[mcp][integration]") {
+TEST_CASE("MCP Integration: notification returns 202", "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
     // A JSON-RPC notification has no "id" field
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
     REQUIRE(res);
-    CHECK(res->status == 204);
+    CHECK(res->status == 202);
 }
 
 // ── 9. Invalid JSON — verify parse error ────────────────────────────────────
@@ -4872,4 +4968,341 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     sqlite3_close(raw_db);
     std::error_code ec;
     fs::remove_all(tmp_dir, ec);
+}
+
+// ── MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f) ──────────
+//
+// Session lifecycle + transport pre-checks, driven through the same in-process
+// build_handler / build_get_handler / build_delete_handler seams. Chaos gates
+// CH-7(b,c), CH-8, CH-9 are P0 merge gates for this rung.
+
+namespace {
+// Helper: extract the minted session id from an initialize response header.
+std::string mint_session(McpTestServer& ts, int id = 1) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":)" + std::to_string(id) +
+                       R"(,"params":{}})");
+    REQUIRE(res->status == 200);
+    return res->get_header_value("Mcp-Session-Id");
+}
+} // namespace
+
+TEST_CASE("MCP 2f: notification answers 202 not 204 (spec MUST, streaming-agnostic)",
+          "[mcp][transport][2f]") {
+    McpTestServer ts; // streaming OFF (no registry) — the flip is unconditional
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
+    CHECK(res->status == 202);
+    CHECK(res->body.empty());
+}
+
+TEST_CASE("MCP 2f: streaming OFF mints no session header (byte-compat)", "[mcp][transport][2f]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Mcp-Session-Id").empty()); // no minting when streaming off
+}
+
+TEST_CASE("MCP 2f: initialize mints a principal-bound session + open audit", "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    auto sid = mint_session(ts);
+    CHECK(sid.size() == 32); // 128-bit hex
+    CHECK(reg.active_count() == 1);
+    // minimal PR-1 audit: open verb fired
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.open|success") !=
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP 2f/CH-8: client-supplied session id on initialize is NOT adopted (no fixation)",
+          "[mcp][transport][2f][ch8]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    const std::string attacker_id(32, 'b');
+    auto res = ts.call_raw(
+        "POST", R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})",
+        {{"Mcp-Session-Id", attacker_id}});
+    CHECK(res->status == 200);
+    const auto minted = res->get_header_value("Mcp-Session-Id");
+    CHECK(minted.size() == 32);
+    CHECK(minted != attacker_id);                       // a FRESH id, never the client's
+    CHECK(reg.validate_and_touch(attacker_id, "test-user") ==
+          mcp::McpSessionRegistry::ValidateResult::kUnknown); // attacker id never became live
+}
+
+TEST_CASE("MCP 2f: presented session validated; unknown → 404 + reject audit",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    auto sid = mint_session(ts);
+
+    SECTION("valid presented session proceeds") {
+        auto ok = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                              {{"Mcp-Session-Id", sid}});
+        CHECK(ok->status == 200);
+    }
+    SECTION("unknown session → 404 + reject audit") {
+        auto bad = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                               {{"Mcp-Session-Id", std::string(32, 'f')}});
+        CHECK(bad->status == 404);
+        auto body = nlohmann::json::parse(bad->body);
+        CHECK(body["error"]["code"] == mcp::kMcpUnknownSession);
+        // shared transport A4 error.data (correlation_id present, req- prefixed)
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+              ts.audit_log.end());
+    }
+}
+
+TEST_CASE("MCP 2f/CH-8: valid session under a different principal → 404 (no oracle)",
+          "[mcp][transport][2f][ch8]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.mock_username = "alice";
+    ts.start();
+
+    auto sid = mint_session(ts); // bound to alice
+    ts.mock_username = "bob";     // subsequent calls authenticate as bob
+    auto res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                           {{"Mcp-Session-Id", sid}});
+    CHECK(res->status == 404); // indistinguishable from an unknown id
+}
+
+TEST_CASE("MCP 2f/CH-7(b): --mcp-no-streaming ignores a presented session id (defined behaviour)",
+          "[mcp][transport][2f][ch7]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg; // registry wired...
+    ts.streaming_disabled_ = true;        // ...but the kill switch is on
+    ts.start();
+
+    // initialize mints nothing
+    auto init = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    CHECK(init->status == 200);
+    CHECK(init->get_header_value("Mcp-Session-Id").empty());
+
+    // a presented (bogus) session id is IGNORED, not 404'd — plain POST proceeds
+    auto res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                           {{"Mcp-Session-Id", std::string(32, 'a')}});
+    CHECK(res->status == 200);
+
+    // notification still flips to 202 (spec MUST, independent of streaming)
+    auto notif = ts.call(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
+    CHECK(notif->status == 202);
+
+    // GET / DELETE → 405 under the kill switch
+    CHECK(ts.call_raw("GET", "")->status == 405);
+    CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", std::string(32, 'a')}})->status == 405);
+}
+
+TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][transport][2f][ch9]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.allowed_origins_for_test = {"https://ui.example.com"};
+    ts.start();
+
+    SECTION("hostile Origin rejected 403 + reject audit (POST)") {
+        auto res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})",
+                               {{"Origin", "https://evil.example.com"}});
+        CHECK(res->status == 403);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        // Full A4 shape locked at a non-cap site too (shared-builder contract):
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].is_string());
+        CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+              ts.audit_log.end());
+    }
+    SECTION("allowlisted Origin permitted (POST)") {
+        auto res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})",
+                               {{"Origin", "https://ui.example.com"}});
+        CHECK(res->status == 200);
+    }
+    SECTION("absent Origin permitted (credential-gated)") {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        CHECK(res->status == 200);
+    }
+    SECTION("hostile Origin rejected on DELETE too (every method)") {
+        auto res = ts.call_raw("DELETE", "", {{"Origin", "https://evil.example.com"},
+                                              {"Mcp-Session-Id", std::string(32, 'a')}});
+        CHECK(res->status == 403);
+        // A4 error.data present on the DELETE-origin denial path too
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    }
+    SECTION("hostile Origin rejected on GET too (403 precedes the 405 placeholder)") {
+        auto res = ts.call_raw("GET", "", {{"Origin", "https://evil.example.com"}});
+        CHECK(res->status == 403); // Origin check runs before the PR-1 405 placeholder
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    }
+}
+
+TEST_CASE("MCP 2f: unsupported MCP-Protocol-Version → 400", "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    auto bad = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                           {{"MCP-Protocol-Version", "1999-01-01"}});
+    CHECK(bad->status == 400);
+    auto body = nlohmann::json::parse(bad->body);
+    CHECK(body["error"]["code"] == mcp::kMcpBadProtocolVersion);
+    CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    // the denial is audited (governance COMP-NICE)
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+          ts.audit_log.end());
+
+    // a supported version is accepted
+    auto ok = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":3})",
+                          {{"MCP-Protocol-Version", "2025-06-18"}});
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("MCP 2f: protocolVersion negotiation is independent of streaming (HP-S1)",
+          "[mcp][transport][2f]") {
+    // Streaming OFF (no registry): negotiation still clamps to the supported set.
+    // This is the intentional THIRD additive change vs pre-2f, documented in the
+    // changelog + server-admin Upgrade Notes. Legacy clients (which send
+    // 2025-03-26 or no version) are unaffected — the byte-compat gate holds.
+    McpTestServer ts; // session_registry_for_test == nullptr → streaming off
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Mcp-Session-Id").empty()); // no minting when streaming off
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["result"]["protocolVersion"] == "2025-06-18"); // negotiated even with streaming off
+
+    // legacy default-version client unchanged
+    auto legacy = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+    auto lbody = nlohmann::json::parse(legacy->body);
+    CHECK(lbody["result"]["protocolVersion"] == "2025-03-26");
+}
+
+TEST_CASE("MCP 2f: initialize negotiates protocolVersion (clamp to supported)",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    SECTION("supported client version is echoed") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["result"]["protocolVersion"] == "2025-06-18");
+    }
+    SECTION("unsupported client version falls back to the default baseline") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2099-01-01"}})");
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["result"]["protocolVersion"] == "2025-03-26");
+    }
+}
+
+TEST_CASE("MCP 2f: GET is a 405 placeholder this rung", "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    CHECK(ts.call_raw("GET", "")->status == 405);
+}
+
+TEST_CASE("MCP 2f/CH-7(c): --mcp-disable still ANSWERS GET/DELETE (not 404)",
+          "[mcp][transport][2f][ch7]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.mcp_disabled_ = true; // MCP disabled at the handler level
+    ts.start();
+
+    auto g = ts.call_raw("GET", "");
+    auto body = nlohmann::json::parse(g->body);
+    CHECK(body["error"]["code"] == mcp::kMcpDisabled);
+    auto d = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", std::string(32, 'a')}});
+    auto dbody = nlohmann::json::parse(d->body);
+    CHECK(dbody["error"]["code"] == mcp::kMcpDisabled);
+}
+
+TEST_CASE("MCP 2f: DELETE terminates a session; reuse 404s; missing header 400",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    SECTION("missing Mcp-Session-Id → 400") {
+        auto res = ts.call_raw("DELETE", "");
+        CHECK(res->status == 400);
+        // shared transport A4 error.data on the null-id (bodyless) denial path
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    }
+    SECTION("terminate then reuse") {
+        auto sid = mint_session(ts);
+        auto del = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        CHECK(del->status == 200);
+        CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.close|success") !=
+              ts.audit_log.end());
+        // reuse → 404, also A4-shaped
+        auto reuse = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        CHECK(reuse->status == 404);
+        auto rbody = nlohmann::json::parse(reuse->body);
+        CHECK(rbody["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    }
+    SECTION("foreign principal cannot terminate (no oracle)") {
+        ts.mock_username = "alice";
+        auto sid = mint_session(ts);
+        ts.mock_username = "bob";
+        CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}})->status == 404);
+        ts.mock_username = "alice"; // owner still can
+        CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}})->status == 200);
+    }
+}
+
+TEST_CASE("MCP 2f/15(j): session cap hit rejects initialize with 429 (never evicts)",
+          "[mcp][transport][2f]") {
+    mcp::McpSessionRegistry reg({.per_principal_cap = 1, .global_cap = 8});
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+
+    auto first = mint_session(ts, 1);
+    CHECK(first.size() == 32);
+
+    auto second = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+    CHECK(second->status == 429);
+    auto body = nlohmann::json::parse(second->body);
+    CHECK(body["error"]["code"] == mcp::kMcpSessionCap);
+    // 15(j) / CH-5 PR-1 merge gate: the cap reject is A4-shaped. error.data
+    // carries a correlation_id, the always-present nullable retry_after_ms, and
+    // a remediation — NOT the old ad-hoc {retry_after_ms, hint} shape.
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].is_string());
+    CHECK_FALSE(body["error"]["data"].contains("hint")); // the retired non-A4 field
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+          ts.audit_log.end());
+    // the live session survived the cap rejection
+    CHECK(reg.validate_and_touch(first, "test-user") ==
+          mcp::McpSessionRegistry::ValidateResult::kValid);
 }

@@ -107,9 +107,9 @@ groups:
           description: >-
             yuzu_onbehalf_rejected_total{surface="{{ $labels.surface }}"} moved —
             a client sent a reserved on-behalf-of header/metadata key (rejected
-            per ADR-0022; HTTP gets 403, gRPC is cancelled). One-off events are
+            per ADR-1005; HTTP gets 403, gRPC is cancelled). One-off events are
             usually an integration testing a delegation convention; identify the
-            caller from the throttled [ADR-0022] warn lines (1 log per 100
+            caller from the throttled [ADR-1005] warn lines (1 log per 100
             rejections carries method/path/source) and fix the client. See
             docs/auth-architecture.md "On-behalf-of assertions rejected".
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
@@ -128,7 +128,7 @@ groups:
             on-behalf-of header on ALL traffic (every REST/MCP/dashboard request
             403s; health probes are exempt and stay green, so the service looks
             up while being unusable) or a deliberate flood. Strip the header at
-            the proxy. Diagnose via the throttled [ADR-0022] warn lines.
+            the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
 
   - name: yuzu-tls

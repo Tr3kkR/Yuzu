@@ -6,11 +6,11 @@ deciders: pending — acceptance requires at least one recorded independent revi
 scope: platform — consumer model, principal classes, UI/API boundary, use-case engine direction
 ---
 
-# 0022 — Yuzu Server is a Headless Platform; Use-Cases Live in External Engines
+# 1005 — Yuzu Server is a Headless Platform; Use-Cases Live in External Engines
 
 Strengthens (does not supersede) `docs/agentic-first-principle.md`: A1's dashboard-parity invariant is hardened here to "UIs may only compose public APIs" for new capabilities. A1's existing scope clause ("existing fragments are not retroactively required to comply") remains in force via the grandfather rules below.
 
-Related: ADR-0021 (Spark/Reflex architecture), ADR-0023 (in-server vulnerability correlation engine) + ADR-4001 (in-server vulnerability dashboard) (both absorbed into grandfathered surface #2, see below), ADR-0017 (management-group confinement of list reads), ADR-0006/0008/0012 (Postgres substrate and store contract), `docs/agentic-first-principle.md` (A1–A4), `docs/auth-architecture.md`, `docs/mcp-server.md`. See also: the [execution plan](../adr-0022-execution-plan.md) (program ladder + first-module scoping).
+Related: ADR-0021 (Spark/Reflex architecture), ADR-0023 (in-server vulnerability correlation engine) + ADR-4001 (in-server vulnerability dashboard) (both absorbed into grandfathered surface #2, see below), ADR-0017 (management-group confinement of list reads), ADR-0006/0008/0012 (Postgres substrate and store contract), `docs/agentic-first-principle.md` (A1–A5), `docs/auth-architecture.md`, `docs/mcp-server.md`. See also: the [execution plan](../adr-1005-execution-plan.md) (program ladder + first-module scoping).
 
 ## Binding status
 
@@ -86,9 +86,45 @@ The existing full dashboard remains in place, maintained, and **fully supported 
 The binding rules above are prospective. Pre-existing surfaces that do not comply are grandfathered — inventoried here so governance reviews have a citable list rather than a judgment call:
 
 1. **The in-server dashboard's in-process store access** (`*_ui.cpp`, `/fragments/*`). Grandfathered until the strangler migration reaches each surface. No NEW private seam may be added; new capability on a grandfathered surface must be API-first (Decision 4).
-2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation. **Extended 2026-07-07:** the ADR-0023 in-server correlation stack (the shipped `NvdDatabase::assess()` and `VulnFindingStore`, and the `VulnCorrelationEngine` + triggers + `Vulnerability:Scan` securable + findings routes that ADR planned — 18.1-flavoured work authored in parallel with this ADR) is **absorbed into this same grandfathered surface**: interim capability, re-homed and deleted by the same strangler sequence. The absorption is **bounded**: it covers ADR-0023's designed scope only (vuln-roadmap M1a/M1b) and it is **placement-only** — Decision 4 (API-first), full governance, ADR-0017 confinement, and ADR-0023's own securable/audit obligations apply to every further in-server vuln PR undiminished. Anything not in this enumeration is **outside the grandfather by default**, classified in governance review, not by the proposing document; for the absorbed M1a/M1b scope the 18.1 re-evaluation above is discharged by this reconciliation, while 18.1-and-beyond work outside that scope still re-evaluates against Decision 2. **Further extended 2026-07-08 — a prospective carve-out, not grandfathering of existing code:** the ADR-4001 vulnerability dashboard (the `/vuln` lens with its `/fragments/vuln/*` surface, the versioned `/api/v1/vuln/*` REST + `query_vulnerabilities` MCP read twins, the `Vulnerability` securable, and the in-server `attack_path_engine`) is absorbed on the same terms — placement-only, bounded to ADR-4001's designed scope, outside-by-default beyond it. Unlike the 0023 extension's shipped components, **every ADR-4001 item is planned/design-only** (ADR-4001 is `proposed`; none of its surfaces exist in code): this section's "pre-existing surfaces" framing does not apply to them — the carve-out pre-authorizes their *future* in-server implementation, activates as each surface ships, and is void for anything ADR-4001's ratification does not carry. Two riders: (a) unlike the legacy un-versioned `/api/nvd/*` routes, 4001's read surfaces are on the **published versioned API contract from birth**, so their Phase-7 re-home requires the full Phase 0.3 deprecation cycle with module-provided equivalents; (b) ADR-4002's scoring substrate is **not** absorbed here — it faces its own Decision 2 boundary review at its own merge. Reconciliation record: execution plan § "Relationship to ADR-0023 and ADR-4001".
+2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation. **Extended 2026-07-07:** the ADR-0023 in-server correlation stack (the shipped `NvdDatabase::assess()` and `VulnFindingStore`, and the `VulnCorrelationEngine` + triggers + `Vulnerability:Scan` securable + findings routes that ADR planned — 18.1-flavoured work authored in parallel with this ADR) is **absorbed into this same grandfathered surface**: interim capability, re-homed and deleted by the same strangler sequence. The absorption is **bounded**: it covers ADR-0023's designed scope only (vuln-roadmap M1a/M1b) and it is **placement-only** — Decision 4 (API-first), full governance, ADR-0017 confinement, and ADR-0023's own securable/audit obligations apply to every further in-server vuln PR undiminished. Anything not in this enumeration is **outside the grandfather by default**, classified in governance review, not by the proposing document; for the absorbed M1a/M1b scope the 18.1 re-evaluation above is discharged by this reconciliation, while 18.1-and-beyond work outside that scope still re-evaluates against Decision 2. **Further extended 2026-07-08 — a prospective carve-out, not grandfathering of existing code:** the ADR-4001 vulnerability dashboard (the `/vuln` lens with its `/fragments/vuln/*` surface, the versioned `/api/v1/vuln/*` REST + `query_vulnerabilities` MCP read twins, the `Vulnerability` securable, and the in-server `attack_path_engine`) is absorbed on the same terms — placement-only, bounded to ADR-4001's designed scope, outside-by-default beyond it. Unlike the 0023 extension's shipped components, **every ADR-4001 item is planned/design-only** (ADR-4001 carries `status: accepted` as of 2026-07-09 per the ADR Acceptance Convention, but none of its surfaces exist in code): this section's "pre-existing surfaces" framing does not apply to them — the carve-out pre-authorizes their *future* in-server implementation, activates as each surface ships, and is void for anything ADR-4001's ratification does not carry. Two riders: (a) unlike the legacy un-versioned `/api/nvd/*` routes, 4001's read surfaces are on the **published versioned API contract from birth**, so their Phase-7 re-home requires the full Phase 0.3 deprecation cycle with module-provided equivalents; (b) ADR-4002's scoring substrate is **not** absorbed here — it faces its own Decision 2 boundary review at its own merge. Reconciliation record: execution plan § "Relationship to ADR-0023 and ADR-4001".
 3. Exceptions recorded here accrete into the "exception ledger" the standing review question refers to:
    - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands.
+
+   - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
+     no MCP twin, and absent from route discovery (A2/A3) — a "no" on
+     Decision 1/4's twin-surface requirement. Recorded rather than fixed
+     pre-merge because:
+     - **No MCP twin — tracked follow-up, not a permanent exception.**
+       Operator-side user lifecycle (list/deactivate/reactivate a
+       SCIM-provisioned account) is a plausible MCP tool, but SCIM's own
+       wire protocol (RFC 7644) is IdP-driven push, not an operator-invoked
+       action — the *twin* to build is an MCP-shaped view/administration
+       surface over the same underlying accounts, not a literal SCIM-over-MCP
+       mirror. Scoping and building that twin is out of scope for this slice;
+       tracked as **#2021** (SCIM Groups→role mapping, slice 2 — the natural
+       place to add an MCP-visible administration surface alongside it) and
+       **#2022** (API-token revocation on deprovision, which also touches the
+       same account-lifecycle surface). Until one of those lands with an MCP
+       twin, this row stands as the open exception.
+     - **RFC 7644 `scim+json` error schema instead of the A4 envelope —
+       correct by mandate, not a gap.** SCIM is a standardized protocol
+       consumed by third-party IdP connectors (Okta, Entra ID, OneLogin) that
+       parse `urn:ietf:params:scim:api:messages:2.0:Error` bodies and
+       specific `scim_type` values; returning an A4 envelope instead would
+       break every conformant connector's error handling. This is a
+       deliberate, permanent exception for this surface — SCIM is the one
+       place in the API where an external RFC, not Yuzu's own convention,
+       owns the wire shape.
+     - **Path shape `/scim/v2/*`, not `/api/v1/...` — RFC-mandated, permanent
+       exception.** RFC 7644 §3.2 fixes the SCIM base-path convention that
+       IdP connector wizards auto-discover against; nesting it under
+       `/api/v1/` would not be a conformant SCIM endpoint. Versioning for
+       this surface instead rides SCIM's own schema/discovery mechanism
+       (`ServiceProviderConfig`/`ResourceTypes`/`Schemas`).
+     - Full design/threat-model record:
+       `docs/security-reviews/scim-provisioning-2026-07-08.md`;
+       operator-facing behavior: `docs/user-manual/scim-provisioning.md`;
+       wire reference: `docs/user-manual/rest-api.md#scim-v2-provisioning`.
 
 ## Interim rules (until the named follow-ups ship)
 

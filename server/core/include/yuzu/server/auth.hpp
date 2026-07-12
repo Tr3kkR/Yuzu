@@ -358,6 +358,20 @@ public:
     /// Remove a user by name.
     bool remove_user(const std::string& username);
 
+    /// Reactivate a user previously soft-deleted via `remove_user` — the
+    /// SCIM v2 PATCH/PUT `active: true` (un-suspend) path (AuthDB::
+    /// reactivate_user's the only writer of `is_active = 1` on an existing
+    /// row; see its header doc for the full semantics: clears lockout
+    /// state, does NOT restore MFA, leaves provisioning_source/role
+    /// untouched). Requires AuthDB (config-file-only deployments have no
+    /// soft-delete concept to reverse) — returns false without one. On
+    /// success, re-reads the row from AuthDB and repopulates the in-memory
+    /// `users_` cache (which `remove_user` erased) so `get_user_role` /
+    /// `list_users` reflect the reactivated account immediately, without
+    /// requiring a fresh login. Returns false if AuthDB reports no such
+    /// user (active or not).
+    bool reactivate_user(const std::string& username);
+
     /// Change a user's role. Uses AuthDB if available, otherwise updates in-memory + config.
     /// Returns false if user not found.
     bool update_role(const std::string& username, Role new_role);

@@ -70,6 +70,43 @@ using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 using SparkFaultFn =
     std::function<void(const std::string& key, bool faulted, std::string_view reason)>;
 
+/// Point-in-time mechanism-internal counters (#1979), folded into
+/// SparkEngineStats' mech_* fields by SparkEngine::stats() and surfaced the
+/// same way (agent heartbeat status_tags — no /metrics endpoint). Every field
+/// defaults to 0, so a mechanism with nothing to report (the cross-platform
+/// test fake, spark_registry, spark_service today) needs no code — only
+/// spark_file.cpp's teardown-quarantine machinery has anything to say yet.
+///
+/// CONSISTENCY CONTRACT: the fields are backed by independent atomics read
+/// without a shared lock, so a returned SparkMechanismStats is a point-in-time
+/// SKEW, not a coherent snapshot — never derive an invariant across two fields.
+/// Note in particular that `retiring` CAN exceed `retiring_cap`: the cap gates
+/// only new watch() calls, while teardown (unwatch / superseded-ancestor) is
+/// deliberately never gated, so in-flight teardowns can overshoot the cap
+/// (spark_file's watch() documents this) — it is NOT a `retiring <= retiring_cap`
+/// invariant. Treat each field as its own independent gauge.
+struct SparkMechanismStats {
+    /// Watches cancelled (unwatch() or a superseded ancestor) but not yet
+    /// drained by the mechanism's own worker — the #1979 retiring_ gauge.
+    std::uint64_t retiring{0};
+    /// The mechanism's fixed cap on `retiring` past which new watch() calls
+    /// are refused (#1979); 0 means "no cap / not applicable". Exposed so an
+    /// operator (and the test) can read how close `retiring` is to the limit
+    /// rather than hardcoding the constant.
+    std::uint64_t retiring_cap{0};
+    /// New watches refused because retiring_ was at its cap (#1979) — a
+    /// failed arm() call at the SparkEngine layer, never silent.
+    std::uint64_t watch_rejected_total{0};
+    /// Watches leaked to process lifetime because a cancelled I/O's
+    /// completion never arrived within the shutdown budget (#1982) — should
+    /// stay 0 in practice; the retiring_ cap bounds it structurally.
+    std::uint64_t quarantined_total{0};
+    /// Mechanism-internal operations that took longer than the mechanism's
+    /// own "slow" threshold while holding its lock (#1980) — an early warning
+    /// for a stalled watcher, not a hard fault.
+    std::uint64_t slow_op_total{0};
+};
+
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
 /// engine: register (pre-start) → start(emit, fault) → watch/unwatch as sparks
 /// arm/disarm while running → stop(). The engine calls start / watch / unwatch
@@ -99,13 +136,22 @@ public:
     watch(const std::string& key, const SparkParams& params) = 0;
 
     /// Stop watching one spark (its last subscription went). Idempotent; an
-    /// unknown key is ignored.
+    /// unknown key is ignored. May be invoked concurrently with another
+    /// unwatch(), with watch(), and with stop() — implementations must
+    /// tolerate an unwatch() that arrives after stop() as an idempotent no-op
+    /// (#1994 L3).
     virtual void unwatch(const std::string& key) = 0;
 
     /// Join the mechanism thread(s). Idempotent. Called by SparkEngine::stop()
     /// BEFORE consumer dispatch threads — a mechanism is a producer, like the
     /// wheel, so it must quiesce before its downstream consumers.
     virtual void stop() = 0;
+
+    /// Point-in-time counters (#1979). Callable from any thread without
+    /// engine-lock coordination — an implementation with counters to report
+    /// backs them with atomics, never a lock shared with watch/unwatch/stop.
+    /// Defaulted so existing/fake mechanisms need no change.
+    [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
 };
 
 /// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism

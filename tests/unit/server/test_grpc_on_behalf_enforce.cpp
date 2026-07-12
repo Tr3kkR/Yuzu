@@ -1,4 +1,4 @@
-// End-to-end coverage for the gRPC on-behalf-of guard (ADR-0022 Interim
+// End-to-end coverage for the gRPC on-behalf-of guard (ADR-1005 Interim
 // rules, execution-plan PR 1.1) — closes the gap flagged in the adversarial
 // review of PR #1972 (HIGH ①): a real grpc::Server, with the real
 // OnBehalfRejectInterceptor wired exactly as server.cpp wires it, receiving
@@ -98,7 +98,7 @@ struct LiveInterceptorHarness {
 }  // namespace
 
 TEST_CASE("Register carrying a reserved on-behalf-of key is CANCELLED and commits no side effect",
-          "[grpc][onbehalf][adr0022]") {
+          "[grpc][onbehalf][adr1005]") {
     LiveInterceptorHarness h;
     REQUIRE(h.registry.agent_count() == 0);
 
@@ -126,7 +126,7 @@ TEST_CASE("Register carrying a reserved on-behalf-of key is CANCELLED and commit
 }
 
 TEST_CASE("every reserved on-behalf-of key is rejected over the real wire, not just one",
-          "[grpc][onbehalf][adr0022]") {
+          "[grpc][onbehalf][adr1005]") {
     // Unhappy-path Gate 4 (UP-4): the interceptor and onbehalf::enforce() are
     // coupled only by both calling the same find_reserved_key() — sound
     // today, but nothing stops a future edit from forking one path. This is
@@ -157,7 +157,7 @@ TEST_CASE("every reserved on-behalf-of key is rejected over the real wire, not j
 }
 
 TEST_CASE("Register with no reserved key proceeds normally through the same interceptor",
-          "[grpc][onbehalf][adr0022]") {
+          "[grpc][onbehalf][adr1005]") {
     LiveInterceptorHarness h;
 
     apb::RegisterRequest req;
@@ -177,7 +177,7 @@ TEST_CASE("Register with no reserved key proceeds normally through the same inte
 }
 
 TEST_CASE("Subscribe (bidi stream) carrying a reserved on-behalf-of key is rejected at stream-open",
-          "[grpc][onbehalf][adr0022]") {
+          "[grpc][onbehalf][adr1005]") {
     // cpp-safety Gate 3 finding: Register's unary coverage doesn't prove the
     // guard works identically for a streaming RPC — Subscribe is the
     // "command-result handler" the execution plan's PR 1.1 rationale singles

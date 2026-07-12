@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `Changelog fragments` CI check). Entries below predate the fragment
 > convention and will be promoted normally at the next release.
 
+## [0.13.0] - 2026-07-11
+
 ### Added
 
 - **Recurring instruction schedules now actually fire (#1191).** `ScheduleEngine::evaluate_due`/`advance_schedule` had no production caller — schedules persisted and listed but never dispatched. A new `ScheduleRunner` poller (the `PolicyEvaluator`/`PreflightRunner` shape, 30s tick, joined before the stores) closes the gap: due schedules fire through the same tracked dispatch path as operator-initiated commands, the approval gate is never bypassed (`requires_approval` OR definition `approval_mode != "auto"`, one ticket per occurrence, one-approval == one-run via the occurrence anchor), and every outcome is audited (`instruction.schedule_fired`, `instruction.approval_required`) and counted (`yuzu_schedule_{fires,fire_failures,approvals_submitted,tick_errors}_total`). Hardened against adversarial review before merge: `POST /api/schedules` requires BOTH `Schedule:Write` and `Execution:Execute` — a created schedule is a fleet-wide command-dispatch primitive with no further permission check at fire time — and re-enabling a disabled schedule requires `Execution:Execute` too (disabling never does, so a runaway schedule can always be stopped); delete and enable/disable are owner-scoped (`created_by`); one approval ticket is now scoped to the single schedule occurrence that requested it (`approvals.schedule_id`), so two schedules sharing the same (creator, definition, scope) can no longer settle on each other's ticket.
@@ -206,25 +208,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade note:** the `tar.purge_source` action requires an agent at this release or later; an older
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
-
-### Fixed
-
-- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
-  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
-  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
-  self-service MCP-token provisioning. The field is now passed through and validated
-  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
-  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
-  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
-  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
-  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
-  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
-  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
-  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
-
-## [0.13.0] - 2026-07-01
-
-### Added
 
 - **JIT (just-in-time) admin elevation (`POST /api/v1/elevate`, SOC 2 CC6.3/CC6.6).** Reduces standing
   privilege: a pre-authorized operator (the new per-user `users.elevation_eligible` flag, auth.db
@@ -436,313 +419,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   degraded (pool/query failure), so a fleet vulnerability query can never read a transient backend
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
-
-### Changed
-
-- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
-  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
-  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
-  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
-  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
-  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
-  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
-  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
-
-### Security
-
-- **Response/execution reads fail closed on a corrupt/load-failed `rbac.db`; per-agent
-  management-group scope-filter foundation added (#1634, PARTIAL — the gate change that makes
-  management-group scoping effective for normal operators is NOT in this change and remains open
-  under #1634).** The response readers (MCP `query_responses` + `aggregate_responses`, REST
-  `GET /executions/{id}/visualization`, and the legacy `GET /api/responses/{id}` / `/aggregate` /
-  `/export`) gained a per-agent management-group filter, routed through ONE predicate
-  (`response_agent_in_scope` → `check_scoped_permission`) gated on `rbac_enforcement_in_effect`.
-
-  **What this fixes today (the real, observable change):** under a **corrupt or load-failed
-  `rbac.db`**, `require_permission`'s legacy fallback opens READ to any authenticated principal, so
-  these readers previously returned the **whole fleet's** responses to anyone. They now fail
-  **closed** (zero rows), matching the #1498 device-visibility posture. A transient response-store
-  read error while resolving scope likewise fails closed — surfaced as `503` (REST aggregate) / a
-  JSON-RPC internal error (`aggregate_responses`), never success-with-empty-totals (agentic-first A4
-  failure-vs-empty).
-
-  **What this does NOT yet do (important — no false sense of security):** under **normal RBAC
-  operation the filter is inert.** A holder of global `Response:Read` passes the gate and
-  `check_scoped_permission`'s global step then admits every agent (filter is a no-op → sees all);
-  a management-group-confined operator is `403`'d by the global `require_permission` gate **before**
-  the filter runs. So this does **not** bound a normal operator's responses to their management
-  groups and does **not** close the cross-operator read #1634 describes. Achieving that requires a
-  new admit-then-filter **gate** for fan-out/list reads (admit an operator holding the permission via
-  *any* management group, then filter) — a systemic change that also affects `/api/agents`,
-  `/devices`, the dashboard `/fragments/results/…` family, and the shipped #1550, and is tracked as
-  the remaining work under **#1634**. This change is the filter foundation that gate will build on.
-
-  Also included: each scope-drop is auditable (`aggregate_responses` → distinct `result=denied` +
-  `audit_persisted:false` on a gap; visualization → `scope_dropped=N` on its
-  `execution.visualization.fetch` success audit; legacy `/api/responses/*` → a `response.read`
-  `result=denied` audit, `detail=scope_dropped=<N> surface=<…>`); `ResponseStore::aggregate` takes a
-  dedicated scope parameter (off the shared `ResponseQuery`, so the row-path readers can't be handed
-  a silently-ignored scope); `distinct_agent_ids` returns `optional` (a store-read error is distinct
-  from a genuinely-empty result); and `aggregate`/`distinct_agent_ids` own their statements via
-  `SqliteStmt` RAII.
-
-- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
-  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
-  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
-  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
-  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
-  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
-  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
-  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
-  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
-  or `first_seen` was written into the future back down to now, so a previously-hidden dark endpoint
-  re-enters the freshness window. No schema change — the column had no other consumer.
-
-- **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
-  route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
-  failed to persist (audit DB locked/full, or a `bad_alloc`-class throw) could previously look like
-  a clean, audited read. Every such route now routes through one shared helper
-  (`server/core/src/rest_audit.hpp`) that captures the `AuditFn` result behind a `try/catch` (the
-  throw arm was previously silent on several routes), logs the gap, and surfaces it per surface:
-  - **Dashboard fragments** (`/fragments/device/dex`, `/fragments/device/guardian`, and the `/dex`
-    drill-downs) set the `Sec-Audit-Failed: true` response header and **still render** — a transient
-    audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
-    **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
-  - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
-    `/api/v1/guaranteed-state/events?agent_id=`, and
-    `/api/v1/guaranteed-state/device-compliance`) **fails closed** with
-    `503` + `Sec-Audit-Failed: true` and serves no PII.
-  - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
-    `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
-    matching the `query_responses` / `revoke_certificate` convention.
-
-  Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
-  evidence-gap signal.
-
-- **Behavioural dispatch-audit sites routed through the shared chokepoint for catch-arm parity
-  (#1647 follow-up).** The remaining per-device/per-signal routes that still called the `AuditFn`
-  raw — `device.live.*` (`/fragments/device/live/run`), `dex.device.perf.query` /
-  `dex.device.procperf.query`, and the `tar_tree_routes` dispatch/read sites
-  (`tar.process_tree.{read,detail}`, `tar.dns.read`, `tar.arp.read`, `tar.sources.{read,configure}`)
-  — now go through `detail::emit_behavioral_audit` in `server/core/src/rest_audit.hpp`. A throwing
-  `audit_fn` (`bad_alloc`-class) is caught and logged instead of escaping the handler (httplib would
-  have turned it into a `500`). Each route keeps its existing **dispatch/set-and-proceed** posture
-  (no read-PII route became a `503`). The `tar_tree_routes` sites previously **discarded** the audit
-  bool and set no header; they now surface `Sec-Audit-Failed: true` on a dropped/throwing audit row,
-  matching the migrated sibling routes. No audit verbs changed.
-
-- **MCP `query_responses` gained a per-agent management-group filter (#1550) — but it is INERT
-  under the global gate and does NOT yet isolate operators; see the #1634 entry above.** The tool
-  previously gated only flat `Response:Read` and then returned **any** execution's response rows
-  (`dispatched_by` was display-only, never an access check). A per-agent filter through the
-  `check_scoped_permission` chokepoint was added — HOWEVER, as the #1634 entry documents, the reader
-  still gates on the **global** `Response:Read`, and `check_scoped_permission`'s global step then
-  admits every agent for a global holder, so under normal RBAC operation **no rows are dropped** and
-  a caller does **not** see only their groups' rows. It does **not** close the cross-operator read;
-  its only active effect today is failing **closed** (zero rows) on a corrupt `rbac.db`. Effective
-  isolation needs the admit-then-filter gate change tracked under #1634. Out-of-scope rows, when
-  dropped (the corrupt-store path), are audited `result=denied` (with the distinct dropped-agent
-  count); the `denied` row's persistence failure surfaces `audit_persisted:false`. RBAC-off →
-  legacy-open (no filter), matching `require_scoped_permission`. The filter runs after
-  the 1000-row cap, so a result that hit the cap before filtering carries
-  `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
-  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(The same
-  per-agent filter is now also on `aggregate_responses`, the REST visualization reader, and the
-  legacy `/api/responses/*` readers — but see the #1634 entry above for the important caveat that
-  this filter, INCLUDING `query_responses`', is currently **inert under the global `Response:Read`
-  gate** (a normal holder sees all agents) and its only active effect is failing **closed** on a
-  corrupt `rbac.db`; effective management-group scoping needs the #1634 gate change. Still flat —
-  and **fail-OPEN on a corrupt `rbac.db`** (no filter at all) — are the dashboard `/fragments/results/…`
-  family and the workflow executions-drawer reader (tracked under #1634, same UP-1 class). Service-scoped
-  tokens are scoped by the token creator's RBAC, not the service tag.)*
-
-- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
-  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
-  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
-  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
-  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
-  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
-  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
-  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
-  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
-  `401`/`403` denial bodies from
-  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
-  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
-  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
-  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
-  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
-  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
-  the audit subsystem recovers."
-
-### Changed
-
-- **TAR `tar.configure` now advertises every per-source enable toggle and the software
-  tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
-  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
-  were already accepted by the agent but missing from the
-  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
-  discover or tune them (notably the enable toggle for the opt-in, off-by-default
-  `software` source). No runtime behaviour change — the params were always honoured; they
-  are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
-  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
-  perf collection at runtime.)
-- **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
-  Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
-  leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
-  agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
-  `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
-  `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
-  `tar_dns_collector`, `tar_proc_etw`, `tar_proc_perf`, `tar_arp_collector`) now delegate to
-  `yuzu::win::{to_wide,from_wide,reg_sz_to_utf8}`. `temp_file` (caller-buffer contract) and
-  `installed_apps` (interior-NUL semantic divergence) deliberately retain their own copies.
-  Behaviour-preserving; no user-facing change.
-- **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
-  governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
-  created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
-  `yuzu_pg_acquire_wait_seconds` now use a bucket set extended into the 10-60s range so the saturation
-  tail no longer collapses into `+Inf` (the slow-ingest alert reads a real bucket rather than the
-  `+Inf`-minus-`le=10` complement). A `yuzu:inventory_ingest_duration_seconds:p99` Prometheus
-  **recording rule** (per `source`/`phase`, `[10m]` window matching the slow-ingest alert) ships
-  alongside, precomputing the now-resolvable tail quantile the extended buckets make meaningful.
-  (2) The per-site read-degrade WARN sampler is now episode-relative: a new outage after a quiet gap
-  re-logs its leading edge instead of staying silent until the next hundredth occurrence because
-  process-lifetime sampling already spent its "1st" on an earlier, recovered outage (the
-  `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only). (3) Issue-ref tokens
-  (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on `/metrics` / Grafana.
-  The deterministic stuck-`need_full` per-agent signal is deferred pending a real-fleet IO baseline.
-
-- **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
-  (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
-  `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
-  collapsing the per-agent connection-hold and `statement_timeout` exposure that, under a cold-cache
-  `need_full` herd, could saturate the shared Postgres pool and flip healthy agents touched→full.
-  New series make the path measurable: `yuzu_inventory_ingest_duration_seconds{source,phase}` (the
-  pooled-connection + transaction hold time, split `full` vs `hash_only`), `yuzu_inventory_read_degrade_total{reason}`
-  (an authoritative read that degraded rather than returning a silent empty — otherwise invisible
-  since `/readyz` stays green under pure saturation; the per-site WARN is now sampled to avoid
-  flooding the log at agentic fan-out), `yuzu_inventory_stale_agents{source}` (a freshness gauge,
-  fed by an execution-bounded count so it can never stall the revocation-teardown sweep it shares a
-  thread with), and `yuzu_inventory_stale_count_unavailable_total` (a freeze-detector so a held gauge
-  is distinguishable from a genuine low). New `YuzuInventoryReadDegraded`, `YuzuInventoryIngestSlow`,
-  and `YuzuInventoryStaleCountUnavailable` alert rules ship active in the `yuzu-inventory` group;
-  `YuzuInventoryStaleAgents` ships disabled (no fleet-size-independent threshold — enable after
-  baselining, see `docs/user-manual/inventory.md`).
-
-- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
-  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
-  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
-  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
-  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
-  release is the cut-over that makes the server *require* them. **Operator action:** provision a
-  reachable PostgreSQL (the bundled image, a managed instance, or
-  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
-  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
-
-### Fixed
-
-- **PostgreSQL substrate container refused to boot on PostgreSQL 18 (#1739).** Every bundled
-  Docker Compose mounted the `postgres-data` volume at `/var/lib/postgresql/data` (the pre-18
-  `PGDATA` path). The `postgres:18` image stores data in a version-pinned subdirectory
-  (`/var/lib/postgresql/18/docker`) and treats a volume mounted at the legacy path as an
-  un-migrated upgrade, so the container exited 1 in a restart loop and the `server` service
-  (which `depends_on` the postgres healthcheck) never started (docker-library/postgres#1259).
-  The volume is now mounted at the PG18-recommended parent `/var/lib/postgresql` across all
-  eight affected composes (including the base `docker-compose.yml` the original report missed),
-  the two reference composes' non-working `PGDATA: /var/lib/postgresql/data` override has been
-  removed (PGDATA is left at the image default), and the Compose Wizard generator
-  (`tools/compose-wizard/`, a packaged release asset) now emits the parent mount and the
-  correct "PostgreSQL 18" label. Unreleased — postgres is a `dev`-only feature with no
-  `Dockerfile.postgres` at v0.12.0, so no shipped release is affected.
-  **Dev/UAT upgrade note:** an operator who already ran one of these stacks before this fix
-  has a pre-18 cluster at the volume root that PG18 cannot read in place; on first boot under
-  the new mount PostgreSQL silently re-initialises an empty cluster at `…/18/docker` and the
-  old data is orphaned (not destroyed) inside the same volume. Since the substrate carries no
-  production data yet, discard just the stale Postgres volume before the first PG18 boot —
-  `docker compose down` then `docker volume rm <project>_postgres-data` (or
-  `<project>_postgres-uat-data` for full-UAT). **Do not** use `docker compose down -v`: it
-  also removes `server-data` and the reference compose's `certs` volume (the per-install CA +
-  leaf certs), which would force the entire fleet to re-enroll.
-- **DEX Catalogue now credits the full Linux signal coverage (was 7, now 17 types).** The per-OS
-  coverage map (`dex_obs_platforms`) that colours the Catalogue's "monitored / not collected on
-  Linux" badges was frozen at the original 7-type conservative set from before the Linux
-  kernel/sysfs collectors existed — the collectors landed without the map being updated in the same
-  change. A Linux fleet's Catalogue therefore showed `perf.disk_latency_high`, `hw.cpu_throttled`,
-  `service.hung`, `os.time_unsynced`, `os.bugcheck`, `os.dirty_shutdown`, `disk.error`,
-  `fs.corruption`, `hw.error`, and `process.hung` as *not collected* even though the agent emits
-  them — via `poll_perf` (the `/proc` CPU/memory/diskstats breach trio), the sysfs CPU-throttle
-  poll, and the journald poll whose kernel-transport lines are classified by `dex_linux_kmsg`. The
-  map is now authoritative at 17 types, so those families render as monitored on any connected
-  Linux agent. macOS coverage (16) was already correct and is unchanged. No agent change, no data
-  change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
-  platforms.
-- **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
-  `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
-  list carry a per-agent management-group drop filter that is **not yet effective** under the
-  *global* `Inventory:Read` / `Infrastructure:Read` gate (a confined operator is denied at the gate;
-  a global operator's filter is a no-op). Docs, the SOC 2 / CAIQ CC6.1 evidence, the capability map,
-  and the relevant code comments are corrected to "designed, not yet verified — per-device
-  confinement only"; ADR-0016 gains an appended Update note (immutable original preserved). The
-  responses surface logic fix is a separate ladder (#1634 / #1718 PR-B); its docs and code comments
-  are annotated here with the same caveat. No behavior change.
-- **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
-  `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
-  strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
-  UTF-8 scrub then replaced the resulting invalid bytes with `?` (`Café` → `Caf?`), so any app or
-  publisher with a non-ASCII name was corrupted in the output — and, now that the names land in the
-  typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
-  now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
-  (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
-  round-trip intact. Affects both machine-scope registry read paths (`list`, `query`). The ingest seam's UTF-8 scrub remains as
-  defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
-  unknown). No proto/wire change.
-
-- **Sibling inventory plugins now read non-ASCII registry strings as UTF-8 (#1682), via a shared
-  helper (#1681).** Four plugins read the registry with the ANSI `Reg*A` APIs and carried the same
-  cp1252 mojibake as #1662 on any non-ASCII value: `vuln_scan` (the installed-apps enumerate path —
-  the same shape as the pre-#1662 `installed_apps`, including a `RegEnumKeyExA` key-name enumeration —
-  plus `config_checks.hpp`), `os_info` (the OS `ProductName` / edition strings), `sccm` (the SCCM
-  client version), and `windows_updates` (the WSUS `WUServer` URL). Every read whose value lands in a
-  stored or fleet-queryable surface now uses the wide `Reg*W` APIs + `WideCharToMultiByte(CP_UTF8)`;
-  presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
-  probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
-  picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
-  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
-  Windows-only header `agents/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
-  plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
-  **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
-  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
-  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
-  (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
-  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
-  delegating shims. This is a **partial** consolidation — **not** every conversion site: other plugins
-  (`processes`, `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, and the
-  `tar_dns_collector`/`tar_proc_etw`/`tar_proc_perf`/`tar_arp_collector` siblings) and several agent-**core**
-  files (`process_enum`, `dex_observer`, `guard_file`, `guard_registry`, `guard_service`, `temp_file`,
-  `trigger_engine`) still carry their own named or inline conversions; a comprehensive sweep is a tracked
-  follow-up, and `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
-  first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
-  `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
-  prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
-  four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
-  cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
-  trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
-  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows: unit tests + a
-  per-plugin MSVC compile, and an end-to-end smoke inside the Hyper-V agent VM that seeded a non-ASCII
-  `DisplayName` "Café Ñoño 日本語" under `HKCU\…\Uninstall` and confirmed it round-tripped byte-exact
-  UTF-8 through the real `RegEnumKeyExW` + `reg_sz_to_utf8` read path.)
-
-- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
-  A `service-running` / `service-stopped` guard watching a steadily-compliant service
-  previously short-circuited silently and never emitted `guard.compliant`, so the
-  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
-  compliant service could never show as compliant (on the dashboard or the per-device
-  REST read). The `registry` and `file` guards already emitted the compliant edge; the
-  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
-  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
-  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
-  service guard remains observe-only on the compliant edge (parity deferred).
-
-### Added
 
 - **TAR — software install/uninstall capture source (`$Software`).** A new TAR
   warehouse source records application **installed / removed / upgraded** events over
@@ -1265,351 +941,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently ignored, leaving the directory — which now holds the boot trace
   `procboot.etl` (boot-process names reveal which security/EDR tools are present)
   — readable by authenticated users (matches the `yuzu-server.iss` data-dir ACL).
-
-### Fixed
-
-- **A4 error envelope on MCP tier-denied paths and dex-perf REST endpoints.** MCP tier-denied
-  errors (read-only mode, tier policy, approval-required) now carry
-  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":"…"}` (the
-  remediation is an actionable hint, not `null`), the dex-perf MCP validation errors
-  (`get_dex_perf_cohorts`/`list_dex_perf_devices` invalid key/cohort_key/limit) carry the same
-  `error.data`, and `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on
-  every 400/503 branch and an `X-Correlation-Id` response header (on success and error), matching
-  the `cohort-diff` sibling. The shared REST A4 helper now always emits the spec-required nullable
-  `retry_after_ms` field. **Behaviour change:** an approval-gated MCP operation on the `supervised`
-  tier is now denied with `kTierDenied` (-32004) instead of `kApprovalRequired` (-32006) — A4
-  reserves -32006 for an envelope carrying a pollable `approval_id` + `status_url`, which the
-  unimplemented re-dispatch path (Phase 2) cannot honestly provide; the operation is still denied
-  and the remediation points at the REST API / dashboard. (#1470)
-
-- **DEX catalogue family tile labelled honestly.** The family device figure is the *largest
-  single signal's* distinct-device count, not the family union (two disjoint 50-device signals
-  read 50, not 100); the tile now reads "Peak signal devices / largest single signal" so the
-  number and label agree. Health score unchanged. (#1374)
-
-- **Operator/API tags beat agent self-report.** An agent's reported `scopable_tags` can no
-  longer overwrite an operator- or API-set tag for the same `(agent_id, key)`, preventing a
-  rogue or misconfigured agent from self-assigning into an operator-declared benchmark cohort. (#1411)
-
-- **Guardian enforce-stop denylist extended with WdFilter and BFE.** Two Windows built-ins that
-  could defeat a *listed* control indirectly — `WdFilter` (Defender's filesystem minifilter,
-  stopping it blinds real-time scanning while `WinDefend` still reads as up) and `BFE` (the Base
-  Filtering Engine the firewall sits on, stopping it tears down the firewall while `mpssvc`
-  looks protected) — are now rejected by `dangerous_enforce_service_stop`. (#1285)
-
-### Changed
-
-- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
-  `process_stream_kernel_dropped` added.** The Windows-specific
-  `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
-  meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
-  both platforms. A new `process_stream_kernel_dropped` key reports
-  **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
-  macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
-  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
-  `process_etw_dropped` will find no value after upgrade — update it to
-  `process_stream_dropped`.
-- **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
-  server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
-  Postgres substrate move and generated a server with no database to talk to.
-  It now has a PostgreSQL section on the Data step with two deployment modes:
-  **bundled** (emits a release-pinned `ghcr.io/tr3kkr/yuzu-postgres` service
-  with the reference healthcheck and gates server start on
-  `depends_on: condition: service_healthy`) and **external/managed** (the
-  operator supplies a DSN, no local container). Either way the server gets a
-  `YUZU_POSTGRES_DSN` env entry (consumed as an env var, not a CLI flag). Per
-  ADR-0010 the credentials/DSN live in the generated `.env`; the compose YAML
-  only references `${YUZU_POSTGRES_PASSWORD}` / `${YUZU_DB_PASSWORD}` /
-  `${YUZU_POSTGRES_DSN}` so no secret is baked into it. Bundled mode enforces
-  the image's distinct-credentials invariant (superuser ≠ app role) and offers
-  a Web-Crypto secret generator. The wizard's default version was also bumped
-  `0.10.0` → `0.12.0` so the bundled image tag resolves.
-- **CI server-test legs now require a reachable PostgreSQL 16**
-  (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
-  provision or authenticate one — except the documented psql-less TCP-probe
-  fallback on a native cluster) — the new `[pg]`-tagged server tests for the
-  Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
-  development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
-  tests skip cleanly; when it is set but unreachable they fail. See
-  `docs/ci-architecture.md` "Postgres for server tests" for the local
-  one-liner.
-
-### Breaking Changes
-
-- **Account lockout is ON by default (`--auth-lockout-threshold=5`).** Existing
-  deployments gain a new failure mode on upgrade with no config change: 5
-  consecutive failed local-password logins lock an account for 15 minutes
-  (returning the same generic 401 as a bad password — no "you are locked"
-  message). Shared/service accounts that authenticate with a password and any
-  password-rotation automation are the highest-risk targets. Recover with
-  `POST /api/v1/users/{name}/unlock`, wait out the window, or disable the
-  control with `--auth-lockout-threshold=0`. SSO/OIDC and API tokens are
-  unaffected. See `docs/user-manual/upgrading.md` § Account lockout and the
-  full feature entry under **Added** below.
-- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
-  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
-  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
-  container started from the published image is **encrypted + mutually
-  authenticated out of the box**: the server auto-generates a per-install CA and
-  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
-  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
-  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
-  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
-  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
-  **refuses to start** (exits non-zero) instead of silently verifying against the
-  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
-  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
-  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
-  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
-  the dashboard cert is signed by the per-install CA, so a browser shows an
-  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
-  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
-  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
-  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
-  with the `yuzu-pki` group baked into all three images, so the
-  different-uid containers can read the shared certs (the CA/server/HTTPS private
-  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
-  Native installs (deb/systemd, Windows installer) were already secure-by-default.
-  New secure reference composes: `docker-compose.reference.yml` (single server) and
-  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
-  gateway topology the **privileged server→gateway command plane (`:50063`) is now
-  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
-  CA-issued client cert, so a container with no Yuzu cert — including a compromised
-  agent — can no longer push commands to the fleet over that plane (previously it
-  was plaintext + unauthenticated). To run the old insecure posture, pass
-  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
-  "Secure-by-default deployment".
-- **Windows TAR process events no longer carry a command line (`cmdline` is
-  empty).** With the Windows `process` source moving from the snapshot-diff poll
-  to the ETW Kernel-Process feeder (see Added), process rows on Windows are
-  names-only — the ETW start event carries no command line. Any dashboard, SIEM
-  export, `tar.sql` query, or Guardian rule that read `cmdline` from
-  `$Process_*` on Windows now sees an empty string. **macOS process rows are now
-  names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
-  Added): the stream carries no command line, and the poll fallback (a Command Line
-  Tools SDK build, or a host without the ES entitlement/root) now blanks the
-  `proc_pidpath` image path it previously placed in `cmdline`. **Linux is
-  unaffected** (the poll still captures command lines). This is intentional
-  (works-council / data-minimization posture) and not
-  reversible by configuration; `process_enabled=false` disables process capture
-  entirely (stream and poll) if required. Command-line redaction patterns
-  consequently have no effect on Windows process rows (there is nothing to
-  redact). The boot-window AutoLogger backfill is configured by the production
-  InnoSetup installer (scoped to the `advanced` component) and by the developer
-  install script (`install-agent-user.ps1`); it takes effect on the next reboot
-  after install. See `docs/user-manual/tar.md`
-  "Upgrade note (Windows process capture → ETW)".
-- **The server now generates per-install default TLS certificates on first
-  boot instead of refusing to start without operator-provided certs.** A fresh
-  install is encrypted and serves the HTTPS dashboard + agent/management gRPC
-  with an auto-generated per-install ECDSA CA (no `--no-tls`/`--no-https`
-  needed). Because the dashboard cert is signed by a per-install CA, browsers
-  show an untrusted-issuer warning until the operator trusts the CA
-  (`<cert-dir>/default-ca.pem`) or replaces the certs. The server warns loudly
-  on six surfaces (startup banner; one-shot audit `server.default_certs_generated`;
-  periodic audit `server.default_certs_in_use`; Prometheus
-  `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
-  `ca_fingerprint` + `ca_expires_at`; `/readyz` `ca_store`/`ca_root`). While on default certs the agent
-  listener runs encrypted but **requests-but-does-not-require** client certs so
-  a first-boot agent can bootstrap; agents then auto-enroll for a per-agent
-  client certificate and upgrade to full mutual TLS (see "Per-agent mutual TLS"
-  under Added). An operator-supplied agent surface keeps strict mTLS, and the
-  management plane is unaffected. **Opt out with
-  `--no-default-certs`** to restore the legacy refuse-to-start. New `--ca-dir`
-  relocates the CA/cert directory. A surface given a cert without its key (or
-  vice-versa) is now a hard startup error. See `docs/auth-architecture.md`
-  "Default certificates".
-- **`--mfa-enforcement=admin-only` and `--mfa-enforcement=required` now
-  ENFORCE (previously a logged no-op).** PR 1/PR 2 accepted these values
-  for forward-compatibility and documented them as no-ops (the server
-  emitted a startup `WARN`). PR 3 wires real enforcement: an un-enrolled
-  login subject to enforcement is redirected through TOTP enrollment
-  (`POST /login/mfa/enroll`) before any session is minted. **An operator
-  who staged `--mfa-enforcement=admin-only|required` based on the prior
-  no-op documentation will hit live enforcement immediately on upgrade.**
-  Before upgrading: ensure all affected accounts are enrolled, or set the
-  flag back to `optional`, upgrade, then re-enable after verifying
-  enrollment. The startup line for non-default modes changes from `WARN`
-  (no-op) to `INFO` (enforcement active). See
-  `docs/user-manual/upgrading.md` for the full pre-flight checklist,
-  including the SSO `amr` requirement and single-admin guidance.
-- **OIDC/SSO sessions are now MFA-gated via the IdP `amr` claim instead of
-  being blanket-exempt from step-up.** An SSO session whose IdP attests a
-  multi-factor login (RFC 8176 `amr` containing `mfa`/`otp`/`hwk`/`fpt`/
-  `face`/`iris`/`sms`/`swk`/`tel`) clears high-risk endpoints without a
-  redundant prompt and re-prompts (via re-SSO) once the assertion ages
-  past `--mfa-step-up-window-secs`. An SSO session whose IdP did **not**
-  attest MFA is handled symmetrically with local users: under `optional`
-  (or `admin-only` for a non-admin) it passes the gate (Yuzu cannot mint a
-  factor for an external identity); under `required` (or `admin-only` for
-  an admin) it is gated and must re-authenticate through SSO. **If you
-  enable `required`/`admin-only` with SSO, configure your IdP to assert
-  `amr` and verify it pre-flight** — otherwise affected SSO users cannot
-  reach high-risk endpoints (recoverable by restarting in `optional`).
-
-- **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
-  Programmatic clients (CI pipelines, automation scripts, health checks)
-  that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
-  fail silently the first time the authenticating user enrolls in TOTP MFA.
-  Handle the 202 branch: read `mfa_pending_token` from the JSON body and
-  POST it along with the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX`
-  recovery code) to `POST /login/mfa` to obtain a session cookie. Clients
-  using API tokens or OIDC are unaffected.
-- **Audit verb taxonomy on every new MFA emission site uses the
-  `target_type="User"` (PascalCase) and `result ∈ {ok, error}` vocabulary
-  from `docs/observability-conventions.md`.** SIEM and Grafana rules that
-  filter on the historical lowercase `target_type="user"` + `success/failure`
-  strings used by `auth.login` / `auth.oidc_login` will not match the new
-  `mfa.*` rows. Existing auth.* sites remain on the historical vocabulary
-  for backwards compatibility (separate tracking issue).
-- **Recovery code format changed from `XXXXX-XXXXX` (50 bits) to
-  `XXXX-XXXX-XXXX-XXXX` (80 bits, four base32 groups).** Codes issued by
-  prior PR1 commits are no longer the canonical shape but remain valid
-  until consumed or regenerated.
-- **`AuthDB::remove_user` now also clears MFA enrollment state.** Soft-
-  deleting a user nulls their `mfa_totp_secret`, clears `mfa_enrolled_at`,
-  and DELETEs every `mfa_recovery_codes` row owned by the user — SOC 2 CC6.8
-  requires credentials be revoked on termination. Any external code or
-  ops tooling that relied on the prior "soft delete leaves MFA intact"
-  behavior must update.
-
-### Fixed
-
-- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
-  (a) `network_capture_method` was validated against the OS-blind union of every
-  platform's capture methods, so a Linux agent would accept and store the
-  Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
-  polling — now validated against the running host's OS accept-list via the new
-  `accepted_capture_methods_for_os` (#540). (b) `process_stabilization_exclusions`
-  and `redaction_patterns` had no element-count or length caps (an oversized array
-  degrades the per-process redaction scan), and an over-short exclusion substring
-  (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
-  256 chars, and an exclusion whose EFFECTIVE substring (after stripping
-  leading/trailing `*`) is shorter than 3 chars is rejected at configure **and
-  dropped on the load path** — `*` does not buy a pass (`*a*` strips to core
-  `a`), and the load-path floor matters because the loader re-parses the stored
-  value every fast cycle, so a sub-floor value persisted before the floor existed
-  (a no-tamper upgrade) or written out of band would otherwise reach the redaction
-  scan and suppress events. The loaders skip non-string elements instead of
-  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
-  discovery metadata is synced (substring not glob, OS-aware method rejection,
-  the 256/256/3 limits), and the stale "glob" comments are corrected to
-  "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
-  pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
-  (#544). (d) **Command-line redaction is now fail-closed on every collect path.**
-  `load_redaction_patterns` previously returned the safe built-in patterns only
-  when the stored value was empty or a non-array; a *valid array whose elements all
-  got dropped* (`[]`, `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is
-  empty) returned an empty set, silently disabling redaction so `password`/`token`/
-  `secret` were written to `process_live` in plaintext — `collect_fast` and
-  `procperf` lacked the defaults-union that `fleet_snapshot` already applied. The
-  built-in defaults are now unioned inside `load_redaction_patterns` via the shared
-  `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
-  can never DISABLE the baseline protection on any path. The load-path JSON parse
-  also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
-  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
-  metadata for `network_capture_method` no longer advertises the process-source
-  `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
-- **TAR source enable/disable is now corruption-resilient and reports a strict
-  state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
-  corrupt `tar.db` was opened and trusted, and since `get_config` returns the
-  caller default on a read failure, every `<source>_enabled` key read as its
-  default — silently re-enabling sources an operator had paused for forensic
-  preservation and defeating the #539 retention guard with no telemetry (#559);
-  (b) `tar.status` echoed the raw stored enable value, so a garbage value
-  (corruption, tampering, a downgrade/upgrade) was passed through instead of
-  flagged, and the collect-time `!= "false"` gate treated any non-`false` value
-  as enabled (#560). Fixes: `TarDatabase::open` runs `PRAGMA integrity_check` and
-  quarantines a corrupt DB aside (`tar.db.corrupt-<epoch>`, with its `-wal`/`-shm`
-  sidecars) before re-initialising a fresh one — failing **closed** if the corrupt
-  file cannot be moved aside rather than re-opening and trusting it; `status` now
-  emits a strict tri-state (`true`/`false`/`errored`); and the collect-time gate
-  (`source_enabled`) and `run_retention` both gate on that same canonical
-  tri-state, so a corrupt or tampered `<source>_enabled` value fails closed —
-  collection stops *and* the source's rows are preserved (not pruned).
-  Recovering such a source via `configure <source>_enabled=true` now also clears
-  its `paused_at`: the enable/disable transition canonicalises the previous value
-  before both legs, so an `errored`→`true` recovery no longer leaves a stale
-  `paused_at` that made `tar.status` report a now-collecting source as paused.
-- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
-  `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
-  on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
-  `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
-  was capturing via a kernel-event method when it was really polling. `do_status` now
-  emits `network_capture_method_effective` (the mechanism actually in force — always
-  `polling` today) alongside the configured `network_capture_method`, computed through a
-  single `effective_network_capture_method()` helper in the schema registry that is the
-  obvious place to wire the runtime check when a kernel-event collector lands. The
-  pre-staging affordance is preserved (the configured value is still stored and reported).
-  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
-  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
-  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
-- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
-  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
-  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
-  per-source enable check could commit one extra snapshot **after** the operator's
-  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
-  diffed against that stale baseline and emitted ghost "stopped" events for every
-  process/connection/service/user that had exited during the pause, breaking the
-  documented "re-enabling starts from a clean baseline" contract. The disable
-  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
-  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
-  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
-  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
-  disable is refused (the source stays enabled and `configure` returns an error)
-  rather than leaving a disabled source with a stale baseline. The
-  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
-  centralised in `diff_state_key()`, used by both the collectors and the disable path
-  so it cannot drift. **Operator-visible change:** the first collection cycle after a
-  re-enable emits a `started` event for every entity currently running/open (an
-  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
-  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
-  row, so the same race is closed for them too: disabling resets the in-memory
-  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
-  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
-  commits no post-disable row, and a re-enable re-baselines instead of emitting a
-  first row whose rate-average covers the entire paused window (a privacy concern on
-  the opt-in, default-off `procperf` per-application source).
-- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
-  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
-  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
-  on `tar.status` because every source defaulted its enabled flag to `true`.
-  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
-  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
-  transition from a single source of truth — so status, retention, and the
-  retention-paused list all agree the source starts disabled (and the first
-  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
-  an agent that never set these keys now reports `<source>_enabled|false` on
-  `tar.status` where it previously reported `true`; **no data collection
-  changes** (collection was already gated off), so this only affects automation
-  that parses `tar.status` to inventory active sources.
-- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
-  The `/tar` retention-paused list had three defects: (a) a source whose
-  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
-  agent DB, or any garbage) was **silently omitted** from the list — showing clean
-  state for an actually-paused source; it now renders with a value-error badge
-  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
-  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
-  (the longest-paused sources sank below recently-paused ones — inverse of operator
-  intent); unknown `paused_at` now sorts as oldest (top) with a
-  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
-  spamming many responses under one `command_id` forced the renderer to parse every
-  response (200ms–3s); the renderer now dedups to the most-recent response per agent
-  before parsing, bounding work to O(visible agents × sources) (#561).
-- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
-  set `Permissions: service-full` on `{app}\logs`, which is not a valid
-  InnoSetup permission group — ISCC silently ignores it, leaving the directory
-  with default ACLs (readable by authenticated users). Now `admins-full
-  system-full`, matching the installer's own data/cert directories. (The same
-  invalid keyword was fixed for the agent installer in #1425 / #1436.)
-- **macOS agents are no longer counted as Windows in DEX denominators.** The
-  OS check used a substring match, and "darwin" contains "win" — so on mixed
-  fleets every macOS agent inflated the Windows-online denominator behind the
-  DEX crash-free rate and the Performance tab's Reporting card, and appeared
-  in the "devices not reporting performance" drill as a phantom Windows
-  device. Both sites now match the OS prefix.
-
-### Added
 
 - **Account lockout for failed local-password logins (SOC 2 CC6.3).** After
   `--auth-lockout-threshold` (default 5) consecutive failed `POST /login`
@@ -2567,7 +1898,215 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
     AuthDB enroll → verify → login → recovery → disable).
 
+- **SAML group→role mapping.** A SAML SSO session is now promoted to `role=admin` when the
+  assertion's IdP-attested groups contain the configured admin group — mirroring the OIDC
+  `admin_group_id` guard exactly (shared `resolve_role_from_groups` helper). Two new flags /
+  env vars: `--saml-group-attribute` (`YUZU_SAML_GROUP_ATTRIBUTE`, the `<Attribute Name="...">`
+  carrying group values) and `--saml-admin-group` (`YUZU_SAML_ADMIN_GROUP`, the exact group
+  value that maps to admin; leading/trailing whitespace is trimmed). Both empty ⇒ unchanged
+  thin-slice behaviour (every SAML login is `role=user`). Matching is exact (case-sensitive, no
+  substring/prefix match) against groups read from the SAME XSW-signature-verified assertion node
+  the NameID is read from — never a document-wide search — and bounded to 64 values (DoS guard).
+  Unlike OIDC, SAML group values are **not** synced into `rbac_store` — they feed the
+  admin/user role decision only (group-scoped RBAC assignments do not apply to SAML
+  principals) — deferred pending source-aware group resolution, see issue #1832 — see
+  `docs/auth-architecture.md` "SAML 2.0 SP", `docs/user-manual/authentication.md` "SAML 2.0 SSO",
+  `docs/user-manual/server-admin.md`, and the security review
+  `docs/security-reviews/saml-sp-2026-07-01.md`.
+
+- **SAML/OIDC SSO login observability parity (#1828–#1830).** `yuzu_auth_saml_login_total` gained a
+  `role` label (`admin`/`user`); OIDC's `/auth/callback` now emits the matching
+  `yuzu_auth_oidc_login_total{result,role}` counter (previously silent). A new
+  `yuzu_saml_group_cap_truncated_total` counter increments when an assertion's group-attribute
+  values exceed the 64-value cap. A one-shot `config.admin_group_set` startup audit row now fires
+  for either `--oidc-admin-group` or `--saml-admin-group` when configured. `--oidc-admin-group` is
+  now trimmed of leading/trailing whitespace at load (closing the same silent-lockout bug already
+  fixed for `--saml-admin-group`), and the OIDC admin audit detail now names the granting group
+  (`admin_group=<value>`), mirroring the SAML audit detail.
+
+- **TAR `perf` + `procperf` collectors on Linux (procfs).** The device
+  performance sampler and the per-application top-N sampler — Windows-only
+  until now — are implemented on Linux: `perf` reads `/proc/stat`,
+  `/proc/meminfo` (`MemAvailable`; `commit_pct` reads 0 under
+  `vm.overcommit_memory=1`), `/proc/diskstats` (whole disks only, 512-byte ABI
+  sectors), and `/proc/net/dev` (loopback excluded); `procperf` does one
+  `/proc/<pid>/stat` read per process per tick (kernel 15-char comm — joins
+  `$Process_Live` by name; `version` is always `""` until on-disk version
+  capture lands). Because `perf` is default-ON, **Linux agents begin device
+  performance sampling automatically on upgrade** (device-level, no user
+  identity; opt out with `perf_enabled=false`); `procperf` remains opt-in on
+  every OS, and enabling it now also feeds the `app_perf` daily sync (B1/B2)
+  from Linux devices — no server change, the plumbing was already
+  platform-agnostic. **Enabling
+  `procperf` syncs per-app names + versions off-device** to the central
+  `app_perf` store (not local-triage-only); the agent emits a `notice|…` line
+  on the enabling `configure`, and it is documented in the config table.
+  **Linux `procperf` redaction is best-effort against the kernel's 15-byte
+  comm** — a pattern only redacts reliably when its sensitive substring is a
+  ≤15-byte, prefix-aligned comm slice (a token past byte 15 is truncated away);
+  operator patterns are matched in the same sanitized space as the stored name
+  (so `*evil|app*` redacts a process that named itself `evil|app`), and comm
+  bytes are scrubbed to valid UTF-8. macOS remains planned for both sources.
+
+- **TAR netqual on Windows + retrospective network quality (ADR-0020).** The
+  per-connection TCP-quality source (`netqual`, opt-in) now collects on Windows
+  via TCP ESTATS — smoothed RTT/jitter, per-tick loss, retrans/segs context per
+  ESTABLISHED connection, privacy-bucketed as before (`kSupportedConstrained`:
+  needs an elevated agent; non-elevated records nothing and `tar.status` reports
+  the new `netqual_capture_method` key as `none`). Two retrospective layers
+  answer "what was network quality like before TAR was running": a per-boot
+  baseline (`$NetQual_Boot`, since-boot TCP retransmit + interface-error totals
+  captured once at agent start, no elevation) and a new opt-in **`netconn`**
+  source (`$NetConn_Live`, `netconn_enabled`) that backfills OS-retained
+  connectivity history — network connect/disconnect, NCSI internet-capability
+  changes, Wi-Fi connect/fail/disconnect with reason codes — reaching
+  days-to-weeks before TAR (or the agent) existed on the box. netconn stores
+  closed enum tokens and numeric reason codes only: no SSID, BSSID, profile
+  name, interface GUID, or MAC is ever extracted (fixture-pinned allow-list
+  parser). The retrospective reach is operator-configurable via
+  `netconn_lookback_seconds` (default 7 days; `0` disables the pre-enablement
+  read entirely, for jurisdictions/works-councils where retrospective
+  collection is not permitted — see ADR-0020). Linux/macOS netconn and the
+  macOS netqual collector remain planned (schema registered, queryable-empty).
+
+- **Mapped-drive TAR capture source (`mapdrive`, capability-map §3.8).** New opt-in
+  (default-off) TAR capture source recording network-share mappings in **both**
+  directions — outbound (drives this host maps to remote shares) and inbound (remote
+  hosts mapping this host's shares, the lateral-movement signal) — distinguished by a
+  `direction` column and queryable via `$MapDrive_Live`/`$MapDrive_Hourly`. Beyond the
+  standard periodic snapshot-diff (`appeared`/`removed`), a one-time backfill at agent
+  init seeds *previously* mapped drives (`origin='historical'`) from persistent OS
+  artifacts — Windows registry `Network`/`Map Network Drive MRU`/`MountPoints2` across
+  offline profiles + Security event log 4624 network logons; Linux `/etc/fstab` + Samba
+  connect logs. Live enumeration uses `WNetEnumResourceW` + `NetSessionEnum` (Windows,
+  inbound needs local-admin/Server-Operator) and `/proc/mounts` + `smbstatus` (Linux,
+  inbound needs Samba); macOS is planned. Rows carry usernames and remote share paths
+  (identity/usage-class telemetry — enabling is audited). Enable with
+  `tar.configure {"mapdrive_enabled":"true"}`; the historical backfill materializes on
+  the first agent restart after enabling. See `docs/user-manual/tar.md`.
+
+- **SCIM 2.0 user provisioning (`/scim/v2/*`, SOC 2 CC6.2/CC6.8).** An
+  enterprise IdP (Okta/Entra/OneLogin) can now auto-provision and
+  auto-deprovision Yuzu operators via its SCIM connector — enable with
+  `--scim-enable` + `--scim-token` (HTTPS required; the server refuses to
+  start without both). Provisioned users are created at the fixed, read-only
+  `user` role and authenticate via SSO, never a local password. Deactivating
+  a user in the IdP soft-deletes the account and revokes its sessions;
+  reactivating restores it (MFA is not restored — the user re-enrolls). A
+  provenance guard ensures SCIM can only ever mutate accounts it provisioned
+  itself, so a locally-created admin or the break-glass account can never be
+  touched by an IdP push. Users-only this slice — Groups→role mapping is a
+  deferred follow-up. See `docs/auth-architecture.md` "SCIM v2 provisioning".
+
+- Engine principals & delegation design (`docs/auth-engine-principals-design.md`) — the ADR-1005 execution plan's item 2b auth-architecture follow-up: a third `engine` principal class with first-class identity (dedicated store, named human owner, soft-retain), scoped role assignments `(principal, role, scope)` as the one authorization model for every principal class, RFC 8693-shaped delegation with intersection-only effective authority, persisted `principal_kind` token attribution, 90-day credential ceiling with overlap-pair rotation, and v1 MCP tier hard-locked to `readonly`. Design only — implementation lands via the Phase 4/5 PR ladder.
+
 ### Changed
+
+- **`POST /api/v1/elevate` response contract: `expires_in` now reports TRUE remaining seconds, not
+  the requested duration.** Previously `expires_in` echoed the requested/capped `duration_secs`
+  verbatim. It now reflects the actual remaining window computed after the grant (always `<=` the
+  requested duration — the window is clamped both to `--jit-max-elevation-secs` and to the calling
+  session's own absolute expiry) and is accompanied by a new `expires_at` (RFC3339 UTC) field.
+  Integrators comparing `expires_in` for exact equality against their requested `duration_secs` should
+  switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
+  `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
+
+- **TAR `tar.configure` now advertises every per-source enable toggle and the software
+  tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
+  `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
+  were already accepted by the agent but missing from the
+  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
+  discover or tune them (notably the enable toggle for the opt-in, off-by-default
+  `software` source). No runtime behaviour change — the params were always honoured; they
+  are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
+  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
+  perf collection at runtime.)
+- **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
+  Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
+  leaf so agent-**core** can reach it without inverting the core-depends-on-plugins direction. The
+  agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
+  `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
+  `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
+  `tar_dns_collector`, `tar_proc_etw`, `tar_proc_perf`, `tar_arp_collector`) now delegate to
+  `yuzu::win::{to_wide,from_wide,reg_sz_to_utf8}`. `temp_file` (caller-buffer contract) and
+  `installed_apps` (interior-NUL semantic divergence) deliberately retain their own copies.
+  Behaviour-preserving; no user-facing change.
+- **Inventory ingest observability polish (#1686).** Three independent refinements from the #1683
+  governance run. (1) A shared-SDK `histogram(name, [labels,] buckets)` overload lets a histogram be
+  created with custom bucket boundaries; `yuzu_inventory_ingest_duration_seconds` and
+  `yuzu_pg_acquire_wait_seconds` now use a bucket set extended into the 10-60s range so the saturation
+  tail no longer collapses into `+Inf` (the slow-ingest alert reads a real bucket rather than the
+  `+Inf`-minus-`le=10` complement). A `yuzu:inventory_ingest_duration_seconds:p99` Prometheus
+  **recording rule** (per `source`/`phase`, `[10m]` window matching the slow-ingest alert) ships
+  alongside, precomputing the now-resolvable tail quantile the extended buckets make meaningful.
+  (2) The per-site read-degrade WARN sampler is now episode-relative: a new outage after a quiet gap
+  re-logs its leading edge instead of staying silent until the next hundredth occurrence because
+  process-lifetime sampling already spent its "1st" on an earlier, recovered outage (the
+  `yuzu_inventory_read_degrade_total` counter is unaffected — log fidelity only). (3) Issue-ref tokens
+  (`(#NNNN)`) were stripped from metric HELP text, which is customer-visible on `/metrics` / Grafana.
+  The deterministic stuck-`need_full` per-agent signal is deferred pending a real-fleet IO baseline.
+
+- **Installed-software inventory ingest is batched, and the ingest/read paths are now observable
+  (#1664/#1675).** `SoftwareInventoryStore` applies a full payload in a single
+  `INSERT … SELECT … unnest($1::text[], …)` statement instead of up to 20 000 single-row inserts,
+  collapsing the per-agent connection-hold and `statement_timeout` exposure that, under a cold-cache
+  `need_full` herd, could saturate the shared Postgres pool and flip healthy agents touched→full.
+  New series make the path measurable: `yuzu_inventory_ingest_duration_seconds{source,phase}` (the
+  pooled-connection + transaction hold time, split `full` vs `hash_only`), `yuzu_inventory_read_degrade_total{reason}`
+  (an authoritative read that degraded rather than returning a silent empty — otherwise invisible
+  since `/readyz` stays green under pure saturation; the per-site WARN is now sampled to avoid
+  flooding the log at agentic fan-out), `yuzu_inventory_stale_agents{source}` (a freshness gauge,
+  fed by an execution-bounded count so it can never stall the revocation-teardown sweep it shares a
+  thread with), and `yuzu_inventory_stale_count_unavailable_total` (a freeze-detector so a held gauge
+  is distinguishable from a genuine low). New `YuzuInventoryReadDegraded`, `YuzuInventoryIngestSlow`,
+  and `YuzuInventoryStaleCountUnavailable` alert rules ship active in the `yuzu-inventory` group;
+  `YuzuInventoryStaleAgents` ships disabled (no fleet-size-independent threshold — enable after
+  baselining, see `docs/user-manual/inventory.md`).
+
+- **BREAKING — the server now runs on PostgreSQL (ADR-0006/0007).** The server constructs a
+  shared connection pool at startup and **fails closed** (refuses to boot, exits non-zero) when
+  `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable — there is no
+  SQLite fallback for the server (the agent stays SQLite). The bundled `yuzu-postgres` image
+  and the `YUZU_POSTGRES_DSN` wiring in every server compose were added in prior releases; this
+  release is the cut-over that makes the server *require* them. **Operator action:** provision a
+  reachable PostgreSQL (the bundled image, a managed instance, or
+  `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
+  `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
+
+- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
+  `process_stream_kernel_dropped` added.** The Windows-specific
+  `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
+  meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
+  both platforms. A new `process_stream_kernel_dropped` key reports
+  **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
+  macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
+  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
+  `process_etw_dropped` will find no value after upgrade — update it to
+  `process_stream_dropped`.
+- **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
+  server substrate** (ADR-0006/0008, #1397). The browser wizard predated the
+  Postgres substrate move and generated a server with no database to talk to.
+  It now has a PostgreSQL section on the Data step with two deployment modes:
+  **bundled** (emits a release-pinned `ghcr.io/tr3kkr/yuzu-postgres` service
+  with the reference healthcheck and gates server start on
+  `depends_on: condition: service_healthy`) and **external/managed** (the
+  operator supplies a DSN, no local container). Either way the server gets a
+  `YUZU_POSTGRES_DSN` env entry (consumed as an env var, not a CLI flag). Per
+  ADR-0010 the credentials/DSN live in the generated `.env`; the compose YAML
+  only references `${YUZU_POSTGRES_PASSWORD}` / `${YUZU_DB_PASSWORD}` /
+  `${YUZU_POSTGRES_DSN}` so no secret is baked into it. Bundled mode enforces
+  the image's distinct-credentials invariant (superuser ≠ app role) and offers
+  a Web-Crypto secret generator. The wizard's default version was also bumped
+  `0.10.0` → `0.12.0` so the bundled image tag resolves.
+- **CI server-test legs now require a reachable PostgreSQL 16**
+  (`scripts/ci/ensure-postgres.sh` exits 1 instead of warning when it cannot
+  provision or authenticate one — except the documented psql-less TCP-probe
+  fallback on a native cluster) — the new `[pg]`-tagged server tests for the
+  Postgres substrate (#1320 PR 1) would otherwise silently skip. Local
+  development is unchanged: with `YUZU_TEST_POSTGRES_DSN` unset the `[pg]`
+  tests skip cleanly; when it is set but unreachable they fail. See
+  `docs/ci-architecture.md` "Postgres for server tests" for the local
+  one-liner.
 
 - **Guardian dashboard redesign — full-page detail, card views, and a Guard
   filter (UI only; no REST `/api/v1` change).** The Guard and Baseline detail
@@ -2594,7 +2133,382 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   containing your active Guards and deploy it — see the upgrade note in
   `docs/user-manual/guaranteed-state.md`.
 
+- **Changelog moved to per-PR fragment files (`changelog.d/`).** PRs no longer edit
+  `CHANGELOG.md` — each change adds one uniquely-named fragment
+  (`changelog.d/<PR#>-<slug>.<section>.md`, body = the finished bullet), and
+  `scripts/assemble-changelog.py promote X.Y.Z` assembles fragments (plus any legacy
+  `[Unreleased]` content) into the release section at tag time. This removes the
+  standing `[Unreleased]` merge-conflict → re-approval loop that hit every second PR.
+  Enforced in depth: a committed Claude Code PreToolUse hook denies direct
+  `CHANGELOG.md` edits with fix-it instructions, the new `Changelog fragments`
+  docs-lint job lints fragments and fails PRs whose diff changes `[Unreleased]`
+  content, and `scripts/release-preflight.sh` blocks tagging while unpromoted
+  fragments remain. Pre-convention branches convert with one command:
+  `scripts/assemble-changelog.py --extract origin/dev --id <PR#>` (moves the branch's
+  `[Unreleased]` additions into fragments and restores `CHANGELOG.md` to dev's
+  version). Convention: `changelog.d/README.md`.
+
+- The in-server vulnerability stack (ADR-0023 correlation engine; ADR-4001 `/vuln` dashboard, design-only) is now formally **interim**: absorbed into ADR-1005's grandfathered surface #2 and scheduled for re-homing into the vulnerability use-case-engine module, with deletion via the execution plan's Phase-7 strangler. Direction only — no behavior change in this release; customer-facing disclosure owed by Workstream G per execution-plan Decision 13.
+
+- **NVD vulnerability matching now evaluates full CPE version ranges.** The server-side
+  CVE store was reshaped from a flat single-upper-bound model to a normalized `cve` +
+  `cve_match` schema that carries NVD's real `versionStartIncluding/Excluding` and
+  `versionEndIncluding/Excluding` bounds, matched by an NVD-grade version comparator
+  (epoch-aware, pre-release ordering, letter-releases). `/api/nvd/match` now returns
+  far fewer false results on real-world version strings. Identity is still
+  product-name based (vendor-precise CPE matching is pending the agent typed-identity
+  collector, ADR-0018), so name-collision false positives are still possible.
+- **`GET /api/nvd/status` `total_cves` now reports a distinct-CVE count.** It previously
+  counted one row per affected product, so a multi-product CVE inflated the figure; the
+  number will read **lower** after upgrade even once fully synced. This is expected, not
+  data loss.
+- **On upgrade, the local NVD mirror is rebuilt.** The CVE-store schema migration
+  (v1→v2) drops and rebuilds the mirror; vulnerability-matching coverage is reduced
+  until the next NVD sync completes (rate-limited — up to a few hours without an API
+  key). The server logs a warning at migration time and self-heals automatically.
+
+- **The NVD sync now builds the full CVE catalog (newest-first), not ~20 keywords.** The server-side
+  NVD sync was keyword-scoped (~20 hardcoded products); it now backfills every CVE published within a
+  configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` =
+  full history) — **newest-first and resumable across restarts**, then settles into a periodic
+  last-modified freshness re-check. Product matching is prefix-anchored so it stays index-fast at
+  catalog scale. **Operator-visible:** `GET /api/nvd/status` `total_cves` grows substantially and the
+  local NVD database reaches into the hundreds of MB; the initial backfill is NVD-rate-limited (hours
+  without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set
+  `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. The mirror is never reported
+  `backfill_complete` while it holds no real NVD CVEs (the built-in fallback rules don't count),
+  so a vulnerability scan can't silently trust a mirror that never populated, and an
+  out-of-band-emptied catalog self-heals by re-fetching. On a local write failure the
+  mirror holds its cursor and stays incomplete (never dropping fetched CVEs), and a
+  prolonged upstream outage is detected and surfaced on `GET /api/nvd/status`
+  (`last_error`) rather than re-walking the full range every tick. An older window that
+  returns empty *after* real data has landed (a stale cache/proxy serving an empty page
+  for a populated range) is re-confirmed before it's trusted, so the backfill can't skip
+  a populated range and falsely report complete; a genuinely-empty boundary window is
+  still accepted so the walk terminates.
+
+- **The NVD sync is more resilient under rate-limiting, and sync failures are now observable.** On
+  HTTP 429 the server-side NVD sync now backs off (honouring a `Retry-After` header, else exponential
+  to a 30-minute cap) and retries the same page instead of failing the window and re-hammering NVD
+  every tick; an HTTP 403 (bad/revoked API key) is logged distinctly and not retried. A new
+  `yuzu_nvd_sync_failures_total` counter (labelled by `reason`: connection / http_429 / http_403 /
+  http_other / parse) exposes sync failures. Shutdown now aborts a long backfill/freshness pass
+  promptly — between pages, and during the rate-limit/backoff sleeps — instead of blocking on the
+  in-flight wait. Internal: the per-CVE upsert prepares its statements once per batch (backfill
+  speedup) and de-duplicates records sharing a CVE id. No config change or action required.
+
+- **Agentic context contract (A5):** every new or materially changed MCP tool must now ship gold-standard machine-readable context — standard spec annotations (`destructiveHint`/`readOnlyHint`/`idempotentHint`), decision-grade descriptions, bounded input schemas, typed output schemas, honest `retry_after_ms`, a maintained `initialize.instructions` orientation blob, and specs exposed as MCP resources — adopted as invariant A5 in `docs/agentic-first-principle.md` per ADR-1005 execution plan Decision 16. Design/policy only — no tool metadata changes ship with this entry; the existing ~50-tool backfill ships via track 2g's four-rung PR ladder.
+
+- **MCP server:** a spec-compliant Streamable HTTP transport (session lifecycle, GET SSE channel with resume, `notifications/progress` for long-running tools) is now committed platform direction, reversing the earlier "no MCP-specific streaming transport is planned" stance — see ADR-1005 execution plan Decision 15 / track 2f. Design only; implementation ships via track 2f's five-rung PR ladder, and the existing `GET /api/v1/events` bridge remains supported.
+
+- Renumbered the headless-platform / use-case-engines ADR from **0022** to **1005** — `docs/adr/1005-headless-platform-use-case-engines.md` and `docs/adr-1005-execution-plan.md`, plus a full in-tree reference sweep (docs cross-refs, code comments, Catch2 test tags, `CLAUDE.md`). Supersedes the interim numbering resolved in issue #1975 (which kept 0022); ADR-0023's placement note is left as the historical record of that earlier resolution.
+
+- **`yuzu_http_requests_total` gains a `principal_class` label** (`human` =
+  session cookie, `agent` = bearer/API token, `none` = no credential;
+  `engine` reserved for ADR-1005 engine principals). Classification is by
+  credential presentation, not validated session — it is a traffic-shape
+  label, never an authorization signal.
+
+  **Upgrade note:** adding a label changes Prometheus series identity — the
+  old `{method,status}` series stop incrementing at upgrade and new
+  `{method,status,principal_class}` series start at zero. Selector-style
+  queries (`rate(yuzu_http_requests_total{method="GET"}[5m])`) and
+  `sum by (method, status)` aggregations are unaffected; only dashboards or
+  rules matching the exact label set, or joining on series identity, need
+  updating.
+
+### Deprecated
+
+- **`vuln_scan` embedded CVE rule list frozen and deprecated (ADR-1005).** The
+  agent plugin's built-in static CVE list (`cve_rules.hpp`) receives no further
+  rule updates, and its use as an authoritative finding source via the
+  `scan`/`cve_scan` actions is deprecated — results against the frozen list
+  grow increasingly stale. The plugin's `inventory` collection action and the
+  generic rule-evaluation plumbing are unaffected and stay supported.
+  Authoritative CVE matching moves to the vulnerability-management use-case
+  engine module (server-side NVD matching is separately deprecated on its own
+  announced cycle); the long-term replacement for on-device rules is
+  engine-published content via the content-distribution plane.
+
 ### Fixed
+
+- **`POST /api/v1/tokens` now honors `mcp_tier`.** The handler documented (and
+  `create_token` already accepted) an `mcp_tier` field but silently dropped it, so a
+  requested MCP token was minted with the empty (RBAC-defer) tier — defeating
+  self-service MCP-token provisioning. The field is now passed through and validated
+  against the closed tier set (`readonly`/`operator`/`supervised`, or omitted); an
+  unrecognised value is a 400. A tiered/service-scoped token missing `expires_at` (or
+  over the 90-day cap) now returns a `400` instead of a misleading `503` "CSPRNG
+  unavailable" that false-paged on-call and wrote a false entropy-failure audit row.
+  The granted `mcp_tier` is recorded in the `api_token.create` audit and echoed by
+  `GET /api/v1/tokens`. **Upgrade note:** any MCP token minted before this fix was
+  stored tier-empty (RBAC-deferred = over-privileged vs intent) — rotate pre-upgrade
+  `mcp_tier` tokens (see `docs/user-manual/upgrading.md`).
+
+- **PostgreSQL substrate container refused to boot on PostgreSQL 18 (#1739).** Every bundled
+  Docker Compose mounted the `postgres-data` volume at `/var/lib/postgresql/data` (the pre-18
+  `PGDATA` path). The `postgres:18` image stores data in a version-pinned subdirectory
+  (`/var/lib/postgresql/18/docker`) and treats a volume mounted at the legacy path as an
+  un-migrated upgrade, so the container exited 1 in a restart loop and the `server` service
+  (which `depends_on` the postgres healthcheck) never started (docker-library/postgres#1259).
+  The volume is now mounted at the PG18-recommended parent `/var/lib/postgresql` across all
+  eight affected composes (including the base `docker-compose.yml` the original report missed),
+  the two reference composes' non-working `PGDATA: /var/lib/postgresql/data` override has been
+  removed (PGDATA is left at the image default), and the Compose Wizard generator
+  (`tools/compose-wizard/`, a packaged release asset) now emits the parent mount and the
+  correct "PostgreSQL 18" label. Unreleased — postgres is a `dev`-only feature with no
+  `Dockerfile.postgres` at v0.12.0, so no shipped release is affected.
+  **Dev/UAT upgrade note:** an operator who already ran one of these stacks before this fix
+  has a pre-18 cluster at the volume root that PG18 cannot read in place; on first boot under
+  the new mount PostgreSQL silently re-initialises an empty cluster at `…/18/docker` and the
+  old data is orphaned (not destroyed) inside the same volume. Since the substrate carries no
+  production data yet, discard just the stale Postgres volume before the first PG18 boot —
+  `docker compose down` then `docker volume rm <project>_postgres-data` (or
+  `<project>_postgres-uat-data` for full-UAT). **Do not** use `docker compose down -v`: it
+  also removes `server-data` and the reference compose's `certs` volume (the per-install CA +
+  leaf certs), which would force the entire fleet to re-enroll.
+- **DEX Catalogue now credits the full Linux signal coverage (was 7, now 17 types).** The per-OS
+  coverage map (`dex_obs_platforms`) that colours the Catalogue's "monitored / not collected on
+  Linux" badges was frozen at the original 7-type conservative set from before the Linux
+  kernel/sysfs collectors existed — the collectors landed without the map being updated in the same
+  change. A Linux fleet's Catalogue therefore showed `perf.disk_latency_high`, `hw.cpu_throttled`,
+  `service.hung`, `os.time_unsynced`, `os.bugcheck`, `os.dirty_shutdown`, `disk.error`,
+  `fs.corruption`, `hw.error`, and `process.hung` as *not collected* even though the agent emits
+  them — via `poll_perf` (the `/proc` CPU/memory/diskstats breach trio), the sysfs CPU-throttle
+  poll, and the journald poll whose kernel-transport lines are classified by `dex_linux_kmsg`. The
+  map is now authoritative at 17 types, so those families render as monitored on any connected
+  Linux agent. macOS coverage (16) was already correct and is unchanged. No agent change, no data
+  change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
+  platforms.
+- **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
+  `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
+  list carry a per-agent management-group drop filter that is **not yet effective** under the
+  *global* `Inventory:Read` / `Infrastructure:Read` gate (a confined operator is denied at the gate;
+  a global operator's filter is a no-op). Docs, the SOC 2 / CAIQ CC6.1 evidence, the capability map,
+  and the relevant code comments are corrected to "designed, not yet verified — per-device
+  confinement only"; ADR-0016 gains an appended Update note (immutable original preserved). The
+  responses surface logic fix is a separate ladder (#1634 / #1718 PR-B); its docs and code comments
+  are annotated here with the same caveat. No behavior change.
+- **Installed-software inventory now preserves non-ASCII app names on Windows (#1662).** The
+  `installed_apps` plugin read the registry uninstall keys via the ANSI `Reg*A` APIs, which return
+  strings in the system code page (cp1252 on Western installs), not UTF-8. The plugin's defensive
+  UTF-8 scrub then replaced the resulting invalid bytes with `?` (`Café` → `Caf?`), so any app or
+  publisher with a non-ASCII name was corrupted in the output — and, now that the names land in the
+  typed `SoftwareInventoryStore`, broke the flagship exact-match query `WHERE name = $1`. The plugin
+  now reads via the wide `Reg*W` APIs and converts UTF-16 → UTF-8 with `WideCharToMultiByte(CP_UTF8)`
+  (the same idiom the `registry`/`processes` plugins already use), so names like `Café Ñoño 日本語`
+  round-trip intact. Affects both machine-scope registry read paths (`list`, `query`). The ingest seam's UTF-8 scrub remains as
+  defence-in-depth (and still covers the Linux/macOS subprocess paths, whose output encoding is
+  unknown). No proto/wire change.
+
+- **Sibling inventory plugins now read non-ASCII registry strings as UTF-8 (#1682), via a shared
+  helper (#1681).** Four plugins read the registry with the ANSI `Reg*A` APIs and carried the same
+  cp1252 mojibake as #1662 on any non-ASCII value: `vuln_scan` (the installed-apps enumerate path —
+  the same shape as the pre-#1662 `installed_apps`, including a `RegEnumKeyExA` key-name enumeration —
+  plus `config_checks.hpp`), `os_info` (the OS `ProductName` / edition strings), `sccm` (the SCCM
+  client version), and `windows_updates` (the WSUS `WUServer` URL). Every read whose value lands in a
+  stored or fleet-queryable surface now uses the wide `Reg*W` APIs + `WideCharToMultiByte(CP_UTF8)`;
+  presence-only checks that never decode a value string (e.g. the `windows_updates` reboot-pending
+  probes) are deliberately left on `Reg*A` since they carry no encoding. The `vuln_scan` path also
+  picks up the full #1662 hardening (WCHAR-count `RegEnumKeyExW` and RAII handle closing). The
+  `to_wide` / `from_wide` / `reg_sz_to_utf8` converters now have a canonical home in a single
+  Windows-only header `agents/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
+  plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
+  **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
+  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
+  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
+  (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
+  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
+  delegating shims. This is a **partial** consolidation — **not** every conversion site: other plugins
+  (`processes`, `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, and the
+  `tar_dns_collector`/`tar_proc_etw`/`tar_proc_perf`/`tar_arp_collector` siblings) and several agent-**core**
+  files (`process_enum`, `dex_observer`, `guard_file`, `guard_registry`, `guard_service`, `temp_file`,
+  `trigger_engine`) still carry their own named or inline conversions; a comprehensive sweep is a tracked
+  follow-up, and `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
+  first NUL (correct `REG_SZ` / `REG_EXPAND_SZ` semantics — a deliberate hardening over the
+  `installed_apps` copy, which strips trailing NULs only), so a malformed interior NUL yields a clean
+  prefix instead of silently truncating the whole output line at the SDK's `const char*` boundary. The
+  four simple readers close their key **before** the allocating UTF-8 conversion, so a `std::bad_alloc`
+  cannot leak the `HKEY`. Deterministic unit coverage (`tests/unit/test_win_str_utils.cpp`): round-trip,
+  trailing-NUL strip, embedded-NUL stop, non-`wchar_t`-multiple size, 512-`wchar_t` no-terminator,
+  lone-surrogate → U+FFFD, null/empty. No proto/wire change. (Verified on Windows: unit tests + a
+  per-plugin MSVC compile, and an end-to-end smoke inside the Hyper-V agent VM that seeded a non-ASCII
+  `DisplayName` "Café Ñoño 日本語" under `HKCU\…\Uninstall` and confirmed it round-tripped byte-exact
+  UTF-8 through the real `RegEnumKeyExW` + `reg_sz_to_utf8` read path.)
+
+- **Guardian Windows service guards now report `guard.compliant` on the compliant edge.**
+  A `service-running` / `service-stopped` guard watching a steadily-compliant service
+  previously short-circuited silently and never emitted `guard.compliant`, so the
+  per-(agent, rule) compliance census read "pending" indefinitely for that guard — a
+  compliant service could never show as compliant (on the dashboard or the per-device
+  REST read). The `registry` and `file` guards already emitted the compliant edge; the
+  Windows `service` guard was the outlier and is now aligned. No proto/wire change; the
+  compliant-edge classifier is extracted as a pure, cross-platform, unit-tested helper
+  (`service_classify_edge`) to pin the behaviour against regression. The Linux systemd
+  service guard remains observe-only on the compliant edge (parity deferred).
+
+- **A4 error envelope on MCP tier-denied paths and dex-perf REST endpoints.** MCP tier-denied
+  errors (read-only mode, tier policy, approval-required) now carry
+  `error.data = {"correlation_id":"req-…","retry_after_ms":null,"remediation":"…"}` (the
+  remediation is an actionable hint, not `null`), the dex-perf MCP validation errors
+  (`get_dex_perf_cohorts`/`list_dex_perf_devices` invalid key/cohort_key/limit) carry the same
+  `error.data`, and `GET /api/v1/dex/perf/{fleet,cohorts,devices}` emit the A4 error envelope on
+  every 400/503 branch and an `X-Correlation-Id` response header (on success and error), matching
+  the `cohort-diff` sibling. The shared REST A4 helper now always emits the spec-required nullable
+  `retry_after_ms` field. **Behaviour change:** an approval-gated MCP operation on the `supervised`
+  tier is now denied with `kTierDenied` (-32004) instead of `kApprovalRequired` (-32006) — A4
+  reserves -32006 for an envelope carrying a pollable `approval_id` + `status_url`, which the
+  unimplemented re-dispatch path (Phase 2) cannot honestly provide; the operation is still denied
+  and the remediation points at the REST API / dashboard. (#1470)
+
+- **DEX catalogue family tile labelled honestly.** The family device figure is the *largest
+  single signal's* distinct-device count, not the family union (two disjoint 50-device signals
+  read 50, not 100); the tile now reads "Peak signal devices / largest single signal" so the
+  number and label agree. Health score unchanged. (#1374)
+
+- **Operator/API tags beat agent self-report.** An agent's reported `scopable_tags` can no
+  longer overwrite an operator- or API-set tag for the same `(agent_id, key)`, preventing a
+  rogue or misconfigured agent from self-assigning into an operator-declared benchmark cohort. (#1411)
+
+- **Guardian enforce-stop denylist extended with WdFilter and BFE.** Two Windows built-ins that
+  could defeat a *listed* control indirectly — `WdFilter` (Defender's filesystem minifilter,
+  stopping it blinds real-time scanning while `WinDefend` still reads as up) and `BFE` (the Base
+  Filtering Engine the firewall sits on, stopping it tears down the firewall while `mpssvc`
+  looks protected) — are now rejected by `dangerous_enforce_service_stop`. (#1285)
+
+- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
+  (a) `network_capture_method` was validated against the OS-blind union of every
+  platform's capture methods, so a Linux agent would accept and store the
+  Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
+  polling — now validated against the running host's OS accept-list via the new
+  `accepted_capture_methods_for_os` (#540). (b) `process_stabilization_exclusions`
+  and `redaction_patterns` had no element-count or length caps (an oversized array
+  degrades the per-process redaction scan), and an over-short exclusion substring
+  (e.g. `"a"`) silently dropped most process events — now capped at 256 elements ×
+  256 chars, and an exclusion whose EFFECTIVE substring (after stripping
+  leading/trailing `*`) is shorter than 3 chars is rejected at configure **and
+  dropped on the load path** — `*` does not buy a pass (`*a*` strips to core
+  `a`), and the load-path floor matters because the loader re-parses the stored
+  value every fast cycle, so a sub-floor value persisted before the floor existed
+  (a no-tamper upgrade) or written out of band would otherwise reach the redaction
+  scan and suppress events. The loaders skip non-string elements instead of
+  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
+  discovery metadata is synced (substring not glob, OS-aware method rejection,
+  the 256/256/3 limits), and the stale "glob" comments are corrected to
+  "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
+  pass vacuously; it now asserts it actually exercised at least one `kPlanned` row
+  (#544). (d) **Command-line redaction is now fail-closed on every collect path.**
+  `load_redaction_patterns` previously returned the safe built-in patterns only
+  when the stored value was empty or a non-array; a *valid array whose elements all
+  got dropped* (`[]`, `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is
+  empty) returned an empty set, silently disabling redaction so `password`/`token`/
+  `secret` were written to `process_live` in plaintext — `collect_fast` and
+  `procperf` lacked the defaults-union that `fleet_snapshot` already applied. The
+  built-in defaults are now unioned inside `load_redaction_patterns` via the shared
+  `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
+  can never DISABLE the baseline protection on any path. The load-path JSON parse
+  also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
+  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
+  metadata for `network_capture_method` no longer advertises the process-source
+  `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
+- **TAR source enable/disable is now corruption-resilient and reports a strict
+  state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
+  corrupt `tar.db` was opened and trusted, and since `get_config` returns the
+  caller default on a read failure, every `<source>_enabled` key read as its
+  default — silently re-enabling sources an operator had paused for forensic
+  preservation and defeating the #539 retention guard with no telemetry (#559);
+  (b) `tar.status` echoed the raw stored enable value, so a garbage value
+  (corruption, tampering, a downgrade/upgrade) was passed through instead of
+  flagged, and the collect-time `!= "false"` gate treated any non-`false` value
+  as enabled (#560). Fixes: `TarDatabase::open` runs `PRAGMA integrity_check` and
+  quarantines a corrupt DB aside (`tar.db.corrupt-<epoch>`, with its `-wal`/`-shm`
+  sidecars) before re-initialising a fresh one — failing **closed** if the corrupt
+  file cannot be moved aside rather than re-opening and trusting it; `status` now
+  emits a strict tri-state (`true`/`false`/`errored`); and the collect-time gate
+  (`source_enabled`) and `run_retention` both gate on that same canonical
+  tri-state, so a corrupt or tampered `<source>_enabled` value fails closed —
+  collection stops *and* the source's rows are preserved (not pruned).
+  Recovering such a source via `configure <source>_enabled=true` now also clears
+  its `paused_at`: the enable/disable transition canonicalises the previous value
+  before both legs, so an `errored`→`true` recovery no longer leaves a stale
+  `paused_at` that made `tar.status` report a now-collecting source as paused.
+- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
+  `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
+  on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
+  `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
+  was capturing via a kernel-event method when it was really polling. `do_status` now
+  emits `network_capture_method_effective` (the mechanism actually in force — always
+  `polling` today) alongside the configured `network_capture_method`, computed through a
+  single `effective_network_capture_method()` helper in the schema registry that is the
+  obvious place to wire the runtime check when a kernel-event collector lands. The
+  pre-staging affordance is preserved (the configured value is still stored and reported).
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
+  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
+  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
+- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
+  per-source enable check could commit one extra snapshot **after** the operator's
+  "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
+  diffed against that stale baseline and emitted ghost "stopped" events for every
+  process/connection/service/user that had exited during the pause, breaking the
+  documented "re-enabling starts from a clean baseline" contract. The disable
+  transition now (a) runs under the collectors' `collect_mu_` so it can't interleave
+  mid-cycle, and (b) clears the source's snapshot-diff baseline so a later re-enable
+  rebuilds from scratch. The clear happens **before** the `_enabled` flag flips and
+  the flag flips only if the clear persisted: if the agent DB is momentarily busy the
+  disable is refused (the source stays enabled and `configure` returns an error)
+  rather than leaving a disabled source with a stale baseline. The
+  source→baseline-key mapping (note `tcp`'s baseline lives under `"network"`) is
+  centralised in `diff_state_key()`, used by both the collectors and the disable path
+  so it cannot drift. **Operator-visible change:** the first collection cycle after a
+  re-enable emits a `started` event for every entity currently running/open (an
+  expected one-time rebaseline), not ghost `stopped` events. The interval samplers
+  (`perf`/`procperf`) keep their previous reading in memory rather than a diff-state
+  row, so the same race is closed for them too: disabling resets the in-memory
+  baseline under `collect_mu_`, and `do_collect_perf`/the procperf leg re-check the
+  enabled flag **after** taking the lock — so a disable racing a mid-flight sample
+  commits no post-disable row, and a re-enable re-baselines instead of emitting a
+  first row whose rate-average covers the entire paused window (a privacy concern on
+  the opt-in, default-off `procperf` per-application source).
+- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+  The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
+  opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
+  on `tar.status` because every source defaulted its enabled flag to `true`.
+  They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
+  through `source_enabled()`, `do_status()`, retention, and the `paused_at`
+  transition from a single source of truth — so status, retention, and the
+  retention-paused list all agree the source starts disabled (and the first
+  `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
+  an agent that never set these keys now reports `<source>_enabled|false` on
+  `tar.status` where it previously reported `true`; **no data collection
+  changes** (collection was already gated off), so this only affects automation
+  that parses `tar.status` to inventory active sources.
+- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/tar` retention-paused list had three defects: (a) a source whose
+  `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
+  agent DB, or any garbage) was **silently omitted** from the list — showing clean
+  state for an actually-paused source; it now renders with a value-error badge
+  and sorts to the top of the list (#560); (b) a pre-v0.12.0 agent that reported a source disabled without a
+  `paused_at` was rendered with a bare em-dash and, worse, **sorted to the bottom**
+  (the longest-paused sources sank below recently-paused ones — inverse of operator
+  intent); unknown `paused_at` now sorts as oldest (top) with a
+  "schema-older-than-server" badge (#558); (c) a malicious/compromised agent
+  spamming many responses under one `command_id` forced the renderer to parse every
+  response (200ms–3s); the renderer now dedups to the most-recent response per agent
+  before parsing, bounding work to O(visible agents × sources) (#561).
+- **Windows server installer locks its log-directory ACL.** `yuzu-server.iss`
+  set `Permissions: service-full` on `{app}\logs`, which is not a valid
+  InnoSetup permission group — ISCC silently ignores it, leaving the directory
+  with default ACLs (readable by authenticated users). Now `admins-full
+  system-full`, matching the installer's own data/cert directories. (The same
+  invalid keyword was fixed for the agent installer in #1425 / #1436.)
+- **macOS agents are no longer counted as Windows in DEX denominators.** The
+  OS check used a substring match, and "darwin" contains "win" — so on mixed
+  fleets every macOS agent inflated the Windows-online denominator behind the
+  DEX crash-free rate and the Performance tab's Reporting card, and appeared
+  in the "devices not reporting performance" drill as a phantom Windows
+  device. Both sites now match the OS prefix.
 
 - **Guardian drift events lost during fleet-wide drift waves (#1307).** The
   agent drift path minted `event_id = "{rule_id}-{ms}-{seq}"` with no agent
@@ -2800,6 +2714,615 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rs_` ids stay non-CSPRNG display identifiers per the #801 convention now that B1
   removes the bearer-reference property (review E, by design).
 
+- **viz-UAT: server config bind-mount must be world-readable (0644, not
+  0600).** `start-viz-uat.sh` generated `yuzu-server.cfg` at mode 0600 owned by
+  the operator's uid, then bind-mounted it into the server container which runs
+  as uid 999 (`yuzu`) — unreadable, so the server fell through to interactive
+  first-run setup, read empty stdin, and died on the password floor. The file
+  is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
+  containerized launcher.
+- **CRITICAL — `POST /login/mfa` was unreachable behind the pre-routing
+  auth gate** (Hermes Agent red-team review, 2026-05-29). The exemption
+  list at `server.cpp:2393` covered `/login` but not `/login/mfa`, so
+  every unauthenticated POST to the MFA challenge was redirected to
+  `/login` before the route handler ran — the MFA login flow was
+  completely deadlocked in any deployment with the gate enabled. The
+  internal governance review missed this because PR1 deferred route-
+  level integration tests. Added `/login/mfa` to the exemption list
+  with a comment crediting the Hermes finding.
+- **HIGH — `/login/mfa` was bypassing the login-specific rate limiter**
+  (Hermes Agent LOW #6 escalated by the credential-brute compounding
+  effect). `is_login = req.path == "/login"` at `server.cpp:2374` did
+  not match `/login/mfa`, so MFA submissions fell through to the looser
+  `api_rate_limiter_` bucket. Expanded the predicate to cover both
+  paths so per-IP rate-limit defence applies to both legs of credential
+  auth. The per-pending-token 5-attempt cap remains as the second layer.
+- **MEDIUM — CSRF protection on the five `/api/settings/mfa/*` POST
+  routes** (Hermes Agent MEDIUM #2). The mutating MFA settings routes
+  (`init`, `verify`, `recovery-codes`, `disable`) relied on session-
+  cookie auth (`SameSite=Lax`) without `Origin` / `Referer` checks; a
+  stolen cookie could be replayed cross-site to strip a victim's MFA.
+  Added an `origin_safe` helper that requires `Origin` (or `Referer`
+  fallback) host to match the request `Host` header on browser POSTs;
+  non-browser clients (curl, automation) that omit both headers pass
+  through. Mismatched host returns 403 with audit verb `csrf.denied`
+  (`target_type="Endpoint"`) for SIEM correlation. Audit detail strings
+  are sanitised (control + high-bit bytes stripped, each field capped at
+  128 B), default ports `:443`/`:80` are normalised so a TLS-terminating
+  reverse proxy that rewrites `Host` to the port-less form does not
+  false-deny, and userinfo (`@`) plus fragment / query (`?`, `#`) in the
+  Origin URL are rejected per RFC 6454.
+
+  **Deferred scope (Gate 4 SHOULD S2 — known follow-up):** `origin_safe`
+  is wired into the 4 mutating MFA POSTs only. 11 sibling state-changing
+  Settings POSTs remain CSRF-unprotected:
+  `/api/settings/users` (and `/role`), `/api/settings/api-tokens`,
+  `/api/settings/plugin-signing/{upload,clear,require}`,
+  `/api/settings/oidc` (and `/test`), `/api/settings/{cert-upload,
+  cert-paste}`, `/api/settings/enrollment-tokens`, `/api/settings/tls`.
+  These were unprotected before PR1 too — the asymmetry is documented
+  here so it isn't mistaken for a regression. A follow-up PR wraps every
+  admin HTMX mutation with the same helper.
+
+- **Windows agent service install was fundamentally broken (#1822).** `yuzu-agent.exe --install-service`
+  registered the process with the SCM, but the binary never implemented the SCM control protocol —
+  no `ServiceMain`/`RegisterServiceCtrlHandler`/`SetServiceStatus` anywhere — so the SCM killed the
+  process for not responding within its start timeout and `sc start YuzuAgent` always failed with
+  error 1053, regardless of config, network, or token. This affected every real install via the
+  shipped installer, not just ad-hoc `sc.exe` use. The agent now implements the real dispatcher
+  (`service_win.{hpp,cpp}`): `--install-service` appends an internal `--service` marker to the
+  registered binPath, and under that flag the process runs `ServiceMain`/a control handler instead
+  of the console path — reporting `SERVICE_RUNNING` immediately after local startup (parity with the
+  systemd unit, which has no readiness protocol either; the agent's server-reconnect loop is
+  unbounded while the network is down, so waiting for it would itself time out the SCM start), and
+  stopping cleanly on `SERVICE_CONTROL_STOP`/`SHUTDOWN` via the existing thread-safe `Agent::stop()`.
+  Also fixes an unquoted service binPath (a hazard under a spaced install path like
+  "Program Files") and adds `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG` so the existing restart-on-failure
+  actions also fire on a clean exit with an error (e.g. the #1303 fail-closed TLS refusal), not just
+  a crash. Re-running `--install-service` over an existing (possibly stale/broken) registration now
+  updates it in place instead of failing with "service already exists" — note this resets binPath to
+  the bare exe + `--service` marker, so a manual re-run must be followed by `sc config` to restore any
+  previously-applied `--server`/`--data-dir`/`--log-file` args, same as the installer's own sequence.
+  The installer's `PrepareToInstall` stop-before-upgrade step now polls for `STOPPED` (skipped entirely
+  on a fresh install with no prior service, to avoid a needless wait) instead of a blind 2-second
+  delay, since `sc stop` only actually completes with this fix. The service still registers to run
+  as LocalSystem (unchanged from before this fix) — migrating it to the least-privilege
+  `NT SERVICE\YuzuAgent` virtual account is the existing, already-tracked #1442, not part of
+  this fix; see `docs/agent-privilege-model.md`.
+
+- **Outbound HTTP clients now set an explicit write timeout.** All nine `httplib::Client` call sites in `server/core/src` (webhook delivery, offload targets, analytics sinks, settings-routes connectivity checks, directory sync, OIDC token/JWKS fetches) previously relied on httplib's implicit 5s write-timeout default; each now calls `set_write_timeout()` explicitly, matching its existing read timeout, so a slow or stalled peer connection is bounded consistently with the read side (#1874).
+
+- **Guardian's enforce-safety gate and push builder no longer throw on malformed stored specs.** `dangerous_enforce_in_spec` — the single chokepoint vetting every enforce-mode promotion and the push backstop — threw a JSON type error when a rule spec carried a present non-string `assertion.type`; and `build_agent_push`'s block marshaller threw the same error on a non-string block `type` (reachable via a REST-authored rule with a non-string `remediation.type`, which the create-time validator did not type-check), aborting the push fan-out with an HTTP 500 for every affected agent. Both now read `type` through an `is_string`-guarded accessor: a malformed shape is treated as not-dangerous / inert rather than throwing. Five unit checks, a push-builder regression, and the libFuzzer harness pin the no-throw contract (#1946, follow-up to #1885).
+
+- Agent now re-registers automatically when the server rejects its session (`NOT_FOUND` after a server restart or a stale-session reap, or `UNAUTHENTICATED` after a mid-session cert rotation), instead of looping on `Heartbeat failed: unknown session` and staying silently disconnected until manually restarted. The forced re-registration uses an escalating, capped backoff so a server-side session fault cannot trigger a fleet-wide re-registration storm. (#1894)
+
+- **Fixed silent loss of multi-product CVE matches.** The NVD store's `INSERT OR REPLACE`
+  upsert keyed on `cve_id`, so a CVE affecting several products kept only the last
+  product row — the others were dropped, causing that CVE to under-report on affected
+  devices. The reshaped store keeps every affected-product row, and per-CVE upserts are
+  now atomic (a mid-sync failure rolls back that CVE and retains its prior match set
+  rather than committing a wiped one).
+
+- **Fixed the server-side NVD CVE sync hanging on its very first request.** `NvdClient::rate_limit()`
+  used a `steady_clock::time_point::min()` sentinel for "no prior request"; on the first call
+  `now - last_request_time_` overflowed `int64`, producing a garbage-negative elapsed time and a
+  `sleep_for` of roughly **292 years**. The NVD sync therefore never issued its first HTTP request on
+  any deployment — `/api/nvd/status` `total_cves` stayed at the built-in seed and the sync thread sat
+  asleep indefinitely. The throttle now skips the wait when there is no prior request (and the timing
+  logic is covered by a regression test). This was also the real reason the sync appeared to ignore
+  its HTTP connection/read timeouts (there was no request in flight to time out) — see #1867.
+
+- **`GET /api/nvd/status` `enabled` now reflects whether NVD sync is actually configured on**, not merely whether the local mirror database file is open. Under `--no-nvd-sync`, `enabled` now correctly reports `false` (previously `true`, which contradicted the error returned by `POST /api/nvd/sync`). A monitoring script or dashboard that read `enabled` to mean "mirror usable" should switch to checking `total_cves` or an HTTP 200 from `/api/nvd/match`. (#1889)
+
+- **Agent no longer crashes under concurrent `execute_bundle` dispatch on Windows (#2037).** A C++
+  exception thrown outside the plugin's `execute()` call (e.g. in metrics, output-flush, protobuf
+  construction, or the gRPC stream write) escaped the dispatch thread pool's worker and triggered
+  `std::terminate()`/`abort()`, killing the whole agent process — observed as `yuzu-agent.exe`
+  exiting with 0xC0000409 under bundles with 3+ concurrent steps. The dispatch thread pool now
+  contains any escaped exception at the worker boundary, and the affected command/step returns a
+  terminal `FAILURE` status (with error detail `agent dispatch error: <what>`) instead of hanging
+  until the server's timeout or bringing down the agent.
+- **NVD sync crashed the server on the very first API request (#1908).** `main.cpp` transitively
+  includes `<httplib.h>` via `scim_routes.hpp` without `CPPHTTPLIB_OPENSSL_SUPPORT` defined, while
+  `yuzu_server_core_lib` (which contains `nvd_client.cpp`) compiled the same header with it. Since
+  httplib is header-only with inline definitions and that macro gates real data members on
+  `httplib::ClientImpl`/`SSLClient`, the two translation units disagreed on class layout — an ODR
+  violation the linker silently resolved by folding one definition into the other, corrupting
+  `httplib::Client` objects on first use. This produced a deterministic SIGSEGV in
+  `NvdClient::fetch_paginated` seconds after boot with NVD sync enabled, on every affected build.
+  `server/core/meson.build` now propagates the macro to every consumer of `yuzu_server_core_dep`
+  via `compile_args`, matching Meson's standard dependency-propagation pattern.
+  Operators on a pre-fix build can work around the crash with `--no-nvd-sync`.
+
+### Security
+
+- **Response/execution reads fail closed on a corrupt/load-failed `rbac.db`; per-agent
+  management-group scope-filter foundation added (#1634, PARTIAL — the gate change that makes
+  management-group scoping effective for normal operators is NOT in this change and remains open
+  under #1634).** The response readers (MCP `query_responses` + `aggregate_responses`, REST
+  `GET /executions/{id}/visualization`, and the legacy `GET /api/responses/{id}` / `/aggregate` /
+  `/export`) gained a per-agent management-group filter, routed through ONE predicate
+  (`response_agent_in_scope` → `check_scoped_permission`) gated on `rbac_enforcement_in_effect`.
+
+  **What this fixes today (the real, observable change):** under a **corrupt or load-failed
+  `rbac.db`**, `require_permission`'s legacy fallback opens READ to any authenticated principal, so
+  these readers previously returned the **whole fleet's** responses to anyone. They now fail
+  **closed** (zero rows), matching the #1498 device-visibility posture. A transient response-store
+  read error while resolving scope likewise fails closed — surfaced as `503` (REST aggregate) / a
+  JSON-RPC internal error (`aggregate_responses`), never success-with-empty-totals (agentic-first A4
+  failure-vs-empty).
+
+  **What this does NOT yet do (important — no false sense of security):** under **normal RBAC
+  operation the filter is inert.** A holder of global `Response:Read` passes the gate and
+  `check_scoped_permission`'s global step then admits every agent (filter is a no-op → sees all);
+  a management-group-confined operator is `403`'d by the global `require_permission` gate **before**
+  the filter runs. So this does **not** bound a normal operator's responses to their management
+  groups and does **not** close the cross-operator read #1634 describes. Achieving that requires a
+  new admit-then-filter **gate** for fan-out/list reads (admit an operator holding the permission via
+  *any* management group, then filter) — a systemic change that also affects `/api/agents`,
+  `/devices`, the dashboard `/fragments/results/…` family, and the shipped #1550, and is tracked as
+  the remaining work under **#1634**. This change is the filter foundation that gate will build on.
+
+  Also included: each scope-drop is auditable (`aggregate_responses` → distinct `result=denied` +
+  `audit_persisted:false` on a gap; visualization → `scope_dropped=N` on its
+  `execution.visualization.fetch` success audit; legacy `/api/responses/*` → a `response.read`
+  `result=denied` audit, `detail=scope_dropped=<N> surface=<…>`); `ResponseStore::aggregate` takes a
+  dedicated scope parameter (off the shared `ResponseQuery`, so the row-path readers can't be handed
+  a silently-ignored scope); `distinct_agent_ids` returns `optional` (a store-read error is distinct
+  from a genuinely-empty result); and `aggregate`/`distinct_agent_ids` own their statements via
+  `SqliteStmt` RAII.
+
+- **Inventory freshness gauge is now immune to agent clock skew (#1685, ADR-0016).** The
+  `yuzu_inventory_stale_agents` gauge counts agents whose installed-software inventory has not synced
+  within the staleness window. It was fed by `inventory_state.last_seen`, stamped from the
+  **agent-supplied** `collected_at` — so the gauge compared a server-side threshold (`now − 2d`)
+  against an agent clock. A future-skewed or hostile agent could pin `last_seen` ahead of now and
+  **never count as stale**, hiding a disappeared endpoint; a >2d past-skewed agent counted as stale
+  while actively syncing. `last_seen`/`first_seen` are now the **server receipt time**, so both sides
+  of the comparison are on one clock. `collected_at` stays on the wire for a future content-age signal
+  but drives no persisted timestamp. A one-time data backfill clamps any pre-fix row whose `last_seen`
+  or `first_seen` was written into the future back down to now, so a previously-hidden dark endpoint
+  re-enters the freshness window. No schema change — the column had no other consumer.
+
+- **Behavioural-data audit failures are now surfaced uniformly across every per-device / per-signal
+  route (#1647, CC7.2 / CC6.1).** A per-person behavioural read whose access-audit row silently
+  failed to persist (audit DB locked/full, or a `bad_alloc`-class throw) could previously look like
+  a clean, audited read. Every such route now routes through one shared helper
+  (`server/core/src/rest_audit.hpp`) that captures the `AuditFn` result behind a `try/catch` (the
+  throw arm was previously silent on several routes), logs the gap, and surfaces it per surface:
+  - **Dashboard fragments** (`/fragments/device/dex`, `/fragments/device/guardian`, and the `/dex`
+    drill-downs) set the `Sec-Audit-Failed: true` response header and **still render** — a transient
+    audit hiccup must not blank the operator's lens. The two `/fragments/device/*` lenses previously
+    **discarded** the result entirely; they now match the long-documented set-and-proceed contract.
+  - **REST** (`GET /api/v1/dex/devices/{id}`, `/api/v1/dex/signals/{obs_type}`,
+    `/api/v1/guaranteed-state/events?agent_id=`, and
+    `/api/v1/guaranteed-state/device-compliance`) **fails closed** with
+    `503` + `Sec-Audit-Failed: true` and serves no PII.
+  - **MCP** `get_dex_signal_detail` previously discarded the result; it now carries
+    `audit_persisted:false` in the tool result (set-and-proceed, no JSON-RPC header channel),
+    matching the `query_responses` / `revoke_certificate` convention.
+
+  Alert on `Sec-Audit-Failed: true` (or `audit_persisted:false`) from any surface as a SOC 2 CC7.2
+  evidence-gap signal.
+
+- **Behavioural dispatch-audit sites routed through the shared chokepoint for catch-arm parity
+  (#1647 follow-up).** The remaining per-device/per-signal routes that still called the `AuditFn`
+  raw — `device.live.*` (`/fragments/device/live/run`), `dex.device.perf.query` /
+  `dex.device.procperf.query`, and the `tar_tree_routes` dispatch/read sites
+  (`tar.process_tree.{read,detail}`, `tar.dns.read`, `tar.arp.read`, `tar.sources.{read,configure}`)
+  — now go through `detail::emit_behavioral_audit` in `server/core/src/rest_audit.hpp`. A throwing
+  `audit_fn` (`bad_alloc`-class) is caught and logged instead of escaping the handler (httplib would
+  have turned it into a `500`). Each route keeps its existing **dispatch/set-and-proceed** posture
+  (no read-PII route became a `503`). The `tar_tree_routes` sites previously **discarded** the audit
+  bool and set no header; they now surface `Sec-Audit-Failed: true` on a dropped/throwing audit row,
+  matching the migrated sibling routes. No audit verbs changed.
+
+- **MCP `query_responses` gained a per-agent management-group filter (#1550) — but it is INERT
+  under the global gate and does NOT yet isolate operators; see the #1634 entry above.** The tool
+  previously gated only flat `Response:Read` and then returned **any** execution's response rows
+  (`dispatched_by` was display-only, never an access check). A per-agent filter through the
+  `check_scoped_permission` chokepoint was added — HOWEVER, as the #1634 entry documents, the reader
+  still gates on the **global** `Response:Read`, and `check_scoped_permission`'s global step then
+  admits every agent for a global holder, so under normal RBAC operation **no rows are dropped** and
+  a caller does **not** see only their groups' rows. It does **not** close the cross-operator read;
+  its only active effect today is failing **closed** (zero rows) on a corrupt `rbac.db`. Effective
+  isolation needs the admit-then-filter gate change tracked under #1634. Out-of-scope rows, when
+  dropped (the corrupt-store path), are audited `result=denied` (with the distinct dropped-agent
+  count); the `denied` row's persistence failure surfaces `audit_persisted:false`. RBAC-off →
+  legacy-open (no filter), matching `require_scoped_permission`. The filter runs after
+  the 1000-row cap, so a result that hit the cap before filtering carries
+  `result_truncated_by_cap:true` — collectors must not treat `count<limit` as "done"; complete
+  collection of >1000-row executions is the keyset-pagination follow-up (#1634). *(The same
+  per-agent filter is now also on `aggregate_responses`, the REST visualization reader, and the
+  legacy `/api/responses/*` readers — but see the #1634 entry above for the important caveat that
+  this filter, INCLUDING `query_responses`', is currently **inert under the global `Response:Read`
+  gate** (a normal holder sees all agents) and its only active effect is failing **closed** on a
+  corrupt `rbac.db`; effective management-group scoping needs the #1634 gate change. Still flat —
+  and **fail-OPEN on a corrupt `rbac.db`** (no filter at all) — are the dashboard `/fragments/results/…`
+  family and the workflow executions-drawer reader (tracked under #1634, same UP-1 class). Service-scoped
+  tokens are scoped by the token creator's RBAC, not the service tag.)*
+
+- **DEX per-device endpoints: audit-fail-closed + A4 denial enrichment.** `GET /api/v1/dex/devices/{id}`,
+  `POST /api/v1/dex/devices/{id}/live`, `GET /api/v1/guaranteed-state/events` (agent-scoped),
+  and `GET /api/v1/dex/signals/{obs_type}` now return `503` + `Sec-Audit-Failed: true` and
+  withhold behavioral PII — or, for `/live`, do **not** dispatch the probe — when the SOC 2
+  CC7.2 audit row cannot persist. The prior behavior silently served data (or dispatched) with
+  an evidence gap. `/live` now audits **pre-dispatch** (`result=requested`, was the
+  post-dispatch `result=dispatched`); the `detail` carries `cid=<correlation_id>` as the join
+  key. The two per-device endpoints (`/dex/devices/{id}`, `/live`) echo `X-Correlation-Id`
+  (the agent-scoped `events` / `signals` siblings carry a server-side `spdlog::warn` instead).
+  `401`/`403` denial bodies from
+  `require_scoped_permission` now carry `correlation_id` + a structured `permission`
+  (`SecurableType:Operation`) A4 field. Dashboard DEX PII drill-downs + perf/procperf dispatch
+  panels set `Sec-Audit-Failed: true` on audit failure but continue to render (HTML surface —
+  a transient audit hiccup must not blank the dashboard, unlike the fail-closed REST endpoints).
+  **Behavior change for API consumers:** an audit-store outage now yields `503` where it
+  previously returned `200`; automation should treat `Sec-Audit-Failed: true` as "retry after
+  the audit subsystem recovers."
+
+- **NAT-aware per-session peer-IP binding (#1128).** The W1.3 stolen-session
+  guard (Subscribe source IP must match Register source IP) false-rejected
+  legitimate direct-connect agents behind multi-egress NAT / proxy pools /
+  CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
+  accommodations now downgrade a mismatch to *advisory* (audited
+  `result="ok" outcome=advisory`, counted on
+  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason,gateway_mode}`)
+  instead of rejecting: (1) both IPs falling inside an operator-declared
+  `--trusted-nat-cidr` range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS
+  client identity, which is **opt-in** via `--nat-trust-mtls-identity`
+  (`YUZU_NAT_TRUST_MTLS_IDENTITY`, default off) and SAFE ONLY WITH PER-AGENT
+  CLIENT CERTS — a shared fleet-wide cert would make it a session-replay
+  bypass; enabling the flag now emits a `warn`-level startup banner so it is
+  not silently lost in a tail-only boot log. Mismatches outside both
+  accommodations still hard-reject; an empty extracted IP always rejects.
+  Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
+  When both accommodations are configured, mTLS-identity match takes
+  precedence (the audit row + metric `reason` label record which fired). The
+  advisory audit row and metric now carry a `gateway_mode` field/label
+  matching the existing reject path, so SIEM rules can correlate advisory and
+  reject volumes by operator-mode dimension.
+- **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
+  gateway `ProxyRegister` path previously recorded the gateway's IP as the
+  source, not the agent's (SOC 2 IR-2 mis-attribution). A new
+  transport-agnostic `RegisterRequest.gateway_observed_peer` field (survives the
+  planned gRPC→QUIC move) carries the agent origin IP; the server now records
+  `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
+  `origin_observed=false` when absent). The direct Register path ignores the
+  field (a direct agent cannot forge a source IP; it is not a defence against a
+  compromised gateway). **Note for gateway deployments:** until the gateway-side
+  population follow-up ships, audit rows on the `ProxyRegister` path still record
+  the gateway node's IP as `source_ip` (the field is not yet populated by
+  today's grpcbox transport, which cannot observe the direct agent peer; the
+  durable source arrives with the QUIC transport, #376). Operators relying on
+  `source_ip` for IR-2 attribution on the gateway path should note this.
+
+- **SSO IdP-group→RBAC provisioning is now source-aware and reconciled (#1832, HIGH).** Fixes two
+  bugs in the OIDC `/auth/callback` group sync: a **confused-deputy** (a locally-created RBAC group
+  and a same-named IdP group were the same `groups` row, so an operator-created local group named
+  e.g. `admins` silently inherited any role granted to an IdP group also asserting `admins`, and vice
+  versa) and a **deprovisioning bypass** (group memberships were only ever added, never removed, so
+  a user dropped from an IdP group kept every role that group granted indefinitely). Fix: IdP
+  memberships are now written under a **namespaced** group name (`entra:<group-id>`, via
+  `RbacStore::namespaced_group_name`) through a new transactional `RbacStore::reconcile_idp_memberships`
+  that both upserts the asserted set and deletes any of the user's `entra:`-owned memberships not
+  re-asserted this login — so IdP-side removal takes effect on the next SSO login. A
+  `source='local'` group create is rejected if its name collides with a reserved IdP prefix
+  (`local:`/`entra:`/`saml:`/`ad:`). The callback is **fail-closed**: an over-cap assertion
+  (`>200` groups) or a reconcile-store failure denies the login outright (no session minted) rather
+  than falling through to a session with stale/unreconciled roles. New audit action
+  `auth.sso_group_provision` (result=ok/skipped/error) and metric
+  `yuzu_auth_sso_group_provision_total{source,result}`. **Upgrade note:** operators who assigned an
+  RBAC role to the old raw-gid OIDC group must re-assign it to the namespaced `entra:<group-id>`
+  group — see `docs/user-manual/authentication.md` "RBAC Group Provisioning". SAML group sync is
+  out of scope here (dropped in #1827; will ride this same reconcile path once #1826 merges).
+
+- **#1832 hardening round — Entra group-overage no longer silently mass-deprovisions SSO users
+  (HIGH).** A user in more than ~200 Entra groups gets no `groups` claim at all — Entra replaces it
+  with a `_claim_names`/`_claim_sources` indirection pointer — and the original #1832 reconcile read
+  that as "this user is in zero groups", deleting every one of their existing IdP-sourced RBAC
+  memberships on their next login. `OidcProvider::parse_id_token` now sets
+  `groups_claim_present`/`groups_overage` on the parsed claims; `/auth/callback` calls
+  `reconcile_idp_memberships` only when the new `groups_claim_reconcilable(claims)` gate passes, and
+  otherwise **skips reconciliation entirely** — existing memberships are left untouched and the login
+  still proceeds (fail-open on membership, never on authentication). New audit result
+  `auth.sso_group_provision` `result=skipped` (`reason=groups_overage|groups_absent`). Also in this
+  round: `reconcile_idp_memberships` now verifies a namespaced group row's `source` before joining a
+  membership to it, so a pre-existing differently-sourced row occupying the same namespaced name (a
+  legacy local group literally named `entra:<gid>`, predating the reserved-prefix guard) can no longer
+  be silently joined and leak its roles; rejects `source=="local"`/empty outright (the stale-membership
+  DELETE is only safe for a real IdP source); drops blank/oversized asserted `external_id` entries
+  instead of seeding a garbage group; and now returns `{added, removed}` membership counts so a no-op
+  reconcile (the common steady-state login) writes no `auth.sso_group_provision` row at all, while a
+  denied login (over-cap or store failure) also emits the shared `auth.oidc_login_failed` audit +
+  analytics event so SIEM queries on that action don't miss a provisioning denial. See
+  `docs/auth-architecture.md` "RBAC group provisioning (#1832)".
+
+- **OIDC JWT signature verification is now enforced on Windows (CRITICAL fail-open fixed).**
+  On the Windows server build, `OidcProvider::verify_jwt_signature` was a stub that
+  returned success **without checking the signature**, so any attacker-forged
+  `RS256`/`RS384`/`RS512` ID token with a valid structure was accepted — arbitrary
+  OIDC session minting / account takeover. Verification now runs the same OpenSSL
+  EVP (JWKS → RSA) path on every platform; a token whose signature cannot be
+  verified against a cached JWKS key is rejected. (#1856, #1782)
+
+- **OIDC session principal is now keyed on the stable `iss`+`sub`, not the mutable display
+  name (#1837, HIGH).** `create_oidc_session`'s authorization principal (`Session::username`,
+  the value `check_permission`/`reconcile_idp_memberships`/audit rows key on) was previously
+  `claims.name` (falling back to `claims.email`) — an IdP-editable, non-unique label. Two SSO
+  users with the same display name collided onto one principal, and #1832's reconcile made
+  that collision destructive (one user's login could delete the other's group memberships and
+  silently inherit their roles). The stable principal is now `"oidc:" + iss + "#" + sub`
+  (`sub` is only guaranteed unique per-issuer per RFC 7519, hence the `iss` scoping); the
+  mutable display name moves to a new `Session::display_name` field, used for UI/audit-detail
+  rendering only; every SSO audit row also carries the sanitized human name in its `detail`
+  string, so a principal's name is recoverable from the audit log without a live session
+  (there is no persistent principal→name directory — that is tracked as a fast-follow, #1852).
+  Every nav-bar "who am I" render site (`/api/me`, `/api/v1/me`, and the ten dashboard-page
+  `nav-user`/`context-user` JS blocks) now shows `display_name`, falling back to the stable id.
+  SAML session-keying is unchanged this slice (still the raw NameID) — SAML doesn't sync to
+  `rbac_store` yet, so its principal risk is dormant; tracked as a fast-follow.
+  See `docs/auth-architecture.md` "Stable principal vs. display name".
+  **Upgrade note (re-login required):** OIDC sessions now key on `oidc:<iss>#<sub>` instead
+  of the display name. `RbacStore` migration v3 purges every IdP-sourced `group_members` row
+  on upgrade (old display-name-keyed memberships are unreachable and would otherwise be a
+  resurrected confused-deputy risk if a local user later took that display name) — they
+  re-populate under the new stable key on each SSO user's next login. Between the v3 migration
+  and a user's first re-login, an operator whose admin role comes *only* from SSO group
+  membership is roleless — recover via a fresh SSO login, `--oidc-admin-group` (grants admin
+  directly on next login without needing the group reconcile), or a local admin / break-glass
+  account.
+  **OIDC JIT admin elevation is temporarily unavailable for SSO operators (#1837):** pending
+  durable SSO identity provisioning (#1852). The stable `oidc:<iss>#<sub>` principal fails
+  `is_valid_username`'s alphanumeric-only check, and an OIDC login provisions no `users` row,
+  so there is no local record to set the flag on. This is not a regression of a
+  previously-supported flow — before #1837, SSO elevation only appeared to work by accident
+  (name-collision borrowing a local user's `elevation_eligible` flag with no cryptographic
+  binding). #1852 is the real restoration path, and this same `[Unreleased]` window DOES
+  include it: durable SSO identity provisioning (`AuthDB::upsert_sso_identity`, PR #1861)
+  gives every OIDC principal a durable `users` row to key `elevation_eligible` on — see
+  `1861-durable-sso-identity-oidc-elevation.security.md`.
+  Session revocation by username for SSO operators is **not** structurally blocked:
+  `AuthManager::invalidate_user_sessions`'s in-memory sweep carries no `is_valid_username`
+  gate and revokes any principal string, `oidc:<iss>#<sub>` included.
+
+- **Durable SSO identity — OIDC JIT admin elevation restored (#1852, HIGH).** `create_oidc_session`
+  mints a stable `oidc:<iss>#<sub>` principal (#1837) but historically wrote **no `users` row** to
+  `auth.db`, so `AuthDB::set_elevation_eligible`/`is_elevation_eligible` had nothing to key on and
+  JIT admin elevation (`POST /api/v1/elevate`, #1799 "OIDC-amr JIT elevation") was unreachable for
+  every SSO operator — a HIGH regression called out explicitly in #1837's Breaking Changes entry.
+  Fix: auth.db migration v6 adds five nullable/defaulted columns to `users`
+  (`identity_source`, `external_iss`, `external_sub`, `display_name`, `last_seen_at`); a new
+  `AuthDB::upsert_sso_identity` auto-provisions (or refreshes) a row for the stable principal,
+  called from `/auth/callback` immediately after `create_oidc_session` mints the session (fail-soft
+  — a provisioning error is logged and the login still succeeds; the principal simply cannot elevate
+  until a later successful login provisions it). The `ON CONFLICT` refresh path touches ONLY
+  `display_name`/`last_seen_at`/`is_active` — it never resets `role` or `elevation_eligible`, so a
+  standing admin grant survives re-login. A new `is_valid_principal` validator (strict superset of
+  `is_valid_username`: unchanged for a local username, additionally accepts a reserved-prefixed
+  `oidc:`/`saml:`/`ad:` principal after a control-byte/SQL-metacharacter blocklist) replaces
+  `is_valid_username` at the elevation-cluster's target-lookup chokepoints (`set_elevation_eligible`,
+  `is_elevation_eligible`, the elevation-eligibility grant route, force-logout-by-username) — every
+  OTHER `is_valid_username` call site (local user create/delete/role-change, MFA, lockout, password)
+  is deliberately left untouched. The elevate route's `mfa_status().enrolled` gate — which
+  unconditionally denied every OIDC session, MFA'd or not, since `mfa_status` correctly stays strict
+  — now applies to local sessions only; an OIDC session's second factor is the IdP-attested `amr`
+  claim, and a **new, dedicated, unconditional gate** requires that proof to exist (`mfa_verified_at`
+  seeded, not just fresh) before elevation is even attempted — closing a gap the restoration would
+  otherwise have reopened under the default `--mfa-enforcement=optional`, where the SHARED
+  `require_mfa_step_up` gate's OIDC-no-proof branch is deliberately lenient for lower-risk step-up
+  sites (PR #1199) and would otherwise have let a never-MFA'd SSO login elevate to full admin.
+  SAML sessions remain provisioned-but-cannot-elevate (no amr equivalent yet; SAML-MFA is a future
+  workstream). Settings → Users now surfaces SSO rows (an `SSO` badge) and suppresses the buttons
+  that would 400 against a non-local-charset principal (Remove); Revoke sessions stays available.
+  See `docs/auth-architecture.md` "Durable SSO identity"; this restores the OIDC JIT elevation
+  that #1837 had made temporarily unavailable for SSO operators.
+- **Durable SSO identity — governance hardening round (#1852 follow-up).** Four fixes on top of the
+  restoration above: (1) the elevate route now requires the target row's `identity_source` to match
+  the session's `auth_source` before honouring an eligibility grant — closes a cross-protocol
+  collision where a crafted SAML NameID, or a legacy `identity_source='local'` row, could share a
+  principal string with a real OIDC identity and borrow its grant; (2) `upsert_sso_identity`'s
+  `ON CONFLICT` refresh no longer sets `is_active = 1`, so a re-login can never resurrect a row a
+  future deprovisioning sweep had soft-deleted; (3) `AuthDB::invalidate_all_sessions` moved to
+  `is_valid_principal`, fixing a force-logout audit-fidelity bug where revoking an SSO principal's
+  sessions always recorded `result="partial"`/`db_error=true` even though the revoke fully succeeded;
+  (4) the Settings → Users "Revoke sessions" button now URL-encodes the principal (`html_escape` alone
+  left `#` untouched, which the browser treated as a URL-fragment separator and silently truncated).
+  A new `yuzu_auth_sso_provision_total{source}` counter makes IdP-provisioning volume observable
+  (the `role.elevation.granted` row already records the MFA basis via its `mfa=oidc_amr|local_totp`
+  field). Stale-row deactivation/reaper (SCIM-less deprovisioning) is tracked as **#1859**; a
+  durable-SSO-identity access-review roster is tracked as **#1860**. See
+  `docs/security-reviews/sso-durable-identity-2026-07-03.md`.
+
+- **Cleared all 12 known npm advisories in the repo's JS tooling.** The
+  docs site moves to Astro 7 (fixes GHSA-2pvr-wf23-7pc7, GHSA-8hv8-536x-4wqp,
+  GHSA-j687-52p2-xcff, GHSA-jrpj-wcv7-9fh9, GHSA-xr5h-phrj-8vxv and the
+  transitive esbuild GHSA-g7r4-m6w7-qqqr), the puppeteer test harness picks
+  up patched `js-yaml`/`ws` (GHSA-h67p-54hq-rp68, GHSA-96hv-2xvq-fx4p), and
+  the Cedar & Vale demo app gains a committed lockfile on `express` 4.22.2 —
+  clearing a high-severity `path-to-regexp` ReDoS (GHSA-37ch-88jc-xwx2) plus
+  three `qs` DoS advisories its previously unpinned tree was carrying — with
+  `npm ci` in its Dockerfile so the image gets exactly the audited tree.
+  Dependabot now watches all three npm lockfile directories (grouped
+  minor+patch weekly; majors as separate PRs) so advisories can no longer
+  accumulate silently, and the README carries the live OpenSSF Best
+  Practices (Passing) badge (#407).
+
+- **Continuous fuzzing via ClusterFuzzLite.** Four libFuzzer harnesses now cover
+  the closure-light untrusted-input parsers — pre-flight plugin-output parsing,
+  deployment config/output parsing, the in-tree YAML-subset scanner (the
+  authorization-load-bearing `yaml_source` reader), and Guardian rule-spec
+  derivation including the `dangerous_enforce_*` chokepoints. PRs touching
+  C++/proto paths get a short ASan code-change fuzz run (`cflite-pr.yml`);
+  locally, `-Dbuild_fuzzers=true` (clang) builds the harnesses and
+  `meson test --suite fuzz` replays the seed corpora deterministically.
+
+- **Container base images and builder pip installs are now pinned by hash.**
+  Every registry base image in the deploy Dockerfiles (ubuntu, erlang, node,
+  postgres, envoy, debian) is pinned to its manifest-list digest, and the
+  builder images install meson through hash-verified requirements files
+  (`deploy/docker/requirements-meson*.txt`, `pip --require-hashes`).
+  Dependabot's docker and pip ecosystems now also watch
+  `deploy/docker/cedar-vale/` and `deploy/docker/`, so digest refreshes and
+  meson bumps arrive as normal dependency PRs.
+
+- **On-behalf-of assertions are now rejected on every ingress surface
+  (ADR-1005 Interim rules).** Five header/metadata names are reserved —
+  `On-Behalf-Of`, `X-On-Behalf-Of`, `X-Yuzu-On-Behalf-Of`,
+  `X-Yuzu-Delegated-Operator`, `X-Yuzu-Delegation-Artifact` (case-insensitive)
+  — and any HTTP request carrying one (REST, MCP, dashboard, static)
+  receives `403` with the A4 error envelope before authentication (sole
+  recorded exception: the four health-probe paths ignore the header, so a
+  header-stamping proxy cannot crash-loop the server); a gRPC call
+  carrying one as a metadata key is cancelled at a server interceptor and
+  independently rejected again at every RPC handler's own entry point
+  before any side effect can commit — see `docs/auth-architecture.md` for
+  the enforcement seam. Nothing previously consumed these headers, so no
+  legitimate integration breaks — but
+  an integration *testing* a delegation header will now see the rejection.
+  Server-verifiable delegation arrives with the ADR-1005 auth follow-up;
+  client-asserted delegation stays rejected permanently. Rejections are
+  counted in the new `yuzu_onbehalf_rejected_total{surface,event="security"}`
+  metric (log lines are throttled; the counter records every event).
+
+### Breaking Changes
+
+- **Account lockout is ON by default (`--auth-lockout-threshold=5`).** Existing
+  deployments gain a new failure mode on upgrade with no config change: 5
+  consecutive failed local-password logins lock an account for 15 minutes
+  (returning the same generic 401 as a bad password — no "you are locked"
+  message). Shared/service accounts that authenticate with a password and any
+  password-rotation automation are the highest-risk targets. Recover with
+  `POST /api/v1/users/{name}/unlock`, wait out the window, or disable the
+  control with `--auth-lockout-threshold=0`. SSO/OIDC and API tokens are
+  unaffected. See `docs/user-manual/upgrading.md` § Account lockout and the
+  full feature entry under **Added** below.
+- **The shipped Docker images are now TLS-by-default (PKI #1289).** The
+  `yuzu-server` / `yuzu-server-chisel` and `yuzu-agent` / `yuzu-agent-chisel`
+  images no longer bake `--no-tls`/`--no-https` into their default CMD, so a
+  container started from the published image is **encrypted + mutually
+  authenticated out of the box**: the server auto-generates a per-install CA and
+  serves the dashboard over **HTTPS on 8443** (8080 becomes the HTTP→HTTPS
+  redirect) and the agent/management/gateway listeners over (m)TLS; the agent
+  connects to the gateway over TLS and, with no `--ca-cert`, **auto-discovers the
+  install CA** at `/etc/yuzu/certs/default-ca.pem`. **Fail-closed (#1303):** if no CA
+  can be pinned (no `--ca-cert` and no discoverable install CA), the agent now
+  **refuses to start** (exits non-zero) instead of silently verifying against the
+  system trust store — which does not trust a Yuzu self-signed CA, a fail-open MITM
+  window once the gateway TLS edge is live. Pass **`--tls-system-roots`** /
+  `YUZU_TLS_SYSTEM_ROOTS=1` only when the server cert chains to a public/corporate CA
+  already in the system store, or `--no-tls` for dev/demo. Two operational notes: (1)
+  the dashboard cert is signed by the per-install CA, so a browser shows an
+  untrusted-issuer warning until you trust it (download `default-ca.pem` or `GET
+  /api/v1/ca/root`); (2) for a multi-container deploy sharing one
+  `/etc/yuzu/certs` volume, the server takes a new **`--cert-group <name|gid>`**
+  flag (`YUZU_CERT_GROUP`) that group-shares the cert dir + the gateway leaf key
+  with the `yuzu-pki` group baked into all three images, so the
+  different-uid containers can read the shared certs (the CA/server/HTTPS private
+  keys stay 0600 owner-only). Demo/UAT/test composes deliberately keep `--no-tls`.
+  Native installs (deb/systemd, Windows installer) were already secure-by-default.
+  New secure reference composes: `docker-compose.reference.yml` (single server) and
+  `docker-compose.reference-gateway.yml` (server + gateway + agent). In the
+  gateway topology the **privileged server→gateway command plane (`:50063`) is now
+  mutual TLS** (#1314): the server presents its leaf and the gateway requires a
+  CA-issued client cert, so a container with no Yuzu cert — including a compromised
+  agent — can no longer push commands to the fleet over that plane (previously it
+  was plaintext + unauthenticated). To run the old insecure posture, pass
+  `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
+  "Secure-by-default deployment".
+- **Windows TAR process events no longer carry a command line (`cmdline` is
+  empty).** With the Windows `process` source moving from the snapshot-diff poll
+  to the ETW Kernel-Process feeder (see Added), process rows on Windows are
+  names-only — the ETW start event carries no command line. Any dashboard, SIEM
+  export, `tar.sql` query, or Guardian rule that read `cmdline` from
+  `$Process_*` on Windows now sees an empty string. **macOS process rows are now
+  names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
+  Added): the stream carries no command line, and the poll fallback (a Command Line
+  Tools SDK build, or a host without the ES entitlement/root) now blanks the
+  `proc_pidpath` image path it previously placed in `cmdline`. **Linux is
+  unaffected** (the poll still captures command lines). This is intentional
+  (works-council / data-minimization posture) and not
+  reversible by configuration; `process_enabled=false` disables process capture
+  entirely (stream and poll) if required. Command-line redaction patterns
+  consequently have no effect on Windows process rows (there is nothing to
+  redact). The boot-window AutoLogger backfill is configured by the production
+  InnoSetup installer (scoped to the `advanced` component) and by the developer
+  install script (`install-agent-user.ps1`); it takes effect on the next reboot
+  after install. See `docs/user-manual/tar.md`
+  "Upgrade note (Windows process capture → ETW)".
+- **The server now generates per-install default TLS certificates on first
+  boot instead of refusing to start without operator-provided certs.** A fresh
+  install is encrypted and serves the HTTPS dashboard + agent/management gRPC
+  with an auto-generated per-install ECDSA CA (no `--no-tls`/`--no-https`
+  needed). Because the dashboard cert is signed by a per-install CA, browsers
+  show an untrusted-issuer warning until the operator trusts the CA
+  (`<cert-dir>/default-ca.pem`) or replaces the certs. The server warns loudly
+  on six surfaces (startup banner; one-shot audit `server.default_certs_generated`;
+  periodic audit `server.default_certs_in_use`; Prometheus
+  `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
+  `ca_fingerprint` + `ca_expires_at`; `/readyz` `ca_store`/`ca_root`). While on default certs the agent
+  listener runs encrypted but **requests-but-does-not-require** client certs so
+  a first-boot agent can bootstrap; agents then auto-enroll for a per-agent
+  client certificate and upgrade to full mutual TLS (see "Per-agent mutual TLS"
+  under Added). An operator-supplied agent surface keeps strict mTLS, and the
+  management plane is unaffected. **Opt out with
+  `--no-default-certs`** to restore the legacy refuse-to-start. New `--ca-dir`
+  relocates the CA/cert directory. A surface given a cert without its key (or
+  vice-versa) is now a hard startup error. See `docs/auth-architecture.md`
+  "Default certificates".
+- **`--mfa-enforcement=admin-only` and `--mfa-enforcement=required` now
+  ENFORCE (previously a logged no-op).** PR 1/PR 2 accepted these values
+  for forward-compatibility and documented them as no-ops (the server
+  emitted a startup `WARN`). PR 3 wires real enforcement: an un-enrolled
+  login subject to enforcement is redirected through TOTP enrollment
+  (`POST /login/mfa/enroll`) before any session is minted. **An operator
+  who staged `--mfa-enforcement=admin-only|required` based on the prior
+  no-op documentation will hit live enforcement immediately on upgrade.**
+  Before upgrading: ensure all affected accounts are enrolled, or set the
+  flag back to `optional`, upgrade, then re-enable after verifying
+  enrollment. The startup line for non-default modes changes from `WARN`
+  (no-op) to `INFO` (enforcement active). See
+  `docs/user-manual/upgrading.md` for the full pre-flight checklist,
+  including the SSO `amr` requirement and single-admin guidance.
+- **OIDC/SSO sessions are now MFA-gated via the IdP `amr` claim instead of
+  being blanket-exempt from step-up.** An SSO session whose IdP attests a
+  multi-factor login (RFC 8176 `amr` containing `mfa`/`otp`/`hwk`/`fpt`/
+  `face`/`iris`/`sms`/`swk`/`tel`) clears high-risk endpoints without a
+  redundant prompt and re-prompts (via re-SSO) once the assertion ages
+  past `--mfa-step-up-window-secs`. An SSO session whose IdP did **not**
+  attest MFA is handled symmetrically with local users: under `optional`
+  (or `admin-only` for a non-admin) it passes the gate (Yuzu cannot mint a
+  factor for an external identity); under `required` (or `admin-only` for
+  an admin) it is gated and must re-authenticate through SSO. **If you
+  enable `required`/`admin-only` with SSO, configure your IdP to assert
+  `amr` and verify it pre-flight** — otherwise affected SSO users cannot
+  reach high-risk endpoints (recoverable by restarting in `optional`).
+
+- **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
+  Programmatic clients (CI pipelines, automation scripts, health checks)
+  that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
+  fail silently the first time the authenticating user enrolls in TOTP MFA.
+  Handle the 202 branch: read `mfa_pending_token` from the JSON body and
+  POST it along with the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX`
+  recovery code) to `POST /login/mfa` to obtain a session cookie. Clients
+  using API tokens or OIDC are unaffected.
+- **Audit verb taxonomy on every new MFA emission site uses the
+  `target_type="User"` (PascalCase) and `result ∈ {ok, error}` vocabulary
+  from `docs/observability-conventions.md`.** SIEM and Grafana rules that
+  filter on the historical lowercase `target_type="user"` + `success/failure`
+  strings used by `auth.login` / `auth.oidc_login` will not match the new
+  `mfa.*` rows. Existing auth.* sites remain on the historical vocabulary
+  for backwards compatibility (separate tracking issue).
+- **Recovery code format changed from `XXXXX-XXXXX` (50 bits) to
+  `XXXX-XXXX-XXXX-XXXX` (80 bits, four base32 groups).** Codes issued by
+  prior PR1 commits are no longer the canonical shape but remain valid
+  until consumed or regenerated.
+- **`AuthDB::remove_user` now also clears MFA enrollment state.** Soft-
+  deleting a user nulls their `mfa_totp_secret`, clears `mfa_enrolled_at`,
+  and DELETEs every `mfa_recovery_codes` row owned by the user — SOC 2 CC6.8
+  requires credentials be revoked on termination. Any external code or
+  ops tooling that relied on the prior "soft delete leaves MFA intact"
+  behavior must update.
+
 ### Tests
 
 - **Scope walking — YAML `fromResultSet:` DSL (PR-E).** New
@@ -2948,61 +3471,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hostnames `yuzu-frontend` / `yuzu-app` / `yuzu-db` (no real services), so
   `/viz/fleet` labels three tiers by name without needing OrbStack VMs — the
   Linux/WSL2-friendly cousin of the macOS `cedar-vale` mode.
-
-### Fixed
-
-- **viz-UAT: server config bind-mount must be world-readable (0644, not
-  0600).** `start-viz-uat.sh` generated `yuzu-server.cfg` at mode 0600 owned by
-  the operator's uid, then bind-mounted it into the server container which runs
-  as uid 999 (`yuzu`) — unreadable, so the server fell through to interactive
-  first-run setup, read empty stdin, and died on the password floor. The file
-  is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
-  containerized launcher.
-- **CRITICAL — `POST /login/mfa` was unreachable behind the pre-routing
-  auth gate** (Hermes Agent red-team review, 2026-05-29). The exemption
-  list at `server.cpp:2393` covered `/login` but not `/login/mfa`, so
-  every unauthenticated POST to the MFA challenge was redirected to
-  `/login` before the route handler ran — the MFA login flow was
-  completely deadlocked in any deployment with the gate enabled. The
-  internal governance review missed this because PR1 deferred route-
-  level integration tests. Added `/login/mfa` to the exemption list
-  with a comment crediting the Hermes finding.
-- **HIGH — `/login/mfa` was bypassing the login-specific rate limiter**
-  (Hermes Agent LOW #6 escalated by the credential-brute compounding
-  effect). `is_login = req.path == "/login"` at `server.cpp:2374` did
-  not match `/login/mfa`, so MFA submissions fell through to the looser
-  `api_rate_limiter_` bucket. Expanded the predicate to cover both
-  paths so per-IP rate-limit defence applies to both legs of credential
-  auth. The per-pending-token 5-attempt cap remains as the second layer.
-- **MEDIUM — CSRF protection on the five `/api/settings/mfa/*` POST
-  routes** (Hermes Agent MEDIUM #2). The mutating MFA settings routes
-  (`init`, `verify`, `recovery-codes`, `disable`) relied on session-
-  cookie auth (`SameSite=Lax`) without `Origin` / `Referer` checks; a
-  stolen cookie could be replayed cross-site to strip a victim's MFA.
-  Added an `origin_safe` helper that requires `Origin` (or `Referer`
-  fallback) host to match the request `Host` header on browser POSTs;
-  non-browser clients (curl, automation) that omit both headers pass
-  through. Mismatched host returns 403 with audit verb `csrf.denied`
-  (`target_type="Endpoint"`) for SIEM correlation. Audit detail strings
-  are sanitised (control + high-bit bytes stripped, each field capped at
-  128 B), default ports `:443`/`:80` are normalised so a TLS-terminating
-  reverse proxy that rewrites `Host` to the port-less form does not
-  false-deny, and userinfo (`@`) plus fragment / query (`?`, `#`) in the
-  Origin URL are rejected per RFC 6454.
-
-  **Deferred scope (Gate 4 SHOULD S2 — known follow-up):** `origin_safe`
-  is wired into the 4 mutating MFA POSTs only. 11 sibling state-changing
-  Settings POSTs remain CSRF-unprotected:
-  `/api/settings/users` (and `/role`), `/api/settings/api-tokens`,
-  `/api/settings/plugin-signing/{upload,clear,require}`,
-  `/api/settings/oidc` (and `/test`), `/api/settings/{cert-upload,
-  cert-paste}`, `/api/settings/enrollment-tokens`, `/api/settings/tls`.
-  These were unprotected before PR1 too — the asymmetry is documented
-  here so it isn't mistaken for a regression. A follow-up PR wraps every
-  admin HTMX mutation with the same helper.
-
-### Tests
-
 - **Integration / synthetic-UAT scripts: replace fragile log-grep assertions
   with Prometheus-metric assertions.** Phase 5 of `/test --full` run
   `1779859754-13864` surfaced a single Integration FAIL whose root cause was
@@ -3051,44 +3519,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     22/22 PASS; the helper passes a four-case behavioural sanity test
     (live PASS, impossible-threshold FAIL, missing-metric FAIL,
     labelled-metric PASS).
-
-### Security
-
-- **NAT-aware per-session peer-IP binding (#1128).** The W1.3 stolen-session
-  guard (Subscribe source IP must match Register source IP) false-rejected
-  legitimate direct-connect agents behind multi-egress NAT / proxy pools /
-  CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
-  accommodations now downgrade a mismatch to *advisory* (audited
-  `result="ok" outcome=advisory`, counted on
-  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason,gateway_mode}`)
-  instead of rejecting: (1) both IPs falling inside an operator-declared
-  `--trusted-nat-cidr` range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS
-  client identity, which is **opt-in** via `--nat-trust-mtls-identity`
-  (`YUZU_NAT_TRUST_MTLS_IDENTITY`, default off) and SAFE ONLY WITH PER-AGENT
-  CLIENT CERTS — a shared fleet-wide cert would make it a session-replay
-  bypass; enabling the flag now emits a `warn`-level startup banner so it is
-  not silently lost in a tail-only boot log. Mismatches outside both
-  accommodations still hard-reject; an empty extracted IP always rejects.
-  Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
-  When both accommodations are configured, mTLS-identity match takes
-  precedence (the audit row + metric `reason` label record which fired). The
-  advisory audit row and metric now carry a `gateway_mode` field/label
-  matching the existing reject path, so SIEM rules can correlate advisory and
-  reject volumes by operator-mode dimension.
-- **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
-  gateway `ProxyRegister` path previously recorded the gateway's IP as the
-  source, not the agent's (SOC 2 IR-2 mis-attribution). A new
-  transport-agnostic `RegisterRequest.gateway_observed_peer` field (survives the
-  planned gRPC→QUIC move) carries the agent origin IP; the server now records
-  `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
-  `origin_observed=false` when absent). The direct Register path ignores the
-  field (a direct agent cannot forge a source IP; it is not a defence against a
-  compromised gateway). **Note for gateway deployments:** until the gateway-side
-  population follow-up ships, audit rows on the `ProxyRegister` path still record
-  the gateway node's IP as `source_ip` (the field is not yet populated by
-  today's grpcbox transport, which cannot observe the direct agent peer; the
-  durable source arrives with the QUIC transport, #376). Operators relying on
-  `source_ip` for IR-2 attribution on the gateway path should note this.
 
 ## [0.12.0] - 2026-05-25
 

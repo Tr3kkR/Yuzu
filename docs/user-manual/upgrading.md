@@ -42,7 +42,7 @@ specific per-field messages (e.g. `Missing metadata.id (or metadata.name)
 field`), and successful saves now emit `instruction.create` /
 `instruction.update` audit rows.
 
-## ⚠️ Reserved on-behalf-of headers rejected + `principal_class` metric label (ADR-0022 Phase 1)
+## ⚠️ Reserved on-behalf-of headers rejected + `principal_class` metric label (ADR-1005 Phase 1)
 
 Two operator-visible changes ship together:
 
@@ -59,7 +59,7 @@ upstream request (the name is Microsoft's Entra OBO term), which would 403
 `/readyz`, `/health`, `/api/health`) are exempt, so the pod stays in rotation
 — a green probe with a 100% 403 rate is the signature (see
 `docs/operations/troubleshooting.md`). Rejections are visible in
-`yuzu_onbehalf_rejected_total` and throttled `[ADR-0022]` warn lines.
+`yuzu_onbehalf_rejected_total` and throttled `[ADR-1005]` warn lines.
 
 **2. `yuzu_http_requests_total` gains a `principal_class` label**
 (`human`/`agent`/`none`; `engine` reserved). This is a Prometheus
