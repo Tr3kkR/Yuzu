@@ -9,18 +9,14 @@ depends-on: >-
 related: >-
   0029 (CVE source catalog and ingestion — sibling document from the same split, no direct
   dependency in either direction; ADR-0028's own Relationship table below is the authoritative
-  statement of that relationship). The CVE-matching content that consumes this ADR's output
-  (proposed as an amendment to PR 1914 / ADR-0023 — PR 1914 merged 2026-07-07; ADR-0023 itself
-  remains `status: proposed` on `dev` (a separate attempt to accept it, PR #1985, was closed
-  unmerged) — status corrected following adversarial review, 2026-07-08, which had wrongly
-  claimed ADR-0023 was already accepted; see CVE_MATCHING_ADR0023_AMENDMENT.md for the amendment
-  content itself).
+  statement of that relationship). The CVE-matching engine that consumes this ADR's output
+  is ADR-0023 (vuln correlation engine), `status: accepted` (merged via PR #1914).
   0018/0019 (server-authoritative vulnerability matching / tri-state findings — downstream
   consumer, language-ecosystem regime). 0024-software-licensing-entitlements (PR 1920, open —
   downstream consumer for license/entitlement matching). docs/roadmap.md Issue 18.5 ("SBOM
   Ingest" — companion, import-side of the same capability) and Issue 18.7 (this capability,
   generation-side; added to `docs/roadmap.md` Phase 18, status: Proposed, 2026-07-08).
-  0022-headless-platform-use-case-engines (PR 1918/1926, merged 2026-07-07/08 —
+  1005-headless-platform-use-case-engines (`status: proposed`, not yet accepted —
   this capability is mechanism under that ADR's Decision-2 test, and stays core/agent-side
   regardless of how the use-case-engine question resolves). The existing vuln_scan plugin
   (agents/plugins/vuln_scan/ — considered and rejected as a host for this capability, Decision 2;
@@ -38,10 +34,6 @@ related: >-
   docs/postgres-store-playbook.md and docs/postgres-migration-ladder.md (cited in Decision 8 for
   whoever designs the deferred store schema). docs/roadmap.md Issue 18.1 (Vulnerability Lifecycle
   — the named future home for findings-side history, Decision 7).
-input-documents: >-
-  CVE_MATCHING_STRATEGY_ARBITRATED.md section 1.6 (origin of this design, written as part of a
-  larger CVE-matching research effort). CVE_MATCHING_ADR0023_AMENDMENT.md (sibling — the
-  matching logic that consumes this ADR's output).
 supersedes: >-
   docs/adr/0025-cve-matching-strategy.md (retired, uncommitted, never merged — its own Decision
   2b/Decision 3 content, using 0025's own now-unrecoverable section numbering, is split out
@@ -60,8 +52,9 @@ supersedes: >-
 
 ## Context
 
-CVE-matching research (see `input-documents`) surfaced that a large, modern CVE surface is
-invisible to today's collection model: dependencies **bundled inside an installed application**
+CVE-matching research (internal working notes, not committed to this repository) surfaced that a
+large, modern CVE surface is invisible to today's collection model: dependencies **bundled inside
+an installed application**
 (Electron/Chromium embedded in Slack/Teams/Discord/VS Code, vendored `OpenSSL.dll`/`libcrypto.so`,
 embedded JARs — the Log4Shell distribution vector, statically-linked libraries) and
 **filesystem-resident language dependencies** (`node_modules`, Python venvs/site-packages, on-disk
@@ -90,10 +83,10 @@ see `supersedes`). It is split out into its own ADR because:
 1. **It has consumers beyond CVE matching.** License/entitlement tracking (the open ADR-0024
    Software Licensing & Entitlements proposal, PR #1920) needs exactly this per-component data;
    supply-chain/attack-surface visibility is a distinct, independently valuable use.
-2. **It is *mechanism*, not *interpretation*, under ADR-0022's own test** (`docs/adr/0022-*` drafts,
-   open PR #1918/#1926) — collection stays core/agent-side regardless of how the still-open
-   use-case-engine relocation debate resolves for CVE-matching *interpretation*. This ADR is safe to
-   accept and build independent of that outcome.
+2. **It is *mechanism*, not *interpretation*, under ADR-1005's own test**
+   (`docs/adr/1005-headless-platform-use-case-engines.md`, `status: proposed`) — collection stays
+   core/agent-side regardless of how the still-open use-case-engine relocation debate resolves for
+   CVE-matching *interpretation*. This ADR is safe to accept and build independent of that outcome.
 3. **It is a materially different collection posture** from registry/package-manager enumeration —
    deep recursive filesystem and binary introspection, with its own performance and privacy/DPIA
    questions — and deserves independent scrutiny rather than riding in on a CVE-matching decision
@@ -195,11 +188,11 @@ plugin.**
 
   **Dependency-origin tag: public-registry-resolved vs. private/internal-source, on every
   lockfile-derived record** (renamed from an earlier "provenance tag" during governance review,
-  2026-07-07 — "provenance" collided with the unrelated HIGH/MEDIUM/LOW source-reliability ranking
-  used elsewhere in this workstream's matching design; see `CVE_MATCHING_ADR0023_AMENDMENT.md`'s
-  "provenance tier"). Not for exclusion — for efficiency and forward-compatibility: the matching
-  engine (`CVE_MATCHING_ADR0023_AMENDMENT.md`) can skip a futile OSV/GHSA query for a private-source
-  entry it already knows can't match, and the same tag is exactly the join key a future
+  2026-07-07 — "provenance" collided with an unrelated HIGH/MEDIUM/LOW source-reliability ranking
+  used elsewhere in this workstream's matching design, not yet committed to any ADR at the time of
+  this writing). Not for exclusion — for efficiency and forward-compatibility: the matching engine (ADR-0023) can skip a
+  futile OSV/GHSA query for a private-source entry it already knows can't match, and the same tag
+  is exactly the join key a future
   internal-vulnerability-repository capability would need. One tag, two consumers, decided now; the
   future consumer itself is not. **Known limitation, accepted rather than solved here** (found
   during unhappy-path review): this classification is a collection-time heuristic (resolved-host-
@@ -224,12 +217,18 @@ addition, not an assumption:
    with unambiguous attribution (the manifest tells you which package a file belongs to). Use the
    **batch form** (`dpkg-query -L $(dpkg-query -W -f='${Package}\n')` / `rpm -qla`), not a naive
    per-package spawn loop — a full desktop image can carry thousands of packages, and per-package
-   process/DB-read overhead adds up (found during cross-platform review). The manifest mixes
+   process/DB-read overhead adds up (found during cross-platform review). **Illustrative example
+   only, not a literal implementation contract:** the command-substitution form shown isn't
+   argv-length-safe on a host with a very large package count (risks `E2BIG`/truncation); the
+   implementing PR should batch through the plugin's own dispatch rather than shell out with a full
+   package-name list in one argv, matching the precedent `sync_source_installed_software.cpp`
+   already sets. A truncated/failed batch degrades to UNKNOWN entries via this ADR's own collection-
+   failure fallback (Decision 4), not silently wrong data, but should be avoided regardless. The manifest mixes
    directories with files and can be empty for virtual/meta packages; filter to regular files before
    checking extensions, and treat an empty manifest as "nothing bundled," not an error, for a
    package with zero files by design. A generic bounded directory walk under `/opt`/`/usr/local` is
    the **fallback only**, for non-packaged software with no package manifest (the same "hard tail"
-   case the arbitrated CVE-matching design already names) — and also the fallback for a
+   case this workstream's matching design elsewhere names) — and also the fallback for a
    **partially-installed package** (an interrupted `dpkg`/`rpm` transaction where the database says
    installed but files are missing/corrupted): a failed manifest query at the *package* level is
    itself emitted as UNKNOWN, per Decision 4, never silently treated as "no bundled libraries."
@@ -291,8 +290,8 @@ ordinary in-root version symlinks are followed and resolved normally.
 independently by three reviewers — architect, plugin-developer, unhappy-path — during the
 2026-07-07 governance pass, converging on the same recommendation).** The `InstallLocation`/
 bundle-path addition in (2) is a small change to ADR-0016's collection scope, but doesn't have a
-clean home in the current three-document split (this ADR, the CVE-source-catalog ADR, and the
-ADR-0023 matching amendment) — it's collection enrichment for *existing* identity fields, not new
+clean home in the current three-document split (this ADR, the CVE-source-catalog ADR, and
+ADR-0023) — it's collection enrichment for *existing* identity fields, not new
 component-inventory collection. **Sequencing matters, not just ownership:** if `component_inventory`
 implementation proceeds before this lands, the "fallback" generic walk (item 3) silently becomes the
 *default* mechanism for every Windows/macOS endpoint, inheriting all of its named costs (wasteful,
@@ -440,7 +439,7 @@ command dispatch — the synchronous-timeout-budget problem this plugin actually
 for it by construction. The right precedent is `filesystem_plugin.cpp`
 (`agents/plugins/filesystem/src/`), which already does exactly this: a bounded, synchronous
 recursive walk returning through `write_output` within depth/size/time budgets (see the
-bound-checking-primitives reuse discussion below) — the shape this plugin's own walk needs, not
+bound-checking-primitives reuse discussion above) — the shape this plugin's own walk needs, not
 `tar`'s streaming model. Separately, `sync_source_installed_software.cpp`'s existing behavior of
 dropping the **entire cycle** on capture-cap truncation (line ~306 in that file) is a materially
 bigger risk here given this tier's higher cardinality and heterogeneity — a truncated
@@ -553,7 +552,7 @@ definition, and `content/definitions/vuln_scan.yaml` needs more than a two-field
    preserves whatever RBAC grants currently exist against that id — but the capability it authorizes
    changes completely, from legacy rule-based scanning to a privileged (root/LocalSystem today),
    machine-wide filesystem/binary-introspection walk feeding a store that carries internal
-   dependency-name data (a named SOC 2 Confidentiality-criterion concern, Decision 2 above). Any
+   dependency-name data (a named SOC 2 Confidentiality-criterion concern, Decision 1 above). Any
    principal or role currently holding execute permission on the old id would silently inherit the
    new, materially more invasive capability with no re-review. **A one-time audit of which
    roles/principals hold execute permission on `security.vuln_scan.scan`, confirming the grant is
@@ -604,8 +603,8 @@ commits to the collection half of that: an on-demand result is ingested into the
 it arrives (the same "live scan uses the just-collected value" principle ADR-0018 already
 established for distro-release), never gated behind the passive Decision-3 cadence. **It does not,
 by itself, guarantee the matching engine re-evaluates that scope immediately** — that half is a
-matching-side decision, which belongs in `CVE_MATCHING_ADR0023_AMENDMENT.md` alongside its existing
-feed-triggered re-evaluation design, not in this collection-only ADR. **Sharpened trigger-keying
+matching-side decision, which belongs in ADR-0023 alongside its existing feed-triggered
+re-evaluation design, not in this collection-only ADR. **Sharpened trigger-keying
 detail (following the `vuln_scan`-instruction-repointing discussion, Decision 2):** that trigger
 should key off **the `component_inventory` action's completion for an agent/scope**, not off any
 specific instruction-definition name or id. `vuln_scan.scan` is one operator-facing entry point that
@@ -883,7 +882,7 @@ implemented as "matching `installed_software`/`device_ci`'s pattern of replacing
 child rows"** — an earlier draft of this paragraph said exactly that, but `installed_software`'s
 actual pattern (`software_inventory_store.cpp`) is an unconditional `DELETE FROM ... WHERE
 agent_id=$1` followed by a bulk `INSERT`, and `device_ci` has no child-row pattern at all (a single
-flat table, corrected in Decision 7 above). Implementing this swap as delete-then-bulk-insert would
+flat table, corrected in Decision 7 below). Implementing this swap as delete-then-bulk-insert would
 silently defeat Decision 7's whole preserve-`first_seen` mechanism: `ON CONFLICT (agent_id,
 component_key)` never fires against a row that was just deleted, so every component's `first_seen`
 would silently reset to "now" on every sync cycle after the first, with no error surfaced. **The
@@ -956,7 +955,7 @@ designed in this ADR.
 ### 5. Shared schema with roadmap Issue 18.5
 
 The output schema is designed to be the **shared input** for both this capability's own consumer
-(CVE matching — see `CVE_MATCHING_ADR0023_AMENDMENT.md`) and Issue 18.5's externally-ingested SBOM
+(CVE matching — see ADR-0023) and Issue 18.5's externally-ingested SBOM
 data. One schema, at least two producers (agent-generated vs. customer-CI-ingested), rather than
 two divergent data models that both claim to describe "software on this endpoint." (Decision 6
 below extends this to a three-way symmetry once export is added.)
@@ -990,11 +989,13 @@ of this schema — not designed here, and not the at-rest format.
   **export** (future, on-demand projection out, not yet a numbered issue). One schema serves all
   three, computed at the boundary — the same principle ADR-0018 already applied to PURL ("computed
   only when interop needs it").
-- **CycloneDX's native VEX (Vulnerability Exploitability eXchange) support maps closely onto this
-  workstream's four-state verdict model** (FIXED/OPEN/NOT-APPLICABLE/UNKNOWN ≈ VEX's
-  fixed/affected/not_affected/under_investigation). Once the matching engine (the ADR-0023
-  amendment) produces verdicts, a CycloneDX+VEX export becomes close to free — a real
-  forward-compatibility argument for eventually building export, not for changing storage now.
+- **CycloneDX's native VEX (Vulnerability Exploitability eXchange) support maps closely onto a
+  proposed four-state verdict model for this workstream** (FIXED/OPEN/NOT-APPLICABLE/UNKNOWN ≈
+  VEX's fixed/affected/not_affected/under_investigation) — **not yet part of any merged ADR at the
+  time of this writing** (ADR-0023 as merged still uses its own tri-state-plus-`potential` model).
+  If a future matching engine ends up producing verdicts in that shape, a CycloneDX+VEX export
+  becomes close to free — a real forward-compatibility argument for eventually building export, not
+  for changing storage now, and not a claim that this mapping is available today.
 - **CycloneDX and SPDX serve different downstream consumers Yuzu already has.** CycloneDX is the
   security/VEX-oriented standard (matches this CVE-matching workstream); SPDX 3.0's
   Security/Licensing profiles are the license-compliance-oriented standard (matches the open
@@ -1004,7 +1005,9 @@ of this schema — not designed here, and not the at-rest format.
 
 **Scope of this decision:** commits to (i) the storage format being internal/relational, and (ii)
 export/import as an anticipated, explicitly out-of-scope-here future capability sitting on top of
-it. Does not design the export/import feature itself (tracked alongside the Decision 8 deferrals).
+it. Does not design the export/import feature itself — **unlike this ADR's other deferred items,
+export/import is not tracked under roadmap Issue 18.7** (see the "not yet a numbered issue" note
+above); it remains unnumbered future work.
 
 ### 7. Retention: current-state-only — the component inventory has no history; discovered vulnerabilities will, but that's a separate future decision
 
@@ -1150,7 +1153,7 @@ complete data). **The mechanism, stated once, covering every case:**
    metadata says).
 
 The sidecar's own collection timestamp is agent-supplied and subject to the same future-dating
-rejection rule as Decision 2's write-guard ordering key (below) in all cases that write it.
+rejection rule as Decision 2's write-guard ordering key (above) in all cases that write it.
 
 **This is a stronger case for current-state-only than `installed_software`'s own, not a weaker
 one.** The same cardinality/cost reasoning that justified giving this its own sync source
@@ -1164,9 +1167,9 @@ verdict against a component has a genuine lifecycle (open → remediated → re-
 vs. last-confirmed dates; SLA tracking) that the raw component inventory does not need and this
 document does not design. That lifecycle question already has a plausible home: `docs/roadmap.md`
 **Issue 18.1, "Vulnerability Lifecycle"** ("CVE → CVSS → owner → SLA → remediation tracking"). This
-ADR's boundary: it feeds `CVE_MATCHING_ADR0023_AMENDMENT.md`'s matching engine a current-state
-component inventory; whatever history that engine's *findings* need is that document's (or a
-future ADR's) decision, not a retention requirement on the inventory itself.
+ADR's boundary: it feeds ADR-0023's matching engine a current-state component inventory; whatever
+history that engine's *findings* need is that ADR's (or a future ADR's) decision, not a retention
+requirement on the inventory itself.
 
 **If genuine component-level historical/change-tracking is ever wanted** (a forensic "was this
 component present two weeks ago" question, distinct from vulnerability history) — that remains a
@@ -1206,7 +1209,9 @@ principle, and shared-schema intent. It explicitly **does not** fully specify:
   **uniqueness-within-agent, path-inclusion, logical-not-resolved-path, and collision-safe-encoding
   requirements are settled** (Decision 7) and constrain, not are designed by, this deferred work.
 - **The CycloneDX/SPDX export/import projection feature** itself (Decision 6 commits only to the
-  storage-format principle that makes it possible later, not its design).
+  storage-format principle that makes it possible later, not its design). **Not covered by roadmap
+  Issue 18.7** — unlike the other bullets in this list, this deferral is unnumbered future work
+  (Decision 6's own scope note); listed here as a deferral of this ADR, not as an Issue-18.7 item.
 - The **`component_inventory` plugin's exact action name(s) and full field list** (Decision 2 settles
   the wire-format *shape* — flat, delimited, honest-empty, `kind`-discriminated, matching
   `installed_software`'s convention — but not the specific action name or the complete per-`kind`
@@ -1276,12 +1281,12 @@ principle, and shared-schema intent. It explicitly **does not** fully specify:
   the opt-out flag's documentation, required before Issue 18.7 ships, not a separate nice-to-have.
 
 **Acknowledged, not resolved: this store's core-vs-use-case-engine placement is contingent on its
-non-CVE consumers actually materializing (per architect review, cross-referencing ADR-0022's own
+non-CVE consumers actually materializing (per architect review, cross-referencing ADR-1005's own
 "a store whose sole consumer is an interpretation layer moves out with that layer" principle).**
 This ADR argues the store stays core-side because it names consumers beyond CVE matching (licensing/
 ADR-0024, supply-chain visibility, Context point 1). If those consumers never materialize and
 CVE-matching ends up the only real reader, the store's core placement is contingent on that fact,
-not permanently settled by this ADR — worth re-checking if and when ADR-0022 resolves.
+not permanently settled by this ADR — worth re-checking if and when ADR-1005 is accepted.
 
 ## Consequences
 
@@ -1396,16 +1401,16 @@ retirement PR itself.
 | ADR / doc | Relationship |
 |---|---|
 | 0016 (agent daily-sync framework) | Mechanism reused (SyncSource/scheduler/hash-skip); a new, separately-governed source (Decision 3) — independent budget/store even though its floor cadence is daily too, plus an event-linked trigger keyed to `installed_software`'s own change detection. **Open dependency (Decision 1):** `installed_apps`/`sync_source_installed_software` needs a small addition (capture `InstallLocation`/`.app` bundle path) to anchor this ADR's walk roots — must land before or alongside implementation (recommended: a dated ADR-0016 amendment section, matching the `device_ci`/blob-v2 precedent), not after. |
-| 0029 (CVE source catalog & ingestion) | **Sibling, not a dependency in either direction** (corrected during governance review, 2026-07-07 — an earlier draft of 0029 incorrectly claimed this ADR as its consumer). Neither document depends on the other; the actual consumer of both is `CVE_MATCHING_ADR0023_AMENDMENT.md`'s matching engine, routed by regime. |
+| 0029 (CVE source catalog & ingestion) | **Sibling, not a dependency in either direction** (corrected during governance review, 2026-07-07 — an earlier draft of 0029 incorrectly claimed this ADR as its consumer). Neither document depends on the other; the actual consumer of both is ADR-0023's matching engine, routed by regime. |
 | `vuln_scan` plugin (existing, not an ADR) | Considered and rejected as the host for this capability (Decision 2) — carries legacy pre-ADR-0018 code pending an unscheduled retirement; a new `component_inventory` plugin is built instead. **The name survives, the plugin doesn't:** the `security.vuln_scan.scan` instruction definition is kept and re-pointed at `component_inventory`'s action, so the operator-facing command an owner already associates with this capability keeps working through the plugin's retirement (Decision 2). |
 | `filesystem` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* bounded-synchronous-walk conventions (Decision 2, citation corrected following adversarial review, 2026-07-08) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only; `tar`'s `ProcStreamCollector` was incorrectly cited here in an earlier draft, but it is a persistent async collector, never invoked synchronously inside one command dispatch, so it doesn't address the command-timeout-budget/partial-result problem this plugin's walk actually faces. `filesystem_plugin.cpp`'s own bounded, synchronous walk is the real precedent for that. |
 | 0018 / 0019 (server-authoritative matching / tri-state findings) | Downstream consumer — this ADR's output feeds the language-ecosystem regime of CVE matching. |
-| CVE_MATCHING_ADR0023_AMENDMENT.md / ADR-0023 (vuln correlation engine, PR #1914, merged 2026-07-07; ADR-0023 itself remains `status: proposed` on `dev` — a prior claim here that it was already accepted was wrong, corrected 2026-07-08) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
-| 0022 (headless platform / use-case engines, PR #1918/#1926, merged 2026-07-07/08 — status corrected following adversarial review, 2026-07-08) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |
+| ADR-0023 (vuln correlation engine, PR #1914, merged 2026-07-07, `status: accepted`) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
+| 1005 (headless platform / use-case engines, PR #1918/#1926 — merged the proposal text to `dev`; the ADR itself is `status: proposed`, not yet accepted) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |
 | 0024 (SLE, PR #1920, open) | Downstream consumer — license/entitlement matching needs the same per-endpoint component data. |
 | roadmap Issue 18.1 (Vulnerability Lifecycle) | Named future home (Decision 7) for the *findings*-side history (open→remediated→re-opened, SLA tracking) this ADR deliberately excludes from the component inventory itself. |
 | roadmap Issue 18.5 (SBOM Ingest) | Companion, not duplicate — import-side of the same capability; shares one internal schema across generate/ingest/export (Decisions 5–6). |
-| roadmap Issue 18.7 (`docs/roadmap.md` Phase 18, status: Proposed — entry added following adversarial review, 2026-07-08) | Tracks this ADR's deferred items (Decision 8), including the export/import projection feature anticipated but not designed by Decision 6. |
+| roadmap Issue 18.7 (`docs/roadmap.md` Phase 18, status: Proposed — entry added following adversarial review, 2026-07-08) | Tracks this ADR's deferred *collection/implementation* items only (Decision 8). Does **not** cover the export/import projection feature — Decision 6 explicitly keeps that as unnumbered future work, not part of Issue 18.7's scope. |
 
 ## Ratification
 
