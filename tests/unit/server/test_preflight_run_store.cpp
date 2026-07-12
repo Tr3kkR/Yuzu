@@ -16,6 +16,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::PreflightRunDeviceRow;
@@ -28,6 +29,16 @@ using yuzu::server::preflight::PreflightTarget;
 namespace preflight = yuzu::server::preflight;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate preflight_tpl{"preflight", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    PreflightRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("preflight template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -55,7 +66,7 @@ PreflightTarget tgt(const std::string& aid) { return {aid, "host-" + aid, "windo
 } // namespace
 
 TEST_CASE("PreflightRunStore owner-scope boundary", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
@@ -97,7 +108,7 @@ TEST_CASE("PreflightRunStore owner-scope boundary", "[pg][preflight][store]") {
 }
 
 TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
@@ -159,7 +170,7 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
 // stale route-persist can't overwrite it (#governance architect/consistency).
 TEST_CASE("persist_and_maybe_complete: completes only when settled; complete grid is immutable",
           "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
