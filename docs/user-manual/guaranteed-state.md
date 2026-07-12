@@ -341,6 +341,32 @@ Guardian surfaces readiness and event counts via the standard observability endp
 - `yuzu_server_guardian_proj_failures_total` (server) counts DEX observation projection failures. The source event is always preserved (the read model degrades, never destroys); `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). `yuzu_server_guardian_observations_reaped_total` is the disposal-evidence counter for reaped DEX projection rows.
 - Broader Prometheus metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
+## SparkEngine — the next-generation detection engine (observe-only)
+
+Guardian is migrating its event-driven detection (file / service / registry watches) onto a new **SparkEngine** in incremental rungs (ADR-0021 Stage-2). **Today the agent stands SparkEngine up *observe-only*:** it runs and reports its own health, but it is **not** wired to drive Guardian — the existing detection path still does all detecting and **all enforcing**. Nothing about how your Guards detect or remediate changes in this build. The migration is deliberately staged so each rung can be measured and rolled back before the next.
+
+**`--spark-disable` / `YUZU_AGENT_SPARK_DISABLE`** is a **boot-time** agent opt-out: when set, SparkEngine is never instantiated and no `spark_*` telemetry is emitted. Like `--dex-disable` it takes effect only at agent start — a live change is ignored until the agent restarts. It is a deploy-time agent setting, **not** a server-side runtime toggle, and it does **not** affect the enforcing legacy path.
+
+Per-rung default posture (recorded here so an upgrade never silently changes what enforces):
+
+| Rung | SparkEngine | What enforces by default | `--spark-disable` effect |
+|------|-------------|--------------------------|--------------------------|
+| **1 (this build)** | instantiated, observe-only, no consumer | legacy path (unchanged) | engine not instantiated |
+| 2 (later) | drives detection, observe-only | legacy path unless flipped | selects the legacy path |
+| 3+ (later) | drives enforcement | legacy path until burn-in | selects the legacy path |
+
+At rung 1 the agent logs the active detection path at startup (`SparkEngine: instantiated OBSERVE-ONLY … Guardian detection path = legacy IGuard (enforcing)`).
+
+**Fleet observability** (all os-labelled — File/Registry are Windows-only, Service is Windows + Linux, macOS has none — so **never aggregate across `os`**; **absent** means no reporting agent of that OS/mechanism, never "0 = healthy"):
+
+- `yuzu_fleet_spark_reporting{os}` — agents running the engine (the denominator; absent under `--spark-disable`).
+- `yuzu_fleet_spark_mechanisms{os,mechanism}` — agents whose spark capability includes that mechanism. An OS reporting but with no `{mechanism}` series does not support it.
+- `yuzu_fleet_spark_armed_faulted{os}` — armed watches a mechanism reported deaf (a live gauge; `> 0` means detection is silently down for that many watches).
+- `yuzu_fleet_spark_watch_rejected{os,mechanism}`, `…_quarantined{os,mechanism}`, `…_slow_op{os,mechanism}` — per-type health counters (watch-cap rejection / mechanism quarantine / slow ops). `quarantined` should stay 0 (page-worthy).
+- `yuzu_fleet_spark_watch_faults{os}`, `…_queued_dropped{os}`, `…_consumer_errors{os}` — engine-level fault / drop / handler-error sums.
+
+At rung 1 (no consumer armed) every counter is 0, so only `reporting` and `mechanisms` carry signal; the rest go live as later rungs arm rules. See the shipped alert rules in `docs/prometheus/yuzu-alerts.yml` (group `yuzu-fleet-spark`). The agent has no `/metrics` endpoint — these are rolled up server-side from heartbeat tags.
+
 ## Related documentation
 
 - [Design v1.1](../yuzu-guardian-design-v1.1.md) — the authoritative architecture document (engineering reference).
