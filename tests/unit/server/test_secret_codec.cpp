@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -134,6 +135,30 @@ private:
 
 #ifdef YUZU_TEST_ENABLE_PG
 
+namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): pre-applies
+// the `secrets` schema migration via a throwaway codec init, then resets
+// kek_meta to the empty first-boot state — each test still mints its own KEK
+// against a fresh keys dir, exactly as on a plain empty database.
+// Security note (governance #2091 Gate 2/6 sign-off): no key material can
+// reach the shared template — the throwaway KEK lives only in this lambda's
+// TempDir (destroyed at scope exit), the DELETE empties kek_meta before the
+// template is ever cloned, and template fingerprints are structure-only.
+yuzu::test::PgTestTemplate secrets_tpl{"secrets", [](const std::string& dsn) {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    if (PQstatus(conn.get()) != CONNECTION_OK)
+        throw std::runtime_error("secrets template: connect failed");
+    if (!codec.init(conn.get()).has_value())
+        throw std::runtime_error("secrets template: init failed to migrate");
+    PgResult reset{PQexec(conn.get(), "DELETE FROM secrets.kek_meta")};
+    if (!reset.ok())
+        throw std::runtime_error("secrets template: kek_meta reset failed");
+}};
+} // namespace
+
 TEST_CASE("SecretCodec: encode_bigint_pk is fixed 8-byte BE", "[secrets]") {
     const std::string be = SecretCodec::encode_bigint_pk(0x0102030405060708);
     REQUIRE(be.size() == 8);
@@ -154,7 +179,7 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
 }
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
@@ -187,7 +212,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
 }
 
 TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     PgConn conn = connect(db.dsn());
     {
@@ -223,7 +248,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
 }
 
 TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -270,7 +295,7 @@ TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][s
 }
 
 TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -318,7 +343,7 @@ TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
 }
 
 TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -386,7 +411,7 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
 }
 
 TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -506,7 +531,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 
 TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk path)",
           "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -566,7 +591,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
 
 TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard, zero-row column",
           "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -641,7 +666,7 @@ TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard
 }
 
 TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
@@ -700,7 +725,7 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
 
 TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",
           "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
@@ -731,7 +756,7 @@ TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails c
 }
 
 TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
@@ -756,7 +781,7 @@ TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][sec
 
 TEST_CASE("SecretCodec: retire with failed key deletion records no false destruction",
           "[pg][secrets]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys;
     FileKeyProvider file_provider(keys.path);
     FailingDeleteProvider provider(file_provider); // delete_kek always fails
