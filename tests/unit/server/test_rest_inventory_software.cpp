@@ -47,6 +47,19 @@ using yuzu::server::pg::PgPool;
 
 namespace {
 
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): same key +
+// identical setup as test_software_inventory_store.cpp (first build wins) —
+// the store set here is exactly {SoftwareInventoryStore}.
+yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    SoftwareInventoryStore store{pool};
+    // Throw, don't return: a silently-unmigrated template would make every
+    // clone fall back to in-test migration — correct but slow, defeating the
+    // point. PgTestTemplate::build records the throw as a fixture error.
+    if (!store.is_open())
+        throw std::runtime_error("swinv template: store failed to migrate");
+}};
+
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -197,7 +210,7 @@ void seed(SoftwareInventoryStore& store, const std::string& agent,
 
 TEST_CASE("REST inventory/software: fleet read returns rows, count, devices_omitted=0",
           "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -221,7 +234,7 @@ TEST_CASE("REST inventory/software: fleet read returns rows, count, devices_omit
 
 TEST_CASE("REST inventory/software: rows carry the blob-v2 package fields",
           "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -272,7 +285,7 @@ TEST_CASE("REST inventory/software: rows carry the blob-v2 package fields",
 
 TEST_CASE("REST inventory/software: name filter narrows the fleet result",
           "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -293,7 +306,7 @@ TEST_CASE("REST inventory/software: name filter narrows the fleet result",
 
 TEST_CASE("REST inventory/software: scope filter drops out-of-scope agent + audits denied",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -321,7 +334,7 @@ TEST_CASE("REST inventory/software: scope filter drops out-of-scope agent + audi
 
 TEST_CASE("REST inventory/software: limit cap flags result_truncated_by_cap",
           "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -339,7 +352,7 @@ TEST_CASE("REST inventory/software: limit cap flags result_truncated_by_cap",
 }
 
 TEST_CASE("REST inventory/software: non-integer limit → 400", "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -353,7 +366,7 @@ TEST_CASE("REST inventory/software: non-integer limit → 400", "[pg][rest][inve
 
 TEST_CASE("REST inventory/software: ?agent_id= narrows to one device",
           "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -375,7 +388,7 @@ TEST_CASE("REST inventory/software: ?agent_id= narrows to one device",
 
 TEST_CASE("REST inventory/software: over-max limit clamps (no error, no cap defeat)",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -407,7 +420,7 @@ TEST_CASE("REST inventory/software: over-max limit clamps (no error, no cap defe
 
 TEST_CASE("REST inventory/software: failed audit surfaces audit_persisted:false (set-and-proceed)",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -429,7 +442,7 @@ TEST_CASE("REST inventory/software: failed audit surfaces audit_persisted:false 
 
 TEST_CASE("REST inventory/software: devices_omitted counts DISTINCT dropped agents, not rows",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -452,7 +465,7 @@ TEST_CASE("REST inventory/software: devices_omitted counts DISTINCT dropped agen
 
 TEST_CASE("REST inventory/software: store degrade → 503 + failure audit, never empty",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     // size-1 pool: after the ctor migration releases its lease, the single connection
     // is free. We hold it for the duration of the request, so query_software's
     // try_acquire_for(kQueryAcquireTimeout) times out → std::nullopt → the route's
@@ -481,7 +494,7 @@ TEST_CASE("REST inventory/software: store degrade → 503 + failure audit, never
 
 TEST_CASE("REST inventory/software: throwing audit_fn does not 500 (throw-safe set-and-proceed)",
           "[pg][rest][inventory_software][security]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
