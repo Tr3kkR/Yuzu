@@ -223,12 +223,19 @@ TEST_CASE("SparkEngine: a stuck queued consumer stalls neither watchers nor sibl
     SparkEngine engine;
     engine.set_cadence_floor_for_test(10);
 
-    std::promise<void> unstick;
-    std::shared_future<void> unstick_f = unstick.get_future().share();
-    std::atomic<int> stuck_calls{0};
-    auto stuck = engine.register_consumer("stuck", [&](const SparkEvent&) {
-        ++stuck_calls;
-        unstick_f.wait(); // deliberately blocked (a popup open for minutes)
+    // Heap-allocated: if a scheduling delay ever pushed this wedged handler's
+    // wakeup past stop()'s join budget, stop() would detach rather than hang
+    // (UP-1) — a still-running detached thread must not reference stack locals
+    // destroyed when this TEST_CASE returns (#1957).
+    struct Sync {
+        std::promise<void> unstick;
+        std::shared_future<void> unstick_f = unstick.get_future().share();
+        std::atomic<int> stuck_calls{0};
+    };
+    auto sync = std::make_shared<Sync>();
+    auto stuck = engine.register_consumer("stuck", [sync](const SparkEvent&) {
+        ++sync->stuck_calls;
+        sync->unstick_f.wait(); // deliberately blocked (a popup open for minutes)
     });
     Collector healthy;
     auto ok = engine.register_consumer("healthy", healthy.handler());
@@ -238,13 +245,13 @@ TEST_CASE("SparkEngine: a stuck queued consumer stalls neither watchers nor sibl
     REQUIRE(engine.arm(*ok, interval_spec(30)).has_value());
 
     engine.start();
-    CHECK(eventually([&] { return stuck_calls.load() >= 1; }));
+    CHECK(eventually([&] { return sync->stuck_calls.load() >= 1; }));
     // The stuck consumer is wedged in its first event — the sibling keeps
     // receiving, which also proves the WATCHER thread never blocked.
     const auto before = healthy.count();
     CHECK(eventually([&] { return healthy.count() >= before + 3; }));
 
-    unstick.set_value(); // release before stop() so the join can complete
+    sync->unstick.set_value(); // release before stop() so the join can complete
     engine.stop();
 }
 
@@ -253,26 +260,33 @@ TEST_CASE("SparkEngine: full queue drops oldest and counts, never blocks",
     SparkEngine engine;
     engine.set_cadence_floor_for_test(10);
 
-    std::promise<void> unstick;
-    std::shared_future<void> unstick_f = unstick.get_future().share();
-    std::atomic<int> calls{0};
+    // Heap-allocated: if a scheduling delay ever pushed this wedged handler's
+    // wakeup past stop()'s join budget, stop() would detach rather than hang
+    // (UP-1) — a still-running detached thread must not reference stack locals
+    // destroyed when this TEST_CASE returns (#1957).
+    struct Sync {
+        std::promise<void> unstick;
+        std::shared_future<void> unstick_f = unstick.get_future().share();
+        std::atomic<int> calls{0};
+    };
+    auto sync = std::make_shared<Sync>();
     auto consumer = engine.register_consumer(
         "slow",
-        [&](const SparkEvent&) {
-            ++calls;
-            unstick_f.wait();
+        [sync](const SparkEvent&) {
+            ++sync->calls;
+            sync->unstick_f.wait();
         },
         /*queue_cap=*/2);
     REQUIRE(consumer.has_value());
     REQUIRE(engine.arm(*consumer, interval_spec(20)).has_value());
 
     engine.start();
-    CHECK(eventually([&] { return calls.load() >= 1; }));
+    CHECK(eventually([&] { return sync->calls.load() >= 1; }));
     // Handler wedged: the queue (cap 2) must overflow and drop rather than
     // block the wheel.
     CHECK(eventually([&] { return engine.stats().queued_dropped_total >= 2; }));
 
-    unstick.set_value();
+    sync->unstick.set_value();
     engine.stop();
 }
 
@@ -282,38 +296,46 @@ TEST_CASE("SparkEngine: bounded queue drops the OLDEST — newest survives (drop
     // the surviving events are the most recent, and an early one was dropped.
     SparkEngine engine;
     engine.set_cadence_floor_for_test(10);
-    std::promise<void> unstick;
-    std::shared_future<void> uf = unstick.get_future().share();
-    std::mutex m;
-    std::vector<std::uint64_t> got;
-    std::atomic<int> calls{0};
+
+    // Heap-allocated: if a scheduling delay ever pushed this wedged handler's
+    // wakeup past stop()'s join budget, stop() would detach rather than hang
+    // (UP-1) — a still-running detached thread must not reference stack locals
+    // destroyed when this TEST_CASE returns (#1957).
+    struct Sync {
+        std::promise<void> unstick;
+        std::shared_future<void> uf = unstick.get_future().share();
+        std::mutex m;
+        std::vector<std::uint64_t> got;
+        std::atomic<int> calls{0};
+    };
+    auto sync = std::make_shared<Sync>();
     auto consumer = engine.register_consumer(
         "slow",
-        [&](const SparkEvent& ev) {
-            if (++calls == 1)
-                uf.wait(); // wedge on the first fire so later fires pile up + drop
-            std::lock_guard lk(m);
-            got.push_back(ev.seq);
+        [sync](const SparkEvent& ev) {
+            if (++sync->calls == 1)
+                sync->uf.wait(); // wedge on the first fire so later fires pile up + drop
+            std::lock_guard lk(sync->m);
+            sync->got.push_back(ev.seq);
         },
         /*queue_cap=*/2);
     REQUIRE(consumer.has_value());
     REQUIRE(engine.arm(*consumer, interval_spec(15)).has_value());
 
     engine.start();
-    CHECK(eventually([&] { return calls.load() >= 1; }));                    // wedged on seq 1
+    CHECK(eventually([&] { return sync->calls.load() >= 1; }));                    // wedged on seq 1
     CHECK(eventually([&] { return engine.stats().queued_dropped_total >= 3; })); // middle seqs dropped
-    unstick.set_value();
+    sync->unstick.set_value();
     CHECK(eventually([&] {
-        std::lock_guard lk(m);
-        return got.size() >= 3;
+        std::lock_guard lk(sync->m);
+        return sync->got.size() >= 3;
     }));
     engine.stop();
 
-    std::lock_guard lk(m);
-    REQUIRE(got.size() >= 3);
-    CHECK(got[0] == 1);      // the wedged first fire
-    CHECK(got[1] > 2);       // seq 2 was dropped as oldest → a NEWER seq survived
-    CHECK(got[2] > got[1]);  // monotonic — most-recent-wins, not most-recent-lost
+    std::lock_guard lk(sync->m);
+    REQUIRE(sync->got.size() >= 3);
+    CHECK(sync->got[0] == 1);      // the wedged first fire
+    CHECK(sync->got[1] > 2);       // seq 2 was dropped as oldest → a NEWER seq survived
+    CHECK(sync->got[2] > sync->got[1]);  // monotonic — most-recent-wins, not most-recent-lost
 }
 
 TEST_CASE("SparkEngine: a handler blocked past the shutdown budget is detached, not hung (UP-1)",

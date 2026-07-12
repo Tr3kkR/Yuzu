@@ -27,7 +27,7 @@ struct AuditEvent {
     std::string session_id;
     std::string result;   // "success", "failure", "denied"
     std::string mcp_tool; // MCP tool name if action was MCP-initiated (empty otherwise)
-    // Actor class (ADR-0022 Decision 9 / execution-plan Phase 3a), mirroring
+    // Actor class (ADR-1005 Decision 9 / execution-plan Phase 3a), mirroring
     // principal_class.hpp's HTTP request-metric label: "human" (session
     // cookie), "agent" (bearer/API token), "none" (unauthenticated — a failed
     // login, a probe-adjacent request; honest label, not a guess at human vs.

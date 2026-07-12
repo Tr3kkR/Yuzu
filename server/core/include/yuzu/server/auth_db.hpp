@@ -31,6 +31,15 @@
 
 namespace yuzu::server {
 
+/// Canonical `users.provisioning_source` values (auth.db migration v7). Every
+/// read/write site MUST go through these constants rather than a raw string
+/// literal — a typo in either fails the SCIM provenance guard OPEN (S-PROV-
+/// CONST, consistency S2): a mismatched write would tag a fresh account with
+/// an unrecognised source (never revivable by SCIM), and a mismatched read in
+/// `provenance_ok` would refuse to recognise a legitimately SCIM-owned row.
+inline constexpr std::string_view kProvisioningSourceScim = "scim";
+inline constexpr std::string_view kProvisioningSourceLocal = "local";
+
 // ── Error Types ──────────────────────────────────────────────────────────────
 
 // Explicit underlying type — locks ABI/serialization width so adding new
@@ -186,6 +195,65 @@ public:
     /// absent/inactive user (fail-closed — not eligible). InvalidUsername for
     /// malformed input.
     std::expected<bool, AuthDBError> is_elevation_eligible(const std::string& username);
+
+    /// Set the provenance marker for a user (SCIM v2 provisioning, slice 1 —
+    /// storage layer only). Distinct from `identity_source` (v6, how a user
+    /// authenticates): this is the security seam that lets a future SCIM
+    /// deprovisioning path refuse to deactivate/delete a user it did not
+    /// create. `source` is caller-supplied ("local" | "scim") — this
+    /// storage-layer accessor does not itself enforce the enum; the SCIM
+    /// route layer is the trusted caller. Single UPDATE ... RETURNING (no
+    /// sqlite3_changes() — #1033). UserNotFound when no active row matched,
+    /// InvalidUsername for malformed input. Never touches credentials or role.
+    std::expected<void, AuthDBError> set_provisioning_source(const std::string& username,
+                                                              const std::string& source);
+
+    /// Read the provenance marker for a user. UNLIKE most accessors on this
+    /// class, this deliberately reads REGARDLESS of `is_active` (soft-deleted
+    /// rows included) — the SCIM provenance guard must be able to approve a
+    /// PATCH/PUT active=true reactivation while the row is still inactive,
+    /// i.e. exactly the moment before `reactivate_user` flips it back.
+    /// UserNotFound only when no row (active or not) matched; InvalidUsername
+    /// for malformed input.
+    std::expected<std::string, AuthDBError>
+    get_provisioning_source(const std::string& username);
+
+    /// Set the `identity_source` marker (auth.db migration v6) directly —
+    /// distinct from `set_provisioning_source` (WHO manages the account's
+    /// lifecycle) — this is HOW the account authenticates, the same column
+    /// `upsert_sso_identity` writes for OIDC rows and the Settings user list
+    /// reads to render the "SSO" badge (S-IDENTITY-SRC). SCIM provisioning is
+    /// its own login surface (IdP-driven, no local password usable — see
+    /// `scim_routes.cpp`), so it gets its own value rather than being rendered
+    /// as `'local'`-login-capable. `source` is caller-supplied; this storage-
+    /// layer accessor does not itself enforce an enum. Single UPDATE ...
+    /// RETURNING (no sqlite3_changes() — #1033). UserNotFound when no active
+    /// row matched, InvalidUsername for malformed input. Never touches
+    /// credentials, role, or provisioning_source.
+    std::expected<void, AuthDBError> set_identity_source(const std::string& username,
+                                                          const std::string& source);
+
+    /// Reactivate a soft-deleted (`is_active = 0`) user row — the SCIM v2
+    /// PATCH/PUT `active: true` (un-suspend) path, and the only writer of
+    /// `is_active = 1` on an EXISTING row (every other UPDATE in this file
+    /// filters `WHERE ... AND is_active = 1`, and `upsert_user` is INSERT ...
+    /// ON CONFLICT DO NOTHING — neither can revive a soft-deleted row).
+    /// Single UPDATE ... RETURNING (no sqlite3_changes() — #1033).
+    ///
+    /// Semantics (deliberate, do not "improve" without a fresh security
+    /// review): clears `failed_login_count` / `last_failed_login_at` /
+    /// `locked_until` — a returning user must not inherit a stale lockout
+    /// from before they were deprovisioned. Does NOT touch
+    /// `mfa_totp_secret` / MFA enrollment state — `remove_user` wiped that
+    /// deliberately on deactivation (see its header comment) and this does
+    /// NOT restore it; the user re-enrolls per the configured MFA
+    /// enforcement mode. Does NOT touch `provisioning_source` or `role` —
+    /// both stay whatever they were before deactivation.
+    ///
+    /// UserNotFound when no row (active OR inactive) matched `username`,
+    /// InvalidUsername for malformed input. Reactivating an ALREADY-active
+    /// user is a harmless no-op (still returns success).
+    std::expected<void, AuthDBError> reactivate_user(const std::string& username);
 
     // ── Session Operations ───────────────────────────────────────────────
     //

@@ -74,6 +74,10 @@ public:
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
         std::lock_guard lk(mu_);
         ++watch_calls_;
+        if (throw_watch_nonstd_)
+            throw 42; // non-std throw → exercises watch_guarded()'s catch(...) arm
+        if (throw_watch_)
+            throw std::runtime_error("forced watch throw"); // contract-violating mechanism (UP-7)
         if (fail_watch_)
             return std::unexpected("forced watch failure");
         watched_.insert(key);
@@ -134,6 +138,14 @@ public:
         std::lock_guard lk(mu_);
         fail_watch_ = b;
     }
+    void set_throw_watch(bool b) {
+        std::lock_guard lk(mu_);
+        throw_watch_ = b;
+    }
+    void set_throw_watch_nonstd(bool b) {
+        std::lock_guard lk(mu_);
+        throw_watch_nonstd_ = b;
+    }
 
 private:
     std::mutex mu_;
@@ -142,10 +154,48 @@ private:
     std::set<std::string> watched_;
     bool started_{false};
     bool fail_watch_{false};
+    bool throw_watch_{false};
+    bool throw_watch_nonstd_{false};
     int watch_calls_{0};
     int unwatch_calls_{0};
     int stop_calls_{0};
     int start_calls_{0};
+};
+
+/// A mechanism whose stop() blocks until released — for #1934 UP-1/F4, a
+/// regression test that stop()'s mechanism-teardown step runs with no engine
+/// lock held.
+class BlockingStopMechanism final : public ISparkMechanism {
+public:
+    void start(SparkEmitFn emit, SparkFaultFn) override { emit_ = std::move(emit); }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {
+        stopping_now_.store(true, std::memory_order_release);
+        std::unique_lock lk(gate_mu_);
+        gate_cv_.wait(lk, [&] { return release_; });
+    }
+    void fire(const std::string& key) {
+        if (emit_)
+            emit_(key, SparkData{std::monostate{}});
+    }
+    bool stopping_now() const { return stopping_now_.load(std::memory_order_acquire); }
+    void release() {
+        {
+            std::lock_guard lk(gate_mu_);
+            release_ = true;
+        }
+        gate_cv_.notify_all();
+    }
+
+private:
+    SparkEmitFn emit_;
+    std::atomic<bool> stopping_now_{false};
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    bool release_{false};
 };
 
 SparkSpec file_spec(const std::string& path) {
@@ -156,6 +206,9 @@ SparkSpec registry_spec(const std::string& hive, const std::string& key) {
 }
 SparkSpec service_spec(const std::string& name) {
     return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
+}
+SparkSpec interval_spec(std::uint64_t ms) {
+    return SparkSpec{SparkType::Interval, IntervalSparkParams{ms}};
 }
 
 /// Register a fake for `type` and return the borrowed pointer (engine owns it).
@@ -381,6 +434,166 @@ TEST_CASE("File spark: unregister_consumer unwatches a watch its removal empties
     engine.stop();
 }
 
+TEST_CASE("File spark: a consumer unregistered mid-arm leaves no ghost subscription "
+          "(#1994 M1)",
+          "[spark][mechanism]") {
+    // Forces the exact interleaving M1 closes: the consumer existed at arm()'s
+    // pre-check (consumers_mu_), but is FULLY unregistered — subscription
+    // removed, mechanism unwatched, consumers_ entry erased — after the
+    // mechanism watch succeeds and before arm_impl's post-insert consumer
+    // re-check. Before the fix, this left a Subscriber permanently in armed_
+    // for a consumer that no longer exists: uncounted by unregister_consumer
+    // (which ran before the sub was inserted) and never delivered to (deliver()
+    // silently no-ops an unknown consumer id) — a silent resource leak, not a
+    // crash.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto consumer = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(consumer.has_value());
+    engine.start();
+
+    engine.set_arm_race_hook_for_test([&] { engine.unregister_consumer(*consumer); });
+
+    const auto spec = file_spec("/etc/hosts");
+    auto sub = engine.arm(*consumer, spec);
+    CHECK_FALSE(sub.has_value()); // lost the race — must report failure, not a ghost
+
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(engine.stats().armed_sparks == 0); // no orphaned key left behind
+    CHECK(fake->watch_calls() == 1);         // the watch DID succeed before the hook fired
+    CHECK(fake->unwatch_calls() == 1);       // unregister_consumer tore it back down — no leak
+    engine.stop();
+}
+
+TEST_CASE("SparkEngine: arm() racing unregister_consumer() under REAL concurrent "
+          "scheduling never leaves a ghost subscription (stress, #1994 M1)",
+          "[spark][engine][stress]") {
+    // The deterministic hook-based test above proves the recheck-then-rollback
+    // LOGIC is correct on one thread; this exercises the actual cross-thread
+    // memory-ordering half with real concurrent scheduling and no seam.
+    for (int trial = 0; trial < 500; ++trial) {
+        SparkEngine engine;
+        engine.set_cadence_floor_for_test(10);
+        engine.start();
+        auto consumer = engine.register_consumer("racer", [](const SparkEvent&) {});
+        REQUIRE(consumer.has_value());
+
+        std::atomic<bool> go{false};
+        std::thread unregisterer([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            engine.unregister_consumer(*consumer);
+        });
+        go.store(true, std::memory_order_release);
+        // Result intentionally unchecked: either outcome (won or lost the race
+        // against the concurrent unregister) is valid — the invariant under
+        // test is "no crash, no ghost", not which side wins.
+        (void)engine.arm(*consumer, interval_spec(20));
+        unregisterer.join();
+        engine.stop();
+
+        // Whichever side won, the consumer is gone and no subscription should
+        // remain pointing at it.
+        CHECK(engine.stats().consumers == 0);
+        CHECK(engine.stats().subscriptions == 0);
+    }
+    SUCCEED("500 concurrent arm()/unregister_consumer() trials completed without a crash or "
+            "a surviving ghost subscription");
+}
+
+TEST_CASE("File spark: a late unwatch from a torn-down arm does not clobber a "
+          "concurrent equal-spec re-arm (#1994 M2)",
+          "[spark][mechanism]") {
+    // Forces the exact interleaving M2 closes: disarm() removes the last
+    // subscription to a key (releasing mu_, about to call unwatch()) while a
+    // NEW arm() of an EQUAL spec races in, sees the key already gone from
+    // armed_, and re-establishes a fresh watch. Before the fix, the first
+    // disarm's now-stale unwatch() would run after the fresh watch() and tear
+    // it down — leaving armed_ showing the key armed with NO live OS watch.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto s1 = engine.arm(*c1, spec);
+    REQUIRE(s1.has_value());
+    CHECK(fake->is_watching(key));
+
+    // disarm()'s hook fires with mu_ already released, just before its
+    // staleness-rechecked unwatch() call — re-arm an equal spec here so the
+    // fresh watch is already up by the time the stale unwatch would fire.
+    engine.set_disarm_race_hook_for_test([&] {
+        auto s2 = engine.arm(*c2, spec);
+        REQUIRE(s2.has_value());
+    });
+    engine.disarm(*s1);
+
+    // The fresh watch must survive: still watched, and the stale unwatch must
+    // have been SKIPPED (not merely harmless) — the mechanism never saw it.
+    CHECK(fake->is_watching(key));
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(fake->watch_calls() == 2);   // original arm + the re-arm
+    CHECK(fake->unwatch_calls() == 0); // the stale unwatch was skipped, not just harmless
+    engine.stop();
+}
+
+TEST_CASE("File spark: disarm() racing an equal-spec arm() under REAL concurrent "
+          "scheduling never tears down a fresh watch (stress, #1994 M2)",
+          "[spark][mechanism][stress]") {
+    // Companion to the deterministic hook test above (which forces the exact
+    // interleaving and is the actual proof of the recheck-then-skip logic).
+    // This twin runs the two ops on real threads with no seam: it does NOT
+    // reliably hit the nanosecond race window (measured ~0.11s for 500 trials
+    // on an idle runner — the window is almost never hit), so its value is
+    // exercising the cross-thread memory-ordering of mech_ops_mu_/mu_ under
+    // TSan, not interleaving coverage. Mirrors the M1 stress twin's framing.
+    for (int trial = 0; trial < 500; ++trial) {
+        SparkEngine engine;
+        FakeMechanism* fake = wire_fake(engine, SparkType::File);
+        auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+        auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+        REQUIRE(c1.has_value());
+        REQUIRE(c2.has_value());
+        engine.start();
+
+        const auto spec = file_spec("/etc/hosts");
+        const std::string key = spark_key(spec);
+        auto s1 = engine.arm(*c1, spec);
+        REQUIRE(s1.has_value());
+
+        std::atomic<bool> go{false};
+        // Catch2 assertion macros are NOT thread-safe and a failed REQUIRE
+        // throws — off the main thread that escapes the std::thread and
+        // std::terminate()s the whole binary (security-guardian/cpp-safety
+        // Gate 2/3). Capture the result and assert on the main thread after
+        // join(), matching the M1 stress twin.
+        std::atomic<bool> rearm_ok{false};
+        std::thread rearmer([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            rearm_ok.store(engine.arm(*c2, spec).has_value(), std::memory_order_release);
+        });
+        go.store(true, std::memory_order_release);
+        engine.disarm(*s1);
+        rearmer.join();
+        CHECK(rearm_ok.load(std::memory_order_acquire));
+
+        // Invariant under test regardless of interleaving order: if armed_
+        // still shows the key armed (c2's subscription survived), the
+        // mechanism must actually be watching it — never torn down and never
+        // silently orphaned.
+        if (engine.stats().armed_sparks > 0)
+            CHECK(fake->is_watching(key));
+        engine.stop();
+    }
+    SUCCEED("500 concurrent disarm()/arm() trials completed with no torn-down fresh watch");
+}
+
 TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][mechanism]") {
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);
@@ -392,6 +605,61 @@ TEST_CASE("File spark: a mechanism watch failure rolls the arm back", "[spark][m
     auto sub = engine.arm(*c, file_spec("/etc/hosts"));
     CHECK_FALSE(sub.has_value());          // watch failed → arm reported failure
     CHECK(engine.stats().armed_sparks == 0); // and the whole key was torn down (B1)
+    CHECK(engine.stats().subscriptions == 0);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a mechanism that THROWS from watch() rolls the arm back cleanly "
+          "(#1994 UP-7)",
+          "[spark][mechanism]") {
+    // The engine's contract is that a mechanism returns std::unexpected on
+    // failure, but the real spark_file::watch() can throw (fs::current_path()
+    // on a relative path). A throw must NOT unwind past arm_impl's rollback and
+    // leave a zombie armed_ entry with no watcher and no id returned — it must
+    // be treated exactly like a returned failure: whole-key teardown, arm()
+    // returns a clean std::unexpected (never propagates the exception).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_throw_watch(true);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // throw is caught, not propagated
+    CHECK_FALSE(sub.has_value());
+    CHECK(sub.error().find("watch mechanism threw:") != std::string::npos); // catch(std::exception&) text
+    CHECK(engine.stats().armed_sparks == 0); // no zombie armed entry
+    CHECK(engine.stats().subscriptions == 0);
+
+    // The engine is still usable afterward: a subsequent good arm succeeds.
+    fake->set_throw_watch(false);
+    auto ok = engine.arm(*c, file_spec("/etc/hosts"));
+    CHECK(ok.has_value());
+    CHECK(engine.stats().armed_sparks == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a mechanism that throws a NON-std exception from watch() is still contained "
+          "(watch_guarded catch(...))",
+          "[spark][mechanism]") {
+    // watch_guarded() has two catch arms; the std::exception arm is covered by
+    // the tests above. A mechanism throwing a non-std type (here `throw 42;`)
+    // must hit the catch(...) arm and be contained exactly the same way — never
+    // propagate out of arm(). One test on the live path suffices: both arm sites
+    // share the single watch_guarded() boundary.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_throw_watch_nonstd(true);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // non-std throw caught, not propagated
+    CHECK_FALSE(sub.has_value());
+    CHECK(sub.error().find("non-std exception") != std::string::npos); // catch(...) text, wire-locked
+    CHECK(engine.stats().armed_sparks == 0); // no zombie armed entry
     CHECK(engine.stats().subscriptions == 0);
     engine.stop();
 }
@@ -416,6 +684,60 @@ TEST_CASE("File spark: a pre-start replay watch failure marks the spark faulted,
     CHECK_FALSE(fake->is_watching(key));       // watch never came up
     CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
     CHECK(engine.stats().armed_faulted == 1);  // …but flagged deaf, not silent
+    CHECK(engine.stats().watch_faults_total == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a pre-start replay watch that THROWS faults the spark, never escapes start() "
+          "(#1994 UP-7 symmetric)",
+          "[spark][mechanism]") {
+    // The pre-start replay path is the symmetric twin of arm_impl: a real
+    // mechanism can THROW from watch() (spark_file's fs::current_path() on a
+    // relative path). start() is void — an escaping throw would unwind AFTER
+    // running_ is latched and the wheel + mechanisms are up, leaving the spark
+    // armed-without-watcher (the exact UP-7 hazard). The replay must catch the
+    // throw and fault in place (subscribers hold ids → no rollback), exactly
+    // like a returned failure — start() must never propagate the exception.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value()); // armed before start (watch deferred)
+    fake->set_throw_watch(true);               // the start() replay watch will THROW
+
+    REQUIRE_NOTHROW(engine.start());           // throw is caught, not propagated
+    CHECK(eventually([&] { return fake->watch_calls() == 1; }));
+    CHECK_FALSE(fake->is_watching(key));       // watch never came up
+    CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
+    CHECK(engine.stats().armed_faulted == 1);  // …but flagged deaf, not silently armed
+    CHECK(engine.stats().watch_faults_total == 1);
+    engine.stop();
+}
+
+TEST_CASE("File spark: a pre-start replay watch that throws a NON-std exception faults, never escapes "
+          "start()",
+          "[spark][mechanism]") {
+    // Replay-path twin of the catch(...) coverage: the live-path test above proves
+    // watch_guarded()'s catch(...) arm on arm(); this proves the SAME boundary on
+    // the pre-start replay in start(). A non-std throw (`throw 42;`) must fault in
+    // place (subscribers hold ids → no rollback) and never propagate out of the
+    // void start().
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    REQUIRE(engine.arm(*c, spec).has_value()); // armed before start (watch deferred)
+    fake->set_throw_watch_nonstd(true);        // the start() replay watch will throw a non-std type
+
+    REQUIRE_NOTHROW(engine.start());           // non-std throw is caught, not propagated
+    CHECK(eventually([&] { return fake->watch_calls() == 1; }));
+    CHECK_FALSE(fake->is_watching(key));
+    CHECK(engine.stats().armed_sparks == 1);   // entry retained (ids outstanding)
+    CHECK(engine.stats().armed_faulted == 1);  // …flagged deaf
     CHECK(engine.stats().watch_faults_total == 1);
     engine.stop();
 }
@@ -574,6 +896,76 @@ TEST_CASE("Service spark emit path does not deadlock an inline re-arm (TRAP 2 tw
     fake->fire(key, SparkData{ServiceSparkData{ServiceRunState::Stopped}});
     CHECK(eventually([&] { return rearmed.load(); }));
     engine.stop();
+}
+
+TEST_CASE("SparkEngine: a queued handler re-entering the engine while stop() is inside "
+          "mechanism teardown does not deadlock (#1934 UP-1/F4)",
+          "[spark][mechanism]") {
+    // Pins the property this whole mechanism-call seam depends on:
+    // SparkEngine::stop() calls a mechanism's stop() with NO engine lock held
+    // (mu_ / consumers_mu_ / mech_ops_mu_ all released — see stop()'s step 2).
+    // A QUEUED handler already dispatched before stop() began may therefore
+    // safely call back into the engine (arm/disarm) WHILE stop() is stuck
+    // inside a slow mechanism teardown: the re-entrant call must fail cleanly
+    // (the engine is stopping) rather than deadlock waiting for a lock stop()
+    // is (incorrectly, in a regression) still holding.
+    SparkEngine engine;
+    auto mech = std::make_unique<BlockingStopMechanism>();
+    BlockingStopMechanism* bm = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+
+    struct Sync {
+        std::mutex m;
+        std::condition_variable cv;
+        bool handler_fired{false};
+        bool reentry_done{false};
+        std::atomic<bool> reentrant_arm_rejected{false};
+    };
+    auto sync = std::make_shared<Sync>();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto consumer = engine.register_consumer("c", [&engine, bm, sync](const SparkEvent&) {
+        {
+            std::lock_guard lk(sync->m);
+            sync->handler_fired = true;
+        }
+        sync->cv.notify_all();
+        // Wait until stop() is actually inside the mechanism teardown before
+        // re-entering — otherwise this races stop()'s own step 1 instead of
+        // exercising step 2's no-lock-held property.
+        while (!bm->stopping_now())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto sub2 = engine.arm_inline(SparkSpec{SparkType::Interval, IntervalSparkParams{60'000}},
+                                       [](const SparkEvent&) {});
+        sync->reentrant_arm_rejected.store(!sub2.has_value());
+        {
+            std::lock_guard lk(sync->m);
+            sync->reentry_done = true;
+        }
+        sync->cv.notify_all();
+        bm->release(); // let stop()'s mechanism teardown — and stop() itself — finish
+    });
+    REQUIRE(consumer.has_value());
+    REQUIRE(engine.arm(*consumer, spec).has_value());
+    engine.start();
+
+    bm->fire(key);
+    {
+        std::unique_lock lk(sync->m);
+        sync->cv.wait(lk, [&] { return sync->handler_fired; });
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop(); // must return once the handler releases the gate, not hang
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    CHECK(elapsed < 5000ms);
+    {
+        std::lock_guard lk(sync->m);
+        CHECK(sync->reentry_done);
+    }
+    CHECK(sync->reentrant_arm_rejected.load()); // failed cleanly, never hung
 }
 
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {
@@ -1069,6 +1461,220 @@ TEST_CASE("File spark (real mechanism): arm() on a nonexistent drive root does n
         probe->engine.stop();
     }
     // else: deliberately leak `probe` (and the parked thread inside it).
+}
+
+TEST_CASE("File spark (real mechanism): watch() on an existing key with a different "
+          "directory clears the stale registration (#1981)",
+          "[spark][mechanism][windows][resilience]") {
+    // Drives WindowsFileMechanism DIRECTLY, bypassing SparkEngine: its arm()
+    // always derives `key` from spark_key(spec), so the same key can never
+    // map to two different paths through THAT call path. ISparkMechanism's
+    // contract treats `key` as an opaque caller-supplied identifier though
+    // (spark_mechanism.hpp) — a future caller may legitimately re-call
+    // watch() for an EXISTING key with updated params on a content edit
+    // (Stage 6's differential re-apply: "unchanged bindings don't re-arm"
+    // implies a changed one updates in place) without an intervening
+    // explicit unwatch(). Before the fix, watch() unconditionally overwrote
+    // key_index_[key], leaking the OLD DirWatch::keys[old_fname] entry
+    // forever — a spurious-fires-forever leak from the abandoned path
+    // (governance chaos-injector Gate 5 finding).
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path dirA = fs::temp_directory_path() / ("spark_1981_a_" + pid);
+    const fs::path dirB = fs::temp_directory_path() / ("spark_1981_b_" + pid);
+    std::error_code ec;
+    fs::remove_all(dirA, ec);
+    fs::remove_all(dirB, ec);
+    fs::create_directories(dirA);
+    fs::create_directories(dirB);
+    const fs::path fileA = dirA / "target.txt";
+    const fs::path fileB = dirB / "target.txt";
+    { std::ofstream(fileA) << "seed"; }
+    { std::ofstream(fileB) << "seed"; }
+
+    // Exception-safe cleanup (quality-engineer Gate 3): a failed assertion
+    // would otherwise skip the trailing remove_all and leak dirA/dirB.
+    // Declared before `mech` so it runs after ~mech closes its handles.
+    struct DirCleanup {
+        const fs::path& a;
+        const fs::path& b;
+        ~DirCleanup() {
+            std::error_code e;
+            fs::remove_all(a, e);
+            fs::remove_all(b, e);
+        }
+    } dir_cleanup{dirA, dirB};
+
+    struct Fires {
+        std::mutex mu;
+        std::vector<std::string> keys;
+        void add(std::string k) {
+            std::lock_guard lk(mu);
+            keys.push_back(std::move(k));
+        }
+        std::size_t count() {
+            std::lock_guard lk(mu);
+            return keys.size();
+        }
+        std::string at(std::size_t i) {
+            std::lock_guard lk(mu);
+            return keys.at(i);
+        }
+    };
+    auto fires = std::make_shared<Fires>();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    mech->start([fires](const std::string& key, SparkData) { fires->add(key); },
+                [](const std::string&, bool, std::string_view) {});
+
+    const std::string key = "shared-key-1981";
+    REQUIRE(mech->watch(key, FileSparkParams{fileA.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm
+
+    // Re-arm the SAME key against dirB, with NO intervening unwatch().
+    REQUIRE(mech->watch(key, FileSparkParams{fileB.string()}).has_value());
+    std::this_thread::sleep_for(150ms);
+
+    { std::ofstream(fileA, std::ios::app) << "changeA"; }
+    std::this_thread::sleep_for(300ms);
+    CHECK(fires->count() == 0); // the OLD registration must be gone — no spurious fire
+
+    { std::ofstream(fileB, std::ios::app) << "changeB"; }
+    CHECK(eventually([&] { return fires->count() >= 1; }, 8000ms));
+    if (fires->count() >= 1)
+        CHECK(fires->at(0) == key);
+
+    mech->unwatch(key);
+    std::this_thread::sleep_for(150ms); // let the worker drain the cancelled read
+    mech->stop();
+    // dirA/dirB removed by DirCleanup on scope exit.
+}
+
+TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under "
+          "re-arm churn while the worker is wedged (#1979/#1982)",
+          "[spark][mechanism][windows][resilience]") {
+    // Determinism trick: the mechanism has ONE worker draining its IOCP, and
+    // it calls emit_ with mu_ RELEASED (spark_file.cpp run()) — a blocking
+    // emit callback therefore wedges the drain loop deterministically while
+    // watch()/unwatch() stay fully operable (they only need mu_, not the
+    // worker). Flood retiring_ past the cap while the worker can't drain,
+    // confirm it's bounded + observable + a fresh watch() is refused, then
+    // release the gate and confirm a full drain plus a prompt, leak-free stop().
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path trigger_dir = fs::temp_directory_path() / ("spark_1979_trig_" + pid);
+    std::error_code ec;
+    fs::remove_all(trigger_dir, ec);
+    fs::create_directories(trigger_dir);
+    const fs::path trigger_file = trigger_dir / "t.txt";
+    { std::ofstream(trigger_file) << "seed"; }
+
+    // Populated by the flood loop below; captured by reference into the cleanup
+    // guard declared next.
+    std::vector<fs::path> flood_dirs;
+
+    // Exception-safe temp-dir cleanup (quality-engineer Gate 3): a failed
+    // REQUIRE/CHECK unwinds past the trailing remove_all calls, otherwise
+    // leaking up to kRetiringCap+8 PID-salted dirs. Declared BEFORE `mech` so
+    // (reverse-declaration order) it runs AFTER ~mech has stop()'d/joined and
+    // closed every directory handle — removing dirs with live handles open
+    // would silently fail. Declared AFTER flood_dirs so flood_dirs outlives it.
+    struct DirCleanup {
+        const fs::path& trig;
+        const std::vector<fs::path>& floods;
+        ~DirCleanup() {
+            std::error_code e;
+            for (const auto& d : floods)
+                fs::remove_all(d, e);
+            fs::remove_all(trig, e);
+        }
+    } dir_cleanup{trigger_dir, flood_dirs};
+
+    struct Gate {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release{false};
+        std::atomic<int> emit_calls{0};
+        void wait() {
+            emit_calls.fetch_add(1);
+            std::unique_lock lk(m);
+            cv.wait(lk, [&] { return release; });
+        }
+        void open() {
+            {
+                std::lock_guard lk(m);
+                release = true;
+            }
+            cv.notify_all();
+        }
+    };
+    auto gate = std::make_shared<Gate>();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    // The mechanism's own cap — read live rather than duplicating the 256
+    // literal, so a change to WindowsFileMechanism::kRetiringCap can't leave a
+    // silently-wrong constant here (quality-engineer Gate 3).
+    const std::uint64_t cap = mech->stats().retiring_cap;
+    REQUIRE(cap > 0);
+
+    // If any assertion below fails, Catch2 unwinds the stack — this guard's
+    // destructor (declared AFTER mech, so it runs BEFORE mech's own
+    // destructor per reverse-declaration-order) opens the gate unconditionally
+    // first. Without it, a failed assertion here leaves the worker wedged in
+    // emit() forever, and ~WindowsFileMechanism's stop()/worker_.join() hangs
+    // the WHOLE test binary, not just this test case.
+    struct GateOpener {
+        std::shared_ptr<Gate> g;
+        ~GateOpener() { g->open(); }
+    } gate_opener{gate};
+
+    mech->start([gate](const std::string&, SparkData) { gate->wait(); },
+                [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm
+
+    { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
+    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+
+    for (std::uint64_t i = 0; i < cap + 8; ++i) {
+        fs::path d = fs::temp_directory_path() /
+                     ("spark_1979_flood_" + pid + "_" + std::to_string(i));
+        fs::create_directories(d);
+        flood_dirs.push_back(d);
+        const std::string key = "flood" + std::to_string(i);
+        // NOT a REQUIRE: this loop deliberately floods PAST the cap, so once
+        // retiring_ hits the cap mid-loop, watch() is SUPPOSED to start
+        // refusing — that's the mechanism under test, not a failure.
+        // unwatch() on a key whose arm was refused (never in key_index_) is a
+        // safe no-op, so it's fine to call unconditionally either way.
+        (void)mech->watch(key, FileSparkParams{(d / "f.txt").string()});
+        mech->unwatch(key); // cancels the just-armed read (if it armed) → retiring_
+    }
+
+    // The worker can't drain (wedged in emit()) — retiring_ must be bounded,
+    // observable, and refuse further growth rather than growing unbounded.
+    CHECK(mech->stats().retiring >= cap);
+    auto refused =
+        mech->watch("overflow", FileSparkParams{(trigger_dir / "overflow.txt").string()});
+    REQUIRE_FALSE(refused.has_value());
+    // Assert it's the CAP rejection specifically, not some unrelated failure
+    // (e.g. a not-started mechanism) that would also produce an empty expected
+    // (quality-engineer Gate 3).
+    CHECK(refused.error().find("cap") != std::string::npos);
+    CHECK(mech->stats().watch_rejected_total >= 1);
+
+    gate->open(); // let the worker drain everything
+    CHECK(eventually([&] { return mech->stats().retiring == 0; }, 10000ms));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    mech->stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 5000ms);
+    CHECK(mech->stats().quarantined_total == 0); // the cap kept this reachable in the first place
+    // trigger_dir + flood_dirs removed by DirCleanup on scope exit.
 }
 
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",

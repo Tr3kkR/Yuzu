@@ -7,6 +7,7 @@
 #include <yuzu/version.hpp>
 
 #include "insecure_tls_gate.hpp"
+#include "scim_routes.hpp"
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
@@ -324,6 +325,18 @@ int main(int argc, char* argv[]) {
         ->check(CLI::Range(1, 2592000))
         ->envname("YUZU_BREAK_GLASS_WINDOW_SECS");
 
+    // SCIM v2 provisioning (`/scim/v2/*`) — enterprise IdP (Okta/Entra)
+    // auto-provisioning + auto-deprovisioning. Disabled by default; fail-closed
+    // checks (token required, HTTPS required) run just before serving — see below.
+    app.add_flag("--scim-enable", cfg.scim_enable,
+                "Enable the SCIM v2 provisioning surface (/scim/v2/*). Requires "
+                "--scim-token and HTTPS; refuses to start otherwise.")
+        ->envname("YUZU_SCIM_ENABLE");
+    app.add_option("--scim-token", cfg.scim_token,
+                  "Bearer credential IdPs present on every /scim/v2/* request. "
+                  "Required when --scim-enable is set; stored as a sha256 hash only.")
+        ->envname("YUZU_SCIM_TOKEN");
+
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
     app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,
                    "Consecutive failed local-password attempts before an account is temporarily "
@@ -391,6 +404,15 @@ int main(int argc, char* argv[]) {
     app.add_flag("--mcp-read-only", cfg.mcp_read_only,
                  "Restrict MCP to read-only tools only (no write/execute)")
         ->envname("YUZU_MCP_READ_ONLY");
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    app.add_flag("--mcp-no-streaming", cfg.mcp_streaming_disable,
+                 "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
+                 "JSON-RPC POST only")
+        ->envname("YUZU_MCP_NO_STREAMING");
+    app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
+                   "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
+                   "repeatable). Empty rejects any present Origin (absent is always allowed).")
+        ->envname("YUZU_MCP_ALLOWED_ORIGINS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,
@@ -459,9 +481,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--nvd-sync-interval", nvd_sync_hours, "NVD sync interval in hours (default: 4)")
         ->default_val(4)
         ->envname("YUZU_NVD_SYNC_INTERVAL");
-    app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")->each([&cfg](const std::string&) {
-        cfg.nvd_sync_enabled = false;
-    });
+    app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")
+        ->each([&cfg](const std::string&) { cfg.nvd_sync_enabled = false; })
+        ->envname("YUZU_NO_NVD_SYNC");
     app.add_option("--nvd-backfill-years", cfg.nvd_backfill_years,
                    "How many years back the newest-first NVD backfill walks (<=0 = full history; "
                    "default: 8)")
@@ -1247,6 +1269,24 @@ int main(int argc, char* argv[]) {
         spdlog::warn("--break-glass-user='{}' is set but --auth-mode is 'standard' — the "
                      "break-glass exemption only applies under --auth-mode=sso-only; ignoring.",
                      cfg.break_glass_user);
+    }
+
+    // ── SCIM v2 provisioning fail-closed guard (CC6.2) ──────────────────────
+    // An unauthenticated /scim/v2/* provisioning surface would be catastrophic
+    // (any anonymous caller could mint/deactivate operator accounts), so refuse
+    // to start rather than boot it half-configured. The token/HTTPS
+    // preconditions live in the testable `scim_boot_guard_ok` (S-BOOTGUARD-TEST,
+    // scim_routes.cpp) — this is the thin main-side wrapper, mirroring
+    // `break_glass_user_valid` above.
+    if (cfg.scim_enable) {
+        std::string err;
+        if (!yuzu::server::scim_boot_guard_ok(cfg, err)) {
+            spdlog::error("{}", err);
+            return EXIT_FAILURE;
+        }
+        spdlog::warn("SCIM v2 provisioning ACTIVE (--scim-enable): /scim/v2/* accepts a "
+                     "bearer-token-authenticated IdP push that can provision AND deprovision "
+                     "operator accounts (read-only 'user' role only).");
     }
 
     std::signal(SIGINT, on_signal);

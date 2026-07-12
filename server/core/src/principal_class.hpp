@@ -1,5 +1,5 @@
 // principal_class — bounded actor-class label for HTTP request metrics
-// (ADR-0022 Consequences; execution-plan PR 1.2).
+// (ADR-1005 Consequences; execution-plan PR 1.2).
 //
 // Classification is by CREDENTIAL PRESENTATION, not by validated session:
 // the label is a traffic-shape metric, not an authorization decision, and

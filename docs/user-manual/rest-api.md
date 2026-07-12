@@ -106,6 +106,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Dashboard TAR](#dashboard-tar)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
+- [SCIM v2 Provisioning](#scim-v2-provisioning)
 - [Health](#health)
 - [Metrics](#metrics)
 
@@ -129,7 +130,7 @@ API tokens are created via `POST /api/v1/tokens` and can be scoped to the creati
 server-verifiable delegation and are **rejected on every endpoint** (sole
 exception: the four unauthenticated health-probe paths, which ignore them —
 see `docs/auth-architecture.md`) with `403` + the standard error envelope
-(ADR-0022): `On-Behalf-Of`, `X-On-Behalf-Of`,
+(ADR-1005): `On-Behalf-Of`, `X-On-Behalf-Of`,
 `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`,
 `X-Yuzu-Delegation-Artifact` (case-insensitive). A client must never assert
 that it acts on another principal's behalf via a header; see
@@ -5735,6 +5736,158 @@ Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and
 #### `POST /saml/acs`
 
 SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+
+---
+
+## SCIM v2 Provisioning
+
+RFC 7643/7644. A **separate protocol surface** from the `/api/v1/` JSON API
+above — its own RFC-defined schema (`application/scim+json`), its own
+bearer-token credential, and its own `scim-service` audit principal. Full
+design detail (provenance guard, deprovision/reactivation semantics, storage
+decision, deferred items) is in `docs/auth-architecture.md` "SCIM v2
+provisioning"; operator setup walkthrough is
+[docs/user-manual/scim-provisioning.md](scim-provisioning.md). This section
+is the wire-level endpoint reference.
+
+**Enablement:** entirely inert (routes not registered) unless
+`--scim-enable` (`YUZU_SCIM_ENABLE`) is set; requires `--scim-token`
+(`YUZU_SCIM_TOKEN`) and HTTPS, or the server refuses to start. **Prefer the
+`YUZU_SCIM_TOKEN` env var over `--scim-token`** — an argv value is visible
+to any local user via `ps`; the env var is not.
+
+**Permission:** every endpoint below, including the three discovery
+endpoints, requires `Authorization: Bearer <scim-token>` — validated
+constant-time against the configured token's hash. Missing/invalid → `401`
++ `WWW-Authenticate: Bearer`. This is unrelated to session cookies, API
+tokens, or RBAC — there is no `role`/permission check on these routes, only
+the bearer credential.
+
+#### `GET /scim/v2/ServiceProviderConfig`
+
+Discovery — static capability document (patch/filter/bulk support flags).
+
+#### `GET /scim/v2/ResourceTypes`
+
+Discovery — a SCIM `ListResponse` describing the `User` resource type.
+
+#### `GET /scim/v2/Schemas`
+
+Discovery — a SCIM `ListResponse` describing the core `User` schema.
+
+#### `POST /scim/v2/Users`
+
+Provision a new user. Body: a SCIM User resource (only `userName` and
+`externalId` are read; other fields real IdPs send — `name`, `emails`, etc. —
+are tolerated and ignored).
+
+> **`userName` must be a slug, not an email address.** Yuzu usernames are
+> alphanumeric plus `.`/`_`/`-` — no `@`. Stock Okta/Entra provisioning
+> defaults `userName` to the user's email and will `400` here; remap
+> `userName` to a non-email slug attribute in the IdP's attribute-mapping
+> config before assigning users. The `400` body's error message calls out
+> the offending character(s).
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `201` + `Location` + `ETag` | Created | SCIM User representation |
+| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
+
+Created at the fixed `role=user` with a discarded CSPRNG password — the
+account authenticates via SSO, never a local password. If the `userName`
+instead matches an existing SCIM-provisioned account that is currently
+**deactivated**, `POST` revives that account (a returning-employee
+reprovision) rather than `409`ing.
+
+#### `GET /scim/v2/Users/{id}`
+
+Read a single provisioned user by its SCIM `id`.
+
+| Status | Condition |
+|---|---|
+| `200` | Found — SCIM User representation |
+| `404` | Unknown `id` |
+
+#### `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=`
+
+Existence check + pagination, the standard "does this user already exist"
+call a connector makes before create. **Only `userName eq "value"` is
+supported** (case-insensitive attribute/operator, double-quoted value); any
+other filter expression is rejected `400` (`scim_type=invalidFilter`).
+Response is a SCIM `ListResponse` envelope; `startIndex` is 1-based per RFC
+7644 §3.4.2.
+
+#### `PUT /scim/v2/Users/{id}`
+
+Replace the mutable identity fields (`externalId`, `active`). **If `active`
+differs from the account's current state, this triggers the identical
+deactivate/reactivate semantics documented under `PATCH` below** — some IdP
+connectors issue `PUT` rather than `PATCH` for lifecycle changes.
+
+| Status | Condition |
+|---|---|
+| `200` | Replaced — SCIM User representation |
+| `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
+| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+
+#### `PATCH /scim/v2/Users/{id}`
+
+The primary lifecycle path. Both the pathless `{"value":{"active":false}}`
+and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
+
+- **`active:false`** deprovisions — soft-deletes the auth account and
+  cascades session revocation.
+- **`active:true`** reactivates — restores the account and clears any stale
+  lockout. MFA is **not** restored; the user re-enrolls on next login.
+
+| Status | Condition |
+|---|---|
+| `200` | Applied — SCIM User representation |
+| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+
+#### `DELETE /scim/v2/Users/{id}`
+
+Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
+hard delete). `204` on success; `404` if unknown or guard-rejected.
+
+#### Provenance guard
+
+Every deactivate/reactivate/update/delete call above re-verifies **both**
+`provisioning_source == "scim"` **and** `role == "user"` on the target
+account immediately before mutating it, and refuses with **`404` — never
+`403`** (a `403` would confirm the resource exists; `404` is indistinguishable
+from "no such SCIM resource") plus a `scim.user.provenance_denied` audit row.
+This is what makes it safe to point an IdP's SCIM connector at this surface
+at all: a locally-created admin, or the `--break-glass-user` account, can
+never be deactivated by a SCIM call; SCIM-provisioned accounts are always
+`role=user` at creation so a compromised IdP cannot create an admin; and the
+`role` check means an operator-elevated former-SCIM account (later promoted
+by a human via the dashboard) also drops out of SCIM's write authority. See
+`docs/auth-architecture.md` "SCIM v2 provisioning" for the full threat
+discussion.
+
+#### Audit actions
+
+Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
+
+| Action | Result | When |
+|---|---|---|
+| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500` |
+| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`; `failure` on an audit-write error (set-and-proceed) |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
+| `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
+
+#### Metrics
+
+`yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
+`yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
+Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
+Metrics.
 
 ---
 

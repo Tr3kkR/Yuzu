@@ -217,11 +217,11 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | Raw resource/process/cast APIs in C++ (`popen`, `system`, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`) | **cpp-safety** |
 | Background thread or callback storing pointer/reference | **cpp-safety**, **sre** |
 | Packaging, systemd units, Dockerfiles, installer scripts | **release-deploy** |
-| New/changed REST route, MCP tool, dashboard fragment/page, or any other capability-adding operator surface | **architect**, **security-guardian** — both apply the ADR-0022 standing question (below) |
+| New/changed REST route, MCP tool, dashboard fragment/page, or any other capability-adding operator surface | **architect**, **security-guardian** — both apply the ADR-1005 standing question (below) |
 
 **Always include architect** when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.
 
-**Always apply the ADR-0022 standing question** on any capability-adding diff: is every behavior of this capability reachable by an authenticated external principal via versioned REST *and* MCP, or a recorded exception in ADR-0022's exception ledger; is it discoverable (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`); does it carry the A4 error envelope; is there no in-process-only behavior; are RBAC and audit enforced at the API layer (not only in the UI)? A dashboard fragment is not an API twin. (Policy: `docs/adr/0022-headless-platform-use-case-engines.md`; current phase status: `docs/adr-0022-execution-plan.md` — both land with PRs #1918/#1926; do not merge this wiring before them.)
+**Always apply the ADR-1005 standing question** on any capability-adding diff: is every behavior of this capability reachable by an authenticated external principal via versioned REST *and* MCP, or a recorded exception in ADR-1005's exception ledger; is it discoverable (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`); does it carry the A4 error envelope; is there no in-process-only behavior; are RBAC and audit enforced at the API layer (not only in the UI)? A dashboard fragment is not an API twin. (Policy: `docs/adr/1005-headless-platform-use-case-engines.md`; current phase status: `docs/adr-1005-execution-plan.md` — both land with PRs #1918/#1926; do not merge this wiring before them.)
 
 **Always include quality-engineer** when new features or fixes land — it's the only agent that flags fixture races, bad error-string substring asserts, and REST-handler-untested-through-store-tests, which are the three highest-ROI test gaps.
 
@@ -403,14 +403,31 @@ state, schema, and contract consistency. Check:
 
 7. **CHANGELOG reverse-chronological order invariant** preserved?
 
-8. **ADR-0022 headless-platform parity** — for any capability this PR
+8. **ADR-1005 headless-platform parity** — for any capability this PR
    adds or changes: is every behavior reachable by an authenticated
    external principal via versioned REST *and* MCP, or a recorded
-   exception in ADR-0022's exception ledger; is it discoverable
+   exception in ADR-1005's exception ledger; is it discoverable
    (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`);
    does it carry the A4 error envelope; is there no in-process-only
    behavior; are RBAC and audit enforced at the API layer (not only
    in the UI)? A dashboard fragment is not an API twin.
+
+9. **A5 agentic context contract** (exec-plan Decision 16) — for any
+   new or materially changed MCP tool ("material" = any change to
+   tier, securable/operation, dispatch behavior, side-effect set, or
+   spec-visible `tools/list`/`initialize` output — per-se, not
+   arguable): standard spec annotations (`title`/`readOnlyHint`/
+   `destructiveHint`/`idempotentHint`/`openWorldHint`; destructive/
+   idempotent semantics machine-readable, never prose-only),
+   decision-grade description (when to use, workflow chaining,
+   empty-result meaning), bounded documented input schema, typed
+   output schema for stable shapes, honest `retry_after_ms` on
+   retryable errors; if the PR adds a tool family or reshapes the
+   operating model, the `initialize.instructions` blob is updated in
+   the same PR. Contract text: `docs/agentic-first-principle.md` §A5.
+   security-guardian co-checks `readOnlyHint`/`destructiveHint`/
+   `idempotentHint` truthfulness against tier + dispatch behavior —
+   a false safe-direction hint is a BLOCKING (HIGH) finding.
 
 ## Output format
 
@@ -486,7 +503,7 @@ Launch all three in one message: **compliance-officer**, **sre**, **enterprise-r
 Each agent gets the same Gate 1-5 context and focuses on a different aspect:
 - **compliance-officer** — SOC 2 control alignment, evidence chain, audit traceability
 - **sre** — observability (metrics, alerts), recovery paths, health probes, capacity
-- **enterprise-readiness** — customer-facing assurance, pilot-visible rough edges, upgrade notes, breaking changes doc coverage
+- **enterprise-readiness** — customer-facing assurance, pilot-visible rough edges, upgrade notes, breaking changes doc coverage; also reviews the A5 exception ledger (`docs/agentic-first-principle.md` §A5 Exceptions) — every entry must carry an issue number + revisit-by date; stale or undated entries are findings
 
 Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to the agent's domain.
 

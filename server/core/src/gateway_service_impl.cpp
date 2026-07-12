@@ -40,7 +40,7 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
 grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* context,
                                                        const pb::RegisterRequest* request,
                                                        pb::RegisterResponse* response) {
-    // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp. Must run
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp. Must run
     // before any side effect below (audit, auth-mgr lookup, registry write).
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
@@ -457,7 +457,7 @@ gw_enrolled:
 grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* context,
                                                         const gw::BatchHeartbeatRequest* request,
                                                         gw::BatchHeartbeatResponse* response) {
-    // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     int acked = 0;
@@ -516,7 +516,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
 grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* context,
                                                         const pb::InventoryReport* request,
                                                         pb::InventoryAck* response) {
-    // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     std::string agent_id;
@@ -611,7 +611,7 @@ grpc::Status
 GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                                const gw::StreamStatusNotification* request,
                                                gw::StreamStatusAck* response) {
-    // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& agent_id = request->agent_id();
@@ -664,7 +664,7 @@ grpc::Status
 GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
                                                    const gw::ForwardGuardianRequest* request,
                                                    gw::ForwardGuardianAck* response) {
-    // ADR-0022 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     const auto& agent_id = request->agent_id();

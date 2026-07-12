@@ -191,7 +191,7 @@ TEST_CASE("AuditStore: all fields stored", "[audit_store]") {
 }
 
 TEST_CASE("AuditStore: principal_class defaults to honest-empty when unset (#1634-adjacent "
-          "ADR-0022 Phase 3a)",
+          "ADR-1005 Phase 3a)",
           "[audit_store]") {
     // Rows this program cannot attribute to an HTTP session/token principal
     // (gRPC agent-daemon calls, gateway proxying, server-internal writers) never

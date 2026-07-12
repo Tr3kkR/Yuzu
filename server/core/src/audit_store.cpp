@@ -70,7 +70,7 @@ void AuditStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_audit_target_ts
                 ON audit_events(target_type, target_id, timestamp);
         )"},
-        // ADR-0022 Decision 9 / execution-plan Phase 3a: additive actor-class
+        // ADR-1005 Decision 9 / execution-plan Phase 3a: additive actor-class
         // column, no delegation semantics, no Postgres migration required (the
         // exec plan explicitly scopes this ahead of AuditStore's own eventual PG
         // Wave-1 cutover). Existing rows backfill to '' (honest-empty — this

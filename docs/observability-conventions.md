@@ -7,7 +7,7 @@ The `sre` and `architect` agents load this document on any change that adds, rem
 - All metrics use the `yuzu_` prefix.
   - Server metrics: `yuzu_server_*`
   - Agent metrics: `yuzu_agent_*`
-- **Consistent label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`, `principal_class`. Avoid one-off labels — they prevent cross-cutting Grafana queries. `principal_class` (ADR-0022) is a **closed** set — `human` | `agent` | `engine` | `none` — classifying credential presentation on request-count metrics; never free-form, never an authorization signal.
+- **Consistent label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`, `principal_class`. Avoid one-off labels — they prevent cross-cutting Grafana queries. `principal_class` (ADR-1005) is a **closed** set — `human` | `agent` | `engine` | `none` — classifying credential presentation on request-count metrics; never free-form, never an authorization signal.
 - **Histogram buckets** (default for latency-style histograms): `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0`.
 - **Bounded-label counters are pre-seeded to 0 at startup** — every known label combination of a closed-set label is initialised when the metric is described, so the family + HELP/TYPE are present on a healthy server and `absent()` alerts stay meaningful (examples: the NVD `reason` series, `yuzu_onbehalf_rejected_total{surface=http|grpc}`).
 - Health endpoints (`/livez`, `/readyz`, `/healthz`) reflect every component's health and are scrapable.
@@ -41,7 +41,7 @@ Structured JSON envelope:
 
 - Suitable for direct delivery to Splunk HEC or generic webhook sinks.
 - Indexed by `timestamp` and `principal` for efficient queries.
-- Denied operations MUST emit an audit event — `spdlog::warn` alone breaks the SOC 2 CC7.2 evidence chain.
+- Denied operations MUST emit an audit event — `spdlog::warn` alone breaks the SOC 2 CC7.2 evidence chain. Example: the MCP Streamable HTTP transport (track 2f) emits `mcp.session.open` / `mcp.session.close` (`result="success"`) and `mcp.session.reject` (`result="failure"`, `detail="reason=origin|protocol_version|unknown_session|missing_session_header|per_principal_cap|global_cap"`) on `target_type="McpSession"` — the reject verb fires on **every** transport denial (origin, protocol-version, unknown/expired session, cap), routed through the shared `try_persist_audit` kernel so a persist failure is logged, never silently swallowed. (Note: the MCP surface uses `"success"`/`"failure"` result tokens, not the `"ok"`/`"denied"` of the envelope example above — a pre-existing surface-wide convention across all `mcp.*` verbs; author SIEM rules for `mcp.*` accordingly.)
 - **Store-availability 503 guards do NOT audit.** A request rejected because a store's database never opened (`is_open()` gate, e.g. the `/api/v1/tokens` routes per #347 CH-3) is an *operational* event, not a principal action: the guard runs before any token/principal interaction, so there is no operation to evidence. The CC7.2 evidence for the outage is the boot-time `spdlog::error` plus the store's entry in the `/readyz` conjunction (and, once #1385 lands, the store-readiness gauge). This is the platform-wide convention for every store-down guard — do not add per-request audit rows to these paths.
 
 ## Event format (envelope)

@@ -1,0 +1,35 @@
+# Curated CPE map (PR 3, ADR-0018 Lane 1 distro packages). Columns:
+#   ecosystem,distro_id,name,cpe_vendor,cpe_product
+# Empty ecosystem/distro_id = wildcard (matches any). Most rows are GLOBAL
+# (empty ecosystem + distro_id) so one row covers deb+rpm+apk+pacman.
+#
+# cpe_vendor is DISPLAY / provenance ONLY — the downstream PR-4 CpeQuery
+# matches on cpe_product and MUST set vendor="" (a curated vendor would
+# re-introduce the NVD vendor-drift miss: NVD carries curl as both
+# haxx:curl and curl:curl). cpe_product must be the EXACT canonical NVD
+# product token (a wrong product => wrong findings — this file is why the
+# map is isolated + fail-closed).
+#
+# SEED-VALIDATION CONTRACT (owed to PR 4): PR 3 is DB-free and cannot verify
+# these cpe_product tokens against the shipped NVD mirror. PR 4 MUST add a test
+# asserting every seed product matches >= 1 real cve_match row (a wrong token
+# silently produces zero coverage). Until then the tokens are hand-vetted only.
+#
+# NOTE: this file lives under content/cpe-map/ deliberately — the
+# Instruction-Engine content bundle (embed_content.py) globs only
+# content/definitions/**/*.yaml + content/packs/**/*.yaml, so it is NOT
+# swept into bundled_content.cpp. It is embedded on its own via
+# embed_binary.py -> kCuratedCpeMap.
+,,openssl,openssl,openssl
+,,openssh-server,openbsd,openssh
+,,openssh-client,openbsd,openssh
+,,curl,curl,curl
+,,libssl3,openssl,openssl
+,,libssl1.1,openssl,openssl
+,,libcurl4,curl,curl
+,,bash,gnu,bash
+,,glibc,gnu,glibc
+,,libc6,gnu,glibc
+,,sudo,sudo_project,sudo
+,,nginx,nginx,nginx
+,,wget,gnu,wget
