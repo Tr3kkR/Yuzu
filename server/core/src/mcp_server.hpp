@@ -14,6 +14,7 @@
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "mcp_session.hpp"
 #include "policy_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
@@ -212,7 +213,29 @@ public:
                             yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
                             // H1 (PR #1796): per-device scope gate for the
                             // device-targeted write tools; see ScopedPermFn above.
-                            ScopedPermFn scoped_perm_fn = {});
+                            ScopedPermFn scoped_perm_fn = {},
+                            // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f).
+                            // sessions == nullptr ⇒ streaming disabled ⇒ pre-2f behaviour
+                            // (no minting, no session/Origin checks) — every legacy caller
+                            // and test stays byte-identical except the unconditional 202.
+                            // `mcp_streaming_disabled` is captured by pointer (live), not the
+                            // stale [=]-over-const-bool& alias pattern.
+                            McpSessionRegistry* sessions = nullptr,
+                            const bool* mcp_streaming_disabled = nullptr,
+                            std::vector<std::string> allowed_origins = {});
+
+    /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
+    /// Separate builders so tests can drive them without the httplib acceptor
+    /// thread (#438), mirroring build_handler(). GET is a 405 placeholder in
+    /// PR 1 (PR 2 turns it into the real SSE channel); DELETE terminates a
+    /// principal-bound session. Both no-op to 405 when streaming is disabled and
+    /// to a kMcpDisabled JSON-RPC error when MCP is disabled.
+    HandlerFn build_get_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
+                                const bool* streaming_disabled, McpSessionRegistry* sessions,
+                                std::vector<std::string> allowed_origins);
+    HandlerFn build_delete_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
+                                   const bool* streaming_disabled, McpSessionRegistry* sessions,
+                                   std::vector<std::string> allowed_origins);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
@@ -236,7 +259,13 @@ public:
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
-                         ScopedPermFn scoped_perm_fn = {});
+                         ScopedPermFn scoped_perm_fn = {},
+                         // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f).
+                         // Pointer (not const bool&) so a nullptr default cannot bind a
+                         // temporary that would dangle once build_handler captures its address.
+                         McpSessionRegistry* sessions = nullptr,
+                         const bool* mcp_streaming_disabled = nullptr,
+                         std::vector<std::string> allowed_origins = {});
 };
 
 } // namespace yuzu::server::mcp
