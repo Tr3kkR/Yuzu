@@ -408,6 +408,18 @@ container without a system bus) is today indistinguishable from "no Service spar
 configured." A mechanism-up gauge (or an `inert` reason on the fault channel)
 distinguishes them; **owned by rung 1** (observe-only), not left open. (sre F3.)
 
+> **Deferred to rung 2 (recorded 2026-07-12, rung-1 governance).** Rung 1 ships the
+> *capability* signal (`yuzu_fleet_spark_mechanisms{os,mechanism}`, from the registered
+> mechanism set) but NOT the runtime inert/mechanism-up signal, and NOT
+> `mech_unsupported_total` (an arm-rejection counter — nothing arms at rung 1, so it is
+> structurally 0 with zero rung-1 signal). Both need per-mechanism liveness plumbing
+> (`spark_file/registry/service.cpp`) whose only consumer is arming, which arrives at
+> rung 2. A started-but-inert mechanism has no functional consequence while nothing
+> arms against it, so the "reports at rest" objective is met for rung 1 by capability;
+> mechanism-up/inert + `mech_unsupported_total` move to **rung 2** (§Guardian detection
+> consumer), where they gain real signal. This is a recorded scope decision, not silent
+> drift.
+
 ### Audit-on-arm
 The arming path (Guardian's `apply_rules` / `start_local` calling
 `arm(Service, …)`) emits an audit event at the Guardian layer, matching the
@@ -541,11 +553,16 @@ Each rung is an independently-governed PR on `dev`, run through the full
    (per-type control). Observability half (per-type stats + alerts) deferred to
    rung 1.
 1. **Instantiate + observe** — SparkEngine constructed in `agent.cpp` behind
-   `--spark-disable`; `yuzu.spark_*` heartbeat tags (incl. queue-drop/consumer-error
-   + inert-mechanism signal) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
-   denominator + alerts, `mech_unsupported_total{os,mechanism}`, and the boot log
-   naming the active detection path (legacy `IGuard` still enforcing at rung 1). No
-   consumer yet; proves the engine runs and reports at rest.
+   `--spark-disable`; `yuzu.spark_*` heartbeat tags (queue-drop/consumer-error +
+   per-type mech counters) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
+   denominator + the capability signal `yuzu_fleet_spark_mechanisms{os,mechanism}` +
+   a reviewed (rung-2-enabled) alert group, and the boot log naming the active
+   detection path (legacy `IGuard` still enforcing at rung 1). No consumer yet;
+   proves the engine runs and reports at rest. **Deferred to rung 2** (see
+   §Inert-mechanism distinguishability): the runtime inert/mechanism-up signal and
+   `mech_unsupported_total{os,mechanism}` (both structurally 0 with no arming), and
+   the alert group is enabled once counters go live with the `increase()` form.
+   Guards against a boot exception (thread exhaustion) by degrading to no-spark.
 2. **Guardian detection consumer** — the queued consumer + arm-per-rule (with the
    `spark_key→rule` index, refcounted shared watchers, and the re-arm/initial-eval
    contract), detection only (observe mode), behind the switch, both paths compiled

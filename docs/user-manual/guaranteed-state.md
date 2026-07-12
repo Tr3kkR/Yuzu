@@ -345,17 +345,17 @@ Guardian surfaces readiness and event counts via the standard observability endp
 
 Guardian is migrating its event-driven detection (file / service / registry watches) onto a new **SparkEngine** in incremental rungs (ADR-0021 Stage-2). **Today the agent stands SparkEngine up *observe-only*:** it runs and reports its own health, but it is **not** wired to drive Guardian — the existing detection path still does all detecting and **all enforcing**. Nothing about how your Guards detect or remediate changes in this build. The migration is deliberately staged so each rung can be measured and rolled back before the next.
 
-**`--spark-disable` / `YUZU_AGENT_SPARK_DISABLE`** is a **boot-time** agent opt-out: when set, SparkEngine is never instantiated and no `spark_*` telemetry is emitted. Like `--dex-disable` it takes effect only at agent start — a live change is ignored until the agent restarts. It is a deploy-time agent setting, **not** a server-side runtime toggle, and it does **not** affect the enforcing legacy path.
+**`--spark-disable` / `YUZU_AGENT_SPARK_DISABLE`** is a **boot-time** agent opt-out: when set, SparkEngine is never instantiated and no `spark_*` telemetry is emitted. Like `--dex-disable` it takes effect only at agent start — a live change is ignored until the agent restarts. It is a deploy-time agent setting, **not** a server-side runtime toggle, and it does **not** affect the enforcing legacy path. **At rung 1, leaving it unset (the default) is recommended** — the engine is observe-only and safe; there is no rung-1 reason to disable it (if a boot exception is hit, e.g. thread exhaustion, the agent already degrades to no-spark on its own and continues).
 
-Per-rung default posture (recorded here so an upgrade never silently changes what enforces):
+Per-rung default posture (recorded here so an upgrade never silently changes what enforces — this is safety-critical, keep it accurate against `docs/spark-stage2-guardian-consumer-design.md`):
 
-| Rung | SparkEngine | What enforces by default | `--spark-disable` effect |
-|------|-------------|--------------------------|--------------------------|
-| **1 (this build)** | instantiated, observe-only, no consumer | legacy path (unchanged) | engine not instantiated |
-| 2 (later) | drives detection, observe-only | legacy path unless flipped | selects the legacy path |
-| 3+ (later) | drives enforcement | legacy path until burn-in | selects the legacy path |
+| Rung | SparkEngine | What enforces **by default** | `--spark-disable` effect |
+|------|-------------|------------------------------|--------------------------|
+| **1 (this build)** | instantiated, observe-only, no consumer | legacy IGuard (unchanged) | engine not instantiated |
+| 2 (later) | drives detection, observe-only (the default path) | **nothing** — a deliberate spark detect-only burn-in; the legacy path is *not* instantiated | selects the enforcing legacy path |
+| 3+ (later) | drives enforcement | legacy IGuard (enforcing), until per-fleet burn-in | recorded explicitly in that rung's PR |
 
-At rung 1 the agent logs the active detection path at startup (`SparkEngine: instantiated OBSERVE-ONLY … Guardian detection path = legacy IGuard (enforcing)`).
+The rung-2 row is the load-bearing one: by default rung 2 **detects but does not enforce** for spark-managed rules (an accepted, greenfield burn-in window), and an operator who needs continued enforcement during that window sets `--spark-disable` to keep the enforcing legacy path. At rung 1 the agent logs the active detection path at startup (`SparkEngine: instantiated OBSERVE-ONLY … Guardian detection path = legacy IGuard (enforcing)`).
 
 **Fleet observability** (all os-labelled — File/Registry are Windows-only, Service is Windows + Linux, macOS has none — so **never aggregate across `os`**; **absent** means no reporting agent of that OS/mechanism, never "0 = healthy"):
 
@@ -365,7 +365,9 @@ At rung 1 the agent logs the active detection path at startup (`SparkEngine: ins
 - `yuzu_fleet_spark_watch_rejected{os,mechanism}`, `…_quarantined{os,mechanism}`, `…_slow_op{os,mechanism}` — per-type health counters (watch-cap rejection / mechanism quarantine / slow ops). `quarantined` should stay 0 (page-worthy).
 - `yuzu_fleet_spark_watch_faults{os}`, `…_queued_dropped{os}`, `…_consumer_errors{os}` — engine-level fault / drop / handler-error sums.
 
-At rung 1 (no consumer armed) every counter is 0, so only `reporting` and `mechanisms` carry signal; the rest go live as later rungs arm rules. See the shipped alert rules in `docs/prometheus/yuzu-alerts.yml` (group `yuzu-fleet-spark`). The agent has no `/metrics` endpoint — these are rolled up server-side from heartbeat tags.
+At rung 1 (no consumer armed) every counter is 0, so only `reporting` and `mechanisms` carry signal; the rest go live as later rungs arm rules. The agent has no `/metrics` endpoint — these are rolled up server-side from heartbeat tags.
+
+**Alerts.** A reviewed `yuzu-fleet-spark` alert group ships **commented-out** in `docs/prometheus/yuzu-alerts.yml`, to be enabled at rung 2. It is disabled at rung 1 because the counters are all 0 (an enabled rule could only fire on a forged heartbeat), and because the mechanism counters (`watch_rejected` / `quarantined` / `slow_op` / `queued_dropped`) are fleet **sums of monotonic per-agent counters** — a `> 0` alert on them **latches**: once any agent reports a non-zero value it stays firing until that agent's process **restarts** (only `armed_faulted`, a live self-healing gauge, is latch-free). The rung-2 templates use `increase(...[15m]) > 0` over counter-typed metrics to avoid this; enable them when rung 2 arms real rules.
 
 ## Related documentation
 

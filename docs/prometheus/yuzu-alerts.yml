@@ -639,87 +639,89 @@ groups:
       #       outage, a broken/disabled sync source, or a network partition.
       #     runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
 
-  - name: yuzu-fleet-spark
-    # SparkEngine detection-engine health (ADR-0021 Stage-2). At rung 1 the engine
-    # is instantiated OBSERVE-ONLY with no consumer, so every counter below is 0 and
-    # these rules cannot fire until rung 2 arms rules against it — they ship now so
-    # detection cutover is covered from its first armed watch. The yuzu_fleet_spark_*
-    # counter gauges are a fleet SUM of each agent's cumulative counter, so we alert
-    # on `> 0` (an increase()/rate() form needs a counter-typed metric — a rung-2
-    # refinement). Every rule PRESERVES the {os[,mechanism]} labels: File/Registry are
-    # Windows-only and Service is Windows+Linux, so a cross-OS aggregate is meaningless
-    # — NEVER `sum without(os)` these.
-    rules:
-      - alert: YuzuSparkMechanismQuarantined
-        expr: |
-          yuzu_fleet_spark_quarantined > 0
-        labels:
-          severity: critical
-        annotations:
-          summary: "Spark {{ $labels.mechanism }} mechanism quarantined on {{ $labels.os }}"
-          description: >-
-            A SparkEngine mechanism reported a quarantine — a structural leak that
-            should stay 0. Detection for that mechanism type is compromised on the
-            affected OS. Inspect the agent `warn` logs for the quarantine reason; this
-            is not expected in normal operation.
-          runbook_url: "https://docs.yuzu.io/runbooks/spark-mechanism-quarantined"
-
-      - alert: YuzuSparkWatchRejected
-        expr: |
-          yuzu_fleet_spark_watch_rejected > 0
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Spark {{ $labels.mechanism }} watch rejections on {{ $labels.os }}"
-          description: >-
-            A SparkEngine mechanism is rejecting watch arms (watch-cap reached) — a
-            denial-of-detection: rules that should be enforced could not arm. Check the
-            per-type watch cap and the volume of rules of that mechanism type on the
-            affected OS.
-          runbook_url: "https://docs.yuzu.io/runbooks/spark-watch-rejected"
-
-      - alert: YuzuSparkArmedFaulted
-        expr: |
-          yuzu_fleet_spark_armed_faulted > 0
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Spark armed watches went deaf on {{ $labels.os }}"
-          description: >-
-            One or more armed spark watches reported FAULTED (armed but no longer
-            watching) — detection is silently down for those watches. Unlike the other
-            spark counters this is a live gauge (recovers when the watch recovers).
-            Correlate with agent restarts / OS event-source ACL changes.
-          runbook_url: "https://docs.yuzu.io/runbooks/spark-armed-faulted"
-
-      - alert: YuzuSparkSlowOp
-        expr: |
-          yuzu_fleet_spark_slow_op > 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Spark {{ $labels.mechanism }} slow watch/unwatch ops on {{ $labels.os }}"
-          description: >-
-            A SparkEngine mechanism is recording slow watch/unwatch operations — a
-            stalled or contended watcher. Sustained slow ops can delay detection.
-            Inspect the mechanism's underlying OS facility (IOCP / TP_WAIT pool / sd-bus
-            / SCM) on the affected OS.
-          runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
-
-      - alert: YuzuSparkQueuedDropped
-        expr: |
-          yuzu_fleet_spark_queued_dropped > 0
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Spark queued events dropped on {{ $labels.os }}"
-          description: >-
-            The SparkEngine bounded consumer queue dropped events (overflow or
-            shutdown). On the observe lane this loses detections; once the enforce lane
-            lands (rung 3) a drop is a silent compliance failure. Check consumer
-            throughput and the queue cap.
-          runbook_url: "https://docs.yuzu.io/runbooks/spark-queued-dropped"
+  # ── yuzu-fleet-spark — DISABLED at rung 1 (reviewed template; enable at rung 2) ──
+  # SparkEngine (ADR-0021 Stage-2) is instantiated OBSERVE-ONLY at rung 1: no consumer
+  # arms rules, so every yuzu_fleet_spark_* counter is provably 0 in production. These
+  # rules are DELIBERATELY COMMENTED OUT until rung 2, for two reasons governance surfaced:
+  #   1. They can only fire on a FORGED heartbeat until rung 2 (an enrolled agent
+  #      spoofing e.g. yuzu.spark_quarantined=1) — an enabled critical would let ONE
+  #      agent page on-call with zero real signal (gov UP-2).
+  #   2. The counters are fleet SUMs of monotonic per-agent counters surfaced as gauges,
+  #      so a bare `> 0` LATCHES: once any agent reports non-zero it never returns to 0
+  #      for that process's lifetime — a transient watch-cap/slow-op blip pages forever
+  #      (gov arch-S2 / sre-F1). The correct form is increase()/rate() over a
+  #      counter-TYPED metric, a rung-2 change (see the exprs below).
+  # ENABLE at rung 2 with: (a) counter-type the yuzu_fleet_spark_* mech counters,
+  # (b) uncomment this group, (c) confirm each runbook notes "restart the agent to clear
+  # a latched signal". armed_faulted is a live/self-healing gauge and is `> 0`-safe; the
+  # cumulative counters use increase(...[15m]) > 0 below. PRESERVE the {os[,mechanism]}
+  # labels — File/Registry are Windows-only, Service is Windows+Linux, so NEVER
+  # sum without(os) these (a cross-OS aggregate is meaningless).
+  #
+  # - name: yuzu-fleet-spark
+  #   rules:
+  #     - alert: YuzuSparkMechanismQuarantined
+  #       expr: |
+  #         increase(yuzu_fleet_spark_quarantined[15m]) > 0
+  #       labels:
+  #         severity: critical
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} mechanism quarantined on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism reported a quarantine — a structural leak that should
+  #           stay 0. Detection for that mechanism type is compromised on the affected OS.
+  #           Inspect the agent `warn` logs; restart the agent to clear a latched signal.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-mechanism-quarantined"
+  #     - alert: YuzuSparkWatchRejected
+  #       expr: |
+  #         increase(yuzu_fleet_spark_watch_rejected[15m]) > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} watch rejections on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism is rejecting watch arms (watch-cap reached) — a
+  #           denial-of-detection: rules that should be enforced could not arm. Check the
+  #           per-type watch cap and the volume of rules of that mechanism type on the OS.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-watch-rejected"
+  #     - alert: YuzuSparkArmedFaulted
+  #       expr: |
+  #         yuzu_fleet_spark_armed_faulted > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark armed watches went deaf on {{ $labels.os }}"
+  #         description: >-
+  #           One or more armed spark watches reported FAULTED (armed but no longer
+  #           watching) — detection is silently down for those watches. This is a live
+  #           gauge (self-heals when the watch recovers) — no latch. Correlate with agent
+  #           restarts / OS event-source ACL changes.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-armed-faulted"
+  #     - alert: YuzuSparkSlowOp
+  #       expr: |
+  #         increase(yuzu_fleet_spark_slow_op[15m]) > 0
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} slow watch/unwatch ops on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism is recording slow watch/unwatch operations — a stalled
+  #           or contended watcher. Sustained slow ops can delay detection. Inspect the
+  #           mechanism's OS facility (IOCP / TP_WAIT pool / sd-bus / SCM) on the OS.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+  #     - alert: YuzuSparkQueuedDropped
+  #       expr: |
+  #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark queued events dropped on {{ $labels.os }}"
+  #         description: >-
+  #           The SparkEngine bounded consumer queue dropped events (overflow or shutdown).
+  #           On the observe lane this loses detections; once the enforce lane lands (rung 3)
+  #           a drop is a silent compliance failure. Check consumer throughput + queue cap.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-queued-dropped"
