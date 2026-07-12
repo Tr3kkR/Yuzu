@@ -7,7 +7,7 @@ The `sre` and `architect` agents load this document on any change that adds, rem
 - All metrics use the `yuzu_` prefix.
   - Server metrics: `yuzu_server_*`
   - Agent metrics: `yuzu_agent_*`
-- **Consistent label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`, `principal_class`. Avoid one-off labels — they prevent cross-cutting Grafana queries. `principal_class` (ADR-0022) is a **closed** set — `human` | `agent` | `engine` | `none` — classifying credential presentation on request-count metrics; never free-form, never an authorization signal.
+- **Consistent label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`, `principal_class`. Avoid one-off labels — they prevent cross-cutting Grafana queries. `principal_class` (ADR-1005) is a **closed** set — `human` | `agent` | `engine` | `none` — classifying credential presentation on request-count metrics; never free-form, never an authorization signal.
 - **Histogram buckets** (default for latency-style histograms): `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0`.
 - **Bounded-label counters are pre-seeded to 0 at startup** — every known label combination of a closed-set label is initialised when the metric is described, so the family + HELP/TYPE are present on a healthy server and `absent()` alerts stay meaningful (examples: the NVD `reason` series, `yuzu_onbehalf_rejected_total{surface=http|grpc}`).
 - Health endpoints (`/livez`, `/readyz`, `/healthz`) reflect every component's health and are scrapable.

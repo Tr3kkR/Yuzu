@@ -481,9 +481,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--nvd-sync-interval", nvd_sync_hours, "NVD sync interval in hours (default: 4)")
         ->default_val(4)
         ->envname("YUZU_NVD_SYNC_INTERVAL");
-    app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")->each([&cfg](const std::string&) {
-        cfg.nvd_sync_enabled = false;
-    });
+    app.add_flag("--no-nvd-sync", "Disable NVD CVE feed sync")
+        ->each([&cfg](const std::string&) { cfg.nvd_sync_enabled = false; })
+        ->envname("YUZU_NO_NVD_SYNC");
     app.add_option("--nvd-backfill-years", cfg.nvd_backfill_years,
                    "How many years back the newest-first NVD backfill walks (<=0 = full history; "
                    "default: 8)")

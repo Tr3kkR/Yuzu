@@ -33,8 +33,8 @@ yuzu-agent --server yuzu-server:50051 --no-tls --log-level debug
 
 | Check | Fix |
 |-------|-----|
-| Proxy/mesh/SSO gateway injecting a reserved on-behalf-of header on every request | grep server logs for `[ADR-0022]` (throttled — 1 warn per 100 rejections) or check `yuzu_onbehalf_rejected_total`; strip the header (`On-Behalf-Of`, `X-On-Behalf-Of`, `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`, `X-Yuzu-Delegation-Artifact`) at the proxy |
-| Single integration getting 403 with `on-behalf-of assertions are not accepted` | The client sends a reserved header — remove it; delegation via headers is never accepted (ADR-0022, see `docs/auth-architecture.md`) |
+| Proxy/mesh/SSO gateway injecting a reserved on-behalf-of header on every request | grep server logs for `[ADR-1005]` (throttled — 1 warn per 100 rejections) or check `yuzu_onbehalf_rejected_total`; strip the header (`On-Behalf-Of`, `X-On-Behalf-Of`, `X-Yuzu-On-Behalf-Of`, `X-Yuzu-Delegated-Operator`, `X-Yuzu-Delegation-Artifact`) at the proxy |
+| Single integration getting 403 with `on-behalf-of assertions are not accepted` | The client sends a reserved header — remove it; delegation via headers is never accepted (ADR-1005, see `docs/auth-architecture.md`) |
 
 Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from this rejection, so the pod stays in rotation while all real traffic 403s — a green probe with a 100% 403 rate is this failure's signature.
 

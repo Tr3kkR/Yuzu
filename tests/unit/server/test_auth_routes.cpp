@@ -155,7 +155,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from Bearer toke
     CHECK(event.result == "success");
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
-    CHECK(event.principal_class == "agent"); // bearer token (ADR-0022 Phase 3a)
+    CHECK(event.principal_class == "agent"); // bearer token (ADR-1005 Phase 3a)
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Token",
@@ -167,7 +167,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Toke
     auto event = fix.ar->make_audit_event(req, "rest.api.call", "success");
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
-    CHECK(event.principal_class == "agent"); // X-Yuzu-Token (ADR-0022 Phase 3a)
+    CHECK(event.principal_class == "agent"); // X-Yuzu-Token (ADR-1005 Phase 3a)
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from session cookie",
@@ -181,7 +181,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from session coo
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
     CHECK(event.session_id == *cookie);
-    CHECK(event.principal_class == "human"); // session cookie (ADR-0022 Phase 3a)
+    CHECK(event.principal_class == "human"); // session cookie (ADR-1005 Phase 3a)
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — empty principal when no auth present",
@@ -191,7 +191,7 @@ TEST_CASE("AuthRoutes::make_audit_event — empty principal when no auth present
     auto event = fix.ar->make_audit_event(req, "anonymous", "success");
     CHECK(event.principal.empty());
     CHECK(event.principal_role.empty());
-    CHECK(event.principal_class == "none"); // no credential (ADR-0022 Phase 3a)
+    CHECK(event.principal_class == "none"); // no credential (ADR-1005 Phase 3a)
 }
 
 TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "

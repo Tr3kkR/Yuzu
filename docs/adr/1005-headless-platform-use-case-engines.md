@@ -6,11 +6,11 @@ deciders: pending — acceptance requires at least one recorded independent revi
 scope: platform — consumer model, principal classes, UI/API boundary, use-case engine direction
 ---
 
-# 0022 — Yuzu Server is a Headless Platform; Use-Cases Live in External Engines
+# 1005 — Yuzu Server is a Headless Platform; Use-Cases Live in External Engines
 
 Strengthens (does not supersede) `docs/agentic-first-principle.md`: A1's dashboard-parity invariant is hardened here to "UIs may only compose public APIs" for new capabilities. A1's existing scope clause ("existing fragments are not retroactively required to comply") remains in force via the grandfather rules below.
 
-Related: ADR-0021 (Spark/Reflex architecture), ADR-0023 (in-server vulnerability correlation engine) + ADR-4001 (in-server vulnerability dashboard) (both absorbed into grandfathered surface #2, see below), ADR-0017 (management-group confinement of list reads), ADR-0006/0008/0012 (Postgres substrate and store contract), `docs/agentic-first-principle.md` (A1–A5), `docs/auth-architecture.md`, `docs/mcp-server.md`. See also: the [execution plan](../adr-0022-execution-plan.md) (program ladder + first-module scoping).
+Related: ADR-0021 (Spark/Reflex architecture), ADR-0023 (in-server vulnerability correlation engine) + ADR-4001 (in-server vulnerability dashboard) (both absorbed into grandfathered surface #2, see below), ADR-0017 (management-group confinement of list reads), ADR-0006/0008/0012 (Postgres substrate and store contract), `docs/agentic-first-principle.md` (A1–A5), `docs/auth-architecture.md`, `docs/mcp-server.md`. See also: the [execution plan](../adr-1005-execution-plan.md) (program ladder + first-module scoping).
 
 ## Binding status
 
