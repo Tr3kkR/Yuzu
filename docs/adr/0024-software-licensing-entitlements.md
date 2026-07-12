@@ -3,19 +3,62 @@ status: proposed
 date: 2026-07-06
 owner: Alex Young
 deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06; industry-direction review 2026-07-08 (metric-typed quantities, Java/SWID surfaces, Direction section)
-scope: capability §27 — agent licence discovery, multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, the SLE page, RBAC, the per-user privacy carve-out, and the recorded target-state direction
+scope: capability §27 — agent licence discovery, the discovery stores and read surface, RBAC, and the per-user privacy carve-out (built in-server); multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, and the compliance UI/MCP surfaces re-scoped to the SAM use-case-engine module per "Placement under ADR-1005"; plus the recorded target-state direction
 context-refs: capability §27 issues #264–#267; #266 (entitlement-register reversal); ADR-0017 flip-wave (#1634, #1715); superseded standalone ADR PR #1870 (rev 1–5 review history); deferred — #1921 (KEK operator surface), #1922 (oidc_client_secret gap), #1923 (round-3 review items)
 ---
 
 # 0024 — Software Licensing & Entitlements (SLE: agent-discovered licences + multi-source entitlements)
 
+## Summary
+
+**Capability §27 — Software Licensing & Entitlements (SLE)** lets a fleet answer: what
+software licences are in use and of what type, what has lapsed, what renews or expires
+soon, how purchases compare with deployment, and what is paid-for but unused. Under
+ADR-1005 (the server is a headless platform — **mechanism, not interpretation**), §27
+splits along that boundary: **this ADR builds the discovery mechanism in-server and
+defers the interpretation half to the SAM use-case-engine (UCE) module** (see "Placement
+under ADR-1005").
+
+**In-server (this ADR) — the discovery mechanism:**
+- **`license_scan` agent plugin** (D2) — probes every OS licensing surface (Windows WMI
+  `SoftwareLicensingProduct` + Office C2R + an extensible ProbeSpec table incl. Java and
+  ISO-19770-2 SWID tags + per-user hives; Linux rpm/dpkg/entitlement-certs/FlexLM; macOS
+  receipts); never persists or transmits key material.
+- **`software_licensing` daily-sync source** (D3) — transports records on the ADR-0016
+  framework (raw-blob hash-skip, forward-compatible, no proto change).
+- **Two born-on-Postgres stores** (D4/D6) — `ProductRegistryStore` (canonical identities +
+  deterministic `product_normalize` matching) and the raw `SoftwareLicensingStore`
+  (per-agent discovered rows).
+- **Read surface + RBAC** (D9/D10) — the `/sle` **Licences** view, the raw `/api/v1/sle/*`
+  discovery reads (incl. the ancestor-aware `/sle/agents/{id}` drill), and the new
+  **`SoftwareLicensing`** securable.
+- **Privacy + erasure** (D11) — pseudonymous-by-default `user_ref` (per-agent keyed-HMAC)
+  and the **agent-decommission erasure cascade** (first production wiring of the
+  five-store fan-out).
+
+**Deferred to the SAM UCE module — the interpretation half:**
+- **Compliance evaluator** (D7/D8) — effective-state/lapse derivation, seat math, posture
+  rollups, deduplicated notifications.
+- **Entitlement plane** (D12/D14) — five sources, metric-typed quantities, CSV ingest.
+- **M365 Graph connector** (D13) — tenant SKU sync + its SecretCodec secret storage (so
+  **§27 carries no SecretCodec wiring**).
+- **Usage metering & reclamation** (D15), and the **Compliance / Entitlements /
+  Reclamation** SLE sub-views + compliance MCP tools (D9).
+
+**Maintainer sign-off required** (Ratification): (1) the Decision-11 per-user probing
+deviation from ADR-0016's machine-scope/no-PII posture; (2) the ADR-1005 placement
+re-scope.
+
+## Background
+
 Supersedes the roadmap Phase 10 sketch of capability §27 (a SQLite `CatalogStore`, a
 hand-maintained entitlement register, a `software_usage` agent plugin, software tags,
-and a compliance dashboard) with the design recorded here: born-on-Postgres stores,
-agent-discovered licences on the ADR-0016 daily-sync framework, multi-source
-entitlements, server-side compliance evaluation, and a new top-level SLE page. It also
-renames the capability from the map's "Software Catalog & Licensing" to **"Software
-Licensing & Entitlements" (SLE)** — the capability-map §27 entry is retitled
+and a compliance dashboard) with the design recorded here: agent-discovered licences on
+the ADR-0016 daily-sync framework and born-on-Postgres discovery stores (built
+in-server), plus multi-source entitlements, compliance evaluation, and the SLE
+compliance surfaces (re-scoped to the SAM use-case-engine module — see "Placement under
+ADR-1005"). It also renames the capability from the map's "Software Catalog & Licensing"
+to **"Software Licensing & Entitlements" (SLE)** — the capability-map §27 entry is retitled
 accordingly. It supersedes the closed standalone ADR PR #1870 (five review rounds; the
 rev 1–5 history remains on that PR), and is numbered 0024 because 0021–0023 are
 reserved by in-flight ADR branches. It records a single, contained deviation from ADR-0016's
@@ -25,6 +68,13 @@ machinery (`LicenseStore`, the `License` RBAC securable, capability §22.3) is
 untouched; all naming here uses `ProductRegistry*` / `SoftwareLicensing*` /
 `SoftwareEntitlement*` / `SoftwareUsage*` and `software_license.*` /
 `software_entitlement.*` event names.
+
+**Placement note (post-ADR-1005):** this ADR is re-scoped to the headless-platform
+boundary that landed after it was drafted — only the agent-side discovery mechanism and
+its stores/read surface are built in-server; compliance evaluation, entitlements, the
+M365 connector, usage reclamation, and the compliance UI/MCP surfaces are deferred to
+the SAM use-case-engine module. See "Placement under ADR-1005" below, which governs
+where each decision is built.
 
 ## Context
 
@@ -70,8 +120,9 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
   catalog," which keeps its existing meaning.
 - **Discovery plane** vs **entitlement plane** — the two data planes: what is
   *observed on endpoints* vs what is *purchased*.
-- **Effective licence state** — the state (including lapse) the server *derives* from
-  agent-reported facts against server-now; not a raw agent field.
+- **Effective licence state** — the state (including lapse) the compliance evaluator
+  (SAM UCE module, Decision 7) *derives* from agent-reported facts against "now"; not a
+  raw agent field.
 - **Entitlement** — a purchased right (a metric-typed quantity — seats in v1 —
   plus type, term, renewal, cost) from a manual, CSV, connector, or agent source.
 - **Licence metric** — the unit an entitlement is denominated in (`seat`, `core`,
@@ -82,22 +133,105 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
   reported as "compliant." **Unreported** — an asset with no usage data; never
   reported as "unused."
 
+## Placement under ADR-1005 (headless-platform boundary)
+
+**Added after ADR-1005 landed on `dev`; load-bearing — it draws the core-mechanism
+vs use-case-engine-interpretation line through every decision below and governs where
+each is built.** ADR-0024 was drafted 2026-07-06 in mutual ignorance of ADR-1005
+(`docs/adr/1005-headless-platform-use-case-engines.md`, `proposed`, same date), which
+establishes that the Yuzu server owns **mechanism, not interpretation**: it collects,
+enforces, and transports facts about the estate (core), while *interpreting* those
+facts for a purpose — domain scoring, compliance-framework semantics, or joins with
+external domain data — lives in an external **use-case engine (UCE)**. Its execution
+plan (`docs/adr-1005-execution-plan.md`, Decision 6) names **software asset management
+as the likely second UCE module**, and flags that module's per-device licence
+attribution as needing a device-grain data-residency review as an explicit first step.
+
+**Ruling — re-scope, not a carve-out.** Applying ADR-1005 Decision 2's boundary test
+component-by-component, §27 splits cleanly, and this ADR is re-scoped to that split
+rather than requesting an in-server exception:
+
+| §27 element | ADR-0024 decision | ADR-1005 class | Justification (Decision 2 + tiebreakers) |
+|---|---|---|---|
+| `license_scan` plugin | D2 | **core** | Collection of estate facts — parallel to the `vuln_scan` plugin ADR-1005 keeps core. |
+| `software_licensing` daily-sync | D3 | **core** | Transport of collected facts on the ADR-0016 framework. |
+| Raw discovered-licence rows | D4 | **core** | An inventory store of raw estate facts. |
+| `ProductRegistryStore` + `product_normalize` | D4/D6 | **core** | Deterministic identity resolution over pure fleet-internal aggregation (a generic engine, no external data) — the `software_catalog`-rollup tiebreaker. |
+| Ingest seam | D5 | **core** | Untrusted-input transport plumbing. |
+| Raw `/sle/agents/{id}` drill + `SoftwareLicensing` securable | D9/D10 | **core** | A raw-fact read, like `/devices`; already ancestor-aware scoped. |
+| Agent-decommission erasure cascade | D11 | **core** | Platform-wide data-lifecycle mechanism (all five per-agent stores). |
+| Per-user `user_ref` discovery | D11 | **core** (collection) | Estate collection; carries behavioural-PII data-processor obligations (see re-home note). |
+| Compliance evaluator (effective state, lapse, seat math, posture rollups) | D7 | **UCE** | Semantics baked into code — interpret facts for a purpose. |
+| Lapse/expiry/renewal notifications | D8 | **UCE** | Evaluator-derived. |
+| `SoftwareEntitlementStore` + entitlement plane | D12 | **UCE** | Purchased-rights domain data joined to fleet facts for compliance. |
+| M365 Graph connector + its SecretCodec wiring | D13 | **UCE** | The canonical "join fleet data with external domain data." |
+| CSV entitlement ingest | D14 | **UCE** | Entitlement-plane ingestion. |
+| `SoftwareUsageStore` reclamation verdicts | D15 | **UCE** | Usage joined with entitlement data for a reclamation purpose. |
+| Compliance / Entitlements / Reclamation SLE sub-views + compliance MCP tools | D9 | **UCE** | Domain use-case (compliance) product surfaces. |
+
+**Consequences of the re-scope for the decisions below.** Decision 4 ships **two**
+born-on-PG stores in-server (`ProductRegistryStore`, the raw `SoftwareLicensingStore`),
+not four; `SoftwareEntitlementStore` and `SoftwareUsageStore` are the UCE module's
+stores. Decision 9's SLE page ships **only its Licences (discovery) view** in-server;
+the interpretation sub-views are the UCE host's UI. Decision 10's fan-out list reads
+(`/sle/licenses/{key}/devices`, the posture list fragments) are UCE-module reads and are
+not built here; only the raw `/sle/agents/{id}` drill and the raw discovery reads ship.
+Decisions 7, 8, 12, 13, 14, 15 are deferred to the SAM UCE module in full — the designs
+they record stand as that module's input, not as in-server work. In particular,
+**SecretCodec's first production wiring does not happen under §27** (Decision 13 moves
+with the connector), so the Decision-13 KEK deferral no longer bears on this ADR. Because
+the SAM UCE host does not exist yet — engine principals, on-behalf-of delegation, and
+bulk-egress primitives are all deferred by ADR-1005 — the interpretation half is a
+scoped backlog, not an immediately-buildable target; §27 v1 is the discovery foundation
+it will read from over the versioned `/api/v1/sle/*` contract.
+
+**Store ownership follows the layer** (ADR-1005 Consequences): the raw discovery store
+and product registry are permanently server-resident core; the entitlement and usage
+stores are interpretation-owned and belong to the UCE module. The seam that makes the
+future extraction a strangler, not a rewrite, is the evaluator's injected-provider
+boundary — the module re-implements the pure decision functions and points them at the
+versioned reads instead of in-process store handles, the same shape as the vuln module's
+NVD re-home.
+
+**Precedent.** This is the boundary question ADR-1005 already settled for the
+vulnerability vertical: its grandfather clause reconciles the in-server ADR-0023
+correlation stack and the ADR-4001 dashboard, and the execution plan's "Relationship to
+ADR-0023 and ADR-4001" records the maintainer ruling. §27 differs only in resolution —
+rather than an in-server carve-out, it re-scopes so the interpretation half is never
+built in-server, the cleaner outcome Decision 2 points to when the work has not yet
+shipped.
+
+**Re-home / PII note.** The `/api/v1/sle/*` discovery reads are on the published
+versioned contract from birth, so any later change to their placement follows the
+standard deprecation cycle. When the SAM UCE module later consumes per-user `user_ref`
+discovery, that behavioural PII crossing the server→engine boundary triggers ADR-1005
+Decision 5's security-guardian design review and makes the module a data processor with
+its own retention/deletion obligations, and the fail-closed per-open behavioural audit
+(Decision 11) must be reproduced engine-side — recorded here as a first-step item for
+that module's scoping, alongside the Decision-6 device-grain residency review.
+
 ## Decisions
 
-1. **Two data planes, kept deliberately distinct.** Licence *discovery* is
+Each decision is tagged for its ADR-1005 placement (see "Placement under ADR-1005"):
+**[core]** ships in-server as discovery mechanism; **[UCE]** is deferred to the SAM
+use-case-engine module — recorded here as that module's design input, not as in-server
+work; **[split]** ships its discovery half in-server and defers its interpretation half.
+Decision numbers are stable, since other documents cite them.
+
+1. **Two data planes, kept deliberately distinct. [split]** Licence *discovery* is
    **agent-only** — there is no manual path to edit discovered state, so "truth on the
-   endpoint" is never hand-massaged. *Entitlements* (what was purchased) accept
-   **manual, CSV, and automated** input. Purchased-vs-deployed math is computed only
-   where entitlement data exists; discovered-only products stay honestly `unentitled`.
-   The two planes never merge into one editable record. A consequence, stated as a
-   gap rather than hidden: **a wrong reading has no operator override** — the
-   remedy is a corrected probe in the next agent release; each record's confidence is
-   surfaced precisely so operators can weight `heuristic` rows accordingly, and
-   Decision 8's worsening-only/hold-down semantics bound the alert noise a misfiring
-   heuristic can cause.
+   endpoint" is never hand-massaged; this plane is the **in-server** mechanism §27 v1
+   builds. *Entitlements* (what was purchased) accept **manual, CSV, and automated**
+   input and are the **SAM UCE module's** plane. Purchased-vs-deployed math is computed
+   only where entitlement data exists (discovered-only products stay honestly
+   `unentitled`) and is UCE interpretation. The two planes never merge into one editable
+   record. A consequence, stated as a gap rather than hidden: **a discovered reading has
+   no operator override** — the remedy is a corrected probe in the next agent release;
+   each record's confidence is surfaced precisely so operators can weight `heuristic`
+   rows accordingly.
 
 2. **Agent discovery is a new `license_scan` plugin that probes every available
-   surface.** Per-OS translation units with pure parsers split out; actions `list`
+   surface. [core]** Per-OS translation units with pure parsers split out; actions `list`
    (emit records) and `surfaces` (diagnostics — which surfaces are available and why
    not). Surfaces v1: Windows WMI `SoftwareLicensingProduct` (own bounded COM, never
    `WBEM_INFINITE`), Office ClickToRun registry, an extensible `ProbeSpec` table (MS
@@ -123,7 +257,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    is strict-sanitised (strips delimiter/control bytes, clamps to 1024 B).
 
 3. **Transport is a new `software_licensing` daily-sync source on the ADR-0016
-   framework.** Parse plugin output → canonical blob (records sorted + deduped,
+   framework. [core]** Parse plugin output → canonical blob (records sorted + deduped,
    delimiter-joined) → SHA-256. **Unlike the three legacy sources, this source's
    hash-skip comparison is computed over the raw received blob bytes** (recomputed
    server-side — the claimed hash is never trusted), not over re-parsed rows — so
@@ -149,24 +283,30 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    records, Decision 12) ride the same blob without breaking mixed-version fleets in
    either direction.
 
-4. **Canonical state lives in born-on-Postgres stores.** `ProductRegistryStore`
-   (canonical identities + match links), `SoftwareLicensingStore` (per-agent discovered
-   rows + posture rollups + alert dedup), `SoftwareEntitlementStore` (purchased state
-   from five sources), and `SoftwareUsageStore` (usage facts). No new SQLite (ADR-0006/
-   0007), full store contract (ADR-0012): migrate-at-construction on a pinned lease,
-   schema-qualified runtime SQL, bounded leases, fatal-on-open-failure, destruct-
-   before-pool. **No cross-schema SQL or FKs** — cross-store joins happen in C++ in the
-   evaluator (never holding a lease across another store call). Reads are authoritative
-   (a degrade returns nullopt → 503/banner, never a silent empty list, which on a
-   compliance surface would be a fail-open lie); ingest writes are fail-soft, retried
-   next cycle. *Rejected: extending `SoftwareInventoryStore` with licence columns —
-   installed software and discovered licences have different lifecycles and postures;
-   one-store-per-typed-domain is the established precedent.*
+4. **Canonical discovery state lives in two born-on-Postgres stores in-server; the
+   entitlement/usage stores are the UCE module's. [split]** In-server core:
+   `ProductRegistryStore` (canonical identities + match links) and
+   `SoftwareLicensingStore` (per-agent **raw discovered rows**). Per Placement under
+   ADR-1005, `SoftwareEntitlementStore` (purchased state from five sources) and
+   `SoftwareUsageStore` (usage facts) are interpretation-layer stores owned by the SAM
+   UCE module and are **not** built in-server; the posture-rollup and alert-dedup tables
+   the evaluator writes are likewise UCE-owned and move with the evaluator (Decision 7),
+   so `SoftwareLicensingStore`'s in-server surface is its raw-discovery tables, kept
+   physically separable from those rollup tables so the future extraction is a table-set
+   split, not a rewrite. The in-server stores follow the full store contract: no new
+   SQLite (ADR-0006/0007), born-on-Postgres (ADR-0012) — migrate-at-construction on a
+   pinned lease, schema-qualified runtime SQL, bounded leases, fatal-on-open-failure,
+   destruct-before-pool; **no cross-schema SQL or FKs**. Reads are authoritative (a
+   degrade returns nullopt → 503/banner, never a silent empty list). *Rejected: extending
+   `SoftwareInventoryStore` with licence columns — installed software and discovered
+   licences have different lifecycles; one-store-per-typed-domain is the established
+   precedent.*
 
 5. **One ingest seam per source, shared by the gRPC and gateway paths, with a
-   same-change typed-registry rule.** The licensing (and usage) ingest seam sits beside
+   same-change typed-registry rule. [core]** The **licensing** ingest seam sits beside
    the existing inventory seams and is called from **both** the direct
-   `ReportInventory` and the gateway `ProxyInventory`. Untrusted-input discipline
+   `ReportInventory` and the gateway `ProxyInventory` (the usage ingest seam ships with
+   the usage source, Decision 15). Untrusted-input discipline
    before the store: blob and record caps, per-field UTF-8 scrub/clamp, enum whitelists
    (unrecognised → `unknown`), expiry plausibility-clamp. The server **recomputes** the
    hash over the raw received bytes — it never trusts the claimed one — and enum
@@ -177,7 +317,7 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    readable under `Infrastructure:Read`, i.e. a leak past the `SoftwareLicensing`
    securable.
 
-6. **Catalog matching is deterministic, not probabilistic.** A pure
+6. **Catalog matching is deterministic, not probabilistic. [core]** A pure
    `product_normalize` library (`normalize_title`, `normalize_vendor`, `norm_key`)
    feeds strictly-ordered tiers — `exact_norm` → `title_vendor` → `token_set` →
    `birth` (new product). **No fuzzy/Levenshtein matching in v1**: every decision is
@@ -186,91 +326,71 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
    redesign. *Rejected: probabilistic matching in v1 — it trades away determinism and
    testability for accuracy the tiered matcher can approximate.*
 
-7. **Compliance is derived server-side, and the honesty commitments are load-bearing.**
-   A background evaluator (cloning the existing rollup lifecycle: boot pass, then
-   completion-spaced cadence, keep-last-good, stop/join before teardown) re-derives
-   **effective licence state including lapse against server-now** — so a device that
-   *stopped syncing* before its licence lapsed still shows `expired`. Non-negotiable
-   honesty rules: discovered-only products stay `unentitled`, **never** "compliant";
-   reclamation's absent-usage state is **Unreported, not Unused**; unknown quantities
-   (seats, cores, …) are `NULL`, never a fabricated zero; a non-seat-metric
-   entitlement is **never coerced into seat math** (Decision 12 — its compliance is
-   `unknown` until an evaluator for that metric exists); multi-source seat sums keep
-   the **per-source breakdown visible** (double-counting is shown, not hidden); the
-   "installed but licence-unreported" delta is shown, not hidden; and discovery `confidence` and
-   `unknown` states are first-class throughout. Verdict *freshness* is part of the same
-   posture: compliance surfaces carry the rollup's as-of time and evaluator staleness is
-   observable rather than silent — a wedged keep-last-good evaluator serving stale
-   verdicts is the same fail-open class as a silent empty list.
+7. **Compliance evaluation — deferred to the SAM UCE module. [UCE]** Per Placement
+   under ADR-1005, deriving effective licence state (including lapse against "now"),
+   purchased-vs-deployed seat math, and compliance verdicts is interpretation and is the
+   SAM UCE module's job — **not built in-server** under §27. Recorded as that module's
+   design input: a background evaluator (boot pass, then completion-spaced cadence,
+   keep-last-good, stop/join before teardown) re-derives effective state including lapse
+   against "now", so a device that *stopped syncing* before its licence lapsed still
+   reads `expired`. The **honesty commitments are the module's load-bearing acceptance
+   criteria**: discovered-only products stay `unentitled`, never "compliant"; absent
+   usage is **Unreported, not Unused**; unknown quantities are `NULL`, never a fabricated
+   zero; a non-seat metric is never coerced into seat math (its compliance is `unknown`
+   until an evaluator for that metric exists); multi-source seat sums keep the per-source
+   breakdown visible; and verdict *freshness* (the rollup's as-of time, observable
+   staleness) is part of the posture — a wedged keep-last-good evaluator serving stale
+   verdicts is the same fail-open class as a silent empty list. The evaluator's
+   injected-provider seam (its I/O behind `Deps` providers, its clock behind `NowFn`, its
+   decision logic as pure functions) is what lets the module re-point those reads at the
+   versioned `/api/v1/sle/*` discovery surface instead of in-process store handles.
 
-8. **Lapse, expiry, and renewal emit deduplicated notifications and webhook events.**
-   The evaluator fires `software_license.expiring` / `software_license.expired` (and
-   `software_entitlement.renewal_due`, Decision 12) through the existing dual-sink
-   pattern (notification store + webhook/offload event). Emission fires **only** on a
-   **worsening** condition/bucket transition (buckets 30/14/7/1 days) or on persistence
-   past a 7-day re-arm; an improving transition never fires, and a condition that
-   clears and re-asserts inside the re-arm window is held down — so oscillating states
-   (KMS grace↔expired drift, daily re-imaged VMs) cannot spam. On the *first* evaluation
-   of an estate (and after a loss of dedup state) existing conditions are treated as new
-   and fire once per product — a bounded burst, deliberately preferred over silently
-   baselining pre-existing expiries on a compliance surface. `renewal_due` uses the
-   **same bucket/re-arm machinery**, keyed on the entitlement plane's renewal date.
-   This satisfies "not dashboard-only" without daily noise, and escalates as expiry
-   approaches.
+8. **Lapse/expiry/renewal notifications — deferred to the SAM UCE module. [UCE]** These
+   are evaluator-derived (Decision 7), so they move with it. Recorded as module design
+   input: `software_license.expiring/expired` and `software_entitlement.renewal_due` fire
+   through the dual-sink pattern (notification store + webhook/offload event) **only** on
+   a **worsening** bucket transition (30/14/7/1 days) or persistence past a 7-day re-arm;
+   improving transitions never fire and a clear-then-re-assert inside the window is held
+   down, so oscillating states cannot spam; the first evaluation of an estate fires once
+   per product (a bounded burst, preferred over silently baselining pre-existing
+   expiries). This is how the module satisfies "not dashboard-only" without daily noise.
 
-9. **Access is a new top-level SLE page plus unified `/api/v1/sle/*` REST and MCP
-   tools, all gated on one new `SoftwareLicensing` securable.** SLE is a **brand-new
-   top-level page** (`/sle`: Licences | Entitlements | Compliance | Reclamation
-   sub-views), built on the shared guardian shell and cloning the `/inventory` provider
-   model (nullopt → degrade banner, never an empty table). SLE v1 renders **tables and
-   KPI tiles** (the `/inventory` model); charts are deliberately out of v1 — adding
-   them later means an opt-in shell head token, not unconditional chart-bundle loading
-   on every shell page. The in-page "Compliance" sub-view keeps its short tab label,
-   but every out-of-page surface is fully qualified ("Licence Compliance" in the
-   command palette, a qualified page title) to avoid colliding with the existing
-   Guardian `/compliance` page — the same qualify-on-collision discipline the
-   Terminology section mandates for "licence". The software **catalog stays on
-   `/inventory`**, cross-linked. RBAC grants follow the established per-role shape,
-   stated here so nothing is left to inference: **Viewer and PlatformEngineer Read;
-   Operator Read + Write; ITServiceOwner full CRUD** (as for its other operational
-   securables); **ApiTokenManager none**; admin roles per their global pattern — a
-   conscious acceptance that entitlement financial metadata is visible to every Read
-   holder, consistent with how other securables scope; deployments needing tighter cost
-   visibility use the existing remedies (deny-override, custom roles) rather than a new
-   field-level mechanism. Connector *configuration*
-   (tenant/client IDs and the secret) is **admin-gated** (the `admin_fn_`
-   OIDC-Settings precedent), **not** `SoftwareLicensing:Write`; only Sync-now rides the
-   securable. **No MFA step-up anywhere in §27** — nothing here executes on endpoints
-   (the `software-packages` step-up exists precisely because that endpoint dispatches
-   executable content); RBAC Write plus full audit (including denied rows) is the
-   control. The top-level nav entry costs edits to the hand-duplicated nav copies
-   (accepted at owner direction), and the long-standing nav drift across those copies
-   and the command palette is reconciled rather than extended. *Rejected: a tab on
-   `/inventory` (rev 1) — reversed at owner direction.*
+9. **Access: the discovery (Licences) view + the raw read API ship in-server; the
+   compliance/entitlement/reclamation surfaces are the UCE host's. [split]** In-server
+   core: the `/sle` **Licences (discovery) view** on the shared guardian shell (cloning
+   the `/inventory` provider model — nullopt → degrade banner, never an empty table;
+   tables and KPI tiles, no charts in v1), the raw `/api/v1/sle/*` **discovery** reads,
+   and the new **`SoftwareLicensing` securable**. Per Placement under ADR-1005, the
+   **Compliance, Entitlements, and Reclamation** sub-views and the **compliance MCP
+   tools** are the SAM UCE host's UI and read API — not built in-server. The software
+   catalog stays on `/inventory`, cross-linked. RBAC grants on the `SoftwareLicensing`
+   securable follow the established per-role shape, stated so nothing is left to
+   inference: **Viewer and PlatformEngineer Read; Operator Read + Write; ITServiceOwner
+   full CRUD**; **ApiTokenManager none**; admin roles per their global pattern. **No MFA
+   step-up anywhere in §27** — nothing here executes on endpoints; RBAC Write plus full
+   audit (including denied rows) is the control. The nav entry and nav-drift
+   reconciliation are bounded to the in-server Licences view; the UCE host owns its own
+   navigation for the deferred surfaces. Connector configuration admin-gating moves with
+   the connector (Decision 13, UCE). *Rejected: a tab on `/inventory` (rev 1) — reversed
+   at owner direction.*
 
-10. **List-read scoping follows ADR-0017 honestly, without inventing a chokepoint.**
-    (Paths here are shorthand for `/api/v1/sle/*` routes.) The SLE fleet-wide
-    aggregate surfaces (`/sle/summary`, `/sle/licenses`, and the Licences fragments)
-    are built from precomputed rollups aggregated across every management group and,
-    exactly like their `/inventory` `software_catalog` twin, cannot take a per-row
-    admit-then-filter; they are **pinned global-only by design** — a group-confined
-    principal is denied (403) with explicit guidance, never served a partial or leaky
-    rollup. The per-device reads split by shape: **single-agent drills
-    (`/sle/agents/{id}`) take the working ancestor-aware per-device scoped gate from
-    day one** (the `device_routes` precedent: tier + management group, 403 outside
-    scope) — this route is also Decision 11's privacy-verification surface, so it gets
-    real confinement immediately; only the **true fan-out list reads**
-    (`/sle/licenses/{key}/devices`, list fragments) ship global-gated and are
-    **registered as flip-wave consumers of ADR-0017 PR-A** (the admit-then-filter
-    chokepoint; umbrella #1634, prerequisite #1715). SLE gates are built on the
-    fail-closed enforcement primitive (`rbac_enforcement_in_effect()`), not the
-    `is_rbac_enabled()` shape whose corrupt-rbac.db fail-open is tracked by #1717 —
-    or they land after #1717 closes it. *Rejected: wiring an ad-hoc
-    per-row filter for the fan-out reads — that is exactly the pattern ADR-0017 exists
-    to replace, and PR-A is not implemented yet (the `#1716` forward-references in
-    `server/core` point at a closed doc-honesty PR, not the gate).*
+10. **List-read scoping follows ADR-0017. [split]** (Paths are shorthand for
+    `/api/v1/sle/*`.) In-server core: the **single-agent raw drill `/sle/agents/{id}`**
+    takes the working ancestor-aware per-device scoped gate from day one (the
+    `device_routes` precedent: tier + management group, 403 outside scope) — it is also
+    Decision 11's privacy-verification surface, so it gets real confinement immediately.
+    The fleet-wide **posture** aggregates (`/sle/summary`, `/sle/licenses`, the posture
+    Licences fragments) and the **fan-out list read** `/sle/licenses/{key}/devices` read
+    the evaluator's rollup, so per Placement under ADR-1005 they are **UCE-module reads,
+    not built in-server**. When the module builds them, its delegated reads pass the same
+    ADR-0017 `authorize_list_read` chokepoint the operator would hit directly (ADR-1005
+    Decision 5) — a globally-granted engine acting for a group-confined operator reaches
+    only that operator's groups. SLE's in-server gates use the fail-closed
+    `rbac_enforcement_in_effect()` primitive, not the `is_rbac_enabled()` shape whose
+    corrupt-rbac.db fail-open is tracked by #1717. *Rejected: an ad-hoc per-row filter for
+    the fan-out reads — exactly the pattern ADR-0017 exists to replace.*
 
-11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default.**
+11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default. [core]**
     At the owner's explicit direction ("probe everything"), the `software_licensing`
     source probes per-user surfaces and records may carry `user_scope=user` +
     `user_ref`, deviating from ADR-0016's machine-scope/no-PII posture — confined to
@@ -304,109 +424,67 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     command path on the `/sle/agents/{id}` drill. Reads that render `user_ref` rows
     (that drill) join the per-open behavioral-audit tier (the `dex.device.view`
     convention: audited per open, fail-closed) and register in the enterprise read
-    inventory; the four new stores and the `user_ref` data class register in the
-    enterprise data inventory at implementation time. The **usage source and the M365
-    connector do not inherit** this carve-out. Maintainer sign-off on this deviation is
+    inventory; the in-server discovery stores and the `user_ref` data class register in
+    the enterprise data inventory at implementation time. The **usage source and the M365
+    connector do not inherit** this carve-out (both are UCE, Decisions 15/13). Maintainer sign-off on this deviation is
     required. *Rejected: raw-collect default (reversed at review) and unsalted
     `sha256/12` (dictionary-reversible).*
 
-12. **Entitlements accept five sources with a visible per-source breakdown and
-    non-clobbering ownership.** Sources: `manual` (GUI form + REST CRUD), `csv` (GUI
-    upload + REST raw `text/csv`), `graph_m365` (scheduled connector, Decision 13),
-    `agent_flexlm` (FlexLM `.lic` `INCREMENT` seat counts) and `agent_kms` (KMS host
-    activation counts) — the agent sources ride the `software_licensing` blob as `ent|`
-    records under the Decision 3 forward-compat rule, with format-pinned host refs so
-    identity keys derive deterministically from the wire. Identity/upsert per source
-    (manual = server UUID; csv = external_id or content hash, **upsert-by-key**;
-    graph = `skuId` full-set upsert with soft-retire; flexlm/kms = host-derived keys).
-    **Quantity model — metric-typed from birth, never a bare seat column.** Every
-    entitlement row carries a `metric` (closed, unknown-preserving vocabulary, the
-    same treatment as Decision 2's discovery enums) plus a numeric `quantity`. v1
-    ships the vocabulary the market has already moved to — `seat | core | processor |
-    employee | token | unknown` — but the **v1 evaluator computes compliance for
-    `seat` entitlements only**; a non-seat row is stored, listed, and summed
-    faithfully with compliance basis `none` and verdict `unknown` until an evaluator
-    for that metric exists (per-core needs the hardware-fact join, per-employee needs
-    an operator-supplied headcount — both recorded in Direction). A core count is
-    never coerced into seats; that is the Decision 7 honesty rule applied at the
-    schema. This is deliberately a schema-birth decision on a born-on-PG store:
-    adding non-seat *evaluation* later is evaluator work, while retrofitting a
-    metric-typed quantity under a shipped `purchased_seats` integer would be a
-    breaking migration of the capability's central table.
-    **Field ownership:** connector/agent writes touch only observed fields and **never
-    clobber operator annotations** (`cost_*`, `contract_ref`, `po_ref`, `notes`);
-    connector-owned rows are immutable in GUI/REST (409) *except* those annotation
-    fields. Compliance vocabulary `compliant | over_deployed | under_used | unentitled |
-    unknown` with the comparison **basis recorded per product**
-    (`installed_vs_purchased | assigned_vs_purchased | inuse_vs_total | none`); NULL
-    quantity ⇒ compliance `unknown`. *Rejected: replace-by-import CSV semantics —
-    overlapping files would duplicate rows and destroy annotations; imports never
-    delete.*
+12. **Entitlements — deferred to the SAM UCE module. [UCE]** The entitlement plane joins
+    purchased rights to discovered facts, so per Placement under ADR-1005 it is the
+    module's, not built in-server. Recorded as module design input: five sources
+    (`manual`, `csv`, `graph_m365`, `agent_flexlm`, `agent_kms`) with per-source
+    identity/upsert (manual = UUID; csv = external_id/content-hash upsert-by-key; graph =
+    `skuId` full-set upsert with soft-retire; flexlm/kms = host-derived keys). The
+    load-bearing schema decision the module should honour: a **metric-typed quantity from
+    birth** (`metric` ∈ `seat|core|processor|employee|token|unknown` + numeric
+    `quantity`), never a bare `purchased_seats` integer — so adding non-seat evaluation is
+    later evaluator work, not a breaking migration; a non-seat row is stored/summed with
+    verdict `unknown`, never coerced into seats (the Decision 7 honesty rule at the
+    schema). Connector/agent writes touch only observed fields and **never clobber
+    operator annotations** (`cost_*`, `contract_ref`, `po_ref`, `notes`). The agent-side
+    FlexLM/KMS `ent|` records still ride the **core** `software_licensing` blob opaquely
+    (Decision 3 forward-compat) — collected as facts; their interpretation is UCE.
+    *Rejected: replace-by-import CSV semantics — imports never delete.*
 
-13. **The M365 connector is tenant-level only, and its secret is SecretCodec-encrypted
-    on the entitlement store (ADR-0010).** Graph calls are **tenant-level**
-    (`subscribedSkus`, `directory/subscriptions`) — **no per-user `licenseDetails`
-    fan-out** (avoids N×HTTP and per-user PII). The connector exposes a manual
-    **Sync-now** trigger (GUI + REST action under `/api/v1/sle/*`), Write-gated per
-    Decision 9, alongside its schedule. The client secret **never touches
-    `RuntimeConfigStore`** (SQLite, off-registry, unrotatable); it lives in a
-    **registered `SecretCodec` column on the born-on-PG entitlement store**
-    (`connector_secret.secret_enc`), while non-secret keys (tenant/client id, enabled)
-    stay in runtime config. This is **SecretCodec's first production wiring**, with a
-    strict boot order: construct provider + codec → **`register_secret_column` →
-    `set_audit_hook` → `codec.init()`** → only then open the PG stores. Registration
-    and the audit hook must precede `init()` — `init()` snapshots the registered
-    columns for the boot-time orphan scan (a restored DB with an encrypted blob but a
-    deleted KEK row must fail closed at *boot* with `kek_orphaned`) and emits the
-    first-boot `kek.generated` audit event, both lost if ordered after. `init()`
-    failure is `startup_failed` — the server refuses to boot rather than run with
-    unreadable secrets. Encrypt failure aborts the write transaction (never a plaintext
-    or empty write); decrypt is **fail-closed** (connector stops, generic external
-    error, no tamper/existence oracle); the Settings secret field is write-only.
-    Connector secret writes follow the OIDC-settings posture (admin gate, **no
-    step-up**); if Settings credential writes ever gain step-up, connector config
-    follows in the same change. **The KEK operator surface (rotation, retirement, the
-    break-glass flag) is deliberately deferred to #1921** — an accepted, recorded
-    deviation from ADR-0010's ships-with-the-first-secret expectation: until #1921
-    lands, the KEK has no operator rotation path, and a Postgres restore *without* the
-    keys directory is hard-down until the keys backup is restored (the break-glass
-    relief valve arrives with #1921). The M365 client secret itself remains replaceable
-    at any time by re-entry in Settings; only the wrapping key lacks an operator path.
-    Connector input is pinned against the SSRF class: GUID/verified-domain validation,
-    **fixed token/Graph hosts**, `@odata.nextLink` followed **only when same-origin**
-    with a bounded page count, **no redirect following** (or same-origin-pinned
-    redirects only), and bounded response size and timeout per call. The pre-existing
-    `oidc_client_secret` plaintext gap is neither extended nor touched (separately
-    tracked: #1922).
+13. **M365 Graph connector + its secret — deferred to the SAM UCE module. [UCE]** The
+    tenant-level Graph connector (`subscribedSkus`, `directory/subscriptions` — no
+    per-user `licenseDetails` fan-out) is the canonical fleet×external-domain-data join,
+    so it is UCE territory and is not built in-server. Consequently **SecretCodec's first
+    production wiring does not land under §27** — the module owns its own secret storage
+    (design recorded here as its input: a registered `SecretCodec` column, never
+    `RuntimeConfigStore`; strict fail-closed boot order register→audit-hook→`init()`;
+    encrypt-failure aborts the write, decrypt is fail-closed with no tamper/existence
+    oracle) and its SSRF hardening (GUID/verified-domain validation, fixed token/Graph
+    hosts, same-origin `@odata.nextLink` only, no redirect following, bounded
+    size/timeout). The **Decision-13 KEK-operator-surface deferral (#1921) therefore no
+    longer bears on this ADR**. The pre-existing `oidc_client_secret` plaintext gap is
+    neither extended nor touched (separately tracked: #1922).
 
-14. **CSV ingest is one shared pure parser with upsert-by-key, a mandatory dry-run, and
-    hard caps.** A single pure `csv_import` library (RFC-4180 quoting/CRLF/BOM,
-    case-insensitive header mapping, line-numbered errors) backs **both** the GUI upload
-    and the REST raw `text/csv` endpoint — same parser, validator, and caps. Semantics
-    are **upsert-by-key** (re-uploading a corrected file updates in place; imports never
-    delete — deletion is explicit). A **dry-run** performs full validation with zero
-    writes (default-ON in the GUI). Caps are explicit: 1 MiB, 10 000 rows, ≤100 reported
-    errors (the uncapped OTA-upload precedent is deliberately not copied). **Entitlement
-    writes (import apply, CRUD, connector sync) nudge the evaluator** — compliance
-    verdicts refresh promptly rather than waiting out the cadence interval, so the
-    dry-run → import → verify loop is coherent.
+14. **CSV entitlement ingest — deferred to the SAM UCE module. [UCE]** Entitlement-plane
+    ingestion. Recorded as module design input: one shared pure `csv_import` parser
+    (RFC-4180 quoting/CRLF/BOM, case-insensitive header mapping, line-numbered errors)
+    backing both a GUI upload and a REST raw `text/csv` endpoint, **upsert-by-key**
+    (imports never delete — deletion is explicit), a **mandatory dry-run** (full
+    validation, zero writes, default-ON), and hard caps (1 MiB, 10 000 rows, ≤100
+    errors). Entitlement writes nudge the evaluator so the dry-run → import → verify loop
+    is coherent.
 
-15. **Usage metering and reclamation are opt-in and conservative.** Usage is a separate
-    **opt-in** daily-sync source (`--usage-sync-enable`, default off) that reads the
-    agent's TAR warehouse locally through the plugin's sandboxed read-only `sql` action
-    and ships **machine-scope** aggregates (the user dimension is dropped on-device,
-    test-enforced; a monthly-tier fallback errs toward "recently used"). Usage
-    **categories** (Used ≤ 30 d, Rarely 31–90 d, Unused > 90 d, **Unreported** = no usage
-    source or no matched row) are **policy computed server-side at read time**, so a
-    threshold change never forces fleet re-sync and **reclamation never fires on missing
-    data**. Reclamation surfaces lead with **usage coverage** (devices reporting vs
-    fleet) and render zero coverage as explicit guidance to enable the opt-in source — a
-    blank candidate list must be attributable to data absence, never read as "nothing to
-    reclaim". Reclamation candidates are paid licence types × Unused/Rarely usage.
-    Product tags live on `ProductRegistryStore` and drive tag-based views and
-    (time-boxed) management-group rules. *Rejected: routing licence/usage data through
-    TAR as a transport — ADR-0016 already settled TAR as pull-only/edge-resident; usage
-    *reads* TAR locally and pushes via daily-sync.*
+15. **Usage metering and reclamation — deferred to the SAM UCE module. [UCE]** The
+    reclamation verdicts (categories, candidates, coverage) join usage with entitlement
+    data for a purpose, so they are UCE interpretation. The **usage collection** half — an
+    opt-in (`--usage-sync-enable`, default off) machine-scope daily-sync source reading
+    the agent's TAR warehouse locally through the plugin's sandboxed read-only `sql`
+    action, user dimension dropped on-device — is agent-side fact collection and, if/when
+    it ships, ships in-server as **mechanism only**; it is out of §27 v1. Recorded as
+    module design input: usage **categories** (Used ≤30 d, Rarely 31–90 d, Unused >90 d,
+    **Unreported** = no data) are policy-computed at read time so a threshold change never
+    forces re-sync and **reclamation never fires on missing data**; reclamation surfaces
+    lead with usage coverage and render zero coverage as explicit guidance, never as
+    "nothing to reclaim". **Product tags on `ProductRegistryStore` stay core** (they drive
+    tag-based views and time-boxed management-group rules). *Rejected: routing
+    licence/usage data through TAR as a transport — usage reads TAR locally and pushes via
+    daily-sync.*
 
 16. **Out of scope.** Yuzu's own product-licence machinery (`LicenseStore`, the
     `License` securable, §22.3) is untouched. Per-user Graph `licenseDetails` fan-out is
@@ -419,6 +497,68 @@ burden beyond preserving ADR-0016 wire stability across mixed-version fleets.
     breadth, closed-loop reclamation, audit-evidence export — are recorded with their
     rationale and layering seams in the **Direction** section below, so the v1
     boundary is a stated waypoint, not a silent ceiling.
+
+## Example: discovered-licence data
+
+*Illustrative — field names indicate the Decision 2/3 record shape, not a frozen wire
+contract; `license_type`/`status`/`source`/`confidence` are closed, unknown-preserving
+vocabularies.*
+
+**What `license_scan` produces (agent-side, Decision 2).** Each surface emits
+strict-sanitised records; the `list` action yields, e.g.:
+
+```jsonc
+// Windows OS licence from WMI SoftwareLicensingProduct — machine-scope, vendor API
+{
+  "kind": "lic", "product": "Windows 11 Pro", "publisher": "Microsoft",
+  "license_type": "volume_kms", "status": "licensed", "channel": "KMS",
+  "expires_at": "2026-10-14",      // KMS grace resolved to an absolute UTC date, never a ticking countdown
+  "confidence": "authoritative",    // from an OS licensing API
+  "source": "win_slp",
+  "key_hint": "…-…-…-…-6TCXB",      // OS-provided partial only; full key never persisted or transmitted
+  "user_scope": "machine", "exe_hints": []
+}
+
+// Per-user Autodesk licence from an offline NTUSER.DAT hive — pseudonymous by default
+{
+  "kind": "lic", "product": "AutoCAD 2025", "publisher": "Autodesk",
+  "license_type": "subscription_named_user", "status": "active", "expires_at": "2026-03-31",
+  "confidence": "probable",         // heuristic registry parse, not a vendor API
+  "source": "user_hive", "user_scope": "user",
+  "user_ref": "a3f9c1d47e0b8c21",   // HMAC-SHA256(k_agent, profile) truncated to 16 hex — never a SID/email; k_agent never leaves the device
+  "exe_hints": ["acad.exe"]
+}
+
+// Oracle JDK via an ISO 19770-2 SWID tag — the audit-relevant probe
+{
+  "kind": "lic", "product": "Oracle JDK 17", "publisher": "Oracle",
+  "license_type": "per_employee", "status": "installed",
+  "confidence": "authoritative",    // parsed vendor SWID artefact
+  "source": "swidtag", "user_scope": "machine", "exe_hints": ["java.exe"]
+}
+```
+
+**On the wire (Decision 3).** Records are sorted, deduped, and delimiter-joined into one
+canonical blob (each line prefixed by kind, e.g. `lic|…`), which is SHA-256'd and rides
+`InventoryReport.plugin_data` as opaque `map<string,bytes>` — no proto change. The blob
+holds only facts that change with discovered state (no collection timestamps), so a
+stable estate hash-skips day to day; unrecognised record kinds (e.g. future `ent|`
+entitlement records, Decision 12) are skipped by both parser and seam, so mixed-version
+fleets never loop.
+
+**What gets stored (Decision 4).** The server recomputes the hash over the raw bytes,
+resolves each raw name to one `ProductRegistry` product via the deterministic
+`product_normalize` matcher (Decision 6), and upserts the raw row into
+`SoftwareLicensingStore.agent_licenses`:
+
+| agent_id | product_id | raw_product | license_type | status | expires_at | confidence | source | key_hint | user_scope | user_ref | last_seen |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `a91f…` | `prod_win11pro` | Windows 11 Pro | volume_kms | licensed | 2026-10-14 | authoritative | win_slp | `…6TCXB` | machine | — | 2026-07-12 |
+| `a91f…` | `prod_autocad25` | AutoCAD 2025 | subscription_named_user | active | 2026-03-31 | probable | user_hive | — | user | `a3f9c1d47e0b8c21` | 2026-07-12 |
+
+These raw rows are the **in-server core** discovery state. The SAM UCE module reads them
+over `/api/v1/sle/*` to derive effective state, match against entitlements, and compute
+the posture rollups — none of which is stored in-server (Placement under ADR-1005).
 
 ## Direction — the target state this v1 is the foundation for
 
@@ -461,8 +601,8 @@ into the v1 slices.
 - **An IdP-anchored user dimension for named-user metrics** — Decision 11's
   per-agent pseudonyms deliberately cannot correlate across devices, so fleet-wide
   named-user math requires a directory-sourced identity plane. Explicitly a future
-  decision with its own privacy review and works-council posture; never a quiet
-  extension of `user_ref`.
+  decision with its own security-guardian design review and data-processor posture;
+  never a quiet extension of `user_ref`.
 - **Licence-server live usage and denials** — v1 reads FlexLM `.lic` statics;
   the engineering-software segment expects checkout/denial telemetry (FlexLM-class,
   then RLM/Sentinel) feeding `inuse_vs_total` — denial events are the renegotiation
@@ -497,46 +637,53 @@ still retrofitting.
 
 ## Consequences
 
-- Yuzu can answer, per asset and fleet-wide: what software licences exist, their
-  types and channels, what has lapsed, and what expires or renews within N days —
-  with notifications — how purchases compare with deployment for entitled products,
-  and what paid software is going unused.
-- Licence discovery has **no manual path**; entitlements do (form, CSV, connector,
-  and agent-derived records). The two planes stay distinct so discovered "truth on the
-  endpoint" is never hand-edited, and purchased-vs-deployed math is claimed only
-  where entitlement data exists — discovered-only products stay honestly `unentitled`.
-- Multi-source seat sums keep the per-source breakdown visible; unknown quantities
-  are `NULL`, not a fabricated zero; absent usage is *Unreported*, never *Unused*.
-- Entitlement quantities are metric-typed from schema birth (`seat | core |
-  processor | employee | token | unknown`), so the market's shift off
-  device-install metrics lands as evaluator work on the Direction ladder, never as
-  a breaking migration of the capability's central table. The v1 evaluator claims
-  seat math only, and says so.
-- Four born-on-Postgres stores join the ladder; the server refuses to boot if their
-  migrations fail, consistent with the substrate posture.
-- A new top-level SLE nav entry costs edits to the hand-duplicated nav copies
-  (accepted at owner direction); the long-standing nav drift across those copies and
-  the command palette is reconciled rather than extended.
+- **In-server (§27 v1) answers the discovery questions** per asset and fleet-wide: what
+  software licences exist, their types and channels. **The SAM UCE module answers the
+  interpretation questions** — what has lapsed, what expires or renews within N days
+  (with notifications), how purchases compare with deployment, and what paid software is
+  going unused — reading the in-server discovery surface over the versioned
+  `/api/v1/sle/*` API.
+- Licence discovery (in-server) has **no manual path**; the entitlement plane (UCE) does
+  (form, CSV, connector, agent-derived records). The two planes stay distinct so
+  discovered "truth on the endpoint" is never hand-edited, and purchased-vs-deployed math
+  is claimed only where entitlement data exists — discovered-only products stay honestly
+  `unentitled`.
+- The module's honesty commitments are its acceptance criteria: multi-source seat sums
+  keep the per-source breakdown visible; unknown quantities are `NULL`, not a fabricated
+  zero; absent usage is *Unreported*, never *Unused*; entitlement quantities are
+  metric-typed from schema birth, so the market's shift off device-install metrics lands
+  as evaluator work, never a breaking migration of the module's central table.
+- **Two** born-on-Postgres **discovery** stores join the ladder in-server
+  (`ProductRegistryStore`, the raw `SoftwareLicensingStore`); the server refuses to boot
+  if their migrations fail, consistent with the substrate posture. The entitlement and
+  usage stores are the UCE module's, not built here.
+- The in-server SLE nav entry (the Licences discovery view) costs edits to the
+  hand-duplicated nav copies (accepted at owner direction), with the long-standing nav
+  drift reconciled rather than extended; the UCE host owns navigation for the deferred
+  surfaces.
 - The per-user carve-out (Decision 11) is a deliberate, contained ADR-0016 deviation
-  requiring maintainer sign-off. Default posture is **pseudonymous** (keyed-HMAC);
-  raw profile names are opt-in and full suppression of the identifier is one flag.
-  A hashed `user_ref` is still personal data, and there is no row-level erasure API —
-  both stated, not hidden. The agent-decommission cascade that completes the erasure
-  story is built by this capability (it does not exist today).
-- The M365 client secret is envelope-encrypted via SecretCodec from its first write,
-  in a registered column on the entitlement store; §27 carries the codec's **first
-  production wiring** (boot-time `init()`, fail-closed). The KEK operator surface is
-  deferred to a tracked issue — until it lands there is no operator rotation path, an
-  accepted deviation from ADR-0010's expectation. The legacy `oidc_client_secret`
-  plaintext gap remains separately tracked and is not extended.
-- Fleet network cost is negligible: licence blobs hash-skip on stable estates, usage
-  blobs are small and only from active machines that opted in, and the Graph sync is
-  one tenant-level call pair per day.
+  requiring maintainer sign-off. Default posture is **pseudonymous** (keyed-HMAC); raw
+  profile names are opt-in and full suppression of the identifier is one flag. A hashed
+  `user_ref` is still personal data, and there is no row-level erasure API — both stated,
+  not hidden. The agent-decommission cascade that completes the erasure story is built by
+  this capability (it does not exist today) and is in-server core.
+- The M365 connector and therefore **SecretCodec's first production wiring move to the
+  SAM UCE module**; §27 carries no SecretCodec wiring, so the ADR-0010
+  KEK-operator-surface deferral (#1921) no longer bears on this ADR. The legacy
+  `oidc_client_secret` plaintext gap remains separately tracked (#1922) and is not
+  extended.
+- Fleet network cost is negligible: licence discovery blobs hash-skip on stable estates
+  (the usage and Graph syncs belong to the deferred surfaces).
 
 ## Ratification
 
 Acceptance of this ADR carries two explicit sign-offs beyond the design itself:
 (1) the **Decision 11 deviation** from ADR-0016's machine-scope/no-PII posture
 (per-user licence probing, pseudonymous by default, contained to two fields on one
-source); (2) the **Decision 13 deferral** of the KEK operator surface to #1921, a
-recorded deviation from ADR-0010's ships-with-the-first-secret expectation.
+source); (2) the **ADR-1005 placement re-scope** (see "Placement under ADR-1005") — a
+maintainer ruling that §27's discovery mechanism is server-resident core while its
+interpretation half (compliance evaluation, entitlements, the M365 connector, usage
+reclamation, and the compliance UI/MCP surfaces) is deferred to the SAM
+use-case-engine module. The **Decision 13 KEK deferral (#1921)** no longer needs
+sign-off here: with the M365 connector re-scoped to the UCE module, §27 carries no
+SecretCodec wiring.

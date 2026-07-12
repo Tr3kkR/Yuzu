@@ -1107,7 +1107,7 @@ Multi-source inventory cleanup pipeline:
 > Entitlements", capability §27 — renamed by the same ADR). The sketches below are
 > stale where they conflict: the SQLite `CatalogStore` becomes the born-on-Postgres
 > `ProductRegistryStore`; entitlements are a five-source plane (manual, CSV, M365
-> connector, agent-observed FlexLM/KMS), not a manual-only register; licence detection
+> connector, agent-observed FlexLM/KMS), not a manual-only register; licence discovery
 > is a new agent `license_scan` plugin on the ADR-0016 daily-sync framework; REST is
 > unified under `/api/v1/sle/*`; usage metering (10.2 / #265) becomes **opt-in**
 > (`--usage-sync-enable`, default off) and machine-scope, not on-by-default launch
