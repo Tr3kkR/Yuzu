@@ -1319,3 +1319,56 @@ TEST_CASE("ApiTokenStore: revoking a rotation SUCCESSOR clears the predecessor's
     CHECK_FALSE((*still)->revoked); // predecessor survives — principal keeps a credential
     CHECK(store.list_active_for_principal(principal).size() == 1);
 }
+
+// ── validate_token_checked: the tri-state a held-open stream needs ───────────
+//
+// `validate_token` folds "definitively gone" and "cannot reach the store" into
+// the same nullopt. That is right for request auth — both answers mean 401 — and
+// wrong for an MCP SSE stream, which must cut a REVOKED credential immediately
+// (ADR-1005 Decision 15(c)) while riding out a transient backend blip rather than
+// killing every live stream on the fleet at once (Decision 15(i), chaos CH-4).
+
+TEST_CASE("ApiTokenStore: validate_token_checked reports a live token as valid",
+          "[token][auth][stream]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    auto raw = store.create_token("Stream Token", "alice");
+    REQUIRE(raw.has_value());
+
+    auto checked = store.validate_token_checked(*raw);
+    CHECK(checked.status == ApiTokenStore::TokenCheck::kValid);
+    REQUIRE(checked.token.has_value());
+    CHECK(checked.token->principal_id == "alice");
+}
+
+TEST_CASE("ApiTokenStore: a revoked token is DEFINITIVELY invalid, not indeterminate",
+          "[token][auth][stream]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    auto raw = store.create_token("Doomed", "alice");
+    REQUIRE(raw.has_value());
+    auto live = store.validate_token(*raw);
+    REQUIRE(live.has_value());
+
+    REQUIRE(store.revoke_token(live->token_id));
+
+    auto checked = store.validate_token_checked(*raw);
+    // kInvalid — NOT kUnavailable. A revocation must cut the stream on the next
+    // tick; if it were reported as indeterminate it would instead buy the revoked
+    // credential a full grace window of extra life.
+    CHECK(checked.status == ApiTokenStore::TokenCheck::kInvalid);
+    CHECK_FALSE(checked.token.has_value());
+}
+
+TEST_CASE("ApiTokenStore: an unknown token is definitively invalid", "[token][auth][stream]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012");
+    CHECK(checked.status == ApiTokenStore::TokenCheck::kInvalid);
+}
+
+TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[token][auth][stream]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
+}

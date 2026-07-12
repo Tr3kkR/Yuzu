@@ -63,3 +63,27 @@ TEST_CASE("MCP transport: Accept opts into SSE (case-insensitive)", "[mcp][trans
     CHECK(accept_wants_sse("application/json,,text/event-stream"));
     CHECK(accept_wants_sse("text/event-stream,"));
 }
+
+TEST_CASE("MCP transport: the Accept comma-split honours RFC-9110 quoted-strings (#2073)",
+          "[mcp][transport]") {
+    // This function GATES the GET SSE channel (2f PR 2). A comma inside a quoted
+    // parameter value is part of that value, not a range separator — splitting on
+    // it naively would hand an SSE stream to a client that asked for JSON, purely
+    // because the token appeared inside a quoted string it controls.
+    CHECK_FALSE(accept_wants_sse(R"(application/json;x=",text/event-stream,")"));
+    CHECK_FALSE(accept_wants_sse(R"(application/json;x="a,text/event-stream")"));
+    // A quoted-pair (\") does not end the quoted-string, so the comma after it is
+    // still inside the value.
+    CHECK_FALSE(accept_wants_sse(R"(application/json;x="a\",text/event-stream,b")"));
+    // Unterminated quote: the rest of the header is swallowed into one range, which
+    // then fails the whole-type compare. Fail-closed is the only safe direction for
+    // a parse ambiguity on a security-relevant gate.
+    CHECK_FALSE(accept_wants_sse(R"(application/json;x=",text/event-stream)"));
+
+    // A genuine SSE opt-in still matches even when a LATER range carries a quoted
+    // comma — the fix must not make the header un-parseable in the honest case.
+    CHECK(accept_wants_sse(R"(text/event-stream, application/json;x="a,b")"));
+    CHECK(accept_wants_sse(R"(application/json;x="a,b", text/event-stream)"));
+    // …including when the SSE range itself carries a quoted parameter.
+    CHECK(accept_wants_sse(R"(text/event-stream;note=",json,")"));
+}
