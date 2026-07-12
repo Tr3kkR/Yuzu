@@ -15,10 +15,13 @@
  */
 #include "spark_fleet_tags.hpp"
 
+#include "spark_heartbeat.hpp"  // agent emitter — bind its ACTUAL emitted keys to the reader
 #include <yuzu/agent/spark.hpp> // spark_type_token — the agent's canonical tokens
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -73,6 +76,62 @@ TEST_CASE("spark_mechs_from_csv keeps recognised tokens and drops the rest", "[s
           std::vector<std::string>{"file", "service"});
     CHECK(spark_mechs_from_csv(",file,").empty() == false);         // stray commas tolerated
     CHECK(spark_mechs_from_csv(",file,") == std::vector<std::string>{"file"});
+    // De-dup: a forged/buggy repeated CSV must not double-count in the capability
+    // gauge (gov sec-L1 / UP-3). An honest agent never repeats.
+    CHECK(spark_mechs_from_csv("file,file,file") == std::vector<std::string>{"file"});
+    CHECK(spark_mechs_from_csv("service,file,service") ==
+          std::vector<std::string>{"service", "file"});
+}
+
+// FULL WRITER↔READER BIND: emit through the agent's real emit_spark_heartbeat_tags
+// and assert every key it produces is one the server reader recognises. This closes
+// the gap that the static_asserts above leave open — they pin server-const == literal,
+// but the agent composes its own literals; a rename on the agent side that isn't
+// mirrored here would ship silent zero-reporting. (gov ca-S1 / qe-S2)
+TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][fleet]") {
+    using yuzu::agent::emit_spark_heartbeat_tags;
+    using yuzu::agent::SparkEngineStats;
+    using yuzu::agent::SparkMechanismStats;
+
+    // The set of keys the server READER recognises: the six fixed keys + every
+    // composed per-{mechanism,metric} key.
+    std::set<std::string> reader_keys = {
+        detail::kSparkTagRunning,      detail::kSparkTagMechs,         detail::kSparkTagArmedFaulted,
+        detail::kSparkTagWatchFaults,  detail::kSparkTagQueuedDropped, detail::kSparkTagConsumerErrors};
+    for (const char* mech : detail::kSparkMechTokens)
+        for (const char* metric : detail::kSparkMetricTokens)
+            reader_keys.insert(detail::spark_type_metric_tag(mech, metric));
+
+    // Emit with EVERY counter non-zero for all three mechanisms, so every key the
+    // agent can produce is exercised.
+    SparkEngineStats ss;
+    ss.armed_faulted = 1;
+    ss.watch_faults_total = 2;
+    ss.queued_dropped_total = 3;
+    ss.consumer_errors_total = 4;
+    std::map<SparkType, SparkMechanismStats> by_type;
+    for (SparkType t : {SparkType::File, SparkType::Registry, SparkType::Service}) {
+        SparkMechanismStats ms;
+        ms.watch_rejected_total = 5;
+        ms.quarantined_total = 6;
+        ms.slow_op_total = 7;
+        by_type[t] = ms;
+    }
+    std::map<std::string, std::string> tags;
+    emit_spark_heartbeat_tags(tags, ss, by_type);
+
+    // Every emitted key must be recognised by the reader — else silent zero-reporting.
+    for (const auto& [key, val] : tags) {
+        INFO("emitted key not recognised by the server reader: " << key);
+        CHECK(reader_keys.count(key) == 1);
+    }
+    // And the always-present + all non-zero keys are actually emitted (no over-suppression).
+    CHECK(tags.count(detail::kSparkTagRunning) == 1);
+    CHECK(tags.count(detail::kSparkTagMechs) == 1);
+    CHECK(tags.at(detail::kSparkTagMechs) == "file,service,registry"); // SparkType enum order
+    CHECK(tags.count(detail::kSparkTagArmedFaulted) == 1);
+    CHECK(tags.count(detail::kSparkTagConsumerErrors) == 1);
+    CHECK(tags.count(detail::spark_type_metric_tag("registry", "quarantined")) == 1);
 }
 
 TEST_CASE("parse_spark_count enforces the forged-value posture", "[spark][fleet]") {

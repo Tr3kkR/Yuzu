@@ -658,6 +658,18 @@ struct StatStubMechanism : ISparkMechanism {
     void stop() override {}
     [[nodiscard]] SparkMechanismStats stats() const override { return fixed; }
 };
+
+/// Fault injector: start() throws (mimics thread-creation failure under EAGAIN),
+/// used to prove SparkEngine tears down cleanly after a mid-boot throw.
+struct ThrowingStartMechanism : ISparkMechanism {
+    void start(SparkEmitFn, SparkFaultFn) override { throw std::runtime_error("start boom"); }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {}
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
 } // namespace
 
 TEST_CASE("stats_by_type preserves the per-mechanism-type breakdown", "[spark][stats]") {
@@ -738,4 +750,71 @@ TEST_CASE("emit_spark_heartbeat_tags: always-present keys + sparse counters", "[
         CHECK(tags.at("yuzu.spark_file_slow_op") == "1");
         CHECK_FALSE(tags.contains("yuzu.spark_file_quarantined"));
     }
+}
+
+TEST_CASE("stats_by_type / stats are safe to call after stop()", "[spark][stats]") {
+    // The heartbeat thread can call these AFTER the agent's stop()/engine stop() and
+    // before it is joined — a stopped engine is a live object and mechanisms_ is not
+    // cleared by stop(), so the read must stay valid (gov cs-S1 / UP-9).
+    SparkEngine engine;
+    SparkMechanismStats ms;
+    ms.watch_rejected_total = 3;
+    REQUIRE(
+        engine.register_mechanism(SparkType::Service, std::make_unique<StatStubMechanism>(ms))
+            .has_value());
+    engine.start();
+    engine.stop();
+
+    const auto by_type = engine.stats_by_type();
+    REQUIRE(by_type.size() == 1);
+    CHECK(by_type.at(SparkType::Service).watch_rejected_total == 3);
+    CHECK(engine.stats().mech_watch_rejected_total == 3);
+    CHECK_FALSE(engine.is_running());
+}
+
+TEST_CASE("register_mechanism failure leaks nothing and leaves the engine usable",
+          "[spark][stats]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File,
+                                      std::make_unique<StatStubMechanism>(SparkMechanismStats{}))
+                .has_value());
+    // Duplicate for the same type is rejected; the rejected mechanism is freed by
+    // register_mechanism's by-value param (no leak — ASan-clean under sanitizer runs).
+    CHECK_FALSE(engine.register_mechanism(SparkType::File,
+                                          std::make_unique<StatStubMechanism>(SparkMechanismStats{}))
+                    .has_value());
+    // A timer-driven type has no mechanism and is rejected too.
+    CHECK_FALSE(engine.register_mechanism(SparkType::Interval,
+                                          std::make_unique<StatStubMechanism>(SparkMechanismStats{}))
+                    .has_value());
+    // The engine still holds exactly the one good mechanism.
+    CHECK(engine.stats_by_type().size() == 1);
+}
+
+TEST_CASE("SparkEngine tears down cleanly when a mechanism start() throws", "[spark][stats]") {
+    // Mirrors the agent's degrade-to-no-spark path (gov cs-S2): start() propagates a
+    // mechanism start() throw, and the engine must then destruct cleanly — joining the
+    // wheel already spawned and no-opping the un-started mechanisms — with no crash,
+    // hang, double-join, or leak (the property the agent's try/catch + reset() relies
+    // on; TSan exercises the emit-during-unwind vs join race here).
+    auto engine = std::make_unique<SparkEngine>();
+    // File registers first (SparkType::File=3 < Service=4), starts as a no-op; Service
+    // throws — so the wheel is up and one mechanism is started when the throw fires.
+    REQUIRE(engine
+                ->register_mechanism(SparkType::File,
+                                     std::make_unique<StatStubMechanism>(SparkMechanismStats{}))
+                .has_value());
+    REQUIRE(engine->register_mechanism(SparkType::Service, std::make_unique<ThrowingStartMechanism>())
+                .has_value());
+
+    bool threw = false;
+    try {
+        engine->start();
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw); // start() propagated the mechanism throw (the agent catches it)
+
+    engine.reset(); // ~SparkEngine → stop(): must not crash / hang / leak
+    SUCCEED("engine destroyed cleanly after a partial-start throw");
 }

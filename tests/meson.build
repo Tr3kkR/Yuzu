@@ -449,6 +449,12 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
+      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
+      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
+      # template — no link to yuzu_agent_core, just the include path.
+      include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with

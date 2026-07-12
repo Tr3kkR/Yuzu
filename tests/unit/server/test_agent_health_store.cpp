@@ -7,6 +7,7 @@
  */
 
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+#include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 
 #include <yuzu/metrics.hpp>
 
@@ -248,6 +249,53 @@ public:
             set_stats_os("yuzu_fleet_net_throughput_bps", os, vals);
     }
 
+    // Spark rollup mirror (gov qe-S1) — the same bucketing + gauge glue as
+    // AgentRegistry::recompute_metrics, reusing the SHIPPED spark_fleet_tags.hpp
+    // helpers (no parallel repro of the parse logic, per the net precedent above).
+    // Covers reporting + capability + one per-mechanism counter — the pattern is
+    // identical across the nine families.
+    void recompute_spark(yuzu::MetricsRegistry& metrics) {
+        namespace sd = yuzu::server::detail;
+        std::lock_guard lock(mu_);
+        for (const char* f : {"yuzu_fleet_spark_reporting", "yuzu_fleet_spark_mechanisms",
+                              "yuzu_fleet_spark_watch_rejected"})
+            metrics.clear_gauge_family(f);
+        auto norm_os = [](const std::string& os) -> std::string {
+            if (os == "windows" || os == "linux" || os == "darwin")
+                return os;
+            return os.empty() ? "unknown" : "other";
+        };
+        std::unordered_map<std::string, int> reporting;
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> mechs;
+        std::unordered_map<std::string, std::unordered_map<std::string, double>> rejected;
+        for (auto& [id, snap] : snapshots_) {
+            auto get = [&](const std::string& k) -> std::string {
+                auto it = snap.status_tags.find(k);
+                return it != snap.status_tags.end() ? it->second : "";
+            };
+            if (get(sd::kSparkTagRunning) != "1")
+                continue; // disabled/non-reporting agent excluded from the denominator
+            const std::string os = norm_os(get("yuzu.os"));
+            ++reporting[os];
+            for (const auto& tok : sd::spark_mechs_from_csv(get(sd::kSparkTagMechs)))
+                ++mechs[os][tok];
+            for (const char* m : sd::kSparkMechTokens)
+                if (auto v = sd::parse_spark_count(
+                        get(sd::spark_type_metric_tag(m, sd::kSparkMetricWatchRejected))))
+                    rejected[os][m] += *v;
+        }
+        for (auto& [os, n] : reporting)
+            metrics.gauge("yuzu_fleet_spark_reporting", {{"os", os}}).set(n);
+        for (auto& [os, mm] : mechs)
+            for (auto& [mech, n] : mm)
+                metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", os}, {"mechanism", mech}})
+                    .set(n);
+        for (auto& [os, mm] : rejected)
+            for (auto& [mech, v] : mm)
+                metrics.gauge("yuzu_fleet_spark_watch_rejected", {{"os", os}, {"mechanism", mech}})
+                    .set(v);
+    }
+
 private:
     struct Snapshot {
         std::string agent_id;
@@ -287,6 +335,34 @@ TEST_CASE("AgentHealthStore: multiple agents aggregate correctly", "[health_stor
     CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "windows"}}).value() == 1.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", "x86_64"}}).value() == 2.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", "aarch64"}}).value() == 1.0);
+}
+
+TEST_CASE("AgentHealthStore: spark rollup buckets per os and mechanism", "[health_store][spark]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // linux agent: service only, one watch rejection.
+    store.upsert("a1", {{"yuzu.os", "linux"},
+                        {"yuzu.spark_running", "1"},
+                        {"yuzu.spark_mechs", "service"},
+                        {"yuzu.spark_service_watch_rejected", "2"}});
+    // windows agent: all three mechanisms, quiescent (no counters).
+    store.upsert("a2", {{"yuzu.os", "windows"},
+                        {"yuzu.spark_running", "1"},
+                        {"yuzu.spark_mechs", "file,service,registry"}});
+    // spark-disabled agent: no spark tags → excluded from the reporting denominator.
+    store.upsert("a3", {{"yuzu.os", "linux"}});
+    store.recompute_spark(metrics);
+
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "linux"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "windows"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", "linux"}, {"mechanism", "service"}})
+              .value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", "windows"}, {"mechanism", "file"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .gauge("yuzu_fleet_spark_watch_rejected", {{"os", "linux"}, {"mechanism", "service"}})
+              .value() == 2.0);
 }
 
 TEST_CASE("AgentHealthStore: stale entries are pruned", "[health_store]") {
