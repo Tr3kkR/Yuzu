@@ -206,14 +206,31 @@ unset — the `[pg]` cases skip cleanly. The `/test` skill and CI
 deliberately hard-fail at the ensure-postgres step instead (that is the
 gate working, not a skill bug).
 
-Two operational notes for shared instances: the `yuzu-ci-postgres`
+Operational notes for shared instances: the `yuzu-ci-postgres`
 container is shared across concurrent jobs on a runner — the migration
 runner's advisory locks are **cluster-wide**, so same-named stores in
 different ephemeral test databases briefly serialize on each other
 (transaction-scoped locks: never deadlock, never cross-database
-corruption). And every test database is created/dropped per case by the
-`PostgresTestDb` fixture; a `yuzu_test_*` pile-up on a shared instance
-means teardown is failing and is logged to stderr by the fixture.
+corruption).
+
+**Test-database lifecycle (PR #2091).** Ephemeral per-case databases
+(`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`)
+coexist with per-process **template** databases
+(`yuzu_test_tpl_<epoch>_<salt>_<key>`, built once by `PgTestTemplate` and
+dropped at `testRunEnded`) — during a run, each of a box's 4 runner agents
+legitimately holds up to ~a dozen template databases. A pile-up is NOT
+automatically "teardown is failing": names embed their creation epoch, and
+every suite start sweeps names older than 6 h (`kTestDbStaleAfterSeconds`),
+so leaks from killed runs self-heal within that window; the sweep prints a
+`sweep saw N ... dropped M` summary in the job log. Hand-cleaning a wedged
+instance: only ever touch `yuzu_test_*`/`yuzu_test_tpl_*` names; prefer
+"name-epoch older than 6 h" over "no current connections" (a live fixture
+is momentarily connection-free between drop and re-create); pre-epoch-format
+names (`yuzu_test_<salt>_<n>`, first number < 1e9) predate the sweeper and
+need manual judgment. The server suite's meson timeout was recalibrated
+600 s → 900 s in the same PR (gate-parameter change; see the comment at the
+`test('server unit tests', ...)` entry in `tests/meson.build` — if a quiet
+Windows debug leg crosses ~700 s, split the suite instead of raising it).
 
 ## Universal vcpkg cache-key contract
 
