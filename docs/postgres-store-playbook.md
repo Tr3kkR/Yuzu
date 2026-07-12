@@ -75,9 +75,11 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    POSTGRES_DB=yuzu -p 5433:5432 postgres:18` then
    `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
 
-   **Store-behaviour tests must use the pre-migrated template variant** — declare one
-   file-local `PgTestTemplate` whose setup constructs the store(s) under test, and open each
-   test with `YUZU_REQUIRE_PG_DB_TPL(var, tpl)`: the ephemeral database is then cloned
+   **Store-behaviour tests must use the pre-migrated template variant** — declare a
+   `PgTestTemplate` per file whose setup constructs the store(s) under test (files needing the
+   exact same store set may share a template key — the registry builds each key once,
+   first-registered setup wins, so shared-key setup lambdas must stay byte-identical), and open
+   each test with `YUZU_REQUIRE_PG_DB_TPL(var, tpl)`: the ephemeral database is then cloned
    (`CREATE DATABASE … TEMPLATE`) with every migration already applied, instead of re-running
    the store's migration DDL per test — per-test migrations were the dominant, worst-scaling
    cost of the `[pg]` set on the contended Windows runners (2026-07-12 server-suite timeout).

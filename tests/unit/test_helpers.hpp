@@ -378,11 +378,12 @@ private:
 /// behaviour itself (pg_migration_runner, fail-closed ctors on broken
 /// schemas) — those need the empty database.
 ///
-/// Template databases are named with the same process salt as ephemeral
-/// ones (two suite processes on one shared instance never collide) and are
-/// dropped at process exit; an abnormal exit leaks them exactly like
-/// ephemeral databases, and they match the same `yuzu_test_*` sweep
-/// pattern.
+/// Template databases carry their own process-random salt (an independent
+/// generator, same collision-avoidance scheme as `unique_db_name` — two
+/// suite processes on one shared instance never collide) and are dropped
+/// at testRunEnded; an abnormal exit (SIGKILL, job-timeout kill) leaks
+/// them exactly like ephemeral databases, and they match the same
+/// `yuzu_test_*` sweep pattern.
 class PgTestTemplate {
 public:
     using Setup = void (*)(const std::string& dsn);
@@ -390,7 +391,9 @@ public:
     PgTestTemplate(std::string name, Setup setup) : name_(std::move(name)), setup_(setup) {}
 
     /// Build (once) and return the template database name; on failure
-    /// returns an empty string and sets `error`.
+    /// returns an empty string and sets `error`. A database that was
+    /// CREATEd before the failure stays registered (Entry::db_name) so
+    /// drop_all_built() still removes it — it just is not handed out.
     std::string ensure(const std::string& admin_dsn, std::string& error) {
         Registry& reg = registry();
         const std::lock_guard<std::mutex> lock(reg.mu);
@@ -400,7 +403,7 @@ public:
             it = reg.entries.emplace(name_, std::move(e)).first;
         }
         error = it->second.error;
-        return it->second.db_name;
+        return error.empty() ? it->second.db_name : std::string{};
     }
 
     /// Drop every built template database NOW. Called from the Catch2
@@ -455,7 +458,10 @@ private:
                        stderr);
             return;
         }
-        const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\"";
+        // FORCE for the same reason as PostgresTestDb's dtor: a connection a
+        // setup callback failed to scope-close must not make the drop fail
+        // and pile template databases onto the shared instance.
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
         if (!res.ok())
             std::fputs(PQerrorMessage(conn.get()), stderr);
@@ -483,6 +489,13 @@ private:
                 return e;
             }
         }
+        // Record the name NOW, not on full success: if rewrite_dbname or the
+        // setup callback fails below, the database physically exists and must
+        // stay registered so drop_all_built()/the dtor can still drop it —
+        // otherwise every failing CI process leaks one more permanent
+        // yuzu_test_tpl_* database on the shared instance (review finding on
+        // #2091; same reason PostgresTestDb assigns db_name_ before CREATE).
+        e.db_name = db_name;
         const std::string tpl_dsn = PostgresTestDb::rewrite_dbname(admin_dsn, db_name);
         if (tpl_dsn.empty()) {
             e.error = "could not parse YUZU_TEST_POSTGRES_DSN to rewrite dbname";
@@ -494,7 +507,6 @@ private:
             e.error = std::string("template setup threw: ") + ex.what();
             return e;
         }
-        e.db_name = db_name;
         return e;
     }
 
