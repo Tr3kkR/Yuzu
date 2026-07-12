@@ -719,11 +719,13 @@ commits:
   product/version, with severity/exploitability). It enumerates the fleet's
   exploitable attack surface, so it is treated as **more sensitive than the
   installed-software inventory it derives from** — a breach discloses what is
-  attackable, not merely what is installed. No end-user PII (machine-scope
-  source, ADR-0016 §8); device-attributability keeps the works-council
-  capability-to-monitor posture of its source data. It sits **outside the
-  server's audit perimeter** (NF-6), so the UCE host's own audit/compliance
-  controls govern it.
+  attackable, not merely what is installed. No direct username/SID
+  (machine-scope source, ADR-0016 §8), but device-attributable and therefore
+  **personal data under GDPR when the device is person-assigned** — hence the
+  subject-erasure (DSAR/Art. 17) path below; device-attributability keeps the
+  works-council capability-to-monitor posture of its source data. It sits
+  **outside the server's audit perimeter** (NF-6), so the UCE host's own
+  audit/compliance controls govern it.
 - **Retention default — open findings retained while current** (refreshed each
   sync cycle); **resolved/superseded findings 90 days** by default (mirrors the
   `recommendations.db` derived-store precedent in §3.5).
