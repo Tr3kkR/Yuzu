@@ -654,27 +654,49 @@ public:
             spdlog::info("SparkEngine: disabled by --spark-disable — not instantiated; "
                          "Guardian detection path = legacy IGuard (enforcing)");
         } else {
-            spark_engine_ = std::make_unique<SparkEngine>();
-            // Register the platform event-driven mechanisms. Each factory returns
-            // nullptr off its platform (File/Registry: Windows-only; Service:
-            // Windows-SCM + Linux-systemd), so an unsupported type is simply left
-            // unregistered — SparkEngine then rejects any future arm() of it. The set
-            // actually registered IS the agent's spark capability, surfaced to the
-            // fleet via the yuzu.spark_mechs heartbeat tag (see the heartbeat block).
-            const auto try_register = [&](SparkType type,
-                                         std::unique_ptr<ISparkMechanism> mech) {
-                if (!mech)
-                    return; // unsupported on this OS — leave the type unregistered
-                if (auto r = spark_engine_->register_mechanism(type, std::move(mech)); !r)
-                    spdlog::warn("SparkEngine: register {} mechanism failed: {}",
-                                 spark_type_token(type), r.error());
-            };
-            try_register(SparkType::File, make_file_mechanism());
-            try_register(SparkType::Registry, make_registry_mechanism());
-            try_register(SparkType::Service, make_service_mechanism());
-            spark_engine_->start();
-            spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
-                         "Guardian detection path = legacy IGuard (enforcing)");
+            // DEGRADE-TO-NO-SPARK on any boot exception. SparkEngine::start() (and a
+            // mechanism start()) spawns threads; thread creation throws
+            // std::system_error under EAGAIN / thread-or-handle exhaustion — most
+            // likely on exactly the overloaded endpoint where the agent must SURVIVE,
+            // not crash-loop. run() is not wrapped by a catch at its call site
+            // (main.cpp `agent->run()`), and this block runs before run()'s own inner
+            // try, so an escape here would std::terminate the process (gov UP-1).
+            try {
+                spark_engine_ = std::make_unique<SparkEngine>();
+                // Register the platform event-driven mechanisms. Each factory returns
+                // nullptr off its platform (File/Registry: Windows-only; Service:
+                // Windows-SCM + Linux-systemd), so an unsupported type is simply left
+                // unregistered — SparkEngine then rejects any future arm() of it. The
+                // set actually registered IS the agent's spark capability, surfaced to
+                // the fleet via the yuzu.spark_mechs heartbeat tag.
+                const auto try_register = [&](SparkType type,
+                                             std::unique_ptr<ISparkMechanism> mech) {
+                    if (!mech)
+                        return; // unsupported on this OS — leave the type unregistered
+                    if (auto r = spark_engine_->register_mechanism(type, std::move(mech)); !r)
+                        spdlog::warn("SparkEngine: register {} mechanism failed: {}",
+                                     spark_type_token(type), r.error());
+                };
+                try_register(SparkType::File, make_file_mechanism());
+                try_register(SparkType::Registry, make_registry_mechanism());
+                try_register(SparkType::Service, make_service_mechanism());
+                spark_engine_->start();
+                spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
+                             "Guardian detection path = legacy IGuard (enforcing)");
+            } catch (const std::exception& e) {
+                // ~SparkEngine (via reset) joins whatever already started; the
+                // heartbeat gate (spark_engine_ != nullptr) then ships no spark tags.
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed ({}) — continuing WITHOUT "
+                             "spark; legacy IGuard detection is unaffected",
+                             e.what());
+            } catch (...) {
+                // Belt-and-braces: NOTHING may terminate the agent for an observe-only
+                // best-effort subsystem, even a non-std throw (gov re-review NICE).
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed (unknown exception) — "
+                             "continuing WITHOUT spark; legacy IGuard detection is unaffected");
+            }
         }
 
         // Record start time for uptime calculation

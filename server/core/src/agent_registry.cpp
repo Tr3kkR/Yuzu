@@ -1,6 +1,7 @@
 #include "agent_registry.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <string>
@@ -1379,6 +1380,18 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         spark_queued_dropped_os, spark_consumer_errors_os;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> spark_watch_rejected_om,
         spark_quarantined_om, spark_slow_op_om;
+    // Per-{mechanism,metric} spark tag keys are loop-invariant across agents AND
+    // cycles — build the 3×3 once, not per agent per 15s sweep (gov perf-S1). Indexed
+    // [mechanism][metric] in kSparkMechTokens / kSparkMetricTokens order. Function-
+    // static: recompute_metrics is single-threaded, and static-local init is
+    // thread-safe regardless.
+    static const std::array<std::array<std::string, 3>, 3> spark_mech_metric_keys = [] {
+        std::array<std::array<std::string, 3>, 3> keys;
+        for (std::size_t mi = 0; mi < 3; ++mi)
+            for (std::size_t ki = 0; ki < 3; ++ki)
+                keys[mi][ki] = spark_type_metric_tag(kSparkMechTokens[mi], kSparkMetricTokens[ki]);
+        return keys;
+    }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
     // label lets a malicious/buggy agent spray unbounded {os=...} series (a
     // Prometheus cardinality DoS). Allowlist it to the values a real agent emits
@@ -1514,14 +1527,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             if (auto v = parse_spark_count(get(kSparkTagConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
             // Per-mechanism-type health counters (the three that back the alerts).
-            for (const char* mech : kSparkMechTokens) {
-                if (auto v =
-                        parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricWatchRejected))))
+            // Keys are the precomputed loop-invariants (perf-S1); index 0/1/2 =
+            // watch_rejected / quarantined / slow_op (kSparkMetricTokens order).
+            for (std::size_t mi = 0; mi < 3; ++mi) {
+                const char* mech = kSparkMechTokens[mi];
+                if (auto v = parse_spark_count(get(spark_mech_metric_keys[mi][0])))
                     spark_watch_rejected_om[net_os][mech] += *v;
-                if (auto v =
-                        parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricQuarantined))))
+                if (auto v = parse_spark_count(get(spark_mech_metric_keys[mi][1])))
                     spark_quarantined_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricSlowOp))))
+                if (auto v = parse_spark_count(get(spark_mech_metric_keys[mi][2])))
                     spark_slow_op_om[net_os][mech] += *v;
             }
         }

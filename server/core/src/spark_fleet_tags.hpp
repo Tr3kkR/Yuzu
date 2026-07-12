@@ -25,6 +25,7 @@
 /// which the caller MUST treat as "did not report", never 0.
 
 #include <charconv>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -50,6 +51,10 @@ inline constexpr const char* kSparkTagPrefix = "yuzu.spark_";
 
 // Closed set of mechanism tokens the fleet rollup buckets by (the `mechanism`
 // gauge label). Windows: file + registry + service; Linux: service; macOS: none.
+// INVARIANT: this set must list every SparkType that becomes a REGISTERED mechanism
+// (spark_type_token() output). The agent emits per-type keys for every registered
+// type; a new registered mechanism whose token is missing here is silently dropped
+// server-side (never bucketed) — extend this set in lockstep. (gov ca-N1)
 inline constexpr const char* kSparkMechFile = "file";
 inline constexpr const char* kSparkMechRegistry = "registry";
 inline constexpr const char* kSparkMechService = "service";
@@ -80,8 +85,12 @@ inline std::string spark_type_metric_tag(std::string_view mech_token, std::strin
 }
 
 /// Parse a `spark_mechs` CSV (the agent's registered mechanism tokens) into the
-/// RECOGNISED closed-set tokens, in encounter order, silently dropping any token
-/// not in kSparkMechTokens (forged / future-value safe). Empty input -> empty.
+/// RECOGNISED closed-set tokens, DEDUPED, in encounter order, silently dropping any
+/// token not in kSparkMechTokens (forged / future-value safe). Empty input -> empty.
+/// De-dup matters because the fleet capability gauge counts one agent once per
+/// mechanism: a forged/buggy repeated CSV ("service,service,…") must not inflate it
+/// (gov sec-L1 / UP-3). An honest agent never repeats — it composes from a map's
+/// unique keys — so the dedup is defence-in-depth, bounded by heartbeat tag size.
 inline std::vector<std::string> spark_mechs_from_csv(std::string_view csv) {
     std::vector<std::string> out;
     for (std::size_t start = 0; start <= csv.size();) {
@@ -90,7 +99,14 @@ inline std::vector<std::string> spark_mechs_from_csv(std::string_view csv) {
             start, comma == std::string_view::npos ? std::string_view::npos : comma - start);
         for (const char* known : kSparkMechTokens)
             if (tok == known) {
-                out.emplace_back(known);
+                bool already = false;
+                for (const auto& seen : out)
+                    if (seen == known) {
+                        already = true;
+                        break;
+                    }
+                if (!already)
+                    out.emplace_back(known);
                 break;
             }
         if (comma == std::string_view::npos)
