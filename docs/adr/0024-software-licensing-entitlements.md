@@ -30,11 +30,11 @@ under ADR-1005").
   deterministic `product_normalize` matching) and the raw `SoftwareLicensingStore`
   (per-agent discovered rows).
 - **Read surface + RBAC** (D9/D10) — the `/sle` **Licences** view, the raw `/api/v1/sle/*`
-  discovery reads (incl. the ancestor-aware `/sle/agents/{id}` drill), and the new
-  **`SoftwareLicensing`** securable.
+  discovery reads (incl. the ancestor-aware `/sle/agents/{id}` drill) **and their MCP twin
+  `query_software_licenses`**, and the new **`SoftwareLicensing`** securable.
 - **Privacy + erasure** (D11) — pseudonymous-by-default `user_ref` (per-agent keyed-HMAC)
-  and the **agent-decommission erasure cascade** (first production wiring of the
-  five-store fan-out).
+  and the **agent-decommission erasure cascade** (first production wiring of the five
+  per-agent-store fan-out; the shared `ProductRegistryStore` is excluded — see D11).
 
 **Deferred to the SAM UCE module — the interpretation half:**
 - **Compliance evaluator** (D7/D8) — effective-state/lapse derivation, seat math, posture
@@ -43,7 +43,7 @@ under ADR-1005").
 - **M365 Graph connector** (D13) — tenant SKU sync + its SecretCodec secret storage (so
   **§27 carries no SecretCodec wiring**).
 - **Usage metering & reclamation** (D15), and the **Compliance / Entitlements /
-  Reclamation** SLE sub-views + compliance MCP tools (D9).
+  Reclamation** SLE sub-views + the compliance MCP tool `get_license_compliance_summary` (D9).
 
 **Maintainer sign-off required** (Ratification): (1) the Decision-11 per-user probing
 deviation from ADR-0016's machine-scope/no-PII posture; (2) the ADR-1005 placement
@@ -158,7 +158,7 @@ rather than requesting an in-server exception:
 | Raw discovered-licence rows | D4 | **core** | An inventory store of raw estate facts. |
 | `ProductRegistryStore` + `product_normalize` | D4/D6 | **core** | Deterministic identity resolution over pure fleet-internal aggregation (a generic engine, no external data) — the `software_catalog`-rollup tiebreaker. |
 | Ingest seam | D5 | **core** | Untrusted-input transport plumbing. |
-| Raw `/sle/agents/{id}` drill + `SoftwareLicensing` securable | D9/D10 | **core** | A raw-fact read, like `/devices`; already ancestor-aware scoped. |
+| Raw `/sle/agents/{id}` drill + discovery reads + their MCP twin `query_software_licenses` + `SoftwareLicensing` securable | D9/D10 | **core** | Raw-fact reads (like `/devices`), ancestor-aware scoped; the REST+MCP twin satisfies ADR-1005 D1. |
 | Agent-decommission erasure cascade | D11 | **core** | Platform-wide data-lifecycle mechanism (all five per-agent stores). |
 | Per-user `user_ref` discovery | D11 | **core** (collection) | Estate collection; carries behavioural-PII data-processor obligations (see re-home note). |
 | Compliance evaluator (effective state, lapse, seat math, posture rollups) | D7 | **UCE** | Semantics baked into code — interpret facts for a purpose. |
@@ -167,7 +167,7 @@ rather than requesting an in-server exception:
 | M365 Graph connector + its SecretCodec wiring | D13 | **UCE** | The canonical "join fleet data with external domain data." |
 | CSV entitlement ingest | D14 | **UCE** | Entitlement-plane ingestion. |
 | `SoftwareUsageStore` reclamation verdicts | D15 | **UCE** | Usage joined with entitlement data for a reclamation purpose. |
-| Compliance / Entitlements / Reclamation SLE sub-views + compliance MCP tools | D9 | **UCE** | Domain use-case (compliance) product surfaces. |
+| Compliance / Entitlements / Reclamation SLE sub-views + the `get_license_compliance_summary` MCP tool | D9 | **UCE** | Domain use-case (compliance) product surfaces. |
 
 **Consequences of the re-scope for the decisions below.** Decision 4 ships **two**
 born-on-PG stores in-server (`ProductRegistryStore`, the raw `SoftwareLicensingStore`),
@@ -359,10 +359,14 @@ Decision numbers are stable, since other documents cite them.
    compliance/entitlement/reclamation surfaces are the UCE host's. [split]** In-server
    core: the `/sle` **Licences (discovery) view** on the shared guardian shell (cloning
    the `/inventory` provider model — nullopt → degrade banner, never an empty table;
-   tables and KPI tiles, no charts in v1), the raw `/api/v1/sle/*` **discovery** reads,
-   and the new **`SoftwareLicensing` securable**. Per Placement under ADR-1005, the
-   **Compliance, Entitlements, and Reclamation** sub-views and the **compliance MCP
-   tools** are the SAM UCE host's UI and read API — not built in-server. The software
+   tables and KPI tiles, no charts in v1), the raw `/api/v1/sle/*` **discovery** reads
+   **and their MCP twin `query_software_licenses`** (`SoftwareLicensing:Read`,
+   management-group scoped like the raw drill — this is the both-REST-and-MCP twin
+   ADR-1005 Decision 1 requires for the in-server discovery capability, shipped from day
+   one, not deferred), and the new **`SoftwareLicensing` securable**. Per Placement under
+   ADR-1005, the **Compliance, Entitlements, and Reclamation** sub-views and the
+   **compliance MCP tool `get_license_compliance_summary`** are the SAM UCE host's UI and
+   read API — not built in-server. The software
    catalog stays on `/inventory`, cross-linked. RBAC grants on the `SoftwareLicensing`
    securable follow the established per-role shape, stated so nothing is left to
    inference: **Viewer and PlatformEngineer Read; Operator Read + Write; ITServiceOwner
@@ -414,10 +418,14 @@ Decision numbers are stable, since other documents cite them.
     GDPR posture stated plainly: a hashed `user_ref` is still personal data
     (Recital 26); erasure is knob-flip to `omit` (full-replaced within one 24 h cycle
     for syncing agents; offline agents purge on reconnect or via decommission) plus the
-    **agent-decommission cascade — the per-store `delete_agent`
-    methods exist today with no production caller, so this capability builds the
-    decommission fan-out and registers its stores with it**; there is **no row-level
-    erasure API**, a stated gap. The effective mode is **centrally verifiable**: the
+    **agent-decommission cascade** — the per-store `delete_agent` methods exist today with
+    no production caller, so this capability builds the decommission fan-out and registers
+    its stores with it. The fan-out covers the **five per-agent stores** (`InventoryStore`,
+    `SoftwareInventoryStore`, `AppPerfDailyStore`, `DeviceInventoryStore`,
+    `SoftwareLicensingStore`) and removes **only agent-scoped rows/links**;
+    `ProductRegistryStore` holds fleet-wide canonical identities shared across agents and
+    is **never** in the cascade (decommission drops an agent's match links, never a shared
+    canonical product). There is **no row-level erasure API**, a stated gap. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
     flapping surface diagnostics never touch the blob and are fetched live via the
@@ -631,8 +639,10 @@ into the v1 slices.
 
 Sequencing signal (not a commitment): the metric ladder and use rights are what
 unblock enterprise datacenter estates; closed-loop reclamation and Guardian
-enforcement are where Yuzu beats rather than meets. The agentic surface needs no
-direction entry — Decision 9 ships MCP parity from day one, which the incumbents are
+enforcement are where Yuzu beats rather than meets. The agentic surface is honoured
+from day one — the in-server discovery reads ship with their MCP twin
+(`query_software_licenses`, Decision 9) per ADR-1005 Decision 1, and the compliance MCP
+(`get_license_compliance_summary`) lands with the module — parity the incumbents are
 still retrofitting.
 
 ## Consequences

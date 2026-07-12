@@ -1065,7 +1065,7 @@ Not implemented. Canonical software-identity registry (vendor, title, version, e
 
 ### 27.2 Software Usage Tracking :x: `T2`
 
-Not implemented. Agent-side application usage metering (launch tracking, run time, last-used timestamp). Categorization: Used, Rarely Used, Unused, Unreported.
+Not implemented. Agent-side application usage metering — **opt-in** (`--usage-sync-enable`, default off) and **machine-scope** (user dimension dropped on-device), read locally from the agent's TAR warehouse (ADR-0024 Decision 15), not on-by-default launch tracking. Categorization (Used, Rarely, Unused, Unreported) is policy-computed server-side at read time; the reclamation verdicts derived from it are SAM use-case-engine-module work (ADR-0024 "Placement under ADR-1005").
 
 ### 27.3 License Entitlements & Compliance :x: `T2`
 
@@ -1077,7 +1077,7 @@ Not implemented. Server-side tags on product registry entries for categorization
 
 ### 27.5 License Compliance Dashboard :x: `T2`
 
-Not implemented. Per-product compliance summary with drill-down to device-level detail. Reclamation candidate identification from usage data.
+Not implemented, and **re-scoped** by ADR-0024's "Placement under ADR-1005": the per-product compliance summary, the compliance dashboard, and reclamation-candidate identification are **SAM use-case-engine (UCE) module** surfaces, not built in-server. §27 v1 ships the in-server discovery reads (the raw `/api/v1/sle/*` + Licences view + the `query_software_licenses` MCP twin); the UCE module reads them over the versioned API to derive compliance and reclamation.
 
 ---
 

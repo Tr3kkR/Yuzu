@@ -278,7 +278,11 @@ Each connector is a self-contained class implementing the Connector interface:
 > Entitlements", capability §27 — renamed by the same ADR). The sketch below is stale
 > where it conflicts (SQLite `CatalogStore` → born-on-Postgres `ProductRegistryStore`;
 > manual-only entitlements → five-source entitlement plane; `/api/v1/catalog/*` →
-> `/api/v1/sle/*`; usage metering becomes opt-in and machine-scope).
+> `/api/v1/sle/*`; usage **collection** becomes opt-in (`--usage-sync-enable`, default
+> off) and machine-scope, not on-by-default launch tracking). Per ADR-0024's "Placement
+> under ADR-1005", compliance evaluation, the entitlement plane, and usage **reclamation
+> verdicts/categories** are re-scoped to the SAM use-case-engine module (Decision 15);
+> §27 v1 builds only the in-server discovery mechanism.
 
 **Duration estimate: 1 sprint**
 
