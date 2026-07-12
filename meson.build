@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.13.0',
+  version: '0.13.1-dev',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
