@@ -11,6 +11,7 @@
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
 #include "network_perf_rules.hpp"
+#include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
 #include "tag_store.hpp"
@@ -1318,6 +1319,18 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // leaves a stale {os=...} series.
     metrics.clear_gauge_family("yuzu_fleet_net_reporting");
     metrics.clear_gauge_family("yuzu_fleet_net_retrans_reporting");
+    // SparkEngine fleet telemetry (ADR-0021 rung 1) — same absent-not-zero rule:
+    // an OS/mechanism that stops reporting goes ABSENT, never a fabricated stale 0
+    // (a flatline-0 on a should-stay-0 counter like quarantined reads as "healthy").
+    metrics.clear_gauge_family("yuzu_fleet_spark_reporting");
+    metrics.clear_gauge_family("yuzu_fleet_spark_mechanisms");
+    metrics.clear_gauge_family("yuzu_fleet_spark_armed_faulted");
+    metrics.clear_gauge_family("yuzu_fleet_spark_watch_faults");
+    metrics.clear_gauge_family("yuzu_fleet_spark_queued_dropped");
+    metrics.clear_gauge_family("yuzu_fleet_spark_consumer_errors");
+    metrics.clear_gauge_family("yuzu_fleet_spark_watch_rejected");
+    metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
+    metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1354,6 +1367,18 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // self-reported tag, so a spoofed os="linux" is the same accepted risk as any
     // heartbeat-sourced gauge — the trust boundary is enrollment, not this tag.
     auto retrans_gauge_eligible = [](const std::string& os) { return os == "linux"; };
+    // SparkEngine fleet telemetry (ADR-0021 rung 1) — per-OS, and per-{OS,mechanism}
+    // for the type-scoped counters. `spark_reporting_os` counts agents running the
+    // engine (denominator); `spark_mech_os[os][mechanism]` counts agents whose
+    // capability includes that mechanism (from the spark_mechs CSV). The counter
+    // maps accumulate the fleet SUM of each cumulative agent counter (a snapshot; an
+    // absent {os}/{os,mechanism} series means no agent reported it — 0 by absence).
+    std::unordered_map<std::string, int> spark_reporting_os;
+    std::unordered_map<std::string, std::unordered_map<std::string, int>> spark_mech_os;
+    std::unordered_map<std::string, double> spark_armed_faulted_os, spark_watch_faults_os,
+        spark_queued_dropped_os, spark_consumer_errors_os;
+    std::unordered_map<std::string, std::unordered_map<std::string, double>> spark_watch_rejected_om,
+        spark_quarantined_om, spark_slow_op_om;
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
     // label lets a malicious/buggy agent spray unbounded {os=...} series (a
     // Prometheus cardinality DoS). Allowlist it to the values a real agent emits
@@ -1465,6 +1490,41 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                     ++net_degraded_os[net_os];
             }
         }
+
+        // SparkEngine fleet telemetry (ADR-0021 rung 1). Present only when the agent
+        // runs the engine (--spark-disable omits ALL spark tags). Bucketed by the
+        // same normalized `net_os` (never a cross-OS blend). spark_running is the
+        // reporting denominator; spark_mechs (CSV of registered mechanism types)
+        // gives the per-{os,mechanism} capability; the counters are sparse (absent ==
+        // 0, never a fabricated 0).
+        if (get(kSparkTagRunning) == "1") {
+            ++spark_reporting_os[net_os];
+            // Capability: split the mechs CSV, bucket each recognised token so the
+            // fleet sees which mechanisms this OS supports (and, by absence of a
+            // {os,mechanism} series, which it does not).
+            for (const auto& tok : spark_mechs_from_csv(get(kSparkTagMechs)))
+                ++spark_mech_os[net_os][tok];
+            // Engine-level cumulative counters (absent == 0).
+            if (auto v = parse_spark_count(get(kSparkTagArmedFaulted)))
+                spark_armed_faulted_os[net_os] += *v;
+            if (auto v = parse_spark_count(get(kSparkTagWatchFaults)))
+                spark_watch_faults_os[net_os] += *v;
+            if (auto v = parse_spark_count(get(kSparkTagQueuedDropped)))
+                spark_queued_dropped_os[net_os] += *v;
+            if (auto v = parse_spark_count(get(kSparkTagConsumerErrors)))
+                spark_consumer_errors_os[net_os] += *v;
+            // Per-mechanism-type health counters (the three that back the alerts).
+            for (const char* mech : kSparkMechTokens) {
+                if (auto v =
+                        parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricWatchRejected))))
+                    spark_watch_rejected_om[net_os][mech] += *v;
+                if (auto v =
+                        parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricQuarantined))))
+                    spark_quarantined_om[net_os][mech] += *v;
+                if (auto v = parse_spark_count(get(spark_type_metric_tag(mech, kSparkMetricSlowOp))))
+                    spark_slow_op_om[net_os][mech] += *v;
+            }
+        }
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1545,6 +1605,33 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         set_stats_os("yuzu_fleet_net_retrans_pct", os, vals);
     for (auto& [os, vals] : net_tput_os)
         set_stats_os("yuzu_fleet_net_throughput_bps", os, vals);
+
+    // SparkEngine fleet telemetry (ADR-0021 rung 1). Only non-empty maps emit, so an
+    // OS/mechanism that reported nothing this cycle stays ABSENT (never a stale 0).
+    for (auto& [os, n] : spark_reporting_os)
+        metrics.gauge("yuzu_fleet_spark_reporting", {{"os", os}}).set(static_cast<double>(n));
+    for (auto& [os, mm] : spark_mech_os)
+        for (auto& [mech, n] : mm)
+            metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", os}, {"mechanism", mech}})
+                .set(static_cast<double>(n));
+    for (auto& [os, v] : spark_armed_faulted_os)
+        metrics.gauge("yuzu_fleet_spark_armed_faulted", {{"os", os}}).set(v);
+    for (auto& [os, v] : spark_watch_faults_os)
+        metrics.gauge("yuzu_fleet_spark_watch_faults", {{"os", os}}).set(v);
+    for (auto& [os, v] : spark_queued_dropped_os)
+        metrics.gauge("yuzu_fleet_spark_queued_dropped", {{"os", os}}).set(v);
+    for (auto& [os, v] : spark_consumer_errors_os)
+        metrics.gauge("yuzu_fleet_spark_consumer_errors", {{"os", os}}).set(v);
+    auto set_mech_gauge = [&](const char* family,
+                              std::unordered_map<std::string,
+                                                 std::unordered_map<std::string, double>>& m) {
+        for (auto& [os, mm] : m)
+            for (auto& [mech, v] : mm)
+                metrics.gauge(family, {{"os", os}, {"mechanism", mech}}).set(v);
+    };
+    set_mech_gauge("yuzu_fleet_spark_watch_rejected", spark_watch_rejected_om);
+    set_mech_gauge("yuzu_fleet_spark_quarantined", spark_quarantined_om);
+    set_mech_gauge("yuzu_fleet_spark_slow_op", spark_slow_op_om);
 }
 
 } // namespace yuzu::server::detail

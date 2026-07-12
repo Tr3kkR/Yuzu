@@ -638,3 +638,88 @@ groups:
       #       inventory source in over two daily cycles. Check for a fleet-wide agent
       #       outage, a broken/disabled sync source, or a network partition.
       #     runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+
+  - name: yuzu-fleet-spark
+    # SparkEngine detection-engine health (ADR-0021 Stage-2). At rung 1 the engine
+    # is instantiated OBSERVE-ONLY with no consumer, so every counter below is 0 and
+    # these rules cannot fire until rung 2 arms rules against it — they ship now so
+    # detection cutover is covered from its first armed watch. The yuzu_fleet_spark_*
+    # counter gauges are a fleet SUM of each agent's cumulative counter, so we alert
+    # on `> 0` (an increase()/rate() form needs a counter-typed metric — a rung-2
+    # refinement). Every rule PRESERVES the {os[,mechanism]} labels: File/Registry are
+    # Windows-only and Service is Windows+Linux, so a cross-OS aggregate is meaningless
+    # — NEVER `sum without(os)` these.
+    rules:
+      - alert: YuzuSparkMechanismQuarantined
+        expr: |
+          yuzu_fleet_spark_quarantined > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spark {{ $labels.mechanism }} mechanism quarantined on {{ $labels.os }}"
+          description: >-
+            A SparkEngine mechanism reported a quarantine — a structural leak that
+            should stay 0. Detection for that mechanism type is compromised on the
+            affected OS. Inspect the agent `warn` logs for the quarantine reason; this
+            is not expected in normal operation.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-mechanism-quarantined"
+
+      - alert: YuzuSparkWatchRejected
+        expr: |
+          yuzu_fleet_spark_watch_rejected > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spark {{ $labels.mechanism }} watch rejections on {{ $labels.os }}"
+          description: >-
+            A SparkEngine mechanism is rejecting watch arms (watch-cap reached) — a
+            denial-of-detection: rules that should be enforced could not arm. Check the
+            per-type watch cap and the volume of rules of that mechanism type on the
+            affected OS.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-watch-rejected"
+
+      - alert: YuzuSparkArmedFaulted
+        expr: |
+          yuzu_fleet_spark_armed_faulted > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spark armed watches went deaf on {{ $labels.os }}"
+          description: >-
+            One or more armed spark watches reported FAULTED (armed but no longer
+            watching) — detection is silently down for those watches. Unlike the other
+            spark counters this is a live gauge (recovers when the watch recovers).
+            Correlate with agent restarts / OS event-source ACL changes.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-armed-faulted"
+
+      - alert: YuzuSparkSlowOp
+        expr: |
+          yuzu_fleet_spark_slow_op > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spark {{ $labels.mechanism }} slow watch/unwatch ops on {{ $labels.os }}"
+          description: >-
+            A SparkEngine mechanism is recording slow watch/unwatch operations — a
+            stalled or contended watcher. Sustained slow ops can delay detection.
+            Inspect the mechanism's underlying OS facility (IOCP / TP_WAIT pool / sd-bus
+            / SCM) on the affected OS.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+
+      - alert: YuzuSparkQueuedDropped
+        expr: |
+          yuzu_fleet_spark_queued_dropped > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spark queued events dropped on {{ $labels.os }}"
+          description: >-
+            The SparkEngine bounded consumer queue dropped events (overflow or
+            shutdown). On the observe lane this loses detections; once the enforce lane
+            lands (rung 3) a drop is a silent compliance failure. Check consumer
+            throughput and the queue cap.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-queued-dropped"

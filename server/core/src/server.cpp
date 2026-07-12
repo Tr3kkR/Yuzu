@@ -594,6 +594,46 @@ public:
         metrics_.describe("yuzu_fleet_net_throughput_bps",
                           "Fleet device network throughput in bytes/s, by {stat,os}: avg / p50 / p90 "
                           "/ max", "gauge");
+        // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 — OBSERVE-ONLY). All
+        // os-labelled (per-OS, never a cross-OS blend — File/Registry are Windows-only,
+        // Service is Windows+Linux, macOS has none). ABSENT means no reporting agent of
+        // that OS/mechanism this cycle — never read absence as 0-is-healthy. At rung 1
+        // (no consumer armed) every counter is 0, so only reporting + mechanisms carry
+        // signal; the counters go live at rung 2. The counter gauges are a fleet SUM of
+        // each cumulative agent counter, so alert on `> 0` (a rate needs a counter-typed
+        // metric — a rung-2 refinement).
+        metrics_.describe("yuzu_fleet_spark_reporting",
+                          "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
+                          "running (spark_running=1) — the denominator for all spark telemetry; "
+                          "absent under --spark-disable", "gauge");
+        metrics_.describe("yuzu_fleet_spark_mechanisms",
+                          "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
+                          "event-driven mechanism (file / registry / service). An OS with agents "
+                          "reporting but no {mechanism} series does not support it (e.g. no file "
+                          "on linux)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_armed_faulted",
+                          "Fleet sum (per `os`) of armed spark watches a mechanism reported deaf "
+                          "(a live gauge, not cumulative). > 0 means detection is silently down "
+                          "for that many watches", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_faults",
+                          "Fleet sum (per `os`) of cumulative post-arm watch-fault edges "
+                          "(watch_faults_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_queued_dropped",
+                          "Fleet sum (per `os`) of cumulative queued events dropped (bounded-queue "
+                          "overflow + shutdown). On the enforce lane (rung 3) a drop is a silent "
+                          "compliance failure", "gauge");
+        metrics_.describe("yuzu_fleet_spark_consumer_errors",
+                          "Fleet sum (per `os`) of cumulative queued handlers that threw "
+                          "(consumer_errors_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_rejected",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "a rule that could not arm (denial-of-detection)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_quarantined",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "a structural leak that should stay 0; any value is page-worthy", "gauge");
+        metrics_.describe("yuzu_fleet_spark_slow_op",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
+                          "(a stalled watcher)", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
