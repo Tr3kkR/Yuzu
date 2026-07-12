@@ -208,6 +208,13 @@ int main(int argc, char* argv[]) {
                  "server-side runtime toggle.")
         ->envname("YUZU_AGENT_INVENTORY_DISABLE");
 
+    app.add_flag("--spark-disable", cfg.spark_disable,
+                 "Disable the SparkEngine detection engine (ADR-0021 Stage-2): do not "
+                 "instantiate it and emit no spark telemetry. Deploy-time opt-out; the "
+                 "enforcing legacy Guardian path is unaffected. Not a server-side runtime "
+                 "toggle.")
+        ->envname("YUZU_AGENT_SPARK_DISABLE");
+
     // Windows service management
     bool install_service = false;
     bool remove_service = false;

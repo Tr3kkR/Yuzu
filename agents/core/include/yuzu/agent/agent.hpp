@@ -65,6 +65,13 @@ struct Config {
                                    // installed-software enumeration may be works-council
                                    // co-determination-relevant — this is the control for
                                    // jurisdictions/agreements that require it off.
+
+    // SparkEngine (ADR-0021 Stage-2, rung 1) — next-gen event-driven detection engine,
+    // instantiated observe-only alongside the enforcing legacy IGuard path.
+    bool spark_disable{false}; // --spark-disable / YUZU_AGENT_SPARK_DISABLE: boot-time
+                               // deploy opt-out; when set, SparkEngine is never
+                               // instantiated and no spark_* telemetry is emitted. The
+                               // enforcing legacy Guardian path is unaffected.
 };
 
 /**

@@ -10,6 +10,7 @@
  */
 
 #include "spark_engine.hpp"
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags (rung-1 tag composition)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,9 +18,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -638,4 +641,101 @@ TEST_CASE("SparkEngine: stop is prompt and idempotent; engine is single-shot",
     CHECK_FALSE(engine.is_running());
     CHECK_FALSE(engine.arm(*consumer, interval_spec(30)).has_value());
     CHECK_FALSE(engine.register_consumer("post-stop", got.handler()).has_value());
+}
+
+namespace {
+/// Fake event-driven mechanism reporting a FIXED SparkMechanismStats — verifies
+/// the per-type breakdown (stats_by_type) and the engine-level mech_* sums
+/// (#2011 rung 1) without needing a platform mechanism or any real watch.
+struct StatStubMechanism : ISparkMechanism {
+    SparkMechanismStats fixed;
+    explicit StatStubMechanism(SparkMechanismStats s) : fixed(s) {}
+    void start(SparkEmitFn, SparkFaultFn) override {}
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {}
+    [[nodiscard]] SparkMechanismStats stats() const override { return fixed; }
+};
+} // namespace
+
+TEST_CASE("stats_by_type preserves the per-mechanism-type breakdown", "[spark][stats]") {
+    SparkEngine engine;
+
+    SparkMechanismStats file_stats;
+    file_stats.retiring = 3;
+    file_stats.retiring_cap = 256;
+    file_stats.watch_rejected_total = 2;
+    file_stats.quarantined_total = 1;
+    file_stats.slow_op_total = 4;
+    SparkMechanismStats svc_stats;
+    svc_stats.watch_rejected_total = 5;
+    svc_stats.slow_op_total = 7;
+
+    REQUIRE(engine.register_mechanism(SparkType::File,
+                                      std::make_unique<StatStubMechanism>(file_stats))
+                .has_value());
+    REQUIRE(engine.register_mechanism(SparkType::Service,
+                                      std::make_unique<StatStubMechanism>(svc_stats))
+                .has_value());
+
+    // Per-type: keys preserved, only registered types appear, values not blended.
+    const auto by_type = engine.stats_by_type();
+    REQUIRE(by_type.size() == 2);
+    REQUIRE(by_type.contains(SparkType::File));
+    REQUIRE(by_type.contains(SparkType::Service));
+    CHECK(by_type.at(SparkType::File).watch_rejected_total == 2);
+    CHECK(by_type.at(SparkType::File).retiring_cap == 256);
+    CHECK(by_type.at(SparkType::Service).watch_rejected_total == 5);
+    CHECK(by_type.at(SparkType::Service).slow_op_total == 7);
+
+    // Engine-level sum folds them together, including the new mech_retiring_cap.
+    const auto s = engine.stats();
+    CHECK(s.mech_watch_rejected_total == 7); // 2 + 5
+    CHECK(s.mech_quarantined_total == 1);    // 1 + 0
+    CHECK(s.mech_slow_op_total == 11);       // 4 + 7
+    CHECK(s.mech_retiring == 3);             // 3 + 0
+    CHECK(s.mech_retiring_cap == 256);       // 256 + 0
+}
+
+TEST_CASE("emit_spark_heartbeat_tags: always-present keys + sparse counters", "[spark][stats]") {
+    std::map<std::string, std::string> tags;
+
+    SECTION("quiescent engine (rung-1 steady state) ships only the capability keys") {
+        SparkEngineStats ss;                          // all zero
+        std::map<SparkType, SparkMechanismStats> by_type;
+        by_type[SparkType::File] = {};
+        by_type[SparkType::Service] = {};
+        emit_spark_heartbeat_tags(tags, ss, by_type);
+
+        CHECK(tags.at("yuzu.spark_running") == "1");
+        CHECK(tags.at("yuzu.spark_mechs") == "file,service"); // map order: File(3) < Service(4)
+        // No counter tags when every counter is 0 (sparse).
+        CHECK(tags.size() == 2);
+    }
+
+    SECTION("non-zero counters emit; zero counters stay absent") {
+        SparkEngineStats ss;
+        ss.armed_faulted = 2;
+        ss.watch_faults_total = 9;
+        // queued_dropped_total and consumer_errors_total stay 0 -> absent.
+        std::map<SparkType, SparkMechanismStats> by_type;
+        SparkMechanismStats file_stats;
+        file_stats.watch_rejected_total = 4;
+        file_stats.slow_op_total = 1;
+        // quarantined_total 0 -> absent.
+        by_type[SparkType::File] = file_stats;
+        emit_spark_heartbeat_tags(tags, ss, by_type);
+
+        CHECK(tags.at("yuzu.spark_running") == "1");
+        CHECK(tags.at("yuzu.spark_mechs") == "file");
+        CHECK(tags.at("yuzu.spark_armed_faulted") == "2");
+        CHECK(tags.at("yuzu.spark_watch_faults") == "9");
+        CHECK_FALSE(tags.contains("yuzu.spark_queued_dropped"));
+        CHECK_FALSE(tags.contains("yuzu.spark_consumer_errors"));
+        CHECK(tags.at("yuzu.spark_file_watch_rejected") == "4");
+        CHECK(tags.at("yuzu.spark_file_slow_op") == "1");
+        CHECK_FALSE(tags.contains("yuzu.spark_file_quarantined"));
+    }
 }

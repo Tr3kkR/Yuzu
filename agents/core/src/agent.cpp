@@ -43,6 +43,9 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
+#include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
 
 #ifdef _WIN32
@@ -633,6 +636,46 @@ public:
         // not just the initial arm (UP-1).
         metrics_.gauge("yuzu_agent_dex_observer_armed")
             .set(dex_health_->load(std::memory_order_relaxed) ? 1.0 : 0.0);
+
+        // 1c-ter. SparkEngine (ADR-0021 Stage-2, rung 1 — INSTANTIATE + OBSERVE).
+        // The next-generation event-driven detection engine is stood up here
+        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
+        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
+        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
+        // up now proves the engine runs and reports at rest, so its resource +
+        // observability envelope can be measured before it carries any load.
+        //
+        // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
+        // when set, SparkEngine is never instantiated and no spark telemetry ships.
+        // The flag selects exactly one detection path at instantiation, establishing
+        // the "old and new never both drive enforce" property the rung-2/3 cutover
+        // leans on (moot at rung 1 — spark has no consumer — but pinned here).
+        if (cfg_.spark_disable) {
+            spdlog::info("SparkEngine: disabled by --spark-disable — not instantiated; "
+                         "Guardian detection path = legacy IGuard (enforcing)");
+        } else {
+            spark_engine_ = std::make_unique<SparkEngine>();
+            // Register the platform event-driven mechanisms. Each factory returns
+            // nullptr off its platform (File/Registry: Windows-only; Service:
+            // Windows-SCM + Linux-systemd), so an unsupported type is simply left
+            // unregistered — SparkEngine then rejects any future arm() of it. The set
+            // actually registered IS the agent's spark capability, surfaced to the
+            // fleet via the yuzu.spark_mechs heartbeat tag (see the heartbeat block).
+            const auto try_register = [&](SparkType type,
+                                         std::unique_ptr<ISparkMechanism> mech) {
+                if (!mech)
+                    return; // unsupported on this OS — leave the type unregistered
+                if (auto r = spark_engine_->register_mechanism(type, std::move(mech)); !r)
+                    spdlog::warn("SparkEngine: register {} mechanism failed: {}",
+                                 spark_type_token(type), r.error());
+            };
+            try_register(SparkType::File, make_file_mechanism());
+            try_register(SparkType::Registry, make_registry_mechanism());
+            try_register(SparkType::Service, make_service_mechanism());
+            spark_engine_->start();
+            spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
+                         "Guardian detection path = legacy IGuard (enforcing)");
+        }
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1790,6 +1833,21 @@ public:
                                         std::format("{:.0f}", ns.throughput_bps);
                             }
 
+                            // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
+                            // OBSERVE-ONLY). Emitted only when the engine is instantiated
+                            // (omitted entirely under --spark-disable, so the fleet
+                            // `reporting` denominator counts only agents running it). Keys
+                            // are pinned to server/core/src/spark_fleet_tags.hpp by
+                            // tests/unit/server/test_spark_fleet_tags.cpp — a drift is
+                            // silent zero-reporting. Counters ship SPARSELY (only when >0):
+                            // fleet-scale, and every counter is 0 at rung 1 (no consumer
+                            // armed), so a quiescent agent ships just the two always-present
+                            // capability keys.
+                            if (!cfg_.spark_disable && spark_engine_) {
+                                emit_spark_heartbeat_tags(tags, spark_engine_->stats(),
+                                                          spark_engine_->stats_by_type());
+                            }
+
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
                             // we last shipped. `last_attached_seq` is a
@@ -2149,6 +2207,8 @@ public:
             guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
+        if (spark_engine_)
+            spark_engine_->stop(); // single-shot + idempotent; ~SparkEngine also stops
         if (updater_)
             updater_->stop();
         // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
@@ -2476,6 +2536,13 @@ private:
     // tag.
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
+    // SparkEngine (ADR-0021 Stage-2, rung 1) — instantiated OBSERVE-ONLY with no
+    // consumer, so (unlike guardian_/dex_observer_) it does NOT emit through
+    // guardian_sink_stream_; ~SparkEngine only joins its own internal wheel/mechanism
+    // threads, making its teardown self-contained regardless of declaration order.
+    // Read by the heartbeat thread (stats_by_type()), which is joined in
+    // quiesce_run_workers() before member teardown. nullptr when --spark-disable is set.
+    std::unique_ptr<SparkEngine> spark_engine_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
