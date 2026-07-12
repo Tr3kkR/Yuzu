@@ -3313,16 +3313,13 @@ public:
     /// teardown ordering in `stop()` — a store already reset to null is simply
     /// skipped.
     ///
-    /// PRODUCTION TRIGGER — DEFERRED (documented, not forgotten): this is the
-    /// injectable entry point; no in-scope caller invokes it yet. The operator
-    /// decommission surface that should call it (a `DELETE /api/v1/sle/agents/{id}`
-    /// / reconciled agent-management action, gated + audited per Decision 9, and
-    /// optionally the offline-agent purge-on-reconnect the ADR mentions) lands
-    /// with the SLE REST PR step — its route lives in settings_routes.cpp /
-    /// rest_api_v1.cpp, out of scope for this cascade step. Today's agent-removal
-    /// paths (registry session teardown, enrollment deny/remove, cert revocation)
-    /// are all non-durable-data by design and deliberately do NOT auto-erase
-    /// (a revoked-for-compromise agent's forensic rows must survive).
+    /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on scoped
+    /// `SoftwareLicensing:Delete` and audit-before-erase fail-closed (Decision 11).
+    /// Today's OTHER agent-removal paths (registry session teardown, enrollment
+    /// deny/remove, cert revocation) are non-durable-data by design and deliberately
+    /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
+    /// survive); this durable erasure is the deliberate, separately-gated Art.17 path.
     [[nodiscard]] DecommissionResult decommission_agent(std::string_view agent_id) {
         AgentDecommission cascade{AgentDecommissionStores{
             .inventory = inventory_store_.get(),

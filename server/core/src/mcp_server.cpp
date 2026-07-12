@@ -10,6 +10,7 @@
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
+#include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -716,7 +717,7 @@ static const ToolDef kTools[] = {
      "REST drill. Requires SoftwareLicensing:Read.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j",
-     R"({"readOnlyHint":true,"idempotentHint":true,"openWorldHint":false,"title":"Query software licenses","safety":"read only; machine-scope licence facts, no user_ref PII"})"},
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Query software licenses"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -2599,8 +2600,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // The MCP twin of GET /api/v1/sle/agents/{id}: one agent's discovered-
             // licence FACTS. Machine-scope only — user_scope/user_ref (Decision 11
             // personal data) are DELIBERATELY omitted; that PII is served only by the
-            // audited, management-group-scoped REST drill, whose fail-closed per-open
-            // behavioural audit this global-gated set-and-proceed MCP read cannot match.
+            // audited REST drill. Gated exactly like the REST drill: the per-device
+            // ancestor-aware SCOPED SoftwareLicensing:Read gate (ADR-0017 confinement —
+            // a group-confined operator reads their in-scope agents, is 403'd outside),
+            // plus the same #1717 fail-closed guard (a corrupt/load-failed rbac.db
+            // REFUSES rather than falling through to a legacy-open Read). Errors carry
+            // the A4 envelope (correlation_id + retry_after_ms), like the tier denial.
             if (tool_name == "query_software_licenses") {
                 if (!tier_allows(tier, "SoftwareLicensing", "Read")) {
                     res.set_content(
@@ -2608,25 +2613,40 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "SoftwareLicensing", "Read"))
-                    return;
-                if (!software_licensing_store) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Software licensing store unavailable"),
-                        "application/json");
+                // #1717 fail-closed (parity with the REST SLE gate's sle_gate_usable):
+                // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
+                // legacy-open Read of per-agent licence facts.
+                if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
+                    res.set_content(a4_error(kInternalError, "authorization subsystem unavailable"),
+                                    "application/json");
                     return;
                 }
                 auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                    res.set_content(a4_error(kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate (SoftwareLicensing:Read + management group) —
+                // the SAME ancestor-aware confinement the REST drill takes (the set_tag
+                // precedent), NOT the global perm gate. Fail closed if it is unwired.
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "SoftwareLicensing", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!software_licensing_store) {
+                    res.set_content(a4_error(kInternalError, "Software licensing store unavailable"),
                                     "application/json");
                     return;
                 }
                 auto rows = software_licensing_store->agent_licenses(agent_id);
                 if (!rows) {
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       "detected-licence store unavailable — read failed"),
+                        a4_error(kInternalError, "detected-licence store unavailable — read failed",
+                                 "retry the request"),
                         "application/json");
                     return;
                 }

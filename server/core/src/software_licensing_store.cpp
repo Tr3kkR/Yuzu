@@ -44,7 +44,6 @@ constexpr std::chrono::milliseconds kStaleCountAcquireTimeout{250};
 // the fleet-distinct and posture sets are one row per product — bounded.
 constexpr int kAgentRowCap = 20000;
 constexpr int kDistinctRowCap = 20000;
-constexpr int kPostureRowCap = 20000;
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -101,41 +100,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX agent_licenses_state_idx  ON agent_licenses (state);"
          "CREATE INDEX agent_licenses_expiry_idx ON agent_licenses (expiry_at) "
          "WHERE expiry_at > 0;"
-         // Evaluator posture rollup (roadmap §7.2), replaced atomically each
-         // cycle. product_key is the SOFT registry norm_key ('' = the honest
-         // unmatched bucket, roadmap R7); the per-effective-state counts
-         // follow the closed §3.2 status vocabulary; refreshed_at is the
-         // as-of stamp compliance surfaces carry (roadmap G-4). The PK is the
-         // multi-instance correctness backstop behind the advisory lock in
-         // replace_posture_rollup (the catalog-rollup ARCH-1 lesson).
-         "CREATE TABLE license_posture_rollup ("
-         "  product_key               TEXT PRIMARY KEY,"
-         "  vendor                    TEXT NOT NULL DEFAULT '',"
-         "  title                     TEXT NOT NULL DEFAULT '',"
-         "  device_count              BIGINT NOT NULL DEFAULT 0,"
-         "  install_count             BIGINT NOT NULL DEFAULT 0,"
-         "  licensed_count            BIGINT NOT NULL DEFAULT 0,"
-         "  subscription_active_count BIGINT NOT NULL DEFAULT 0,"
-         "  trial_count               BIGINT NOT NULL DEFAULT 0,"
-         "  grace_count               BIGINT NOT NULL DEFAULT 0,"
-         "  expired_count             BIGINT NOT NULL DEFAULT 0,"
-         "  unlicensed_count          BIGINT NOT NULL DEFAULT 0,"
-         "  unknown_count             BIGINT NOT NULL DEFAULT 0,"
-         "  next_expiry_at            BIGINT NOT NULL DEFAULT 0,"
-         "  expiring_soon_count       BIGINT NOT NULL DEFAULT 0,"
-         "  refreshed_at              BIGINT NOT NULL DEFAULT 0);"
-         // Alert dedup state (ADR-0024 Decision 8). PK(product_key, kind) per
-         // the §7.2 I-6 review note, adopted at implementation: `expired` and
-         // `expiring` dedup independently per product. kind is a CLOSED
-         // vocabulary — the CHECK keeps a typo'd kind from silently minting a
-         // third dedup stream.
-         "CREATE TABLE license_alert_state ("
-         "  product_key   TEXT NOT NULL,"
-         "  kind          TEXT NOT NULL CHECK (kind IN ('expired', 'expiring')),"
-         "  fingerprint   TEXT NOT NULL DEFAULT '',"
-         "  bucket        BIGINT NOT NULL DEFAULT 0,"
-         "  last_fired_at BIGINT NOT NULL DEFAULT 0,"
-         "  PRIMARY KEY (product_key, kind));"},
+         // NB: the evaluator's posture-rollup (license_posture_rollup) and
+         // alert-dedup (license_alert_state) tables are NOT created here — per
+         // ADR-0024 "Placement under ADR-1005" the compliance evaluator and its
+         // posture/alert state are the SAM use-case-engine module's, in the
+         // module's own database, not in-server (store ownership follows the
+         // layer, ADR-1005). The in-server store is raw discovery only.
+         },
     };
     return kMigrations;
 }
@@ -214,28 +185,6 @@ void fill_license_row(const pg::PgResult& res, int row, AgentLicenseRow& out) {
     out.last_seen = result_i64(res, row, 15);
 }
 
-constexpr const char* kPostureCols =
-    "product_key, vendor, title, device_count, install_count, licensed_count, "
-    "subscription_active_count, trial_count, grace_count, expired_count, unlicensed_count, "
-    "unknown_count, next_expiry_at, expiring_soon_count, refreshed_at";
-
-void fill_posture_row(const pg::PgResult& res, int row, LicensePostureRow& out) {
-    out.product_key = PQgetvalue(res.get(), row, 0);
-    out.vendor = PQgetvalue(res.get(), row, 1);
-    out.title = PQgetvalue(res.get(), row, 2);
-    out.device_count = result_i64(res, row, 3);
-    out.install_count = result_i64(res, row, 4);
-    out.licensed_count = result_i64(res, row, 5);
-    out.subscription_active_count = result_i64(res, row, 6);
-    out.trial_count = result_i64(res, row, 7);
-    out.grace_count = result_i64(res, row, 8);
-    out.expired_count = result_i64(res, row, 9);
-    out.unlicensed_count = result_i64(res, row, 10);
-    out.unknown_count = result_i64(res, row, 11);
-    out.next_expiry_at = result_i64(res, row, 12);
-    out.expiring_soon_count = result_i64(res, row, 13);
-    out.refreshed_at = result_i64(res, row, 14);
-}
 
 } // namespace
 
@@ -517,207 +466,6 @@ std::optional<std::vector<DetectedProduct>> SoftwareLicensingStore::distinct_pro
         out.push_back(std::move(p));
     }
     return out;
-}
-
-bool SoftwareLicensingStore::replace_posture_rollup(const std::vector<LicensePostureRow>& rows,
-                                                    std::int64_t refreshed_at) {
-    if (!open_)
-        return false;
-    // ONE transaction: atomic replace of the whole rollup. KEEP-LAST-GOOD: any
-    // lease/SQL failure returns false → with_txn_for ROLLs back → the prior
-    // rollup + its as-of stamp survive untouched (the stamp visibly ages —
-    // evaluator staleness stays observable, ADR-0024 Decision 7).
-    return pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
-        // Cluster-wide serialisation (the catalog-rollup ARCH-1 lesson): two
-        // server instances sharing one Postgres both run evaluators; a racing
-        // DELETE+INSERT under READ COMMITTED can leave duplicate rows.
-        // Blocking (not try_): each instance carries its own freshly derived
-        // rows, so the loser waits and applies its own replace (last writer
-        // wins — both derive from the same tables); the wait is transaction-
-        // scoped and bounded by the pool's statement_timeout. The PK is the
-        // belt-and-braces backstop behind the lock.
-        pg::PgResult lk = pg::exec_params(
-            c, "SELECT pg_advisory_xact_lock(hashtextextended('sle_license_posture_rollup', 0))",
-            std::vector<std::string>{});
-        if (lk.status() != PGRES_TUPLES_OK)
-            return false;
-        if (pg::exec_params(c, "DELETE FROM software_licensing_store.license_posture_rollup",
-                            std::vector<std::string>{})
-                .status() != PGRES_COMMAND_OK)
-            return false;
-        if (rows.empty())
-            return true; // an empty estate replaces to an empty rollup
-        // Parallel-array batch insert (#1664 pattern): constant 15 params —
-        // $1 the shared as-of stamp, $2..$15 the per-column arrays.
-        std::vector<std::string_view> text_cols[3];
-        for (auto& col : text_cols)
-            col.reserve(rows.size());
-        std::vector<std::string> num_strs[11];
-        for (auto& col : num_strs)
-            col.reserve(rows.size());
-        for (const auto& r : rows) {
-            text_cols[0].emplace_back(r.product_key);
-            text_cols[1].emplace_back(r.vendor);
-            text_cols[2].emplace_back(r.title);
-            num_strs[0].push_back(std::to_string(r.device_count));
-            num_strs[1].push_back(std::to_string(r.install_count));
-            num_strs[2].push_back(std::to_string(r.licensed_count));
-            num_strs[3].push_back(std::to_string(r.subscription_active_count));
-            num_strs[4].push_back(std::to_string(r.trial_count));
-            num_strs[5].push_back(std::to_string(r.grace_count));
-            num_strs[6].push_back(std::to_string(r.expired_count));
-            num_strs[7].push_back(std::to_string(r.unlicensed_count));
-            num_strs[8].push_back(std::to_string(r.unknown_count));
-            num_strs[9].push_back(std::to_string(r.next_expiry_at));
-            num_strs[10].push_back(std::to_string(r.expiring_soon_count));
-        }
-        std::vector<std::string> params;
-        params.reserve(15);
-        params.push_back(std::to_string(refreshed_at));
-        for (const auto& col : text_cols)
-            params.push_back(pg::to_text_array(col));
-        for (const auto& col : num_strs) {
-            std::vector<std::string_view> views(col.begin(), col.end());
-            params.push_back(pg::to_text_array(views));
-        }
-        pg::PgResult ins = pg::exec_params(
-            c,
-            "INSERT INTO software_licensing_store.license_posture_rollup "
-            "(product_key, vendor, title, device_count, install_count, licensed_count, "
-            "subscription_active_count, trial_count, grace_count, expired_count, "
-            "unlicensed_count, unknown_count, next_expiry_at, expiring_soon_count, refreshed_at) "
-            "SELECT pk, ven, ti, dc, ic, lc, sac, tc, gc, ec, ulc, uc, nea, esc, $1::bigint "
-            "FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[], $6::bigint[], "
-            "$7::bigint[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[], "
-            "$12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[]) "
-            "AS t(pk, ven, ti, dc, ic, lc, sac, tc, gc, ec, ulc, uc, nea, esc)",
-            params);
-        return ins.status() == PGRES_COMMAND_OK;
-    });
-}
-
-std::optional<std::vector<LicensePostureRow>> SoftwareLicensingStore::posture_rollup() {
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: posture_rollup degraded — store not open "
-                         "(occurrence {})",
-                         d.occurrence);
-        return std::nullopt;
-    }
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: posture_rollup degraded — no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
-    }
-    const std::string sql = std::string("SELECT ") + kPostureCols +
-                            " FROM software_licensing_store.license_posture_rollup "
-                            "ORDER BY device_count DESC, product_key LIMIT $1::bigint";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
-                                       std::vector<std::string>{std::to_string(kPostureRowCap)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: posture_rollup degraded — query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::nullopt;
-    }
-    const int n = PQntuples(res.get());
-    std::vector<LicensePostureRow> out;
-    out.reserve(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-        LicensePostureRow r;
-        fill_posture_row(res, i, r);
-        out.push_back(std::move(r));
-    }
-    return out;
-}
-
-std::expected<std::optional<LicenseAlertState>, LicensingReadError>
-SoftwareLicensingStore::alert_state(std::string_view product_key, std::string_view kind) {
-    // AUTHORITATIVE read: the evaluator must NOT read a degrade as "never
-    // fired" — that would re-fire the alert on every degraded cycle, exactly
-    // the spam Decision 8's dedup exists to prevent.
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: alert_state degraded — store not open "
-                         "(occurrence {})",
-                         d.occurrence);
-        return std::unexpected(LicensingReadError::kDegraded);
-    }
-    if (product_key.empty() || kind.empty())
-        return std::optional<LicenseAlertState>{}; // precondition miss → absent, not a degrade
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: alert_state degraded — no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::unexpected(LicensingReadError::kDegraded);
-    }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT fingerprint, bucket, last_fired_at "
-        "FROM software_licensing_store.license_alert_state "
-        "WHERE product_key = $1 AND kind = $2",
-        std::vector<std::string>{std::string(product_key), std::string(kind)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareLicensingStore: alert_state degraded — query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::unexpected(LicensingReadError::kDegraded);
-    }
-    if (PQntuples(res.get()) == 0)
-        return std::optional<LicenseAlertState>{}; // never fired (or dedup state lost) → G-3
-    LicenseAlertState out;
-    out.fingerprint = PQgetvalue(res.get(), 0, 0);
-    out.bucket = result_i64(res, 0, 1);
-    out.last_fired_at = result_i64(res, 0, 2);
-    return std::optional<LicenseAlertState>{std::move(out)};
-}
-
-bool SoftwareLicensingStore::upsert_alert_state(std::string_view product_key,
-                                                std::string_view kind,
-                                                std::string_view fingerprint, std::int64_t bucket,
-                                                std::int64_t last_fired_at) {
-    if (!open_ || product_key.empty() || kind.empty())
-        return false;
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("SoftwareLicensingStore: upsert_alert_state skipped for ({}, {}), no "
-                     "connection ({})",
-                     product_key, kind, pool_.last_error());
-        return false;
-    }
-    // A kind outside the closed vocabulary fails the schema CHECK and lands in
-    // the error branch (fail-soft, never throws).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO software_licensing_store.license_alert_state "
-        "(product_key, kind, fingerprint, bucket, last_fired_at) "
-        "VALUES ($1, $2, $3, $4::bigint, $5::bigint) "
-        "ON CONFLICT (product_key, kind) DO UPDATE SET "
-        "  fingerprint = EXCLUDED.fingerprint, bucket = EXCLUDED.bucket, "
-        "  last_fired_at = EXCLUDED.last_fired_at "
-        "RETURNING product_key",
-        std::vector<std::string>{std::string(product_key), std::string(kind),
-                                 std::string(fingerprint), std::to_string(bucket),
-                                 std::to_string(last_fired_at)});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::warn("SoftwareLicensingStore: upsert_alert_state failed for ({}, {}): {}",
-                     product_key, kind, PQerrorMessage(lease.get()));
-        return false;
-    }
-    return true;
 }
 
 bool SoftwareLicensingStore::delete_agent(std::string_view agent_id) {

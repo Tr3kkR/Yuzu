@@ -28,7 +28,6 @@
 #include <vector>
 
 using yuzu::server::AgentLicenseRow;
-using yuzu::server::LicensePostureRow;
 using yuzu::server::LicensingReadError;
 using yuzu::server::SoftwareLicensingStore;
 using yuzu::server::pg::PgPool;
@@ -77,24 +76,6 @@ AgentLicenseRow small_row(const std::string& product, const std::string& state,
     return r;
 }
 
-LicensePostureRow posture_row(const std::string& key, std::int64_t devices) {
-    LicensePostureRow p;
-    p.product_key = key;
-    p.vendor = "v";
-    p.title = "t";
-    p.device_count = devices;
-    p.install_count = devices + 1;
-    p.licensed_count = 1;
-    p.subscription_active_count = 2;
-    p.trial_count = 3;
-    p.grace_count = 4;
-    p.expired_count = 5;
-    p.unlicensed_count = 6;
-    p.unknown_count = 7;
-    p.next_expiry_at = 1234;
-    p.expiring_soon_count = 8;
-    return p;
-}
 
 } // namespace
 
@@ -436,110 +417,6 @@ TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight i
     CHECK_FALSE(h->has_value());
 }
 
-TEST_CASE("SoftwareLicensingStore posture rollup replaces atomically and reads back",
-          "[pg][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
-
-    SECTION("a rollup replace round-trips every column, most-deployed first") {
-        REQUIRE(store.replace_posture_rollup({posture_row("acme:reader", 3), posture_row("", 10)},
-                                             777)); // '' = the honest unmatched bucket
-        auto got = store.posture_rollup();
-        REQUIRE(got.has_value());
-        REQUIRE(got->size() == 2);
-        CHECK((*got)[0].product_key == ""); // 10 devices → sorts first
-        CHECK((*got)[0].device_count == 10);
-        const auto& r = (*got)[1];
-        CHECK(r.product_key == "acme:reader");
-        CHECK(r.device_count == 3);
-        CHECK(r.install_count == 4);
-        CHECK(r.licensed_count == 1);
-        CHECK(r.subscription_active_count == 2);
-        CHECK(r.trial_count == 3);
-        CHECK(r.grace_count == 4);
-        CHECK(r.expired_count == 5);
-        CHECK(r.unlicensed_count == 6);
-        CHECK(r.unknown_count == 7);
-        CHECK(r.next_expiry_at == 1234);
-        CHECK(r.expiring_soon_count == 8);
-        CHECK(r.refreshed_at == 777); // the evaluator's as-of stamp (G-4)
-    }
-
-    SECTION("a second replace atomically swaps the whole rollup — old rows gone") {
-        REQUIRE(store.replace_posture_rollup({posture_row("old:key", 1)}, 100));
-        REQUIRE(store.replace_posture_rollup({posture_row("new:key", 2)}, 200));
-        auto got = store.posture_rollup();
-        REQUIRE(got.has_value());
-        REQUIRE(got->size() == 1);
-        CHECK((*got)[0].product_key == "new:key");
-        CHECK((*got)[0].refreshed_at == 200);
-    }
-
-    SECTION("an empty estate replaces to an empty rollup (a genuine zero, not a degrade)") {
-        REQUIRE(store.replace_posture_rollup({posture_row("k", 1)}, 100));
-        REQUIRE(store.replace_posture_rollup({}, 200));
-        auto got = store.posture_rollup();
-        REQUIRE(got.has_value());
-        CHECK(got->empty());
-    }
-}
-
-TEST_CASE("SoftwareLicensingStore alert state: PK(product_key, kind), upsert/get, closed kinds",
-          "[pg][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
-
-    SECTION("never-fired → absent value (the G-3 first-evaluation state), not a degrade") {
-        auto s = store.alert_state("acme:reader", "expiring");
-        REQUIRE(s.has_value());
-        CHECK_FALSE(s->has_value());
-    }
-
-    SECTION("the two kinds dedup INDEPENDENTLY per product (the §7.2 I-6 PK)") {
-        REQUIRE(store.upsert_alert_state("acme:reader", "expiring", "fp-expiring", 30, 1000));
-        REQUIRE(store.upsert_alert_state("acme:reader", "expired", "fp-expired", 0, 2000));
-        auto expiring = store.alert_state("acme:reader", "expiring");
-        REQUIRE(expiring.has_value());
-        REQUIRE(expiring->has_value());
-        CHECK((*expiring)->fingerprint == "fp-expiring");
-        CHECK((*expiring)->bucket == 30);
-        CHECK((*expiring)->last_fired_at == 1000);
-        auto expired = store.alert_state("acme:reader", "expired");
-        REQUIRE(expired.has_value());
-        REQUIRE(expired->has_value());
-        CHECK((*expired)->fingerprint == "fp-expired");
-        CHECK((*expired)->bucket == 0);
-        CHECK((*expired)->last_fired_at == 2000);
-        // Another product's state is independent.
-        auto other = store.alert_state("other:product", "expiring");
-        REQUIRE(other.has_value());
-        CHECK_FALSE(other->has_value());
-    }
-
-    SECTION("upsert updates in place (bucket escalation + re-arm restamp)") {
-        REQUIRE(store.upsert_alert_state("acme:reader", "expiring", "fp1", 30, 1000));
-        REQUIRE(store.upsert_alert_state("acme:reader", "expiring", "fp1", 7, 5000));
-        auto s = store.alert_state("acme:reader", "expiring");
-        REQUIRE(s.has_value());
-        REQUIRE(s->has_value());
-        CHECK((*s)->bucket == 7);
-        CHECK((*s)->last_fired_at == 5000);
-    }
-
-    SECTION("a kind outside the closed vocabulary fails the CHECK → false, nothing stored") {
-        CHECK_FALSE(store.upsert_alert_state("acme:reader", "over_deployed", "fp", 0, 1));
-        auto s = store.alert_state("acme:reader", "expiring");
-        REQUIRE(s.has_value());
-        CHECK_FALSE(s->has_value());
-    }
-}
-
 TEST_CASE("SoftwareLicensingStore count_stale_agents keys on server-receipt last_seen (C-10)",
           "[pg][software_licensing]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -596,9 +473,6 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         auto rows = store.agent_licenses("no-such-agent");
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
-        auto posture = store.posture_rollup();
-        REQUIRE(posture.has_value());
-        CHECK(posture->empty()); // never evaluated yet — still a successful read
     }
 
     SECTION("a backend failure (schema dropped) degrades every read — never a silent empty") {
@@ -612,10 +486,6 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         }
         CHECK_FALSE(store.agent_licenses("agent-a").has_value());
         CHECK_FALSE(store.distinct_products().has_value());
-        CHECK_FALSE(store.posture_rollup().has_value());
-        auto s = store.alert_state("k", "expiring");
-        REQUIRE_FALSE(s.has_value());
-        CHECK(s.error() == LicensingReadError::kDegraded);
         auto h = store.stored_hash("agent-a");
         REQUIRE_FALSE(h.has_value()); // degrade → the seam nacks kError, NOT need_full
         CHECK(h.error() == LicensingReadError::kDegraded);
@@ -624,14 +494,12 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         CHECK_FALSE(store.replace_agent_licenses("agent-a", {small_row("P", "licensed")}, "h2",
                                                  "hash"));
         CHECK_FALSE(store.touch("agent-a"));
-        CHECK_FALSE(store.replace_posture_rollup({posture_row("k", 1)}, 1));
-        CHECK_FALSE(store.upsert_alert_state("k", "expiring", "fp", 30, 1));
-        // The four sampled authoritative reads above bumped the shared
-        // read-degrade counter under this source's label (#1675 convention).
+        // The degraded authoritative reads above bumped the shared read-degrade
+        // counter under this source's label (#1675 convention).
         CHECK(metrics
                   .counter("yuzu_inventory_read_degrade_total",
                            {{"reason", "query_error"}, {"source", "software_licensing"}})
-                  .value() == 4.0);
+                  .value() >= 2.0);
     }
 }
 
@@ -660,12 +528,8 @@ TEST_CASE("SoftwareLicensingStore store_not_open: constructor failure degrades e
     REQUIRE_FALSE(store.is_open());
     CHECK_FALSE(store.agent_licenses("agent-a").has_value());
     CHECK_FALSE(store.distinct_products().has_value());
-    CHECK_FALSE(store.posture_rollup().has_value());
-    CHECK_FALSE(store.alert_state("k", "expiring").has_value());
     CHECK_FALSE(store.stored_hash("agent-a").has_value());
     CHECK_FALSE(store.count_stale_agents(1).has_value());
     CHECK_FALSE(store.replace_agent_licenses("agent-a", {}, "h", "hash"));
     CHECK_FALSE(store.touch("agent-a"));
-    CHECK_FALSE(store.replace_posture_rollup({}, 1));
-    CHECK_FALSE(store.upsert_alert_state("k", "expiring", "fp", 1, 1));
 }

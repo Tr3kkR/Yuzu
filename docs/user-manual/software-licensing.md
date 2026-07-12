@@ -115,7 +115,7 @@ securable — see [Access control](#access-control)):
 |---|---|---|
 | `GET /api/v1/sle/agents/{agent_id}` | one device's discovered licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
 | `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` |
-| MCP `query_software_licenses` | one device's discovered-licence **facts** (machine-scope; **no `user_ref`**) | global `SoftwareLicensing:Read` |
+| MCP `query_software_licenses` | one device's discovered-licence **facts** (machine-scope; **no `user_ref`**) | **per-device scoped** `SoftwareLicensing:Read` (the drill's confinement + #1717 fail-closed guard) |
 
 The **single-agent drill** (`GET /sle/agents/{id}`) takes a real per-device scoped gate
 and is **audited on every open** (`sle.agent.view`, fail-closed: a non-persistable audit

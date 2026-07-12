@@ -97,41 +97,11 @@ struct DetectedProduct {
     std::string vendor;
 };
 
-/// One posture-rollup row (roadmap §7.2 `license_posture_rollup`), keyed by
-/// the SOFT product key (= registry norm_key; '' bucket = unmatched). The
-/// per-effective-state counts follow the closed §3.2 status vocabulary as
-/// derived by `effective_license_state` (server-now lapse rule, ADR-0024
-/// Decision 7). `next_expiry_at` 0 = no expiring licence; `refreshed_at` is
-/// the evaluator's as-of stamp (roadmap G-4 — compliance surfaces carry it).
-struct LicensePostureRow {
-    std::string product_key;
-    std::string vendor;
-    std::string title;
-    std::int64_t device_count{0};
-    std::int64_t install_count{0}; ///< installed-software rows joined via aliases
-    std::int64_t licensed_count{0};
-    std::int64_t subscription_active_count{0};
-    std::int64_t trial_count{0};
-    std::int64_t grace_count{0};
-    std::int64_t expired_count{0};
-    std::int64_t unlicensed_count{0};
-    std::int64_t unknown_count{0};
-    std::int64_t next_expiry_at{0};
-    std::int64_t expiring_soon_count{0};
-    std::int64_t refreshed_at{0};
-};
-
-/// Alert-dedup state for one (product_key, kind) condition (roadmap §7.2
-/// `license_alert_state`, PK(product_key, kind) per the I-6 review note —
-/// `expired` and `expiring` dedup independently per product). `fingerprint`
-/// identifies the fired condition instance; `bucket` is the days-to-expiry
-/// escalation bucket last fired (0 for `expired`); `last_fired_at` drives the
-/// 7-day re-arm (ADR-0024 Decision 8).
-struct LicenseAlertState {
-    std::string fingerprint;
-    std::int64_t bucket{0};
-    std::int64_t last_fired_at{0};
-};
+// NB: the posture-rollup (`LicensePostureRow`) and alert-dedup
+// (`LicenseAlertState`) types the compliance evaluator produced are NOT defined
+// here — per ADR-0024 "Placement under ADR-1005" the evaluator and its
+// posture/alert state are the SAM use-case-engine module's, stored in the
+// module's own database, not created in-server.
 
 /// Error type for the authoritative single-row reads (mirrors `CiReadError` /
 /// `RegistryReadError`): the success type's `std::nullopt` == absent (read
@@ -209,43 +179,10 @@ public:
     /// AUTHORITATIVE read: `std::nullopt` on a degrade.
     [[nodiscard]] std::optional<std::vector<DetectedProduct>> distinct_products();
 
-    /// Atomically replace the whole posture rollup with the evaluator's
-    /// freshly derived rows in ONE transaction, each row stamped with
-    /// `refreshed_at` (the evaluator's as-of time, roadmap G-4). KEEP-LAST-
-    /// GOOD: on any lease/SQL failure the transaction rolls back, leaving the
-    /// prior rollup + its as-of stamp intact (the stamp visibly ages —
-    /// staleness observable per ADR-0024 Decision 7). Returns false on
-    /// failure. Concurrent replaces (multi-instance) serialise on a
-    /// cluster-wide advisory lock; the PK is the correctness backstop.
-    [[nodiscard]] bool replace_posture_rollup(const std::vector<LicensePostureRow>& rows,
-                                              std::int64_t refreshed_at);
-
-    /// The posture rollup (the `/sle` Licences view source), most-deployed
-    /// first, capped. Reads the PRECOMPUTED rows the evaluator replaced — a
-    /// cheap indexed scan, never an on-demand aggregate. AUTHORITATIVE read:
-    /// `std::nullopt` on a degrade; an empty value = never evaluated yet or a
-    /// genuinely empty estate (rows carry `refreshed_at` to tell the two
-    /// apart).
-    [[nodiscard]] std::optional<std::vector<LicensePostureRow>> posture_rollup();
-
-    /// Alert-dedup state for one (product_key, kind). `kind` vocabulary is
-    /// closed: "expired" | "expiring" (schema CHECK). AUTHORITATIVE read:
-    /// `std::unexpected(kDegraded)` on a store/pool/query failure (the
-    /// evaluator must NOT treat a degrade as "never fired" — that would
-    /// re-fire on every degraded cycle); a value holding `std::nullopt` when
-    /// the condition has never fired (including after dedup-state loss — the
-    /// bounded first-evaluation burst, roadmap G-3); a value holding the
-    /// state otherwise.
-    [[nodiscard]] std::expected<std::optional<LicenseAlertState>, LicensingReadError>
-    alert_state(std::string_view product_key, std::string_view kind);
-
-    /// Upsert the alert-dedup state for one (product_key, kind) after an
-    /// emission decision. Fail-soft: false on failure (a kind outside the
-    /// closed vocabulary fails the schema CHECK and returns false — never
-    /// throws).
-    [[nodiscard]] bool upsert_alert_state(std::string_view product_key, std::string_view kind,
-                                          std::string_view fingerprint, std::int64_t bucket,
-                                          std::int64_t last_fired_at);
+    // The posture-rollup and alert-dedup read/write methods (replace_posture_rollup,
+    // posture_rollup, alert_state, upsert_alert_state) are removed — they are the
+    // compliance evaluator's, and per ADR-0024 "Placement under ADR-1005" the
+    // evaluator + its posture/alert state are the SAM UCE module's, not in-server.
 
     /// Drop an agent's detected rows AND its state row (the roadmap D-3
     /// agent-decommission cascade calls this per store). Both deletes run in one

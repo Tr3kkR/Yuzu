@@ -15,7 +15,10 @@
 /// The posture/compliance reads (`/sle/summary`, `/sle/licenses`) and the fan-out
 /// list are the SAM UCE module's interpretation surface — not built in-server, so
 /// not tested here. The discovery read's MCP twin (`query_software_licenses`) is
-/// covered in test_mcp_server.cpp.
+/// covered by the `[mcp][sle]` cases in test_mcp_server.cpp — the scoped-gate
+/// confinement, the fail-closed-when-unwired posture, the store-unavailable /
+/// degrade A4 errors, and the Decision-11 user_ref/user_scope PII omission that
+/// distinguishes the twin from this audited REST drill.
 
 #include "sle_routes.hpp"
 #include "test_route_sink.hpp"

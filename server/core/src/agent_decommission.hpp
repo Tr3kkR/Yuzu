@@ -6,13 +6,11 @@
 /// so that an operator decommission CAN durably erase a machine's stored rows.
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
-/// were invoked only from unit tests). NOTE: the fan-out is built here, but its
-/// PRODUCTION TRIGGER is DEFERRED — the gated/audited operator decommission route
-/// that would call it lands with a later SLE PR (see `server.cpp`'s
-/// `decommission_agent` "PRODUCTION TRIGGER — DEFERRED" note). Until that route
-/// ships, the ADR's "offline agents purge ... via decommission" story is the
-/// mechanism-ready-but-not-yet-operator-triggerable state, not yet operationally
-/// realizable. §27 builds the fan-out and registers its stores with it.
+/// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:
+/// `DELETE /api/v1/sle/agents/{id}` (gated on scoped `SoftwareLicensing:Delete`,
+/// audit-before-erase fail-closed — see `sle_routes.cpp`) calls
+/// `ServerImpl::decommission_agent`, which builds this cascade. §27 builds the
+/// fan-out AND wires its first production caller.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure
