@@ -13,6 +13,7 @@
 #include "../test_helpers.hpp"
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,6 +25,15 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::preflight::PreflightTarget;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_deployment_run_store.cpp (identical setup — first build wins).
+yuzu::test::PgTestTemplate deprun_tpl{"deprun", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    DeploymentRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("deprun template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -116,7 +126,7 @@ TEST_CASE("best_response_per_agent picks terminal > running, then output, then l
 
 TEST_CASE("deployment engine drives stage→execute, skips out-of-scope, runs once",
           "[pg][deployment][engine]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -170,7 +180,7 @@ TEST_CASE("deployment engine drives stage→execute, skips out-of-scope, runs on
 
 TEST_CASE("deployment engine records a non-zero installer exit as failed",
           "[pg][deployment][engine]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};

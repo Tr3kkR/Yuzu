@@ -38,6 +38,8 @@
 #if defined(YUZU_TEST_ENABLE_PG)
 #include <chrono>
 #include <format>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include <libpq-fe.h>
@@ -152,6 +154,8 @@ inline const char* pg_admin_dsn_env() {
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
 }
 
+class PgTestTemplate;
+
 /// RAII fixture for an ephemeral, uniquely-named Postgres database.
 ///
 /// Connects to YUZU_TEST_POSTGRES_DSN, issues `CREATE DATABASE
@@ -160,9 +164,55 @@ inline const char* pg_admin_dsn_env() {
 /// leaked test connection cannot keep it alive). Name uniqueness uses the
 /// same process-salt + atomic-counter scheme as `unique_temp_path` — never
 /// thread-id/clock salting (flake #473).
+///
+/// The one-arg form clones from a pre-migrated `PgTestTemplate` instead of
+/// creating an empty database — see PgTestTemplate for when to use which.
 class PostgresTestDb {
 public:
-    PostgresTestDb() {
+    PostgresTestDb() { init(nullptr); }
+
+    /// Clone an ephemeral database from `tpl` (`CREATE DATABASE ...
+    /// TEMPLATE`), so the store constructors under test find every
+    /// migration already applied and skip straight through the
+    /// schema_meta version check.
+    explicit PostgresTestDb(PgTestTemplate& tpl);
+
+    ~PostgresTestDb() {
+        if (db_name_.empty() || admin_dsn_.empty())
+            return;
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            // Can't throw from a dtor — but a silent failure piles leaked
+            // yuzu_test_* databases onto a shared instance; say so.
+            log_leak("teardown admin connect failed", nullptr);
+            return;
+        }
+        // FORCE (PG 13+; every supported leg pins 16): terminate any
+        // connection a test leaked so the drop cannot fail and pile up
+        // databases on the shared instance.
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+        if (!res.ok())
+            log_leak("DROP DATABASE failed", PQerrorMessage(conn.get()));
+    }
+
+    PostgresTestDb(const PostgresTestDb&) = delete;
+    PostgresTestDb& operator=(const PostgresTestDb&) = delete;
+    PostgresTestDb(PostgresTestDb&&) = delete;
+    PostgresTestDb& operator=(PostgresTestDb&&) = delete;
+
+    /// True when the ephemeral database exists and `dsn()` is usable.
+    [[nodiscard]] bool available() const noexcept { return available_; }
+    /// Why `available()` is false.
+    [[nodiscard]] const std::string& error() const noexcept { return error_; }
+    /// Conninfo (keyword/value form) for the ephemeral database.
+    [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
+    [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
+
+private:
+    /// Shared constructor body. `tpl_name` == nullptr -> empty database
+    /// (default template1); else clone from the named template database.
+    void init(const std::string* tpl_name) {
         const char* admin = pg_admin_dsn_env();
         if (admin == nullptr) {
             error_ = "YUZU_TEST_POSTGRES_DSN not set";
@@ -178,13 +228,26 @@ public:
             error_ = std::string("admin connect failed: ") + PQerrorMessage(conn.get());
             return;
         }
-        const std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
-        yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
-        if (!res.ok()) {
-            error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
-            return;
+        std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
+        if (tpl_name != nullptr)
+            create += " TEMPLATE \"" + *tpl_name + "\"";
+        // Clone-from-template refuses while ANY connection to the template
+        // is open (SQLSTATE 55006). The builder's PgPool has PQfinish()ed by
+        // the time ensure() returns, but the backend teardown can lag a
+        // moment — retry briefly instead of failing the fixture.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;) {
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
+            if (res.ok())
+                break;
+            const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+            const bool in_use = sqlstate != nullptr && std::string_view(sqlstate) == "55006";
+            if (!in_use || std::chrono::steady_clock::now() >= deadline) {
+                error_ = std::string("CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        res.reset();
         conn.reset();
 
         dsn_ = rewrite_dbname(admin_dsn_, db_name_);
@@ -223,39 +286,6 @@ public:
         available_ = true;
     }
 
-    ~PostgresTestDb() {
-        if (db_name_.empty() || admin_dsn_.empty())
-            return;
-        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
-        if (PQstatus(conn.get()) != CONNECTION_OK) {
-            // Can't throw from a dtor — but a silent failure piles leaked
-            // yuzu_test_* databases onto a shared instance; say so.
-            log_leak("teardown admin connect failed", nullptr);
-            return;
-        }
-        // FORCE (PG 13+; every supported leg pins 16): terminate any
-        // connection a test leaked so the drop cannot fail and pile up
-        // databases on the shared instance.
-        const std::string drop = "DROP DATABASE IF EXISTS \"" + db_name_ + "\" WITH (FORCE)";
-        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
-        if (!res.ok())
-            log_leak("DROP DATABASE failed", PQerrorMessage(conn.get()));
-    }
-
-    PostgresTestDb(const PostgresTestDb&) = delete;
-    PostgresTestDb& operator=(const PostgresTestDb&) = delete;
-    PostgresTestDb(PostgresTestDb&&) = delete;
-    PostgresTestDb& operator=(PostgresTestDb&&) = delete;
-
-    /// True when the ephemeral database exists and `dsn()` is usable.
-    [[nodiscard]] bool available() const noexcept { return available_; }
-    /// Why `available()` is false.
-    [[nodiscard]] const std::string& error() const noexcept { return error_; }
-    /// Conninfo (keyword/value form) for the ephemeral database.
-    [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
-    [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
-
-private:
     // std::format + fputs, never printf-family (docs/cpp-conventions.md;
     // std::print is unavailable on GCC 13 libstdc++ / Apple Clang 15 — same
     // portable form as canary_main.cpp). Called from the dtor, so formatting
@@ -316,7 +346,184 @@ private:
     std::string dsn_;
     std::string error_;
     bool available_{false};
+
+    friend class PgTestTemplate; // rewrite_dbname for the template's own DSN
 };
+
+/// A pre-migrated template database, built at most once per process and
+/// cloned per test (2026-07-12 Wee Tam server-suite timeout: per-test
+/// `CREATE DATABASE` + full store migrations + `DROP` made the [pg] tests
+/// the slowest-scaling part of the suite under runner contention — the
+/// migration DDL is the bulk of it, and a `CREATE DATABASE ... TEMPLATE`
+/// clone hands every test an already-migrated schema instead).
+///
+/// Declare one per test file (or share a name across files that need the
+/// exact same store set — the registry builds each NAME once, first setup
+/// wins):
+///
+///   static yuzu::test::PgTestTemplate tpl{"swinv", [](const std::string& dsn) {
+///       yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+///       yuzu::server::SoftwareInventoryStore store{pool};  // ctor migrates
+///   }};
+///   TEST_CASE("...", "[pg]...") {
+///       YUZU_REQUIRE_PG_DB_TPL(db, tpl);
+///       ...
+///   }
+///
+/// The setup callback MUST construct (and destruct, by scope exit) every
+/// store the file's tests rely on: Postgres refuses to clone a template
+/// that still has open connections, so a pool leaked past the callback
+/// turns into a fixture error, not a hang. Keep using plain
+/// YUZU_REQUIRE_PG_DB for tests that exercise migration/fresh-database
+/// behaviour itself (pg_migration_runner, fail-closed ctors on broken
+/// schemas) — those need the empty database.
+///
+/// Template databases are named with the same process salt as ephemeral
+/// ones (two suite processes on one shared instance never collide) and are
+/// dropped at process exit; an abnormal exit leaks them exactly like
+/// ephemeral databases, and they match the same `yuzu_test_*` sweep
+/// pattern.
+class PgTestTemplate {
+public:
+    using Setup = void (*)(const std::string& dsn);
+
+    PgTestTemplate(std::string name, Setup setup) : name_(std::move(name)), setup_(setup) {}
+
+    /// Build (once) and return the template database name; on failure
+    /// returns an empty string and sets `error`.
+    std::string ensure(const std::string& admin_dsn, std::string& error) {
+        Registry& reg = registry();
+        const std::lock_guard<std::mutex> lock(reg.mu);
+        auto it = reg.entries.find(name_);
+        if (it == reg.entries.end()) {
+            Entry e = build(admin_dsn);
+            it = reg.entries.emplace(name_, std::move(e)).first;
+        }
+        error = it->second.error;
+        return it->second.db_name;
+    }
+
+    /// Drop every built template database NOW. Called from the Catch2
+    /// testRunEnded listener (test_pg_template_cleanup.cpp) — i.e. before
+    /// main returns, while libpq's TLS stack is guaranteed alive. The
+    /// Registry static destructor cannot be trusted with this: its
+    /// registration order vs OpenSSL's atexit cleanup depends on which test
+    /// ran first, and on Catch2-filtered runs (`"[pg]"`, a single case) the
+    /// exit-time PQconnectdb finds OpenSSL already torn down and leaks every
+    /// template onto the shared instance.
+    static void drop_all_built() {
+        Registry& reg = registry();
+        const std::lock_guard<std::mutex> lock(reg.mu);
+        for (const auto& [name, e] : reg.entries)
+            drop_entry(e);
+        reg.entries.clear();
+    }
+
+private:
+    struct Entry {
+        std::string db_name; ///< empty when the build failed
+        std::string error;
+        std::string admin_dsn; ///< for the exit-time drop
+    };
+
+    /// Process-lifetime registry: dedupes builds by template name. The real
+    /// cleanup is drop_all_built() from the testRunEnded listener; this
+    /// destructor is only a best-effort backstop for a run that never
+    /// reached testRunEnded, and can itself fail on ordering (see
+    /// drop_all_built's comment) — hence the stderr breadcrumbs.
+    struct Registry {
+        std::mutex mu;
+        std::map<std::string, Entry> entries;
+
+        ~Registry() {
+            for (const auto& [name, e] : entries)
+                drop_entry(e);
+        }
+    };
+
+    /// Best-effort drop of one built template database; failures go to
+    /// stderr (same philosophy as PostgresTestDb::log_leak — a silent
+    /// failure piles leaked yuzu_test_tpl_* databases onto a shared
+    /// instance).
+    static void drop_entry(const Entry& e) {
+        if (e.db_name.empty())
+            return;
+        yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK) {
+            std::fputs("PgTestTemplate: teardown admin connect failed — leaked a "
+                       "yuzu_test_tpl_* database\n",
+                       stderr);
+            return;
+        }
+        const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\"";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+        if (!res.ok())
+            std::fputs(PQerrorMessage(conn.get()), stderr);
+    }
+
+    static Registry& registry() {
+        static Registry r;
+        return r;
+    }
+
+    Entry build(const std::string& admin_dsn) const {
+        Entry e;
+        e.admin_dsn = admin_dsn;
+        const std::string db_name = "yuzu_test_tpl_" + std::to_string(process_salt()) + "_" + name_;
+        {
+            yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                e.error = std::string("template admin connect failed: ") + PQerrorMessage(conn.get());
+                return e;
+            }
+            const std::string create = "CREATE DATABASE \"" + db_name + "\"";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
+            if (!res.ok()) {
+                e.error = std::string("template CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+                return e;
+            }
+        }
+        const std::string tpl_dsn = PostgresTestDb::rewrite_dbname(admin_dsn, db_name);
+        if (tpl_dsn.empty()) {
+            e.error = "could not parse YUZU_TEST_POSTGRES_DSN to rewrite dbname";
+            return e;
+        }
+        try {
+            setup_(tpl_dsn); // store ctors run the migrations; scope exit closes conns
+        } catch (const std::exception& ex) {
+            e.error = std::string("template setup threw: ") + ex.what();
+            return e;
+        }
+        e.db_name = db_name;
+        return e;
+    }
+
+    static std::uint64_t process_salt() {
+        static const std::uint64_t salt = [] {
+            std::mt19937_64 rng{std::random_device{}()};
+            return rng() % 1000000000;
+        }();
+        return salt;
+    }
+
+    std::string name_;
+    Setup setup_;
+};
+
+inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
+    const char* admin = pg_admin_dsn_env();
+    if (admin == nullptr) {
+        error_ = "YUZU_TEST_POSTGRES_DSN not set";
+        return;
+    }
+    std::string tpl_error;
+    const std::string tpl_name = tpl.ensure(admin, tpl_error);
+    if (tpl_name.empty()) {
+        error_ = "template build failed: " + tpl_error;
+        return;
+    }
+    init(&tpl_name);
+}
 
 /// Standard prologue for a Postgres-backed TEST_CASE: skip when no DSN is
 /// configured, fail when it is configured but broken, else bind `var` to a
@@ -329,6 +536,19 @@ private:
     }                                                                                              \
     yuzu::test::PostgresTestDb var;                                                                \
     INFO("[YUZU_REQUIRE_PG_DB] fixture status (blank == database came up OK): " << var.error());   \
+    REQUIRE(var.available())
+
+/// Same contract as YUZU_REQUIRE_PG_DB, but `var` is cloned from the
+/// pre-migrated PgTestTemplate `tpl` instead of starting empty — use for
+/// store-behaviour tests; keep the plain macro for migration/fresh-database
+/// behaviour tests.
+#define YUZU_REQUIRE_PG_DB_TPL(var, tpl)                                                           \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    yuzu::test::PostgresTestDb var{tpl};                                                           \
+    INFO("[YUZU_REQUIRE_PG_DB_TPL] fixture status (blank == database came up OK): "                \
+         << var.error());                                                                          \
     REQUIRE(var.available())
 
 #endif // YUZU_TEST_ENABLE_PG

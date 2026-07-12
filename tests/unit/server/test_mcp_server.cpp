@@ -4012,6 +4012,22 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
 
 // ── query_installed_software (ADR-0016 typed store + management-group scope) ──
 
+namespace {
+using yuzu::server::pg::PgPool;
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): same key +
+// identical setup as test_software_inventory_store.cpp (first build wins) —
+// the [pg] tests here construct exactly {SoftwareInventoryStore}.
+yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    SoftwareInventoryStore store{pool};
+    // Throw, don't return: a silently-unmigrated template would make every
+    // clone fall back to in-test migration — correct but slow, defeating the
+    // point. PgTestTemplate::build records the throw as a fixture error.
+    if (!store.is_open())
+        throw std::runtime_error("swinv template: store failed to migrate");
+}};
+} // namespace
+
 TEST_CASE("MCP query_installed_software: store unavailable → internal error",
           "[mcp][inventory]") {
     McpTestServer ts; // no software_inventory_store wired
@@ -4024,7 +4040,7 @@ TEST_CASE("MCP query_installed_software: store unavailable → internal error",
 
 TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's groups",
           "[mcp][pg][inventory]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareInventoryStore store{pool};
@@ -4106,7 +4122,7 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     // (pool/query failure → query_software returns nullopt), the tool must return a
     // JSON-RPC error, NOT success with empty content — a fleet vuln query must not
     // read a transient PG failure as "installed nowhere" (authoritative reads, A4).
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     yuzu::server::SoftwareInventoryStore store{pool};
