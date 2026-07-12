@@ -1721,6 +1721,13 @@ CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on `open
 
 TPM, Secure Boot, UEFI verification. Reports posture state into compliance reporting (18.2).
 
+### Issue 18.7: Agent-Side Component Inventory Collection
+**Capability:** new | **Scope:** Agent + server | **Status:** Proposed
+
+Bundled/vendored-dependency and embedded-runtime detection (Electron/Chromium, Go/Rust buildinfo,
+filesystem-resident lockfiles) that today's package-manager-based `installed_software` source can't
+see — the generation-side companion to Issue 18.5 (SBOM Ingest). See `docs/adr/0028-*`.
+
 ### Out of scope (documented exclusions)
 
 - **MDM (mobile)** — partner integration only; Yuzu's agent surface is workstation + server, not iOS / Android.
