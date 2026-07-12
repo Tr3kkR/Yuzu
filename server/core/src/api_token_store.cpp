@@ -411,6 +411,33 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     return t;
 }
 
+ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token) {
+    if (raw_token.empty())
+        return {TokenCheck::kInvalid, std::nullopt};  // definitive: no credential is no credential
+    if (!db_)
+        return {TokenCheck::kUnavailable, std::nullopt};  // store closed → we cannot know
+
+    if (auto token = validate_token(raw_token))
+        return {TokenCheck::kValid, std::move(token)};
+
+    // The negative answer came from one of two very different places: the row is
+    // absent/revoked/expired (definitive), or the read itself failed (SQLITE_BUSY,
+    // I/O error, corruption — `validate_token` folds those into nullopt too).
+    // Probe the store with a trivial read: if THAT works, the store is healthy and
+    // the negative answer was real. Fail-safe direction: a broken store reports
+    // kUnavailable, which grants a BOUNDED grace window — it never grants access.
+    std::unique_lock db_lock(db_mtx_);
+    sqlite3_stmt* probe = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT 1 FROM api_tokens LIMIT 1;", -1, &probe, nullptr) !=
+        SQLITE_OK)
+        return {TokenCheck::kUnavailable, std::nullopt};
+    const int rc = sqlite3_step(probe);
+    sqlite3_finalize(probe);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return {TokenCheck::kUnavailable, std::nullopt};
+    return {TokenCheck::kInvalid, std::nullopt};
+}
+
 void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
     std::lock_guard cache_lock(cache_mtx_);
     token_cache_.erase(token_hash);

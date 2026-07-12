@@ -28,6 +28,12 @@
 
 namespace yuzu::server {
 
+namespace mcp {
+// Defined in mcp_stream.hpp; forward-declared so the auth header does not pull
+// in the MCP stream module (the dependency runs the other way).
+enum class StreamRevalidate;
+}  // namespace mcp
+
 namespace detail {
 
 /// Sanitises an externally-controlled string (the motivating case is an
@@ -89,6 +95,31 @@ public:
     /// that has already cleared its authorization gate via require_auth or
     /// require_permission and just needs to know who's calling.
     std::optional<auth::Session> resolve_session(const httplib::Request& req);
+
+    /// Re-validate the credential on a HELD-OPEN stream (MCP `GET /mcp/v1/`),
+    /// against the principal that stream is bound to. Called once per heartbeat
+    /// tick from the SSE pump, so a revoked credential cuts a LIVE stream — not
+    /// merely future attaches (ADR-1005 Decision 15(c)).
+    ///
+    /// Tri-state on purpose (Decision 15(i) / chaos CH-4): an unreachable auth
+    /// backend is NOT a revocation, and must not cut every stream on the fleet at
+    /// the same instant — it yields kIndeterminate, which the pump rides out for a
+    /// bounded grace window. Anything definitive (no credential, unknown/expired
+    /// cookie, revoked/expired token, credential now bound to a DIFFERENT
+    /// principal) is kRevoked and kills the stream on the spot.
+    ///
+    /// Credential precedence mirrors `resolve_session` (cookie → Bearer →
+    /// X-Yuzu-Token) but deliberately skips its lazy elevation-reap side effect —
+    /// re-validation is a read, not a request.
+    ///
+    /// NOTE (accepted, documented for security review): a cookie-authenticated
+    /// stream slides the session's INACTIVITY window on every tick, so a live
+    /// stream keeps its cookie session alive. The absolute session lifetime still
+    /// terminates it. MCP clients authenticate with API tokens in practice; if the
+    /// inactivity semantics matter for a future browser-side MCP client, the fix is
+    /// a non-touching `peek_session` on AuthManager.
+    mcp::StreamRevalidate revalidate_stream(const httplib::Request& req,
+                                            const std::string& expected_principal);
 
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.

@@ -14,6 +14,7 @@
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mcp_stream.hpp" // mcp::StreamRevalidate — the held-open-stream re-validation contract
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "principal_class.hpp"
@@ -362,6 +363,51 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     }
 
     return std::nullopt;
+}
+
+mcp::StreamRevalidate AuthRoutes::revalidate_stream(const httplib::Request& req,
+                                                    const std::string& expected_principal) {
+    using R = mcp::StreamRevalidate;
+
+    // 1. Session cookie. AuthManager's session table is in-memory, so its answer is
+    //    always DEFINITIVE — there is no backend to be unavailable.
+    const auto cookie = extract_session_cookie(req);
+    if (!cookie.empty() && cookie.size() <= auth::kMaxSessionTokenLength) {
+        auto session = auth_mgr_.validate_session(cookie);
+        if (!session)
+            return R::kRevoked;  // signed out / expired / unknown — definitive
+        // A credential that now resolves to a DIFFERENT principal is a rebind, and a
+        // rebind is a revocation of the stream's authority: the stream carries the
+        // original principal's session messages and must not survive the change.
+        return session->username == expected_principal ? R::kValid : R::kRevoked;
+    }
+
+    // 2. Authorization: Bearer <token>, then 3. X-Yuzu-Token (resolve_session's order).
+    std::string raw;
+    if (const auto header = req.get_header_value("Authorization");
+        header.size() > 7 && header.substr(0, 7) == "Bearer ") {
+        raw = header.substr(7);
+    } else {
+        raw = req.get_header_value("X-Yuzu-Token");
+    }
+    if (raw.empty() || raw.size() > auth::kMaxApiTokenLength)
+        return R::kRevoked;  // no usable credential on the request — definitive
+    if (!api_token_store_)
+        return R::kRevoked;  // token auth is not configured at all — definitive
+
+    const auto checked = api_token_store_->validate_token_checked(raw);
+    switch (checked.status) {
+    case ApiTokenStore::TokenCheck::kUnavailable:
+        // The store is unreachable. That is NOT evidence of revocation — say so, and
+        // let the pump ride out its bounded grace window (Decision 15(i), CH-4).
+        return R::kIndeterminate;
+    case ApiTokenStore::TokenCheck::kInvalid:
+        return R::kRevoked;
+    case ApiTokenStore::TokenCheck::kValid:
+        return checked.token && checked.token->principal_id == expected_principal ? R::kValid
+                                                                                  : R::kRevoked;
+    }
+    return R::kRevoked;  // unreachable; fail closed
 }
 
 std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,

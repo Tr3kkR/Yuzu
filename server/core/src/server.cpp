@@ -116,6 +116,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
+#include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
@@ -415,6 +416,34 @@ public:
                           "counter");
         for (auto side : {"engine", "operator"}) {
             metrics_.counter("yuzu_server_principal_quota_admits_total", {{"side", side}});
+        }
+        // MCP Streamable HTTP transport (ADR-1005 Decision 15(k) — the family was
+        // NAMED in the decision, not left to implementer discretion, so alerts can
+        // be authored against it before every rung has landed). Pre-seeded to 0 per
+        // docs/observability-conventions.md so absent() alerts stay meaningful, and
+        // `reason` is a CLOSED set — every value is seeded here and no label value
+        // is ever derived from caller-controlled input.
+        metrics_.describe("yuzu_mcp_sessions_active", "MCP Streamable HTTP sessions currently live",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_sessions_opened_total",
+                          "MCP Streamable HTTP sessions minted on initialize", "counter");
+        metrics_.describe("yuzu_mcp_streams_active",
+                          "MCP GET SSE streams currently held open (each pins one HTTP worker)",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_stream_replay_ring_evictions_total",
+                          "Frames evicted from a session's bounded replay ring — a client whose "
+                          "cursor falls behind gets a 404 and must re-initialize",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_rejects_total",
+                          "MCP GET SSE stream attach denials by reason", "counter");
+        metrics_.gauge("yuzu_mcp_sessions_active").set(0);
+        metrics_.counter("yuzu_mcp_sessions_opened_total");
+        metrics_.gauge("yuzu_mcp_streams_active").set(0);
+        metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
+        for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
+                            "per_principal_stream_cap", "global_stream_cap",
+                            "replay_window_exceeded", "origin"}) {
+            metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
@@ -5392,6 +5421,42 @@ private:
         // in-progress connections; 30s gives adequate headroom.
         web_server_->set_read_timeout(30);
         web_server_->set_write_timeout(30);
+
+        // -- Worker pool + held-open-stream budget (ADR-1005 Decision 15(h)) ---
+        //
+        // Every held-open SSE response pins ONE worker for the life of the stream
+        // (the content provider blocks in cv.wait_for). Until now the pool was
+        // httplib's implicit default and nothing capped concurrent streams, so a
+        // fleet of agentic clients could occupy every worker and starve plain REST.
+        //
+        // Size the pool EXPLICITLY (same numbers httplib would pick by default, but
+        // now ours to reason about) and derive the stream budget from it, holding a
+        // reserve of workers that streams can never take.
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t pool_base =
+            cfg_.http_worker_threads > 0
+                ? cfg_.http_worker_threads
+                : std::max<std::size_t>(8, hw > 0 ? static_cast<std::size_t>(hw) - 1 : 0);
+        const std::size_t pool_max = pool_base * 4; // httplib's growable-pool ratio
+        web_server_->new_task_queue = [pool_base, pool_max] {
+            return new httplib::ThreadPool(pool_base, pool_max);
+        };
+        const std::size_t effective_streams = detail::derive_stream_budget(
+            pool_max, detail::kPlainRestReserveDefault, cfg_.mcp_max_streams);
+        if (effective_streams < cfg_.mcp_max_streams) {
+            // Clamp, never refuse: a derived resource limit must not brick a boot.
+            spdlog::warn("--mcp-max-streams {} exceeds the worker budget; clamped to {} "
+                         "(pool max {} - plain-REST reserve {})",
+                         cfg_.mcp_max_streams, effective_streams, pool_max,
+                         detail::kPlainRestReserveDefault);
+        }
+        stream_budget_ = std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{
+            effective_streams, cfg_.mcp_max_streams_per_principal});
+        spdlog::info("HTTP worker pool: base={} max={}; held-open MCP SSE streams capped at {} "
+                     "({} per principal), plain-REST reserve {}. NOTE: /api/v1/events and the "
+                     "dashboard SSE streams are NOT yet on this budget (issue #2056).",
+                     pool_base, pool_max, effective_streams, cfg_.mcp_max_streams_per_principal,
+                     detail::kPlainRestReserveDefault);
 
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler([this](const httplib::Request& req,
@@ -11600,7 +11665,8 @@ private:
             // stop() joins the web server's worker threads (~ServerImpl → stop()
             // → web_server_->stop()) before any member destructs — no handler
             // runs after the join, so member-destruction order is irrelevant.
-            mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
+            mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>(
+                mcp::McpSessionRegistry::Config{}, mcp::McpSessionRegistry::ClockFn{}, &metrics_);
             // PR 4.3 (T13): wire the engine-principal store + the SAME
             // engine-credential store (api_token_store_) + the shared
             // owner-existence predicate the 8 engine tools need. Setters
@@ -11792,7 +11858,17 @@ private:
                 // per-user user_ref PII stays on the audited REST drill).
                 software_licensing_store_.get(),
                 // PR 4.2 — engine role-assignment MCP twins.
-                engine_principal_store_.get());
+                engine_principal_store_.get(),
+                // PR 2 (GET SSE channel): the SHARED held-open-stream budget (one
+                // instance across every SSE surface on this worker pool) and the
+                // per-tick credential re-validation seam. Both are raw borrows of
+                // ServerImpl members — same lifetime argument as mcp_sessions_ above
+                // (stop() joins the workers before any member destructs).
+                stream_budget_.get(),
+                [this](const httplib::Request& req,
+                       const std::string& principal) -> mcp::StreamRevalidate {
+                    return auth_routes_->revalidate_stream(req, principal);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -12153,6 +12229,14 @@ private:
     // /mcp/v1/ handlers; safe because stop() joins web_server_ before members
     // destruct (see ~ServerImpl → stop() → web_server_->stop()).
     std::unique_ptr<mcp::McpSessionRegistry> mcp_sessions_;
+    // Shared admission budget for held-open SSE responses (2f PR 2, Decision
+    // 15(h)). ONE instance for the whole web server — the streamed-POST channel
+    // (2f PR 3) and /api/v1/events (#2056) take leases from THIS object rather
+    // than minting their own counters, or the shared worker pool can still be
+    // starved by whichever surface opted out. Same raw-borrow lifetime argument
+    // as mcp_sessions_ above; a live provider's lease is released on teardown,
+    // and stop() joins those workers before this member destructs.
+    std::unique_ptr<detail::StreamBudget> stream_budget_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;

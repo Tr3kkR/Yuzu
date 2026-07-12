@@ -6586,10 +6586,17 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                   const bool* mcp_disabled,
                                                   const bool* streaming_disabled,
                                                   McpSessionRegistry* sessions,
-                                                  std::vector<std::string> allowed_origins) {
+                                                  std::vector<std::string> allowed_origins,
+                                                  yuzu::server::detail::StreamBudget* stream_budget,
+                                                  StreamRevalidateFn revalidate_fn,
+                                                  yuzu::MetricsRegistry* metrics) {
     const std::vector<std::string> origins = std::move(allowed_origins);
     return [=](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Content-Type", "application/json");
+        // NOTE: no up-front Content-Type here. httplib's set_header EMPLACES into a
+        // multimap without erasing, while set_chunked_content_provider only
+        // set_header's its own type — so an application/json set here would ride
+        // along on the SSE response as a SECOND Content-Type header. Every denial
+        // path below sets the JSON type through set_content (which erases first).
         auto session_audit = [&](const char* action, const char* result,
                                  const std::string& target_id, const std::string& detail) {
             (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
@@ -6614,6 +6621,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "origin"}})
+                    .increment();
+            }
             res.status = 403;
             res.set_content(
                 error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
@@ -6625,8 +6636,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
-        // PR 1 placeholder — the real GET SSE channel is 2f PR 2.
-        res.status = 405;
+        // The SSE channel itself (session gate, Accept negotiation, replay, caps,
+        // provider) lives in mcp_stream.cpp — this file stays wiring.
+        handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
+                        metrics, audit_fn);
     };
 }
 
@@ -6729,12 +6742,15 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool* mcp_streaming_disabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
-                                EnginePrincipalStore* engine_principal_store) {
+                                EnginePrincipalStore* engine_principal_store,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
     svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins));
+                                          sessions, allowed_origins, stream_budget, revalidate_fn,
+                                          metrics));
     svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
@@ -6761,6 +6777,19 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  "({} tools, {} resources, {} prompts{}{})",
                  kToolCount, kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "",
                  streaming_off ? ", streaming disabled" : "");
+    // A streaming-enabled endpoint with either seam unwired is a misconfiguration,
+    // not a mode: without the budget, held-open GET streams are admitted without
+    // limit onto the shared worker pool; without re-validation, a revoked
+    // credential keeps its live stream until the session TTL. Test seams omit
+    // them deliberately; a production registration must not.
+    if (!streaming_off && stream_budget == nullptr) {
+        spdlog::warn("MCP: streaming enabled with NO stream budget — concurrent GET SSE "
+                     "streams are uncapped on the shared HTTP worker pool");
+    }
+    if (!streaming_off && !revalidate_fn) {
+        spdlog::warn("MCP: streaming enabled with NO credential re-validation — a live GET SSE "
+                     "stream will survive revocation of the credential that opened it");
+    }
 }
 
 } // namespace yuzu::server::mcp

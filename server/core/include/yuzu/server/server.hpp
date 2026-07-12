@@ -304,6 +304,18 @@ struct Config {
     /// allowed because the endpoint requires a credential). Wired via the
     /// repeatable --mcp-allowed-origin / YUZU_MCP_ALLOWED_ORIGINS.
     std::vector<std::string> mcp_allowed_origins;
+    /// Concurrently held-open MCP SSE streams, globally and per principal
+    /// (Decision 15(d)/(h)). Each stream pins one HTTP worker for its whole life,
+    /// so this is a worker-pool budget, not a taste setting: the global cap is
+    /// clamped at boot to `pool_max - plain-REST reserve`. Per-principal is
+    /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
+    /// cursor, a held-open worker is not.
+    std::size_t mcp_max_streams{16};
+    std::size_t mcp_max_streams_per_principal{4};
+    /// Base size of the shared httplib worker pool (0 = auto: max(8, hw−1), the
+    /// same number httplib picks by default — but chosen explicitly so the stream
+    /// budget above can be derived from it). Pool max is 4× the base.
+    std::size_t http_worker_threads{0};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)

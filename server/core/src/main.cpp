@@ -432,6 +432,17 @@ int main(int argc, char* argv[]) {
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
                    "repeatable). Empty rejects any present Origin (absent is always allowed).")
         ->envname("YUZU_MCP_ALLOWED_ORIGINS");
+    app.add_option("--mcp-max-streams", cfg.mcp_max_streams,
+                   "Max concurrently held-open MCP SSE streams (each pins one HTTP worker; "
+                   "clamped at boot to the worker pool minus a plain-REST reserve)")
+        ->envname("YUZU_MCP_MAX_STREAMS");
+    app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
+                   "Max concurrently held-open MCP SSE streams per principal")
+        ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
+    app.add_option("--http-worker-threads", cfg.http_worker_threads,
+                   "Base size of the shared HTTP worker pool (0 = auto: max(8, cores-1); "
+                   "pool grows to 4x this). Held-open SSE streams are budgeted against it.")
+        ->envname("YUZU_HTTP_WORKER_THREADS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,
