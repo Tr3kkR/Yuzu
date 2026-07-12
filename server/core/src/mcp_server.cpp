@@ -2,6 +2,7 @@
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
+#include "mcp_transport.hpp" // Streamable HTTP transport pre-checks (2f)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -916,13 +917,31 @@ McpServer::HandlerFn McpServer::build_handler(
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
-    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn) {
+    yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
+    McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
+    std::vector<std::string> allowed_origins) {
 
-    // Capture by reference so runtime changes (e.g., settings UI toggle)
-    // take effect without server restart. The references point to cfg_ members
-    // which outlive the returned handler (owned by the server impl).
-    const bool& is_read_only = read_only_mode;
-    const bool& is_disabled = mcp_disabled;
+    // Live reads via a pointer captured by value in the [=] handler below, so a
+    // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
+    // already-built handler. A [=] capture of a `const bool&` ALIAS freezes a
+    // stale copy at build time (verified) — which is why the pre-2f POST kill
+    // switch silently ignored the settings toggle while GET/DELETE (same const
+    // bool* idiom) honored it; this restores parity across all three handlers
+    // (governance CONS-S1). read_only_mode / mcp_disabled bind to cfg_ members
+    // that outlive the handler, so their addresses are stable.
+    const bool* const p_read_only = &read_only_mode;
+    const bool* const p_disabled = &mcp_disabled;
+
+    // MCP Streamable HTTP (ADR-1005 Decision 15, 2f). Streaming is ON only when a
+    // session registry is wired AND the --mcp-no-streaming kill switch is off.
+    // sessions == nullptr (legacy build_handler callers / most tests) ⇒ streaming
+    // off ⇒ the pre-2f stateless path, byte-identical except the unconditional 202.
+    // The kill-switch pointer is captured by value (the bool it points at is a cfg_
+    // member that outlives the handler) — an empirically-verified live read, unlike
+    // the stale copy a [=] capture of a const bool& alias produces.
+    McpSessionRegistry* const mcp_sessions = sessions;
+    const bool* const p_streaming_off = mcp_streaming_disabled;
+    const std::vector<std::string> mcp_allowed_origins = std::move(allowed_origins);
 
     // Live-query bundle orchestrator (ADR-0011) — backs execute_bundle /
     // get_bundle_result. Built from the same dispatch_fn + response_store the MCP
@@ -966,11 +985,65 @@ McpServer::HandlerFn McpServer::build_handler(
     return [=](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Content-Type", "application/json");
 
+        // Session-lifecycle audit routed through the shared behavioural-audit
+        // kernel so a persist failure/throw is logged + metric-bumped, never
+        // silently swallowed on an adversarial-facing denial (governance COMP-S1,
+        // observability-conventions CC7.2). A denial proceeds regardless — the
+        // safe outcome — but the audit gap is no longer invisible.
+        auto session_audit = [&](const char* action, const char* result,
+                                 const std::string& target_id, const std::string& detail) {
+            (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
+                                                          target_id, detail);
+        };
+
         // Runtime kill switch check (G4-UHP-MCP-003) — evaluated on every request
-        if (is_disabled) {
+        if (*p_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
             res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
                             "application/json");
             return;
+        }
+
+        // Streamable HTTP is ON only when a registry is wired AND --mcp-no-streaming
+        // is off. Streaming OFF ⇒ the pre-2f stateless path (no minting, no
+        // Origin/session checks) — legacy clients unchanged bar the 202 below.
+        const bool streaming_on =
+            mcp_sessions != nullptr && !(p_streaming_off && *p_streaming_off);
+
+        // ── Transport pre-checks (streaming enabled only) ──────────────────
+        if (streaming_on) {
+            // Origin (DNS-rebinding defence). Absent → allowed (credential
+            // required); present → must match the configured allowlist (CH-9).
+            if (!transport::origin_allowed(req.get_header_value("Origin"),
+                                           mcp_allowed_origins)) {
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+                res.status = 403;
+                res.set_content(
+                    error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
+                                           "remove the Origin header or add this origin to "
+                                           "--mcp-allowed-origin"),
+                    "application/json");
+                return;
+            }
+            // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
+            const auto pv = req.get_header_value("MCP-Protocol-Version");
+            if (!pv.empty() && !transport::protocol_version_supported(pv)) {
+                const auto cid = yuzu::server::detail::make_correlation_id();
+                session_audit("mcp.session.reject", "failure", "",
+                              "reason=protocol_version cid=" + cid);
+                res.status = 400;
+                res.set_content(
+                    error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
+                                           cid,
+                                           "send MCP-Protocol-Version: 2025-06-18 (or omit the "
+                                           "header to accept the 2025-03-26 default)"),
+                    "application/json");
+                return;
+            }
         }
 
         // Auth check — reuses the server's existing auth middleware pipeline
@@ -987,10 +1060,37 @@ McpServer::HandlerFn McpServer::build_handler(
         auto& rpc = *parsed;
         auto id = rpc.id.value_or(nlohmann::json(nullptr));
 
+        // ── Presented session validation (Streamable HTTP) ──────────────────
+        // Any method other than initialize that carries an Mcp-Session-Id must
+        // present a live, principal-bound one; unknown / expired / foreign → 404
+        // and the client re-initializes (no cross-principal oracle — the wrong
+        // principal is indistinguishable from a never-existed id, 15(a)/CH-8).
+        if (streaming_on) {
+            const auto sid = req.get_header_value("Mcp-Session-Id");
+            if (!sid.empty() && rpc.method != "initialize") {
+                if (mcp_sessions->validate_and_touch(sid, session->username) !=
+                    McpSessionRegistry::ValidateResult::kValid) {
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+                                  "reason=unknown_session cid=" + cid);
+                    res.status = 404;
+                    // Echo the request id — this is a post-parse error with a known
+                    // id, and JSON-RPC 2.0 SHOULD echo it (governance CONS-S3).
+                    res.set_content(
+                        error_response_a4(id, kMcpUnknownSession, "Unknown or expired session", cid,
+                                          "re-initialize: send an initialize request to obtain a "
+                                          "fresh Mcp-Session-Id"),
+                        "application/json");
+                    return;
+                }
+            }
+        }
+
         // ── Notification (no id → no response) ───────────────────────────
         if (!rpc.id.has_value()) {
-            // notifications/initialized — acknowledge and return empty
-            res.status = 204;
+            // notifications/initialized — acknowledge (MCP Streamable HTTP spec:
+            // an accepted notification/response POST answers 202, not 204).
+            res.status = 202;
             return;
         }
 
@@ -1001,9 +1101,49 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // ── initialize ────────────────────────────────────────────────────
         if (method == "initialize") {
+            // Negotiate the protocol revision: echo the client's requested version
+            // when supported, else fall back to the default baseline. (2g PR 1
+            // records the negotiated revision + strict-client handling; PR 1 only
+            // clamps to the supported set.)
+            std::string negotiated{transport::kProtocolDefault};
+            if (params.contains("protocolVersion") && params["protocolVersion"].is_string()) {
+                const auto req_pv = params["protocolVersion"].get<std::string>();
+                if (transport::protocol_version_supported(req_pv)) {
+                    negotiated = req_pv;
+                }
+            }
+
+            // Mint a session (streaming only). A cap hit rejects THIS initialize
+            // with an A4-shaped JSON-RPC error (correlation_id + nullable
+            // retry_after_ms + remediation, via the shared error_response_a4
+            // builder) — a live session is never evicted to make room
+            // (ADR-1005 exec-plan Decision 15(j); chaos-design CH-5, a PR-1 gate).
+            // A client-supplied Mcp-Session-Id is never adopted here (no
+            // fixation, 15(a)/CH-8).
+            if (streaming_on) {
+                auto mint = mcp_sessions->mint(session->username);
+                if (!mint.ok) {
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    session_audit("mcp.session.reject", "failure", "",
+                                  "reason=" + mint.reject_reason + " cid=" + cid);
+                    res.status = 429;
+                    res.set_content(
+                        error_response_a4(
+                            id, kMcpSessionCap, "Session limit reached", cid,
+                            "end an unused session via DELETE /mcp/v1/ or wait for idle timeout"),
+                        "application/json");
+                    return;
+                }
+                res.set_header("Mcp-Session-Id", mint.session_id);
+                // detail left empty — the principal is derived from `req` by the
+                // audit layer; the session-id prefix in target_id correlates
+                // open→close (governance CONS-N2).
+                session_audit("mcp.session.open", "success", mint.session_id.substr(0, 8), "");
+            }
+
             auto result =
                 JObj()
-                    .add("protocolVersion", "2025-03-26")
+                    .add("protocolVersion", negotiated)
                     .raw("capabilities",
                          JObj()
                              .raw("tools", R"({"listChanged":false})")
@@ -1520,7 +1660,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── C7: read_only_mode enforcement ──────────────────────────
             // When the server is in read-only mode, reject any tool that
             // performs a Write/Execute/Delete operation.
-            if (is_read_only && kWriteTools.contains(tool_name)) {
+            if (*p_read_only && kWriteTools.contains(tool_name)) {
                 mcp_audit("denied", "read-only mode");
                 res.set_content(a4_error(kTierDenied, "MCP is in read-only mode",
                                          "the server is running with --mcp-read-only; use the "
@@ -5041,6 +5181,134 @@ McpServer::HandlerFn McpServer::build_handler(
     };
 }
 
+// ── GET / DELETE handlers (Streamable HTTP transport, 2f PR 1) ──────────────
+// mcp_disabled / streaming_disabled are captured by pointer (live cfg_ reads),
+// mirroring build_handler's kill-switch treatment. GET is a 405 placeholder this
+// rung (the SSE channel lands in 2f PR 2); DELETE terminates a principal-bound
+// session (200) or 404s an unknown/foreign one (no cross-principal oracle).
+
+McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_fn,
+                                                  const bool* mcp_disabled,
+                                                  const bool* streaming_disabled,
+                                                  McpSessionRegistry* sessions,
+                                                  std::vector<std::string> allowed_origins) {
+    const std::vector<std::string> origins = std::move(allowed_origins);
+    return [=](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Content-Type", "application/json");
+        auto session_audit = [&](const char* action, const char* result,
+                                 const std::string& target_id, const std::string& detail) {
+            (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
+                                                          target_id, detail);
+        };
+        if (mcp_disabled && *mcp_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
+            res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
+                            "application/json");
+            return;
+        }
+        const bool streaming_on =
+            sessions != nullptr && !(streaming_disabled && *streaming_disabled);
+        if (!streaming_on) {
+            res.status = 405; // GET requires Streamable HTTP; --mcp-no-streaming → 405
+            return;
+        }
+        // Origin before auth so a hostile Origin is rejected even unauthenticated (CH-9).
+        if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+            res.status = 403;
+            res.set_content(
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
+                                       "remove the Origin header or add this origin to "
+                                       "--mcp-allowed-origin"),
+                "application/json");
+            return;
+        }
+        auto session = auth_fn(req, res);
+        if (!session)
+            return; // auth_fn already set 401
+        // PR 1 placeholder — the real GET SSE channel is 2f PR 2.
+        res.status = 405;
+    };
+}
+
+McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn audit_fn,
+                                                     const bool* mcp_disabled,
+                                                     const bool* streaming_disabled,
+                                                     McpSessionRegistry* sessions,
+                                                     std::vector<std::string> allowed_origins) {
+    const std::vector<std::string> origins = std::move(allowed_origins);
+    return [=](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Content-Type", "application/json");
+        auto session_audit = [&](const char* action, const char* result,
+                                 const std::string& target_id, const std::string& detail) {
+            (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
+                                                          target_id, detail);
+        };
+        if (mcp_disabled && *mcp_disabled) {
+            // Kill-switch denial is intentionally NOT A4-shaped: "feature off" is
+            // terminal for the caller (no session to correlate, no client-side
+            // remediation) — the deliberate boundary vs the 8 A4 transport denials
+            // (gov Gate 6 consensus; a converge-or-annotate follow-up is tracked).
+            res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
+                            "application/json");
+            return;
+        }
+        const bool streaming_on =
+            sessions != nullptr && !(streaming_disabled && *streaming_disabled);
+        if (!streaming_on) {
+            res.status = 405;
+            return;
+        }
+        if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+            res.status = 403;
+            res.set_content(
+                error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
+                                       "remove the Origin header or add this origin to "
+                                       "--mcp-allowed-origin"),
+                "application/json");
+            return;
+        }
+        auto session = auth_fn(req, res);
+        if (!session)
+            return; // auth_fn already set 401
+        const auto sid = req.get_header_value("Mcp-Session-Id");
+        if (sid.empty()) {
+            // Audit the malformed-request denial too so a SIEM watching DELETE
+            // rejects sees it (governance sec-LOW).
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", "",
+                          "reason=missing_session_header cid=" + cid);
+            res.status = 400;
+            res.set_content(
+                error_response_null_a4(kInvalidRequest, "Mcp-Session-Id header required", cid,
+                                       "include the Mcp-Session-Id header naming the session to "
+                                       "terminate"),
+                "application/json");
+            return;
+        }
+        if (sessions->terminate(sid, session->username)) {
+            session_audit("mcp.session.close", "success", sid.substr(0, 8), "");
+            res.status = 200;
+        } else {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+                          "reason=unknown_session cid=" + cid);
+            res.status = 404;
+            res.set_content(
+                error_response_null_a4(kMcpUnknownSession, "Unknown or expired session", cid,
+                                       "the session does not exist or is already terminated; no "
+                                       "action needed"),
+                "application/json");
+        }
+    };
+}
+
 // ── Route registration ────────────────────────────────────────────────────
 
 void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
@@ -5062,7 +5330,17 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
-                                ScopedPermFn scoped_perm_fn) {
+                                ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
+                                const bool* mcp_streaming_disabled,
+                                std::vector<std::string> allowed_origins) {
+    // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
+    // build_handler std::move()s below. &mcp_disabled is a live pointer into the
+    // cfg_ member (outlives the handlers).
+    svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
+                                          sessions, allowed_origins));
+    svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
+                                                mcp_streaming_disabled, sessions, allowed_origins));
+
     svr.Post("/mcp/v1/",
              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -5074,12 +5352,17 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(response_scope_fn), software_inventory_store,
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn), agent_registry,
-                           std::move(scoped_perm_fn)));
+                           std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
+                           sessions, mcp_streaming_disabled, std::move(allowed_origins)));
 
-    spdlog::info(
-        "MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",
-        kToolCount, kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "");
+    // Streaming is ON only when a registry is wired AND the kill switch is off —
+    // report the true state, not just the kill-switch bit (governance arch/sre NICE).
+    const bool streaming_off =
+        sessions == nullptr || (mcp_streaming_disabled && *mcp_streaming_disabled);
+    spdlog::info("MCP: registered JSON-RPC endpoint at POST/GET/DELETE /mcp/v1/ "
+                 "({} tools, {} resources, {} prompts{}{})",
+                 kToolCount, kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "",
+                 streaming_off ? ", streaming disabled" : "");
 }
 
 } // namespace yuzu::server::mcp
