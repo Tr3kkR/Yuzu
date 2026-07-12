@@ -1172,7 +1172,14 @@ Server-side tags on software catalog entries:
 *Formalize third-party integration and provide client libraries for automation.*
 
 ### Issue 11.1: Consumer Application Registration
-**Capability:** 24.4 | **Scope:** Server | **Status:** Open
+**Capability:** 24.4 | **Scope:** Server | **Status:** Open — **partially superseded by ADR-1005**
+
+> **ADR-1005 note:** the consumer auth/token model described below (scoped API
+> tokens, rate limits, consumer identity) is absorbed into ADR-1005's **engine
+> principals** (see `docs/adr/1005-headless-platform-use-case-engines.md`
+> Decision 5 and the execution plan's Phase 4). The push/consumer-deploy fanout
+> mechanics (pushing instruction definitions and policies *to* consumers) are
+> **not** addressed by ADR-1005 and remain open under this issue.
 
 Formal model for external systems consuming Yuzu data:
 - `ConsumerStore` (SQLite): name, URL, max_concurrent_instructions, offload_target, enabled
@@ -1651,7 +1658,13 @@ Honor `Accept: application/json` on `/fragments/*` page routes; return structure
 **Files:** new `server/core/src/agent_sse_routes.{cpp,hpp}`, reuse `server.cpp:2450-2478` infrastructure.
 
 ### Issue 17.4: Service-Account Principal Type
-**Capability:** new | **Scope:** Server (auth) | **Status:** Proposed
+**Capability:** new | **Scope:** Server (auth) | **Status:** Proposed — **absorbed into the ADR-1005 auth follow-up**
+
+> **ADR-1005 note:** this issue's substance (a machine principal type with
+> least-privilege scoping and rotation) is absorbed into the engine-principal
+> class and the auth-architecture follow-up design (execution plan Phase 2b /
+> Phase 4 — see `docs/adr-1005-execution-plan.md`). Do not implement it
+> standalone; it would build a second, parallel machine-principal model.
 
 `auth_db` migration adds `principal_type IN ('user','service_account')`. Service accounts can be scoped to mgmt-group / plugin / operation subsets. Token rotation pair-overlap workflow exposed via REST. Required for least-privilege agentic worker identity in multi-tenant deployments. Touches A2 (discovery surface for service-account scopes).
 
@@ -1668,17 +1681,21 @@ Every failure response includes `correlation_id`, `retry_after_ms` (nullable), `
 
 ## Phase 18: Compliance & Lifecycle (Proposed)
 
-*Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: `docs/capability-agentic-audit-2026-05.md` §7 P3.*
+*Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: `docs/capability-agentic-audit-2026-05.md` §7 P3. See also: the ADR-1005 execution plan (`docs/adr-1005-execution-plan.md`) — several items in this phase are boundary-affected by the headless-platform decision and must be re-evaluated against ADR-1005 Decision 2 before implementation.*
 
 ### Issue 18.1: Vulnerability Lifecycle
-**Capability:** new | **Scope:** Server | **Status:** Proposed
+**Capability:** new | **Scope:** UCE module (was: Server) | **Status:** Proposed
 
-CVE → CVSS → owner → SLA → remediation tracking. Supplements existing `vuln_scan` plugin with a server-side lifecycle store. Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
+CVE → CVSS → owner → SLA → remediation tracking. Supplements the existing `vuln_scan` collection plugin with a findings store carrying a triage lifecycle (new / triaged / accepted-risk / remediated / reopened) **in the vulnerability-management use-case engine (UCE) module, not a server-side store** — the execution plan's M3 milestone builds exactly this findings store + lifecycle as part of the module that re-homes the server-side NVD capability (ADR-1005 grandfathered surface #2; see `docs/adr-1005-execution-plan.md`, Module scoping). Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
 
 ### Issue 18.2: Compliance Reporting Templates
-**Capability:** new | **Scope:** Server | **Status:** Proposed
+**Capability:** new | **Scope:** Server | **Status:** Proposed — **boundary-affected by ADR-1005**
 
 CIS Benchmarks, NIST 800-171, SOC 2 evidence-pack templates that compose PolicyStore rules + audit log entries into auditor-ready PDF/CSV bundles.
+
+> **ADR-1005 note:** compliance-framework mappings are interpretation baked
+> into code — re-evaluate against Decision 2's boundary test before
+> implementation; likely a future UCE module.
 
 ### Issue 18.3: Certificate Lifecycle
 **Capability:** new | **Scope:** Server + agent | **Status:** Proposed
@@ -1691,9 +1708,13 @@ Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate i
 HashiCorp Vault, Azure Key Vault, AWS Secrets Manager connectors for connector credentials and enrollment tokens. Replaces SQLite-encrypted-at-rest for shops with a vault.
 
 ### Issue 18.5: SBOM Ingest
-**Capability:** new | **Scope:** Server | **Status:** Proposed
+**Capability:** new | **Scope:** Server | **Status:** Proposed — **boundary-affected by ADR-1005**
 
 CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on `openssl-1.1.1k` lights up every fleet host carrying that component.
+
+> **ADR-1005 note:** joins fleet data with external domain data — re-evaluate
+> against Decision 2's boundary test before implementation; the execution
+> plan's deferred ledger earmarks it as a separate future UCE module.
 
 ### Issue 18.6: Hardware Attestation
 **Capability:** new | **Scope:** Agent + server | **Status:** Proposed

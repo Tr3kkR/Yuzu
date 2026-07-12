@@ -1,0 +1,1 @@
+{"spark":{"type":"registry-value"},"assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","key":"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run","value_type":"REG_SZ"}},"remediation":{"params":{"mode":"backoff","max_attempts":3}}}

@@ -21,12 +21,13 @@
 FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
 
 # ── System packages (matches ci.yml) ─────────────────────────────────────
+COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y \
         cmake ninja-build pkg-config curl zip unzip tar \
         python3-pip ccache git \
         bison flex libsystemd-dev \
         gcc-15 g++-15 clang-21 \
-    && pip3 install --break-system-packages meson==1.9.2 \
+    && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8

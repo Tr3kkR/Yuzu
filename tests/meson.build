@@ -38,8 +38,16 @@ if host_os == 'windows'
     # Catch2 satisfies the leftover refs.
     dependencies: [_libcatch2main, _libcatch2],
   )
+  # No-main variant for yuzu_agent_tests (#1648 diagnostic): the suite
+  # supplies its own main() via unit/test_runner_main.cpp so it can log
+  # Catch2's real return code, so it must NOT also pull in Catch2Main.
+  catch2_nomain_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: [_libcatch2],
+  )
 else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+  catch2_nomain_dep = dependency('Catch2', modules: ['Catch2::Catch2'], method: 'cmake', required: true, include_type: 'system')
 endif
 
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
@@ -110,6 +118,10 @@ endif
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
+    # Custom Catch2 entry point (#1648 diagnostic) — logs Session::run()'s
+    # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
+    # above.
+    'unit/test_runner_main.cpp',
     'unit/test_plugin_loader.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
@@ -138,6 +150,10 @@ agent_test_exe = executable(
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
+    'unit/test_thread_pool.cpp',
+    'unit/test_spark_disk.cpp',
+    'unit/test_spark_engine.cpp',
+    'unit/test_spark_mechanism.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
@@ -158,8 +174,15 @@ agent_test_exe = executable(
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
-  cpp_args: test_partial_init_args,
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
+  # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
+  # as agents/core/meson.build gates guard_systemd.cpp/spark_service.cpp.
+  cpp_args: test_partial_init_args + agent_platform_args,
+  # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
+  # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
+  # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
+  # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
@@ -269,6 +292,7 @@ if build_server
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
+      'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
@@ -361,6 +385,8 @@ if build_server
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
+      'unit/server/test_mcp_session.cpp',
+      'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
       'unit/server/test_inventory_eval.cpp',
@@ -379,6 +405,9 @@ if build_server
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
+      'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-1005 PR 1.1 gRPC end-to-end enforcement
+      'unit/server/test_principal_class.cpp', # ADR-1005 PR 1.2 actor-class label
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
@@ -401,6 +430,8 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_vuln_finding_store.cpp',
+      'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
@@ -408,6 +439,9 @@ if build_server
       'unit/server/test_app_perf_group_reader.cpp',
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
+      'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_json.cpp',
+      'unit/server/test_scim_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

@@ -28,13 +28,15 @@ on:
       - '.github/workflows/runner-inventory-sentinel.yml'
   pull_request:
     branches: [main, dev]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.github/runner-inventory.json'
-      - '.github/workflows/runner-inventory-sentinel.yml'
+    # No paths-ignore here (issue #1978). Filtering this whole workflow out
+    # for docs-only PRs left the required contexts (Preflight, Proto
+    # backward-compat, Linux/Windows/macOS debug) permanently "Expected —
+    # waiting for status", so a non-admin could never merge a docs-only PR
+    # (they had to be admin-bypassed). Instead the workflow always runs and
+    # the `preflight` job's `code_changed` output gates the heavy build jobs:
+    # a docs-only PR skips them, and a *skipped* required check is satisfied
+    # whereas an *absent* one is not. The `push:` trigger above keeps its
+    # paths-ignore — post-merge docs pushes need no build and gate nothing.
   workflow_dispatch:
 
 # Scorecard Token-Permissions hardening: ci.yml builds and tests only —
@@ -95,6 +97,12 @@ jobs:
     name: "Preflight (runner health)"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # Job-level permissions REPLACE the workflow default (contents: read), so
+    # both are listed. pull-requests: read is required by the code-vs-docs gate
+    # below, which lists the PR's changed files via the REST API (issue #1978).
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
       # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
@@ -110,6 +118,12 @@ jobs:
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
+      # code_changed (issue #1978): false iff every changed file in a PR is in
+      # the docs/ignore set the pull_request trigger used to carry. Gates the
+      # heavy build jobs (proto-compat, linux, windows, macos) so a docs-only
+      # PR skips them instead of blocking forever on absent required checks.
+      # Always true for non-PR events (push / workflow_dispatch build always).
+      code_changed: ${{ steps.codegate.outputs.code_changed }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -124,7 +138,54 @@ jobs:
       # otherwise only runs at release time, so a regex regression would surface
       # too late (after the full build matrix). No build deps — just bash.
       - name: Shell gate tests
-        run: bash tests/shell/test_check_compose_versions.sh
+        run: |
+          bash tests/shell/test_check_compose_versions.sh
+          bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+
+      # ── Docs-only vs code gate (issue #1978) ───────────────────────────
+      # Decide whether the heavy build matrix runs for this PR. The
+      # classification (which paths count as docs-only, the 3000-file API-cap
+      # truncation guard) lives in scripts/ci/detect-code-change.sh and is
+      # covered by tests/shell/test_detect_code_change.sh. Fail-closed
+      # throughout: a non-PR event, an API/permission failure, an empty list,
+      # or a truncated list all build rather than silently skip.
+      - name: Determine code-vs-docs change set (docs-only gate)
+        id: codegate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}) — building unconditionally."
+            exit 0
+          fi
+          # Fail-closed on any API/permission failure: build rather than block.
+          if ! files=$(gh api --paginate \
+                "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --jq '.[].filename'); then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "PR files API failed — building to be safe (fail-closed)."
+            exit 0
+          fi
+          echo "Changed files in PR #${{ github.event.pull_request.number }}:"
+          printf '%s\n' "$files"
+          if [[ -z "$files" ]]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Empty changed-file list — building to be safe (fail-closed)."
+            exit 0
+          fi
+          # changed_files is the authoritative total; the script fails closed if
+          # the API list is shorter (truncated past the 3000-file cap). Wrap the
+          # call so a classifier error fails toward BUILD (never toward a blocked
+          # PR), independent of the runner's default shell error mode.
+          if ! code_changed=$(printf '%s\n' "$files" \
+                | bash scripts/ci/detect-code-change.sh "${{ github.event.pull_request.changed_files }}"); then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Classifier errored — building to be safe (fail-closed)."
+            exit 0
+          fi
+          echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
+          echo "Result: code_changed=$code_changed"
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
@@ -149,7 +210,9 @@ jobs:
     needs: [preflight]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
-    if: needs.preflight.outputs.linux_pool_healthy == 'true'
+    # `&& code_changed` (issue #1978): a docs-only PR skips this required job
+    # (skipped == satisfied), so it no longer blocks the merge on an absent check.
+    if: needs.preflight.outputs.linux_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
@@ -175,7 +238,8 @@ jobs:
     # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
     # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
     # Big Tam skips this job fast instead of queueing against an empty pool.
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
     # Self-hosted: Big Tam (Threadripper 9970X, native Ubuntu 26.04). Persistent
     # ccache + vcpkg state between runs on the same workspace amortizes the
     # install cost. Trade-off: the runner process serializes this matrix, so
@@ -286,7 +350,7 @@ jobs:
       # ubuntu26 until setup-beam ships a 26.04 build — it would fail to resolve
       # the asset. Verified by gateway eunit on the Big Tam leg.
       - name: Install Erlang/OTP and rebar3
-        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: ubuntu24
         with:
@@ -480,7 +544,8 @@ jobs:
     # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
     # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
     # Shulgi fallback) — mirrors the Linux pool gate.
-    if: needs.preflight.outputs.windows_pool_healthy == 'true'
+    # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
+    if: needs.preflight.outputs.windows_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -780,6 +845,11 @@ jobs:
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
+    needs: [preflight]
+    # code_changed (issue #1978): docs-only PRs skip this required job
+    # (skipped == satisfied). No self-hosted pool gate — GitHub-hosted — so
+    # it otherwise runs on every code PR.
+    if: needs.preflight.outputs.code_changed == 'true'
     runs-on: macos-15  # Apple Silicon, Xcode 16 / Apple Clang 16
     timeout-minutes: 90
     strategy:
@@ -972,6 +1042,50 @@ jobs:
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
+
+  # ── Docs-only required-check stubs (issue #1978) ──────────────────────
+  # The linux/windows/macos required contexts are MATRIX-expanded names
+  # ("Linux gcc-15 debug", "Windows MSVC debug", "macOS debug"). A matrix job
+  # skipped at the job level is skipped BEFORE the matrix expands, so it emits
+  # none of its inner check-run names (actions/runner#952). Gating the real
+  # jobs on code_changed therefore leaves those required contexts "Expected —
+  # waiting" forever on a docs-only PR — the exact hang #1978 must avoid.
+  #
+  # This job emits those exact names as `success` when, and only when, the real
+  # matrix jobs are skipped for a docs-only PR. It is itself a matrix job, so
+  # the SAME runner#952 behaviour makes it collision-free: on a code PR it is
+  # skipped before expansion and emits nothing, leaving the real job as the
+  # sole producer of each name. Exactly one producer per required name per run
+  # (real job on code PRs, this stub on docs-only PRs) — no duplicate/masking.
+  #
+  # proto-compat is a NON-matrix job: its skipped run reports "Proto
+  # backward-compat: skipped", which already satisfies the required check, so
+  # it needs no stub. preflight always runs; "CHANGELOG order" (docs-lint.yml)
+  # runs on every PR. Together that satisfies all six required contexts on a
+  # docs-only PR without a build.
+  docs-required-checks:
+    name: ${{ matrix.check }}
+    needs: [preflight]
+    if: needs.preflight.outputs.code_changed == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # MUST stay byte-identical to the matrix-expanded names the real jobs
+        # produce on a PR and that the dev ruleset requires. If a real job's
+        # name template or its PR matrix leg changes, update these in lockstep.
+        check:
+          - "Linux gcc-15 debug"
+          - "Windows MSVC debug"
+          - "macOS debug"
+    steps:
+      - name: Satisfy required check (docs-only PR — no build)
+        run: |
+          echo "Docs-only PR (#1978): '${{ matrix.check }}' is not built."
+          echo "This stub emits the required check name as success so the PR is"
+          echo "not blocked on an absent matrix context. Any PR that touches"
+          echo "code runs the real '${{ matrix.check }}' build instead."
 
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR (or a push to main) touches CI infrastructure

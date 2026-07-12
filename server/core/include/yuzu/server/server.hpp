@@ -268,9 +268,30 @@ struct Config {
     /// can never be a permanent standing exemption.
     int break_glass_window_secs{86400};
 
+    // SCIM v2 provisioning (`/scim/v2/*`) — enterprise IdP (Okta/Entra)
+    // auto-provisioning + auto-deprovisioning of Yuzu operators (Users only).
+    // Disabled by default: an unauthenticated provisioning surface would be
+    // catastrophic, so the server FAILS CLOSED at boot if --scim-enable is
+    // set without --scim-token, and if HTTPS is disabled (the bearer token
+    // would cross the wire in plaintext) — see main.cpp. Wired via
+    // --scim-enable / YUZU_SCIM_ENABLE.
+    bool scim_enable{false};
+    /// Bearer credential IdPs present as `Authorization: Bearer <token>` on
+    /// every /scim/v2/* request. Stored as a sha256 hash only (ScimStore).
+    /// Required (fail-closed) whenever scim_enable is true. Wired via
+    /// --scim-token / YUZU_SCIM_TOKEN.
+    std::string scim_token;
+
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
+    /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
+    /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
+    /// allowed because the endpoint requires a credential). Wired via the
+    /// repeatable --mcp-allowed-origin / YUZU_MCP_ALLOWED_ORIGINS.
+    std::vector<std::string> mcp_allowed_origins;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)

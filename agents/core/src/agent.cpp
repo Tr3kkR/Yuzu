@@ -43,6 +43,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -142,76 +143,10 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
-// ── Bounded Thread Pool ──────────────────────────────────────────────────────
-// Replaces unbounded std::thread-per-command dispatch. Workers pull tasks from
-// a shared queue protected by a mutex + condition variable. If the queue exceeds
-// max_queue_size, submit() returns false so the caller can reject the command.
+// ThreadPool (bounded dispatch pool + per-task exception firewall, #2037) now
+// lives in thread_pool.hpp so the firewall behaviour is unit-testable in
+// isolation. Used unqualified below via namespace yuzu::agent.
 
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t num_threads, size_t max_queue_size = 1000)
-        : max_queue_size_{max_queue_size} {
-        // Clamp thread count: min 4, max 32
-        num_threads = std::max<size_t>(num_threads, 4);
-        num_threads = std::min<size_t>(num_threads, 32);
-        workers_.reserve(num_threads);
-        for (size_t i = 0; i < num_threads; ++i) {
-            workers_.emplace_back([this] {
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock lock(mu_);
-                        cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
-                        if (stop_ && tasks_.empty())
-                            return;
-                        task = std::move(tasks_.front());
-                        tasks_.pop();
-                    }
-                    task();
-                }
-            });
-        }
-        spdlog::info("Thread pool started: {} workers, max queue {}", num_threads, max_queue_size);
-    }
-
-    // Returns false if the queue is full (backpressure).
-    bool submit(std::function<void()> task) {
-        {
-            std::lock_guard lock(mu_);
-            if (stop_)
-                return false;
-            if (tasks_.size() >= max_queue_size_)
-                return false;
-            tasks_.push(std::move(task));
-        }
-        cv_.notify_one();
-        return true;
-    }
-
-    ~ThreadPool() {
-        {
-            std::lock_guard lock(mu_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& w : workers_) {
-            if (w.joinable())
-                w.join();
-        }
-    }
-
-    // Non-copyable, non-movable
-    ThreadPool(const ThreadPool&) = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
-
-private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool stop_ = false;
-    size_t max_queue_size_;
-};
 
 // Context implementations
 // These are passed to plugins; they bridge the C ABI callbacks to gRPC streams.
@@ -2060,146 +1995,26 @@ public:
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
                     bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
-                        // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
-                        const int32_t stagger_s =
-                            std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
-                        const int32_t delay_s =
-                            std::min(cmd.delay_seconds(), int32_t{300}); // cap 5 min
-                        if (stagger_s > 0 || delay_s > 0) {
-                            int32_t random_stagger = 0;
-                            if (stagger_s > 0) {
-                                std::random_device rd;
-                                std::mt19937 gen(rd());
-                                std::uniform_int_distribution<int32_t> dist(0, stagger_s);
-                                random_stagger = dist(gen);
-                            }
-                            const int32_t total_delay = std::min(
-                                (delay_s > 0 ? delay_s : 0) + random_stagger, int32_t{600});
-                            spdlog::debug("Command {} stagger {}s + delay {}s = {}s",
-                                          cmd.command_id(), random_stagger, delay_s, total_delay);
-
-                            if (total_delay > 0) {
-                                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
-                            }
-
-                            // Check expiration after the delay — skip stale commands
-                            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
-                                auto now_ms =
-                                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count();
-                                if (now_ms > cmd.expires_at().millis_epoch()) {
-                                    spdlog::warn("Command {} expired after stagger/delay "
-                                                 "(expired_at={}, now={})",
-                                                 cmd.command_id(), cmd.expires_at().millis_epoch(),
-                                                 now_ms);
-                                    pb::CommandResponse expired_resp;
-                                    expired_resp.set_command_id(cmd.command_id());
-                                    expired_resp.set_status(pb::CommandResponse::REJECTED);
-                                    expired_resp.set_output("command expired after stagger/delay");
-                                    auto epoch =
-                                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            std::chrono::system_clock::now().time_since_epoch())
-                                            .count();
-                                    expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
-
-                                    std::lock_guard lock(stream_write_mu_);
-                                    stream->Write(expired_resp, grpc::WriteOptions());
-                                    return;
-                                }
-                            }
-                        }
-
-                        metrics_
-                            .counter("yuzu_agent_commands_executed_total",
-                                     {{"plugin", cmd.plugin()}})
-                            .increment();
-                        CommandContextImpl ctx_impl{
-                            .stream = stream,
-                            .write_mu = &stream_write_mu_,
-                            .command_id = cmd.command_id(),
-                            .start_time = std::chrono::steady_clock::now(),
-                        };
-                        auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
-
-                        // Convert protobuf parameter map -> C ABI YuzuParam array
-                        // Direct construction: single vector of YuzuParam pointing at proto map
-                        // entries (no intermediate string copies — proto owns the data).
-                        const auto& proto_params = cmd.parameters();
-                        std::vector<YuzuParam> params;
-                        params.reserve(proto_params.size());
-                        for (const auto& [k, v] : proto_params) {
-                            params.push_back(YuzuParam{k.c_str(), v.c_str()});
-                        }
-
-                        // Defence-in-depth: wrap the plugin's execute() so a
-                        // thrown C++ exception cannot propagate up into the
-                        // command-dispatch thread and terminate() the whole
-                        // agent process. Plugins are expected to convert
-                        // failures into a non-zero `rc`; this is the safety
-                        // net for the cases they miss. Observed 2026-05-12:
-                        // agent_logging.get_log threw filesystem_error from
-                        // fs::exists on EACCES and brought the agent down
-                        // mid-test. The plugin bug is fixed separately;
-                        // this catch is so the next plugin's mistake
-                        // doesn't have the same blast radius.
-                        int rc;
+                        // Outer exception firewall (#2037). The ThreadPool worker
+                        // already contains any escaped exception so the agent
+                        // process survives; catching here additionally lets the
+                        // server receive a terminal FAILURE instead of waiting on
+                        // its own timeout for a command whose dispatch task threw
+                        // outside the plugin execute() guard.
                         try {
-                            rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
-                                                 params.size());
+                            execute_command_task(target, cmd, stream);
                         } catch (const std::exception& e) {
-                            spdlog::error("Plugin {} action {} threw std::exception: {}",
-                                          cmd.plugin(), cmd.action(), e.what());
-                            std::string msg = "plugin threw exception: ";
-                            msg += e.what();
-                            ctx_impl.append_output(msg.c_str());
-                            rc = 1;
+                            spdlog::error("Command {} dispatch failed outside plugin execute: {}",
+                                          cmd.command_id(), e.what());
+                            send_dispatch_failure(stream, cmd.command_id(),
+                                                  std::string("agent dispatch error: ") + e.what());
                         } catch (...) {
-                            spdlog::error("Plugin {} action {} threw non-std exception",
-                                          cmd.plugin(), cmd.action());
-                            ctx_impl.append_output("plugin threw non-std exception");
-                            rc = 1;
+                            spdlog::error("Command {} dispatch failed outside plugin execute "
+                                          "(non-std exception)",
+                                          cmd.command_id());
+                            send_dispatch_failure(stream, cmd.command_id(),
+                                                  "agent dispatch error: non-std exception");
                         }
-
-                        // Flush any buffered output before sending timing/status
-                        ctx_impl.flush_output();
-
-                        auto end_time = std::chrono::steady_clock::now();
-                        auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                           end_time - ctx_impl.start_time)
-                                           .count();
-
-                        // Send timing metadata before the final status
-                        {
-                            pb::CommandResponse timing_resp;
-                            timing_resp.set_command_id(cmd.command_id());
-                            timing_resp.set_status(pb::CommandResponse::RUNNING);
-                            timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
-
-                            std::lock_guard lock(stream_write_mu_);
-                            stream->Write(timing_resp, grpc::WriteOptions());
-                        }
-
-                        // Send final status
-                        {
-                            pb::CommandResponse final_resp;
-                            final_resp.set_command_id(cmd.command_id());
-                            final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
-                                                          : pb::CommandResponse::FAILURE);
-                            final_resp.set_exit_code(rc);
-
-                            auto now_epoch =
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
-
-                            std::lock_guard lock(stream_write_mu_);
-                            stream->Write(final_resp, grpc::WriteOptions());
-                        }
-
-                        spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
-                                     exec_ms);
                     });
 
                     if (!submitted) {
@@ -2362,6 +2177,185 @@ private:
         std::lock_guard lock(stream_write_mu_);
         if (guardian_sink_stream_)
             guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+    }
+
+    // Per-command dispatch task (#2037): runs one CommandRequest through its
+    // plugin and streams timing + terminal status back. Extracted from the
+    // dispatch lambda so the ThreadPool exception firewall and the
+    // FAILURE-on-throw path around it stay small and readable. A `return`
+    // here skips this command's remaining status writes exactly as it did
+    // inside the lambda.
+    void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
+                              const std::shared_ptr<SubscribeStream>& stream) {
+        // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
+        const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
+        const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
+        if (stagger_s > 0 || delay_s > 0) {
+            int32_t random_stagger = 0;
+            if (stagger_s > 0) {
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<int32_t> dist(0, stagger_s);
+                random_stagger = dist(gen);
+            }
+            const int32_t total_delay =
+                std::min((delay_s > 0 ? delay_s : 0) + random_stagger, int32_t{600});
+            spdlog::debug("Command {} stagger {}s + delay {}s = {}s", cmd.command_id(),
+                          random_stagger, delay_s, total_delay);
+
+            if (total_delay > 0) {
+                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+            }
+
+            // Check expiration after the delay — skip stale commands
+            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+                if (now_ms > cmd.expires_at().millis_epoch()) {
+                    spdlog::warn("Command {} expired after stagger/delay "
+                                 "(expired_at={}, now={})",
+                                 cmd.command_id(), cmd.expires_at().millis_epoch(), now_ms);
+                    pb::CommandResponse expired_resp;
+                    expired_resp.set_command_id(cmd.command_id());
+                    expired_resp.set_status(pb::CommandResponse::REJECTED);
+                    expired_resp.set_output("command expired after stagger/delay");
+                    auto epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                    expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
+
+                    std::lock_guard lock(stream_write_mu_);
+                    stream->Write(expired_resp, grpc::WriteOptions());
+                    return;
+                }
+            }
+        }
+
+        metrics_.counter("yuzu_agent_commands_executed_total", {{"plugin", cmd.plugin()}})
+            .increment();
+        CommandContextImpl ctx_impl{
+            .stream = stream,
+            .write_mu = &stream_write_mu_,
+            .command_id = cmd.command_id(),
+            .start_time = std::chrono::steady_clock::now(),
+        };
+        auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+
+        // Convert protobuf parameter map -> C ABI YuzuParam array
+        // Direct construction: single vector of YuzuParam pointing at proto map
+        // entries (no intermediate string copies — proto owns the data).
+        const auto& proto_params = cmd.parameters();
+        std::vector<YuzuParam> params;
+        params.reserve(proto_params.size());
+        for (const auto& [k, v] : proto_params) {
+            params.push_back(YuzuParam{k.c_str(), v.c_str()});
+        }
+
+        // Defence-in-depth: wrap the plugin's execute() so a
+        // thrown C++ exception cannot propagate up into the
+        // command-dispatch thread and terminate() the whole
+        // agent process. Plugins are expected to convert
+        // failures into a non-zero `rc`; this is the safety
+        // net for the cases they miss. Observed 2026-05-12:
+        // agent_logging.get_log threw filesystem_error from
+        // fs::exists on EACCES and brought the agent down
+        // mid-test. The plugin bug is fixed separately;
+        // this catch is so the next plugin's mistake
+        // doesn't have the same blast radius.
+        int rc;
+        try {
+            rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(), params.size());
+        } catch (const std::exception& e) {
+            spdlog::error("Plugin {} action {} threw std::exception: {}", cmd.plugin(),
+                          cmd.action(), e.what());
+            std::string msg = "plugin threw exception: ";
+            msg += e.what();
+            ctx_impl.append_output(msg.c_str());
+            rc = 1;
+        } catch (...) {
+            spdlog::error("Plugin {} action {} threw non-std exception", cmd.plugin(),
+                          cmd.action());
+            ctx_impl.append_output("plugin threw non-std exception");
+            rc = 1;
+        }
+
+        // Flush any buffered output before sending timing/status
+        ctx_impl.flush_output();
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto exec_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end_time - ctx_impl.start_time)
+                .count();
+
+        // Send timing metadata before the final status
+        {
+            pb::CommandResponse timing_resp;
+            timing_resp.set_command_id(cmd.command_id());
+            timing_resp.set_status(pb::CommandResponse::RUNNING);
+            timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
+
+            std::lock_guard lock(stream_write_mu_);
+            stream->Write(timing_resp, grpc::WriteOptions());
+        }
+
+        // Log before the terminal write so nothing that can throw runs AFTER a
+        // terminal status has been sent — otherwise the dispatch firewall's
+        // catch would send a second terminal status (FAILURE after SUCCESS) for
+        // the same command_id (#2037 hardening).
+        spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc, exec_ms);
+
+        // Send final status (must be the last statement — see above)
+        {
+            pb::CommandResponse final_resp;
+            final_resp.set_command_id(cmd.command_id());
+            final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
+                                          : pb::CommandResponse::FAILURE);
+            final_resp.set_exit_code(rc);
+
+            auto now_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
+
+            std::lock_guard lock(stream_write_mu_);
+            stream->Write(final_resp, grpc::WriteOptions());
+        }
+    }
+
+    // Best-effort terminal FAILURE for a command whose dispatch task threw
+    // outside the plugin execute() guard (#2037). Invoked from the dispatch
+    // exception firewall so the server receives a terminal status instead of
+    // waiting on its timeout. Must not itself throw — the Write is guarded.
+    void send_dispatch_failure(const std::shared_ptr<SubscribeStream>& stream,
+                               const std::string& command_id, const std::string& message) noexcept {
+        try {
+            pb::CommandResponse resp;
+            resp.set_command_id(command_id);
+            resp.set_status(pb::CommandResponse::FAILURE);
+            resp.set_exit_code(1);
+            // Carry the reason in the structured error field, NOT output: the
+            // server finalizes a terminal frame onto prior RUNNING rows in place
+            // only when output is empty (agent_service_impl.cpp). A non-empty
+            // output would instead INSERT a second row and leave any already-
+            // streamed RUNNING output rows un-finalized (#2037 UP-1).
+            resp.mutable_error()->set_code("agent_dispatch_error");
+            resp.mutable_error()->set_message(message);
+            auto epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+            resp.mutable_sent_at()->set_millis_epoch(epoch);
+            std::lock_guard lock(stream_write_mu_);
+            if (stream)
+                stream->Write(resp, grpc::WriteOptions());
+        } catch (...) {
+            // Last-resort log, itself guarded: this function is noexcept, so a
+            // throw from spdlog here would be an immediate terminate() — the
+            // exact failure #2037 exists to prevent.
+            try {
+                spdlog::error("Command {} failed to send dispatch-failure response", command_id);
+            } catch (...) {}
+        }
     }
 
     // #1420 / #1434 — single quiesce-and-join chokepoint for the three

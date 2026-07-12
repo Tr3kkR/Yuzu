@@ -1,0 +1,1 @@
+{"spark":{"type":"service-status","service":"Spooler"},"assertion":{"type":"service-running"},"remediation":{"action":"service-start","params":{"max_attempts":3}}}

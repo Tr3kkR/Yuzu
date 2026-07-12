@@ -177,6 +177,7 @@ TEST_CASE("AuditStore: all fields stored", "[audit_store]") {
     event.user_agent = "Mozilla/5.0";
     event.session_id = "sess-abc";
     event.result = "success";
+    event.principal_class = "human";
     CHECK(store.log(event));
 
     auto results = store.query();
@@ -186,6 +187,27 @@ TEST_CASE("AuditStore: all fields stored", "[audit_store]") {
     CHECK(results[0].detail == "changed to true");
     CHECK(results[0].user_agent == "Mozilla/5.0");
     CHECK(results[0].session_id == "sess-abc");
+    CHECK(results[0].principal_class == "human");
+}
+
+TEST_CASE("AuditStore: principal_class defaults to honest-empty when unset (#1634-adjacent "
+          "ADR-1005 Phase 3a)",
+          "[audit_store]") {
+    // Rows this program cannot attribute to an HTTP session/token principal
+    // (gRPC agent-daemon calls, gateway proxying, server-internal writers) never
+    // set principal_class — the column must default to "" (honest-empty), never
+    // a synthesised guess.
+    AuditStore store(":memory:");
+    AuditEvent event;
+    event.principal = "system";
+    event.principal_role = "system";
+    event.action = "cert.reload";
+    event.result = "success";
+    CHECK(store.log(event));
+
+    auto results = store.query();
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].principal_class.empty());
 }
 
 TEST_CASE("AuditStore: time range filter", "[audit_store]") {

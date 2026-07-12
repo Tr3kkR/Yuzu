@@ -1,8 +1,7 @@
 # Yuzu
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Tr3kkR/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/Tr3kkR/Yuzu)
-<!-- OpenSSF Best Practices Badge: application in progress (issue #407). Once approved, replace <ID> with the project id from bestpractices.dev. -->
-<!-- [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12582/badge)](https://www.bestpractices.dev/projects/12582)
 [![Zizmor](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml)
 
 **Enterprise endpoint management platform.** Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.

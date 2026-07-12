@@ -75,6 +75,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--saml-sp-acs-url` | *(none)* | **SAML 2.0 SP.** Full public URL of the Assertion Consumer Service (`https://<host>/saml/acs`). The IdP must be configured to POST the response to this URL. Env: `YUZU_SAML_SP_ACS_URL`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
+| `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
 | `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
@@ -183,6 +185,46 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
+
+The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track
+2f, PR 1). Three changes are visible to existing clients:
+
+1. **A JSON-RPC *notification* POST (a request with no `id`, e.g.
+   `notifications/initialized`) now returns `HTTP 202 Accepted` instead of
+   `204 No Content`.** The body stays empty. This is a spec MUST and applies
+   regardless of the kill switch below. **Affected:** only a strict client that
+   asserts the status is exactly `204` (or asserts an empty-body status other
+   than `202`) — the reference clients (mcp-remote, Claude Desktop) treat any
+   2xx-with-empty-body as success and are unaffected. Adjust such assertions to
+   accept `202`.
+2. **`initialize` responses now carry an additive `Mcp-Session-Id` header.**
+   Clients that don't use it can safely ignore it (plain-POST flows are
+   otherwise byte-identical). Clients that do may present it on later requests;
+   an unknown/expired/foreign id returns `404`, at which point the client
+   re-initializes (sessions are in-memory, so a server restart has the same
+   effect). `DELETE /mcp/v1/` ends a session.
+3. **`initialize` now negotiates the protocol revision** instead of always
+   returning `2025-03-26`. A client that sends `params.protocolVersion` of a
+   *supported* revision (`2025-03-26` or `2025-06-18`) gets that value echoed;
+   anything else (including no `protocolVersion`) still returns `2025-03-26`.
+   **Affected:** only a newer client that requests `2025-06-18` — a legacy client
+   requesting `2025-03-26` (or nothing) sees no change. Negotiation is independent
+   of the `--mcp-no-streaming` kill switch.
+
+New CLI flags (all optional):
+
+- `--mcp-no-streaming` (`YUZU_MCP_NO_STREAMING`) — disable the Streamable HTTP
+  transport: no session minting, `GET`/`DELETE /mcp/v1/` → `405`, plain
+  JSON-RPC POST only. The `202` notification status still applies. Use this if a
+  buffering reverse proxy interferes with streaming.
+- `--mcp-allowed-origin <value>` (`YUZU_MCP_ALLOWED_ORIGINS`, repeatable) — an
+  allowed `Origin` header value (`scheme://host:port`, exact match) for
+  DNS-rebinding defence. **An absent `Origin` is always allowed** (the endpoint
+  requires a credential); an **empty allowlist rejects any *present* `Origin`**
+  (the secure default) — browser-based MCP clients must be allowlisted
+  explicitly. Non-browser clients (which send no `Origin`) need no configuration.
 
 ### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
 
@@ -1020,7 +1062,7 @@ re-checks. Configuration is via CLI flags at startup (each has an env-var equiva
 | `--nvd-proxy` | `YUZU_NVD_PROXY` | *(none)* | HTTP proxy URL for egress to `services.nvd.nist.gov`, for deployments with restricted outbound network access. |
 | `--nvd-sync-interval` | `YUZU_NVD_SYNC_INTERVAL` | `4` | Freshness re-check cadence, in hours, once the backfill has completed. |
 | `--nvd-backfill-years` | `YUZU_NVD_BACKFILL_YEARS` | `8` | How far back (in years) the newest-first backfill walks. `0` = full history. The floor is clamped to NVD's catalog start (1999-01-01) and to a 200-year effective maximum, so no value reaches before the catalog begins. |
-| `--no-nvd-sync` | — | off | Disable NVD sync entirely. |
+| `--no-nvd-sync` | `YUZU_NO_NVD_SYNC` | off | Disable NVD sync entirely. |
 
 > **Note:** the initial backfill makes sustained HTTPS requests to `services.nvd.nist.gov`
 > and grows the local NVD database to hundreds of MB. Without an API key it can take hours.

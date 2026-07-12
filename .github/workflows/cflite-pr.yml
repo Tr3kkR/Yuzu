@@ -1,0 +1,61 @@
+# ClusterFuzzLite — PR-scoped fuzzing of the in-tree libFuzzer harnesses
+# (tests/fuzz/, built by .clusterfuzzlite/build.sh inside the OSS-Fuzz
+# base-builder container; see .clusterfuzzlite/README.md for the target
+# inventory and how to add one).
+#
+# mode: code-change — fuzzes only what the PR touches, short budget
+# (fuzz-seconds below), so this is a fast regression net, not a soak.
+# Deep exploration belongs to a future scheduled batch leg (deferred
+# until the harness set stabilizes). NOT a required status check.
+#
+# This also satisfies the OpenSSF Scorecard Fuzzing check (0/10 before
+# this workflow existed — the check detects the .clusterfuzzlite/ config).
+
+name: ClusterFuzzLite PR fuzzing
+
+on:
+  pull_request:
+    branches: [dev, main]
+    # Only fuzz PRs that can change fuzzed behavior — the harnesses
+    # compile first-party C++ directly (no meson/vcpkg), so workflows,
+    # docs, gateway-Erlang, YAML-content or script changes can't affect
+    # them. Keep this list in sync with .clusterfuzzlite/build.sh inputs.
+    paths:
+      - 'server/**'
+      - 'agents/**'
+      - 'sdk/**'
+      - 'proto/**'
+      - 'tests/fuzz/**'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/cflite-pr.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  fuzz:
+    name: Fuzz (address sanitizer, code-change)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write   # SARIF upload of crash findings
+    steps:
+      - name: Build fuzzers
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: c++
+          sanitizer: address
+
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: code-change
+          sanitizer: address
+          output-sarif: true

@@ -1,0 +1,4 @@
+name: "quoted # not-a-comment"
+list: [a, b, c]
+folded: >
+  first line

@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -455,7 +456,9 @@ void NvdSyncManager::do_backfill() {
             return;
         }
         if (!result.records.empty()) {
-            if (!db_->upsert_cves(result.records)) {
+            // Backfill passes nullptr: historical CVEs MUST NOT drive the freshness/feed
+            // delta trigger — backfill has its own trigger (ADR-0023 Decision 6d).
+            if (!db_->upsert_cves(result.records, nullptr)) {
                 // Persist failed (BEGIN/COMMIT/rollback) — HOLD the cursor and retry next tick;
                 // never advance past unpersisted CVEs (#1889 review r4). We deliberately do NOT
                 // advance-and-drop after N tries: for a vuln mirror, silently dropping a window
@@ -563,6 +566,10 @@ void NvdSyncManager::do_freshness() {
     const auto start = (parsed && *parsed <= now) ? *parsed : (now - std::chrono::days(2));
     std::size_t total = 0;
 
+    // The freshness/feed delta: the cve_ids persisted on this pass. Collected now so a
+    // future feed trigger can consume it (ADR-0023 Decision 6d); no consumer wired yet.
+    std::vector<std::string> changed;
+
     for (const auto& [ws, we] : nvd_split_windows(start, now, max_window)) {
         if (stopping_.load())
             return;
@@ -580,7 +587,8 @@ void NvdSyncManager::do_freshness() {
             return;
         }
         if (!result.records.empty()) {
-            if (!db_->upsert_cves(result.records)) {
+            // Freshness passes &changed: these ARE the feed delta (ADR-0023 Decision 6d).
+            if (!db_->upsert_cves(result.records, &changed)) {
                 // Persist failed — HOLD last_freshness_check and retry; never advance past
                 // unpersisted CVEs (dropping a modified CVE is a silent, permanent miss —
                 // #1889 review r4). Fails SAFE: freshness stays behind and the error surfaces.

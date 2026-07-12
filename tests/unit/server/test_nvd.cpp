@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1193,7 +1194,7 @@ TEST_CASE("NvdDatabase: upsert_cves merges duplicate cve_id, losing no matches",
     std::vector<CveRecord> batch;
     batch.push_back(make_cve("CVE-2024-DUP", "productone", "2.0"));
     batch.push_back(make_cve("CVE-2024-DUP", "producttwo", "3.0"));
-    db.upsert_cves(batch);
+    REQUIRE(db.upsert_cves(batch));
 
     REQUIRE(db.total_cve_count() == 1);                                   // one distinct CVE
     REQUIRE(db.match_inventory({{"productone", "1.0"}}).size() == 1);     // first product kept
@@ -1347,4 +1348,762 @@ TEST_CASE("NvdClient::fetch_paginated: a cancel during the 429 backoff aborts pr
     REQUIRE(r.reason == NvdFailureReason::kCancelled);
     // Woke mid-backoff (~400ms), nowhere near the full 5s Retry-After.
     REQUIRE(elapsed < std::chrono::seconds(3));
+}
+
+// ── PR1: assess() typed-identity API + vendor index (ADR-0018) ───────────────
+
+namespace {
+// A CVE whose single cpeMatch carries an explicit vendor, is_vulnerable flag, and
+// versionEndExcluding upper bound (the shape assess() exercises). Distinct from the
+// name-only make_cve above, which leaves cpe_vendor empty.
+CveRecord make_cve_v(std::string id, std::string vendor, std::string product,
+                     std::string end_excluding, bool vulnerable = true,
+                     std::string severity = "HIGH") {
+    CveRecord rec;
+    rec.cve_id = std::move(id);
+    rec.severity = std::move(severity);
+    rec.description = "Test vulnerability";
+    rec.published = "2024-01-01T00:00:00.000";
+    rec.source = "nvd";
+    CpeMatch cm;
+    cm.cpe_vendor = std::move(vendor);
+    cm.cpe_product = std::move(product);
+    cm.version_end_excluding = std::move(end_excluding);
+    cm.is_vulnerable = vulnerable;
+    rec.matches.push_back(std::move(cm));
+    return rec;
+}
+} // namespace
+
+TEST_CASE("assess: product only in is_vulnerable=0 rows is not known", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "9.9", /*vulnerable=*/false));
+    auto r = db.assess({"acme", "widget", "1.0", true});
+    REQUIRE_FALSE(r.product_known); // platform-only operand must never count as known
+    REQUIRE(r.hits.empty());
+}
+
+TEST_CASE("assess: mixed vulnerable/platform rows yield only the vulnerable hit", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-VULN", "acme", "widget", "9.9", true));
+    db.upsert_cve(make_cve_v("CVE-PLAT", "acme", "widget", "9.9", false));
+    auto r = db.assess({"acme", "widget", "1.0", true});
+    REQUIRE(r.product_known);
+    REQUIRE(r.hits.size() == 1);
+    REQUIRE(r.hits[0].cve_id == "CVE-VULN");
+}
+
+TEST_CASE("assess: known product with an out-of-range version is assessed-clean", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "3.0.7", true));
+    auto r = db.assess({"acme", "widget", "3.0.7", true}); // at the exclusive end → not vulnerable
+    REQUIRE(r.product_known); // the identity is known...
+    REQUIRE(r.hits.empty());  // ...and assessed clean (empty hits, not "unknown")
+}
+
+TEST_CASE("assess: an in-range hit carries severity/description/published/fixed_in",
+          "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "3.0.7", true, "CRITICAL"));
+    auto r = db.assess({"acme", "widget", "3.0.6", true});
+    REQUIRE(r.product_known);
+    REQUIRE(r.hits.size() == 1);
+    REQUIRE(r.hits[0].cve_id == "CVE-A");
+    REQUIRE(r.hits[0].severity == "CRITICAL");
+    REQUIRE(r.hits[0].description == "Test vulnerability");
+    REQUIRE(r.hits[0].published == "2024-01-01T00:00:00.000");
+    REQUIRE(r.hits[0].fixed_in == "3.0.7");
+}
+
+TEST_CASE("assess: prefix path escapes the underscore wildcard (no sibling over-match)",
+          "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    // Sibling product with an 'x' where the query has '_'. A raw LIKE '_' would match it.
+    db.upsert_cve(make_cve_v("CVE-SIB", "", "linuxxkernel", "9.9", true));
+    auto r = db.assess({"", "linux_kernel", "1.0", /*exact_product=*/false});
+    REQUIRE_FALSE(r.product_known); // '_' is escaped to a literal → the sibling does NOT match
+    REQUIRE(r.hits.empty());
+    // The genuine linux_kernel row DOES match via the prefix path.
+    db.upsert_cve(make_cve_v("CVE-REAL", "", "linux_kernel", "9.9", true));
+    auto r2 = db.assess({"", "linux_kernel", "1.0", false});
+    REQUIRE(r2.product_known);
+    REQUIRE(r2.hits.size() == 1);
+    REQUIRE(r2.hits[0].cve_id == "CVE-REAL");
+}
+
+TEST_CASE("assess: mixed-case vendor/product still hits (internal lowercasing)", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "3.0.7", true));
+    auto r = db.assess({"ACME", "WiDgEt", "3.0.6", true});
+    REQUIRE(r.product_known);
+    REQUIRE(r.hits.size() == 1);
+    REQUIRE(r.hits[0].cve_id == "CVE-A");
+}
+
+TEST_CASE("assess: vendor disambiguates a shared product name", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-ACME", "acme", "widget", "9.9", true));
+    db.upsert_cve(make_cve_v("CVE-GLOBEX", "globex", "widget", "9.9", true));
+    auto a = db.assess({"acme", "widget", "1.0", true});
+    REQUIRE(a.product_known);
+    REQUIRE(a.hits.size() == 1);
+    REQUIRE(a.hits[0].cve_id == "CVE-ACME"); // only the acme CVE, not globex's
+    auto wrong = db.assess({"initech", "widget", "1.0", true});
+    REQUIRE_FALSE(wrong.product_known); // wrong vendor → the identity is unknown
+    REQUIRE(wrong.hits.empty());
+}
+
+TEST_CASE("assess: fixed_in is best-effort and deterministic regardless of row order",
+          "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    // (a) versionEndExcluding populated → fixed_in carries it.
+    db.upsert_cve(make_cve_v("CVE-VEE", "acme", "p1", "3.0.7", true));
+    REQUIRE(db.assess({"acme", "p1", "1.0", true}).hits.at(0).fixed_in == "3.0.7");
+
+    // (b) versionEndIncluding (no exclusive boundary) → fixed_in empty.
+    {
+        CveRecord rec;
+        rec.cve_id = "CVE-VEI";
+        rec.severity = "HIGH";
+        rec.description = "d";
+        rec.source = "nvd";
+        CpeMatch cm;
+        cm.cpe_vendor = "acme";
+        cm.cpe_product = "p2";
+        cm.version_end_including = "3.0.7";
+        rec.matches.push_back(cm);
+        db.upsert_cve(rec);
+        auto r = db.assess({"acme", "p2", "1.0", true});
+        REQUIRE(r.hits.size() == 1);
+        REQUIRE(r.hits[0].fixed_in.empty());
+    }
+    // (c) exact CPE pin → fixed_in empty.
+    {
+        CveRecord rec;
+        rec.cve_id = "CVE-PIN";
+        rec.severity = "HIGH";
+        rec.description = "d";
+        rec.source = "nvd";
+        CpeMatch cm;
+        cm.cpe_vendor = "acme";
+        cm.cpe_product = "p3";
+        cm.cpe_version = "1.0";
+        rec.matches.push_back(cm);
+        db.upsert_cve(rec);
+        auto r = db.assess({"acme", "p3", "1.0", true});
+        REQUIRE(r.hits.size() == 1);
+        REQUIRE(r.hits[0].fixed_in.empty());
+    }
+    // (d) two in-range rows for one CVE — one with vee, one without — must yield the same
+    //     non-empty fixed_in regardless of which row was inserted first.
+    auto two_rows = [](bool vee_first) {
+        NvdDatabase d(":memory:");
+        CveRecord rec;
+        rec.cve_id = "CVE-MIX";
+        rec.severity = "HIGH";
+        rec.description = "d";
+        rec.source = "nvd";
+        CpeMatch with_vee;
+        with_vee.cpe_vendor = "acme";
+        with_vee.cpe_product = "p4";
+        with_vee.version_end_excluding = "5.0";
+        CpeMatch no_vee;
+        no_vee.cpe_vendor = "acme";
+        no_vee.cpe_product = "p4";
+        no_vee.version_end_including = "9.9";
+        if (vee_first) {
+            rec.matches.push_back(with_vee);
+            rec.matches.push_back(no_vee);
+        } else {
+            rec.matches.push_back(no_vee);
+            rec.matches.push_back(with_vee);
+        }
+        d.upsert_cve(rec);
+        auto r = d.assess({"acme", "p4", "1.0", true});
+        REQUIRE(r.hits.size() == 1);
+        REQUIRE(r.hits[0].fixed_in == "5.0"); // deterministic non-empty either way
+    };
+    two_rows(true);
+    two_rows(false);
+}
+
+TEST_CASE("assess: empty product is not known even with a vendor set (guard order)",
+          "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "9.9", true));
+    auto r1 = db.assess({"", "", "1.0", true});
+    REQUIRE_FALSE(r1.product_known);
+    REQUIRE(r1.hits.empty());
+    // Vendor set, product empty — guard 1 precedes the vendor branch.
+    auto r2 = db.assess({"acme", "", "1.0", true});
+    REQUIRE_FALSE(r2.product_known);
+    REQUIRE(r2.hits.empty());
+}
+
+TEST_CASE("assess: an unqualified sub-3-char prefix is rejected (prefix floor)", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "", "ab", "9.9", true));
+    auto r = db.assess({"", "ab", "1.0", /*exact_product=*/false});
+    REQUIRE_FALSE(r.product_known); // <3-char unqualified prefix → refused before any query
+    REQUIRE(r.hits.empty());
+    // Vendor scope lifts the floor — the same short prefix is allowed.
+    db.upsert_cve(make_cve_v("CVE-B", "acme", "ab", "9.9", true));
+    auto r2 = db.assess({"acme", "ab", "1.0", false});
+    REQUIRE(r2.product_known);
+    REQUIRE(r2.hits.size() == 1);
+    REQUIRE(r2.hits[0].cve_id == "CVE-B");
+}
+
+TEST_CASE("assess: an empty installed version is known but never a hit", "[nvd][assess]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-A", "acme", "widget", "9.9", true));
+    auto r = db.assess({"acme", "widget", "", true});
+    REQUIRE(r.product_known); // the identity exists...
+    REQUIRE(r.hits.empty());  // ...but no version → no fabricated clean/vulnerable verdict
+}
+
+TEST_CASE("NvdDatabase: v4 composite index is created once and is idempotent across reopen",
+          "[nvd][db][migration]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-v4-"}};
+    const std::string path = tmp.path.string();
+    {
+        NvdDatabase db(path);
+        REQUIRE(db.is_open());
+    }
+    // Reopen: schema_meta already at v4, so the migration must NOT re-run or error.
+    {
+        NvdDatabase db2(path);
+        REQUIRE(db2.is_open());
+    }
+
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+    // A fresh DB reaches v4.
+    sqlite3_stmt* st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(raw, "SELECT version FROM schema_meta WHERE store='nvd_database'", -1,
+                               &st, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+    REQUIRE(sqlite3_column_int(st, 0) == 4);
+    sqlite3_finalize(st);
+    // Exactly ONE composite index (idempotent — not created twice).
+    st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(raw,
+                               "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND "
+                               "name='idx_cve_match_vendor_product'",
+                               -1, &st, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+    REQUIRE(sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
+    // The v3 single-column index is KEPT alongside it (no regression).
+    st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(raw,
+                               "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND "
+                               "name='idx_cve_match_product'",
+                               -1, &st, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+    REQUIRE(sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+}
+
+TEST_CASE("products_for_cves: DISTINCT + is_vulnerable=1 only, with cross-chunk dedup",
+          "[nvd][db]") {
+    NvdDatabase db(":memory:");
+    REQUIRE(db.products_for_cves({}).empty()); // empty input → empty result
+
+    db.upsert_cve(make_cve_v("CVE-VULN", "acme", "widget", "9.9", true));
+    db.upsert_cve(make_cve_v("CVE-PLAT", "acme", "gadget", "9.9", false)); // is_vulnerable=0 excluded
+    auto p = db.products_for_cves({"CVE-VULN", "CVE-PLAT"});
+    REQUIRE(p.size() == 1);
+    REQUIRE(p[0].first == "acme");
+    REQUIRE(p[0].second == "widget");
+
+    // The SAME vendor/product under 501 distinct cve_ids straddles the 500-id chunk
+    // boundary; SQL DISTINCT is per-chunk, so cross-chunk dedup must collapse it to one.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 501; ++i) {
+        std::string id = "CVE-BULK-" + std::to_string(i);
+        db.upsert_cve(make_cve_v(id, "bulkvendor", "bulkproduct", "9.9", true));
+        ids.push_back(id);
+    }
+    auto q500 = db.products_for_cves(std::vector<std::string>(ids.begin(), ids.begin() + 500));
+    REQUIRE(q500.size() == 1); // exactly at the chunk boundary
+    auto q501 = db.products_for_cves(ids);
+    REQUIRE(q501.size() == 1); // 501 ids → two chunks → dedup still holds
+    REQUIRE(q501[0].first == "bulkvendor");
+    REQUIRE(q501[0].second == "bulkproduct");
+}
+
+TEST_CASE("upsert_cves: changed_ids is opt-in and deduped; nullptr leaves the bool contract",
+          "[nvd][db]") {
+    NvdDatabase db(":memory:");
+    // nullptr (the default) → persist bool unchanged, no delta collected.
+    REQUIRE(db.upsert_cves({make_cve("CVE-N1", "p", "1.0")}));
+
+    // Non-null → filled with the persisted cve_ids.
+    std::vector<std::string> changed;
+    std::vector<CveRecord> batch{make_cve("CVE-C1", "p1", "1.0"), make_cve("CVE-C2", "p2", "1.0")};
+    REQUIRE(db.upsert_cves(batch, &changed));
+    REQUIRE(changed.size() == 2);
+
+    // A batch with a duplicate cve_id → the delta is deduped (the merge folds duplicates).
+    std::vector<std::string> dchanged;
+    std::vector<CveRecord> dup{make_cve("CVE-D", "pa", "1.0"), make_cve("CVE-D", "pb", "2.0")};
+    REQUIRE(db.upsert_cves(dup, &dchanged));
+    REQUIRE(dchanged.size() == 1);
+    REQUIRE(dchanged[0] == "CVE-D");
+}
+
+TEST_CASE("assess/match query plans seek on the right index (two-index schema)", "[nvd][perf]") {
+    // Mirrors the REAL cve_match schema after migration v4: BOTH the v3 single-column
+    // idx_cve_match_product and the v4 composite idx_cve_match_vendor_product. Asserts
+    // the planner picks the right seek per query shape and never full-scans.
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    const char* schema =
+        "CREATE TABLE cve_match(id INTEGER PRIMARY KEY, cve_id TEXT, cpe_vendor TEXT,"
+        " cpe_product TEXT NOT NULL, is_vulnerable INTEGER DEFAULT 1);"
+        "CREATE INDEX idx_cve_match_product ON cve_match(cpe_product COLLATE NOCASE);"
+        "CREATE INDEX idx_cve_match_vendor_product ON cve_match(cpe_vendor, cpe_product COLLATE "
+        "NOCASE);";
+    REQUIRE(sqlite3_exec(db, schema, nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto plan_of = [&](const char* q) {
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(db, q, -1, &st, nullptr) == SQLITE_OK);
+        std::string plan;
+        while (sqlite3_step(st) == SQLITE_ROW)
+            if (const unsigned char* d = sqlite3_column_text(st, 3))
+                plan += reinterpret_cast<const char*>(d);
+        sqlite3_finalize(st);
+        return plan;
+    };
+
+    // (a) vendor + exact product → composite index, no scan.
+    {
+        auto p = plan_of("EXPLAIN QUERY PLAN SELECT id FROM cve_match WHERE cpe_vendor='acme' AND "
+                         "cpe_product='widget' COLLATE NOCASE AND is_vulnerable=1;");
+        INFO("plan (a): " << p);
+        REQUIRE(p.find("idx_cve_match_vendor_product") != std::string::npos);
+        REQUIRE(p.find("SCAN") == std::string::npos);
+    }
+    // (b) vendor + prefix product → composite index, no scan.
+    {
+        auto p = plan_of("EXPLAIN QUERY PLAN SELECT id FROM cve_match WHERE cpe_vendor='acme' AND "
+                         "cpe_product LIKE 'wid%' ESCAPE '\\' AND is_vulnerable=1;");
+        INFO("plan (b): " << p);
+        REQUIRE(p.find("idx_cve_match_vendor_product") != std::string::npos);
+        REQUIRE(p.find("SCAN") == std::string::npos);
+        // Assert the PRODUCT column is used as a range bound, not just the vendor
+        // equality: dropping COLLATE NOCASE from the composite's product column
+        // degrades the plan to `(cpe_vendor=?)` only — which STILL names the index and
+        // has no SCAN, so the two checks above pass on that regression. `cpe_product>`
+        // is present only when the LIKE-prefix range seek actually engages (FIX 4).
+        REQUIRE(p.find("cpe_product>") != std::string::npos);
+    }
+    // (c) vendor-less prefix → the single-column index (no regression from v4).
+    {
+        auto p = plan_of("EXPLAIN QUERY PLAN SELECT id FROM cve_match WHERE cpe_product LIKE 'wid%' "
+                         "ESCAPE '\\' AND is_vulnerable=1;");
+        INFO("plan (c): " << p);
+        REQUIRE(p.find("idx_cve_match_product") != std::string::npos);
+        REQUIRE(p.find("SCAN") == std::string::npos);
+        // Same collation-regression guard as (b): the product range bound must engage,
+        // not a bare index name with no seek (FIX 4).
+        REQUIRE(p.find("cpe_product>") != std::string::npos);
+    }
+    // (d) match_inventory's exact query shape still seeks.
+    {
+        auto p = plan_of("EXPLAIN QUERY PLAN SELECT id FROM cve_match WHERE cpe_product LIKE "
+                         "'openssl%' ESCAPE '\\' AND is_vulnerable=1;");
+        INFO("plan (d): " << p);
+        REQUIRE(p.find("SCAN") == std::string::npos);
+    }
+    sqlite3_close(db);
+}
+
+// ── Adversarial tester — hostile cases the coder's own suite did not cover ───
+// Attack angles from the PR1 review brief: is_vulnerable leak variants, LIKE-escape
+// completeness (embedded backslash / literal '%'), vendor-collation asymmetry,
+// exact-path floor exemption, fixed_in with TWO distinct non-empty candidates,
+// products_for_cves with hostile ids, and a forced per-CVE savepoint rollback
+// inside an otherwise-successful batch (changed_ids must exclude it).
+
+TEST_CASE("assess(adversarial): an out-of-range vulnerable row plus an in-range platform "
+          "row yields known-but-clean, never a fabricated hit",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    // Same cve_id, two matches: the is_vulnerable=1 row's range does NOT cover the
+    // installed version; the is_vulnerable=0 row's range DOES cover it. The WHERE
+    // is_vulnerable=1 filter must exclude the second row entirely — it must never
+    // surface as a hit just because its range happens to contain the version.
+    CveRecord rec;
+    rec.cve_id = "CVE-MIXED-RANGE";
+    rec.severity = "HIGH";
+    rec.description = "d";
+    rec.published = "2024-01-01T00:00:00.000";
+    rec.source = "nvd";
+    CpeMatch vulnerable_out_of_range;
+    vulnerable_out_of_range.cpe_vendor = "acme";
+    vulnerable_out_of_range.cpe_product = "widget";
+    vulnerable_out_of_range.version_end_excluding = "1.0"; // installed 5.0 is NOT < 1.0
+    vulnerable_out_of_range.is_vulnerable = true;
+    CpeMatch platform_in_range;
+    platform_in_range.cpe_vendor = "acme";
+    platform_in_range.cpe_product = "widget";
+    platform_in_range.version_end_excluding = "9.9"; // installed 5.0 IS < 9.9
+    platform_in_range.is_vulnerable = false;
+    rec.matches.push_back(vulnerable_out_of_range);
+    rec.matches.push_back(platform_in_range);
+    db.upsert_cve(rec);
+
+    auto r = db.assess({"acme", "widget", "5.0", true});
+    REQUIRE(r.product_known);  // the is_vulnerable=1 row makes the identity known...
+    REQUIRE(r.hits.empty());   // ...but neither row produces a hit (out-of-range / excluded)
+}
+
+TEST_CASE("assess(adversarial): a literal backslash in the stored product is matched "
+          "only via its escaped form",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    // Stored product contains a REAL backslash character. Vendor scope lifts the
+    // 3-char prefix floor so a 2-char query ("a\") is legal.
+    db.upsert_cve(make_cve_v("CVE-BACKSLASH", "acme", "a\\b", "9.9", true));
+    // A sibling with NO backslash must not be swept in by a broken escape.
+    db.upsert_cve(make_cve_v("CVE-SIBLING", "acme", "axb", "9.9", true));
+
+    auto hit = db.assess({"acme", "a\\", "1.0", /*exact_product=*/false});
+    REQUIRE(hit.product_known);
+    REQUIRE(hit.hits.size() == 1);
+    REQUIRE(hit.hits[0].cve_id == "CVE-BACKSLASH"); // "axb" must NOT appear
+}
+
+TEST_CASE("assess(adversarial): a literal '%' in the stored product requires a literal "
+          "'%' in the query, not a wildcard",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-PCT", "acme", "100%cpu", "9.9", true));
+    db.upsert_cve(make_cve_v("CVE-SIB", "acme", "100xcpu", "9.9", true));
+
+    auto r = db.assess({"acme", "100%", "1.0", /*exact_product=*/false});
+    REQUIRE(r.product_known);
+    REQUIRE(r.hits.size() == 1);
+    REQUIRE(r.hits[0].cve_id == "CVE-PCT"); // "100xcpu" must NOT match the escaped '%'
+}
+
+TEST_CASE("assess(adversarial): cpe_vendor stored non-lowercase is invisible to the "
+          "BINARY vendor filter — asymmetric with the product path's COLLATE NOCASE",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    // Simulate a producer that (unlike nvd_client.cpp's `lower()`) failed to
+    // normalize case on cpe_vendor before it reached the store. nvd_db.cpp itself
+    // enforces no such invariant — it only documents it as a comment.
+    db.upsert_cve(make_cve_v("CVE-CASE", "ACME", "widget", "9.9", true));
+
+    // The caller queries with a normal lowercase vendor, exactly as every real
+    // caller (server-side CPE-identity resolution) would.
+    //
+    // REGRESSION GUARD for an ACCEPTED limitation, not a bug to 'fix' by editing this
+    // test: cpe_vendor is BINARY-collated (the composite index seek depends on it);
+    // producers MUST lowercase vendor at ingest (nvd_client.cpp does). If a future
+    // producer regresses, fix it at ingest, NOT by relaxing this assertion. See
+    // ADR-0023 / the assess() vendor-filter comment.
+    auto r = db.assess({"acme", "widget", "1.0", true});
+    // FINDING: this currently comes back product_known=false — a false "unknown"
+    // verdict — because `m.cpe_vendor = ?` has no COLLATE NOCASE (unlike
+    // `m.cpe_product = ? COLLATE NOCASE`, which forgives exactly this class of
+    // mismatch). See the ranked findings for severity/exploitability discussion.
+    REQUIRE_FALSE(r.product_known);
+    REQUIRE(r.hits.empty());
+}
+
+TEST_CASE("assess(adversarial): exact_product with a 2-char product is exempt from the "
+          "prefix floor even with an empty vendor",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-GO", "", "go", "9.9", true));
+    auto r = db.assess({"", "go", "1.0", /*exact_product=*/true});
+    REQUIRE(r.product_known); // floor only gates the LIKE-prefix path, never exact
+    REQUIRE(r.hits.size() == 1);
+}
+
+TEST_CASE("assess(adversarial): fixed_in with TWO distinct non-empty in-range candidates "
+          "resolves to the MINIMUM versionEndExcluding, order-independent",
+          "[nvd][adversarial]") {
+    // Unlike the coder's determinism test (exactly one row ever has a non-empty
+    // fixed_in), here BOTH in-range rows for the same cve_id+product carry a
+    // DIFFERENT non-empty version_end_excluding (3.0 and 8.0). The correct fix
+    // boundary for an installed version in range of both is the SMALLEST upper
+    // bound (3.0) — the least version that lifts the install out of range. The
+    // reconciliation must compare with the NVD comparator (not string compare) and
+    // must be independent of which row SQLite returns first.
+    auto build = [](bool first_is_3_0) {
+        NvdDatabase d(":memory:");
+        CveRecord rec;
+        rec.cve_id = "CVE-MULTI-FIX";
+        rec.severity = "HIGH";
+        rec.description = "d";
+        rec.source = "nvd";
+        CpeMatch fix_3_0;
+        fix_3_0.cpe_vendor = "acme";
+        fix_3_0.cpe_product = "widget";
+        fix_3_0.version_end_excluding = "3.0";
+        CpeMatch fix_8_0;
+        fix_8_0.cpe_vendor = "acme";
+        fix_8_0.cpe_product = "widget";
+        fix_8_0.version_end_excluding = "8.0";
+        if (first_is_3_0) {
+            rec.matches.push_back(fix_3_0);
+            rec.matches.push_back(fix_8_0);
+        } else {
+            rec.matches.push_back(fix_8_0);
+            rec.matches.push_back(fix_3_0);
+        }
+        d.upsert_cve(rec);
+        // Installed version 2.0 is in-range for BOTH candidate upper bounds.
+        return d.assess({"acme", "widget", "2.0", true});
+    };
+    auto a = build(true);
+    auto b = build(false);
+    REQUIRE(a.hits.size() == 1);
+    REQUIRE(b.hits.size() == 1);
+    INFO("first_is_3_0=true  -> fixed_in=" << a.hits[0].fixed_in);
+    INFO("first_is_3_0=false -> fixed_in=" << b.hits[0].fixed_in);
+    // The minimum upper bound wins regardless of insertion order.
+    REQUIRE(a.hits[0].fixed_in == "3.0");
+    REQUIRE(b.hits[0].fixed_in == "3.0");
+}
+
+TEST_CASE("assess(adversarial): fixed_in min is NUMERIC not lexical (8.0 vs 10.0)",
+          "[nvd][adversarial]") {
+    // "10.0" < "8.0" lexically but 10.0 > 8.0 numerically. The reconciliation must
+    // pick 8.0 (the true minimum), proving the NVD comparator — not string compare —
+    // drives the min, in both insertion orders.
+    auto build = [](bool eight_first) {
+        NvdDatabase d(":memory:");
+        CveRecord rec;
+        rec.cve_id = "CVE-NUM-FIX";
+        rec.severity = "HIGH";
+        rec.description = "d";
+        rec.source = "nvd";
+        CpeMatch fix_8;
+        fix_8.cpe_vendor = "acme";
+        fix_8.cpe_product = "widget";
+        fix_8.version_end_excluding = "8.0";
+        CpeMatch fix_10;
+        fix_10.cpe_vendor = "acme";
+        fix_10.cpe_product = "widget";
+        fix_10.version_end_excluding = "10.0";
+        if (eight_first) {
+            rec.matches.push_back(fix_8);
+            rec.matches.push_back(fix_10);
+        } else {
+            rec.matches.push_back(fix_10);
+            rec.matches.push_back(fix_8);
+        }
+        d.upsert_cve(rec);
+        return d.assess({"acme", "widget", "2.0", true});
+    };
+    REQUIRE(build(true).hits.at(0).fixed_in == "8.0");
+    REQUIRE(build(false).hits.at(0).fixed_in == "8.0");
+}
+
+TEST_CASE("products_for_cves(adversarial): a hostile/empty cve_id in the input neither "
+          "crashes nor false-matches",
+          "[nvd][adversarial]") {
+    NvdDatabase db(":memory:");
+    db.upsert_cve(make_cve_v("CVE-REAL", "acme", "widget", "9.9", true));
+
+    auto p = db.products_for_cves({"", "CVE-DOES-NOT-EXIST'; DROP TABLE cve_match; --"});
+    REQUIRE(p.empty());
+    // The store must still be fully functional afterward — no injection, no corruption.
+    REQUIRE(db.total_cve_count() == 1);
+    REQUIRE(db.assess({"acme", "widget", "1.0", true}).product_known);
+}
+
+TEST_CASE("upsert_cves(adversarial): changed_ids excludes a per-CVE savepoint rollback "
+          "inside an otherwise-successful batch",
+          "[nvd][adversarial]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-adv-partial-"}};
+    const std::string path = tmp.path.string();
+
+    {
+        // Install a trigger that forces the insert for one specific product to fail,
+        // simulating the "data-dependent per-record failure" the production code
+        // comment says the current TEXT-only schema can't otherwise produce.
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        // NvdDatabase hasn't created its tables yet on this raw handle — open+close
+        // an NvdDatabase first so cve_match exists, then attach the trigger.
+        sqlite3_close(raw);
+    }
+    { NvdDatabase warm(path); } // runs migrations, creates cve/cve_match, then closes
+
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        const char* trig = "CREATE TRIGGER poison_guard BEFORE INSERT ON cve_match "
+                          "WHEN NEW.cpe_product = 'poison' "
+                          "BEGIN SELECT RAISE(ABORT, 'blocked for test'); END;";
+        REQUIRE(sqlite3_exec(raw, trig, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    NvdDatabase db(path);
+    std::vector<CveRecord> batch;
+    batch.push_back(make_cve_v("CVE-GOOD", "acme", "safe", "9.9", true));
+    batch.push_back(make_cve_v("CVE-POISON", "acme", "poison", "9.9", true));
+
+    std::vector<std::string> changed;
+    const bool ok = db.upsert_cves(batch, &changed);
+
+    // FIX 3, RETAINED side: a per-CVE SAVEPOINT rollback fails one record while the
+    // surrounding batch STILL commits the rest — so bool is false yet changed_ids is
+    // non-empty with the ids that genuinely committed (CVE-GOOD). This is the ONLY
+    // non-empty-on-false case FIX 3 leaves standing. The complementary CLEARED side
+    // (an outer COMMIT failure wipes changed_ids, since nothing committed) is covered
+    // by inspection: it is the `if (changed_ids) changed_ids->clear();` guard on the
+    // txn.commit()!=SQLITE_OK branch in upsert_cves_impl. Forcing a WAL COMMIT to fail
+    // deterministically needs an I/O-fault VFS shim (a COMMIT can't fail from external
+    // contention in WAL), so it is not exercised at runtime here.
+    REQUIRE_FALSE(ok); // the batch was NOT fully persisted
+    REQUIRE(changed.size() == 1);
+    REQUIRE(changed[0] == "CVE-GOOD"); // the rolled-back CVE must never appear here
+
+    // CVE-GOOD's insert genuinely committed (per-CVE SAVEPOINT rollback is scoped to
+    // the failing CVE only — the surrounding batch transaction still commits the rest).
+    REQUIRE(db.assess({"acme", "safe", "1.0", true}).product_known);
+    // CVE-POISON's header+matches must have rolled back together (UP-1 atomicity) —
+    // it must not appear as a known identity at all.
+    REQUIRE_FALSE(db.assess({"acme", "poison", "1.0", true}).product_known);
+}
+
+TEST_CASE("assess/products_for_cves: a DB fault THROWS, never a false absent/empty verdict "
+          "(FIX 1)",
+          "[nvd][adversarial]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"nvd-fault-throw-"}};
+    const std::string path = tmp.path.string();
+
+    NvdDatabase db(path);
+    db.upsert_cve(make_cve_v("CVE-REAL", "acme", "widget", "9.9", true));
+    REQUIRE(db.assess({"acme", "widget", "1.0", true}).product_known);   // healthy first
+    REQUIRE(db.products_for_cves({"CVE-REAL"}).size() == 1);
+
+    // Drop cve_match out from under the store via a second connection so the next
+    // prepare fails with "no such table: cve_match" (same technique the atomic-rollback
+    // test uses). Before FIX 1 both functions swallowed the prepare error and returned
+    // an empty result — indistinguishable from a genuine no-rows/absent identity, i.e. a
+    // fabricated product_known=false / an empty CVE→product inversion. FIX 1 makes them
+    // THROW so the caller can distinguish a DB fault and abort, never record clean.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "DROP TABLE cve_match;", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    // Prepare-failure throw path (forced deterministically above). The step-error path
+    // (a mid-scan SQLITE_BUSY/IOERR/CORRUPT → rc != SQLITE_DONE → throw) shares the same
+    // throw site and is covered by inspection — it cannot be forced without a VFS shim.
+    REQUIRE_THROWS_AS(db.assess({"acme", "widget", "1.0", true}), std::runtime_error);
+    REQUIRE_THROWS_AS(db.products_for_cves({"CVE-REAL"}), std::runtime_error);
+}
+
+// Regression test for issue #1908: rules out parse_response()/the move-iterator
+// insert() as the source of a SIGSEGV heap-corruption crash in fetch_paginated().
+// Deliberately does not construct an httplib::Client (see the CAVEAT below the
+// JSON builders for why) — only the parse+append path is exercised here.
+namespace {
+std::string zero_pad6(int n) {
+    std::string s = std::to_string(n);
+    if (s.size() < 6) {
+        s.insert(0, 6 - s.size(), '0');
+    }
+    return s;
+}
+
+// One synthetic "vulnerabilities[i]" entry shaped like a real NVD API response:
+// cve.id, descriptions[lang=en], metrics.cvssMetricV31[0].cvssData.baseSeverity,
+// published/lastModified, and configurations[].nodes[].cpeMatch[] (2 matches) —
+// exactly the fields NvdClient::parse_response() reads.
+std::string make_synthetic_vuln_json(int n) {
+    const std::string suffix = zero_pad6(n);
+    const std::string vendor = "vendor" + std::to_string(n);
+    const std::string product = "product" + std::to_string(n);
+    std::string s;
+    s.reserve(650);
+    s += R"({"cve":{"id":"CVE-2024-)" + suffix + R"(",)";
+    s += R"("descriptions":[{"lang":"en","value":"Synthetic test vulnerability )" + suffix +
+         R"("}],)";
+    s += R"("metrics":{"cvssMetricV31":[{"cvssData":{"baseSeverity":"HIGH"}}]},)";
+    s += R"("published":"2024-01-01T00:00:00.000",)";
+    s += R"("lastModified":"2024-06-15T12:00:00.000",)";
+    s += R"("configurations":[{"nodes":[{"cpeMatch":[)";
+    s += R"({"criteria":"cpe:2.3:a:)" + vendor + ":" + product +
+         R"(:1.0.0:*:*:*:*:*:*:*","versionStartIncluding":"1.0.0",)"
+         R"("versionEndExcluding":"2.0.0","vulnerable":true},)";
+    s += R"({"criteria":"cpe:2.3:a:)" + vendor + ":" + product +
+         R"(b:2.0.0:*:*:*:*:*:*:*","versionEndExcluding":"3.0.0","vulnerable":true})";
+    s += R"(]}]}]}})";
+    return s;
+}
+
+std::string make_synthetic_page_json(int page_offset, int count, int total_results) {
+    std::string body;
+    body.reserve(static_cast<std::size_t>(count) * 650 + 64);
+    body += R"({"totalResults":)" + std::to_string(total_results) + R"(,"vulnerabilities":[)";
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) {
+            body += ",";
+        }
+        body += make_synthetic_vuln_json(page_offset + i);
+    }
+    body += "]}";
+    return body;
+}
+} // namespace
+
+// CAVEAT (macOS/AppleClang only): Apple Clang 21 / Apple libc++'s "trivial
+// relocation" vector-growth optimization desyncs ASan's container poisoning,
+// producing a false-positive "container-overflow" inside nlohmann::json::parse()
+// and independently inside httplib::Client's std::regex host:port parsing —
+// neither involves Yuzu code. Locally this test needs
+// `ASAN_OPTIONS=detect_container_overflow=0`; the checks that catch real
+// allocator corruption (heap-buffer-overflow, use-after-free, double-free) stay
+// active regardless. libstdc++ (the nightly sanitizer CI toolchain) doesn't use
+// this relocation optimization, so the FP is not expected there.
+TEST_CASE("NvdClient parse+append stays memory-clean across 2 synthetic 2000-CVE pages",
+          "[nvd][parse][sanitizer]") {
+    constexpr int kResultsPerPage = 2000; // mirrors nvd_client.cpp's kResultsPerPage
+    constexpr int kTotalResults = 26935;  // mirrors the real crash's totalResults
+
+    NvdClient client;
+    NvdFetchResult combined;
+    int start_index = 0;
+
+    for (int page = 0; page < 2; ++page) {
+        const std::string body =
+            make_synthetic_page_json(start_index, kResultsPerPage, kTotalResults);
+
+        auto page_result = client.parse_response(body);
+        REQUIRE(page_result.ok);
+        REQUIRE(page_result.records.size() == static_cast<std::size_t>(kResultsPerPage));
+
+        combined.total_results = page_result.total_results;
+        // The exact move-iterator insert fetch_paginated() uses to append a page.
+        combined.records.insert(combined.records.end(),
+                                std::make_move_iterator(page_result.records.begin()),
+                                std::make_move_iterator(page_result.records.end()));
+
+        start_index += kResultsPerPage;
+    }
+
+    REQUIRE(combined.records.size() == static_cast<std::size_t>(kResultsPerPage) * 2);
+    REQUIRE(combined.total_results == kTotalResults);
+    REQUIRE(combined.records.front().cve_id == "CVE-2024-000000");
+    REQUIRE(combined.records.back().cve_id == "CVE-2024-003999");
+    // Spot-check a match survived the parse+move+insert pipeline intact.
+    REQUIRE(combined.records[500].matches.size() == 2);
+    REQUIRE(combined.records[500].matches[0].cpe_vendor == "vendor500");
+    REQUIRE(combined.records[3000].matches[1].cpe_product == "product3000b");
 }

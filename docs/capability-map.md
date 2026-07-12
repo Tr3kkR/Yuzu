@@ -442,6 +442,17 @@ product-name based, not vendor/CPE-precise (false positives from name
 collisions possible; vendor precision pending ADR-0018). See
 `docs/vuln-scan-roadmap.md`.
 
+> **ADR-1005 grandfathered surface #2.** The server-side NVD sync + CVE
+> matching is in-server *interpretation* under ADR-1005's boundary test and is
+> grandfathered until re-homed into the first use-case engine (UCE) module —
+> a strangler migration gated on a matcher-parity milestone (M3) before any
+> server-side deletion; see `docs/adr-1005-execution-plan.md`. The agent-side
+> `vuln_scan` collection action is *mechanism* and stays core, but the
+> plugin's embedded static CVE rule list (`cve_rules.hpp`) and its use as an
+> authoritative `cve_scan` finding source are **frozen (no further rule
+> updates) and deprecated** — the long-term replacement is engine-published
+> content delivered through the existing content-distribution plane.
+
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 
 `event_logs` plugin (cross-platform).

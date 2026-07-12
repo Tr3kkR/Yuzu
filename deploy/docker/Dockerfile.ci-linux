@@ -17,7 +17,6 @@
 # cutover. Digest is the multi-arch OCI index for ubuntu:26.04.
 FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
 
-ARG MESON_VERSION=1.9.2
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 
 # ── System packages (covers both x64 and ARM64 cross-compile) ─────────
@@ -56,7 +55,8 @@ RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-
     && rm /tmp/node.tar.xz
 
 # ── Meson (pinned version) ────────────────────────────────────────────
-RUN pip3 install --break-system-packages meson==${MESON_VERSION}
+COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
+RUN pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt
 
 # ── vcpkg (pre-cloned at pinned commit) ───────────────────────────────
 RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \

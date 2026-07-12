@@ -80,6 +80,11 @@ std::string dangerous_enforce_service_stop(std::string_view service_name);
 /// callers that hold only the stored spec (the mode toggle, the metadata-only
 /// update, and the push backstop), not a fresh request body — every path that
 /// promotes a rule to enforce must share this one check.
+///
+/// Total over arbitrary bytes: malformed or type-mismatched JSON yields empty
+/// (not dangerous), and no nlohmann exception ever propagates — it runs at the
+/// push chokepoint on stored rows with no REST-layer guard above it (#1946).
+/// The fuzz harness calls it unguarded to enforce this.
 std::string dangerous_enforce_in_spec(const std::string& spec_json);
 
 } // namespace yuzu::server::guardian

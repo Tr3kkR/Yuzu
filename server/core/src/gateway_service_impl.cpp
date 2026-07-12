@@ -9,6 +9,7 @@
 #include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
+#include "grpc_on_behalf_enforce.hpp"
 #include "guaranteed_state_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_ingestion.hpp"
@@ -39,6 +40,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
 grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* context,
                                                        const pb::RegisterRequest* request,
                                                        pb::RegisterResponse* response) {
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp. Must run
+    // before any side effect below (audit, auth-mgr lookup, registry write).
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
     const auto& info = request->info();
 
     // #1064: on this path the transport peer is the GATEWAY's IP, not the
@@ -449,9 +454,12 @@ gw_enrolled:
 
 // -- BatchHeartbeat -----------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*context*/,
+grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* context,
                                                         const gw::BatchHeartbeatRequest* request,
                                                         gw::BatchHeartbeatResponse* response) {
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
     int acked = 0;
     for (const auto& hb : request->heartbeats()) {
         // Validate that the session is known
@@ -505,9 +513,12 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*c
 
 // -- ProxyInventory -----------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*context*/,
+grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* context,
                                                         const pb::InventoryReport* request,
                                                         pb::InventoryAck* response) {
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
     std::string agent_id;
     {
         std::lock_guard lock(sessions_mu_);
@@ -597,9 +608,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
 // -- NotifyStreamStatus -------------------------------------------------------
 
 grpc::Status
-GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* /*context*/,
+GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                                const gw::StreamStatusNotification* request,
                                                gw::StreamStatusAck* response) {
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
 
@@ -647,9 +661,12 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* /*context*/,
 // -- ForwardGuardianMessage ---------------------------------------------------
 
 grpc::Status
-GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* /*context*/,
+GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
                                                    const gw::ForwardGuardianRequest* request,
                                                    gw::ForwardGuardianAck* response) {
+    // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
+    if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+
     const auto& agent_id = request->agent_id();
 
     // agent_id is gateway-asserted (the gateway stamps the agent's bound

@@ -68,9 +68,22 @@ name: "CodeQL"
 # not depend on CodeQL finishing. Concurrency group's cancel-in-progress:
 # true lets a queued newer run supersede a stale one (cancels BOTH
 # matrix legs together).
+#
+# PR fast-path (`analyze-actions-pr`): every PR to dev/main gets a
+# lightweight `actions`-language-only CodeQL run on a GHA-hosted runner
+# (minutes, no C++ build, no self-hosted capacity). This is DELIBERATELY
+# not the c-cpp trace — a full traced MSVC/gcc build per PR would burn
+# Big Tam/Wee Tam capacity the CI matrix already needs, and every commit
+# is still c-cpp-scanned within 24h by the nightly schedule above. The
+# split also puts a CodeQL check run on every PR commit, which is what
+# the OpenSSF Scorecard SAST check measures (it scored 7/10 with the
+# nightly-only cadence: "0 of 21 commits checked"). Do not "simplify"
+# by folding the PR leg into the heavy matrix or vice versa.
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [dev, main]
   schedule:
     # Daily 04:00 UTC — off-hours, both runners available. Tightens C++
     # vuln detection from <=7 days to <=24h (folds CodeQL into the Tier-3
@@ -94,8 +107,41 @@ env:
   CCACHE_COMPRESS: "true"
 
 jobs:
+  # Lightweight PR leg — actions language only, GHA-hosted. See the
+  # "PR fast-path" paragraph in the header comment for why this is not
+  # the c-cpp trace. No SARIF filtering: the actions extractor only
+  # reads .github/, which is entirely first-party.
+  analyze-actions-pr:
+    name: "Analyze (actions, PR fast-path)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write   # github/codeql-action/analyze SARIF upload
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        with:
+          languages: actions
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        with:
+          # Distinct category from the nightly Linux leg's actions scan so
+          # the two analysis series don't overwrite each other's alerts.
+          category: "/language:actions-pr"
+
   analyze:
     name: "Analyze (${{ matrix.os }})"
+    # The heavy self-hosted trace never runs on PR events — the
+    # analyze-actions-pr job above is the PR fast-path.
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       security-events: write   # github/codeql-action/upload-sarif
@@ -321,7 +367,7 @@ jobs:
       # junction lookup.
       - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
-        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           # erlef/setup-beam can't auto-detect the self-hosted runner OS;
           # the explicit ImageOS hint matches ci.yml:230.
@@ -331,7 +377,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -440,7 +486,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -496,7 +542,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

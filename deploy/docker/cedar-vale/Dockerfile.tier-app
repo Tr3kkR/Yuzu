@@ -9,7 +9,7 @@
 
 FROM yuzu-agent-viz-uat:latest AS agentsrc
 
-FROM node:22-trixie-slim
+FROM node:22-trixie-slim@sha256:4228fca437e45714a3ebd1d4ecd1dcc583cf79f5a940aa025e286b472d93b67c
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 libsqlite3-0 ca-certificates tini curl \
@@ -22,9 +22,12 @@ COPY --from=agentsrc /usr/lib/yuzu/plugins/               /usr/lib/yuzu/plugins/
 RUN ldconfig
 
 WORKDIR /app
-# package.json first so `npm install` layer caches independently of app code.
-COPY deploy/docker/cedar-vale/app/package.json /app/package.json
-RUN npm install --omit=dev --no-audit --no-fund
+# Manifest + lockfile first so the `npm ci` layer caches independently of app
+# code. `npm ci` (not `npm install`) so the image gets exactly the committed,
+# Dependabot-audited tree — a drifted package.json fails the build loudly.
+COPY deploy/docker/cedar-vale/app/package.json \
+     deploy/docker/cedar-vale/app/package-lock.json /app/
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # App source (server.js, public/deck.css). node_modules from the install above
 # survives because the host app/ has no node_modules dir to clobber it.

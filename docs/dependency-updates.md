@@ -13,9 +13,32 @@ tells you where it belongs.
 | GitHub Actions    | `uses: ...@vX` in every `.github/workflows/*` | Dependabot (weekly) — `.github/dependabot.yml` `github-actions` entry                         |
 | Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry                                 |
 | Python tooling    | `requirements-ci.txt` (repo root)             | Dependabot (weekly) — `.github/dependabot.yml` `pip` entry                                    |
+| npm tooling       | `package-lock.json` in `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` | Dependabot (weekly, grouped per directory) — `.github/dependabot.yml` `npm` entry; see "npm tooling" below |
 | vcpkg baseline    | `vcpkg.json` `builtin-baseline`               | Scheduled workflow — `.github/workflows/vcpkg-baseline-update.yml` (monthly PR, hands-off)     |
 | rebar3 deps       | `gateway/rebar.config`                        | **Manual quarterly review** — see "Rebar3 review checklist" below                              |
 | Git submodules    | —                                             | No submodules; nothing to track                                                               |
+
+## Update tiers — what carries a remediation SLA
+
+Not everything Dependabot tracks ships to customers. Two tiers, and the
+tier — not the tracking mechanism — decides the remediation posture:
+
+- **Tier 1 — product.** Anything compiled into or shipped alongside the
+  server, agent, or gateway: vcpkg deps, Docker base images, rebar3 deps,
+  and the vendored JS assets embedded into the server binary. Security
+  advisories here follow the vulnerability-management commitments in
+  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream F).
+- **Tier 2 — repo tooling.** Build/test/docs/demo tooling that never
+  ships in a product artifact: the three npm directories and the pip CI
+  tooling. Advisories are tracked, surfaced, and auto-patched through the
+  same Dependabot flow, but are triaged case-by-case and carry **no
+  product SLA** — a DoS in the demo deck server is not a product CVE.
+
+This tiering is the story SOC 2 evidence cites: Tier 2 surfaces are
+in-scope for *tracking* (advisories cannot accumulate silently anywhere
+in the repo) and explicitly out of scope for product remediation SLAs.
+If a Tier 2 surface's output starts shipping in a product artifact, it
+moves to Tier 1 with its whole ecosystem.
 
 ### Base branch
 
@@ -86,6 +109,41 @@ find them:
 ```bash
 grep -rn 'meson==' deploy/docker/
 ```
+
+## npm tooling (docs site, UAT harness, demo app)
+
+Three npm-managed directories, all Tier 2 (nothing here ships in a
+product artifact):
+
+| Directory | What it is | Exercised by |
+|---|---|---|
+| `site/` | Astro docs site (GitHub Pages) | `docs-site.yml` build job on every PR touching it |
+| `tests/puppeteer/` | Puppeteer UAT harness | manual / UAT runs only — **no CI coverage** |
+| `deploy/docker/cedar-vale/app/` | Cedar & Vale demo deck server (Express + pg; built only by the viz-UAT rig) | local `docker-compose.viz-uat.yml` builds |
+
+Each directory commits a `package-lock.json` and is listed in the
+`npm` entry of `.github/dependabot.yml`. Minor+patch bumps ride one
+grouped weekly PR per directory; **majors arrive as separate
+single-dependency PRs** (the group filters on `update-types`) so a
+breaking major — Astro N+1, express 5, a puppeteer line bump — never
+dams the patch stream behind a red migration PR. Astro majors are
+validated by the docs-site build job; **puppeteer majors get a manual
+UAT-harness smoke before approval**, because nothing in CI exercises
+that harness. The docs site pins its toolchain floor in
+`site/package.json` `engines` (mirrors Astro's own floor — currently
+Node ≥ 22.12.0, npm ≥ 9.6.5; the docs-site job runs Node 22).
+
+**Standing convention — new npm directories.** A directory gaining a
+`package.json` ships, in the same PR: a committed `package-lock.json`,
+an entry in the `npm` block's `directories:` list in
+`.github/dependabot.yml` (the list is explicit; there is no
+auto-discovery), and `npm ci` — never `npm install` — in any Dockerfile
+that consumes it, so images get exactly the committed, audited tree and
+manifest/lockfile drift fails the build loudly. A lone `package.json`
+has an unpinned transitive tree that is invisible to Dependabot,
+`npm audit`, and OSV alike — exactly the hole PR #1877 closed for the
+cedar-vale app, where the unpinned tree was carrying a live
+high-severity ReDoS.
 
 ## vcpkg baseline
 
@@ -190,11 +248,11 @@ For Inter font: a binary `.woff2` refresh follows the same pattern but uses `emb
 
 ### Why these aren't in Dependabot
 
-Dependabot's npm ecosystem requires a `package.json` in the repository root, which Yuzu doesn't have (these are flat vendored files, not an npm-managed dependency tree). The cost of a manual quarterly review against the pinned byte counts is small relative to the cost of standing up an npm toolchain just for staleness tracking. If the vendored JS surface grows past 8–10 packages, reconsider.
+These are flat vendored files embedded into the server binary at build time — there is no `package.json` describing them, so Dependabot's npm ecosystem has nothing to parse. (The repo's actual npm-managed directories — `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` — **are** Dependabot-tracked; see "npm tooling" above.) The cost of a manual quarterly review against the pinned byte counts is small relative to the cost of converting the embedded-JS flow to an npm toolchain just for staleness tracking. If the vendored JS surface grows past 8–10 packages, reconsider.
 
 ## Staleness query — "what's the oldest pinned dep?"
 
-- **Dependabot-tracked** (`github-actions`, `docker`, `pip`) — open the
+- **Dependabot-tracked** (`github-actions`, `docker`, `pip`, `npm`) — open the
   "Dependency updates" tab on the GitHub UI, or
   `gh pr list --label dependencies --state open`. An open Dependabot PR
   with an old `createdAt` is the staleness signal; merge latency is

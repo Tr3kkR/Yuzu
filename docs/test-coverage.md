@@ -1,15 +1,15 @@
 # Test Coverage Tracking
 
-Last updated: 2026-07-03
+Last updated: 2026-07-06
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 21 files | Active |
 | Server unit tests | `yuzu_server_tests` | 38 files | Active (requires `build_server=true`) |
 
-**Totals:** 49 test files (+1: `test_installed_apps_inventory.cpp`, blob contract v2). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
+**Totals:** 53 test files (+1: `test_thread_pool.cpp` — the #2037 dispatch-pool exception firewall; +3: `test_spark_disk.cpp`, `test_spark_engine.cpp`, `test_spark_mechanism.cpp` — the ADR-0021 SparkEngine + File/Registry/Service mechanisms). Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests. Note: these per-suite file counts and the "Tested" tables below have drifted from `tests/meson.build`'s actual source list on prior updates too — treat as directionally accurate, not authoritative; `tests/meson.build` is the source of truth for what's actually compiled.
 
 Run all tests: `meson test -C build-linux --print-errorlogs`
 
@@ -28,6 +28,9 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 | `test_filesystem_read.cpp` | Filesystem plugin | validate_path, read parameters, CRLF stripping, binary detection, pagination |
 | `test_string_utils.cpp` | Shared utilities | icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line |
 | `test_vuln_rules.cpp` | Vuln scan rules | compare_versions, CveRule data integrity, CVE matching logic |
+| `test_spark_engine.cpp` | SparkEngine core (ADR-0021) | timer wheel + multi-due-tick no-double-lock regression, arm-dedup fan-out, per-subscriber startup one-shot, stuck-consumer isolation, bounded-queue drop-oldest + drop identity, bounded-shutdown detach (UP-1), inline duration watchdog + throw-survival, disarm, disk breach/recovery edges, lifecycle, register_consumer-vs-stop() race — deterministic hook-forced interleaving (Tr3kkR finding, PR #1927 review) + a real-concurrency stress complement (quality-engineer finding, PR #1927 review); wedged-handler sync state heap-allocated so a detached dispatch can't UAF stack locals (#1957) |
+| `test_spark_disk.cpp` | Disk spark decision fns | latch breach/recovery, invalid-reading-keeps-latch (UP-5), threshold + min-free logic |
+| `test_spark_mechanism.cpp` | `ISparkMechanism` seam + File/Registry/Service | arm/dedup/fan-out/disarm-teardown via a FakeMechanism, watch-failure whole-key rollback (B1), pre-start-replay fault, fault-channel transitions (B1), inline re-arm no-deadlock (TRAP 2), unregister_consumer unwatches a watch its removal empties (Tr3kkR finding, PR #1927 review); mechanism-call race fixes — ghost-subscription on arm-vs-unregister (#1994 M1) and late-unwatch-vs-equal-spec-rearm (#1994 M2), each a deterministic hook-forced test + a real-concurrency stress twin; stop()-inside-mechanism-teardown re-entry does not deadlock (#1934 UP-1/F4); Windows-only (`#ifdef _WIN32`) real-mechanism smoke for File/Registry + delete/recreate resilience + inline µs-dispatch latency + disarm-then-rearm watch retention (PR #1927 review) + ancestor-walk termination on a nonexistent drive root (PR #1927 review) + stale-key-registration cleared on a different-dir re-arm (#1981) + retiring_ cap bounded/observable/refused under a wedged-worker flood (#1979/#1982); real-mechanism smoke for Service on both Windows (SCM) and Linux with libsystemd (`#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)`) — fd/thread collapse, churn, live-transition, inline latency, key-coalescing (two engine keys folding onto one unit/service each still emit independently) |
 | `test_kv_store.cpp` | KV storage | Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases) |
 | `test_trigger_engine.cpp` | Trigger engine | Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases) |
 | `test_new_plugins.cpp` | Plugin runtime | Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases) |
@@ -91,7 +94,8 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 |------|-----------|----------------|
 | `test_auth.cpp` | Auth manager | Crypto primitives, user CRUD, sessions, enrollment tokens, pending agents, config persistence |
 | `test_auto_approve.cpp` | Auto-approve | Hostname glob, CIDR subnet, CA fingerprints, rule evaluation (any/all mode), config persistence |
-| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules |
+| `test_nvd.cpp` | NVD database | Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules, assess() coverage-aware matching, vendor composite index (EXPLAIN plans), products_for_cves CVE→product inversion, upsert_cves changed_ids delta |
+| `test_cpe_identity_resolver.cpp` | CPE identity resolver (PR 3) | Lane gate (os-native / unsupported ecosystem, case-insensitive), no-identity / no-version decision ordering, curated exact-High hit + global-vs-distro-override precedence, `normalize_product` table (interpreter-prefix, SAFE-suffix, lib-dot soname, prefix-then-no-suffix, prefix floor), display-only vendor contract, fail-closed floor (12 vs 13 exact boundary), and adversarial regressions (13-malformed-lines → 0 rows, empty-product row dropped, uncurated dotted-lib e2e dot-strip). Untested / PR-4-owed: seed cpe_product-vs-NVD-mirror validation (DB-free in PR 3 — a wrong token silently yields zero coverage until PR 4 asserts each seed product hits ≥ 1 real `cve_match` row). |
 | `test_update_registry.cpp` | OTA registry | Package CRUD, latest_for version selection, rollout eligibility, binary_path |
 | `test_https_config.cpp` | HTTPS config | Default values, cookie security attributes (Secure, HttpOnly, SameSite), retention config |
 | `test_response_store.cpp` | Response store | Store/retrieve, query filters (agent_id, status, time range), pagination, TTL, ordering |
@@ -116,6 +120,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |
 | `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |
 | `test_software_inventory_store.cpp` | `SoftwareInventoryStore` + `inventory_ingestion` seam (ADR-0016) | Canonical-hash cross-pin (blob contract v2, 12 fields), hash-skip ingest (full/touched/need_full/drift/cold-cache), atomic full-replace, invalid-UTF-8 scrub-to-U+FFFD store + agent hash coordination (UP-IN1), codepoint-boundary truncation (UP-10), oversized-blob drop+nack (UP-2/UP-4), kError→need_full nack (UP-2), fleet query (live PostgreSQL); v2 12-field round-trip through store + ingest seam; v1→v2 mixed-version compat (bounded need_full loop, not infinite); migration v5 upgrade (pre-v5 rows read `''` in new columns) |
+| `test_vuln_finding_store.cpp` + `test_vuln_finding_store_adversarial.cpp` | `VulnFindingStore` (born-on-PG, ADR-0023 M1a) | Fail-closed ctor + idempotent migration, reconcile sequence (upsert-always / authoritative-gated sweep + `disposed_clean` delete + coverage clobber), monotonic in-txn `run_ts` + NTP-step-back safety, re-observe/status-upgrade in place, three-way coverage read (Ok/NotFound/Degraded under real pool exhaustion), authoritative `fleet_summary` (nullopt-on-degrade, excludes resolved), nullable cvss/fixed_in NULL round-trip, non-finite cvss (NaN/+Inf)→NULL no-abort (FIX 2), UP-2 mass-resolve backstop arm/narrow (FIX 3), NUL-in-identity reject (FIX 4), mixed-case severity/status query-filter normalization (FIX 6), whole-batch rollback on a bad row (mid-batch), duplicate-key-in-batch upsert, per-agent advisory-lock serialization + cross-store namespace isolation (deterministic `pg_try_advisory_xact_lock` proof), SQL-metacharacter parameterization; also exercises `SoftwareInventoryStore::list_agent_ids` keyset pager (live PostgreSQL) |
 | `test_notification_store.cpp` | Notifications | In-app notification CRUD, read/unread status |
 | `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing (present/empty/absent, Entra `_claim_names`/`_claim_sources` group-overage detection, `groups_claim_reconcilable` gate) |
 | `test_quarantine_store.cpp` | Quarantine | Device quarantine/release, network isolation state |

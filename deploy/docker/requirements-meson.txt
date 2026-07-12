@@ -1,0 +1,11 @@
+# Hash-pinned meson for the container builder images (OpenSSF
+# Pinned-Dependencies — a bare `pip install meson==X` pins the version but
+# not the artifact). Consumed via `pip install --require-hashes -r` by
+# Dockerfile.{agent,server,ci,ci-linux,agent.chisel,server.chisel}.
+# Dependabot's pip ecosystem watches this directory, so bumps arrive as
+# normal dependency PRs (it regenerates the hashes).
+# meson is pure Python with zero install_requires — the wheel + sdist
+# hashes below are the complete closure.
+meson==1.9.2 \
+    --hash=sha256:1a284dc1912929098a6462401af58dc49ae3f324e94814a38a8f1020cee07cba \
+    --hash=sha256:3499b59bb23982496e01e57b4103ac2f826f9c3a3f59e507a0a832487fe55e3d

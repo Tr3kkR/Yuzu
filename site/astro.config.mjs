@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
 import rewriteLinks from './src/remark/rewrite-links.mjs';
 import stripFirstH1 from './src/remark/strip-first-h1.mjs';
 
@@ -10,9 +11,14 @@ export default defineConfig({
   base: '/Yuzu',
   trailingSlash: 'always',
   markdown: {
-    // Manifest-driven link rewriting: in-scope .md links -> site routes,
-    // out-of-scope -> GitHub blob URLs, dangling -> build failure.
-    remarkPlugins: [rewriteLinks, stripFirstH1],
+    // Astro 7: remark plugins ride the explicit unified() processor —
+    // markdown.remarkPlugins is deprecated (shikiConfig is not; it stays
+    // a sibling option). Manifest-driven link rewriting: in-scope .md
+    // links -> site routes, out-of-scope -> GitHub blob URLs, dangling ->
+    // build failure.
+    processor: unified({
+      remarkPlugins: [rewriteLinks, stripFirstH1],
+    }),
     shikiConfig: { theme: 'night-owl', wrap: false },
   },
 });

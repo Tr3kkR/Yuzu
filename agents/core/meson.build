@@ -9,11 +9,13 @@
 agent_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 agent_crypto_deps = [agent_openssl_dep]
 
-# Linux: the systemd service guard (guard_systemd.cpp) watches unit run-state over
-# sd-bus, which libsystemd provides. The sd-bus impl is wrapped in
-# `#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)` and compiles to a no-op
-# stub (start() returns false, like the off-Linux build) when libsystemd is not used.
-# The `systemd_guard` feature option (default `enabled`) controls the dependency:
+# Linux: the systemd service guard (guard_systemd.cpp) AND the Service spark
+# mechanism (spark_service.cpp, ADR-0021 Stage 1 PR 1c) watch unit run-state over
+# sd-bus, which libsystemd provides. Both are wrapped in
+# `#if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)` and compile to a no-op
+# stub (start() returns false / make_service_mechanism() returns nullptr, like the
+# off-Linux build) when libsystemd is not used. The `systemd_guard` feature option
+# (default `enabled`) controls the dependency for BOTH:
 #   enabled  — require libsystemd, so the shipped agent always offers the guard and a
 #              build that has lost libsystemd-dev FAILS loudly instead of silently
 #              shipping a guard-less agent. Default ⇒ CI / Docker / release stay
@@ -38,7 +40,7 @@ endif
 
 yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
-  files('src/agent.cpp', 'src/agent_csr.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/dex_event.cpp', 'src/dex_linux_collector.cpp', 'src/dex_linux_journal.cpp', 'src/dex_linux_kmsg.cpp', 'src/dex_linux_proc.cpp', 'src/dex_linux_storage.cpp', 'src/dex_linux_sysfs.cpp', 'src/dex_macos_collector.cpp', 'src/dex_macos_iokit.cpp', 'src/dex_macos_oslog.cpp', 'src/dex_macos_signals.cpp', 'src/dex_observer.cpp', 'src/dex_perf_breach.cpp', 'src/dex_rate_limiter.cpp', 'src/dex_signal_catalog.cpp', 'src/dex_win_poll.cpp', 'src/guard_file.cpp', 'src/guard_registry.cpp', 'src/guard_service.cpp', 'src/guard_systemd.cpp', 'src/guardian_engine.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/local_dispatcher.cpp', 'src/network_interfaces.cpp', 'src/net_quality_sampler.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/resilience_strategy.cpp', 'src/sdk_utilities.cpp', 'src/sync_scheduler.cpp', 'src/sync_source_app_perf.cpp', 'src/sync_source_device_ci.cpp', 'src/sync_source_installed_software.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
+  files('src/agent.cpp', 'src/agent_csr.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/dex_event.cpp', 'src/dex_linux_collector.cpp', 'src/dex_linux_journal.cpp', 'src/dex_linux_kmsg.cpp', 'src/dex_linux_proc.cpp', 'src/dex_linux_storage.cpp', 'src/dex_linux_sysfs.cpp', 'src/dex_macos_collector.cpp', 'src/dex_macos_iokit.cpp', 'src/dex_macos_oslog.cpp', 'src/dex_macos_signals.cpp', 'src/dex_observer.cpp', 'src/dex_perf_breach.cpp', 'src/dex_rate_limiter.cpp', 'src/dex_signal_catalog.cpp', 'src/dex_win_poll.cpp', 'src/guard_file.cpp', 'src/guard_registry.cpp', 'src/guard_service.cpp', 'src/guard_systemd.cpp', 'src/guardian_engine.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/local_dispatcher.cpp', 'src/network_interfaces.cpp', 'src/net_quality_sampler.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/resilience_strategy.cpp', 'src/sdk_utilities.cpp', 'src/spark_disk.cpp', 'src/spark_engine.cpp', 'src/spark_file.cpp', 'src/spark_interval.cpp', 'src/spark_registry.cpp', 'src/spark_service.cpp', 'src/spark_spec.cpp', 'src/spark_startup.cpp', 'src/sync_scheduler.cpp', 'src/sync_source_app_perf.cpp', 'src/sync_source_device_ci.cpp', 'src/sync_source_installed_software.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),
