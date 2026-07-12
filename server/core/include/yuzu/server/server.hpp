@@ -285,6 +285,13 @@ struct Config {
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
+    /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
+    /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
+    /// allowed because the endpoint requires a credential). Wired via the
+    /// repeatable --mcp-allowed-origin / YUZU_MCP_ALLOWED_ORIGINS.
+    std::vector<std::string> mcp_allowed_origins;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
