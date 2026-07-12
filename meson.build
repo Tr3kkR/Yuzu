@@ -1,7 +1,10 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.13.0',
+  # A pre-release suffix (-dev/-rcN) is handled by the numeric-component split
+  # below (search PROJECT_VERSION_PATCH); keep the suffix on dev — it is what
+  # keeps CI exercising the pre-release codepath.
+  version: '0.13.1-dev',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -64,9 +67,19 @@ else
 endif
 
 version_conf = configuration_data()
-version_conf.set('PROJECT_VERSION_MAJOR', meson.project_version().split('.')[0])
-version_conf.set('PROJECT_VERSION_MINOR', meson.project_version().split('.')[1])
-version_conf.set('PROJECT_VERSION_PATCH', meson.project_version().split('.')[2])
+# The three numeric components feed `int` fields in version.hpp
+# (`int kVersionMajor/Minor/Patch = @...@;`), so each MUST be a plain integer.
+# A pre-release version (e.g. 0.13.1-dev, the post-release bump) carries its
+# suffix on the patch element, which would emit `int kVersionPatch = 1-dev;` —
+# invalid C++ ("use of undeclared identifier 'dev'") that red-lines the whole
+# build matrix. Strip the pre-release suffix off the patch, then validate every
+# component with `.to_int()`: that turns any malformed version (typo, SemVer
+# `+build` metadata, non-numeric) into a loud single `meson setup` failure
+# instead of an opaque compile break across every CI leg. PROJECT_VERSION (below)
+# keeps the full string for the string-typed fields (kVersionString/kFullVersionString).
+version_conf.set('PROJECT_VERSION_MAJOR', meson.project_version().split('.')[0].to_int())
+version_conf.set('PROJECT_VERSION_MINOR', meson.project_version().split('.')[1].to_int())
+version_conf.set('PROJECT_VERSION_PATCH', meson.project_version().split('.')[2].split('-')[0].to_int())
 version_conf.set('YUZU_BUILD_NUMBER', yuzu_build_number)
 version_conf.set('YUZU_GIT_COMMIT_HASH', yuzu_git_commit_hash)
 version_conf.set('PROJECT_VERSION', meson.project_version())
