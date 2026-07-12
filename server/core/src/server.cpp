@@ -10063,13 +10063,6 @@ private:
             }
             return true;
         };
-        auto sle_perm_fn = [this, sle_gate_usable](const httplib::Request& req,
-                                                   httplib::Response& res, const std::string& type,
-                                                   const std::string& op) -> bool {
-            if (!sle_gate_usable(req, res))
-                return false;
-            return require_permission(req, res, type, op);
-        };
         auto sle_scoped_perm_fn = [this, sle_gate_usable](
                                       const httplib::Request& req, httplib::Response& res,
                                       const std::string& type, const std::string& op,
@@ -10079,30 +10072,24 @@ private:
             return require_scoped_permission(req, res, type, op, agent_id);
         };
         sle_routes_ = std::make_unique<SleRoutes>();
+        // Per ADR-0024 "Placement under ADR-1005", only the discovery mechanism is
+        // in-server: the raw per-agent drill (GET) and the audited durable-erasure
+        // trigger (DELETE). The posture/compliance reads and the fan-out list are the
+        // SAM UCE module's interpretation surface, not built here. The discovery
+        // read's machine-surface twin is the `query_software_licenses` MCP tool
+        // (mcp_server.cpp), per ADR-1005 Decision 1.
         sle_routes_->register_routes(
-            *web_server_, sle_perm_fn, sle_scoped_perm_fn,
-            // Posture rollup (summary + licenses). nullopt on degrade → 503; empty in
-            // PR1a until the PR1b compliance evaluator populates it.
-            [this]() -> std::optional<std::vector<LicensePostureRow>> {
-                if (!software_licensing_store_)
-                    return std::nullopt;
-                return software_licensing_store_->posture_rollup();
-            },
-            // Fan-out (devices carrying a product key) — ADR-0017 PR-A flip-wave
-            // consumer (#1634/#1715), global-gated NOW. PR1a has no per-device posture
-            // breakdown yet, so return an HONEST EMPTY list (a real value, NOT a
-            // degrade — there is no store read here that could degrade); the PR1b
-            // evaluator supplies the rows, and the admit-then-filter "filters before
-            // LIMIT" completeness test lands at the flip.
-            [](const std::string& /*product_key*/, int /*limit*/)
-                -> std::optional<std::vector<SleLicenseDeviceRow>> {
-                return std::vector<SleLicenseDeviceRow>{};
-            },
-            // Single-agent drill — REAL data in PR1a. nullopt on degrade → 503.
+            *web_server_, sle_scoped_perm_fn,
+            // Single-agent drill — REAL detected-licence data. nullopt on degrade → 503.
             [this](const std::string& agent_id) -> std::optional<std::vector<AgentLicenseRow>> {
                 if (!software_licensing_store_)
                     return std::nullopt;
                 return software_licensing_store_->agent_licenses(agent_id);
+            },
+            // Erasure cascade — the DELETE route's production caller (Decision 11):
+            // fans delete_agent across every registered per-agent store.
+            [this](const std::string& agent_id) -> DecommissionResult {
+                return decommission_agent(agent_id);
             },
             audit_fn);
 

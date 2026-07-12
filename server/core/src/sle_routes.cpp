@@ -1,17 +1,16 @@
 /// @file sle_routes.cpp
-/// `/api/v1/sle/*` read-route registration (ADR-0024, PR1a). See sle_routes.hpp
-/// for the per-route auth posture. The handler chain mirrors the
-/// `/api/v1/inventory/software` precedent EXACTLY: correlation id + header on
-/// every path → auth/perm gate → 503-on-degrade (never an empty 200) → limit
-/// clamp 1..1000 → audit; errors via the A4 envelope + `X-Correlation-Id`.
+/// `/api/v1/sle/*` in-server discovery route registration (ADR-0024; the
+/// discovery half kept in-server per "Placement under ADR-1005"). Two routes:
+/// the raw per-agent detected-licence drill (GET) and the audited durable-erasure
+/// trigger (DELETE). The posture/compliance reads and the fan-out list are the
+/// SAM UCE module's, not built here. See sle_routes.hpp for the per-route auth
+/// posture. The handler chain mirrors the `/api/v1/inventory/software` precedent:
+/// correlation id + header → auth/scope gate → fail-closed behavioural audit →
+/// 503-on-degrade (never an empty 200); errors via the A4 envelope.
 ///
 /// A4 / JSON helpers are re-implemented locally (small, self-contained) rather
-/// than shared from rest_api_v1.cpp, whose `JObj`/`ok_json`/`error_json_a4` are
-/// file-local (anonymous namespace / translation-unit `detail`) — the same
-/// self-contained-route-file discipline InventoryRoutes follows with its own
-/// `clamp_limit`. The wire shape (`{"error":{code,message,correlation_id,
-/// retry_after_ms,...}},"meta":{"api_version":"v1"}}` and `{"data":...,"meta":
-/// {"api_version":"v1"}}`) is kept byte-compatible with the A4 envelope.
+/// than shared from rest_api_v1.cpp, whose helpers are translation-unit-local —
+/// the same self-contained-route-file discipline InventoryRoutes follows.
 
 #include "sle_routes.hpp"
 
@@ -21,9 +20,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <format>
@@ -37,18 +34,6 @@ namespace yuzu::server {
 namespace {
 
 using nlohmann::json;
-
-std::int64_t epoch_now_secs() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-// Upper bound on the `expiring_within_days` filter (~100 years). The filter
-// computes `now + days*86400`; an unclamped value (std::stoll reaches ~9.2e18)
-// would overflow int64 in that multiply/add — signed-overflow UB. 100 years is
-// far past any real expiry horizon, so clamping here changes no legitimate query.
-constexpr std::int64_t kMaxExpiringWithinDays = 36500;
 
 /// grep-token correlation id, `req-<hex-ms>-<hex-seq>` — same shape as
 /// rest_api_v1.cpp's make_correlation_id (echoed in X-Correlation-Id + every A4
@@ -97,77 +82,6 @@ void send_json(httplib::Response& res, int status, std::string body) {
     res.set_content(std::move(body), "application/json");
 }
 
-/// Clamp `limit` into [1, hi] in 64-bit BEFORE narrowing so a negative/wrapped
-/// value can't defeat the cap (mirrors the /inventory/software REST route). A
-/// non-integer value returns `dflt` (the query is lenient; the REST sibling 400s,
-/// but the SLE reads follow the inventory-fragment lenient-clamp convention).
-int clamp_limit(const httplib::Request& req, int dflt, int hi) {
-    if (!req.has_param("limit"))
-        return dflt;
-    try {
-        std::int64_t want = std::stoll(req.get_param_value("limit"));
-        return static_cast<int>(std::clamp<std::int64_t>(want, 1, hi));
-    } catch (...) {
-        return dflt;
-    }
-}
-
-std::string lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
-}
-
-bool icontains(const std::string& hay, const std::string& needle) {
-    if (needle.empty())
-        return true;
-    return lower(hay).find(needle) != std::string::npos;
-}
-
-/// A posture row matches `state` when the corresponding per-effective-state count
-/// is non-zero (the rollup carries per-state counts, not one state per product).
-/// `lapsed` is the §3.2 lapse union (expired ∪ unlicensed). An unrecognised token
-/// matches nothing (honest — no product is in a nonexistent state).
-bool state_matches(const LicensePostureRow& r, const std::string& state) {
-    if (state == "licensed")
-        return r.licensed_count > 0;
-    if (state == "subscription_active")
-        return r.subscription_active_count > 0;
-    if (state == "trial")
-        return r.trial_count > 0;
-    if (state == "grace")
-        return r.grace_count > 0;
-    if (state == "expired")
-        return r.expired_count > 0;
-    if (state == "unlicensed")
-        return r.unlicensed_count > 0;
-    if (state == "unknown")
-        return r.unknown_count > 0;
-    if (state == "lapsed")
-        return (r.expired_count + r.unlicensed_count) > 0;
-    return false;
-}
-
-json posture_to_json(const LicensePostureRow& r) {
-    json j;
-    j["product_key"] = r.product_key;
-    j["vendor"] = r.vendor;
-    j["title"] = r.title;
-    j["device_count"] = r.device_count;
-    j["install_count"] = r.install_count;
-    j["licensed"] = r.licensed_count;
-    j["subscription_active"] = r.subscription_active_count;
-    j["trial"] = r.trial_count;
-    j["grace"] = r.grace_count;
-    j["expired"] = r.expired_count;
-    j["unlicensed"] = r.unlicensed_count;
-    j["unknown"] = r.unknown_count;
-    j["next_expiry_at"] = r.next_expiry_at;
-    j["expiring_soon"] = r.expiring_soon_count;
-    j["refreshed_at"] = r.refreshed_at;
-    return j;
-}
-
 json agent_license_to_json(const AgentLicenseRow& r) {
     json j;
     j["product"] = r.product;
@@ -195,232 +109,30 @@ json agent_license_to_json(const AgentLicenseRow& r) {
 
 } // namespace
 
-void SleRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
-                                PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn) {
+void SleRoutes::register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
+                                AgentLicensesFn agent_licenses_fn, DecommissionFn decommission_fn,
+                                AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(perm_fn), std::move(scoped_perm_fn), std::move(posture_fn),
-                    std::move(devices_fn), std::move(agent_licenses_fn), std::move(audit_fn));
+    register_routes(sink, std::move(scoped_perm_fn), std::move(agent_licenses_fn),
+                    std::move(decommission_fn), std::move(audit_fn));
 }
 
-void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermFn scoped_perm_fn,
-                                PostureFn posture_fn, LicenseDevicesFn devices_fn,
-                                AgentLicensesFn agent_licenses_fn, AuditFn audit_fn) {
-    perm_fn_ = std::move(perm_fn);
+void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
+                                AgentLicensesFn agent_licenses_fn, DecommissionFn decommission_fn,
+                                AuditFn audit_fn) {
     scoped_perm_fn_ = std::move(scoped_perm_fn);
-    posture_fn_ = std::move(posture_fn);
-    devices_fn_ = std::move(devices_fn);
     agent_licenses_fn_ = std::move(agent_licenses_fn);
+    decommission_fn_ = std::move(decommission_fn);
     audit_fn_ = std::move(audit_fn);
 
-    // ── GET /api/v1/sle/summary — fleet posture headline (GLOBAL SoftwareLicensing:Read) ──
-    // Reads the precomputed posture rollup and derives honest aggregates. In PR1a
-    // the rollup is empty (the PR1b evaluator populates it), so this returns an
-    // honest empty shape (as_of=0, evaluated=false, zero counts) — NOT a fabricated
-    // zero and NOT a silent-empty degrade (a degrade is a 503 below). Aggregate,
-    // machine-scope headline (no user_ref) → SET-AND-PROCEED audit (try_persist_audit).
-    sink.Get("/api/v1/sle/summary", [this](const httplib::Request& req, httplib::Response& res) {
-        const auto cid = make_cid();
-        res.set_header("X-Correlation-Id", cid);
-        if (!perm_fn_) {
-            send_json(res, 503, a4_error(503, "authorization gate not configured", cid));
-            return;
-        }
-        if (!perm_fn_(req, res, "SoftwareLicensing", "Read"))
-            return; // perm_fn wrote 401/403/503 (fail-closed on corrupt rbac.db per G-1)
-
-        std::optional<std::vector<LicensePostureRow>> rollup;
-        if (posture_fn_)
-            rollup = posture_fn_();
-        if (!rollup) {
-            // Store/pool/query degrade — NEVER a fabricated empty summary (an empty
-            // compliance headline reads as "nothing detected / nothing lapsed").
-            (void)detail::try_persist_audit(audit_fn_, req, "sle.summary", "failure",
-                                            "SoftwareLicensing", "fleet",
-                                            "posture rollup degraded; cid=" + cid);
-            send_json(res, 503,
-                      a4_error(503, "SLE posture rollup unavailable — read failed", cid, 5000,
-                               "retry the request"));
-            return;
-        }
-
-        std::int64_t as_of = 0, installs = 0, lapsed = 0, expiring = 0, next_expiry = 0;
-        for (const auto& r : *rollup) {
-            installs += r.install_count;
-            if ((r.expired_count + r.unlicensed_count) > 0)
-                ++lapsed;
-            expiring += r.expiring_soon_count;
-            as_of = std::max(as_of, r.refreshed_at);
-            if (r.next_expiry_at > 0 && (next_expiry == 0 || r.next_expiry_at < next_expiry))
-                next_expiry = r.next_expiry_at;
-        }
-        json data;
-        data["as_of"] = as_of;
-        // evaluated derives from the rollup's as-of stamp (per-row refreshed_at). An
-        // empty rollup reads as evaluated=false — correct in PR1a (no evaluator yet);
-        // PR1b adds a first-class rollup as-of stamp to distinguish an
-        // evaluated-but-empty estate from a never-run one (roadmap G-4).
-        data["evaluated"] = as_of > 0;
-        data["products"] = static_cast<std::int64_t>(rollup->size());
-        data["installs"] = installs;
-        data["lapsed_products"] = lapsed;
-        data["expiring_soon"] = expiring;
-        data["next_expiry_at"] = next_expiry;
-
-        (void)detail::try_persist_audit(
-            audit_fn_, req, "sle.summary", "success", "SoftwareLicensing", "fleet",
-            "products=" + std::to_string(rollup->size()) + " cid=" + cid);
-        send_json(res, 200, ok_json(std::move(data)));
-    });
-
-    // ── GET /api/v1/sle/licenses?state=&expiring_within_days=&q=&limit= ──
-    // Fleet posture rows (GLOBAL SoftwareLicensing:Read), filtered then capped
-    // 1..1000. Global-gated aggregate (pinned global-only per ADR-0017 / Decision
-    // 10): a group-confined principal is denied at the global gate, never served a
-    // partial rollup. Empty until the PR1b evaluator populates the rollup.
-    sink.Get("/api/v1/sle/licenses", [this](const httplib::Request& req, httplib::Response& res) {
-        const auto cid = make_cid();
-        res.set_header("X-Correlation-Id", cid);
-        if (!perm_fn_) {
-            send_json(res, 503, a4_error(503, "authorization gate not configured", cid));
-            return;
-        }
-        if (!perm_fn_(req, res, "SoftwareLicensing", "Read"))
-            return;
-
-        std::optional<std::vector<LicensePostureRow>> rollup;
-        if (posture_fn_)
-            rollup = posture_fn_();
-        if (!rollup) {
-            (void)detail::try_persist_audit(audit_fn_, req, "sle.licenses.query", "failure",
-                                            "SoftwareLicensing", "fleet",
-                                            "posture rollup degraded; cid=" + cid);
-            send_json(res, 503,
-                      a4_error(503, "SLE posture rollup unavailable — read failed", cid, 5000,
-                               "retry the request"));
-            return;
-        }
-
-        const std::string state = req.has_param("state") ? req.get_param_value("state") : "";
-        const std::string q = req.has_param("q") ? lower(req.get_param_value("q")) : "";
-        std::int64_t expiring_days = -1; // -1 = no expiry filter
-        if (req.has_param("expiring_within_days")) {
-            try {
-                // Clamp to [0, kMaxExpiringWithinDays] BEFORE the days*86400 multiply
-                // below — an unclamped value overflows int64 (signed-overflow UB). A
-                // negative clamps to 0 (filter active, today-only), preserving the
-                // prior std::max(0, …) behaviour.
-                expiring_days = std::clamp<std::int64_t>(
-                    std::stoll(req.get_param_value("expiring_within_days")), 0,
-                    kMaxExpiringWithinDays);
-            } catch (...) {
-                expiring_days = -1; // non-integer → no filter (lenient)
-            }
-        }
-        const int limit = clamp_limit(req, 200, 1000);
-        const std::int64_t now = epoch_now_secs();
-
-        json licenses = json::array();
-        std::int64_t as_of = 0;
-        std::int64_t matched = 0;
-        bool hit_cap = false;
-        for (const auto& r : *rollup) {
-            as_of = std::max(as_of, r.refreshed_at);
-            if (!state.empty() && !state_matches(r, state))
-                continue;
-            if (expiring_days >= 0 &&
-                !(r.next_expiry_at > 0 && r.next_expiry_at <= now + expiring_days * 86400))
-                continue;
-            if (!q.empty() && !(icontains(r.title, q) || icontains(r.vendor, q) ||
-                                icontains(r.product_key, q)))
-                continue;
-            ++matched;
-            if (static_cast<int>(licenses.size()) >= limit) {
-                hit_cap = true; // more match than the page holds
-                continue;
-            }
-            licenses.push_back(posture_to_json(r));
-        }
-
-        (void)detail::try_persist_audit(
-            audit_fn_, req, "sle.licenses.query", "success", "SoftwareLicensing",
-            state.empty() ? "fleet" : ("state=" + state),
-            "rows=" + std::to_string(licenses.size()) + " cid=" + cid);
-
-        json data;
-        data["licenses"] = std::move(licenses);
-        data["count"] = matched;
-        data["as_of"] = as_of;
-        if (hit_cap)
-            data["result_truncated_by_cap"] = true;
-        send_json(res, 200, ok_json(std::move(data)));
-    });
-
-    // ── GET /api/v1/sle/licenses/{key}/devices — fan-out list (GLOBAL-gated) ──
-    // ADR-0017 PR-A FLIP-WAVE CONSUMER (#1634 umbrella checklist; #1715 deny-precedence
-    // prerequisite): a true fan-out list read that CANNOT admit-then-filter under the
-    // current global gate, so it ships GLOBAL-gated on SoftwareLicensing:Read and is
-    // registered here (code) + on the ADR-0017 ladder (docs step) as a flip consumer.
-    // The admit-then-filter chokepoint and its "filters BEFORE the LIMIT" completeness
-    // test land AT THE FLIP, NOT in PR1a (roadmap §3.5 / D-4 / test matrix). PR1a wires
-    // an honest-empty provider (the per-device posture breakdown is PR1b).
-    sink.Get(R"(/api/v1/sle/licenses/([^/]+)/devices)",
-             [this](const httplib::Request& req, httplib::Response& res) {
-                 const auto cid = make_cid();
-                 res.set_header("X-Correlation-Id", cid);
-                 const std::string key = req.matches.size() > 1 ? req.matches[1].str() : "";
-                 if (!perm_fn_) {
-                     send_json(res, 503, a4_error(503, "authorization gate not configured", cid));
-                     return;
-                 }
-                 if (!perm_fn_(req, res, "SoftwareLicensing", "Read"))
-                     return;
-
-                 const int limit = clamp_limit(req, 200, 1000);
-                 std::optional<std::vector<SleLicenseDeviceRow>> rows;
-                 if (devices_fn_)
-                     rows = devices_fn_(key, limit);
-                 if (!rows) {
-                     (void)detail::try_persist_audit(audit_fn_, req, "sle.licenses.devices",
-                                                     "failure", "SoftwareLicensing", "key=" + key,
-                                                     "fan-out read degraded; cid=" + cid);
-                     send_json(res, 503,
-                               a4_error(503, "SLE licence device list unavailable — read failed",
-                                        cid, 5000, "retry the request"));
-                     return;
-                 }
-
-                 const bool hit_cap = static_cast<int>(rows->size()) >= limit;
-                 json devices = json::array();
-                 for (const auto& d : *rows) {
-                     json j;
-                     j["agent_id"] = d.agent_id;
-                     j["hostname"] = d.hostname;
-                     j["state"] = d.state;
-                     j["expiry_at"] = d.expiry_at;
-                     devices.push_back(std::move(j));
-                 }
-                 (void)detail::try_persist_audit(
-                     audit_fn_, req, "sle.licenses.devices", "success", "SoftwareLicensing",
-                     "key=" + key, "rows=" + std::to_string(devices.size()) + " cid=" + cid);
-
-                 json data;
-                 data["product_key"] = key;
-                 data["devices"] = std::move(devices);
-                 data["count"] = static_cast<std::int64_t>(rows->size());
-                 if (hit_cap)
-                     data["result_truncated_by_cap"] = true;
-                 send_json(res, 200, ok_json(std::move(data)));
-             });
-
     // ── GET /api/v1/sle/agents/{agent_id} — single-agent DRILL (scoped + fail-closed audit) ──
-    // Decision 10/11 + roadmap D-4/G-2: takes the WORKING ancestor-aware per-device
-    // scoped gate day one (SoftwareLicensing:Read + agent scope; 403 outside scope),
-    // the device_routes precedent. Renders per-agent detected licences INCLUDING
-    // user_scope/user_ref (personal data), so it joins the per-open behavioural-audit
-    // tier (emit_behavioral_audit, dex.device.view convention) and FAILS CLOSED (503 +
+    // Decision 10/11: takes the WORKING ancestor-aware per-device scoped gate day one
+    // (SoftwareLicensing:Read + agent scope; 403 outside scope), the device_routes
+    // precedent. Renders per-agent detected licences INCLUDING user_scope/user_ref
+    // (personal data), so it joins the per-open behavioural-audit tier
+    // (emit_behavioral_audit, dex.device.view convention) and FAILS CLOSED (503 +
     // Sec-Audit-Failed) if the access-audit row cannot persist — the device's licence
-    // PII is never served without durable evidence (SOC 2 CC7.2). REAL data in PR1a.
+    // PII is never served without durable evidence (SOC 2 CC7.2).
     sink.Get(R"(/api/v1/sle/agents/([^/]+))",
              [this](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = make_cid();
@@ -459,6 +171,11 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                  if (agent_licenses_fn_)
                      rows = agent_licenses_fn_(agent_id);
                  if (!rows) {
+                     // Store/pool/query degrade — a durable failure-audit (the aggregate
+                     // routes' pattern), then 503 (never a silent empty 200).
+                     (void)detail::try_persist_audit(audit_fn_, req, "sle.agent.view", "failure",
+                                                     "Agent", agent_id,
+                                                     "detected-licence store degraded; cid=" + cid);
                      send_json(res, 503,
                                a4_error(503, "detected-licence store unavailable — read failed", cid,
                                         5000, "retry the request"));
@@ -474,6 +191,95 @@ void SleRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, ScopedPermF
                  data["count"] = static_cast<std::int64_t>(rows->size());
                  send_json(res, 200, ok_json(std::move(data)));
              });
+
+    // ── DELETE /api/v1/sle/agents/{agent_id} — audited durable-erasure trigger (D-11) ──
+    // The agent-decommission cascade's production caller: fans delete_agent across
+    // every registered per-agent store, durably erasing the machine's stored rows
+    // (including the Decision-11 user_ref personal data — the reason this route
+    // exists). Gate: SCOPED SoftwareLicensing:Delete (D-9: only Administrator +
+    // ITServiceOwner hold Delete; Operator/Viewer 403) — the scope stops a
+    // group-confined ITSO erasing an out-of-scope device, while
+    // require_scoped_permission's global step still admits global holders fleet-wide.
+    //
+    // TWO durable audit events (spdlog alone is not GDPR Art.17 evidence):
+    //   1. AUDIT-BEFORE-ERASE, FAIL-CLOSED (`sle.agent.decommission|attempt`): when
+    //      the attempt row is KNOWN to have failed to persist, do NOT erase — an
+    //      unaudited erasure destroys the very data that would evidence what was
+    //      erased (503 + Sec-Audit-Failed). If the process dies mid-cascade, the
+    //      attempt row still evidences who initiated it.
+    //   2. OUTCOME (`sle.agent.decommission|success/partial`), set-and-proceed with
+    //      the per-store breakdown.
+    //
+    // HONESTY (#1947): each store's delete_agent now returns committed status
+    // (`[[nodiscard]] bool`, a false/rolled-back txn → `Failed`, never `Deleted`), so
+    // `r.ok()` means every store's DELETE committed; a `Failed` store → 500 (the
+    // cascade is idempotent; re-issue the DELETE).
+    sink.Delete(
+        R"(/api/v1/sle/agents/([^/]+))",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            const auto cid = make_cid();
+            res.set_header("X-Correlation-Id", cid);
+            const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+            if (!scoped_perm_fn_) {
+                send_json(res, 503, a4_error(503, "scope gate not configured", cid));
+                return;
+            }
+            if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Delete", agent_id))
+                return; // the gate wrote its own 401/403
+            if (!decommission_fn_) {
+                send_json(res, 503, a4_error(503, "decommission cascade not configured", cid, 5000));
+                return;
+            }
+            if (!detail::emit_behavioral_audit(
+                    audit_fn_, req, res, "sle.agent.decommission", "attempt", "Agent", agent_id,
+                    "durable-erasure cascade requested cid=" + cid)) {
+                send_json(res, 503,
+                          a4_error(503,
+                                   "audit subsystem unavailable; refusing to erase without "
+                                   "durable evidence",
+                                   cid, 5000, "retry the request"));
+                spdlog::warn("sle.agent.decommission audit fail-closed (503, no erase) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+
+            const DecommissionResult r = decommission_fn_(agent_id);
+
+            std::string breakdown;
+            json stores = json::object();
+            for (const auto& s : r.stores) {
+                stores[s.store] = to_string(s.outcome);
+                breakdown += s.store;
+                breakdown += '=';
+                breakdown += to_string(s.outcome);
+                breakdown += ' ';
+            }
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "sle.agent.decommission", r.ok() ? "success" : "partial", "Agent",
+                agent_id,
+                breakdown + "deleted=" + std::to_string(r.deleted) +
+                    " skipped=" + std::to_string(r.skipped) +
+                    " failed=" + std::to_string(r.failed) + " cid=" + cid);
+
+            if (!r.ok()) {
+                send_json(res, 500,
+                          a4_error(500,
+                                   "agent decommission incomplete — one or more stores failed (" +
+                                       std::to_string(r.failed) +
+                                       " failed); re-issue the DELETE (the cascade is idempotent)",
+                                   cid, 5000, "retry the request"));
+                return;
+            }
+            json data;
+            data["agent_id"] = agent_id;
+            data["decommissioned"] = true;
+            data["stores"] = std::move(stores);
+            data["deleted"] = static_cast<std::int64_t>(r.deleted);
+            data["skipped"] = static_cast<std::int64_t>(r.skipped);
+            data["failed"] = static_cast<std::int64_t>(r.failed);
+            send_json(res, 200, ok_json(std::move(data)));
+        });
 }
 
 } // namespace yuzu::server
