@@ -125,13 +125,13 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           languages: actions
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           # Distinct category from the nightly Linux leg's actions scan so
           # the two analysis series don't overwrite each other's alerts.
@@ -367,7 +367,7 @@ jobs:
       # junction lookup.
       - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
-        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           # erlef/setup-beam can't auto-detect the self-hosted runner OS;
           # the explicit ImageOS hint matches ci.yml:230.
@@ -377,7 +377,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -486,7 +486,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -542,7 +542,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

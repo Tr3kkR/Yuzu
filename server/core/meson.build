@@ -252,6 +252,61 @@ content_embed = custom_target(
   build_always_stale: true,  # always re-scan content/ for edits
 )
 
+# Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
+# content/cpe-map/ deliberately — embed_content.py above globs ONLY
+# content/{definitions,packs}/**/*.yaml, so this CSV is NOT swept into the
+# Instruction-Engine bundle; it is embedded on its own as a std::string_view
+# (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
+#
+# Build-time LOWER-BOUND guard on WELL-FORMED rows (NOT the authoritative
+# floor). This probe counts only lines that share the shape the runtime parser
+# accepts — non-blank, non-`#`, split on `,` into EXACTLY 5 fields with a
+# non-empty name (field[2]) AND non-empty cpe_product (field[4]) — so 13
+# malformed / empty-product lines can no longer pass configure and then crash
+# the server at boot. It deliberately does NOT replicate the runtime's `\x1f`
+# key-dedup (impractical in a one-liner), so it is an over-count relative to
+# distinct keys: the runtime ctor (map_.size() < kMinCuratedRows in
+# cpe_identity_resolver.cpp) remains the AUTHORITATIVE floor. See ADR-0018.
+cpe_map_csv = files('../../content/cpe-map/curated-cpe-map.csv')
+_cpe_probe = run_command(
+  embed_python, '-c',
+  '''import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+n = 0
+for l in lines:
+    s = l.strip()
+    if not s or s.startswith("#"):
+        continue
+    parts = l.split(",")
+    if len(parts) == 5 and parts[2].strip() and parts[4].strip():
+        n += 1
+print(n)''',
+  cpe_map_csv,
+  check: true,
+)
+_cpe_rows = _cpe_probe.stdout().strip().to_int()
+if _cpe_rows < 13
+  error(
+    'Curated CPE map has ' + _cpe_rows.to_string() + ' well-formed data rows but '
+    + 'kMinCuratedRows is 13 (server/core/src/cpe_identity_resolver.hpp). Build-time '
+    + 'lower-bound guard: a thin map ships a resolver that high-confidence-matches '
+    + 'almost nothing. The runtime ctor is the authoritative floor. See ADR-0018.'
+  )
+endif
+
+cpe_map_embed = custom_target(
+  'cpe_map_bundle',
+  input: cpe_map_csv,
+  output: 'cpe_map_bundle.cpp',
+  command: [
+    embed_python,
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'CuratedCpeMap',
+  ],
+)
+
 # Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
 # server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
 # static lib with warnings off so third-party source does not trip our
@@ -294,7 +349,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed,
-   yuzu_css_embed, inter_embed, content_embed,
+   yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -317,6 +372,7 @@ yuzu_server_core_lib = static_library(
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
+    'src/cpe_identity_resolver.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
     'src/update_registry.cpp',
@@ -355,6 +411,9 @@ yuzu_server_core_lib = static_library(
     'src/management_group_store.cpp',
     'src/api_token_store.cpp',
     'src/secure_random.cpp',
+    'src/scim_store.cpp',
+    'src/scim_json.cpp',
+    'src/scim_routes.cpp',
     'src/quarantine_store.cpp',
     'src/result_set_store.cpp',
     'src/result_set_matcher.cpp',
@@ -373,6 +432,8 @@ yuzu_server_core_lib = static_library(
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
+    'src/mcp_session.cpp',
+    'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_routes.cpp',
     'src/guardian_routes.cpp',
@@ -486,6 +547,17 @@ yuzu_server_core_lib = static_library(
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
+  # CPPHTTPLIB_OPENSSL_SUPPORT gates real data members on httplib::ClientImpl/
+  # SSLClient (header-only, inline definitions) — every consumer TU must define
+  # it identically to yuzu_server_core_lib's own cpp_args, or the linker folds
+  # mismatched-layout definitions of the same class into one symbol (ODR
+  # violation). main.cpp transitively includes <httplib.h> via scim_routes.hpp
+  # without this propagated, which corrupted httplib::Client objects on first
+  # use (SIGSEGV in NvdClient::fetch_paginated's first request).
+  # CPPHTTPLIB_LISTEN_BACKLOG doesn't affect class layout (no ODR hazard), but
+  # is propagated for the same reason: without it, a consumer TU falls back to
+  # httplib's default listen() backlog of 5 instead of the intended 128.
+  compile_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
                  libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps

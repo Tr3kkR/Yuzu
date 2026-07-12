@@ -36,7 +36,9 @@
 #include <string_view>
 
 #if defined(YUZU_TEST_ENABLE_PG)
+#include <chrono>
 #include <format>
+#include <thread>
 
 #include <libpq-fe.h>
 
@@ -190,6 +192,34 @@ public:
             error_ = "could not parse YUZU_TEST_POSTGRES_DSN to rewrite dbname";
             return;
         }
+
+        // Post-create connectivity probe (#1961): CREATE DATABASE on the admin
+        // connection proves the database EXISTS, not that the cluster will accept a
+        // FRESH connection to it at the moment a pool later connects. PgPool
+        // connects lazily on first acquire() and valid() only proves the DSN parsed
+        // (pg/pg_pool.hpp), so a transient create-then-connect gap on a shared CI
+        // cluster — max_connections pressure, a loopback refusal — surfaces far
+        // downstream as an empty lease in whichever [pg] test happened to run,
+        // reported without a reason. Prove connectability HERE, with a brief retry,
+        // so available() means CONNECTABLE (not merely CREATED) and a genuine outage
+        // fails this fixture with the real libpq reason.
+        {
+            std::string probe_err;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            for (;;) {
+                yuzu::server::pg::PgConn probe{PQconnectdb(dsn_.c_str())};
+                if (PQstatus(probe.get()) == CONNECTION_OK)
+                    break;
+                probe_err = PQerrorMessage(probe.get());
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    error_ = "post-create connect probe failed: " +
+                             (probe_err.empty() ? std::string("unknown error") : probe_err);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+
         available_ = true;
     }
 
@@ -298,7 +328,7 @@ private:
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
     }                                                                                              \
     yuzu::test::PostgresTestDb var;                                                                \
-    INFO("PostgresTestDb: " << var.error());                                                       \
+    INFO("[YUZU_REQUIRE_PG_DB] fixture status (blank == database came up OK): " << var.error());   \
     REQUIRE(var.available())
 
 #endif // YUZU_TEST_ENABLE_PG

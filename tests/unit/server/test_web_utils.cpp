@@ -607,3 +607,48 @@ TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
     CHECK(audit_token(std::string("a\x7F" "b")) == "a_b");
     CHECK(audit_token(std::string("a\tb")) == "a_b");
 }
+
+// ── is_login_exempt_path (H1, 2026-07-08 SCIM review) ───────────────────────
+
+TEST_CASE("is_login_exempt_path: /scim/v2/* is exempt (prefix match)",
+          "[web_utils][login_exempt][scim]") {
+    // The concrete bug (H1): every IdP call was 302-redirected to /login
+    // before ScimRoutes' own bearer gate ever ran.
+    CHECK(is_login_exempt_path("/scim/v2/Users"));
+    CHECK(is_login_exempt_path("/scim/v2/Users/deadbeef"));
+    CHECK(is_login_exempt_path("/scim/v2/ServiceProviderConfig"));
+    CHECK(is_login_exempt_path("/scim/v2/ResourceTypes"));
+    CHECK(is_login_exempt_path("/scim/v2/Schemas"));
+    // Prefix, not exact — the bare "/scim/v2" (no trailing slash) does NOT
+    // match any real route and is deliberately not exempted.
+    CHECK_FALSE(is_login_exempt_path("/scim/v2"));
+}
+
+TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
+          "[web_utils][login_exempt]") {
+    CHECK_FALSE(is_login_exempt_path("/api/v1/foo"));
+    CHECK_FALSE(is_login_exempt_path("/api/v1/ca/issued"));
+    CHECK_FALSE(is_login_exempt_path("/api/v1/ca/revoke"));
+    CHECK_FALSE(is_login_exempt_path("/mcp/v1/tools"));
+    CHECK_FALSE(is_login_exempt_path("/dashboard"));
+    CHECK_FALSE(is_login_exempt_path("/scimv2/Users")); // no slash — not a prefix match
+}
+
+TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
+          "[web_utils][login_exempt][regression]") {
+    CHECK(is_login_exempt_path("/login"));
+    CHECK(is_login_exempt_path("/login/mfa"));
+    CHECK(is_login_exempt_path("/login/mfa/enroll"));
+    CHECK(is_login_exempt_path("/health"));
+    CHECK(is_login_exempt_path("/api/health"));
+    CHECK(is_login_exempt_path("/auth/oidc/start"));
+    CHECK(is_login_exempt_path("/auth/callback"));
+    CHECK(is_login_exempt_path("/api/v1/openapi.json"));
+    CHECK(is_login_exempt_path("/auth/saml/start"));
+    CHECK(is_login_exempt_path("/saml/acs"));
+    CHECK(is_login_exempt_path("/api/v1/ca/root"));
+    CHECK(is_login_exempt_path("/api/v1/ca/crl"));
+    CHECK(is_login_exempt_path("/static/app.css"));
+    // Deliberately NOT exempt (requires a session): step-up MFA.
+    CHECK_FALSE(is_login_exempt_path("/login/mfa/stepup"));
+}

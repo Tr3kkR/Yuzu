@@ -70,6 +70,14 @@ void AuditStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_audit_target_ts
                 ON audit_events(target_type, target_id, timestamp);
         )"},
+        // ADR-1005 Decision 9 / execution-plan Phase 3a: additive actor-class
+        // column, no delegation semantics, no Postgres migration required (the
+        // exec plan explicitly scopes this ahead of AuditStore's own eventual PG
+        // Wave-1 cutover). Existing rows backfill to '' (honest-empty — this
+        // program cannot retroactively attribute historical rows).
+        {2, R"(
+            ALTER TABLE audit_events ADD COLUMN principal_class TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "audit_store", kMigrations)) {
         spdlog::error("AuditStore: schema migration failed, closing database");
@@ -92,8 +100,9 @@ bool AuditStore::log(const AuditEvent& event) {
 
     const char* sql = R"(
         INSERT INTO audit_events (timestamp, principal, principal_role, action,
-            target_type, target_id, detail, source_ip, user_agent, session_id, result, ttl_expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            target_type, target_id, detail, source_ip, user_agent, session_id, result, ttl_expires_at,
+            principal_class)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -120,6 +129,7 @@ bool AuditStore::log(const AuditEvent& event) {
     sqlite3_bind_text(stmt, 10, event.session_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 12, ttl);
+    sqlite3_bind_text(stmt, 13, event.principal_class.c_str(), -1, SQLITE_TRANSIENT);
 
     int step_rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -171,7 +181,7 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
 
     std::string sql =
         "SELECT id, timestamp, principal, principal_role, action, target_type, target_id, detail, "
-        "source_ip, user_agent, session_id, result FROM audit_events WHERE 1=1";
+        "source_ip, user_agent, session_id, result, principal_class FROM audit_events WHERE 1=1";
     std::vector<std::pair<int, std::string>> text_binds;
     // int64_binds: (param_index, value) pairs for integer parameters
     std::vector<std::pair<int, int64_t>> int_binds;
@@ -288,6 +298,7 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.user_agent = col_text(9);
         e.session_id = col_text(10);
         e.result = col_text(11);
+        e.principal_class = col_text(12);
         results.push_back(std::move(e));
     }
     sqlite3_finalize(stmt);

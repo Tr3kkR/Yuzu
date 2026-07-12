@@ -95,6 +95,42 @@ groups:
             send buffers are full. This may cause command delivery delays.
             Consider scaling the gateway or reducing command dispatch rate.
 
+  - name: yuzu-security
+    rules:
+      - alert: YuzuOnBehalfAssertionRejected
+        expr: |
+          increase(yuzu_onbehalf_rejected_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A client asserted on-behalf-of delegation ({{ $labels.surface }})"
+          description: >-
+            yuzu_onbehalf_rejected_total{surface="{{ $labels.surface }}"} moved —
+            a client sent a reserved on-behalf-of header/metadata key (rejected
+            per ADR-1005; HTTP gets 403, gRPC is cancelled). One-off events are
+            usually an integration testing a delegation convention; identify the
+            caller from the throttled [ADR-1005] warn lines (1 log per 100
+            rejections carries method/path/source) and fix the client. See
+            docs/auth-architecture.md "On-behalf-of assertions rejected".
+          runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
+
+      - alert: YuzuOnBehalfRejectionFlood
+        expr: |
+          rate(yuzu_onbehalf_rejected_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sustained on-behalf-of rejections — likely a header-injecting proxy"
+          description: >-
+            Sustained rejection rate on surface="{{ $labels.surface }}" — the
+            signature of a proxy/mesh/SSO gateway stamping a reserved
+            on-behalf-of header on ALL traffic (every REST/MCP/dashboard request
+            403s; health probes are exempt and stay green, so the service looks
+            up while being unusable) or a deliberate flood. Strip the header at
+            the proxy. Diagnose via the throttled [ADR-1005] warn lines.
+          runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
