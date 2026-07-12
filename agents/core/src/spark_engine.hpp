@@ -102,8 +102,12 @@ struct SparkEngineStats {
     std::uint64_t inline_over_100us_total{0}; ///< tail counter (p-high proxy)
     std::uint64_t inline_over_10ms_total{0};  ///< scheduler-quantum-class outliers
     // Summed across every registered mechanism's stats() (#1979); see
-    // SparkMechanismStats for per-field meaning.
+    // SparkMechanismStats for per-field meaning. The per-mechanism-type breakdown
+    // (which sum() folds away) is available via stats_by_type() (#2011 rung 1).
     std::uint64_t mech_retiring{0};
+    std::uint64_t mech_retiring_cap{0}; ///< summed teardown-backpressure ceiling — the
+                                        ///< context that makes mech_retiring readable
+                                        ///< (a bare retiring count has no scale)
     std::uint64_t mech_watch_rejected_total{0};
     std::uint64_t mech_quarantined_total{0};
     std::uint64_t mech_slow_op_total{0};
@@ -196,6 +200,15 @@ public:
     [[nodiscard]] bool is_running() const noexcept;
 
     [[nodiscard]] SparkEngineStats stats() const;
+
+    /// Per-mechanism-type snapshot of the mechanism-owned counters (#2011 rung 1).
+    /// Keyed by the registered SparkType — the KEY that stats() sums away — so the
+    /// agent can export a per-type (file / registry / service) heartbeat breakdown
+    /// instead of a single blended sum. Only registered (event-driven, platform-
+    /// supported) mechanisms appear, so the key set doubles as the agent's spark
+    /// capability. Same point-in-time skew caveat as SparkMechanismStats (each field
+    /// is an independent atomic; not a coherent cross-field snapshot).
+    [[nodiscard]] std::map<SparkType, SparkMechanismStats> stats_by_type() const;
 
     /// Test seam: substitute the platform disk reader. Set BEFORE start().
     void set_disk_reader_for_test(DiskReaderFn reader);

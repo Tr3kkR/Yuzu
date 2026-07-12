@@ -978,6 +978,7 @@ SparkEngineStats SparkEngine::stats() const {
         for (const auto& [type, m] : mechanisms_) {
             const auto ms = m->stats();
             s.mech_retiring += ms.retiring;
+            s.mech_retiring_cap += ms.retiring_cap;
             s.mech_watch_rejected_total += ms.watch_rejected_total;
             s.mech_quarantined_total += ms.quarantined_total;
             s.mech_slow_op_total += ms.slow_op_total;
@@ -1000,6 +1001,18 @@ SparkEngineStats SparkEngine::stats() const {
     s.inline_over_100us_total = inline_over_100us_.load(std::memory_order_relaxed);
     s.inline_over_10ms_total = inline_over_10ms_.load(std::memory_order_relaxed);
     return s;
+}
+
+std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {
+    // Same shape as the mech_* sum in stats() (lines above) but the SparkType key
+    // is preserved instead of folded away. mu_-only (never shares a lock with
+    // watch/unwatch/stop) and m->stats() is atomic-only, so this cannot block or
+    // reenter the engine — identical safety to the stats() sum loop.
+    std::map<SparkType, SparkMechanismStats> out;
+    std::lock_guard lk(mu_);
+    for (const auto& [type, m] : mechanisms_)
+        out.emplace(type, m->stats());
+    return out;
 }
 
 void SparkEngine::set_disk_reader_for_test(DiskReaderFn reader) {
