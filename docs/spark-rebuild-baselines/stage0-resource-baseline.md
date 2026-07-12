@@ -17,7 +17,7 @@ The campaign plan cites "the existing `/test` perf measure machinery" for the re
 
 ## Premise validation — done now, on real code, cheap
 
-Before committing to the O(mechanisms)-vs-O(rules) thesis as Stage 1's core justification, checked whether it holds on the *old* code, on the piece I can exercise on this Linux box: `SystemdServiceGuard` (`agents/core/src/guard_systemd.cpp`, `guard_systemd.hpp:189-192` — each instance owns a dedicated `std::thread thread_` + its own sd-bus connection).
+Before committing to the O(mechanisms)-vs-O(rules) thesis as Stage 1's core justification, checked whether it holds on the *old* code, on the piece I can exercise on this Linux box: `SystemdServiceGuard` (`agents/core/src/guard_systemd.cpp`, `agents/core/include/yuzu/agent/guard_systemd.hpp:189-192` — each instance owns a dedicated `std::thread thread_` + its own sd-bus connection).
 
 **Method:** a temporary Catch2 case (hidden tag `[.]`, never part of the permanent suite — written, run, and reverted via `git checkout` in the same session; not committed) constructed 20 `SystemdServiceGuard`s against real running systemd units on the dev box (`accounts-daemon`, `avahi-daemon`, `bluetooth`, `chrony`, `colord`, `containerd`, `cron`, `cups`/`cups-browsed`, `dbus`, `docker`, `gdm`, `ModemManager`, `networkd-dispatcher`, `NetworkManager`, `nvidia-persistenced`, `polkit`, `power-profiles-daemon`, `rsyslog`, `rtkit-daemon`), sampling `/proc/self/status` `Threads:` before arming, after arming, and after `stop()`.
 

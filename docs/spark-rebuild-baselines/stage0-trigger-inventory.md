@@ -6,7 +6,7 @@ Captured 2026-07-05 on `feat/spark-rebuild` @ origin/dev (2294dfe0), before any 
 
 - `sdk/include/yuzu/plugin.h:299` — C ABI `yuzu_register_trigger(YuzuPluginContext*, const char* trigger_id, ...)`.
 - `sdk/include/yuzu/plugin.hpp:162` — C++ wrapper `PluginContext::register_trigger(...)` (thin call-through).
-- `agents/core/src/agent.cpp:481` — the ABI entry point implementation; requires `pctx->trigger_engine` in the per-plugin context (`agent.cpp:2342` wiring comment).
+- `agents/core/src/agent.cpp:422` — the ABI entry point implementation; requires `pctx->trigger_engine` in the per-plugin context (`agent.cpp:2423` wiring comment; the context field is set at `:554`).
 - `agents/core/src/trigger_engine.{hpp,cpp}` — the engine itself; deletes in Stage 5.
 
 ## Plugin callers — grep across all 47 plugins found exactly ONE
@@ -15,13 +15,13 @@ Captured 2026-07-05 on `feat/spark-rebuild` @ origin/dev (2294dfe0), before any 
 
 | Trigger ID | Type | Purpose | Runtime re-register site |
 |---|---|---|---|
-| `tar.fast` | interval | fast capture cadence | `tar_plugin.cpp:385`, dynamic re-register `:2152/:2156` |
-| `tar.slow` | interval | slow capture cadence | `tar_plugin.cpp:390`, dynamic re-register `:2160/:2164` |
-| `tar.perf` | interval | perf-tier capture | `tar_plugin.cpp:404` |
-| `tar.software` | interval | software-inventory capture (config-tunable cadence, "0" disables — `tar.yaml:455`) | `tar_plugin.cpp:419`, dynamic re-register `:2171/:2176` |
-| `tar.rollup` | interval | warehouse rollup | `tar_plugin.cpp:425` |
+| `tar.fast` | interval | fast capture cadence | `tar_plugin.cpp:430`, dynamic re-register `:2573/:2577` |
+| `tar.slow` | interval | slow capture cadence | `tar_plugin.cpp:435`, dynamic re-register `:2581/:2585` |
+| `tar.perf` | interval | perf-tier capture | `tar_plugin.cpp:449` |
+| `tar.software` | interval | software-inventory capture (config-tunable cadence, "0" disables — `tar.yaml:455`) | `tar_plugin.cpp:464`, dynamic re-register `:2592/:2597` |
+| `tar.rollup` | interval | warehouse rollup | `tar_plugin.cpp:470` |
 
-All five unregister on shutdown/reconfigure (`:551-555`). This is the entire Stage-5 "built-in schedules → shipped Reflex bindings" worklist — small and fully enumerated, not a discovery risk.
+All five unregister on shutdown/reconfigure (`:736-740`). This is the entire Stage-5 "built-in schedules → shipped Reflex bindings" worklist — small and fully enumerated, not a discovery risk.
 
 ## Content-plane trigger vocabulary (server-side `TriggerConfig`, separate mechanism)
 
@@ -48,5 +48,5 @@ The Stage-1 framing "port the watching" (move detection logic from `guard_*.cpp`
 ## Stage 5 action items derived from this inventory
 
 1. ~~Port `agent_startup` as a spark type (missing from the original Stage-1 file list) — one-shot fire-at-boot, no persistent watcher.~~ **DONE — `spark_startup.cpp` landed on `dev`.**
-2. Convert TAR's 5 interval triggers to shipped Reflex bindings (embedded content, per ADR §8) — `tar_plugin.cpp`'s `register_trigger`/`unregister_trigger` calls are replaced by SparkEngine subscription + Reflex binding lookup; the dynamic re-register-on-reconfigure paths (`:2152-2176`) need an equivalent "rebind on config change" path in the new engine.
-3. Delete `yuzu_register_trigger`/`unregister_trigger` from the ABI (`plugin.h`, `plugin.hpp`), `trigger_engine.{hpp,cpp}`, and the `agent.cpp` wiring (`:481-510`, `:2342` context field) once TAR is migrated — no other plugin depends on them.
+2. Convert TAR's 5 interval triggers to shipped Reflex bindings (embedded content, per ADR §8) — `tar_plugin.cpp`'s `register_trigger`/`unregister_trigger` calls are replaced by SparkEngine subscription + Reflex binding lookup; the dynamic re-register-on-reconfigure paths (`:2573-2597`) need an equivalent "rebind on config change" path in the new engine.
+3. Delete `yuzu_register_trigger`/`unregister_trigger` from the ABI (`plugin.h`, `plugin.hpp`), `trigger_engine.{hpp,cpp}`, and the `agent.cpp` wiring (`:422`, `:554`/`:2423` context field) once TAR is migrated — no other plugin depends on them.
