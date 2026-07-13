@@ -21,6 +21,7 @@
 #include "test_api_token_pg_helper.hpp" // shared "apitoken" PgTestTemplate (one registration)
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include <libpq-fe.h>
 
@@ -1371,4 +1372,29 @@ TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[token][auth
     TempDb tmp;
     ApiTokenStore store(tmp.path);
     CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
+}
+
+TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
+          "[token][auth][stream]") {
+    // The whole reason validate_token_checked exists. validate_token collapses "the row
+    // is gone" and "I could not read the table" into the same nullopt — right for
+    // request auth (both mean 401), fatal for a held-open stream, where the first must
+    // kill it immediately and the second must NOT (an auth-store hiccup would otherwise
+    // cut every stream on the fleet at once — ADR-1005 Decision 15(i), chaos CH-4).
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    auto raw = store.create_token("doomed-store", "alice");
+    REQUIRE(raw.has_value());
+
+    // Break the store from a second connection. Do NOT validate first — a cached token
+    // would answer from memory and never touch the broken table.
+    sqlite3* saboteur = nullptr;
+    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &saboteur) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(saboteur, "DROP TABLE api_tokens;", nullptr, nullptr, nullptr) ==
+            SQLITE_OK);
+    sqlite3_close(saboteur);
+
+    const auto checked = store.validate_token_checked(*raw);
+    CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
+    CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
 }

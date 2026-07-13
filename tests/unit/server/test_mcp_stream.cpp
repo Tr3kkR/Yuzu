@@ -14,6 +14,8 @@
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
 
+#include <yuzu/server/auth.hpp>
+
 #include <atomic>
 #include <string>
 #include <thread>
@@ -121,16 +123,25 @@ TEST_CASE("StreamBudget: the per-principal map is bounded by LIVE principals",
 
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
           "[mcp][stream][ch6]") {
-    // The shipped defaults (16 streams) always fit the SMALLEST pool httplib will
-    // ever give us (base 8 → max 32), leaving the plain-REST reserve intact.
-    CHECK(detail::derive_stream_budget(32, 8, 16) == 16);
+    // Each permitted stream must be able to pin kMaxProvidersPerStream (2) workers —
+    // a takeover leaves the superseded provider draining while its replacement runs —
+    // so the affordable count is (pool - reserve) / 2, not (pool - reserve).
+    // Smallest pool httplib will ever hand us: base 8 → max 32. (32-8)/2 = 12.
+    CHECK(detail::derive_stream_budget(32, 8, 16) == 12);
+    CHECK(detail::derive_stream_budget(32, 8, 8) == 8); // under the affordable count: honoured
     // An operator asking for more than the pool can spare gets clamped, not obeyed.
-    CHECK(detail::derive_stream_budget(32, 8, 64) == 24);
+    CHECK(detail::derive_stream_budget(32, 8, 64) == 12);
+    CHECK(detail::derive_stream_budget(64, 8, 64) == 28);
     // Degenerate pools cannot spare anything — streams are refused rather than
-    // allowed to eat the reserve.
+    // allowed to eat the plain-REST reserve.
     CHECK(detail::derive_stream_budget(8, 8, 16) == 0);
     CHECK(detail::derive_stream_budget(4, 8, 16) == 0);
     CHECK(detail::derive_stream_budget(0, 8, 16) == 0);
+    // The floor on --http-worker-threads (8 → pool max 32) guarantees the derived
+    // budget is never zero, so MCP streaming cannot be silently disabled by a knob
+    // that reads like a tuning parameter.
+    CHECK(detail::derive_stream_budget(detail::kMinHttpWorkerThreads * 4,
+                                       detail::kPlainRestReserveDefault, 16) > 0);
 }
 
 // ── Replay ring + resume (CH-2, CH-3) ───────────────────────────────────────
@@ -163,8 +174,12 @@ TEST_CASE("McpStreamState: a fresh attach replays only the frames after the curs
 
     std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
     REQUIRE(attached.sink->sse->queue.size() == 2); // 4 and 5 only — no duplicates
-    CHECK(attached.sink->sse->queue.front().data == "4\nframe-4");
-    CHECK(attached.sink->sse->queue.back().data == "5\nframe-5");
+    // The id rides on the frame, not packed into the payload (a stringly-typed id
+    // meant re-parsing it inside the content provider, where a throw is terminate).
+    CHECK(attached.sink->sse->queue.front().id == 4);
+    CHECK(attached.sink->sse->queue.front().data == "frame-4");
+    CHECK(attached.sink->sse->queue.back().id == 5);
+    CHECK(attached.sink->sse->queue.back().data == "frame-5");
 }
 
 TEST_CASE("McpStreamState: cursor 0 replays the whole surviving window (CH-2)",
@@ -219,12 +234,13 @@ TEST_CASE("McpStreamState: a live sink receives published frames", "[mcp][stream
     state.publish("message", "live-frame");
     std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
     REQUIRE(attached.sink->sse->queue.size() == 1);
-    CHECK(attached.sink->sse->queue.front().data == "1\nlive-frame");
+    CHECK(attached.sink->sse->queue.front().id == 1);
+    CHECK(attached.sink->sse->queue.front().data == "live-frame");
 }
 
 // ── Takeover + budget interaction (CH-5) ────────────────────────────────────
 
-TEST_CASE("McpStreamState: a second GET takes over and INHERITS the lease (CH-5)",
+TEST_CASE("McpStreamState: a takeover is admitted at a full cap but is still COUNTED (CH-5)",
           "[mcp][stream][ch5]") {
     detail::StreamBudget budget{{.global_cap = 1, .per_principal_cap = 1}};
     mcp::McpStreamState state;
@@ -233,27 +249,91 @@ TEST_CASE("McpStreamState: a second GET takes over and INHERITS the lease (CH-5)
     REQUIRE(first.status == mcp::McpStreamState::AttachStatus::kAttached);
     CHECK(budget.active() == 1);
 
-    // The budget is now full. A reconnect on the SAME session must still succeed:
-    // the common second GET is a client re-attaching across a zombie TCP the server
-    // has not noticed yet, and making it wait for its own zombie to time out would
-    // turn the cap into a self-inflicted lockout.
+    // The budget is full. A reconnect on the SAME session must still succeed: the
+    // common second GET is a client re-attaching across a zombie TCP the server has
+    // not noticed yet, and making it wait for its own zombie to time out would turn
+    // the cap into a self-inflicted lockout.
     auto second = state.attach_and_replay(0, &budget, "alice");
     REQUIRE(second.status == mcp::McpStreamState::AttachStatus::kAttached);
     CHECK(second.generation > first.generation);
-    CHECK(budget.active() == 1); // lease transferred, not double-counted
+
+    // …but it takes its OWN lease. The superseded provider goes on pinning its worker
+    // until it drains, and an UNCOUNTED pinned worker is exactly the hole the budget
+    // exists to close: with lease inheritance, one client hammering GET on one session
+    // could exhaust the pool while the gauge still read 1.
+    CHECK(budget.active() == 2);
 
     // The superseded sink is closed with a reason the old provider will report.
     CHECK(first.sink->sse->closed.load());
     CHECK(first.sink->close_reason.load() == mcp::McpStreamClose::kSuperseded);
+    CHECK(state.has_draining_sink());
 
-    // Detaching the SUPERSEDED sink must not return the lease — it belongs to the
-    // sink that replaced it now.
+    // Each sink returns its own worker.
     state.detach(first.sink);
     CHECK(budget.active() == 1);
+    CHECK_FALSE(state.has_draining_sink());
 
-    // Detaching the LIVE sink does return it.
     state.detach(second.sink);
     CHECK(budget.active() == 0);
+}
+
+TEST_CASE("McpStreamState: a second takeover is refused while the handover is pending (CH-5)",
+          "[mcp][stream][ch5]") {
+    // This is what BOUNDS the pool. A takeover skips the cap check, so without this
+    // rule a client could hammer GET on one session and pin providers without limit —
+    // each superseded one still holds a worker until it drains, and a peer with a
+    // closed TCP window can stall that for the whole write timeout.
+    detail::StreamBudget budget{{.global_cap = 100, .per_principal_cap = 100}};
+    mcp::McpStreamState state;
+
+    auto first = state.attach_and_replay(0, &budget, "alice");
+    REQUIRE(first.status == mcp::McpStreamState::AttachStatus::kAttached);
+    auto second = state.attach_and_replay(0, &budget, "alice");
+    REQUIRE(second.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    // `first` has not detached yet, so the session already has its one draining sink.
+    auto third = state.attach_and_replay(0, &budget, "alice");
+    CHECK(third.status == mcp::McpStreamState::AttachStatus::kHandoverPending);
+    CHECK_FALSE(third.sink);
+    CHECK(budget.active() == 2); // never more than kMaxProvidersPerStream per session
+
+    // Once the superseded provider drains, a takeover is allowed again.
+    state.detach(first.sink);
+    auto fourth = state.attach_and_replay(0, &budget, "alice");
+    CHECK(fourth.status == mcp::McpStreamState::AttachStatus::kAttached);
+    CHECK(budget.active() == 2);
+}
+
+TEST_CASE("McpStreamState: closing a sink wakes its pump immediately, not a tick later",
+          "[mcp][stream][race]") {
+    // Regression for a lost wakeup: `closed` is the pump's wait PREDICATE, so it must
+    // be modified while holding the sink mutex. Storing it atomically outside the lock
+    // and then notifying races the pump's release-and-block — the notify lands on an
+    // empty wait queue and the provider sleeps the FULL tick. That is not just latency:
+    // the superseded provider keeps pinning a worker for the whole 3 s.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump::Config cfg;
+    cfg.tick = std::chrono::seconds(30); // a wakeup that RELIES on the tick would hang
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; }, cfg};
+
+    std::atomic<bool> returned{false};
+    FakeWire wire;
+    std::thread pumper([&] {
+        pump.pump_once(wire.writer());
+        returned.store(true);
+    });
+
+    // Give the pump time to reach its wait, then close.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    state->close(mcp::McpStreamClose::kSessionTerminated);
+    pumper.join();
+
+    CHECK(returned.load());
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kSessionTerminated);
 }
 
 TEST_CASE("McpStreamState: a cap hit rejects the attach and leaves the ring intact",
@@ -385,7 +465,8 @@ TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reas
     CHECK(wire.contains(R"("reason":"session_terminated")"));
 }
 
-TEST_CASE("McpStreamPump: a superseded pump exits instead of double-writing", "[mcp][stream]") {
+TEST_CASE("McpStreamPump: a superseded pump exits WITHOUT writing a close frame",
+          "[mcp][stream]") {
     auto state = std::make_shared<mcp::McpStreamState>();
     auto first = state->attach_and_replay(0, nullptr, "alice");
     mcp::McpStreamPump pump{first.sink, state, first.generation,
@@ -397,7 +478,15 @@ TEST_CASE("McpStreamPump: a superseded pump exits instead of double-writing", "[
 
     FakeWire wire;
     CHECK_FALSE(pump.pump_once(wire.writer()));
-    CHECK(wire.contains(R"("reason":"superseded")"));
+
+    // No final frame, deliberately. The client already has a newer stream on this
+    // session, so the only thing that can still be listening on THIS socket is the
+    // stalled peer that provoked the takeover — and writing to it would block this
+    // worker for the full write timeout while its lease is still charged. That
+    // blocking write was the mechanism by which a rapid-reconnect client could pin
+    // the pool.
+    CHECK(wire.out.empty());
+    CHECK(first.sink->close_reason.load() == mcp::McpStreamClose::kSuperseded);
 }
 
 TEST_CASE("McpStreamPump: a dead peer ends the stream", "[mcp][stream]") {
@@ -545,6 +634,12 @@ TEST_CASE("McpStreamState: concurrent publish / attach / detach / close is race-
     }
 
     CHECK(state->next_event_id() == 401);
+    // THE accounting invariant: one lease per pinned provider, no more and no fewer.
+    // A leak here is invisible in testing and fatal in production — MCP streaming
+    // would slowly die over a server's uptime as slots were never returned.
+    const std::size_t providers = (state->has_live_sink() ? 1u : 0u) +
+                                  (state->has_draining_sink() ? 1u : 0u);
+    CHECK(budget.active() == providers);
 }
 
 TEST_CASE("McpSessionRegistry: concurrent mint / stream_for / terminate is race-free",

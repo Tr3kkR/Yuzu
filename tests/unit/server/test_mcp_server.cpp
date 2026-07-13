@@ -5915,6 +5915,88 @@ TEST_CASE("MCP 2f PR2/CH-2: an in-window resume is admitted", "[mcp][transport][
     CHECK(res->status == 200);
 }
 
+TEST_CASE("MCP 2f PR2: tearing down the response returns the worker and audits the close",
+          "[mcp][transport][2f][stream]") {
+    // The release callback is the ONLY place a stream's budget lease is returned, and it
+    // runs from ~Response (httplib invokes it unconditionally there). If it ever stopped
+    // running — or threw — every stream would leak a worker slot until restart, which is
+    // invisible in testing and fatal over a server's uptime. Destroying the Response here
+    // exercises exactly the production teardown.
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4, .per_principal_cap = 4}};
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        REQUIRE(res->status == 200);
+        CHECK(budget.active() == 1); // a worker is pinned while the stream is held open
+    } // ~Response → releaser → detach
+
+    CHECK(budget.active() == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.stream.close|success") !=
+          ts.audit_log.end());
+    // The session survives its stream's teardown — a dropped connection is not a
+    // terminated session; the client can reconnect and resume.
+    CHECK(reg.active_count() == 1);
+}
+
+TEST_CASE("MCP 2f PR2/CH-5: a rapid re-GET is refused while the superseded stream drains",
+          "[mcp][transport][2f][stream][ch5]") {
+    // Bounds the pool: a takeover skips the cap check (so a client is never locked out
+    // by its own zombie), so the number of PROVIDERS per session must be bounded some
+    // other way — one live plus at most one draining.
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8, .per_principal_cap = 8}};
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.start();
+    const auto sid = mint_session(ts);
+
+    auto first = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+    REQUIRE(first->status == 200);
+    auto second = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                          {"Accept", "text/event-stream"}});
+    REQUIRE(second->status == 200); // takeover: admitted even though `first` is undrained
+    CHECK(budget.active() == 2);    // …and COUNTED — both providers still pin a worker
+
+    auto third = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+    CHECK(third->status == 429);
+    auto body = nlohmann::json::parse(third->body);
+    CHECK(body["error"]["code"] == mcp::kMcpStreamCap);
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpHandoverRetryAfterMs);
+    CHECK(budget.active() == 2); // the refusal costs nothing and evicts nothing
+}
+
+TEST_CASE("MCP 2f PR2: a hostile Last-Event-ID never destroys the session",
+          "[mcp][transport][2f][stream]") {
+    // std::stoull("-1") does not throw — it WRAPS to UINT64_MAX, which lands past the
+    // ring window and would have terminated the client's session over a typo. A cursor
+    // we cannot parse means "replay what we still hold", never "burn the session down".
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+
+    for (const char* hostile : {"-1", "+5", "abc", "9999999999999999999999999", "1abc", " 1"}) {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"Last-Event-ID", hostile}});
+        INFO("Last-Event-ID: " << hostile);
+        CHECK(res->status == 200);
+        CHECK(reg.active_count() == 1); // still alive
+    }
+}
+
 TEST_CASE("MCP 2f PR2: --mcp-no-streaming still 405s GET (kill switch beats the channel)",
           "[mcp][transport][2f][stream][ch7]") {
     mcp::McpSessionRegistry reg;

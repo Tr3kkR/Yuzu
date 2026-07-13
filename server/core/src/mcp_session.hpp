@@ -34,7 +34,12 @@ public:
         std::size_t per_principal_cap = 8;      // Decision 15(d): bounded per-principal
         std::size_t global_cap = 1024;          // Decision 15(d): bounded globally
         std::chrono::seconds idle_ttl{1800};    // 30 min; slides on every use
-        std::size_t ring_cap = 500;             // per-session replay ring (PR 2; see mcp_stream.hpp)
+        // Per-session replay ring, bounded on BOTH axes (see mcp_stream.hpp; the frame
+        // count alone is not a memory bound). The frame cap must not exceed the sink's
+        // own queue cap or a full-ring replay would trip the sink's drop-oldest guard
+        // and gap a resume the ring could have served — static_assert'd in mcp_stream.cpp.
+        std::size_t ring_cap = 500;
+        std::size_t ring_bytes_cap = 64 * 1024;
     };
 
     // Injectable monotonic clock for deterministic tests (defaults to
@@ -108,7 +113,9 @@ private:
     // the registry must never call into a stream while holding its own mutex.
     std::vector<std::shared_ptr<McpStreamState>> gc_locked();  // caller holds mu_
     std::size_t principal_count_locked(const std::string& p) const;  // caller holds mu_
-    void refresh_active_gauge_locked() const;                        // caller holds mu_
+    // Caller must NOT hold mu_ — this takes the process-global metrics mutex, and
+    // /metrics holds that one for a whole exposition build.
+    void publish_active_gauge(std::size_t active) const;
 
     Config cfg_;
     ClockFn clock_;

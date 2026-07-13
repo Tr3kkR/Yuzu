@@ -51,7 +51,11 @@ class MetricsRegistry;
 
 namespace yuzu::server::auth {
 struct Session;
-}
+// Defined in <yuzu/server/auth.hpp>. Opaquely forward-declared (the underlying
+// type is pinned there, so this is well-formed) to keep the MCP stream header off
+// the auth header's include cost.
+enum class CredentialCheck : int;
+}  // namespace yuzu::server::auth
 
 namespace yuzu::server::mcp {
 
@@ -86,12 +90,25 @@ inline constexpr std::chrono::milliseconds kMcpRevalidateGraceDefault{60000};
 /// succeed for a capacity reason.
 inline constexpr std::int64_t kMcpStreamCapRetryAfterMs = 5000;
 
-/// One frame in a session's replay ring.
-struct McpStreamEvent {
-    std::uint64_t id = 0;    ///< per-session, monotonic from 1
-    std::string event_type;  ///< SSE `event:` — "message" for JSON-RPC frames (PR 3)
-    std::string data;        ///< SSE `data:` payload
-};
+/// `retry_after_ms` when a session's previous stream is still draining. Short by
+/// design: the superseded provider exits on its next wake, so the handover clears in
+/// well under a tick — this is a "try again in a moment", not a capacity wait.
+inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 500;
+
+/// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries
+/// the per-session event id). Deliberately NOT a bespoke type: the id used to be
+/// packed into `data` as a `"<id>\n<payload>"` string and re-parsed in the provider,
+/// which put a throwing `stoull` inside a content-provider callback — and httplib
+/// runs those on an unguarded worker task, where an escaped exception is
+/// `std::terminate`, not a 500.
+using McpStreamEvent = sse_bus::SseEvent;
+
+/// Byte cap on a session's replay ring, enforced alongside the frame cap. The frame
+/// count alone is not a memory bound: 1024 sessions × 500 frames is only a bound if
+/// you also know what a frame weighs. 64 KiB/session keeps the fleet-wide worst case
+/// at ~64 MiB rather than the ~250 MiB an unbounded-size 500-frame ring would allow
+/// at PR-3 progress-frame sizes (Decision 15(d): ALL in-memory state bounded).
+inline constexpr std::size_t kMcpRingBytesCapDefault = 64 * 1024;
 
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
@@ -109,11 +126,12 @@ const char* to_string(McpStreamClose reason);
 /// Tri-state credential re-validation (Decision 15(c)+(i)). The distinction is
 /// load-bearing: kRevoked kills the stream NOW, kIndeterminate starts a bounded
 /// grace window so an auth-backend blip does not cut every live stream at once.
-enum class StreamRevalidate {
-    kValid,
-    kRevoked,
-    kIndeterminate,
-};
+///
+/// This is an ALIAS of the auth layer's own type, not an MCP-specific one: the
+/// answer is produced by auth and merely consumed here, and the next held-open
+/// surface to want per-tick re-validation (`/api/v1/events`, #2056) must not have
+/// to name an MCP type to get it.
+using StreamRevalidate = auth::CredentialCheck;
 
 /// Re-validate the credential that opened a stream, against the principal the
 /// stream is bound to. Takes the ORIGINAL request (the handler keeps a copy —
@@ -127,12 +145,21 @@ using StreamAuditFn = std::function<bool(const httplib::Request&, const std::str
                                          const std::string& result, const std::string& target_type,
                                          const std::string& target_id, const std::string& detail)>;
 
-/// One live GET attachment: the reusable SSE sink plus the close-reason channel
-/// the generic sink lacks. Heap-owned; shared by the provider, the release
-/// callback, and (while live) the session's stream state.
+/// One live GET attachment: the reusable SSE sink, the close-reason channel the
+/// generic sink lacks, and THE BUDGET LEASE FOR THE WORKER THIS ATTACHMENT PINS.
+///
+/// The lease lives here, not on the session: an httplib worker is pinned per
+/// held-open RESPONSE, and a superseded response keeps pinning its worker until it
+/// drains. Charging the lease to the session instead would leave those workers
+/// uncounted — which is how a single client hammering GET on one session could
+/// exhaust the pool while the cap still read 1.
+///
+/// Heap-owned; shared by the provider, the release callback, and (while live or
+/// draining) the session's stream state.
 struct McpStreamSink {
     std::shared_ptr<sse_bus::SseSinkState> sse = std::make_shared<sse_bus::SseSinkState>();
     std::atomic<McpStreamClose> close_reason{McpStreamClose::kNone};
+    sse_bus::StreamBudget::Lease lease;  ///< released exactly once, in McpStreamState::detach
 
     /// First reason wins — a revocation already recorded must not be overwritten
     /// by the client-gone the teardown then observes.
@@ -152,23 +179,35 @@ struct McpStreamSink {
 class McpStreamState {
 public:
     explicit McpStreamState(std::size_t ring_cap = kMcpRingCapDefault,
-                            yuzu::MetricsRegistry* metrics = nullptr);
+                            yuzu::MetricsRegistry* metrics = nullptr,
+                            std::size_t ring_bytes_cap = kMcpRingBytesCapDefault);
 
     McpStreamState(const McpStreamState&) = delete;
     McpStreamState& operator=(const McpStreamState&) = delete;
+    // Holds a mutex, so it is already non-movable — say so, and a future member
+    // reorder cannot silently make it movable while providers hold raw references.
+    McpStreamState(McpStreamState&&) = delete;
+    McpStreamState& operator=(McpStreamState&&) = delete;
 
     /// Append a frame to the ring and hand it to the live sink, if any. The
     /// producer seam for track 2f PR 3 (progress bridge) and for tests.
     /// Returns the assigned per-session event id.
     ///
-    /// Drop-oldest at the ring cap; every eviction is counted (a client whose
-    /// cursor falls behind the ring is 404'd on resume, never silently gapped).
+    /// CONTRACT (Decision 15(b) — LOAD-BEARING): a published frame MUST be a message
+    /// arising from THIS session's own requests. The GET channel is exempt from
+    /// per-tool tier/RBAC gating precisely because it carries nothing else; a
+    /// server-initiated or cross-session frame published here would reopen that
+    /// question and the exemption would no longer hold.
+    ///
+    /// Drop-oldest at the frame AND byte caps; every eviction is counted (a client
+    /// whose cursor falls behind the ring is 404'd on resume, never silently gapped).
     std::uint64_t publish(std::string event_type, std::string data);
 
     enum class AttachStatus {
         kAttached,
-        kGap,             ///< cursor outside the ring window → caller 404s, client re-initializes
-        kStreamCapHit,    ///< budget rejected → caller 429s
+        kGap,              ///< cursor outside the ring window → caller 404s, client re-initializes
+        kStreamCapHit,     ///< budget rejected → caller 429s
+        kHandoverPending,  ///< a superseded provider has not drained yet → caller 429s
     };
 
     struct AttachResult {
@@ -186,44 +225,56 @@ public:
     /// because a publisher needs the same mutex.
     ///
     /// Takeover, not reject-second: if the session already has a live sink, the
-    /// newcomer supersedes it (generation bumped, old sink closed kSuperseded)
-    /// and INHERITS its budget lease. The common second GET is a client
-    /// reconnecting across a zombie TCP the server has not noticed yet;
-    /// rejecting it would lock that client out for a full write-timeout, and
-    /// requiring fresh budget headroom for a reconnect would make the cap
-    /// self-inflicting.
+    /// newcomer supersedes it (generation bumped, old sink closed kSuperseded) and is
+    /// admitted WITHOUT a cap check — the common second GET is a client reconnecting
+    /// across a zombie TCP the server has not noticed yet, and making it wait for its
+    /// own zombie to time out would turn the cap into a self-inflicted lockout.
+    ///
+    /// It still takes its OWN lease (the superseded provider keeps pinning its worker
+    /// until it drains, and an uncounted pinned worker is exactly the hole this budget
+    /// exists to close). The pool is bounded structurally instead: a session holds at
+    /// most one draining sink, so at most two providers — a second takeover while a
+    /// handover is still pending returns kHandoverPending, and `derive_stream_budget`
+    /// reserves `kMaxProvidersPerStream` workers for every permitted stream.
     ///
     /// `budget == nullptr` disables admission control (test seams only —
     /// production always wires the shared budget).
     AttachResult attach_and_replay(std::uint64_t last_event_id, sse_bus::StreamBudget* budget,
                                    const std::string& principal);
 
-    /// Close the live sink, if any (idempotent). Wakes the provider, which
-    /// writes the final `stream-closed` frame and returns false. Never blocks on
-    /// socket I/O — safe to call from the registry under a DELETE/GC.
+    /// Close the live sink, if any (idempotent). Wakes the provider, which writes the
+    /// final `stream-closed` frame and returns false. Never blocks on socket I/O —
+    /// safe to call from the registry under a DELETE/GC.
     void close(McpStreamClose reason);
 
-    /// Provider-release path. Releases the budget lease and clears the live sink
-    /// iff `sink` is still the live one — a SUPERSEDED sink detaches without
-    /// releasing, because its lease moved to the sink that replaced it.
+    /// Provider-release path: clears the sink (live OR draining) and returns the lease
+    /// for the worker THAT sink was pinning. Idempotent.
     void detach(const std::shared_ptr<McpStreamSink>& sink);
 
     std::uint64_t current_generation() const;
     std::uint64_t next_event_id() const;    ///< id the next publish will assign
     std::uint64_t evictions_total() const;  ///< frames dropped from the ring (observability/tests)
     bool has_live_sink() const;
+    bool has_draining_sink() const;         ///< a superseded provider has not torn down yet
 
 private:
-    void close_locked(McpStreamClose reason);  ///< caller holds mu_
+    /// Close a sink, setting `closed` UNDER its mutex (it is the pump's wait
+    /// predicate — an atomic store outside the lock races the pump's
+    /// release-and-block and the wakeup is lost). Never blocks on I/O; never called
+    /// while holding mu_.
+    static void close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason);
+    static std::size_t frame_bytes(const McpStreamEvent& ev);
 
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
     std::size_t ring_cap_;
+    std::size_t ring_bytes_cap_;
+    std::size_t ring_bytes_ = 0;
     std::uint64_t next_id_ = 1;  ///< CH-3: per-session, starts at 1
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     std::shared_ptr<McpStreamSink> live_;
-    sse_bus::StreamBudget::Lease lease_;  ///< held while live_ != nullptr
+    std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;
 };
 
@@ -258,9 +309,16 @@ public:
     /// One provider pass: wait up to a tick, re-validate, drain, heartbeat.
     /// Returns false when the stream is over (httplib then runs the release
     /// callback, which detaches the sink and audits the close reason).
+    ///
+    /// NEVER THROWS. httplib runs a chunked content provider from a bare ThreadPool
+    /// task — outside the try/catch that wraps `routing()` — so an escaped exception
+    /// here is `std::terminate`, not a 500 (the #2037 failure class). The body is
+    /// wrapped; do not unwrap it. Re-validation alone reaches SQLite and the auth
+    /// manager, both of which can throw.
     bool pump_once(const WriteFn& write);
 
 private:
+    bool pump_once_impl(const WriteFn& write); ///< the throwing body pump_once() guards
     bool finish(const WriteFn& write, McpStreamClose reason);
     std::chrono::steady_clock::time_point now() const;
 

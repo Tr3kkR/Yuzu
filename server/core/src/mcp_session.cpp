@@ -37,9 +37,14 @@ std::size_t McpSessionRegistry::principal_count_locked(const std::string& p) con
     return n;
 }
 
-void McpSessionRegistry::refresh_active_gauge_locked() const {
+void McpSessionRegistry::publish_active_gauge(std::size_t active) const {
+    // Called AFTER releasing mu_, never under it. MetricsRegistry::gauge() takes the
+    // process-global metrics mutex, which /metrics also holds for the whole exposition
+    // build — taking it under the registry mutex would make every Prometheus scrape
+    // serialise against every MCP POST and every stream tick (both call
+    // validate_and_touch). Cheap to avoid; nasty to diagnose.
     if (metrics_ != nullptr) {
-        metrics_->gauge(kMetricSessionsActive).set(static_cast<double>(sessions_.size()));
+        metrics_->gauge(kMetricSessionsActive).set(static_cast<double>(active));
     }
 }
 
@@ -63,11 +68,13 @@ std::vector<std::shared_ptr<McpStreamState>> McpSessionRegistry::gc_locked() {
 
 void McpSessionRegistry::gc() {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
+    std::size_t active = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         reaped = gc_locked();
-        refresh_active_gauge_locked();
+        active = sessions_.size();
     }
+    publish_active_gauge(active);
     for (const auto& s : reaped) {
         if (s) {
             s->close(McpStreamClose::kSessionTerminated);
@@ -78,6 +85,8 @@ void McpSessionRegistry::gc() {
 McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& principal) {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
     MintResult result;
+    std::size_t active = 0;
+    bool opened = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         reaped = gc_locked();  // reclaim idle sessions before enforcing caps
@@ -108,16 +117,18 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
             } else {
                 const auto t = now();
                 sessions_.emplace(id, Entry{principal, t, t,
-                                            std::make_shared<McpStreamState>(cfg_.ring_cap,
-                                                                             metrics_)});
-                if (metrics_ != nullptr) {
-                    metrics_->counter(kMetricSessionsOpened).increment();
-                }
+                                            std::make_shared<McpStreamState>(
+                                                cfg_.ring_cap, metrics_, cfg_.ring_bytes_cap)});
+                opened = true;
                 result = {true, id, {}};
             }
         }
-        refresh_active_gauge_locked();
+        active = sessions_.size();
     }
+    if (opened && metrics_ != nullptr) {
+        metrics_->counter(kMetricSessionsOpened).increment();
+    }
+    publish_active_gauge(active);
     for (const auto& s : reaped) {
         if (s) {
             s->close(McpStreamClose::kSessionTerminated);
@@ -130,6 +141,7 @@ McpSessionRegistry::ValidateResult
 McpSessionRegistry::validate_and_touch(const std::string& id, const std::string& principal) {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
     ValidateResult result = ValidateResult::kUnknown;
+    std::size_t active = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         reaped = gc_locked();
@@ -141,8 +153,9 @@ McpSessionRegistry::validate_and_touch(const std::string& id, const std::string&
             it->second.last_seen = now();
             result = ValidateResult::kValid;
         }
-        refresh_active_gauge_locked();
+        active = sessions_.size();
     }
+    publish_active_gauge(active);
     for (const auto& s : reaped) {
         if (s) {
             s->close(McpStreamClose::kSessionTerminated);
@@ -164,6 +177,7 @@ std::shared_ptr<McpStreamState> McpSessionRegistry::stream_for(const std::string
 
 bool McpSessionRegistry::terminate(const std::string& id, const std::string& principal) {
     std::shared_ptr<McpStreamState> stream;
+    std::size_t active = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = sessions_.find(id);
@@ -172,8 +186,9 @@ bool McpSessionRegistry::terminate(const std::string& id, const std::string& pri
         }
         stream = std::move(it->second.stream);
         sessions_.erase(it);
-        refresh_active_gauge_locked();
+        active = sessions_.size();
     }
+    publish_active_gauge(active);
     // Outside mu_ (lock order, as in gc_locked). The stream state itself survives
     // until the live provider's release callback drops the last reference — the
     // erase above only removes the registry's.

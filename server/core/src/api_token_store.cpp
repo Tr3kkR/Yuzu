@@ -6,6 +6,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "secure_random.hpp"
+#include "sqlite_raii.hpp"
 
 #include <yuzu/secure_zero.hpp>
 
@@ -427,12 +428,13 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // the negative answer was real. Fail-safe direction: a broken store reports
     // kUnavailable, which grants a BOUNDED grace window — it never grants access.
     std::unique_lock db_lock(db_mtx_);
-    sqlite3_stmt* probe = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT 1 FROM api_tokens LIMIT 1;", -1, &probe, nullptr) !=
-        SQLITE_OK)
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT 1 FROM api_tokens LIMIT 1;", -1, &raw, nullptr) != SQLITE_OK)
         return {TokenCheck::kUnavailable, std::nullopt};
-    const int rc = sqlite3_step(probe);
-    sqlite3_finalize(probe);
+    // RAII from here: the next early return added to this block must not be able to
+    // leak a prepared statement on the shared connection.
+    SqliteStmt probe{raw};
+    const int rc = sqlite3_step(probe.get());
     if (rc != SQLITE_ROW && rc != SQLITE_DONE)
         return {TokenCheck::kUnavailable, std::nullopt};
     return {TokenCheck::kInvalid, std::nullopt};

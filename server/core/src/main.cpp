@@ -441,7 +441,12 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
     app.add_option("--http-worker-threads", cfg.http_worker_threads,
                    "Base size of the shared HTTP worker pool (0 = auto: max(8, cores-1); "
-                   "pool grows to 4x this). Held-open SSE streams are budgeted against it.")
+                   "pool grows to 4x this; values below 8 are floored). Held-open SSE "
+                   "streams are budgeted against it.")
+        // Bounded: the pool max is 4x this, and an absurd value would overflow that
+        // product into a max < base, which httplib's ThreadPool ctor throws on — at
+        // listen() time, long after the flag was accepted.
+        ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))
         ->envname("YUZU_HTTP_WORKER_THREADS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)

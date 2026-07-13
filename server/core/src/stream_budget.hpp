@@ -25,18 +25,39 @@
 
 namespace yuzu::server::detail {
 
-/// Plain-REST reserve: worker threads never available to held-open streams, so
-/// a saturated stream budget cannot starve ordinary request/response traffic
-/// (Decision 15(h), chaos CH-6).
+/// Plain-REST reserve: worker threads held back from streams, so a saturated stream
+/// budget does not starve ordinary request/response traffic (Decision 15(h), CH-6).
+///
+/// HONESTY NOTE: this is a reserve only against the surfaces that actually take
+/// leases. httplib has no per-route worker reservation — three other held-open
+/// providers share the same pool and are still UNCAPPED (`GET /api/v1/events`,
+/// the dashboard execution SSE, and the legacy `/events` stream; issue #2056 moves
+/// them onto this budget). Until they adopt it, the reserve bounds the MCP surface,
+/// not the pool as a whole.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
 
-/// Effective global stream cap: the operator's request, clamped to what the
-/// worker pool can actually spare. Pure — the unit-testable half of CH-6.
+/// Workers a single permitted stream can pin at once. A stream is normally one
+/// provider on one worker — but a takeover leaves the superseded provider draining
+/// (still pinning its worker) while the replacement runs, and `McpStreamState` allows
+/// at most ONE pending handover per session. So the budget must reserve two workers
+/// for every stream it admits, or a fleet of reconnecting clients would oversubscribe
+/// the pool by exactly the number of handovers in flight.
+inline constexpr std::size_t kMaxProvidersPerStream = 2;
+
+/// Floor for `--http-worker-threads`. httplib's own default base is `max(8, cores-1)`;
+/// going below 8 drives the derived stream budget to zero, which would disable MCP
+/// streaming entirely from behind a knob that reads like a tuning parameter.
+inline constexpr std::size_t kMinHttpWorkerThreads = 8;
+
+/// Effective global stream cap: the operator's request, clamped to what the worker
+/// pool can actually spare once the reserve and the per-stream provider allowance are
+/// taken out. Pure — the unit-testable half of CH-6.
 inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
                                                   std::size_t plain_rest_reserve,
                                                   std::size_t requested_global_cap) {
     const std::size_t spare = pool_max > plain_rest_reserve ? pool_max - plain_rest_reserve : 0;
-    return requested_global_cap < spare ? requested_global_cap : spare;
+    const std::size_t affordable = spare / kMaxProvidersPerStream;
+    return requested_global_cap < affordable ? requested_global_cap : affordable;
 }
 
 /// Global + per-principal admission counters for held-open SSE responses.
@@ -89,7 +110,13 @@ public:
 
         /// Return the slot early. Idempotent — a second call is a no-op, so the
         /// destructor after an explicit release does nothing.
-        void release() {
+        ///
+        /// `noexcept` is structural, not decorative: this runs from ~Lease (itself
+        /// implicitly noexcept) on a provider-teardown path, so a throwing
+        /// `lock_guard` here would terminate anyway. Making it explicit means the
+        /// "a slot is always returned" claim cannot be quietly broken by a future
+        /// throwing member.
+        void release() noexcept {
             if (budget_ != nullptr) {
                 budget_->release_slot(principal_);
                 budget_ = nullptr;
@@ -116,15 +143,30 @@ public:
     static constexpr const char* kRejectPerPrincipal = "per_principal_stream_cap";
     static constexpr const char* kRejectGlobal = "global_stream_cap";
 
-    AcquireResult try_acquire(const std::string& principal) {
+    enum class Admission {
+        kEnforceCaps,  ///< a NEW stream: subject to both caps
+        kTakeover,     ///< replaces a stream this principal already holds
+    };
+
+    /// A takeover is admitted without a cap check but STILL TAKES A LEASE. It is not
+    /// a new stream — it replaces one the principal already has — and refusing it
+    /// would lock a reconnecting client out behind its own not-yet-reaped zombie
+    /// stream. It must still be counted, because the superseded provider goes on
+    /// pinning its worker until it drains; an uncounted pinned worker is precisely
+    /// the hole this budget exists to close. The resulting overshoot is bounded by
+    /// `kMaxProvidersPerStream`, which `derive_stream_budget` reserves for.
+    AcquireResult try_acquire(const std::string& principal,
+                              Admission mode = Admission::kEnforceCaps) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (total_ >= cfg_.global_cap) {
-            return {Lease{}, kRejectGlobal};
-        }
         auto it = per_principal_.find(principal);
         const std::size_t held = it == per_principal_.end() ? 0 : it->second;
-        if (held >= cfg_.per_principal_cap) {
-            return {Lease{}, kRejectPerPrincipal};
+        if (mode == Admission::kEnforceCaps) {
+            if (total_ >= cfg_.global_cap) {
+                return {Lease{}, kRejectGlobal};
+            }
+            if (held >= cfg_.per_principal_cap) {
+                return {Lease{}, kRejectPerPrincipal};
+            }
         }
         ++total_;
         per_principal_[principal] = held + 1;

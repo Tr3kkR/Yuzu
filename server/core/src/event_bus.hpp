@@ -5,6 +5,7 @@
 /// Header-only — small enough that a separate TU adds no value.
 
 #include <cstddef>
+#include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -25,6 +26,14 @@ namespace yuzu::server::detail {
 struct SseEvent {
     std::string event_type;
     std::string data;
+    /// Optional SSE `id:` for routes that support `Last-Event-ID` resume. 0 = no id
+    /// (heartbeats and synthetics carry none — resuming onto a heartbeat's id would
+    /// skip real frames). Routes that predate this field packed the id into `data`
+    /// as a `"<id>\n<payload>"` prefix and re-parsed it in the provider; carrying it
+    /// as a field instead removes a throwing `stoull` from a content-provider
+    /// callback, which httplib runs on an UNGUARDED worker task — an escaped
+    /// exception there is `std::terminate`, not a 500 (#2037's failure class).
+    std::uint64_t id = 0;
 };
 
 // -- SSE Event Bus ------------------------------------------------------------

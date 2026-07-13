@@ -14,7 +14,6 @@
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
-#include "mcp_stream.hpp" // mcp::StreamRevalidate — the held-open-stream re-validation contract
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "principal_class.hpp"
@@ -365,49 +364,68 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     return std::nullopt;
 }
 
-mcp::StreamRevalidate AuthRoutes::revalidate_stream(const httplib::Request& req,
+auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                                                     const std::string& expected_principal) {
-    using R = mcp::StreamRevalidate;
+    using R = auth::CredentialCheck;
 
-    // 1. Session cookie. AuthManager's session table is in-memory, so its answer is
-    //    always DEFINITIVE — there is no backend to be unavailable.
-    const auto cookie = extract_session_cookie(req);
-    if (!cookie.empty() && cookie.size() <= auth::kMaxSessionTokenLength) {
-        auto session = auth_mgr_.validate_session(cookie);
-        if (!session)
-            return R::kRevoked;  // signed out / expired / unknown — definitive
-        // A credential that now resolves to a DIFFERENT principal is a rebind, and a
-        // rebind is a revocation of the stream's authority: the stream carries the
-        // original principal's session messages and must not survive the change.
-        return session->username == expected_principal ? R::kValid : R::kRevoked;
+    // The invariant: a stream lives iff a FRESH request carrying these same headers
+    // would still authenticate as `expected_principal`. So this must mirror
+    // resolve_session's precedence EXACTLY — including its fall-through. An earlier
+    // version returned kRevoked as soon as a cookie failed, which killed (every 3 s,
+    // in a reconnect loop) a perfectly good token-authenticated stream that happened
+    // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
+    // It failed closed, but it was still wrong.
+
+    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
+    //    always DEFINITIVE — there is no backend that could be unavailable.
+    if (const auto cookie = extract_session_cookie(req);
+        !cookie.empty() && cookie.size() <= auth::kMaxSessionTokenLength) {
+        if (auto session = auth_mgr_.validate_session(cookie)) {
+            // A credential that now resolves to a DIFFERENT principal is a rebind, and
+            // a rebind revokes the stream's authority: the stream carries the original
+            // principal's messages and must not survive the change.
+            if (session->username == expected_principal)
+                return R::kValid;
+            return R::kRevoked;
+        }
+        // Cookie present but dead — fall through to the token headers, exactly as
+        // resolve_session does.
     }
 
-    // 2. Authorization: Bearer <token>, then 3. X-Yuzu-Token (resolve_session's order).
-    std::string raw;
+    // 2. Authorization: Bearer <token>, then 3. X-Yuzu-Token — resolve_session's order.
+    // Both are tried: a request may carry a dead Bearer and a live X-Yuzu-Token.
+    std::array<std::string, 2> candidates{};
     if (const auto header = req.get_header_value("Authorization");
         header.size() > 7 && header.substr(0, 7) == "Bearer ") {
-        raw = header.substr(7);
-    } else {
-        raw = req.get_header_value("X-Yuzu-Token");
+        candidates[0] = header.substr(7);
     }
-    if (raw.empty() || raw.size() > auth::kMaxApiTokenLength)
-        return R::kRevoked;  // no usable credential on the request — definitive
-    if (!api_token_store_)
-        return R::kRevoked;  // token auth is not configured at all — definitive
+    candidates[1] = req.get_header_value("X-Yuzu-Token");
 
-    const auto checked = api_token_store_->validate_token_checked(raw);
-    switch (checked.status) {
-    case ApiTokenStore::TokenCheck::kUnavailable:
-        // The store is unreachable. That is NOT evidence of revocation — say so, and
-        // let the pump ride out its bounded grace window (Decision 15(i), CH-4).
-        return R::kIndeterminate;
-    case ApiTokenStore::TokenCheck::kInvalid:
-        return R::kRevoked;
-    case ApiTokenStore::TokenCheck::kValid:
-        return checked.token && checked.token->principal_id == expected_principal ? R::kValid
-                                                                                  : R::kRevoked;
+    bool store_unavailable = false;
+    for (const auto& raw : candidates) {
+        if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
+            continue;
+        const auto checked = api_token_store_->validate_token_checked(raw);
+        switch (checked.status) {
+        case ApiTokenStore::TokenCheck::kValid:
+            if (checked.token && checked.token->principal_id == expected_principal)
+                return R::kValid;
+            break; // a valid token for SOMEONE ELSE is not authority for this stream
+        case ApiTokenStore::TokenCheck::kUnavailable:
+            // The store could not answer. That is NOT evidence of revocation — remember
+            // it, but keep looking: another credential on the request may still say yes.
+            store_unavailable = true;
+            break;
+        case ApiTokenStore::TokenCheck::kInvalid:
+            break; // definitively not a credential — try the next one
+        }
     }
-    return R::kRevoked;  // unreachable; fail closed
+
+    // Nothing on this request authenticates as the stream's principal. If the store was
+    // unreachable while we looked, we genuinely do not KNOW — say so, and let the pump
+    // ride out its bounded grace window rather than cutting every stream on the fleet
+    // at the same instant (Decision 15(i), CH-4).
+    return store_unavailable ? R::kIndeterminate : R::kRevoked;
 }
 
 std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,

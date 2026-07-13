@@ -28,12 +28,6 @@
 
 namespace yuzu::server {
 
-namespace mcp {
-// Defined in mcp_stream.hpp; forward-declared so the auth header does not pull
-// in the MCP stream module (the dependency runs the other way).
-enum class StreamRevalidate;
-}  // namespace mcp
-
 namespace detail {
 
 /// Sanitises an externally-controlled string (the motivating case is an
@@ -118,7 +112,7 @@ public:
     /// terminates it. MCP clients authenticate with API tokens in practice; if the
     /// inactivity semantics matter for a future browser-side MCP client, the fix is
     /// a non-touching `peek_session` on AuthManager.
-    mcp::StreamRevalidate revalidate_stream(const httplib::Request& req,
+    auth::CredentialCheck revalidate_stream(const httplib::Request& req,
                                             const std::string& expected_principal);
 
     /// Calls require_auth, then checks session.role == admin.

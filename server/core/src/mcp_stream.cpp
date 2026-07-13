@@ -4,15 +4,31 @@
 #include "mcp_session.hpp"
 #include "mcp_transport.hpp"
 #include "rest_a4_envelope.hpp"
+#include "auth_routes.hpp" // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_audit.hpp"
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
+#include <functional>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace yuzu::server::mcp {
+
+// The ring's frame cap must never exceed the sink queue's cap: a full-ring replay is
+// pushed through enqueue_capped, so a larger ring would silently drop the OLDEST
+// replayed frames — gapping a resume that the ring could actually have served, which
+// is precisely the failure the ring exists to prevent.
+static_assert(kMcpRingCapDefault <= sse_bus::kPerConnectionQueueCapDefault,
+              "replay ring must fit the sink queue or a full replay self-gaps");
+static_assert(McpSessionRegistry::Config{}.ring_cap == kMcpRingCapDefault,
+              "registry default and stream default must not drift");
 
 namespace {
 
@@ -21,6 +37,7 @@ constexpr std::size_t kMaxWriteSlice = 8192;  // sibling parity (/api/v1/events)
 // Metric names — the Decision 15(k) family, fixed at PR 0 so dashboards/alerts
 // can be authored against them before the code lands.
 constexpr const char* kMetricStreamsActive = "yuzu_mcp_streams_active";
+constexpr const char* kMetricStreamsHandover = "yuzu_mcp_streams_handover_pending";
 constexpr const char* kMetricRingEvictions = "yuzu_mcp_stream_replay_ring_evictions_total";
 constexpr const char* kMetricStreamRejects = "yuzu_mcp_stream_rejects_total";
 
@@ -33,12 +50,64 @@ void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
 // SSE framing. Ring frames carry an `id:` so a broken stream can resume with
 // `Last-Event-ID`; heartbeats and the close frame deliberately do NOT (they are
 // not replayable state — resuming onto a heartbeat id would skip real frames).
-std::string format_frame(const McpStreamEvent& ev) {
-    std::string out = "id: ";
-    out += std::to_string(ev.id);
-    out += '\n';
-    out += sse_bus::format_sse(sse_bus::SseEvent{ev.event_type, ev.data});
+std::string format_frame(const sse_bus::SseEvent& ev) {
+    std::string out;
+    if (ev.id != 0) {
+        out += "id: ";
+        out += std::to_string(ev.id);
+        out += '\n';
+    }
+    out += sse_bus::format_sse(ev);
     return out;
+}
+
+// SSE is a line protocol: a newline in `event_type` would terminate the field and
+// let the rest of the string forge SSE lines. `data` is safe (format_sse re-prefixes
+// every line), but the type is not — strip rather than trust. The producer seam
+// (`publish`) is the only way a type reaches the wire.
+std::string sanitize_event_type(std::string type) {
+    for (char& c : type) {
+        if (c == '\n' || c == '\r') {
+            c = '_';
+        }
+    }
+    return type;
+}
+
+// What a client should DO about each close reason. Part of the A4 shape on the final
+// frame: "your stream ended" is only actionable if we say what ends it.
+const char* close_remediation(McpStreamClose reason) {
+    switch (reason) {
+    case McpStreamClose::kCredentialRevoked:
+        return "re-authenticate, then re-initialize and reconnect";
+    case McpStreamClose::kAuthUnavailable:
+        return "the auth store was unreachable; retry — durable results remain fetchable "
+               "by execution_id";
+    case McpStreamClose::kSessionTerminated:
+        return "re-initialize to mint a new session";
+    case McpStreamClose::kClientGone:
+    case McpStreamClose::kSuperseded:
+    case McpStreamClose::kNone:
+        break;
+    }
+    return "reconnect with Last-Event-ID to resume within the replay window";
+}
+
+// Strict, non-throwing cursor parse. std::stoull would be wrong twice over: it does
+// not throw on "-1" (it WRAPS to UINT64_MAX, which lands past the ring window and so
+// would terminate the client's session over a typo), it accepts trailing junk, and it
+// throws on overflow — inside a content-provider callback that must never throw.
+std::uint64_t parse_last_event_id(std::string_view raw) {
+    if (raw.empty() || raw.front() == '-' || raw.front() == '+') {
+        return 0;
+    }
+    std::uint64_t value = 0;
+    const char* const end = raw.data() + raw.size();
+    const auto [ptr, ec] = std::from_chars(raw.data(), end, value);
+    if (ec != std::errc{} || ptr != end) {
+        return 0; // unparseable cursor → replay what we still hold, never terminate
+    }
+    return value;
 }
 
 bool write_all(const McpStreamPump::WriteFn& write, std::string_view payload) {
@@ -77,35 +146,46 @@ const char* to_string(McpStreamClose reason) {
 
 // ── McpStreamState ──────────────────────────────────────────────────────────
 
-McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metrics)
-    : ring_cap_(ring_cap == 0 ? 1 : ring_cap), metrics_(metrics) {}
+McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metrics,
+                               std::size_t ring_bytes_cap)
+    : ring_cap_(ring_cap == 0 ? 1 : ring_cap),
+      ring_bytes_cap_(ring_bytes_cap == 0 ? 1 : ring_bytes_cap), metrics_(metrics) {}
 
 std::uint64_t McpStreamState::publish(std::string event_type, std::string data) {
     std::shared_ptr<McpStreamSink> live;
     std::uint64_t id = 0;
-    std::string queued;  // "<id>\n<data>" — the sink queue's framing (see pump drain)
-    std::string type;
     std::uint64_t evicted = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         id = next_id_++;
-        ring_.push_back(McpStreamEvent{id, std::move(event_type), std::move(data)});
-        while (ring_.size() > ring_cap_) {
+        ring_.push_back(sse_bus::SseEvent{sanitize_event_type(std::move(event_type)),
+                                          std::move(data), id});
+        while (ring_.size() > ring_cap_ || (ring_bytes_ + frame_bytes(ring_.back()) > ring_bytes_cap_ &&
+                                            ring_.size() > 1)) {
+            // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a
+            // memory bound — one 5 MB frame would blow the budget the count says we
+            // are respecting. Always keep at least the newest frame.
+            ring_bytes_ -= frame_bytes(ring_.front());
             ring_.pop_front();
             ++evictions_;
             ++evicted;
         }
-        const auto& ev = ring_.back();
-        type = ev.event_type;
-        queued = std::to_string(ev.id) + '\n' + ev.data;
+        ring_bytes_ += frame_bytes(ring_.back());
+
+        // Enqueue to the live sink UNDER mu_, not after releasing it. Two concurrent
+        // publishers (PR 3 will have concurrent tool calls on one session) would
+        // otherwise be able to interleave between id-assignment and enqueue, putting
+        // id 6 on the wire before id 5 — which silently breaks the monotonic
+        // Last-Event-ID contract the whole resume mechanism rests on.
+        // Safe: this is the DECLARED lock order (mu_ → sink mu), and enqueue_capped
+        // never blocks on I/O or calls back into us.
         live = live_;
+        if (live) {
+            sse_bus::enqueue_capped(live->sse, ring_.back(), ring_cap_);
+        }
     }
-    // Hand off to the sink outside mu_ (lock order mu_ → sink mu still holds; the
-    // shorter the critical section, the less a slow attach blocks a publisher).
     if (live) {
-        sse_bus::enqueue_capped(live->sse, sse_bus::SseEvent{std::move(type), std::move(queued)},
-                               ring_cap_);
-        live->sse->cv.notify_one();
+        live->sse->cv.notify_one(); // outside mu_ — no need to hold it to wake a waiter
     }
     if (evicted > 0 && metrics_ != nullptr) {
         metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
@@ -118,6 +198,7 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
                                                                const std::string& principal) {
     AttachResult out;
     std::shared_ptr<McpStreamSink> superseded;
+    sse_bus::StreamBudget::Lease new_lease;
     {
         std::lock_guard<std::mutex> lk(mu_);
 
@@ -135,31 +216,63 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
             return out;
         }
 
-        // 2. Admission. A takeover inherits the superseded stream's lease (see
-        //    header rationale); a first attach must be admitted by the budget.
+        // 2. Admission.
+        //
+        // The scarce resource is not the session — it is the httplib WORKER each
+        // held-open response pins for its whole life. So the accounting rule is:
+        // one lease per SINK (per pinned worker), never one per session. An earlier
+        // version kept the lease on the session and let a takeover inherit it, which
+        // meant a superseded provider — still pinning its worker until it drains, and
+        // a peer with a closed TCP window can stall that for the full write timeout —
+        // was charged to nobody. A client could then hammer GET on ONE session and
+        // pin the whole pool while the cap read 1. That defeats the entire point of
+        // Decision 15(h).
+        //
+        // A takeover is admitted WITHOUT a cap check (a client reconnecting across a
+        // zombie TCP must never be locked out by its own zombie), but it still takes
+        // a lease, so the accounting stays truthful. The bound comes from structure
+        // instead: a session holds at most ONE draining sink, so at most TWO
+        // providers — hence `derive_stream_budget` reserves 2 workers per permitted
+        // stream, and a second takeover while a handover is still pending is refused.
         if (live_) {
-            superseded = std::move(live_);
+            if (draining_) {
+                out.status = AttachStatus::kHandoverPending;
+                return out; // one handover at a time — this is what bounds the pool
+            }
+            draining_ = std::move(live_);
             live_.reset();
-            superseded->set_close_reason(McpStreamClose::kSuperseded);
-        } else if (budget != nullptr) {
-            auto acquired = budget->try_acquire(principal);
+            superseded = draining_;
+        }
+        if (budget != nullptr) {
+            // A takeover bypasses the CAPS but not the accounting.
+            const auto mode = superseded ? sse_bus::StreamBudget::Admission::kTakeover
+                                         : sse_bus::StreamBudget::Admission::kEnforceCaps;
+            auto acquired = budget->try_acquire(principal, mode);
             if (!acquired.lease) {
+                // Only reachable on the first-attach path (a takeover always admits).
                 out.status = AttachStatus::kStreamCapHit;
                 out.reject_reason = acquired.reject_reason;
+                if (superseded) {
+                    // Unreachable today, but if it ever becomes reachable, do NOT leave
+                    // the session with a closed stream and no replacement.
+                    live_ = std::move(draining_);
+                    draining_.reset();
+                    superseded.reset();
+                }
                 return out;
             }
-            lease_ = std::move(acquired.lease);
+            new_lease = std::move(acquired.lease);
         }
 
         // 3. Replay + attach, under the same lock a publisher would need — so no
-        //    frame can slip into the window between the two.
+        //    frame can slip into the window between the two. (The `/api/v1/events`
+        //    sibling does replay and subscribe under SEPARATE locks and documents the
+        //    resulting lost-frame window; here it cannot happen.)
         auto sink = std::make_shared<McpStreamSink>();
+        sink->lease = std::move(new_lease);
         for (const auto& ev : ring_) {
             if (ev.id > last_event_id) {
-                sse_bus::enqueue_capped(sink->sse,
-                                       sse_bus::SseEvent{ev.event_type,
-                                                        std::to_string(ev.id) + '\n' + ev.data},
-                                       ring_cap_);
+                sse_bus::enqueue_capped(sink->sse, ev, ring_cap_);
             }
         }
         live_ = sink;
@@ -168,48 +281,81 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         out.generation = ++generation_;
     }
 
-    // Wake the superseded provider outside mu_ (lock order; it will write its
-    // final frame and return false, releasing its worker).
+    // Wake the superseded provider outside mu_ (lock order). `closed` MUST be set
+    // while holding the sink mutex: the pump evaluates it as its wait predicate, and
+    // a store+notify issued in the window between the pump's predicate check and its
+    // atomic release-and-block is simply LOST — the provider would then sleep a full
+    // tick before noticing, pinning a worker for 3 s per takeover.
     if (superseded) {
-        superseded->sse->closed.store(true);
-        superseded->sse->cv.notify_all();
-    } else if (metrics_ != nullptr) {
-        // Gauge counts LIVE streams: a takeover replaces one, it does not add one.
+        close_sink(superseded, McpStreamClose::kSuperseded);
+    }
+    if (metrics_ != nullptr) {
         metrics_->gauge(kMetricStreamsActive).increment();
+        if (superseded) {
+            metrics_->gauge(kMetricStreamsHandover).increment();
+        }
     }
     return out;
 }
 
-void McpStreamState::close_locked(McpStreamClose reason) {
-    if (!live_) {
+void McpStreamState::close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason) {
+    if (!sink) {
         return;
     }
-    live_->set_close_reason(reason);
-    live_->sse->closed.store(true);
-    live_->sse->cv.notify_all();
+    sink->set_close_reason(reason);
+    {
+        // `closed` is the pump's wait PREDICATE, so it must be modified while owning
+        // the sink mutex. Storing it atomically without the lock and then notifying is
+        // a classic lost wakeup: if the pump has already evaluated the predicate and is
+        // about to release-and-block, the notify lands on an empty wait queue and the
+        // provider sleeps the full tick. Being atomic does not save you — ownership of
+        // the mutex during the modification is what orders it against the wait.
+        std::lock_guard<std::mutex> lk(sink->sse->mu);
+        sink->sse->closed.store(true);
+    }
+    sink->sse->cv.notify_all();
 }
 
 void McpStreamState::close(McpStreamClose reason) {
-    std::lock_guard<std::mutex> lk(mu_);
-    close_locked(reason);
-    // The live sink is intentionally NOT cleared here: the provider is still
-    // running and will call detach() on teardown, which is the single place the
-    // budget lease is returned. Clearing it here would leak the lease.
+    std::shared_ptr<McpStreamSink> live;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        live = live_;
+        // The live sink is intentionally NOT cleared: the provider is still running and
+        // calls detach() on teardown, which is the single place its lease is returned.
+    }
+    close_sink(live, reason); // outside mu_ (lock order) — never blocks on I/O
 }
 
 void McpStreamState::detach(const std::shared_ptr<McpStreamSink>& sink) {
-    bool released = false;
+    if (!sink) {
+        return;
+    }
+    bool was_live = false;
+    bool was_draining = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (live_ != sink) {
-            return;  // superseded sink: its lease moved to the sink that replaced it
+        if (live_ == sink) {
+            live_.reset();
+            was_live = true;
+        } else if (draining_ == sink) {
+            draining_.reset(); // the handover completed — a new takeover may proceed
+            was_draining = true;
         }
-        live_.reset();
-        lease_.release();
-        released = true;
     }
-    if (released && metrics_ != nullptr) {
+    if (!was_live && !was_draining) {
+        return; // already detached (idempotent — httplib runs the releaser exactly once,
+                // but a caller must not be able to corrupt the accounting by re-running it)
+    }
+    // Release the lease OUTSIDE mu_ so the global budget mutex is never nested under a
+    // per-stream one on this path. Each sink owns its own lease, so this returns exactly
+    // the worker THIS provider was pinning.
+    sink->lease.release();
+    if (metrics_ != nullptr) {
         metrics_->gauge(kMetricStreamsActive).decrement();
+        if (was_draining) {
+            metrics_->gauge(kMetricStreamsHandover).decrement();
+        }
     }
 }
 
@@ -231,6 +377,15 @@ std::uint64_t McpStreamState::evictions_total() const {
 bool McpStreamState::has_live_sink() const {
     std::lock_guard<std::mutex> lk(mu_);
     return live_ != nullptr;
+}
+
+bool McpStreamState::has_draining_sink() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return draining_ != nullptr;
+}
+
+std::size_t McpStreamState::frame_bytes(const McpStreamEvent& ev) {
+    return ev.event_type.size() + ev.data.size();
 }
 
 // ── McpStreamPump ───────────────────────────────────────────────────────────
@@ -256,18 +411,50 @@ std::chrono::steady_clock::time_point McpStreamPump::now() const {
 
 bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     sink_->set_close_reason(reason);
-    // Best-effort final frame: a client that is still readable learns WHY its
-    // stream ended (Decision 15(f) — a close is never indistinguishable from a
-    // clean completion). A dead peer simply fails the write; nothing to do.
-    const std::string frame =
-        sse_bus::format_sse(sse_bus::SseEvent{"stream-closed",
-                                            std::string("{\"reason\":\"") +
-                                                to_string(sink_->close_reason.load()) + "\"}"});
-    (void)write_all(write, frame);
+    const McpStreamClose actual = sink_->close_reason.load();
+
+    // A SUPERSEDED stream gets no final frame — deliberately. The client already has a
+    // newer stream on this session, so the only thing that can be waiting on the far
+    // end of this socket is the stalled peer that caused the takeover in the first
+    // place; writing to it would block this worker for the full write timeout (30 s)
+    // while its lease is still charged. Every other reason gets the frame.
+    if (actual != McpStreamClose::kSuperseded) {
+        // Decision 15(f): a close is never indistinguishable from a clean completion,
+        // and the reason is machine-parseable in the same A4 shape as every denial on
+        // this route (so a client has ONE error contract, not two).
+        const auto cid = yuzu::server::detail::make_correlation_id();
+        std::string body = "{\"reason\":";
+        body += detail::json_quoted(to_string(actual));
+        body += ",\"correlation_id\":";
+        body += detail::json_quoted(cid);
+        body += ",\"retry_after_ms\":null,\"remediation\":";
+        body += detail::json_quoted(close_remediation(actual));
+        body += "}";
+        (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"stream-closed", body}));
+    }
     return false;
 }
 
 bool McpStreamPump::pump_once(const WriteFn& write) {
+    // HARD exception boundary. httplib invokes a chunked content provider from a bare
+    // ThreadPool task — `routing()` is inside its try/catch, this is NOT — so an
+    // escaped exception here is std::terminate, not a 500 (the #2037 failure class).
+    // Everything below can throw: revalidate_() reaches SQLite and the auth manager,
+    // and every frame build allocates.
+    try {
+        return pump_once_impl(write);
+    } catch (const std::exception& e) {
+        spdlog::warn("MCP stream pump: aborting stream after exception: {}", e.what());
+        sink_->set_close_reason(McpStreamClose::kClientGone);
+        return false; // httplib still runs the releaser → detach() → the lease comes back
+    } catch (...) {
+        spdlog::warn("MCP stream pump: aborting stream after unknown exception");
+        sink_->set_close_reason(McpStreamClose::kClientGone);
+        return false;
+    }
+}
+
+bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     std::deque<sse_bus::SseEvent> drained;
     std::uint64_t dropped = 0;
     std::optional<sse_bus::SseEvent> pre_emit;
@@ -347,16 +534,10 @@ bool McpStreamPump::pump_once(const WriteFn& write) {
         }
     }
     for (const auto& ev : drained) {
-        // Queue payloads are framed "<id>\n<data>" by publish/replay.
-        const std::size_t nl = ev.data.find('\n');
-        McpStreamEvent frame;
-        if (nl == std::string::npos) {
-            frame = McpStreamEvent{0, ev.event_type, ev.data};
-        } else {
-            frame = McpStreamEvent{std::stoull(ev.data.substr(0, nl)), ev.event_type,
-                                   ev.data.substr(nl + 1)};
-        }
-        if (!write_all(write, format_frame(frame))) {
+        // The id rides on the frame (SseEvent::id) — it is NOT parsed back out of the
+        // payload. Re-parsing put a throwing stoull inside this callback, which httplib
+        // runs on an unguarded worker task.
+        if (!write_all(write, format_frame(ev))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
@@ -384,8 +565,13 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                           std::string_view remediation, std::optional<std::int64_t> retry_after_ms,
                           const std::string& sid) {
         // Only a prefix of the session id reaches the audit row — enough to join a
-        // reject to its stream, never enough to replay it (PR 1 convention).
-        (void)audit("mcp.session.reject", "failure", sid.substr(0, 8),
+        // reject to its stream, never enough to replay it. Sanitized because the id is
+        // an attacker-controlled HEADER until it validates: raw bytes here could inject
+        // `;`/`=` field separators or CR/LF into a "k=v;k=v" audit detail that SIEM
+        // tooling parses (yuzu::server::detail::sanitize_detail_value, the convention
+        // for every externally-controlled audit string).
+        (void)audit("mcp.session.reject", "failure",
+                    yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                     std::string("reason=") + reason + " cid=" + cid);
         count_reject(metrics, reason);
         res.status = status;
@@ -414,14 +600,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
-    std::uint64_t last_event_id = 0;
-    if (const std::string lei = req.get_header_value("Last-Event-ID"); !lei.empty()) {
-        try {
-            last_event_id = std::stoull(lei);
-        } catch (const std::exception&) {
-            last_event_id = 0;  // unparseable cursor → replay what we still hold
-        }
-    }
+    const std::uint64_t last_event_id =
+        parse_last_event_id(req.get_header_value("Last-Event-ID"));
 
     auto stream = sessions.stream_for(sid, principal);
     if (!stream) {
@@ -436,7 +616,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // POST 404s too — one coherent "re-initialize" signal, and no abandoned
         // session lingering against the session cap.
         (void)sessions.terminate(sid, principal);
-        (void)audit("mcp.session.close", "success", sid.substr(0, 8),
+        (void)audit("mcp.session.close", "success",
+                    yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                     "reason=replay_window_exceeded cid=" + cid);
         count_reject(metrics, "replay_window_exceeded");
         res.status = 404;
@@ -454,12 +635,46 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
              sid);
         return;
     }
+    if (attached.status == McpStreamState::AttachStatus::kHandoverPending) {
+        // A previous stream on this session was superseded and its provider has not
+        // torn down yet. Admitting a third would let one client pin providers without
+        // bound (each one holds a worker until it drains). Retry shortly — the
+        // handover completes as soon as the old provider wakes.
+        deny(429, kMcpStreamCap, "A previous stream on this session is still closing",
+             "stream_handover_pending", "retry shortly; the superseded stream is draining",
+             kMcpHandoverRetryAfterMs, sid);
+        return;
+    }
 
-    // Audit BEFORE the provider: set_chunked_content_provider seals the headers,
-    // so Sec-Audit-Failed can only be set here (the /api/v1/events posture —
-    // signal the evidence gap, then proceed; a transient audit hiccup must not
-    // silently drop an operator's stream).
-    if (!audit("mcp.stream.attach", "success", sid.substr(0, 8),
+    auto sink = attached.sink;
+    const std::uint64_t generation = attached.generation;
+
+    // From here to set_chunked_content_provider, the sink is attached and its budget
+    // lease is HELD, but the releaser that returns it is not installed yet. Everything
+    // in between allocates (the Request copy, the pump, the audit strings), so a
+    // bad_alloc would unwind out of the handler with the lease held forever: 16 of
+    // those and MCP streaming is dead until restart. httplib guarantees the releaser
+    // runs once installed (~Response calls it unconditionally) — this guard covers the
+    // window before that guarantee starts.
+    bool provider_installed = false;
+    const auto lease_guard = [&]() noexcept {
+        if (!provider_installed) {
+            stream->detach(sink);
+        }
+    };
+    struct ScopeExit {
+        const std::function<void()>& fn;
+        ~ScopeExit() { fn(); }
+    };
+    const std::function<void()> guard_fn = lease_guard;
+    ScopeExit scope_exit{guard_fn};
+
+    // Audit BEFORE the provider: set_chunked_content_provider seals the headers, so
+    // Sec-Audit-Failed can only be set here (the /api/v1/events posture — signal the
+    // evidence gap, then proceed; a transient audit hiccup must not silently drop an
+    // operator's stream).
+    if (!audit("mcp.stream.attach", "success",
+               yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                "correlation_id=" + cid + " last_event_id=" + std::to_string(last_event_id) +
                    " generation=" + std::to_string(attached.generation))) {
         res.set_header("Sec-Audit-Failed", "true");
@@ -469,11 +684,12 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     res.set_header("X-Accel-Buffering", "no");  // defeat reverse-proxy response buffering
     res.set_header("X-Content-Type-Options", "nosniff");
 
-    // The pump outlives this stack frame — copy what it needs. `req` is httplib's
-    // per-connection object; the re-validation closure must not bet on it.
+    // The provider and releaser run inside this request's lifetime, but pinning the
+    // headers we re-validate against by copy costs one allocation and removes any
+    // question of aliasing httplib's per-connection object across ticks.
+    // (Never read req_copy->matches: its smatch iterators alias the ORIGINAL path.)
     auto req_copy = std::make_shared<httplib::Request>(req);
-    auto sink = attached.sink;
-    const std::uint64_t generation = attached.generation;
+    const std::string audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
 
     auto revalidate_fn = [req_copy, principal, revalidate]() -> StreamRevalidate {
         if (!revalidate) {
@@ -481,8 +697,11 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         }
         return revalidate(*req_copy, principal);
     };
-    auto session_alive = [&sessions, sid, principal]() {
-        return sessions.validate_and_touch(sid, principal) ==
+    // `sessions` is a ServerImpl member; stop() joins the web workers before any member
+    // destructs, so no provider can outlive it.
+    auto* registry = &sessions;
+    auto session_alive = [registry, sid, principal]() {
+        return registry->validate_and_touch(sid, principal) ==
                McpSessionRegistry::ValidateResult::kValid;
     };
     auto pump = std::make_shared<McpStreamPump>(sink, stream, generation, std::move(revalidate_fn),
@@ -494,13 +713,22 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
             return pump->pump_once(
                 [&s](const char* p, std::size_t n) { return s.write(p, n); });
         },
-        [stream, sink, audit_fn, req_copy, sid, cid](bool /*success*/) {
-            stream->detach(sink);
-            (void)yuzu::server::detail::try_persist_audit(
-                audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession", sid.substr(0, 8),
-                std::string("reason=") + to_string(sink->close_reason.load()) +
-                    " correlation_id=" + cid);
+        [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
+            // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
+            // std::terminate no matter what httplib does, so the whole body is guarded
+            // (try_persist_audit swallows its own, but the string building allocates).
+            try {
+                stream->detach(sink); // returns this provider's worker to the budget
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession", audit_sid,
+                    std::string("reason=") + to_string(sink->close_reason.load()) +
+                        " correlation_id=" + cid);
+            } catch (...) {
+                // The lease is still returned: detach() is the first call, and Lease's
+                // destructor would return it even if that somehow threw.
+            }
         });
+    provider_installed = true;
 }
 
 }  // namespace yuzu::server::mcp

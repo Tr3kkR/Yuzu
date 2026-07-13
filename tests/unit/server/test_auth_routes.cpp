@@ -22,6 +22,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -602,4 +603,104 @@ TEST_CASE("AuthRoutes::url_decode — mixed valid and malformed sequences (H-A)"
     // The malformed '%GH' is passed through; the valid '%41' decodes to 'A'.
     CHECK(AuthRoutes::url_decode("%GH%41")   == "%GHA");
     CHECK(AuthRoutes::url_decode("ok%41")    == "okA");
+}
+
+// ── revalidate_stream: the tri-state a HELD-OPEN stream needs ────────────────
+//
+// This is the production implementation of ADR-1005 Decision 15(c)/(i) — the code
+// that decides, every heartbeat tick, whether a live MCP SSE stream keeps running.
+// The distinction it draws is the whole point: a REVOKED credential must cut the
+// stream on the spot, while an auth store that merely cannot be REACHED must not cut
+// every stream on the fleet at the same instant (chaos CH-4).
+
+TEST_CASE("revalidate_stream: a live token for the stream's principal is valid",
+          "[auth][stream][ch4]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+}
+
+TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
+          "[auth][stream][ch4]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto live = f.api_tokens->validate_token(token);
+    REQUIRE(live.has_value());
+    REQUIRE(f.api_tokens->revoke_token(live->token_id));
+
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    // kRevoked, NOT kIndeterminate: an indeterminate answer would buy the revoked
+    // credential a full grace window of extra life on a live stream.
+    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kRevoked);
+}
+
+TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authority",
+          "[auth][stream][ch4]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token(); // belongs to test_user
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    // The stream carries test_user's messages. A credential that authenticates as
+    // somebody else does not entitle the holder to keep reading them.
+    CHECK(f.ar->revalidate_stream(req, "someone_else") == auth::CredentialCheck::kRevoked);
+}
+
+TEST_CASE("revalidate_stream: no credential at all is a definitive no", "[auth][stream][ch4]") {
+    AuthRoutesFixture f;
+    httplib::Request bare;
+    CHECK(f.ar->revalidate_stream(bare, "test_user") == auth::CredentialCheck::kRevoked);
+}
+
+TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
+          "[auth][stream][ch4]") {
+    // The invariant: a stream lives iff a fresh request with these headers would still
+    // authenticate as this principal — so this must mirror resolve_session's
+    // fall-through exactly. An earlier version returned kRevoked as soon as the cookie
+    // failed, which killed a perfectly good token-authenticated stream every 3 s (in a
+    // reconnect loop) whenever the client also carried a stale cookie from a browser
+    // jar or a cookie-injecting proxy.
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    httplib::Request req;
+    req.set_header("Cookie", "yuzu_session=dead-and-gone");
+    req.set_header("Authorization", "Bearer " + token);
+    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+}
+
+TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
+          "[auth][stream][ch4]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    httplib::Request req;
+    req.set_header("Authorization", "Bearer yuzu_not_a_real_token_000000000000");
+    req.set_header("X-Yuzu-Token", token);
+    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+}
+
+TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not revoked",
+          "[auth][stream][ch4]") {
+    // CH-4's second half. If the store cannot answer, we do not KNOW the credential is
+    // gone — and treating "cannot tell" as "revoked" would cut every stream on the
+    // fleet the moment the auth store hiccupped. The pump rides out a bounded grace
+    // window on kIndeterminate instead.
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    // NOTE: deliberately do NOT validate the token first — a successful validation
+    // would populate the 60 s token cache, and the cached answer would sail straight
+    // past the broken store, testing nothing.
+
+    // Break the store underneath the token, from a SECOND connection — no test-only
+    // hook on the production store, and this is what a real corruption/ops accident
+    // looks like from the reader's side: the statement it needs will not prepare.
+    {
+        sqlite3* saboteur = nullptr;
+        REQUIRE(sqlite3_open((f.tmp_dir / "api_tokens.db").string().c_str(), &saboteur) ==
+                SQLITE_OK);
+        REQUIRE(sqlite3_exec(saboteur, "DROP TABLE api_tokens;", nullptr, nullptr, nullptr) ==
+                SQLITE_OK);
+        sqlite3_close(saboteur);
+    }
+
+    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);
 }
