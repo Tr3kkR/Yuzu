@@ -316,8 +316,9 @@ jobs:
           # on a shared host lock (the standard fix — this is what apt-systemd-daily
           # itself does). Keep DPkg::Lock::Timeout inside as belt-and-suspenders
           # for the frontend lock vs. any background unattended-upgrades. Serializing
-          # apt also staggers the legs, so they don't hit ensure-postgres (one
-          # shared yuzu-ci-postgres container) or pip --user ($HOME) all at once.
+          # apt also staggers the legs, so they don't hit ensure-postgres
+          # (per-agent yuzu-ci-postgres-<n> containers since #2094) or
+          # pip --user ($HOME) all at once.
           # FD-9 flock pattern: the subshell opens the lock file on fd 9, flock
           # blocks up to 600s for it, and releases on subshell exit. /tmp is
           # 1777 so the runner can create the lock; all 4 runners are the same
@@ -470,10 +471,12 @@ jobs:
 
       # Postgres for server tests (ADR-0006 decision 8, #1318). On this
       # self-hosted runner the script idempotently (re)uses a persistent
-      # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
-      # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
-      # no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1): a missing
-      # Postgres fails the job here, before the test step.
+      # docker container — PER AGENT on the 4-runner pool
+      # (`yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>, #2094; the shared
+      # `yuzu-ci-postgres` on :15432 remains for single-agent boxes) — and
+      # exports YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per
+      # runner, no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1):
+      # a missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
