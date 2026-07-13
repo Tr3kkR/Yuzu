@@ -806,7 +806,7 @@ public:
         metrics_.describe("yuzu_scim_role_changes_total",
                           "Total SCIM-provisioned user role changes applied via SCIM Group "
                           "membership (--scim-admin-group), by the group-membership-driven "
-                          "role-recompute core — a sustained rate is a normal signal of IdP "
+                          "role-recompute core - a sustained rate is a normal signal of IdP "
                           "group-membership churn, not itself an anomaly",
                           "counter");
         // CC6.7 evidence-gap fix (governance hardening round): bumped when

@@ -38,6 +38,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -2258,6 +2259,102 @@ TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 
         cli.Get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22HugeGroup%22)", hdr);
     REQUIRE(by_name);
     CHECK(json::parse(by_name->body)["totalResults"] == 0);
+}
+
+// ── CC6.7 evidence-gap fix coverage (governance hardening round) ──────────
+//
+// recompute_scim_user_role's `AuthManager::update_role` call has a few ways
+// to genuinely fail: an invalid username, a missing/inactive row, or a raw
+// write error from AuthDB. The first two are unreachable here — every read
+// this function performs first (`get_provisioning_source`, then
+// `db_authoritative_role`/`get_user`) shape-checks and `is_active=1`-filters
+// identically to `update_role` itself, over the SAME username string, so
+// they fail together, never letting the reads succeed while only the write
+// fails (that would need concurrent mid-request mutation of the SAME
+// connection — documented as an infeasible clean/fast unit-test injection
+// elsewhere in this file; see the "NOTE (injection gap)" comment on the
+// revive-role-refusal test above). A raw SQL write error, however, is
+// reachable deterministically and without any race: plant a `BEFORE UPDATE
+// OF role` trigger (via a second raw sqlite3 connection to the SAME auth.db
+// file — an established pattern in this suite, e.g. test_auth_sso_identity.
+// cpp's pre-migration row seeding) that RAISEs on this one user's role
+// column. The reads (SELECTs) are entirely unaffected by the trigger; only
+// `AuthDB::update_role`'s UPDATE hits it and genuinely fails.
+TEST_CASE("Groups integration: a genuine update_role failure during recompute audits "
+         "scim.user.role_changed/failure and bumps yuzu_scim_role_change_failures_total "
+         "(C1 remediation)",
+         "[scim][routes][integration][groups][role_change_failure]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.auth_mgr.set_metrics_registry(&ts.metrics);
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "carol");
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    // Plant a trigger that aborts ONLY an UPDATE of 'carol's role column —
+    // reads (get_provisioning_source/db_authoritative_role, both plain
+    // SELECTs) are untouched, so they resolve exactly as they would on the
+    // happy path; only the subsequent `AuthDB::update_role` UPDATE fails.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2((ts.data_dir / "auth.db").string().c_str(), &raw,
+                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        char* err = nullptr;
+        int rc = sqlite3_exec(raw,
+                              "CREATE TRIGGER block_carol_role_update "
+                              "BEFORE UPDATE OF role ON users "
+                              "WHEN NEW.username = 'carol' "
+                              "BEGIN SELECT RAISE(ABORT, 'forced test write failure'); END;",
+                              nullptr, nullptr, &err);
+        REQUIRE(rc == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    // The Group PATCH (add member) itself still succeeds — recompute
+    // failures are silent to the SCIM caller by design (set-and-proceed;
+    // the Group mutation already committed).
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    // The role change did NOT apply — the trigger aborted the UPDATE.
+    auto entry = ts.auth_db->get_user("carol");
+    REQUIRE(entry.has_value());
+    CHECK(entry->role == auth::Role::user);
+
+    // scim.user.role_changed/failure audit row, keyed on the user's scim_id.
+    AuditQuery q;
+    q.action = "scim.user.role_changed";
+    q.target_id = user_id;
+    auto rows = ts.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    bool found_failure = false;
+    for (const auto& row : rows) {
+        if (row.result == "failure" &&
+            row.detail.find("intended_new_role=admin") != std::string::npos)
+            found_failure = true;
+    }
+    CHECK(found_failure);
+
+    // yuzu_scim_role_change_failures_total bumped exactly once; the
+    // success counter (yuzu_scim_role_changes_total) must NOT have moved —
+    // this is the failure path, not the success path.
+    CHECK(ts.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+    CHECK(ts.metrics.counter("yuzu_scim_role_changes_total").value() == 0.0);
 }
 
 #endif // YUZU_SCIM_TSAN_BUILD

@@ -1789,6 +1789,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                  "mid-request",
                                  id);
                     send_scim_error(res, 500, "resource state changed mid-request");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                         "Group");
                     record_request(auth_mgr, "group_replace", 500);
                     return;
                 }
