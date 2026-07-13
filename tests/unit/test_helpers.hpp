@@ -145,6 +145,12 @@ struct TempDbFile {
 
     explicit TempDbFile(std::string_view prefix = "yuzu-test-") : path(unique_temp_path(prefix)) {}
 
+    /// Exact-match overload so `TempDbFile db{"prefix-"}` compiles: a string
+    /// literal converts equally well to std::string_view (prefix ctor) and
+    /// std::filesystem::path (adopt ctor below), which is ambiguous — until
+    /// now every call site worked around it with std::string_view{...}.
+    explicit TempDbFile(const char* prefix) : TempDbFile(std::string_view{prefix}) {}
+
     /// Adopt a caller-computed path. Useful when the fixture needs to place
     /// the file under a subdirectory that `unique_temp_path` does not model
     /// (e.g. a per-UID dir shared across tests). The caller is still
