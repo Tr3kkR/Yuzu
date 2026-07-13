@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """flake-retry.py — CI flake-retry wrapper around `meson test` (Yuzu).
 
-Runs `meson test`; on a clean pass, exits 0 and does nothing else. On failure
-it isolates the failed Catch2 case(s) and, for those listed in
+Runs `meson test`; every run — green included — then gets the #2093 duration
+watchdog (a per-suite duration/budget table in the step summary + a ::warning
+for any suite past 80% of its meson timeout; reporting only, pass/fail
+semantics never change). On a clean pass, exits 0 with no retry machinery.
+On failure it isolates the failed Catch2 case(s) and, for those listed in
 `tests/known-flaky.json` (scoped to the current OS), retries them in isolation.
 
 Outcome contract:
@@ -36,6 +39,10 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime
 
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
+# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092):
+# '[pg]', '~[pg]', '[a][b]', '~[a][b]'. Name specs / comma lists are not used
+# in tests/meson.build (its comment holds that line), so they are not matched.
+CATCH2_TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
 
@@ -127,6 +134,69 @@ def meson_failed_suites(builddir):
     return _failed_testcase_names(xml_path)
 
 
+def _entry_durations(builddir):
+    """{meson-junit testcase name: wall seconds} from testlog.junit.xml.
+
+    Meson writes one <testcase> per test() entry with a per-entry `time`
+    attribute (the <testsuite> nodes carry aggregates we ignore). Defensive
+    by design — this feeds pure reporting (#2093), so a missing file, parse
+    error, or absent/garbled time attr degrades to "no row", never a crash.
+    Duplicate names are summed."""
+    xml_path = os.path.join(builddir, "meson-logs", "testlog.junit.xml")
+    if not os.path.exists(xml_path):
+        return {}
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return {}
+    durations = {}
+    for tc in tree.iter("testcase"):
+        name = tc.get("name", "")
+        try:
+            secs = float(tc.get("time"))
+        except (TypeError, ValueError):
+            continue
+        durations[name] = durations.get(name, 0.0) + secs
+    return durations
+
+
+def budget_rows(durations, tests):
+    """Pure: [(display_name, secs, budget_or_None, frac_or_None)] per junit
+    entry, mapping junit names to introspected entries via match_suite. The
+    budget is the entry's meson timeout; falsy (0 = meson's "no timeout")
+    becomes None, as does the whole budget for an unmappable name."""
+    rows = []
+    for junit_name in sorted(durations):
+        secs = durations[junit_name]
+        entry = match_suite(junit_name, tests)
+        name = entry.get("name") if entry and entry.get("name") else junit_name
+        budget = (entry.get("timeout") or None) if entry else None
+        rows.append((name, secs, budget, (secs / budget) if budget else None))
+    return rows
+
+
+def report_suite_budgets(builddir, tests, warn_frac=0.8):
+    """#2093: degrade duration creep toward a suite's meson timeout into a
+    visible ::warning instead of a discontinuous red wall (the server suite
+    crept 448s -> 512s/600 in green runs with zero signal before the
+    2026-07-12 timeouts). Runs on every invocation — green included, that is
+    the entire point — and never changes pass/fail semantics."""
+    rows = budget_rows(_entry_durations(builddir), tests)
+    if not rows:
+        return
+    for name, secs, budget, frac in rows:
+        if frac is not None and frac > warn_frac:
+            gh("warning",
+               f"{name} at {secs:.0f}/{budget}s ({frac:.0%}) of its meson timeout — "
+               f"split the suite or rebalance before this flakes (#2092, #2093)")
+    lines = ["### Suite durations vs meson budgets", "",
+             "| test entry | wall (s) | budget (s) | used |", "|---|---:|---:|---:|"]
+    for name, secs, budget, frac in rows:
+        lines.append(f"| {name} | {secs:.0f} | {f'{budget:g}' if budget else '—'} | "
+                     f"{f'{frac:.0%}' if frac is not None else '—'} |")
+    summary("\n".join(lines))
+
+
 # ── meson introspection: suite name -> binary command ─────────────────────────
 def introspect_tests(builddir):
     out = subprocess.run(
@@ -153,6 +223,19 @@ def match_suite(failed_name, tests):
 
 
 # ── running Catch2 binaries ───────────────────────────────────────────────────
+def _cmd_without_test_specs(cmd):
+    """cmd minus positional Catch2 tag-filter specs.
+
+    Sharded meson entries (#2092) carry a tag spec ('~[pg]' / '[pg]') in their
+    args, and Catch2 ORs positional test specs — appending a case name to the
+    introspected cmd would re-run the whole shard ∪ case. The isolated retry
+    must REPLACE the shard filter with the case name. argv[0] and option args
+    are never touched."""
+    if not cmd:
+        return []
+    return [cmd[0]] + [a for a in cmd[1:] if not CATCH2_TAG_SPEC.match(a)]
+
+
 def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
@@ -170,6 +253,9 @@ def catch2_failed_cases(test, this_os):
     clean unclassifiable result instead of blocking the job indefinitely — the
     observed failure mode this guards is a fast abnormal exit, not a hang, so
     this is a robustness net rather than a fix for that specific pattern."""
+    # Deliberately keeps any shard tag-filter in cmd: the enumeration re-run
+    # must only surface failures from THIS shard (#2092). Only the isolated
+    # retry_case() strips it.
     cmd = test.get("cmd") or []
     if not cmd or not CATCH2_EXE.search(os.path.basename(cmd[0])):
         return None  # gateway (python) or anything not a Catch2 binary
@@ -197,7 +283,8 @@ def retry_case(test, case, retries):
     crash — same timeout source and rationale as catch2_failed_cases()."""
     for _ in range(retries):
         try:
-            result = _run(test.get("cmd"), test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(_cmd_without_test_specs(test.get("cmd") or []),
+                          test.get("env"), test.get("workdir"), extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -209,7 +296,7 @@ def retry_case(test, case, retries):
 # ── orchestration ─────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="meson test with known-flaky case retry")
-    ap.add_argument("--builddir", required=True)
+    ap.add_argument("--builddir")  # required unless --selftest (validated below)
     ap.add_argument("--known-flaky", default="tests/known-flaky.json")
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--stale-days", type=int, default=90)
@@ -219,6 +306,8 @@ def main(argv=None):
 
     if args.selftest:
         return _selftest()
+    if not args.builddir:
+        ap.error("--builddir is required (unless --selftest)")
 
     this_os = detect_os()
     # Validate the list up front (fail-fast on a malformed list).
@@ -230,6 +319,21 @@ def main(argv=None):
 
     # 1. Run meson test normally.
     rc = subprocess.run(["meson", "test", "-C", args.builddir] + args.meson_args).returncode
+
+    # 2. Duration-vs-budget watchdog (#2093) — before the green early-return,
+    #    because the creep it exists to surface happens in green runs. Hard
+    #    exception-guarded: reporting must never turn a green run red (e.g.
+    #    introspect returning rc 0 with garbled stdout, or a non-numeric
+    #    timeout reaching the frac arithmetic).
+    tests = []
+    try:
+        tests = introspect_tests(args.builddir)
+        report_suite_budgets(args.builddir, tests)
+    except Exception as ex:  # noqa: BLE001 — watchdog is reporting-only by contract
+        # `tests` keeps whatever introspect managed to return ([] if it was
+        # introspect itself that threw) — the failure path below re-uses it.
+        gh("warning", f"suite-budget watchdog failed (reporting only, run unaffected): {ex}")
+
     if rc == 0:
         return 0
 
@@ -239,8 +343,6 @@ def main(argv=None):
     if not failed_suites:
         gh("error", "test failed but no per-suite junit to classify — failing (no masking)")
         return rc or 1
-
-    tests = introspect_tests(args.builddir)
     blocked = []      # case names that must fail the job
     recovered = []    # (case, cross_platform) that recovered
     for suite_name in sorted(failed_suites):
@@ -251,6 +353,15 @@ def main(argv=None):
         cases = catch2_failed_cases(test, this_os)
         if cases is None:
             blocked.append(f"{suite_name} (not a classifiable Catch2 run — crash/non-Catch2)")
+            continue
+        if not cases:
+            # The suite failed under meson but a solo enumeration re-run
+            # reproduced no failing case — an order/contention-dependent
+            # failure (or a stale junit from a crashed previous run). Nothing
+            # can be attributed to a listed flake, so returning 0 here would
+            # mask a real red. Block, per the header contract.
+            blocked.append(f"{suite_name} (suite failed but enumeration re-run "
+                           f"reproduced no failing case — unclassifiable, no masking)")
             continue
         for case in sorted(cases):
             entry = flaky.get(case)
@@ -331,6 +442,80 @@ def _selftest():
                     '<testcase name="B"><failure>x</failure></testcase></testsuite></testsuites>')
         check(_failed_testcase_names(x) == {"B"}, "junit picks only failed cases")
 
+    # duration extraction + budget rows (#2093).
+    with tempfile.TemporaryDirectory() as d:
+        logs = os.path.join(d, "meson-logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:
+            f.write('<testsuites><testsuite>'
+                    '<testcase name="agent - yuzu:agent unit tests" time="200.5"/>'
+                    '<testcase name="agent - yuzu:agent unit tests" time="0.5"/>'   # dup: summed
+                    '<testcase name="docs - yuzu:changelog order"/>'                # no time: skipped
+                    '<testcase name="tar - yuzu:tar unit tests" time="garbled"/>'   # bad time: skipped
+                    '</testsuite></testsuites>')
+        durations = _entry_durations(d)
+        check(durations == {"agent - yuzu:agent unit tests": 201.0},
+              "durations: sums dups, skips missing/garbled time attrs")
+        check(_entry_durations(os.path.join(d, "nope")) == {}, "durations: missing junit -> {}")
+
+    bt = [{"name": "agent unit tests", "timeout": 240}, {"name": "docs check", "timeout": 0}]
+    rows = budget_rows({"agent - yuzu:agent unit tests": 201.0,
+                        "docs - yuzu:docs check": 5.0,
+                        "mystery - yuzu:unmapped entry": 1.0}, bt)
+    by_name = {r[0]: r for r in rows}
+    check(by_name["agent unit tests"][2] == 240 and abs(by_name["agent unit tests"][3] - 201.0 / 240) < 1e-9,
+          "budget rows: maps junit name, computes frac")
+    check(by_name["docs check"][2] is None and by_name["docs check"][3] is None,
+          "budget rows: timeout 0 (meson no-timeout) -> no budget/frac")
+    check(by_name["mystery - yuzu:unmapped entry"][2] is None,
+          "budget rows: unmappable junit name keeps its name, no budget")
+    # >80% predicate: 0.81 fires, 0.79 doesn't (frac > warn_frac).
+    frac_hi = budget_rows({"a - yuzu:agent unit tests": 0.81 * 240}, bt)[0][3]
+    frac_lo = budget_rows({"a - yuzu:agent unit tests": 0.79 * 240}, bt)[0][3]
+    check(frac_hi > 0.8, "watchdog fires above 80%")
+    check(not (frac_lo > 0.8), "watchdog silent below 80%")
+
+    # report_suite_budgets end-to-end (#2093): the ::warning line and summary
+    # table must actually emit — an inverted threshold or a formatting
+    # exception would otherwise ship silently, since the watchdog is
+    # reporting-only and nothing else exercises it.
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        logs = os.path.join(d, "meson-logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:
+            f.write('<testsuites><testsuite>'
+                    '<testcase name="server - yuzu:server unit tests" time="510.0"/>'
+                    '<testcase name="tar - yuzu:tar unit tests" time="12.0"/>'
+                    '</testsuite></testsuites>')
+        entries = [{"name": "server unit tests", "timeout": 600},
+                   {"name": "tar unit tests", "timeout": 90}]
+        summary_path = os.path.join(d, "summary.md")
+        old_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        os.environ["GITHUB_STEP_SUMMARY"] = summary_path
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                report_suite_budgets(d, entries)
+        finally:
+            if old_summary is None:
+                del os.environ["GITHUB_STEP_SUMMARY"]
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = old_summary
+        stdout = out.getvalue()
+        check("::warning::" in stdout and "server unit tests at 510/600s (85%)" in stdout,
+              "watchdog warning emits for the over-budget suite")
+        check("tar unit tests" not in stdout, "no warning for the under-budget suite")
+        with open(summary_path, encoding="utf-8") as f:
+            table = f.read()
+        check("### Suite durations vs meson budgets" in table
+              and "| test entry | wall (s) | budget (s) | used |" in table,
+              "summary table heading and header row written")
+        check("| server unit tests | 510 | 600 | 85% |" in table
+              and "| tar unit tests | 12 | 90 | 13% |" in table,
+              "summary table rows written on green")
+
     # catch2 exe detection.
     check(CATCH2_EXE.search("yuzu_agent_tests.exe") is not None, "catch2 exe matches (win)")
     check(CATCH2_EXE.search("yuzu_server_tests") is not None, "catch2 exe matches (nix)")
@@ -339,6 +524,67 @@ def _selftest():
     # suite matching.
     tests = [{"name": "agent unit tests", "cmd": ["x"]}, {"name": "tar unit tests", "cmd": ["y"]}]
     check(match_suite("agent - yuzu:agent unit tests", tests)["cmd"] == ["x"], "suite match")
+
+    # sharded server suite (#2092): the two shard names must map uniquely
+    # (neither is a substring of the other; longest-match protects prefixes).
+    shards = [{"name": "server unit tests", "cmd": ["s", "~[pg]"]},
+              {"name": "server pg unit tests", "cmd": ["s", "[pg]"]}]
+    check(match_suite("server - yuzu:server unit tests", shards)["cmd"] == ["s", "~[pg]"],
+          "non-pg shard maps to itself")
+    check(match_suite("server - yuzu:server pg unit tests", shards)["cmd"] == ["s", "[pg]"],
+          "pg shard maps to itself")
+
+    # tag-spec surgery for isolated retries (#2092): strip positional tag
+    # filters, keep argv[0] and option args, never invent args.
+    check(_cmd_without_test_specs(["x", "~[pg]"]) == ["x"], "strips ~[pg]")
+    check(_cmd_without_test_specs(["x", "[pg]"]) == ["x"], "strips [pg]")
+    check(_cmd_without_test_specs(["x", "--foo", "[a][b]"]) == ["x", "--foo"],
+          "strips compound tag spec, keeps options")
+    check(_cmd_without_test_specs(["x"]) == ["x"], "no-spec cmd unchanged")
+    check(_cmd_without_test_specs([]) == [], "empty cmd stays empty")
+    check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
+          "argv[0] untouched even when spec-shaped")
+    check(_cmd_without_test_specs(["x", "~[a][b]"]) == ["x"], "strips tilde compound spec")
+    check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
+    check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
+
+    # Repo-hygiene guard (#2092): every positional arg on the server test()
+    # entries in tests/meson.build must be a Catch2 tag-filter spec — the
+    # invariant the retry surgery relies on. A future case-name or comma-list
+    # spec would OR with the retried case and corrupt recovery verdicts; this
+    # catches it at test time instead of in a masked flake.
+    meson_build = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "..", "tests", "meson.build")
+    with open(meson_build, encoding="utf-8") as f:
+        _src = f.read()
+    # Entry-shaped parse (kwarg order and line breaks don't matter): grab
+    # every test(..., server_test_exe, ...) body, then any args: [...] list
+    # inside it. An args-less entry has no positional specs to strip, so it
+    # is correctly exempt; both shard entries must be found and args-carrying
+    # or the guard fails loudly instead of silently inspecting half the
+    # surface.
+    _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
+    check(len(_entries) >= 2, "meson.build: both server shard entries located")
+    _shard_specs = []
+    for _body in _entries:
+        # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
+        # own inner ']' and validates nothing (found independently by two
+        # governance reviewers) — the ']' inside a quoted string must be
+        # consumed by the string alternative, not end the list.
+        _m = re.search(r"args:\s*\[((?:\s*'[^']*'\s*,?)*)\]", _body, re.S)
+        if not _m:
+            continue  # an args-less entry has no positional specs to strip
+        _args = re.findall(r"'([^']*)'", _m.group(1))
+        check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
+        for _arg in _args:
+            check(CATCH2_TAG_SPEC.match(_arg) is not None,
+                  f"meson.build server test arg {_arg!r} is not a tag-filter spec")
+        _shard_specs.append(tuple(_args))
+    # Positive pin so hollow extraction can never pass again: the two shard
+    # filters must come back verbatim. A third shard or a rebalance updates
+    # this line consciously.
+    check(("~[pg]",) in _shard_specs and ("[pg]",) in _shard_specs,
+          "meson.build: both shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

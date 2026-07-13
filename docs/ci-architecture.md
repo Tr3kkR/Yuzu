@@ -241,15 +241,30 @@ legitimately holds up to ~a dozen template databases. A pile-up is NOT
 automatically "teardown is failing": names embed their creation epoch, and
 every suite start sweeps names older than 6 h (`kTestDbStaleAfterSeconds`),
 so leaks from killed runs self-heal within that window; the sweep prints a
-`sweep saw N ... dropped M` summary in the job log. Hand-cleaning a wedged
-instance: only ever touch `yuzu_test_*`/`yuzu_test_tpl_*` names; prefer
-"name-epoch older than 6 h" over "no current connections" (a live fixture
-is momentarily connection-free between drop and re-create); pre-epoch-format
-names (`yuzu_test_<salt>_<n>`, first number < 1e9) predate the sweeper and
-need manual judgment. The server suite's meson timeout was recalibrated
-600 s → 900 s in the same PR (gate-parameter change; see the comment at the
-`test('server unit tests', ...)` entry in `tests/meson.build` — if a quiet
-Windows debug leg crosses ~700 s, split the suite instead of raising it).
+`sweep saw N ... dropped M` summary in the job log. A weekly out-of-band
+janitor complements it (#1367): `cache-prune.yml` (Sundays 04:00 UTC +
+`workflow_dispatch`) runs `scripts/ci/sweep-test-databases.sh` on both
+self-hosted boxes, so leaks reclaim even on a box that stops running `[pg]`
+legs. The janitor self-discovers the per-agent topology from #2094/#2114 —
+every running `yuzu-ci-postgres(-<n>)` container on the docker boxes, and in
+DSN mode the machine DSN's base port plus the next three per-agent ports
+(dark higher ports are the normal pre-cutover state and skip silently); a
+degraded sweep (psql missing, cluster dark, a pass query failing) exits
+nonzero so the weekly run goes red rather than rotting silently.
+Epoch-named databases age by the same >6 h/server-clock rule; names
+the epoch sweeper can never parse (pre-epoch format `yuzu_test_<salt>_<n>`,
+implausible clock stamps) are dropped only when the datdir's `PG_VERSION`
+mtime exceeds 7 days AND the database has zero active backends
+(superuser-only via `pg_stat_file`; dropped without FORCE so a racing
+connection vetoes). Hand-cleaning a wedged instance: only ever touch
+`yuzu_test_*`/`yuzu_test_tpl_*` names; prefer "name-epoch older than 6 h"
+over "no current connections" (a live fixture is momentarily
+connection-free between drop and re-create); pre-epoch-format names are
+reclaimed by the weekly cron after 7 days — hand-clean only if one must go
+sooner. The server suite's meson timeout was recalibrated 600 s → 900 s in
+the same PR, then split into `[pg]`/`~[pg]` shards at 600 s each (#2092;
+see the comment above the two `test('server ...', ...)` entries in
+`tests/meson.build`).
 
 ## Universal vcpkg cache-key contract
 
@@ -299,8 +314,12 @@ is shared. Closes #406.
 
 `scripts/ci/flake-retry.py` wraps the `meson test` step on `ci.yml`'s three
 test legs (PR fast-path + push matrix; **not** nightly/sanitizer, which stay
-fail-loud so a real ASan/TSan race is never masked). On a clean run it does
-nothing. On failure it isolates the failed **Catch2 case(s)** — it re-runs the
+fail-loud so a real ASan/TSan race is never masked). Every run — green
+included — first gets the #2093 duration watchdog: a per-suite
+duration/budget table in the step summary, plus a `::warning` for any suite
+past 80% of its meson timeout (reporting only; pass/fail semantics never
+change). On a clean run it does nothing further. On failure it isolates the
+failed **Catch2 case(s)** — it re-runs the
 failed suite binary (located via `meson introspect --tests`) with Catch2's own
 junit reporter, since meson's junit is only suite-level — then:
 
@@ -333,7 +352,7 @@ header).
 the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
 `actions/cache` for vcpkg — catches workflow regressions before main.
 
-## Cache pruning
+## Cache pruning + weekly maintenance
 
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
@@ -341,6 +360,9 @@ old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
 (`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
 built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
+on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
+databases (thresholds and semantics: "Test-database lifecycle" above).
 
 ## Chiselled demo images + agent bundle (release-time)
 
