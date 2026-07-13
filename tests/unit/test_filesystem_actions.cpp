@@ -9,6 +9,8 @@
  * test file's anonymous namespace since we cannot link the plugin directly.
  */
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -26,12 +28,31 @@ namespace {
 
 // ── TempFile / TempDir helpers ──────────────────────────────────────────
 
+// Every fixture below lives under ONE process-salted base dir. The fixed
+// literal names the ~27 call sites pass stay readable, but two concurrent CI
+// jobs on the same shared-identity box (one shared %TEMP%) can no longer see
+// each other's files — under the old fixed paths, one job's fixture dtor
+// deleted the other job's live file mid-test (#1883). The base is created
+// once and recursively removed at process exit by yuzu::test::TempDir.
+const fs::path& fsaction_base() {
+    static yuzu::test::TempDir base{"yuzu_test_fsaction-"};
+    static const bool created = [] {
+        std::error_code ec;
+        fs::create_directories(base.path, ec);
+        return fs::exists(base.path);
+    }();
+    // A silently-failed creation would fail every fixture below with
+    // confusing downstream errors — fail loudly at the source (gov safe-2).
+    REQUIRE(created);
+    return base.path;
+}
+
 struct TempFile {
     fs::path path;
 
     explicit TempFile(const std::string& content = "",
                       const std::string& name = "yuzu_test_fsaction.txt") {
-        path = fs::temp_directory_path() / name;
+        path = fsaction_base() / name;
         std::ofstream f(path, std::ios::binary);
         f << content;
     }
@@ -46,7 +67,7 @@ struct TempDir {
     fs::path path;
 
     explicit TempDir(const std::string& name = "yuzu_test_fsaction_dir") {
-        path = fs::temp_directory_path() / name;
+        path = fsaction_base() / name;
         std::error_code ec;
         fs::create_directories(path, ec);
     }
