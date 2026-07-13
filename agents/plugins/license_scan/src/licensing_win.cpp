@@ -89,7 +89,16 @@ struct HKeyCloser {
 // installed_apps_plugin.cpp:676-683, roadmap C-1).
 struct HiveUnloadGuard {
     const std::wstring& mount;
-    ~HiveUnloadGuard() { RegUnLoadKeyW(HKEY_USERS, mount.c_str()); }
+    bool* unload_failed{nullptr}; ///< set (never cleared) when RegUnLoadKeyW fails
+    ~HiveUnloadGuard() {
+        // A failed unload leaves the offline NTUSER.DAT mounted under HKEY_USERS
+        // and the profile file locked, with nothing to explain it. A destructor
+        // cannot throw and must not allocate, so the failure rides a plain flag
+        // that the caller folds into the per_user_hives probe diagnostic
+        // (`hive_unload_failed`) — the plugin's official reporting channel.
+        if (RegUnLoadKeyW(HKEY_USERS, mount.c_str()) != ERROR_SUCCESS && unload_failed)
+            *unload_failed = true;
+    }
 };
 
 // ── environment expansion ──────────────────────────────────────────────────
@@ -419,6 +428,13 @@ bool enable_privilege(const wchar_t* name) {
     HANDLE token{};
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
         return false;
+    // RAII, not a manual CloseHandle at the tail — the HKeyCloser/HiveUnloadGuard
+    // in-file convention: the handle closes on EVERY exit path, including any
+    // future early return added between acquire and release.
+    struct TokenCloser {
+        HANDLE h;
+        ~TokenCloser() { CloseHandle(h); }
+    } token_guard{token};
     bool ok = false;
     LUID luid{};
     if (LookupPrivilegeValueW(nullptr, name, &luid)) {
@@ -434,7 +450,6 @@ bool enable_privilege(const wchar_t* name) {
             ok = true;
         }
     }
-    CloseHandle(token);
     return ok;
 }
 
@@ -491,6 +506,7 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
     WinRegProbeHost fs_host; // filesystem defaults only (per-user file probes)
     std::size_t hive_rows = 0;
     std::size_t file_rows = 0;
+    bool hive_unload_failed = false; // any profile's RegUnLoadKeyW failed (guard flag)
 
     for (const auto& profile : profiles) {
         // ── registry hive: loaded HKU\<SID> FIRST (C-1 probe order) ─────────
@@ -507,7 +523,7 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
             const std::wstring ntuser = profile.profile_path_w + L"\\NTUSER.DAT";
             const std::wstring mount_w = to_wide("YUZU_LIC_" + profile.sid);
             if (RegLoadKeyW(HKEY_USERS, mount_w.c_str(), ntuser.c_str()) == ERROR_SUCCESS) {
-                HiveUnloadGuard unload_guard{mount_w};
+                HiveUnloadGuard unload_guard{mount_w, &hive_unload_failed};
                 {
                     HKEY mounted{};
                     if (RegOpenKeyExW(HKEY_USERS, mount_w.c_str(), 0, KEY_READ, &mounted) ==
@@ -540,7 +556,18 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
     }
 
     if (priv_ok) {
-        outcomes.push_back({"per_user_hives", true, hive_rows, {}});
+        if (hive_unload_failed) {
+            // A RegUnLoadKeyW failure (exotic — the inner scope closes every HKEY
+            // into the hive before the guard runs) leaves that profile's
+            // NTUSER.DAT mounted + locked until reboot. The rows probed are still
+            // valid (rides `list` regardless), but the condition must be visible:
+            // ok=false + rows, the privilege_missing precedent. Never a silent
+            // leak of a system-wide mount. Non-cycle-blocking — per-user hives
+            // are never a primary surface (sync source, ADR-0024 D3/R15).
+            outcomes.push_back({"per_user_hives", false, hive_rows, "hive_unload_failed"});
+        } else {
+            outcomes.push_back({"per_user_hives", true, hive_rows, {}});
+        }
     } else {
         // R15: hardened installs that strip SeBackup/SeRestore surface as
         // privilege_missing through the live `surfaces` diagnostics. Loaded

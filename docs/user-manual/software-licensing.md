@@ -205,8 +205,11 @@ The per-user offline-hive probe reads other profiles' `NTUSER.DAT` and rides
 **already granted** by `scripts/install-agent-user.ps1` — **no new privilege** is
 introduced by this feature. On a hardened install that strips those privileges,
 machine-scope surfaces (SLP, C2R, ProbeSpec) still report normally; only the per-user
-surface reports `privilege_missing` through the live diagnostics. Per-user hives are
-**never a primary surface**, so a missing privilege neither skips nor wipes the sync
+surface reports `privilege_missing` through the live diagnostics. (The same diagnostic
+channel reports `hive_unload_failed` in the exotic case where a probed offline hive
+cannot be unmounted afterwards — the probe's rows are still valid, but that profile's
+`NTUSER.DAT` stays locked until reboot.) Per-user hives are
+**never a primary surface**, so neither condition skips nor wipes the sync
 cycle — the machine-scope detections proceed. See
 [`docs/agent-privilege-model.md`](../agent-privilege-model.md) (the `license_scan` row).
 
