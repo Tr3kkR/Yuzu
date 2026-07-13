@@ -13,6 +13,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::OfflineEndpoint;
@@ -22,6 +23,16 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate offline_tpl{"offline", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("offline template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -39,7 +50,7 @@ const OfflineEndpoint* find(const std::vector<OfflineEndpoint>& v, const std::st
 } // namespace
 
 TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
 

@@ -75,6 +75,20 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    POSTGRES_DB=yuzu -p 5433:5432 postgres:18` then
    `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
 
+   **Store-behaviour tests must use the pre-migrated template variant** — declare a
+   `PgTestTemplate` per file whose setup constructs the store(s) under test (files needing the
+   exact same store set may share a template key — the registry builds each key once, and every
+   additional setup attaching to the key is replay-verified against a fresh scratch database —
+   a structurally divergent setup, additive OR subset, fails its tests loudly instead of
+   inheriting the wrong template), and open each test with `YUZU_REQUIRE_PG_DB_TPL(var, tpl)`: the ephemeral database is then cloned
+   (`CREATE DATABASE … TEMPLATE`) with every migration already applied, instead of re-running
+   the store's migration DDL per test — per-test migrations were the dominant, worst-scaling
+   cost of the `[pg]` set on the contended Windows runners (2026-07-12 server-suite timeout).
+   Keep plain `YUZU_REQUIRE_PG_DB` only for tests that exercise migration, fresh/empty-
+   database, or pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no
+   migrations, so a template buys them nothing). Full contract: the `PgTestTemplate` doc
+   comment in `tests/unit/test_helpers.hpp`.
+
 8. **`meson.build`** — add the new `.cpp` to the server target (and the test). `libpq_dep` is
    already gated on `build_server`.
 

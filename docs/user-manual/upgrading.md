@@ -591,6 +591,48 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
+
+This release adds the **SLE** (Software Licensing & Entitlements) **discovery** surface,
+gated on a new **`SoftwareLicensing`** RBAC securable. Per **ADR-1005** the server ships
+the discovery mechanism only: the per-device **`GET /api/v1/sle/agents/{id}`** drill, its
+machine-scope MCP twin `query_software_licenses`, and the audited erasure
+**`DELETE /api/v1/sle/agents/{id}`**. The licence **compliance / entitlement / reclamation**
+views and the fleet **posture** reads (a `/sle` page and `/api/v1/sle/summary` ·
+`/licenses` · the per-product device fan-out) **interpret** discovered facts and ship with
+the future **SAM use-case-engine module** — they are *not* in this release, so a reader
+who saw the earlier ADR expecting an in-server compliance page should not look for one yet.
+Because RBAC role defaults are seeded with `INSERT OR IGNORE` on **every** boot, an
+upgrading deployment **silently auto-grants** the new securable to the built-in roles the
+first time it starts the new build:
+
+| Role | Grant |
+|---|---|
+| Viewer, PlatformEngineer | Read |
+| Operator | Read + Write |
+| ITServiceOwner, Administrator | full CRUD |
+| ApiTokenManager | none |
+
+**No action is required** if that matches your intent — the securable gates the SLE
+discovery reads/erasure (`GET`/`DELETE /api/v1/sle/agents/{id}` and the MCP twin); the
+`/inventory` software catalog is unchanged and remains under `Inventory:Read`.
+
+**But** the per-device drill exposes each endpoint's **detected-licence facts** —
+product, vendor, channel, status, expiry, and, on per-user surfaces, the per-user
+**`user_ref`** identifier — **to every Read holder, including `Viewer`**. **A deployment
+that must restrict this visibility should deny or remove the `SoftwareLicensing` Read
+grant from `Viewer` (and any other broad role) BEFORE enabling the SLE sources.** A
+**deny rule wins** over the seeded allow (deny-override), so an explicit deny is the
+durable control — re-seeding on the next boot cannot re-open it. (Entitlement/purchase
+**cost** metadata is *not* served in-server this release — it is the SAM UCE module's,
+governed by that module's own RBAC when it ships.)
+
+The SLE detection source also collects a new, suppressible **per-user identifier**
+(`user_ref`) on per-user licence surfaces. It defaults to a per-device keyed-HMAC
+pseudonym; see [Software licence detection](software-licensing.md) for the
+`--license-scan-user-ref` flag, the honest limits of that default, and the
+`--inventory-disable` source-level opt-out.
+
 ### Gateway distribution cookie now required (#659) — **BREAKING**
 
 The Erlang gateway shipped a hardcoded default distribution cookie

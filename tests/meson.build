@@ -166,11 +166,14 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
+    'unit/test_licensing_parsers.cpp',
+    'unit/test_licensing_sync.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
+    include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
@@ -358,6 +361,7 @@ if build_server
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
@@ -427,12 +431,18 @@ if build_server
       'unit/server/test_pg_pool.cpp',
       'unit/server/test_pg_migration_runner.cpp',
       'unit/server/test_pg_hardening.cpp',
+      'unit/server/test_pg_template_cleanup.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
+      'unit/server/test_product_normalize.cpp',
+      'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_licensing_store.cpp',
+      'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_device_inventory_store.cpp',
+      'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_app_perf_rollup.cpp',
@@ -473,12 +483,18 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  # 600s: the server suite has grown to ~1200 test cases (#1032 added viz-engine
-  # coverage) and ASan instrumentation slows the full run past the previous
-  # 180s cap. TSan with halt_on_error usually exits earlier, but a sanitizer-
-  # instrumented full pass easily hits 4-5 min. A real hang is still bounded
-  # by the 60-min job-level timeout in nightly.yml.
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 600)
+  # 900s: recalibrated 2026-07-12 (Wee Tam server-suite timeouts) — the suite
+  # has grown to ~3500 cases (incl. the [pg] Postgres-substrate tests; per-OS
+  # counts differ slightly) and reached 512s on an otherwise-idle Windows MSVC
+  # debug leg, blowing the previous 600s cap whenever the box ran concurrent
+  # jobs (4 runner agents + one shared native Postgres on one host roughly
+  # double the wall time under contention). Sanitizer-instrumented nightly
+  # passes run slower still. A real hang is still bounded by the job-level
+  # timeouts (90-120 min in ci.yml, 60 min in nightly.yml for every job that
+  # runs this suite). If a quiet Windows debug leg crosses ~700s again, split
+  # the suite (e.g. '[pg]' / '~[pg]' shards, each with its own budget)
+  # instead of raising this number.
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 900)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

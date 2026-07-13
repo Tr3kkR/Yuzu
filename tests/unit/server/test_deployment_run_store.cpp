@@ -14,6 +14,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::DeploymentDeviceRow;
@@ -26,6 +27,17 @@ using yuzu::server::pg::PgResult;
 using yuzu::server::preflight::PreflightTarget;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_deployment_engine.cpp (identical setup — first build wins). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate deprun_tpl{"deprun", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    DeploymentRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("deprun template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -61,7 +73,7 @@ std::string step_of(DeploymentRunStore& s, const std::string& id, const std::str
 
 TEST_CASE("DeploymentRunStore execute-once CAS + guarded transitions",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -157,7 +169,7 @@ TEST_CASE("DeploymentRunStore execute-once CAS + guarded transitions",
 }
 
 TEST_CASE("DeploymentRunStore owner-scope + cascade", "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -186,7 +198,7 @@ TEST_CASE("DeploymentRunStore owner-scope + cascade", "[pg][deployment][store]")
 
 TEST_CASE("DeploymentRunStore allows one running deployment per source run",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -221,7 +233,7 @@ TEST_CASE("DeploymentRunStore allows one running deployment per source run",
 
 TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};

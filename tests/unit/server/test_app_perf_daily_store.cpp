@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,14 @@ using yuzu::server::canon_merge_daily;
 using yuzu::server::pg::PgPool;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_app_perf_ingestion.cpp (identical setup — first build wins).
+yuzu::test::PgTestTemplate apperf_daily_tpl{"apperf_daily", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AppPerfDailyStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("apperf_daily template: store failed to migrate");
+}};
 std::int64_t today_utc() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -97,7 +106,7 @@ TEST_CASE("canon_merge_daily re-clamps the MERGED sample sum (sec-M1 LOW)", "[ap
 }
 
 TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_daily_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore store{pool};
@@ -201,7 +210,7 @@ TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
             {.app_name = "a", .version = "1.0.0.0", .day = day, .samples = 1, .instances_max = 1,
              .cpu_avg = 1.0, .cpu_max = 1.0, .ws_avg_bytes = 1, .ws_max_bytes = 1}};
         CHECK(store.apply_daily("agent-e", rows));
-        store.delete_agent("agent-e");
+        CHECK(store.delete_agent("agent-e")); // committed → true
         auto got = store.get_agent_app_perf("agent-e");
         REQUIRE(got.has_value());
         CHECK(got->empty());

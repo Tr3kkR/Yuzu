@@ -18,13 +18,29 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <stdexcept>
 
 using yuzu::server::SoftwareCatalogRollup;
 using yuzu::server::SoftwareInventoryStore;
 using yuzu::server::pg::PgPool;
 
+namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): same key +
+// identical setup as test_software_inventory_store.cpp (first build wins) —
+// the store set here is exactly {SoftwareInventoryStore}.
+yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    SoftwareInventoryStore store{pool};
+    // Throw, don't return: a silently-unmigrated template would make every
+    // clone fall back to in-test migration — correct but slow, defeating the
+    // point. PgTestTemplate::build records the throw as a fixture error.
+    if (!store.is_open())
+        throw std::runtime_error("swinv template: store failed to migrate");
+}};
+} // namespace
+
 TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][rollup]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
