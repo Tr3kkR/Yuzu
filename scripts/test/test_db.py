@@ -1202,13 +1202,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         # under concurrent writers (nightly + PR run sharing YUZU_TEST_DB on
         # one runner box) a busy_timeout-exhausted 'database is locked' used
         # to escape as a raw traceback. Exit 1 = operational failure; exit 2
-        # stays reserved for validation errors.
-        print(
-            f"test_db: SQLite busy/locked on {db_path()}: {e} — "
-            "concurrent writer (overlapping runs sharing YUZU_TEST_DB?); "
-            "busy_timeout exhausted",
-            file=sys.stderr,
+        # stays reserved for validation errors. Only diagnose contention when
+        # the error actually is lock-shaped — 'unable to open database file'
+        # etc. must not be blamed on a concurrent writer.
+        msg = str(e)
+        hint = (
+            " — concurrent writer (overlapping runs sharing YUZU_TEST_DB?); "
+            "busy_timeout exhausted"
+            if "locked" in msg.lower() or "busy" in msg.lower()
+            else ""
         )
+        print(f"test_db: SQLite operational error on {db_path()}: {msg}{hint}",
+              file=sys.stderr)
         return 1
 
 
