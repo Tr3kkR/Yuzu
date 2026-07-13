@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -150,6 +151,23 @@ TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
         // produces, and indistinguishable by the enabled flag alone.
         const auto bogus = yuzu::test::unique_temp_path("rbac-loadfail-") / "rbac.db";
         RbacStore broken(bogus);
+        REQUIRE_FALSE(broken.is_open());
+        CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
+    }
+
+    SECTION("corrupt file (migration fails) → fail closed, not full-fleet") {
+        // The constructor's OTHER failure path (#2104): sqlite3_open_v2
+        // succeeds on the garbage file, then the schema migration hits
+        // SQLITE_NOTADB and create_tables closes db_ — the literal #1717
+        // corrupt-but-openable rbac.db. The garbage must be NON-empty:
+        // SQLite treats a zero-byte file as a valid fresh database.
+        yuzu::test::TempDbFile db{"yuzu_test_rbac_corrupt-"};
+        {
+            std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
+            REQUIRE(f.is_open());
+            f << "not a valid sqlite database";
+        }
+        RbacStore broken(db.path);
         REQUIRE_FALSE(broken.is_open());
         CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
     }
