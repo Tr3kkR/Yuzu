@@ -4451,13 +4451,17 @@ TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persist
     REQUIRE(res);
     CHECK(res->status == 200); // set-and-proceed, NOT a refusal
 
-    // On the wire in BOTH channels (content[].text and structuredContent).
-    CHECK(res->body.find("\"audit_persisted\":false") != std::string::npos);
-
     auto envelope = nlohmann::json::parse(res->body);
+    // BOTH channels carry the flag. The raw-body substring only ever matches
+    // structuredContent (content[].text is a JSON *string*, so its quotes are
+    // backslash-escaped) — so assert the text channel structurally, not by substring.
     const auto& payload = envelope.at("result").at("structuredContent");
     REQUIRE(payload.contains("audit_persisted"));
     CHECK(payload.at("audit_persisted") == false);
+    auto text_payload = nlohmann::json::parse(
+        envelope.at("result").at("content")[0].at("text").get<std::string>());
+    REQUIRE(text_payload.contains("audit_persisted"));
+    CHECK(text_payload.at("audit_persisted") == false);
     // Data is STILL SERVED alongside the flag — that is the set-and-proceed half.
     CHECK(payload.at("count").get<std::int64_t>() == 1);
     // And the Decision-11 PII omission still holds on the flagged path.

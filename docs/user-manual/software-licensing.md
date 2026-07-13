@@ -127,6 +127,20 @@ per-user `user_ref` personal data is served solely by the audited REST drill. On
 degradation the drill returns a **`503` degrade**, never a successful empty result — so a
 licence query can never read a transient outage as "nothing licensed".
 
+**Evidence-gap signal (`audit_persisted`).** Every read of this data is recorded as an
+access-audit row (SOC 2 CC7.2). If that row cannot be persisted, the two surfaces differ,
+because only one of them has a header channel:
+
+- **REST drill** — refuses. It returns `503` with `Sec-Audit-Failed: true` and serves **no
+  licence data**: the `user_ref` personal data it renders is never disclosed without
+  durable evidence of who read it.
+- **MCP twin** — serves the data (machine-scope facts, no personal data) but flags the
+  gap: the response payload carries **`audit_persisted: false`** (found at
+  `result.structuredContent.audit_persisted`, and in the `result.content[0].text` payload).
+  The key is **absent** when the audit row persisted normally — so treat *presence of the
+  key* as the alarm, not its value. Alert on it: it means a licence read happened with no
+  durable trail.
+
 **Compliance, entitlements, usage/reclamation, and the fleet posture reads** (`/sle/summary`,
 `/sle/licenses`, the per-product device fan-out, and the compliance MCP tool) **interpret**
 discovered facts against purchased rights and are the **SAM use-case-engine module's**
