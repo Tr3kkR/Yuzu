@@ -750,10 +750,6 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
-        // Initialize bounded thread pool for command dispatch
-        thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
-
-        // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
@@ -786,6 +782,47 @@ public:
             thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
+
+        // NOTE: constructed AFTER the ScopeExit above is armed. The failure path below
+        // returns early, and before this reorder that return escaped WITHOUT the guard —
+        // so plugins already dlopen'd and init()'d were dlclose'd without ever having
+        // their shutdown() called (~PluginHandle only DLCLOSEs; the ScopeExit is the sole
+        // caller of shutdown()). Unflushed plugin state, unreleased OS handles, and any
+        // plugin-init thread left executing unmapped code. (governance Gate-8 UP8-3.)
+        // Initialize bounded thread pool for command dispatch.
+        //
+        // ThreadPool's ctor now joins whatever it managed to spawn and RETHROWS on
+        // std::thread's EAGAIN (thread/pid exhaustion — a pids-capped container,
+        // RLIMIT_NPROC). That fixed the terminate-in-~vector, but the rethrow has nowhere
+        // to go: main.cpp's `agent->run()` is a BARE call with no enclosing handler, and
+        // this construction sits before run()'s own inner try. So the exception escaped
+        // main() and std::terminate'd anyway — trading one terminate for another
+        // (governance Gate-4 UP-5).
+        //
+        // Catch it here and report a CLEAN STARTUP FAILURE instead: a non-zero exit that
+        // systemd Restart= / Docker / the Windows SCM can react to (#1303), and — the
+        // point of rung 1 — an agent that lives long enough to SAY spark degraded, rather
+        // than a crash-loop that destroys the very signal the degrade path produces.
+        try {
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+        } catch (const std::exception& e) {
+            spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
+                             "is out of threads. Exiting with a startup failure rather than "
+                             "aborting.",
+                             e.what());
+            startup_failed_ = true;
+            return;
+        } catch (...) {
+            // Belt-and-braces, and NOT theoretical: ThreadPool's ctor now logs INSIDE its own
+            // try, and spdlog RETHROWS non-std exceptions. A catch(std::exception&) alone
+            // would let such a throw escape the bare `agent->run()` in main.cpp and
+            // std::terminate — re-opening the very hole this catch exists to close
+            // (governance Gate-8 cpp-safety).
+            spdlog::critical("could not create the command dispatch thread pool (non-std "
+                             "exception) — exiting with a startup failure rather than aborting.");
+            startup_failed_ = true;
+            return;
+        }
 
         // Wire trigger dispatch + start the engine. Plugins registered their
         // triggers during init() (above); the engine has been holding them
