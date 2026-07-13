@@ -204,7 +204,9 @@ TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
     // (#1883). Both engines must keep sharing the ONE path — the write→reload
     // round-trip through the same file is the behaviour under test. The RAII
     // guard replaces both manual fs::remove calls (unique_temp_path guarantees
-    // the path does not pre-exist).
+    // the path does not pre-exist). TempDbFile on a plain .cfg is deliberate:
+    // there is no generic TempFile guard, and its -wal/-shm removes are
+    // harmless no-ops here.
     yuzu::test::TempDbFile cfg{"yuzu_test_auto_approve-"};
     const auto& tmp = cfg.path;
 

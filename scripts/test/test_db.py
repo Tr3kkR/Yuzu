@@ -1206,10 +1206,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the error actually is lock-shaped — 'unable to open database file'
         # etc. must not be blamed on a concurrent writer.
         msg = str(e)
+        # Primary result code (low byte of the extended code) when the driver
+        # exposes it (Python 3.11+): SQLITE_BUSY=5, SQLITE_LOCKED=6,
+        # SQLITE_PROTOCOL=15. Message-substring fallback for older Pythons.
+        code = getattr(e, "sqlite_errorcode", None)
+        lock_shaped = (code is not None and (code & 0xFF) in (5, 6, 15)) or (
+            "locked" in msg.lower() or "busy" in msg.lower()
+        )
         hint = (
             " — concurrent writer (overlapping runs sharing YUZU_TEST_DB?); "
             "busy_timeout exhausted"
-            if "locked" in msg.lower() or "busy" in msg.lower()
+            if lock_shaped
             else ""
         )
         print(f"test_db: SQLite operational error on {db_path()}: {msg}{hint}",

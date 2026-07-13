@@ -46,9 +46,10 @@ namespace {
 
 // Delegates to the shared salt + atomic counter helper (#482). The prior
 // thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to.
+// #473 traced back to. yuzu_test_ prepended so files land inside the Wee Tam
+// Defender exclusion wildcard yuzu_* (K1/CX1 on the #1883 sweep).
 static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
+    return yuzu::test::unique_temp_path("yuzu_test_" + prefix + "-");
 }
 
 struct AuditRecord {
@@ -69,7 +70,7 @@ struct RestTokensHarness {
     // ctor: the broken_token_db arm adopts a path under a missing parent dir
     // via the adopt-a-path ctor (removal is then a harmless no-op).
     yuzu::test::TempDbFile db_file;
-    yuzu::test::TempDbFile device_db_file{"rest-api-device-tokens-"};
+    yuzu::test::TempDbFile device_db_file{"yuzu_test_rest_api_device_tokens-"};
     std::unique_ptr<ApiTokenStore> token_store;
     std::unique_ptr<DeviceTokenStore> device_token_store;
 
@@ -415,8 +416,8 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
     // scope exit (even via a failing REQUIRE unwinding), then the guards
     // remove the files — the old trailing fs::remove pair leaked both DBs on
     // any assertion failure (#486).
-    yuzu::test::TempDbFile audit_db{"rest-api-audit-"};
-    yuzu::test::TempDbFile token_db{"rest-api-csprng-store-"};
+    yuzu::test::TempDbFile audit_db{"yuzu_test_rest_api_audit-"};
+    yuzu::test::TempDbFile token_db{"yuzu_test_rest_api_csprng_store-"};
 
     {
         AuditStore audit_store(audit_db.path, /*retention_days=*/365,

@@ -60,19 +60,19 @@ struct RestGsHarness {
     // file (+ -wal/-shm) is removed. RAII replaces the old manual dtor and
     // also covers a ctor REQUIRE throwing mid-construction, which previously
     // leaked all three DBs (#486 / qe-B1).
-    yuzu::test::TempDbFile db_file{"rest-gs-"};
+    yuzu::test::TempDbFile db_file{"yuzu_test_rest_gs-"};
     std::unique_ptr<GuaranteedStateStore> store;
 
     // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
     // endpoint polls; the dispatch stub returns a deterministic command_id so a test
     // can pre-insert the matching response row. live_sent toggles the offline path.
-    yuzu::test::TempDbFile resp_db_file{"rest-gs-resp-"};
+    yuzu::test::TempDbFile resp_db_file{"yuzu_test_rest_gs_resp-"};
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
     std::string last_live_plugin, last_live_action;
 
     // BaselineStore for the baseline-anchored per-device status route.
-    yuzu::test::TempDbFile bl_db_file{"rest-gs-bl-"};
+    yuzu::test::TempDbFile bl_db_file{"yuzu_test_rest_gs_bl-"};
     std::unique_ptr<BaselineStore> baseline_store;
 
     std::string session_user{"alice"};

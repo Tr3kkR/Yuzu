@@ -47,7 +47,11 @@ struct TestDb {
 // #473 traced back to.
 
 static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
+    // yuzu_test_ prepended so every temp file this suite mints lands inside
+    // the Wee Tam Defender exclusion wildcard yuzu_* (adversarial-review
+    // K1/CX1 on the #1883 sweep — the path wildcard is the fallback layer
+    // behind the yuzu_server_tests.exe process exclusion).
+    return yuzu::test::unique_temp_path("yuzu_test_" + prefix + "-");
 }
 
 // RAII guard to remove temp files on scope exit. Thin wrapper over the
