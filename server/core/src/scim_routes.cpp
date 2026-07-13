@@ -452,7 +452,13 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 ///      `AuthManager::update_role` (which also invalidates the user's
 ///      sessions) and audit `scim.user.role_changed` (set-and-proceed, same
 ///      posture as every other audit on this surface — see `audit()`'s doc
-///      comment).
+///      comment). `trigger_detail` is a caller-supplied, human-readable
+///      description of WHAT triggered this recompute (e.g. the triggering
+///      group's displayName + op, or "user_provision" for the user
+///      create/revive call site) and is folded into the audit detail as
+///      `via_group="<...>"` (CC6.7 evidence: which group/op caused this role
+///      change, since a user can match via multiple admin groups). Purely
+///      cosmetic — never affects the resolved role logic.
 ///
 /// CONCURRENCY (TOCTOU role drift, Hermes security gate): steps 1-5 above are
 /// a non-atomic read-resolve-write — each of `ScimStore`'s `db_mtx_` and
@@ -483,7 +489,8 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
                               AuditStore* audit_store, const httplib::Request& req,
                               const std::string& user_scim_id,
-                              const std::string& scim_admin_group) {
+                              const std::string& scim_admin_group,
+                              const std::string& trigger_detail) {
     if (!scim_store || !auth_mgr)
         return;
 
@@ -506,6 +513,14 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
         spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (a Group referenced a non-SCIM account)",
                     resource->username, user_scim_id);
+        // Metric-only signal (Minor #2, reviewer-adjudicated): this IS a
+        // provenance-based skip, so it reuses the same counter every other
+        // provenance refusal on this surface bumps. Deliberately NOT an
+        // audit row here — recompute runs per-member, and a bulk Group
+        // mutation with many non-SCIM members would flood the audit log;
+        // the counter is the right-weight signal for a load-bearing guard
+        // that still needs to be observable.
+        bump_provenance_denied(auth_mgr);
         return;
     }
 
@@ -529,12 +544,19 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
 
     std::string old_role_str = auth::role_to_string(*current);
     std::string new_role_str = auth::role_to_string(resolved);
+    // CC6.7: fold the caller-supplied trigger context (which group/op — or
+    // user-provision — caused this recompute) into the audit detail. A user
+    // can match via multiple admin groups; this records the one whose
+    // mutation actually triggered THIS recompute call.
+    std::string via_detail =
+        trigger_detail.empty() ? "" : " via_group=\"" + trigger_detail + "\"";
     if (!auth_mgr->update_role(resource->username, resolved)) {
         spdlog::error("SCIM: recompute_scim_user_role — update_role failed for '{}' "
                      "(scim_id={}, intended {} -> {}); role change did NOT apply",
                      resource->username, user_scim_id, old_role_str, new_role_str);
         audit(auth_mgr, audit_store, req, "scim.user.role_changed", "failure", user_scim_id,
-             "reason=group old_role=" + old_role_str + " intended_new_role=" + new_role_str);
+             "reason=group old_role=" + old_role_str + " intended_new_role=" + new_role_str +
+                 via_detail);
         bump_role_change_failure(auth_mgr);
         return;
     }
@@ -544,7 +566,7 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
     // Set-and-proceed (UP-N2) — see `audit()`'s doc comment; the role change
     // above already committed.
     audit(auth_mgr, audit_store, req, "scim.user.role_changed", "success", user_scim_id,
-         "reason=group old_role=" + old_role_str + " new_role=" + new_role_str);
+         "reason=group old_role=" + old_role_str + " new_role=" + new_role_str + via_detail);
     bump_role_changed(auth_mgr);
 }
 
@@ -982,7 +1004,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // account's role reflects group membership immediately, not only
         // after the next Group mutation.
         recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, resource->scim_id,
-                                 scim_admin_group);
+                                 scim_admin_group, "user_provision");
 
         // Honour an explicit active:false on create (some IdPs stage a user
         // deactivated) by immediately deactivating the account we just
@@ -1611,7 +1633,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // #2021 trigger (a): recompute role for every member on create.
         for (const auto& uid : members)
             recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                     scim_admin_group);
+                                     scim_admin_group,
+                                     input.display_name + " op=group_create");
 
         auto gbase = groups_location_base(req);
         auto ubase = location_base(req);
@@ -1812,7 +1835,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                         affected.push_back(m);
                 for (const auto& uid : affected)
                     recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                             scim_admin_group);
+                                             scim_admin_group,
+                                             input.display_name + " op=group_replace");
 
                 auto updated = scim_store->get_group_by_id(id);
                 if (!updated) {
@@ -1871,6 +1895,17 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   }
                   const auto& patch = *parsed;
 
+                  // [HIGH fix] Captured BEFORE update_group so the
+                  // rename-recompute logic below can tell whether THIS PATCH
+                  // actually changed displayName — a rename can move the
+                  // group across the --scim-admin-group boundary, which
+                  // affects every CURRENT member, not just ones the same
+                  // PATCH explicitly adds/removes (mirrors the PUT handler's
+                  // metadata-only-replace recompute above).
+                  const std::string pre_update_display_name = group->display_name;
+                  bool display_name_changed = false;
+                  std::string new_display_name = pre_update_display_name;
+
                   if (patch.display_name.has_value() || patch.external_id.has_value()) {
                       std::string new_display = patch.display_name.value_or(group->display_name);
                       std::string new_external = patch.external_id.value_or(group->external_id);
@@ -1896,6 +1931,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           record_request(auth_mgr, "group_patch", 500);
                           return;
                       }
+                      display_name_changed = (new_display != pre_update_display_name);
+                      new_display_name = new_display;
                   }
 
                   // #2021 trigger (b): every member ADDED and every member
@@ -1996,12 +2033,44 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       }
                   }
 
+                  // [HIGH fix] A displayName-changing PATCH can move this
+                  // group across the --scim-admin-group boundary, which can
+                  // add/remove EVERY current member from the admin group —
+                  // not just members this SAME PATCH explicitly added/
+                  // removed via member ops. Mirror the PUT handler's
+                  // metadata-only-replace recompute: read the CURRENT
+                  // membership (AFTER all membership mutations above, so a
+                  // rename onto the admin group promotes the group's actual
+                  // current members) and fold it into the affected set
+                  // whenever displayName changed. Leave the existing
+                  // add/remove-only fast path untouched when it did not —
+                  // no need to recompute the whole group for a pure
+                  // membership PATCH, that was already correct.
+                  auto current_members = scim_store->list_group_member_user_scim_ids(id);
+
+                  // De-duplicate added ∪ removed ∪ (rename ? current : {})
+                  // so no member is recomputed — and audited — twice for the
+                  // same PATCH.
+                  std::vector<std::string> to_recompute;
+                  auto add_unique = [&to_recompute](const std::string& uid) {
+                      if (std::find(to_recompute.begin(), to_recompute.end(), uid) ==
+                          to_recompute.end())
+                          to_recompute.push_back(uid);
+                  };
                   for (const auto& uid : affected_added)
-                      recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                               scim_admin_group);
+                      add_unique(uid);
                   for (const auto& uid : affected_removed)
+                      add_unique(uid);
+                  if (display_name_changed)
+                      for (const auto& uid : current_members)
+                          add_unique(uid);
+
+                  std::string trigger = new_display_name + " op=group_patch";
+                  if (display_name_changed)
+                      trigger += " renamed_from='" + pre_update_display_name + "'";
+                  for (const auto& uid : to_recompute)
                       recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                               scim_admin_group);
+                                               scim_admin_group, trigger);
 
                   auto updated = scim_store->get_group_by_id(id);
                   if (!updated) {
@@ -2012,7 +2081,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       record_request(auth_mgr, "group_patch", 500);
                       return;
                   }
-                  auto members = scim_store->list_group_member_user_scim_ids(id);
+                  const auto& members = current_members;
                   audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
                        "Group");
                   res.set_content(scim::group_to_json(*updated, members, groups_location_base(req),
@@ -2063,7 +2132,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                    for (const auto& uid : former_members)
                        recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                                scim_admin_group);
+                                                scim_admin_group,
+                                                group->display_name + " op=group_delete");
 
                    audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id, {},
                         "Group");

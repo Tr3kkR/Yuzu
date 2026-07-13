@@ -2460,4 +2460,217 @@ TEST_CASE("Groups integration: a genuine update_role failure during recompute au
     CHECK(ts.metrics.counter("yuzu_scim_role_changes_total").value() == 0.0);
 }
 
+// ── PATCH displayName-rename must recompute all current members ────────────
+//
+// External-reviewer falsifier (CHANGES_REQUESTED on PR #2127): before this
+// fix, a PATCH that changed ONLY `displayName` fell into the membership
+// block with empty `affected_added`/`affected_removed` (no member op in the
+// same PATCH), so the recompute loop touched nobody — even though the
+// rename could move the group across the --scim-admin-group boundary and
+// silently leave every current member's role stale. The PUT handler already
+// snapshotted+recomputed the full membership on ANY replace, incl.
+// metadata-only; these cases mirror that for PATCH.
+
+TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every current member "
+         "(reviewer falsifier, PR #2127)",
+         "[scim][routes][integration][groups][patch][rename-recompute]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto member_id = create_scim_user_over_wire(cli, ts.token, "mia");
+
+    auto group_post =
+        cli.Post("/scim/v2/Groups", hdr,
+                 json{{"displayName", "Yuzu-Admins"},
+                      {"members", json::array({{{"value", member_id}}})}}
+                     .dump(),
+                 "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("mia").value() == auth::Role::admin);
+
+    // A live session for mia, so the recompute's session-invalidation side
+    // effect (AuthManager::update_role) is directly checkable, not just
+    // inferred from the role/audit outcome.
+    auto session_token =
+        ts.auth_mgr.create_local_session("mia", auth::Role::admin, /*mfa_verified=*/true);
+    REQUIRE_FALSE(session_token.empty());
+    REQUIRE(ts.auth_mgr.validate_session(session_token).has_value());
+
+    // A PATCH that ONLY renames the group — no member add/remove op at all.
+    json rename_body{{"Operations",
+                      json::array({{{"op", "replace"},
+                                    {"value", json{{"displayName", "Former-Admins"}}}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, rename_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    // The falsifier: the member must be DEMOTED even though this PATCH never
+    // explicitly touched membership.
+    CHECK(ts.auth_mgr.get_user_role("mia").value() == auth::Role::user);
+
+    // ...and the pre-existing session was invalidated by that role change —
+    // the reviewer's ordering concern (stale valid sessions surviving an
+    // effective demotion) is directly falsified here, not just inferred.
+    CHECK_FALSE(ts.auth_mgr.validate_session(session_token).has_value());
+
+    AuditQuery q;
+    q.action = "scim.user.role_changed";
+    q.target_id = member_id;
+    auto rows = ts.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    bool found_demotion = false;
+    bool found_trigger_detail = false;
+    for (const auto& row : rows) {
+        if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
+            found_demotion = true;
+        if (row.detail.find("via_group=\"Former-Admins") != std::string::npos)
+            found_trigger_detail = true;
+    }
+    CHECK(found_demotion);
+    // Minor #2: the audit detail carries the triggering group's (post-
+    // rename) displayName.
+    CHECK(found_trigger_detail);
+}
+
+TEST_CASE("Groups integration: PATCH rename ONTO the admin group promotes every current member "
+         "(inverse of the reviewer falsifier)",
+         "[scim][routes][integration][groups][patch][rename-recompute]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto member_id = create_scim_user_over_wire(cli, ts.token, "nina");
+
+    auto group_post =
+        cli.Post("/scim/v2/Groups", hdr,
+                 json{{"displayName", "Team-A"}, {"members", json::array({{{"value", member_id}}})}}
+                     .dump(),
+                 "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("nina").value() == auth::Role::user);
+
+    // A PATCH that ONLY renames "Team-A" onto the admin group's name.
+    json rename_body{{"Operations",
+                      json::array({{{"op", "replace"},
+                                    {"value", json{{"displayName", "Yuzu-Admins"}}}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, rename_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    CHECK(ts.auth_mgr.get_user_role("nina").value() == auth::Role::admin);
+}
+
+TEST_CASE("Groups integration: PATCH mixing a rename with a member add recomputes BOTH the "
+         "pre-existing members and the newly-added one, exactly once each",
+         "[scim][routes][integration][groups][patch][rename-recompute]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto pre_existing_member = create_scim_user_over_wire(cli, ts.token, "oscar");
+    auto new_member = create_scim_user_over_wire(cli, ts.token, "penny");
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr,
+                               json{{"displayName", "Yuzu-Admins"},
+                                    {"members", json::array({{{"value", pre_existing_member}}})}}
+                                   .dump(),
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("oscar").value() == auth::Role::admin);
+    REQUIRE(ts.auth_mgr.get_user_role("penny").value() == auth::Role::user);
+
+    // Single PATCH: rename OFF the admin group AND add a new member in the
+    // same request. Both the pre-existing member (found only via the
+    // rename-triggered recompute-all-current-members path) and the new
+    // member (found via the ordinary add-op path) must end up demoted, and
+    // neither may be recomputed/audited twice.
+    json mixed_body{
+        {"Operations",
+         json::array({{{"op", "replace"},
+                      {"value", json{{"displayName", "Former-Admins"}}}},
+                     {{"op", "add"},
+                      {"path", "members"},
+                      {"value", json::array({{{"value", new_member}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, mixed_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    CHECK(ts.auth_mgr.get_user_role("oscar").value() == auth::Role::user);
+    CHECK(ts.auth_mgr.get_user_role("penny").value() == auth::Role::user);
+
+    // Exactly one scim.user.role_changed row per member for THIS PATCH (no
+    // double-recompute from the dedup logic) — oscar's demotion.
+    AuditQuery oscar_q;
+    oscar_q.action = "scim.user.role_changed";
+    oscar_q.target_id = pre_existing_member;
+    auto oscar_rows = ts.audit_store->query(oscar_q);
+    int oscar_demotions = 0;
+    for (const auto& row : oscar_rows)
+        if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
+            ++oscar_demotions;
+    CHECK(oscar_demotions == 1);
+}
+
+// (Minor #3, optional per the review) — a group member value that maps to a
+// non-SCIM account during a rename-triggered recompute bumps
+// yuzu_scim_provenance_denied_total exactly like the ordinary add/remove
+// path already does, without writing a per-member audit row (avoiding a
+// bulk-rename audit flood).
+TEST_CASE("Groups integration: PATCH rename over a non-SCIM member bumps "
+         "yuzu_scim_provenance_denied_total (Minor #3)",
+         "[scim][routes][integration][groups][patch][provenance]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.auth_mgr.set_metrics_registry(&ts.metrics);
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    REQUIRE(ts.auth_mgr.upsert_user("root-admin", "correct-horse-battery-staple",
+                                    auth::Role::admin));
+    auto local_admin_mapping = ts.scim_store->create_resource("root-admin");
+    REQUIRE(local_admin_mapping.has_value());
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr,
+                               json{{"displayName", "Team-B"},
+                                    {"members", json::array(
+                                                    {{{"value", local_admin_mapping->scim_id}}})}}
+                                   .dump(),
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json rename_body{{"Operations",
+                      json::array({{{"op", "replace"},
+                                    {"value", json{{"displayName", "Yuzu-Admins"}}}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, rename_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    CHECK(ts.auth_mgr.get_user_role("root-admin").value() == auth::Role::admin);
+    CHECK(ts.metrics.counter("yuzu_scim_provenance_denied_total").value() >= 1.0);
+}
+
 #endif // YUZU_SCIM_TSAN_BUILD
