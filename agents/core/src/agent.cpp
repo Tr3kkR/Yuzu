@@ -1407,29 +1407,47 @@ public:
 
             // 3b. OTA updater: rollback check and old binary cleanup
             {
-                updater_ = std::make_unique<Updater>(
+                // Publish the fresh Updater, then work through the LOCAL copy — the slot can
+                // be re-read by Agent::stop() on another thread at any moment.
+                auto updater = std::make_shared<Updater>(
                     UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                     current_executable_path());
+                set_updater(updater);
 
-                if (updater_->rollback_if_needed()) {
+                if (updater->rollback_if_needed()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
-                updater_->cleanup_old_binary();
+                updater->cleanup_old_binary();
             }
 
             // 4. Open Subscribe bidi stream
             {
+                // DECLARATION ORDER IS LOAD-BEARING: `sub_ctx` MUST be declared BEFORE its
+                // CtxSlot. Destruction is reverse-order, so ~CtxSlot retracts the pointer
+                // (under ctx_mu_, blocking any in-flight cancel) and only THEN is `sub_ctx`
+                // destroyed. Swap these two lines and the context dies while still published —
+                // reopening the exact use-after-free this slot exists to close, with every test
+                // still green. TSan will not catch the reorder. (Gate-8 round 8 unhappy-path
+                // UP8-4.)
                 grpc::ClientContext sub_ctx;
                 if (!session_id_.empty()) {
                     sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
                 }
-                subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
+                // Published for the whole of this scope; retracted under ctx_mu_ by the dtor
+                // on EVERY exit — including the `continue` below and any throw.
+                //
+                // It stays published LONGER than the old hand-written clear did (which fired
+                // before the joins below): the plugin shutdown loop, the thread-pool reset and
+                // the heartbeat/sync joins now all run with it live, so stop() can TryCancel a
+                // context whose stream is already gone. That is safe — gRPC's ClientContext
+                // owns the underlying call ref, so TryCancel after the stream dies is a no-op,
+                // not a UAF — and `sub_ctx` outlives every moment it is published.
+                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx};
 
                 std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
                 if (!stream) {
                     spdlog::error("Failed to open Subscribe stream");
-                    subscribe_ctx_.store(nullptr, std::memory_order_release);
                     if (!stop_requested_.load(std::memory_order_acquire)) {
                         ++reconnect_count;
                         spdlog::warn("Subscribe failed — will attempt reconnect");
@@ -1459,13 +1477,18 @@ public:
                 }
 
                 // 4b. Spawn OTA update check thread
-                if (cfg_.auto_update && updater_) {
+                if (cfg_.auto_update && updater()) {
                     auto* raw_stub = static_cast<void*>(stub.get());
-                    update_thread_ = std::thread([this, raw_stub]() {
+                    // The thread CAPTURES its own shared_ptr. It must not re-read updater_ on
+                    // every iteration: run() may publish a new Updater on the next reconnect,
+                    // and this thread would then be using a different object mid-flight (and,
+                    // with a unique_ptr, a freed one).
+                    update_thread_ = std::thread([this, raw_stub,
+                                                  updater = updater()]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
                         while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater_->check_and_apply(raw_stub);
+                            auto result = updater->check_and_apply(raw_stub);
                             if (result.has_value() && result.value()) {
                                 spdlog::info("OTA update applied - agent will restart");
                                 stop();
@@ -1569,11 +1592,13 @@ public:
                             // sync coincides with a disconnect; the 30s deadline is the backstop.
                             ctx.set_deadline(std::chrono::system_clock::now() +
                                              std::chrono::seconds{30});
-                            sync_ctx_.store(&ctx, std::memory_order_release);
+                            // Was a BARE store/store(nullptr) pair — the one slot that got no
+                            // lock at all, so a teardown cancel could TryCancel this frame's
+                            // `ctx` after it had been destroyed. Retracted under ctx_mu_ by the
+                            // dtor, on the early `return std::nullopt` below too.
+                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx};
                             pb::InventoryAck ack;
                             auto status = sync_stub->ReportInventory(&ctx, report, &ack);
-                            // Clear before `ctx` leaves scope so teardown never derefs a dead ctx.
-                            sync_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::debug("sync: ReportInventory RPC failed: {}",
                                               status.error_message());
@@ -1688,7 +1713,9 @@ public:
 
                             // Build heartbeat with piggybacked metrics
                             grpc::ClientContext ctx;
-                            heartbeat_ctx_.store(&ctx, std::memory_order_release);
+                            // Per-iteration: the dtor retracts it under ctx_mu_ at the end of
+                            // this loop body, before `ctx` is destroyed.
+                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx};
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1879,7 +1906,6 @@ public:
 
                             pb::HeartbeatResponse resp;
                             auto status = hb_stub->Heartbeat(&ctx, req, &resp);
-                            heartbeat_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::warn("Heartbeat failed: {}", status.error_message());
                                 // Orphan condition (#1894): the Subscribe stream is
@@ -1929,12 +1955,8 @@ public:
                                         std::this_thread::sleep_for(slice);
                                         left -= slice;
                                     }
-                                    if (!should_stop()) {
-                                        if (auto* sctx = subscribe_ctx_.load(
-                                                std::memory_order_acquire)) {
-                                            sctx->TryCancel();
-                                        }
-                                    }
+                                    if (!should_stop())
+                                        cancel_ctx(subscribe_ctx_); // owned by run()'s frame
                                     break; // this connection is done; a fresh
                                            // heartbeat thread spawns on reconnect
                                 }
@@ -1946,7 +1968,8 @@ public:
                                 forced_rereg_streak_.store(0, std::memory_order_release);
                             }
                         }
-                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
+                        // No store(nullptr) here: the per-iteration CtxSlot already retracted
+                        // it under ctx_mu_ on every way out of the loop body.
                         spdlog::info("Heartbeat thread stopped");
                     });
                 }
@@ -2096,7 +2119,9 @@ public:
                     }
                 }
 
-                subscribe_ctx_.store(nullptr, std::memory_order_release);
+                // No store(nullptr) here: `sub_slot` retracts subscribe_ctx_ under ctx_mu_ when
+                // this scope ends, and it also covers the `continue` paths above that this
+                // hand-written clear never did.
 
                 // Detach the Guardian event-sink from this (now broken) stream BEFORE
                 // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
@@ -2116,26 +2141,28 @@ public:
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
-                if (updater_) {
-                    updater_->stop();
+                if (auto u = updater()) {
+                    u->stop(); // local copy keeps it alive even if run() swaps the slot
                 }
                 if (update_thread_.joinable()) {
                     update_thread_.join();
                 }
 
-                // Signal heartbeat thread to exit and cancel any in-flight RPC
+                // Signal heartbeat thread to exit and cancel any in-flight RPC.
+                // cancel_ctx() holds ctx_mu_ across the load+TryCancel, so the heartbeat
+                // thread's ~CtxSlot cannot retire `ctx` underneath us — this fires on every
+                // TRANSIENT RECONNECT, not just shutdown, so it was the most-executed of the
+                // four UAF sites the first ctx_mu_ patch missed. The lock is released before
+                // the join below (never hold ctx_mu_ across a join).
                 heartbeat_stop_.store(true, std::memory_order_release);
-                if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-                    hctx->TryCancel();
-                }
+                cancel_ctx(heartbeat_ctx_);
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
                 // Daily-sync thread is per-connection (like heartbeat): stop +
                 // join it on disconnect; its state persists in kv_store_.
                 sync_stop_.store(true, std::memory_order_release);
-                if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
-                    sctx->TryCancel(); // unblock an in-flight ReportInventory (mirrors heartbeat)
+                cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory (mirrors heartbeat)
                 if (sync_thread_.joinable()) {
                     sync_thread_.join();
                 }
@@ -2209,19 +2236,23 @@ public:
         // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
         // they stay live through both drains and emit_guardian_event's null-check under
         // the lock remains UAF-safe.
-        if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
-            ctx->TryCancel();
-        }
+        // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
+        // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
+        cancel_ctx(subscribe_ctx_);
         if (guardian_)
             guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
-        if (updater_)
-            updater_->stop();
-        // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
-        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-            hctx->TryCancel();
-        }
+        // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
+        // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
+        if (auto u = updater())
+            u->stop();
+        // Cancel any in-flight heartbeat / daily-sync RPC to unblock those threads. Both
+        // contexts are STACK objects owned by their own thread's frame, and this runs on the
+        // watcher / SCM thread — so both go through cancel_ctx()'s locked load+TryCancel.
+        // sync_ctx_ was missed entirely by the first ctx_mu_ patch.
+        cancel_ctx(heartbeat_ctx_);
+        cancel_ctx(sync_ctx_);
     }
 
     std::string_view agent_id() const noexcept override { return cfg_.agent_id; }
@@ -2461,17 +2492,18 @@ private:
     void quiesce_run_workers() noexcept {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
-        if (updater_)
-            updater_->stop();
-        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire))
-            hctx->TryCancel();
+        if (auto u = updater())
+            u->stop();
+        // Both cancels go through the locked chokepoint. The lock is released before every
+        // join below — holding ctx_mu_ across a join() would deadlock against the very thread
+        // whose ~CtxSlot needs it to exit.
+        cancel_ctx(heartbeat_ctx_);
         if (snapshot_pump_thread_.joinable())
             snapshot_pump_thread_.join();
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
         sync_stop_.store(true, std::memory_order_release);
-        if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
-            sctx->TryCancel(); // unblock an in-flight ReportInventory before joining
+        cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
             sync_thread_.join();
         if (update_thread_.joinable())
@@ -2508,9 +2540,83 @@ private:
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
     // before the connect loop, read after run() returns; no atomic needed.
     bool startup_failed_{false};
+    /// Serialises the three ClientContext pointers below against every cross-thread cancel.
+    ///
+    /// ALL THREE point at STACK objects — `&sub_ctx` in the reconnect-loop frame, `&ctx` in
+    /// the per-iteration heartbeat frame, `&ctx` in the sync sender's frame — and they are
+    /// TryCancel()'d from OTHER threads: the POSIX shutdown watcher, the Windows SCM control
+    /// thread, and (for subscribe_ctx_) the heartbeat thread. Without this lock the owner can
+    /// clear its pointer, leave the scope (destroying the ClientContext), and be joined, while
+    /// a canceller sits between its load() and its TryCancel() — a use-after-free on a freed
+    /// context, or a cancel against a DIFFERENT stream that reused the stack slot.
+    ///
+    /// It was survivable-by-luck before: the signal handler ran stop() inline on whichever
+    /// thread took the signal, often the main thread, i.e. INSIDE run(). Moving the teardown
+    /// onto a dedicated watcher thread (the B2 fix) makes stop() concurrent with run()'s exit
+    /// on EVERY SIGTERM, so the race went from occasional to reliable.
+    ///
+    /// THE RULE, and why it is now STRUCTURAL rather than a convention. Every publish/retract
+    /// goes through CtxSlot, and every cancel through cancel_ctx() — there are no bare
+    /// store()/load()+TryCancel() sites left. The first attempt at this fix hand-rolled a
+    /// lock_guard at each site and covered 3 of 7, leaving the identical UAF open on the
+    /// reconnect path (which runs far more often than shutdown). Three reviewers found it
+    /// independently. A rule you must remember at seven call sites is a rule that gets missed;
+    /// the RAII owner cannot be. (governance Gate-8 round 7: cpp-safety, cpp-expert,
+    /// security-guardian.)
+    ///
+    /// LOCK ORDER: ctx_mu_ is the OUTERMOST lock either of them takes. cancel_ctx() does hold
+    /// it across TryCancel(), which takes gRPC's own internal ClientContext lock — so the order
+    /// is strictly ctx_mu_ -> grpc-internal, and never the reverse (gRPC's sync API never calls
+    /// back into our code, and grpc_call_cancel does not block). Never take ctx_mu_ while
+    /// already holding it — a nested lock_guard on this NON-RECURSIVE mutex self-deadlocked
+    /// Agent::stop() in an earlier round and the agent hung on every SIGTERM; note it would
+    /// HANG, not throw, so a bad path is silent. And never hold it across a join(): the thread
+    /// being joined needs it for its own ~CtxSlot.
+    std::mutex ctx_mu_;
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> sync_ctx_{nullptr}; // ADR-0016 daily-sync RPC (cancel on teardown)
+
+    /// Publishes a STACK-owned ClientContext into one of the slots above for exactly the
+    /// lifetime of the enclosing scope, and retracts it under ctx_mu_ on the way out —
+    /// including on the exception and early-return paths a hand-written store(nullptr) misses.
+    /// Because the retraction takes ctx_mu_, an in-flight cancel_ctx() holding the lock keeps
+    /// the pointee alive until its TryCancel() returns.
+    ///
+    /// THE LOCK IS HELD ONLY MOMENTARILY — inside the ctor body and the dtor body, never for
+    /// the slot's LIFETIME. That is load-bearing, not an implementation detail: `sub_slot`'s
+    /// scope encloses `thread_pool_.reset()` and the heartbeat/sync/updater joins, and the
+    /// heartbeat thread's own ~CtxSlot needs ctx_mu_ to exit. Hold the lock for the slot's
+    /// lifetime (e.g. "optimise" these lock_guards into a unique_lock member) and run() would
+    /// deadlock against the very thread it is joining, on every reconnect. Do not.
+    class CtxSlot {
+    public:
+        CtxSlot(std::mutex& mu, std::atomic<grpc::ClientContext*>& slot,
+                grpc::ClientContext* ctx) noexcept
+            : mu_{mu}, slot_{slot} {
+            std::lock_guard lk(mu_);
+            slot_.store(ctx, std::memory_order_release);
+        }
+        ~CtxSlot() {
+            std::lock_guard lk(mu_);
+            slot_.store(nullptr, std::memory_order_release);
+        }
+        CtxSlot(const CtxSlot&) = delete;
+        CtxSlot& operator=(const CtxSlot&) = delete;
+
+    private:
+        std::mutex& mu_;
+        std::atomic<grpc::ClientContext*>& slot_;
+    };
+
+    /// The ONLY way to cancel one of the three contexts. Loads AND TryCancel()s under ctx_mu_
+    /// so the owning frame's ~CtxSlot cannot retire the context in between. Safe on a slot
+    /// that is already null (the common case — the RPC has finished).
+    void cancel_ctx(std::atomic<grpc::ClientContext*>& slot) noexcept {
+        std::lock_guard lk(ctx_mu_);
+        if (auto* c = slot.load(std::memory_order_acquire))
+            c->TryCancel();
+    }
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
@@ -2544,7 +2650,49 @@ private:
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
-    std::unique_ptr<Updater> updater_;
+    /// SHARED_PTR BEHIND A MUTEX, not a unique_ptr — and not a std::atomic<shared_ptr> either.
+    ///
+    /// WHY IT IS SHARED. run() REASSIGNS this on every reconnect (a fresh Updater per
+    /// connection, so Updater::stop()'s latched stop_requested_ is cleared — reusing one would
+    /// leave OTA dead after the first disconnect). Meanwhile Agent::stop() dereferences it from
+    /// ANOTHER thread (the POSIX shutdown watcher, the Windows SCM/console thread). With a
+    /// unique_ptr, run() could FREE the Updater while stop() was inside updater_->stop() — a
+    /// use-after-free, and worse: since Updater gained a ctx_mu_ held across TryCancel(), a
+    /// std::mutex DESTROYED WHILE LOCKED (UB; glibc tolerates it, MSVC and Apple Clang do not).
+    ///
+    /// WHY NOT std::atomic<std::shared_ptr<Updater>>, which is the obvious C++20 answer and was
+    /// the first fix I wrote: **libc++ has never implemented P0718R2.** There is no
+    /// atomic<shared_ptr> specialisation, so it instantiates the PRIMARY template over a
+    /// non-trivially-copyable type and is ill-formed. It compiles on libstdc++ and MSVC STL and
+    /// red-lines the macOS leg of Tier-1 CI. A green Linux build is not evidence of portability.
+    /// (governance Gate-8 round 10 cpp-safety.)
+    ///
+    /// THE LOCK IS MOMENTARY — held only across the pointer copy in updater()/set_updater(),
+    /// NEVER across u->stop() or a TryCancel(). Same discipline as CtxSlot. Hold it across the
+    /// stop() and a wedged OTA drain would block run() and ~Agent behind it.
+    ///
+    /// Every reader takes a LOCAL shared_ptr copy first (via updater()), which keeps the object
+    /// alive for the whole call even if run() swaps the slot underneath. There is no
+    /// `updater_->x()` anywhere — grep for it across agents/ , not just this file.
+    mutable std::mutex updater_mu_;
+    std::shared_ptr<Updater> updater_;
+
+    /// A LOCAL copy of the current Updater, or nullptr. The copy is what makes the caller safe.
+    [[nodiscard]] std::shared_ptr<Updater> updater() const {
+        std::lock_guard lk(updater_mu_);
+        return updater_;
+    }
+
+    /// Publish a new Updater. The previous one is released OUTSIDE the lock: if this drops its
+    /// last reference, ~Updater must not run while updater_mu_ is held.
+    void set_updater(std::shared_ptr<Updater> u) {
+        std::shared_ptr<Updater> old;
+        {
+            std::lock_guard lk(updater_mu_);
+            old = std::move(updater_);
+            updater_ = std::move(u);
+        }
+    }
     std::thread update_thread_;
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
