@@ -42,6 +42,7 @@ constexpr const char* kMetricRingEvictions = "yuzu_mcp_stream_replay_ring_evicti
 constexpr const char* kMetricStreamRejects = "yuzu_mcp_stream_rejects_total";
 constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
+constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -162,10 +163,17 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
     {
         // A single frame must not exceed the ring's byte budget, or the "always keep the
         // newest frame" rule below would admit it whole and the byte cap would bound
-        // nothing. Truncate instead — a truncated frame the client can see is strictly
-        // better than an unbounded ring, and the eviction counter records that it happened.
-        if (data.size() > ring_bytes_cap_) {
-            data.resize(ring_bytes_cap_);
+        // nothing.
+        //
+        // Do NOT byte-truncate it: these payloads are JSON, so a cut at an arbitrary
+        // offset yields a guaranteed-unparseable frame — which we would then hand to the
+        // live sink AND store in the ring under an id, so every resume would faithfully
+        // re-serve the same garbage. Substitute a well-formed frame that says what
+        // happened and where the real answer is. The client gets something it can parse
+        // and act on; the ring stays bounded.
+        if (event_type.size() + data.size() > ring_bytes_cap_) {
+            data = "{\"error\":\"frame_too_large\",\"bytes\":" + std::to_string(data.size()) +
+                   ",\"remediation\":\"fetch the full result by execution_id\"}";
             oversized = true;
         }
         std::lock_guard<std::mutex> lk(mu_);
@@ -202,9 +210,10 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
     if (evicted > 0 && metrics_ != nullptr) {
         metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
     }
-    if (oversized) {
-        spdlog::warn("MCP stream: truncated an oversized frame to the {}-byte ring budget",
-                     ring_bytes_cap_);
+    if (oversized && metrics_ != nullptr) {
+        // Counted, not just logged: an unbounded warn-per-publish is a log-flood vector,
+        // and a new failure mode nobody can alert on is a failure mode nobody sees.
+        metrics_->counter(kMetricFramesTruncated).increment();
     }
     return id;
 }
@@ -295,6 +304,18 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         out.status = AttachStatus::kAttached;
         out.sink = sink;
         out.generation = ++generation_;
+
+        // Gauges are published UNDER mu_, paired with the state change they describe. Done
+        // outside, a takeover whose superseded provider detaches before the attacher gets
+        // to the increment drives `handover_pending` transiently negative — a spurious
+        // sample an alert would see. The metrics registry takes its own lock and calls
+        // nothing back into us, so nesting it here cannot cycle.
+        if (metrics_ != nullptr) {
+            metrics_->gauge(kMetricStreamsActive).increment();
+            if (superseded) {
+                metrics_->gauge(kMetricStreamsHandover).increment();
+            }
+        }
     }
 
     // Wake the superseded provider outside mu_ (lock order). `closed` MUST be set
@@ -304,12 +325,6 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
     // tick before noticing, pinning a worker for 3 s per takeover.
     if (superseded) {
         close_sink(superseded, McpStreamClose::kSuperseded);
-    }
-    if (metrics_ != nullptr) {
-        metrics_->gauge(kMetricStreamsActive).increment();
-        if (superseded) {
-            metrics_->gauge(kMetricStreamsHandover).increment();
-        }
     }
     return out;
 }
@@ -365,7 +380,8 @@ void McpStreamState::detach(const std::shared_ptr<McpStreamSink>& sink) {
     }
     // Release the lease OUTSIDE mu_ so the global budget mutex is never nested under a
     // per-stream one on this path. Each sink owns its own lease, so this returns exactly
-    // the worker THIS provider was pinning.
+    // the worker THIS provider was pinning. The lease goes home BEFORE the metrics touch —
+    // that ordering is what lets the callers treat a throwing metric as ignorable.
     sink->lease.release();
     if (metrics_ != nullptr) {
         metrics_->gauge(kMetricStreamsActive).decrement();
@@ -462,15 +478,21 @@ bool McpStreamPump::pump_once(const WriteFn& write) {
     try {
         return pump_once_impl(write);
     } catch (...) {
-        // Record the reason FIRST — an internal fault must not be audited as a client
-        // disconnect, or the operator goes looking at the client for our bug. Only then
-        // log, and guard even that: spdlog's formatter allocates, and this catch exists
-        // precisely because we may be out of memory.
+        // `set_close_reason` is the ONLY thing here that cannot throw (an atomic CAS on a
+        // member that already exists) — and it is the one thing that must happen, so an
+        // internal fault is not audited as a client disconnect and the operator does not
+        // go looking at the client for our bug.
         sink_->set_close_reason(McpStreamClose::kInternalError);
-        count_stream_close(metrics_, McpStreamClose::kInternalError);
+        // EVERYTHING else in this handler allocates: MetricsRegistry::counter() inserts a
+        // map node on first use, and spdlog's formatter builds a string. We are here
+        // because something threw — quite possibly bad_alloc — and a throw from inside a
+        // catch handler propagates straight out of pump_once into an unguarded httplib
+        // ThreadPool task, i.e. std::terminate. That is the exact hole this boundary
+        // exists to close, so the best-effort part gets its own net.
         try {
+            count_stream_close(metrics_, McpStreamClose::kInternalError);
             spdlog::warn("MCP stream pump: aborting stream after an exception");
-        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left to say
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
         }
         return false; // httplib still runs the releaser → detach() → the lease comes back
     }
@@ -702,7 +724,15 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         bool installed = false;
         ~LeaseGuard() noexcept {
             if (!installed) {
-                stream->detach(*sink);
+                try {
+                    stream->detach(*sink); // returns the lease first, then touches metrics
+                } catch (...) {            // NOLINT(bugprone-empty-catch)
+                    // detach() allocates (metric name temporaries), and this destructor
+                    // runs while UNWINDING — a throw escaping here is a double fault, i.e.
+                    // terminate. The lease is already home by then: detach() releases it
+                    // before it touches metrics, and Lease's own destructor would return it
+                    // regardless.
+                }
             }
         }
     };

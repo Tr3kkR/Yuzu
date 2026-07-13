@@ -460,7 +460,12 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
                            -1, &raw, nullptr) != SQLITE_OK)
         return {TokenCheck::kUnavailable, std::nullopt}; // could not even ask
     SqliteStmt stmt{raw};
-    sqlite3_bind_text(stmt.get(), 1, hash.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_bind_text(stmt.get(), 1, hash.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        // An unbound parameter would make this `WHERE token_hash = NULL`, which matches
+        // nothing, which is SQLITE_DONE, which is "definitively revoked" — the exact false
+        // revocation this function exists to prevent, arriving through a different door.
+        return {TokenCheck::kUnavailable, std::nullopt};
+    }
 
     const int rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_DONE)

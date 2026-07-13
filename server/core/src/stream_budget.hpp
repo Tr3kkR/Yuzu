@@ -168,8 +168,12 @@ public:
                 return {Lease{}, kRejectPerPrincipal};
             }
         }
-        ++total_;
+        // Insert BEFORE bumping the total: the map insert allocates (a node plus a string
+        // copy) and can throw, and a throw after `++total_` would leak a global slot for
+        // the life of the process — a cap that silently tightens every time the machine is
+        // under memory pressure.
         per_principal_[principal] = held + 1;
+        ++total_;
         return {Lease{this, principal}, nullptr};
     }
 

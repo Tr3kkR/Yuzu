@@ -236,6 +236,9 @@ inline void sse_resource_release(const std::shared_ptr<SseSinkState>& state, Eve
         std::lock_guard<std::mutex> lk(state->mu);
         state->closed.store(true);
     }
+    // The scope above ENDS here on purpose: publishers take the bus mutex and then the
+    // sink mutex, so unsubscribing while still holding `state->mu` would invert that
+    // order and deadlock. Do not move `unsubscribe` into the block.
     state->cv.notify_all();
     bus.unsubscribe(state->sub_id);
 }

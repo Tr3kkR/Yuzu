@@ -670,3 +670,67 @@ TEST_CASE("McpSessionRegistry: concurrent mint / stream_for / terminate is race-
     CHECK(minted.load() > 0);
     CHECK(reg.active_count() == 0);
 }
+
+// ── The exception boundary (an escaped throw here is std::terminate) ─────────
+
+TEST_CASE("McpStreamPump: an exception from re-validation ends the stream, never escapes",
+          "[mcp][stream]") {
+    // httplib runs a chunked content provider from a bare ThreadPool task — outside the
+    // try/catch that wraps routing() — so an exception escaping pump_once is
+    // std::terminate, not a 500 (#2037's failure class). Re-validation reaches SQLite and
+    // the auth manager, both of which can throw, so this boundary is load-bearing.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            []() -> mcp::StreamRevalidate { throw std::runtime_error("auth blew up"); },
+                            [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK_NOTHROW(pump.pump_once(wire.writer()));
+    CHECK_FALSE(pump.pump_once(wire.writer())); // and the stream is over
+
+    // The fault is recorded as OURS. Auditing it as a client disconnect would send the
+    // operator looking at the client for a server bug.
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kInternalError);
+}
+
+TEST_CASE("McpStreamPump: the exception boundary holds with no metrics registry wired",
+          "[mcp][stream]") {
+    // The catch handler's own metric/log calls allocate — and it exists precisely because
+    // we may be out of memory. Exercise the null-metrics branch too, so the guard is
+    // covered on both.
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, nullptr);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            []() -> mcp::StreamRevalidate { throw std::bad_alloc(); },
+                            [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK_NOTHROW(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kInternalError);
+}
+
+TEST_CASE("McpStreamState: an oversized frame is replaced, not corrupted",
+          "[mcp][stream]") {
+    // Byte-truncating a JSON payload yields a guaranteed-unparseable frame — which would
+    // then be handed to the live sink AND stored in the ring under an id, so every resume
+    // would faithfully re-serve the same garbage. Substitute a well-formed notice instead.
+    mcp::McpStreamState state{/*ring_cap=*/8, nullptr, /*ring_bytes_cap=*/256};
+    state.publish("message", std::string(4096, 'x'));
+
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    REQUIRE(attached.sink->sse->queue.size() == 1);
+    const auto& frame = attached.sink->sse->queue.front();
+    CHECK(frame.data.find("frame_too_large") != std::string::npos);
+    CHECK(frame.data.find("execution_id") != std::string::npos);
+    CHECK(frame.data.size() <= 256);
+    CHECK(frame.data.find(std::string(64, 'x')) == std::string::npos); // no raw payload
+}

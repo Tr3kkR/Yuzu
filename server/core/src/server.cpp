@@ -443,6 +443,10 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
                           "Frames dropped from a slow consumer's per-connection queue", "counter");
+        metrics_.describe("yuzu_mcp_stream_frames_too_large_total",
+                          "Frames replaced by a frame_too_large notice because they exceeded the "
+                          "per-session replay-ring byte budget",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_replay_ring_evictions_total",
                           "Frames evicted from a session's bounded replay ring — a client whose "
                           "cursor falls behind gets a 404 and must re-initialize",
@@ -454,6 +458,7 @@ public:
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
+        metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
