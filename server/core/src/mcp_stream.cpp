@@ -29,6 +29,10 @@ static_assert(kMcpRingCapDefault <= sse_bus::kPerConnectionQueueCapDefault,
               "replay ring must fit the sink queue or a full replay self-gaps");
 static_assert(McpSessionRegistry::Config{}.ring_cap == kMcpRingCapDefault,
               "registry default and stream default must not drift");
+// Same for the byte cap: the registry header cannot name the constant (it only
+// forward-declares McpStreamState), so the two literals are pinned together here.
+static_assert(McpSessionRegistry::Config{}.ring_bytes_cap == kMcpRingBytesCapDefault,
+              "registry byte-cap default and stream byte-cap default must not drift");
 
 namespace {
 
