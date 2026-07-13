@@ -2630,6 +2630,78 @@ TEST_CASE("Groups integration: PATCH mixing a rename with a member add recompute
     CHECK(oscar_demotions == 1);
 }
 
+// ── PATCH member-cap rejection must NOT commit a co-submitted rename ───────
+//
+// Re-review MEDIUM (same class as the [HIGH fix] above, on the error path):
+// `update_group` committed the displayName rename BEFORE the member-count-cap
+// check, so a PATCH that both renamed the group AND pushed membership over
+// kMaxGroupMembers committed the rename, then 400'd on the cap, and never
+// reached the recompute loop — leaving every current member's role stale
+// (here: still admin, with a valid session, after a rejected PATCH). The PUT
+// handler already ordered the cap check before update_group; this proves
+// PATCH now matches.
+
+TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit a "
+         "co-submitted displayName rename (re-review MEDIUM, PR #2127)",
+         "[scim][routes][integration][groups][patch][rename-recompute][member-cap]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto member_id = create_scim_user_over_wire(cli, ts.token, "admin_member");
+
+    auto group_post =
+        cli.Post("/scim/v2/Groups", hdr,
+                 json{{"displayName", "Yuzu-Admins"},
+                      {"members", json::array({{{"value", member_id}}})}}
+                     .dump(),
+                 "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("admin_member").value() == auth::Role::admin);
+
+    auto session_token = ts.auth_mgr.create_local_session("admin_member", auth::Role::admin,
+                                                          /*mfa_verified=*/true);
+    REQUIRE_FALSE(session_token.empty());
+
+    // Build an `add` op with exactly kMaxGroupMembers dummy member values —
+    // combined with the group's existing 1 member, that's one over the cap.
+    // These never need to resolve to real SCIM users, since the cap check
+    // must reject the request before resolve_member_values runs. Plain
+    // string values (not `{"value": ...}` objects) keep the body well under
+    // the route's kMaxBodyBytes (64 KiB) limit.
+    json member_values = json::array();
+    for (int i = 0; i < 5000; ++i)
+        member_values.push_back(std::to_string(i));
+
+    // Single PATCH: rename AWAY from the admin group's name AND push
+    // membership over the cap in the same request.
+    json mixed_body{
+        {"Operations",
+         json::array({{{"op", "replace"},
+                      {"value", json{{"displayName", "Former-Admins"}}}},
+                     {{"op", "add"}, {"path", "members"}, {"value", member_values}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, mixed_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 400);
+
+    // The rename must NOT have been committed on the rejected path.
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    REQUIRE(get_res->status == 200);
+    CHECK(json::parse(get_res->body)["displayName"].get<std::string>() == "Yuzu-Admins");
+
+    // No stale demotion-skip: the rename was rejected, so the member stays
+    // admin and the pre-existing session stays valid.
+    CHECK(ts.auth_mgr.get_user_role("admin_member").value() == auth::Role::admin);
+    CHECK(ts.auth_mgr.validate_session(session_token).has_value());
+}
+
 // (Minor #3, optional per the review) — a group member value that maps to a
 // non-SCIM account during a rename-triggered recompute bumps
 // yuzu_scim_provenance_denied_total exactly like the ordinary add/remove

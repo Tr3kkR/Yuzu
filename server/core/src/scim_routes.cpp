@@ -1895,6 +1895,39 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   }
                   const auto& patch = *parsed;
 
+                  // #7 (sre capacity): bound the resulting member count
+                  // before mutating ANYTHING — including the displayName
+                  // rename below — see kMaxGroupMembers's doc comment. Moved
+                  // above the rename/update_group so a PATCH that both
+                  // renames the group AND pushes membership over the cap
+                  // 400s without committing the rename, matching the PUT
+                  // handler's validate-before-mutate ordering (a rejected
+                  // PATCH must not leave a stale-privilege window from a
+                  // committed-then-abandoned rename).
+                  {
+                      std::size_t resulting_count = 0;
+                      if (patch.replace_members.has_value()) {
+                          resulting_count = patch.replace_members->size();
+                      } else {
+                          std::size_t current_count =
+                              scim_store->list_group_member_user_scim_ids(id).size();
+                          std::size_t remove_count = patch.remove_all_members
+                                                          ? current_count
+                                                          : patch.members_to_remove.size();
+                          std::size_t after_remove =
+                              current_count > remove_count ? current_count - remove_count : 0;
+                          resulting_count = after_remove + patch.members_to_add.size();
+                      }
+                      if (resulting_count > kMaxGroupMembers) {
+                          send_scim_error(res, 400, "members exceeds the maximum group size",
+                                         "invalidValue");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                               "member count exceeds cap", "Group");
+                          record_request(auth_mgr, "group_patch", 400);
+                          return;
+                      }
+                  }
+
                   // [HIGH fix] Captured BEFORE update_group so the
                   // rename-recompute logic below can tell whether THIS PATCH
                   // actually changed displayName — a rename can move the
@@ -1939,33 +1972,6 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   // REMOVED by this PATCH gets a recompute below.
                   std::vector<std::string> affected_added;
                   std::vector<std::string> affected_removed;
-
-                  // #7 (sre capacity): bound the resulting member count
-                  // before mutating anything — see kMaxGroupMembers's doc
-                  // comment.
-                  {
-                      std::size_t resulting_count = 0;
-                      if (patch.replace_members.has_value()) {
-                          resulting_count = patch.replace_members->size();
-                      } else {
-                          std::size_t current_count =
-                              scim_store->list_group_member_user_scim_ids(id).size();
-                          std::size_t remove_count = patch.remove_all_members
-                                                          ? current_count
-                                                          : patch.members_to_remove.size();
-                          std::size_t after_remove =
-                              current_count > remove_count ? current_count - remove_count : 0;
-                          resulting_count = after_remove + patch.members_to_add.size();
-                      }
-                      if (resulting_count > kMaxGroupMembers) {
-                          send_scim_error(res, 400, "members exceeds the maximum group size",
-                                         "invalidValue");
-                          audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
-                               "member count exceeds cap", "Group");
-                          record_request(auth_mgr, "group_patch", 400);
-                          return;
-                      }
-                  }
 
                   if (patch.replace_members.has_value()) {
                       // A `replace` on `members` in the same body as
