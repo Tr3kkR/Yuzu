@@ -34,6 +34,9 @@ struct TempUpdaterDir {
         : guard("yuzu_test_updater_" + suffix + "-") {
         std::error_code ec;
         fs::create_directories(guard.path, ec);
+        // A silently-failed creation (full temp volume, ACL) would hollow out
+        // the negative-assertion rollback tests into no-op passes (gov safe-2).
+        REQUIRE(fs::exists(guard.path));
     }
 };
 

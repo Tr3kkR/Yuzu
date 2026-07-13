@@ -137,9 +137,10 @@ struct TempDir {
 /// (finding qe-B1 from Run 3).
 ///
 /// This is the preferred pattern for new tests. `unique_temp_path()` alone
-/// is a lower-level primitive exposed for tests that do not own a SQLite
-/// file (e.g. KV-store tests which open via `KvStore::open(path)` and do
-/// not generate WAL/SHM directly).
+/// is a lower-level primitive exposed for callers that only need a salted
+/// NAME (e.g. test_guardian_engine.cpp's `unique_kv_path`, which places the
+/// salted filename under a caller-managed per-UID directory and hands it to
+/// TempDbFile's adopt-a-path ctor).
 struct TempDbFile {
     std::filesystem::path path;
 

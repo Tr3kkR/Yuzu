@@ -66,9 +66,10 @@ const fs::path& read_base() {
     static const bool created = [] {
         std::error_code ec;
         fs::create_directories(base.path, ec);
-        return true;
+        return fs::exists(base.path);
     }();
-    (void)created;
+    // Fail loudly if the base could not be created (gov safe-2).
+    REQUIRE(created);
     return base.path;
 }
 

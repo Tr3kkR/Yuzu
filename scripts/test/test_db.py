@@ -206,6 +206,10 @@ def connect(create_dirs: bool = False):
         # so the journal_mode switch itself retries under contention, and at
         # 10000 to match the driver-level `timeout=10.0` above — a smaller
         # value here would silently SHORTEN the effective timeout.
+        # WAL means recent commits live in the -wal sidecar until checkpoint:
+        # anything archiving/copying this DB must take .db + -wal + -shm
+        # together (or run PRAGMA wal_checkpoint(TRUNCATE) first), else the
+        # copy silently reads OLDER data with no error (gov up-4).
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -1208,10 +1212,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         msg = str(e)
         # Primary result code (low byte of the extended code) when the driver
         # exposes it (Python 3.11+): SQLITE_BUSY=5, SQLITE_LOCKED=6,
-        # SQLITE_PROTOCOL=15. Message-substring fallback for older Pythons.
+        # SQLITE_PROTOCOL=15. The message-substring check is ONLY the fallback
+        # for older Pythons — when the authoritative code is present it alone
+        # decides, so a non-lock error naming a 'busy_*' table can't pick up
+        # the contention hint (gov sec-1).
         code = getattr(e, "sqlite_errorcode", None)
-        lock_shaped = (code is not None and (code & 0xFF) in (5, 6, 15)) or (
-            "locked" in msg.lower() or "busy" in msg.lower()
+        lock_shaped = (
+            (code & 0xFF) in (5, 6, 15)
+            if code is not None
+            else ("locked" in msg.lower() or "busy" in msg.lower())
         )
         hint = (
             " — concurrent writer (overlapping runs sharing YUZU_TEST_DB?); "
