@@ -430,6 +430,17 @@ public:
         metrics_.describe("yuzu_mcp_streams_active",
                           "MCP GET SSE streams currently held open (each pins one HTTP worker)",
                           "gauge");
+        metrics_.describe("yuzu_http_held_open_responses",
+                          "SSE responses held open right now across ALL surfaces (MCP GET, "
+                          "/api/v1/events, dashboard drawer, legacy /events) — each pins one "
+                          "HTTP worker thread",
+                          "gauge");
+        metrics_.describe("yuzu_http_held_open_capacity",
+                          "Held-open responses this server is sized for (--max-sse-streams, "
+                          "clamped to the worker pool). Utilisation = responses / capacity",
+                          "gauge");
+        metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
+        metrics_.gauge("yuzu_http_held_open_responses").set(0);
         metrics_.describe("yuzu_mcp_streams_handover_pending",
                           "Superseded MCP SSE streams still draining — each still pins a worker",
                           "gauge");
@@ -3405,6 +3416,14 @@ public:
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
+                // Held-open responses across EVERY streaming surface, against the capacity the
+                // worker pool was sized for (ADR-0030 Decision 3). This is THE number: it is
+                // what says "raise --max-sse-streams", and no per-surface gauge can express
+                // it, because the pool is what they all share.
+                if (stream_budget_) {
+                    metrics_.gauge("yuzu_http_held_open_responses")
+                        .set(static_cast<double>(stream_budget_->active()));
+                }
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));
@@ -5453,45 +5472,49 @@ private:
         // httplib's implicit default and nothing capped concurrent streams, so a
         // fleet of agentic clients could occupy every worker and starve plain REST.
         //
-        // Size the pool EXPLICITLY (same numbers httplib would pick by default, but
-        // now ours to reason about) and derive the stream budget from it, holding a
-        // reserve of workers that streams can never take.
-        const unsigned hw = std::thread::hardware_concurrency();
-        const std::size_t auto_base =
-            std::max<std::size_t>(8, hw > 0 ? static_cast<std::size_t>(hw) - 1 : 0);
-        std::size_t pool_base = cfg_.http_worker_threads > 0 ? cfg_.http_worker_threads : auto_base;
-        // Floor at httplib's own default base. Below it the derived stream budget goes
-        // to zero and every MCP GET 429s forever behind a single warn line — a silent
-        // cliff at the bottom of a knob nobody expects to disable a feature.
-        if (pool_base < detail::kMinHttpWorkerThreads) {
-            spdlog::warn("--http-worker-threads {} is below the minimum {}; using {}", pool_base,
-                         detail::kMinHttpWorkerThreads, detail::kMinHttpWorkerThreads);
-            pool_base = detail::kMinHttpWorkerThreads;
+        // The arrow points FROM the workload TO the pool (ADR-0030). It used to point the
+        // other way: the pool was httplib's accidental default (32 threads on an 8-core box)
+        // and the stream cap fell out of it at 12 — on a platform whose own design notes size
+        // it for "hundreds of agentic clients per server". A cap two orders of magnitude below
+        // the workload is not a safety feature, it is a self-inflicted scarcity.
+        //
+        // A held-open stream costs a BLOCKED thread: ~8-16 KB resident (the 8 MB stack is
+        // virtual), zero CPU, one wakeup per heartbeat. Sizing for hundreds is cheap; refusing
+        // to serve them is not.
+        const std::size_t target_streams = cfg_.max_sse_streams > 0
+                                               ? cfg_.max_sse_streams
+                                               : detail::kTargetHeldOpenStreamsDefault;
+        std::size_t pool_base =
+            detail::derive_worker_pool(target_streams, detail::kPlainRestReserveDefault);
+        if (cfg_.http_worker_threads > 0) {
+            // An operator who pins the pool by hand overrides the derivation — and then the
+            // stream target is clamped to what their pool can actually carry, not the reverse.
+            pool_base = std::max(cfg_.http_worker_threads, detail::kMinHttpWorkerThreads);
         }
-        const std::size_t pool_max = pool_base * 4; // httplib's growable-pool ratio
+        const std::size_t pool_max = pool_base; // no growth games: the pool IS the budget
         web_server_->new_task_queue = [pool_base, pool_max] {
             return new httplib::ThreadPool(pool_base, pool_max);
         };
         const std::size_t effective_streams = detail::derive_stream_budget(
-            pool_max, detail::kPlainRestReserveDefault, cfg_.mcp_max_streams);
-        if (effective_streams < cfg_.mcp_max_streams) {
-            // Clamp, never refuse: a derived resource limit must not brick a boot.
-            spdlog::warn("--mcp-max-streams {} exceeds the worker budget; clamped to {} "
-                         "(pool max {} - plain-REST reserve {}, {} workers reserved per stream "
-                         "for takeover handover)",
-                         cfg_.mcp_max_streams, effective_streams, pool_max,
+            pool_max, detail::kPlainRestReserveDefault, target_streams);
+        if (effective_streams < target_streams) {
+            spdlog::warn("--max-sse-streams {} exceeds what a pool of {} can carry; clamped to "
+                         "{} (plain-REST reserve {}, {} workers per stream for takeover "
+                         "handover). Raise --http-worker-threads or lower the target.",
+                         target_streams, pool_max, effective_streams,
                          detail::kPlainRestReserveDefault, detail::kMaxProvidersPerStream);
         }
-        stream_budget_ = std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{
-            effective_streams, cfg_.mcp_max_streams_per_principal});
-        metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
-        spdlog::info("HTTP worker pool: base={} max={}; held-open MCP SSE streams capped at {} "
-                     "({} per principal). NOTE: the plain-REST reserve of {} bounds the MCP "
-                     "surface only — GET /api/v1/events, the dashboard execution SSE, and the "
-                     "legacy /events stream share this pool and are still UNCAPPED (#2056 moves "
-                     "them onto this budget).",
-                     pool_base, pool_max, effective_streams, cfg_.mcp_max_streams_per_principal,
-                     detail::kPlainRestReserveDefault);
+        stream_budget_ =
+            std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});
+        metrics_.gauge("yuzu_http_held_open_capacity")
+            .set(static_cast<double>(effective_streams));
+        metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
+                     "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
+                     "GET /mcp/v1/, GET /api/v1/events, the dashboard executions drawer, and the "
+                     "legacy /events stream. Watch yuzu_http_held_open_responses / "
+                     "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0030).",
+                     pool_max, effective_streams, detail::kPlainRestReserveDefault);
 
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler([this](const httplib::Request& req,
@@ -6886,7 +6909,36 @@ private:
         });
 
         // SSE endpoint
-        web_server_->Get("/events", [this](const httplib::Request&, httplib::Response& res) {
+        web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
+            // ADMISSION CONTROL (ADR-0030). This route performs NO authentication — a
+            // separate, tracked defect — so until that is fixed it is a pre-auth
+            // thread-pinning DoS: every connection holds an httplib worker for its whole
+            // life. Leasing it bounds that. The principal is resolved BEST-EFFORT (never
+            // enforced, so dashboard behaviour is unchanged): a signed-in operator's tabs key
+            // to their own name and get the normal dashboard allowance, while every
+            // unauthenticated caller shares one small anonymous bucket — which caps the DoS
+            // without locking out an operator.
+            std::string principal = "anonymous";
+            std::size_t per_principal = detail::kPerPrincipalAnonymous;
+            if (auth_routes_) {
+                if (auto sess = auth_routes_->resolve_session(req)) {
+                    principal = sess->username;
+                    per_principal = detail::kPerPrincipalDashboard;
+                }
+            }
+            auto lease = std::make_shared<detail::StreamBudget::Lease>();
+            if (stream_budget_) {
+                auto admitted = stream_budget_->try_acquire(detail::SseSurface::kLegacyEvents,
+                                                            principal, per_principal);
+                if (!admitted.lease) {
+                    res.status = 429;
+                    res.set_header("Retry-After", "5");
+                    res.set_content("too many live streams open", "text/plain; charset=utf-8");
+                    return;
+                }
+                *lease = std::move(admitted.lease);
+            }
+
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
 
@@ -6917,8 +6969,9 @@ private:
                     return detail::sse_content_provider(sink_state, offset, sink);
                 },
                 detail::adopt_quota_slot_into_stream(
-                    [sink_state, bus](bool success) {
+                    [sink_state, bus, lease](bool success) {
                         detail::sse_resource_release(sink_state, *bus, success);
+                        // `lease` dies here — the worker returns to the one shared budget.
                     }));
         });
 
@@ -11257,6 +11310,7 @@ private:
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
+        wf_deps.stream_budget = stream_budget_.get(); // ADR-0030: one budget, every surface
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*

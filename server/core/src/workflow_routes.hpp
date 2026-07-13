@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stream_budget.hpp"
+
 #include <yuzu/server/auth.hpp>
 
 #include "approval_manager.hpp"
@@ -71,6 +73,11 @@ public:
     /// order so the diff at call sites is mechanical. Pointer fields
     /// default to nullptr where the previous overload accepted defaults.
     struct Deps {
+        /// THE shared admission budget for held-open responses (ADR-0030). The executions
+        /// drawer holds a worker thread for as long as an operator leaves the tab open, so it
+        /// leases from the same counter as every other streaming surface. nullptr = no
+        /// admission control (test harnesses only).
+        yuzu::server::detail::StreamBudget* stream_budget{nullptr};
         AuthFn auth_fn;
         PermFn perm_fn;
         AuditFn audit_fn;

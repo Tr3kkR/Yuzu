@@ -310,16 +310,18 @@ struct Config {
     /// clamped at boot to `pool_max - plain-REST reserve`. Per-principal is
     /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
     /// cursor, a held-open worker is not.
-    /// 12, not 16, on purpose: the smallest worker pool httplib will hand us (base 8 →
-    /// max 32) affords exactly 12 after the plain-REST reserve and the per-stream
-    /// handover allowance. A default of 16 would be clamped to 12 on every ordinary
-    /// 8-core box and warn about it on every boot — a warning about a setting the
-    /// operator never touched. Bigger boxes can raise it; the clamp still protects them.
-    std::size_t mcp_max_streams{12};
+    /// Concurrent held-open SSE responses this server is sized for, across EVERY streaming
+    /// surface (MCP GET, /api/v1/events, the dashboard executions drawer, the legacy /events
+    /// stream). The worker pool is derived FROM this — not the other way round (ADR-0030):
+    /// a stream costs a blocked thread, which is cheap, so the operator declares the workload
+    /// and the pool is sized to honour it. 0 = the default (128).
+    std::size_t max_sse_streams{0};
+    /// Per-principal MCP stream allowance — a per-surface anti-monopoly policy, NOT a
+    /// capacity limit (the pool is protected by the global budget alone).
     std::size_t mcp_max_streams_per_principal{4};
-    /// Base size of the shared httplib worker pool (0 = auto: max(8, hw−1), the
-    /// same number httplib picks by default — but chosen explicitly so the stream
-    /// budget above can be derived from it). Pool max is 4× the base.
+    /// Pin the shared HTTP worker pool by hand. 0 = derive it from `max_sse_streams`, which
+    /// is what you want. Setting it overrides the derivation, and the stream target is then
+    /// clamped to whatever the pool you chose can actually carry.
     std::size_t http_worker_threads{0};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)

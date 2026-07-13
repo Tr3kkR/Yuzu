@@ -671,9 +671,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // chain currently get a row per reconnect; the forensic-grade audit on
     // first-load remains on /fragments/executions/{id}/detail's
     // `execution.detail.view`.
+    auto* stream_budget = deps.stream_budget;
     sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))",
-             [auth_fn, perm_fn, audit_fn, execution_tracker,
-              execution_event_bus](const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
+              stream_budget](const httplib::Request& req, httplib::Response& res) {
                  auto session = auth_fn(req, res);
                  if (!session)
                      return;
@@ -764,6 +765,27 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          sink_state->cv.notify_one();
                      });
                  std::string captured_exec_id = exec_id;
+
+                 // Admission control. This response is about to hold an httplib worker thread
+                 // for as long as the operator leaves the drawer open, so it takes a lease from
+                 // the ONE budget every streaming surface shares (ADR-0030). Held in a
+                 // shared_ptr so it dies with the release lambda — the worker goes back on any
+                 // teardown path, including a throw.
+                 auto lease = std::make_shared<detail::StreamBudget::Lease>();
+                 if (stream_budget != nullptr) {
+                     auto admitted = stream_budget->try_acquire(detail::SseSurface::kDashboardExec,
+                                                                session->username,
+                                                                detail::kPerPrincipalDashboard);
+                     if (!admitted.lease) {
+                         res.status = 429;
+                         res.set_header("Retry-After", "5");
+                         res.set_content("too many live streams open — close a tab and retry",
+                                         "text/plain; charset=utf-8");
+                         return;
+                     }
+                     *lease = std::move(admitted.lease);
+                 }
+
                  // UP-1: adopt any pending engine QuotaSlot into this
                  // stream's resource-releaser so the concurrency reservation
                  // survives for the stream's actual lifetime instead of
@@ -815,10 +837,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          return true;
                      },
                      detail::adopt_quota_slot_into_stream(
-                         [sink_state, bus, captured_exec_id](bool /*success*/) {
+                         [sink_state, bus, captured_exec_id, lease](bool /*success*/) {
                              sink_state->closed.store(true);
                              sink_state->cv.notify_all();
                              bus->unsubscribe(captured_exec_id, sink_state->sub_id);
+                             // The lease dies with this lambda, returning the worker to the
+                             // one budget every streaming surface shares (ADR-0030).
                          }));
              });
 

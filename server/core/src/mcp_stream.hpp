@@ -122,6 +122,11 @@ inline constexpr std::size_t kMcpRingBytesCapDefault = 64 * 1024;
 /// turning every resume into a gap.
 inline constexpr std::size_t kMinRingBytesCap = 256;
 
+/// Per-principal MCP stream allowance. A per-SURFACE policy, not a pool limit — the pool is
+/// protected by the budget's global cap alone. This one exists to stop a single agentic
+/// token monopolising the channel, not to ration capacity.
+inline constexpr std::size_t kMcpStreamsPerPrincipalDefault = 4;
+
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
 /// to tell "your credential was revoked" from "our auth backend is down".
@@ -253,7 +258,8 @@ public:
     /// `budget == nullptr` disables admission control (test seams only —
     /// production always wires the shared budget).
     AttachResult attach_and_replay(std::uint64_t last_event_id, sse_bus::StreamBudget* budget,
-                                   const std::string& principal);
+                                   const std::string& principal,
+                                   std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault);
 
     /// Close the live sink, if any (idempotent). Wakes the provider, which writes the
     /// final `stream-closed` frame and returns false. Never blocks on socket I/O —

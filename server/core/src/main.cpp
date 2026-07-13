@@ -432,20 +432,21 @@ int main(int argc, char* argv[]) {
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
                    "repeatable). Empty rejects any present Origin (absent is always allowed).")
         ->envname("YUZU_MCP_ALLOWED_ORIGINS");
-    app.add_option("--mcp-max-streams", cfg.mcp_max_streams,
-                   "Max concurrently held-open MCP SSE streams (each pins one HTTP worker; "
-                   "clamped at boot to the worker pool minus a plain-REST reserve)")
-        ->envname("YUZU_MCP_MAX_STREAMS");
+    app.add_option("--max-sse-streams", cfg.max_sse_streams,
+                   "Concurrent held-open SSE responses this server is sized for, across ALL "
+                   "streaming surfaces (MCP GET, /api/v1/events, dashboard, legacy /events). "
+                   "The HTTP worker pool is derived from this: a stream costs one blocked "
+                   "thread (~8-16 KB, no CPU). 0 = default (128). See ADR-0030.")
+        ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))
+        ->envname("YUZU_MAX_SSE_STREAMS");
     app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
-                   "Max concurrently held-open MCP SSE streams per principal")
+                   "Max concurrent MCP SSE streams for a single principal — an anti-monopoly "
+                   "policy, not a capacity limit (capacity is --max-sse-streams)")
         ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
     app.add_option("--http-worker-threads", cfg.http_worker_threads,
-                   "Base size of the shared HTTP worker pool (0 = auto: max(8, cores-1); "
-                   "pool grows to 4x this; values below 8 are floored). Held-open SSE "
-                   "streams are budgeted against it.")
-        // Bounded: the pool max is 4x this, and an absurd value would overflow that
-        // product into a max < base, which httplib's ThreadPool ctor throws on — at
-        // listen() time, long after the flag was accepted.
+                   "Pin the shared HTTP worker pool size by hand. 0 (default) derives it from "
+                   "--max-sse-streams, which is what you want; setting it clamps the stream "
+                   "target to what your pool can carry.")
         ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))
         ->envname("YUZU_HTTP_WORKER_THREADS");
 

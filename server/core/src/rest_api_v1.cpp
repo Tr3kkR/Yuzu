@@ -1146,7 +1146,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store,
+    detail::StreamBudget* stream_budget) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1159,7 +1160,7 @@ void RestApiV1::register_routes(
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
-                    std::move(app_perf_providers), engine_principal_store);
+                    std::move(app_perf_providers), engine_principal_store, stream_budget);
 }
 
 void RestApiV1::register_routes(
@@ -1178,7 +1179,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store,
+    detail::StreamBudget* stream_budget) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -8803,8 +8805,8 @@ void RestApiV1::register_routes(
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
     sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-                                metrics_registry](const httplib::Request& req,
-                                                  httplib::Response& res) {
+                                metrics_registry, stream_budget](const httplib::Request& req,
+                                                                 httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session) {
             // auth_fn already set 401 + body. Nothing to do.
@@ -9028,6 +9030,28 @@ void RestApiV1::register_routes(
                 detail::enqueue_capped(sink_state, std::move(sse));
             });
 
+        // Admission control (ADR-0030). This response is about to hold an httplib worker for
+        // the life of the subscription. Taken BEFORE the bus subscription so a rejected
+        // caller never leaves a listener behind. Held in a shared_ptr so the lease dies with
+        // the release lambda — the worker returns on every teardown path.
+        auto lease = std::make_shared<detail::StreamBudget::Lease>();
+        if (stream_budget != nullptr) {
+            auto admitted = stream_budget->try_acquire(detail::SseSurface::kApiEvents,
+                                                       session->username,
+                                                       detail::kPerPrincipalApiEvents);
+            if (!admitted.lease) {
+                res.status = 429;
+                res.set_content(
+                    detail::error_json_a4(429, "too many concurrent event streams", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "close an existing /api/v1/events stream, or raise "
+                                          "--max-sse-streams"),
+                    "application/json");
+                return;
+            }
+            *lease = std::move(admitted.lease);
+        }
+
         auto* bus = execution_event_bus;
         sink_state->sub_id =
             bus->subscribe(exec_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
@@ -9156,7 +9180,7 @@ void RestApiV1::register_routes(
                 return true;
             },
             detail::adopt_quota_slot_into_stream(
-                [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
+                [sink_state, bus, exec_id_for_capture, metrics_registry, lease](bool /*success*/) {
                     sink_state->closed.store(true);
                     sink_state->cv.notify_all();
                     bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
@@ -9164,6 +9188,7 @@ void RestApiV1::register_routes(
                         metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
                             .decrement();
                     }
+                    // `lease` dies here, returning the worker to the one shared budget.
                 }));
     });
 

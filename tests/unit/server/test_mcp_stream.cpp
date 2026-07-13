@@ -57,44 +57,47 @@ mcp::McpStreamPump::Config fast_cfg(std::chrono::milliseconds grace = std::chron
 
 TEST_CASE("StreamBudget: per-principal cap rejects the newcomer, never a live lease",
           "[mcp][stream][ch5]") {
-    detail::StreamBudget budget{{.global_cap = 10, .per_principal_cap = 2}};
+    detail::StreamBudget budget{{.global_cap = 10}};
+    constexpr std::size_t kPerPrincipal = 2;
 
-    auto a = budget.try_acquire("alice");
-    auto b = budget.try_acquire("alice");
+    auto a = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", kPerPrincipal);
+    auto b = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", kPerPrincipal);
     REQUIRE(a.lease);
     REQUIRE(b.lease);
 
-    auto c = budget.try_acquire("alice");
+    auto c = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", kPerPrincipal);
     CHECK_FALSE(c.lease);
     CHECK(std::string(c.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
     // The two live leases are untouched — a cap hit denies the new stream, it does
     // not tear down streams that were already admitted.
-    CHECK(budget.active_for("alice") == 2);
+    CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 2);
     CHECK(a.lease);
     CHECK(b.lease);
 
     // A different principal is unaffected by alice's cap.
-    auto d = budget.try_acquire("bob");
+    auto d = budget.try_acquire(detail::SseSurface::kMcpGet, "bob", kPerPrincipal);
     CHECK(d.lease);
     CHECK(budget.active() == 3);
 }
 
 TEST_CASE("StreamBudget: global cap rejects across principals", "[mcp][stream][ch5]") {
-    detail::StreamBudget budget{{.global_cap = 2, .per_principal_cap = 8}};
-    auto a = budget.try_acquire("alice");
-    auto b = budget.try_acquire("bob");
+    detail::StreamBudget budget{{.global_cap = 2}};
+    constexpr std::size_t kPerPrincipal = 8;
+    auto a = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", kPerPrincipal);
+    auto b = budget.try_acquire(detail::SseSurface::kMcpGet, "bob", kPerPrincipal);
     REQUIRE(a.lease);
     REQUIRE(b.lease);
 
-    auto c = budget.try_acquire("carol");
+    auto c = budget.try_acquire(detail::SseSurface::kMcpGet, "carol", kPerPrincipal);
     CHECK_FALSE(c.lease);
     CHECK(std::string(c.reject_reason) == detail::StreamBudget::kRejectGlobal);
 }
 
 TEST_CASE("StreamBudget: a lease returns its slot exactly once", "[mcp][stream][ch5]") {
-    detail::StreamBudget budget{{.global_cap = 1, .per_principal_cap = 1}};
+    detail::StreamBudget budget{{.global_cap = 1}};
+    constexpr std::size_t kPerPrincipal = 1;
     {
-        auto a = budget.try_acquire("alice");
+        auto a = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", kPerPrincipal);
         REQUIRE(a.lease);
         CHECK(budget.active() == 1);
         a.lease.release();
@@ -104,21 +107,22 @@ TEST_CASE("StreamBudget: a lease returns its slot exactly once", "[mcp][stream][
     }
     CHECK(budget.active() == 0);
     // Slot is genuinely free again.
-    auto b = budget.try_acquire("bob");
+    auto b = budget.try_acquire(detail::SseSurface::kMcpGet, "bob", kPerPrincipal);
     CHECK(b.lease);
 }
 
 TEST_CASE("StreamBudget: the per-principal map is bounded by LIVE principals",
           "[mcp][stream][ch5]") {
-    detail::StreamBudget budget{{.global_cap = 100, .per_principal_cap = 1}};
+    detail::StreamBudget budget{{.global_cap = 100}};
+    constexpr std::size_t kPerPrincipal = 1;
     for (int i = 0; i < 50; ++i) {
-        auto lease = budget.try_acquire("principal-" + std::to_string(i));
+        auto lease = budget.try_acquire(detail::SseSurface::kMcpGet, "principal-" + std::to_string(i), kPerPrincipal);
         CHECK(lease.lease);
     } // each lease dies here
     // A per-principal entry that never erased at zero would leave 50 rows behind
     // for 50 principals that have long since disconnected.
     CHECK(budget.active() == 0);
-    CHECK(budget.active_for("principal-7") == 0);
+    CHECK(budget.active_for(detail::SseSurface::kMcpGet, "principal-7") == 0);
 }
 
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
@@ -242,7 +246,8 @@ TEST_CASE("McpStreamState: a live sink receives published frames", "[mcp][stream
 
 TEST_CASE("McpStreamState: a takeover is admitted at a full cap but is still COUNTED (CH-5)",
           "[mcp][stream][ch5]") {
-    detail::StreamBudget budget{{.global_cap = 1, .per_principal_cap = 1}};
+    detail::StreamBudget budget{{.global_cap = 1}};
+    constexpr std::size_t kPerPrincipal = 1;
     mcp::McpStreamState state;
 
     auto first = state.attach_and_replay(0, &budget, "alice");
@@ -283,7 +288,8 @@ TEST_CASE("McpStreamState: a second takeover is refused while the handover is pe
     // rule a client could hammer GET on one session and pin providers without limit —
     // each superseded one still holds a worker until it drains, and a peer with a
     // closed TCP window can stall that for the whole write timeout.
-    detail::StreamBudget budget{{.global_cap = 100, .per_principal_cap = 100}};
+    detail::StreamBudget budget{{.global_cap = 100}};
+    constexpr std::size_t kPerPrincipal = 100;
     mcp::McpStreamState state;
 
     auto first = state.attach_and_replay(0, &budget, "alice");
@@ -341,13 +347,14 @@ TEST_CASE("McpStreamState: a cap hit rejects the attach and leaves the ring inta
     // Global headroom to spare, so the PER-PRINCIPAL cap is the only constraint
     // that binds — and the reject reason must name that one, not the global cap it
     // is nowhere near (an operator raising the wrong knob fixes nothing).
-    detail::StreamBudget budget{{.global_cap = 8, .per_principal_cap = 1}};
+    detail::StreamBudget budget{{.global_cap = 8}};
+    constexpr std::size_t kPerPrincipal = 1; // the surface's own anti-monopoly policy
     mcp::McpStreamState busy;
-    auto held = busy.attach_and_replay(0, &budget, "alice");
+    auto held = busy.attach_and_replay(0, &budget, "alice", kPerPrincipal);
     REQUIRE(held.status == mcp::McpStreamState::AttachStatus::kAttached);
 
     mcp::McpStreamState other;
-    auto rejected = other.attach_and_replay(0, &budget, "alice");
+    auto rejected = other.attach_and_replay(0, &budget, "alice", kPerPrincipal);
     CHECK(rejected.status == mcp::McpStreamState::AttachStatus::kStreamCapHit);
     CHECK(std::string(rejected.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
     CHECK_FALSE(rejected.sink);
@@ -604,7 +611,8 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
 TEST_CASE("McpStreamState: concurrent publish / attach / detach / close is race-free",
           "[mcp][stream][race]") {
     auto state = std::make_shared<mcp::McpStreamState>(/*ring_cap=*/16);
-    detail::StreamBudget budget{{.global_cap = 64, .per_principal_cap = 64}};
+    detail::StreamBudget budget{{.global_cap = 64}};
+    constexpr std::size_t kPerPrincipal = 64;
     std::atomic<bool> stop{false};
     std::vector<std::thread> threads;
 

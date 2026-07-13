@@ -5833,7 +5833,7 @@ TEST_CASE("MCP 2f PR2: attach audit failure sets Sec-Audit-Failed and PROCEEDS",
 
 TEST_CASE("MCP 2f PR2/CH-5: stream cap rejects with an A4 429 and never evicts a live stream",
           "[mcp][transport][2f][stream][ch5]") {
-    yuzu::server::detail::StreamBudget budget{{.global_cap = 1, .per_principal_cap = 1}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 1}};
     mcp::McpSessionRegistry reg;
     McpTestServer ts;
     ts.session_registry_for_test = &reg;
@@ -5922,7 +5922,7 @@ TEST_CASE("MCP 2f PR2: tearing down the response returns the worker and audits t
     // running — or threw — every stream would leak a worker slot until restart, which is
     // invisible in testing and fatal over a server's uptime. Destroying the Response here
     // exercises exactly the production teardown.
-    yuzu::server::detail::StreamBudget budget{{.global_cap = 4, .per_principal_cap = 4}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
     mcp::McpSessionRegistry reg;
     McpTestServer ts;
     ts.session_registry_for_test = &reg;
@@ -5951,7 +5951,7 @@ TEST_CASE("MCP 2f PR2/CH-5: a rapid re-GET is refused while the superseded strea
     // Bounds the pool: a takeover skips the cap check (so a client is never locked out
     // by its own zombie), so the number of PROVIDERS per session must be bounded some
     // other way — one live plus at most one draining.
-    yuzu::server::detail::StreamBudget budget{{.global_cap = 8, .per_principal_cap = 8}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
     mcp::McpSessionRegistry reg;
     McpTestServer ts;
     ts.session_registry_for_test = &reg;

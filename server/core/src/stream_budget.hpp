@@ -20,38 +20,58 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <utility>
 
 namespace yuzu::server::detail {
 
-/// Plain-REST reserve: worker threads held back from streams, so a saturated stream
-/// budget does not starve ordinary request/response traffic (Decision 15(h), CH-6).
+/// Plain-REST reserve: worker threads held back from streams, so held-open connections
+/// can never starve ordinary request/response traffic (ADR-0030 Decision 1; ADR-1005
+/// execution plan Decision 15(h); chaos CH-6).
 ///
-/// HONESTY NOTE: this is a reserve only against the surfaces that actually take
-/// leases. httplib has no per-route worker reservation — three other held-open
-/// providers share the same pool and are still UNCAPPED (`GET /api/v1/events`,
-/// the dashboard execution SSE, and the legacy `/events` stream; issue #2056 moves
-/// them onto this budget). Until they adopt it, the reserve bounds the MCP surface,
-/// not the pool as a whole.
+/// This is a real reserve, not an aspiration: EVERY surface that holds a response open
+/// leases from the one budget below — MCP's GET channel, `GET /api/v1/events`, the
+/// dashboard executions drawer, and the legacy `/events` stream. A surface that held a
+/// worker without a lease would make the arithmetic here a fiction.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
 
-/// Workers a single permitted stream can pin at once. A stream is normally one
-/// provider on one worker — but a takeover leaves the superseded provider draining
-/// (still pinning its worker) while the replacement runs, and `McpStreamState` allows
-/// at most ONE pending handover per session. So the budget must reserve two workers
-/// for every stream it admits, or a fleet of reconnecting clients would oversubscribe
-/// the pool by exactly the number of handovers in flight.
+/// Workers a single permitted stream can pin at once. A stream is normally one provider on
+/// one worker — but a takeover leaves the superseded provider draining (still pinning its
+/// worker) while the replacement runs, and `McpStreamState` allows at most ONE pending
+/// handover per session. So the pool must afford two workers for every stream admitted, or
+/// a fleet of reconnecting clients oversubscribes it by the number of handovers in flight.
 inline constexpr std::size_t kMaxProvidersPerStream = 2;
 
-/// Floor for `--http-worker-threads`. httplib's own default base is `max(8, cores-1)`;
-/// going below 8 drives the derived stream budget to zero, which would disable MCP
-/// streaming entirely from behind a knob that reads like a tuning parameter.
+/// Concurrent held-open responses the server is sized for, across ALL surfaces.
+///
+/// This is the number an operator reasons about, and the pool is derived FROM it — not the
+/// other way round (ADR-0030 Decision 2). The previous arrow pointed the wrong way: the pool
+/// was httplib's accidental default (32 on an 8-core box) and the stream cap fell out of it
+/// at 12 — while this platform's own design notes size it for "hundreds of agentic clients
+/// per server" (`event_bus.hpp`). A cap two orders of magnitude below the workload is not a
+/// safety feature, it is a self-inflicted scarcity.
+///
+/// A stream costs a BLOCKED thread: ~8-16 KB resident (the 8 MB stack is virtual), zero CPU,
+/// and one wakeup per heartbeat. 128 streams is a few MB and a few tens of wakeups a second.
+inline constexpr std::size_t kTargetHeldOpenStreamsDefault = 128;
+
+/// Workers needed to honour a stream target, with the plain-REST reserve intact.
+/// The inverse of the old `derive_stream_budget`, and the direction the arrow should have
+/// pointed from the start.
+inline constexpr std::size_t derive_worker_pool(std::size_t target_streams,
+                                                std::size_t plain_rest_reserve) {
+    return kMaxProvidersPerStream * target_streams + plain_rest_reserve;
+}
+
+/// Floor for an explicit `--http-worker-threads`. Below httplib's own default base the
+/// derived budget collapses, which would disable streaming from behind a knob that reads
+/// like a tuning parameter.
 inline constexpr std::size_t kMinHttpWorkerThreads = 8;
 
-/// Effective global stream cap: the operator's request, clamped to what the worker
-/// pool can actually spare once the reserve and the per-stream provider allowance are
-/// taken out. Pure — the unit-testable half of CH-6.
+/// Held-open responses a given pool can afford once the reserve is held back. Retained as
+/// the safety clamp for an operator who pins `--http-worker-threads` by hand: the target is
+/// honoured only if the pool they chose can actually carry it.
 inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
                                                   std::size_t plain_rest_reserve,
                                                   std::size_t requested_global_cap) {
@@ -60,24 +80,84 @@ inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
     return requested_global_cap < affordable ? requested_global_cap : affordable;
 }
 
-/// Global + per-principal admission counters for held-open SSE responses.
+/// Per-surface per-principal policies. These are ANTI-MONOPOLY limits, not capacity limits —
+/// capacity is the global cap alone. They differ per surface because the questions differ: an
+/// agentic token holding MCP streams is not the same actor as an operator with nine dashboard
+/// tabs open, and one number cannot answer both without locking somebody out of the product.
+inline constexpr std::size_t kPerPrincipalApiEvents = 16;
+inline constexpr std::size_t kPerPrincipalDashboard = 16;
+/// The legacy `/events` stream performs NO authentication (a separate, tracked defect: it is a
+/// pre-auth thread-pinning DoS on today's dev). Every unauthenticated caller therefore shares
+/// ONE small bucket, which bounds that DoS without locking out a signed-in operator, whose
+/// connections key to their own principal instead.
+inline constexpr std::size_t kPerPrincipalAnonymous = 4;
+
+/// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
+/// the list ADR-0030 says must be exhaustive. Adding a new streaming route means adding a
+/// value here and taking a lease; there is no third option.
+enum class SseSurface {
+    kMcpGet,          ///< GET /mcp/v1/          — token, principal-bound session
+    kApiEvents,       ///< GET /api/v1/events    — token, Execution:Read
+    kDashboardExec,   ///< GET /sse/executions/{id} — cookie, the executions drawer
+    kLegacyEvents,    ///< GET /events           — the legacy dashboard stream
+};
+
+inline const char* to_string(SseSurface s) {
+    switch (s) {
+    case SseSurface::kMcpGet:
+        return "mcp_get";
+    case SseSurface::kApiEvents:
+        return "api_events";
+    case SseSurface::kDashboardExec:
+        return "dashboard_exec";
+    case SseSurface::kLegacyEvents:
+        return "legacy_events";
+    }
+    return "unknown";
+}
+
+/// THE admission budget for held-open responses — one instance, every surface.
 ///
-/// REJECT-not-evict (Decision 15(j)): a cap hit denies the NEW stream; a live
-/// stream is never torn down to make room for a newcomer, so one noisy
-/// principal cannot cut another's stream.
+/// The global cap is the only thing protecting the shared worker pool, so it is the
+/// budget's own business. The PER-PRINCIPAL cap is a per-surface POLICY and is therefore
+/// supplied by the caller: an agentic token holding 4 MCP streams is a different question
+/// from an operator with 9 dashboard tabs open, and a single number cannot answer both
+/// without locking somebody out of their own product.
+///
+/// REJECT-not-evict (Decision 15(j)): a cap hit denies the NEW stream; a live stream is
+/// never torn down to make room for a newcomer, so one noisy principal cannot cut another's.
 ///
 /// Thread-safe: httplib dispatches attach/release across worker threads.
 class StreamBudget {
 public:
     struct Config {
-        std::size_t global_cap = 16;
-        std::size_t per_principal_cap = 4;
+        /// Held-open responses allowed across ALL surfaces. Derived from the worker pool,
+        /// which is in turn derived from the operator's declared stream target (ADR-0030).
+        std::size_t global_cap = kTargetHeldOpenStreamsDefault;
     };
 
     explicit StreamBudget(Config cfg) : cfg_(cfg) {}
 
     StreamBudget(const StreamBudget&) = delete;
     StreamBudget& operator=(const StreamBudget&) = delete;
+
+    /// Per-principal counting is keyed by SURFACE too: a principal's dashboard tabs and
+    /// their MCP streams are different allowances answering different questions.
+    struct Key {
+        SseSurface surface = SseSurface::kMcpGet;
+        std::string principal;
+
+        bool operator==(const Key& o) const noexcept {
+            return surface == o.surface && principal == o.principal;
+        }
+    };
+
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const noexcept {
+            return std::hash<std::string>{}(k.principal) ^
+                   (static_cast<std::size_t>(k.surface) * 0x9e3779b97f4a7c15ULL);
+        }
+    };
 
     /// Move-only RAII slot. Releasing is idempotent and never throws, so a
     /// stream's slot is returned exactly once no matter which path
@@ -87,7 +167,7 @@ public:
         Lease() = default;
 
         Lease(Lease&& other) noexcept
-            : budget_(other.budget_), principal_(std::move(other.principal_)) {
+            : budget_(other.budget_), key_(std::move(other.key_)) {
             other.budget_ = nullptr;
         }
 
@@ -95,7 +175,7 @@ public:
             if (this != &other) {
                 release();
                 budget_ = other.budget_;
-                principal_ = std::move(other.principal_);
+                key_ = std::move(other.key_);
                 other.budget_ = nullptr;
             }
             return *this;
@@ -118,18 +198,17 @@ public:
         /// throwing member.
         void release() noexcept {
             if (budget_ != nullptr) {
-                budget_->release_slot(principal_);
+                budget_->release_slot(key_);
                 budget_ = nullptr;
             }
         }
 
     private:
         friend class StreamBudget;
-        Lease(StreamBudget* budget, std::string principal)
-            : budget_(budget), principal_(std::move(principal)) {}
+        Lease(StreamBudget* budget, Key key) : budget_(budget), key_(std::move(key)) {}
 
         StreamBudget* budget_ = nullptr;
-        std::string principal_;
+        Key key_;
     };
 
     struct AcquireResult {
@@ -155,16 +234,22 @@ public:
     /// pinning its worker until it drains; an uncounted pinned worker is precisely
     /// the hole this budget exists to close. The resulting overshoot is bounded by
     /// `kMaxProvidersPerStream`, which `derive_stream_budget` reserves for.
-    AcquireResult try_acquire(const std::string& principal,
+    /// `per_principal_cap` is the CALLER's policy for its surface (0 = no per-principal
+    /// limit — the global cap still applies, and it is the only thing the worker pool
+    /// actually needs). Counting is keyed by (surface, principal), so an operator's
+    /// dashboard tabs and their MCP streams do not compete for the same allowance.
+    AcquireResult try_acquire(SseSurface surface, const std::string& principal,
+                              std::size_t per_principal_cap,
                               Admission mode = Admission::kEnforceCaps) {
+        const Key key{surface, principal};
         std::lock_guard<std::mutex> lk(mu_);
-        auto it = per_principal_.find(principal);
+        auto it = per_principal_.find(key);
         const std::size_t held = it == per_principal_.end() ? 0 : it->second;
         if (mode == Admission::kEnforceCaps) {
             if (total_ >= cfg_.global_cap) {
                 return {Lease{}, kRejectGlobal};
             }
-            if (held >= cfg_.per_principal_cap) {
+            if (per_principal_cap > 0 && held >= per_principal_cap) {
                 return {Lease{}, kRejectPerPrincipal};
             }
         }
@@ -182,30 +267,35 @@ public:
         // So: make the string copy and reserve the map node (both may throw, nothing has
         // moved), then move the counters (cannot throw), then hand the already-owned
         // string to the Lease by move (cannot throw).
-        std::string owner = principal;
-        auto [entry, inserted] = per_principal_.try_emplace(principal, held);
+        Key owner = key;
+        auto [entry, inserted] = per_principal_.try_emplace(key, held);
         entry->second = held + 1;
         ++total_;
         return {Lease{this, std::move(owner)}, nullptr};
     }
 
+    /// Held-open responses right now, across every surface. THE number: this is what the
+    /// worker pool is actually spending, and `active() / capacity()` is the utilisation an
+    /// operator needs (ADR-0030 Decision 3) — no per-surface gauge can express it.
     std::size_t active() const {
         std::lock_guard<std::mutex> lk(mu_);
         return total_;
     }
 
-    std::size_t active_for(const std::string& principal) const {
+    std::size_t capacity() const { return cfg_.global_cap; }
+
+    std::size_t active_for(SseSurface surface, const std::string& principal) const {
         std::lock_guard<std::mutex> lk(mu_);
-        auto it = per_principal_.find(principal);
+        auto it = per_principal_.find(Key{surface, principal});
         return it == per_principal_.end() ? 0 : it->second;
     }
 
     Config config() const { return cfg_; }
 
 private:
-    void release_slot(const std::string& principal) {
+    void release_slot(const Key& key) {
         std::lock_guard<std::mutex> lk(mu_);
-        auto it = per_principal_.find(principal);
+        auto it = per_principal_.find(key);
         if (it == per_principal_.end()) {
             return;  // defensive: a lease is only minted through try_acquire
         }
@@ -222,7 +312,7 @@ private:
     mutable std::mutex mu_;
     Config cfg_;
     std::size_t total_ = 0;
-    std::unordered_map<std::string, std::size_t> per_principal_;
+    std::unordered_map<Key, std::size_t, KeyHash> per_principal_;
 };
 
 }  // namespace yuzu::server::detail

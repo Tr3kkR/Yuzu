@@ -242,7 +242,8 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
 
 McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t last_event_id,
                                                                sse_bus::StreamBudget* budget,
-                                                               const std::string& principal) {
+                                                               const std::string& principal,
+                                                               std::size_t per_principal_cap) {
     AttachResult out;
     std::shared_ptr<McpStreamSink> superseded;
     sse_bus::StreamBudget::Lease new_lease;
@@ -295,7 +296,8 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
             // A takeover bypasses the CAPS but not the accounting.
             const auto mode = is_takeover ? sse_bus::StreamBudget::Admission::kTakeover
                                           : sse_bus::StreamBudget::Admission::kEnforceCaps;
-            auto acquired = budget->try_acquire(principal, mode);
+            auto acquired = budget->try_acquire(sse_bus::SseSurface::kMcpGet, principal,
+                                                per_principal_cap, mode);
             if (!acquired.lease) {
                 // Only reachable on the first-attach path (a takeover always admits). The
                 // session is untouched — nothing has been mutated yet.
@@ -695,7 +697,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
-    auto attached = stream->attach_and_replay(last_event_id, budget, principal);
+    auto attached = stream->attach_and_replay(last_event_id, budget, principal,
+                                              kMcpStreamsPerPrincipalDefault);
     if (attached.status == McpStreamState::AttachStatus::kGap) {
         // The cursor's frames are gone. Terminate the session so the client's next
         // POST 404s too — one coherent "re-initialize" signal, and no abandoned
