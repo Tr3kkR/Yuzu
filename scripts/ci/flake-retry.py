@@ -36,6 +36,10 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime
 
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
+# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092):
+# '[pg]', '~[pg]', '[a][b]', '~[a][b]'. Name specs / comma lists are not used
+# in tests/meson.build (its comment holds that line), so they are not matched.
+CATCH2_TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
 
@@ -153,6 +157,19 @@ def match_suite(failed_name, tests):
 
 
 # ── running Catch2 binaries ───────────────────────────────────────────────────
+def _cmd_without_test_specs(cmd):
+    """cmd minus positional Catch2 tag-filter specs.
+
+    Sharded meson entries (#2092) carry a tag spec ('~[pg]' / '[pg]') in their
+    args, and Catch2 ORs positional test specs — appending a case name to the
+    introspected cmd would re-run the whole shard ∪ case. The isolated retry
+    must REPLACE the shard filter with the case name. argv[0] and option args
+    are never touched."""
+    if not cmd:
+        return []
+    return [cmd[0]] + [a for a in cmd[1:] if not CATCH2_TAG_SPEC.match(a)]
+
+
 def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
@@ -170,6 +187,9 @@ def catch2_failed_cases(test, this_os):
     clean unclassifiable result instead of blocking the job indefinitely — the
     observed failure mode this guards is a fast abnormal exit, not a hang, so
     this is a robustness net rather than a fix for that specific pattern."""
+    # Deliberately keeps any shard tag-filter in cmd: the enumeration re-run
+    # must only surface failures from THIS shard (#2092). Only the isolated
+    # retry_case() strips it.
     cmd = test.get("cmd") or []
     if not cmd or not CATCH2_EXE.search(os.path.basename(cmd[0])):
         return None  # gateway (python) or anything not a Catch2 binary
@@ -197,7 +217,8 @@ def retry_case(test, case, retries):
     crash — same timeout source and rationale as catch2_failed_cases()."""
     for _ in range(retries):
         try:
-            result = _run(test.get("cmd"), test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(_cmd_without_test_specs(test.get("cmd") or []),
+                          test.get("env"), test.get("workdir"), extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -339,6 +360,26 @@ def _selftest():
     # suite matching.
     tests = [{"name": "agent unit tests", "cmd": ["x"]}, {"name": "tar unit tests", "cmd": ["y"]}]
     check(match_suite("agent - yuzu:agent unit tests", tests)["cmd"] == ["x"], "suite match")
+
+    # sharded server suite (#2092): the two shard names must map uniquely
+    # (neither is a substring of the other; longest-match protects prefixes).
+    shards = [{"name": "server unit tests", "cmd": ["s", "~[pg]"]},
+              {"name": "server pg unit tests", "cmd": ["s", "[pg]"]}]
+    check(match_suite("server - yuzu:server unit tests", shards)["cmd"] == ["s", "~[pg]"],
+          "non-pg shard maps to itself")
+    check(match_suite("server - yuzu:server pg unit tests", shards)["cmd"] == ["s", "[pg]"],
+          "pg shard maps to itself")
+
+    # tag-spec surgery for isolated retries (#2092): strip positional tag
+    # filters, keep argv[0] and option args, never invent args.
+    check(_cmd_without_test_specs(["x", "~[pg]"]) == ["x"], "strips ~[pg]")
+    check(_cmd_without_test_specs(["x", "[pg]"]) == ["x"], "strips [pg]")
+    check(_cmd_without_test_specs(["x", "--foo", "[a][b]"]) == ["x", "--foo"],
+          "strips compound tag spec, keeps options")
+    check(_cmd_without_test_specs(["x"]) == ["x"], "no-spec cmd unchanged")
+    check(_cmd_without_test_specs([]) == [], "empty cmd stays empty")
+    check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
+          "argv[0] untouched even when spec-shaped")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

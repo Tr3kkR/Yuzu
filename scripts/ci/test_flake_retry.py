@@ -42,6 +42,8 @@ if a and a[0] == "introspect":
         cmd = ["/bin/echo"]                 # basename not yuzu_*_tests -> unclassifiable
     else:
         cmd = [os.environ["FAKE_CATCH2_BIN"]]
+        if os.environ.get("FAKE_SHARD_SPEC"):   # sharded entry (#2092): tag filter in cmd
+            cmd.append(os.environ["FAKE_SHARD_SPEC"])
     print(json.dumps([{"name": "fake unit tests", "cmd": cmd, "env": {}, "workdir": None,
                        "suite": ["yuzu:fake"]}]))
     sys.exit(0)
@@ -59,17 +61,29 @@ sys.exit(0)
 """
 
 FAKE_CATCH2 = r"""#!/usr/bin/env python3
-import os, sys
+import os, re, sys
 a = sys.argv[1:]
 fail = [c for c in os.environ.get("FAKE_FAIL_CASES", "").split(";") if c]
 always = [c for c in os.environ.get("FAKE_ALWAYS_FAIL", "").split(";") if c]
+TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
 if "--reporter" in a:                       # enumeration run -> emit Catch2 junit
+    # A sharded entry's tag filter must SURVIVE into the enumeration run
+    # (#2092: only the isolated retry strips it) — a missing spec means the
+    # wrapper stripped too much, so emit nothing (-> unclassifiable -> block).
+    spec = os.environ.get("FAKE_SHARD_SPEC")
+    if spec and spec not in a:
+        sys.exit(1)
     out = a[a.index("--out") + 1]
     tcs = "".join('<testcase classname="c" name="%s"><failure>boom</failure></testcase>' % c
                   for c in fail)
     open(out, "w").write('<testsuites><testsuite name="fake">%s</testsuite></testsuites>' % tcs)
     sys.exit(1 if fail else 0)
-case = a[0] if a else ""                     # isolated retry of one case by name
+# Isolated retry of one case by name. A leftover tag spec means the wrapper
+# failed to strip the shard filter (real Catch2 would OR it with the case and
+# re-run the whole shard) -> hard fail so the recovery scenario can't pass.
+if any(TAG_SPEC.match(x) for x in a):
+    sys.exit(1)
+case = a[0] if a else ""
 sys.exit(1 if case in always else 0)
 """
 
@@ -122,6 +136,8 @@ def main():
         run_scenario("unlisted failure -> block", {"FAKE_FAIL_CASES": "RealBug"}, listed, False),
         run_scenario("non-Catch2 suite -> block",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_NONCATCH2": "1"}, listed, False),
+        run_scenario("sharded suite (#2092): retry replaces tag filter",
+                     {"FAKE_FAIL_CASES": "FlakeA", "FAKE_SHARD_SPEC": "~[pg]"}, listed, True),
     ]
     if all(results):
         print(f"\nflake-retry integration test: OK ({len(results)} scenarios)")
