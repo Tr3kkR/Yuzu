@@ -179,15 +179,19 @@ jobs:
         run: meson compile -C build-linux-asan
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Idempotent persistent `yuzu-ci-postgres` docker container on
-      # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
-      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
-      # fails the job here, before the test step.
+      # Idempotent persistent docker container — per agent on the 4-runner
+      # pool (`yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>, #2094) — same
+      # step as ci.yml's linux job. Required since #1320 PR 1 (SOFT_EXIT=1):
+      # a missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-asan --print-errorlogs
+        # --timeout-multiplier 2: the #2092 server shards carry 600s budgets
+        # sized for uninstrumented runs; sanitizer instrumentation runs
+        # slower (the pre-split 900s budget was justified by exactly that),
+        # and 2x1200s parallel shards still fit this job's timeout.
+        run: meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs
 
       - name: ccache stats
         if: always()
@@ -382,7 +386,8 @@ jobs:
         id: test
         env:
           LD_PRELOAD: /tmp/libgai_sync_shim.so
-        run: meson test -C build-linux-tsan --print-errorlogs
+        # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets).
+        run: meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs
 
       - name: Capture stack trace under gdb (#438 diagnostic)
         # With the gai_sync_shim active, the originally-documented #438
@@ -767,7 +772,9 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-coverage --print-errorlogs
+        # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets;
+        # coverage instrumentation is similarly slower than plain debug).
+        run: meson test -C build-linux-coverage --timeout-multiplier 2 --print-errorlogs
 
       - name: Generate coverage reports
         run: |
