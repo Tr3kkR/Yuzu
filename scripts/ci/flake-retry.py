@@ -192,7 +192,7 @@ def report_suite_budgets(builddir, tests, warn_frac=0.8):
     lines = ["### Suite durations vs meson budgets", "",
              "| test entry | wall (s) | budget (s) | used |", "|---|---:|---:|---:|"]
     for name, secs, budget, frac in rows:
-        lines.append(f"| {name} | {secs:.0f} | {budget if budget else '—'} | "
+        lines.append(f"| {name} | {secs:.0f} | {f'{budget:g}' if budget else '—'} | "
                      f"{f'{frac:.0%}' if frac is not None else '—'} |")
     summary("\n".join(lines))
 
@@ -354,6 +354,15 @@ def main(argv=None):
         if cases is None:
             blocked.append(f"{suite_name} (not a classifiable Catch2 run — crash/non-Catch2)")
             continue
+        if not cases:
+            # The suite failed under meson but a solo enumeration re-run
+            # reproduced no failing case — an order/contention-dependent
+            # failure (or a stale junit from a crashed previous run). Nothing
+            # can be attributed to a listed flake, so returning 0 here would
+            # mask a real red. Block, per the header contract.
+            blocked.append(f"{suite_name} (suite failed but enumeration re-run "
+                           f"reproduced no failing case — unclassifiable, no masking)")
+            continue
         for case in sorted(cases):
             entry = flaky.get(case)
             if entry is None:
@@ -500,6 +509,9 @@ def _selftest():
         check("tar unit tests" not in stdout, "no warning for the under-budget suite")
         with open(summary_path, encoding="utf-8") as f:
             table = f.read()
+        check("### Suite durations vs meson budgets" in table
+              and "| test entry | wall (s) | budget (s) | used |" in table,
+              "summary table heading and header row written")
         check("| server unit tests | 510 | 600 | 85% |" in table
               and "| tar unit tests | 12 | 90 | 13% |" in table,
               "summary table rows written on green")
@@ -553,16 +565,26 @@ def _selftest():
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
     check(len(_entries) >= 2, "meson.build: both server shard entries located")
-    _args_entries = 0
+    _shard_specs = []
     for _body in _entries:
-        _m = re.search(r"args:\s*\[(.*?)\]", _body, re.S)
+        # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
+        # own inner ']' and validates nothing (found independently by two
+        # governance reviewers) — the ']' inside a quoted string must be
+        # consumed by the string alternative, not end the list.
+        _m = re.search(r"args:\s*\[((?:\s*'[^']*'\s*,?)*)\]", _body, re.S)
         if not _m:
-            continue
-        _args_entries += 1
-        for _arg in re.findall(r"'([^']*)'", _m.group(1)):
+            continue  # an args-less entry has no positional specs to strip
+        _args = re.findall(r"'([^']*)'", _m.group(1))
+        check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
+        for _arg in _args:
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
-    check(_args_entries >= 2, "meson.build: both tag-filtered shard entries carry args")
+        _shard_specs.append(tuple(_args))
+    # Positive pin so hollow extraction can never pass again: the two shard
+    # filters must come back verbatim. A third shard or a rebalance updates
+    # this line consciously.
+    check(("~[pg]",) in _shard_specs and ("[pg]",) in _shard_specs,
+          "meson.build: both shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

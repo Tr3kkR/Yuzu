@@ -246,9 +246,13 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
 fi
 
 # dsn mode (Wee Tam machine env; per-agent ports post-#2114)
+degraded=0   # a precondition warning already names the real problem — don't
+             # also print the misleading generic "no instances" notice
+
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   if ! find_psql; then
     echo "::warning::sweep-test-databases: YUZU_TEST_POSTGRES_DSN is set but no psql found — DSN sweep skipped" >&2
+    degraded=1
   else
     dsn="$YUZU_TEST_POSTGRES_DSN"
     host="127.0.0.1"   # default when the DSN names no host
@@ -260,10 +264,13 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
       port="${BASH_REMATCH[6]:-5432}" query="${BASH_REMATCH[8]}"
       mkconn() { echo "${base}:$1/postgres${query}"; }
     else
-      # Keyword form: later keywords win in libpq conninfo strings.
+      # Keyword form: later keywords win in libpq conninfo strings. The
+      # key matches are anchored to start-of-string/whitespace so a value
+      # embedding "port="/"host=" (e.g. inside options='...') can't spoof
+      # the top-level keyword.
       port=5432
-      if [[ "$dsn" =~ port=([0-9]+) ]]; then port="${BASH_REMATCH[1]}"; fi
-      if [[ "$dsn" =~ host=([^[:space:]]+) ]]; then host="${BASH_REMATCH[1]}"; fi
+      if [[ "$dsn" =~ (^|[[:space:]])port=([0-9]+) ]]; then port="${BASH_REMATCH[2]}"; fi
+      if [[ "$dsn" =~ (^|[[:space:]])host=([^[:space:]]+) ]]; then host="${BASH_REMATCH[2]}"; fi
       mkconn() { echo "${dsn} port=$1 dbname=postgres"; }
     fi
     for ((n = 0; n < AGENTS; n++)); do
@@ -290,10 +297,11 @@ elif (( ! swept_any )) && tcp_probe 127.0.0.1 5432; then
     # A listener we can see but no client to sweep it with is a precondition
     # failure worth signalling, not a quiet "no instances".
     echo "::warning::sweep-test-databases: something listens on 127.0.0.1:5432 but no psql was found — native sweep skipped" >&2
+    degraded=1
   fi
 fi
 
-if (( ! swept_any )); then
+if (( ! swept_any && ! degraded )); then
   echo "::notice::sweep-test-databases: no Postgres instances to sweep on this host"
 fi
 exit 0

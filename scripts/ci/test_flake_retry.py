@@ -141,6 +141,13 @@ def main():
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_NONCATCH2": "1"}, listed, False),
         run_scenario("sharded suite (#2092): retry replaces tag filter",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_SHARD_SPEC": "~[pg]"}, listed, True),
+        # Suite red under meson, but the solo enumeration re-run reproduces
+        # ZERO failing cases (order/contention-dependent failure, or a stale
+        # junit from a crashed run). Nothing is attributable to a listed
+        # flake, so the wrapper must block — returning 0 here is the
+        # masked-green hole governance UP-1 closed.
+        run_scenario("suite fails, enumeration reproduces nothing -> block",
+                     {"FAKE_FAIL_CASES": ""}, listed, False),
     ]
     if all(results):
         print(f"\nflake-retry integration test: OK ({len(results)} scenarios)")
