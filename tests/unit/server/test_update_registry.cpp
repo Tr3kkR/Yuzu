@@ -7,6 +7,8 @@
 
 #include "update_registry.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -18,8 +20,11 @@ namespace fs = std::filesystem;
 namespace {
 
 /// Helper: create a temporary directory for update_dir and return its path.
+/// Process-salted: a fixed dir name is a cross-JOB shared resource on the
+/// shared-identity CI pools — one job's cleanup remove_all would yank the
+/// dir out from under another job's live UpdateRegistry (#1883).
 fs::path make_temp_update_dir() {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_update_registry";
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_update_registry-");
     std::error_code ec;
     fs::create_directories(tmp, ec);
     return tmp;

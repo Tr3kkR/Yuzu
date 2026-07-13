@@ -892,12 +892,12 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
-struct ScopedTestDb {
-    std::filesystem::path path;
-    ScopedTestDb() : path(std::filesystem::temp_directory_path() / "test_scoped_rbac.db") {
-        std::filesystem::remove(path);
-    }
-    ~ScopedTestDb() { std::filesystem::remove(path); }
+// Per-test SQLite temp file for the on-disk ManagementGroupStore — the fixed
+// "test_scoped_rbac.db" name was a cross-JOB shared resource on the
+// shared-identity CI pools (#1883); TempDbFile also picks up the -wal/-shm
+// cleanup the old fixture missed.
+struct ScopedTestDb : yuzu::test::TempDbFile {
+    ScopedTestDb() : TempDbFile("yuzu_test_scoped_rbac-") {}
 };
 } // namespace
 
