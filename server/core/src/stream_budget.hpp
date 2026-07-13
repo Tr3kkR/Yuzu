@@ -168,13 +168,17 @@ public:
                 return {Lease{}, kRejectPerPrincipal};
             }
         }
-        // Insert BEFORE bumping the total: the map insert allocates (a node plus a string
-        // copy) and can throw, and a throw after `++total_` would leak a global slot for
-        // the life of the process — a cap that silently tightens every time the machine is
-        // under memory pressure.
-        per_principal_[principal] = held + 1;
+        // Build the Lease FIRST, then mutate the counters. Every allocating step —
+        // the map node, and the Lease's own by-value copy of `principal` — must happen
+        // BEFORE any counter moves, because a throw after a counter has moved leaks that
+        // slot for the life of the process: a cap that silently tightens every time the
+        // machine is under memory pressure, with no lease in existence to give it back.
+        // Once the lease exists and the map node is reserved, nothing below can throw.
+        Lease lease{this, principal};
+        auto [entry, inserted] = per_principal_.try_emplace(principal, held);
+        entry->second = held + 1;
         ++total_;
-        return {Lease{this, principal}, nullptr};
+        return {std::move(lease), nullptr};
     }
 
     std::size_t active() const {

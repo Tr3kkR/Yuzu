@@ -47,6 +47,7 @@
 
 namespace yuzu {
 class MetricsRegistry;
+class Gauge;
 }
 
 namespace yuzu::server::auth {
@@ -283,6 +284,14 @@ private:
     std::shared_ptr<McpStreamSink> live_;
     std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    // Resolved ONCE at construction. MetricsRegistry::gauge(name) allocates (a string
+    // temporary for the name, plus a map node on first use) and takes the process-global
+    // registry lock — neither is acceptable on a path that runs under mu_, and a throw
+    // there would strand a sink that already holds a lease. The families live in
+    // node-based maps, so these references are stable for the registry's life; a
+    // Gauge::increment through them takes only that gauge's own mutex.
+    yuzu::Gauge* gauge_streams_active_ = nullptr;
+    yuzu::Gauge* gauge_streams_handover_ = nullptr;
 };
 
 /// The content-provider body of one live GET stream.

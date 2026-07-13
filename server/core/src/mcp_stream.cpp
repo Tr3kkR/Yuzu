@@ -33,6 +33,7 @@ static_assert(McpSessionRegistry::Config{}.ring_cap == kMcpRingCapDefault,
 namespace {
 
 constexpr std::size_t kMaxWriteSlice = 8192;  // sibling parity (/api/v1/events)
+constexpr std::size_t kMaxEventTypeBytes = 64;  // SSE event names are short by construction
 
 // Metric names — the Decision 15(k) family, fixed at PR 0 so dashboards/alerts
 // can be authored against them before the code lands.
@@ -153,7 +154,15 @@ const char* to_string(McpStreamClose reason) {
 McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metrics,
                                std::size_t ring_bytes_cap)
     : ring_cap_(ring_cap == 0 ? 1 : ring_cap),
-      ring_bytes_cap_(ring_bytes_cap == 0 ? 1 : ring_bytes_cap), metrics_(metrics) {}
+      ring_bytes_cap_(ring_bytes_cap == 0 ? 1 : ring_bytes_cap), metrics_(metrics) {
+    if (metrics_ != nullptr) {
+        // Pay the allocation and the global-registry lock HERE, once, on a path that is
+        // allowed to throw — not inside attach/detach, where a throw would strand a sink
+        // that is already live and already holds a budget lease.
+        gauge_streams_active_ = &metrics_->gauge(kMetricStreamsActive);
+        gauge_streams_handover_ = &metrics_->gauge(kMetricStreamsHandover);
+    }
+}
 
 std::uint64_t McpStreamState::publish(std::string event_type, std::string data) {
     std::shared_ptr<McpStreamSink> live;
@@ -174,6 +183,12 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
         if (event_type.size() + data.size() > ring_bytes_cap_) {
             data = "{\"error\":\"frame_too_large\",\"bytes\":" + std::to_string(data.size()) +
                    ",\"remediation\":\"fetch the full result by execution_id\"}";
+            // The frame is event_type + data, so a pathological type could still overshoot
+            // the bound the notice was meant to restore. Types are server-chosen and short
+            // ("message"); clamp anyway rather than trust that forever.
+            if (event_type.size() > kMaxEventTypeBytes) {
+                event_type.resize(kMaxEventTypeBytes);
+            }
             oversized = true;
         }
         std::lock_guard<std::mutex> lk(mu_);
@@ -259,31 +274,26 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         // instead: a session holds at most ONE draining sink, so at most TWO
         // providers — hence `derive_stream_budget` reserves 2 workers per permitted
         // stream, and a second takeover while a handover is still pending is refused.
-        if (live_) {
-            if (draining_) {
-                out.status = AttachStatus::kHandoverPending;
-                return out; // one handover at a time — this is what bounds the pool
-            }
-            draining_ = std::move(live_);
-            live_.reset();
-            superseded = draining_;
+        if (live_ && draining_) {
+            out.status = AttachStatus::kHandoverPending;
+            return out; // one handover at a time — this is what bounds the pool
         }
+        // Allocate BEFORE mutating live_/draining_. If make_shared threw after the
+        // supersede, the session would be left with no live sink and a superseded provider
+        // still on the wire receiving nothing — silent frame loss, and the next handover
+        // blocked forever.
+        auto sink = std::make_shared<McpStreamSink>();
+        const bool is_takeover = live_ != nullptr; // decided BEFORE anything is mutated
         if (budget != nullptr) {
             // A takeover bypasses the CAPS but not the accounting.
-            const auto mode = superseded ? sse_bus::StreamBudget::Admission::kTakeover
-                                         : sse_bus::StreamBudget::Admission::kEnforceCaps;
+            const auto mode = is_takeover ? sse_bus::StreamBudget::Admission::kTakeover
+                                          : sse_bus::StreamBudget::Admission::kEnforceCaps;
             auto acquired = budget->try_acquire(principal, mode);
             if (!acquired.lease) {
-                // Only reachable on the first-attach path (a takeover always admits).
+                // Only reachable on the first-attach path (a takeover always admits). The
+                // session is untouched — nothing has been mutated yet.
                 out.status = AttachStatus::kStreamCapHit;
                 out.reject_reason = acquired.reject_reason;
-                if (superseded) {
-                    // Unreachable today, but if it ever becomes reachable, do NOT leave
-                    // the session with a closed stream and no replacement.
-                    live_ = std::move(draining_);
-                    draining_.reset();
-                    superseded.reset();
-                }
                 return out;
             }
             new_lease = std::move(acquired.lease);
@@ -293,27 +303,35 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         //    frame can slip into the window between the two. (The `/api/v1/events`
         //    sibling does replay and subscribe under SEPARATE locks and documents the
         //    resulting lost-frame window; here it cannot happen.)
-        auto sink = std::make_shared<McpStreamSink>();
         sink->lease = std::move(new_lease);
         for (const auto& ev : ring_) {
             if (ev.id > last_event_id) {
-                sse_bus::enqueue_capped(sink->sse, ev, ring_cap_);
+                sse_bus::enqueue_capped(sink->sse, ev, ring_cap_); // allocates — still safe:
+                                                                   // live_/draining_ untouched
             }
+        }
+        // COMMIT. Everything above could throw and leave the session exactly as it was;
+        // nothing below can.
+        if (live_) {
+            draining_ = std::move(live_);
+            superseded = draining_;
         }
         live_ = sink;
         out.status = AttachStatus::kAttached;
         out.sink = sink;
         out.generation = ++generation_;
 
-        // Gauges are published UNDER mu_, paired with the state change they describe. Done
+        // Gauges are published UNDER mu_, paired with the state change they describe: done
         // outside, a takeover whose superseded provider detaches before the attacher gets
-        // to the increment drives `handover_pending` transiently negative — a spurious
-        // sample an alert would see. The metrics registry takes its own lock and calls
-        // nothing back into us, so nesting it here cannot cycle.
-        if (metrics_ != nullptr) {
-            metrics_->gauge(kMetricStreamsActive).increment();
+        // to the increment drives `handover_pending` transiently negative — a sample an
+        // alert would see. Safe to do here ONLY because the gauges were resolved at
+        // construction: an increment through the cached pointer takes that gauge's own
+        // mutex and allocates nothing, so it cannot throw while this sink is live and
+        // holding a lease with no releaser armed yet.
+        if (gauge_streams_active_ != nullptr) {
+            gauge_streams_active_->increment();
             if (superseded) {
-                metrics_->gauge(kMetricStreamsHandover).increment();
+                gauge_streams_handover_->increment();
             }
         }
     }
@@ -383,10 +401,10 @@ void McpStreamState::detach(const std::shared_ptr<McpStreamSink>& sink) {
     // the worker THIS provider was pinning. The lease goes home BEFORE the metrics touch —
     // that ordering is what lets the callers treat a throwing metric as ignorable.
     sink->lease.release();
-    if (metrics_ != nullptr) {
-        metrics_->gauge(kMetricStreamsActive).decrement();
+    if (gauge_streams_active_ != nullptr) {
+        gauge_streams_active_->decrement();
         if (was_draining) {
-            metrics_->gauge(kMetricStreamsHandover).decrement();
+            gauge_streams_handover_->decrement();
         }
     }
 }
