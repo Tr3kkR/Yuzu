@@ -7,10 +7,12 @@
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
 /// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:
-/// `DELETE /api/v1/sle/agents/{id}` (gated on scoped `SoftwareLicensing:Delete`,
-/// audit-before-erase fail-closed — see `sle_routes.cpp`) calls
-/// `ServerImpl::decommission_agent`, which builds this cascade. §27 builds the
-/// fan-out AND wires its first production caller.
+/// `DELETE /api/v1/sle/agents/{id}` (gated on scoped `SoftwareLicensing:Delete`
+/// AND scoped `Inventory:Delete` — the cascade's blast radius is wider than its
+/// name, so it authorizes for BOTH securables it erases through; audit-before-erase
+/// fail-closed — see `sle_routes.cpp`) calls `ServerImpl::decommission_agent`,
+/// which builds this cascade. §27 builds the fan-out AND wires its first
+/// production caller.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure

@@ -198,7 +198,7 @@ public:
     /// Count agents whose licensing state has not been refreshed since
     /// `stale_before_secs` (epoch seconds), i.e. `last_seen <
     /// stale_before_secs` on `agent_license_state` — the roadmap C-10
-    /// per-source staleness read the evaluator and `/sle` surfaces consume
+    /// per-source staleness read the UCE module's evaluator consumes
     /// ("Unreported ≠ Unused" needs a checkable staleness signal). Mirrors
     /// the sibling's bounded posture: a SHORT lease acquire AND a per-
     /// statement `SET LOCAL statement_timeout` so a metrics-sweep caller can

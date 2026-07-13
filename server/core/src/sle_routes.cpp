@@ -202,10 +202,17 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // The agent-decommission cascade's production caller: fans delete_agent across
     // every registered per-agent store, durably erasing the machine's stored rows
     // (including the Decision-11 user_ref personal data — the reason this route
-    // exists). Gate: SCOPED SoftwareLicensing:Delete (D-9: only Administrator +
-    // ITServiceOwner hold Delete; Operator/Viewer 403) — the scope stops a
-    // group-confined ITSO erasing an out-of-scope device, while
-    // require_scoped_permission's global step still admits global holders fleet-wide.
+    // exists). Gate: SCOPED SoftwareLicensing:Delete AND SCOPED Inventory:Delete —
+    // a CONJUNCTION (D-9), because the cascade erases more than licences: three of
+    // its five stores (InventoryStore, SoftwareInventoryStore, DeviceInventoryStore)
+    // are ADR-0016 stores governed by the Inventory securable. On the seeded matrix
+    // this changes nothing (Administrator + ITServiceOwner hold full CRUD on both),
+    // but RBAC is operator-editable, and a custom role granted SoftwareLicensing:Delete
+    // WITHOUT Inventory:Delete must not be able to erase inventory data it cannot
+    // otherwise touch. Authorize for the FULL blast radius, not just the route's name.
+    // Both checks are scoped, so a group-confined ITSO cannot erase an out-of-scope
+    // device, while require_scoped_permission's global step still admits global
+    // holders fleet-wide.
     //
     // TWO durable audit events (spdlog alone is not GDPR Art.17 evidence):
     //   1. AUDIT-BEFORE-ERASE, FAIL-CLOSED (`sle.agent.decommission|attempt`): when
@@ -231,6 +238,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 return;
             }
             if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Delete", agent_id))
+                return; // the gate wrote its own 401/403
+            // The second half of the conjunction: the cascade also erases the ADR-0016
+            // Inventory-securable stores, so the caller must hold Delete on those too.
+            if (!scoped_perm_fn_(req, res, "Inventory", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
                 send_json(res, 503, a4_error(503, "decommission cascade not configured", cid, 5000));

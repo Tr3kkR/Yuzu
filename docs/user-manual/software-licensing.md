@@ -4,8 +4,10 @@ Yuzu detects each endpoint's **installed software licences** — what is license
 what type and channel, and what has lapsed or expires soon — and syncs the result to
 the central server's PostgreSQL database on a **daily** cadence. This is a source of
 the agent **daily-sync framework** (ADR-0016), governed by **ADR-0024 (Software
-Licensing & Entitlements, "SLE")**, and it powers the **SLE** dashboard page and the
-`/api/v1/sle/*` REST surface.
+Licensing & Entitlements, "SLE")**, and it powers the `/api/v1/sle/*` REST surface and
+its MCP twin. **There is no SLE dashboard page in this release** — this release ships the
+read/erase API only; see
+[Reading detected licences](#reading-detected-licences) for what is and is not built.
 
 > **Terminology.** This page is about **detected software licences** — third-party
 > licence facts observed on the endpoint (Microsoft, Autodesk, JetBrains, …). It is

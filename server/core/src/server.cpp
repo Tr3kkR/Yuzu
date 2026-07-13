@@ -2431,8 +2431,9 @@ public:
         // SLE wiring (PR1a): the detected-licence store (step 7) + the canonical
         // ProductRegistryStore (step 8), both born-on-PG and fail-closed. The
         // entitlement/usage stores, the compliance evaluator, and the posture-rollup
-        // thread land in later PR steps; the /api/v1/sle/* READ routes are registered
-        // below (in the route-wiring block) against these two stores.
+        // thread are the SAM UCE module's (ADR-1005: interpretation is never built
+        // in-server) — NOT a later in-server PR step. The /api/v1/sle/* READ routes
+        // are registered below (in the route-wiring block) against these two stores.
         if (pg_pool_ && !startup_failed_) {
             software_licensing_store_ = std::make_unique<SoftwareLicensingStore>(*pg_pool_);
             if (!software_licensing_store_->is_open()) {
@@ -2449,9 +2450,10 @@ public:
         }
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
-        // own fail-closed open. The PR1b compliance evaluator writes it (matcher
-        // pass); PR1a constructs it so the store ladder + /readyz probe are complete
-        // (roadmap G-10) and the SLE routes can share the pool-guarded lifetime.
+        // own fail-closed open. The UCE module's compliance evaluator (ADR-1005) is
+        // what writes it via the matcher pass; the server constructs it so the store
+        // ladder + /readyz probe are complete (roadmap G-10) and the SLE routes can
+        // share the pool-guarded lifetime.
         if (pg_pool_ && !startup_failed_) {
             product_registry_store_ = std::make_unique<ProductRegistryStore>(*pg_pool_);
             if (!product_registry_store_->is_open()) {
@@ -3567,8 +3569,8 @@ public:
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
-        // destruct-before-pool). Nothing borrows it long-lived (the PR1b evaluator
-        // that writes it is not yet wired), so no unwire step precedes the reset.
+        // destruct-before-pool). Nothing borrows it long-lived (its writer is the UCE
+        // module's evaluator, out-of-server), so no unwire step precedes the reset.
         product_registry_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -11381,8 +11383,8 @@ private:
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
-    // so it destructs before the pool; the /api/v1/sle/* routes read it (PR1b evaluator
-    // writes it).
+    // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
+    // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.

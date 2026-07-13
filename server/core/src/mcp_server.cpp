@@ -2684,11 +2684,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("confidence", r.confidence)
                                 .add("exe_hints", r.exe_hints));
                 }
-                auto payload = JObj()
-                                   .add("agent_id", agent_id)
-                                   .add("count", static_cast<std::int64_t>(rows->size()))
-                                   .raw("licenses", arr.str());
-                mcp_audit("success", agent_id);
+                JObj payload;
+                payload.add("agent_id", agent_id)
+                    .add("count", static_cast<std::int64_t>(rows->size()))
+                    .raw("licenses", arr.str());
+                // The access-audit row is the SOC 2 evidence for this read, so its
+                // persistence bool is NOT discardable: a dropped row means licence facts
+                // were served with no durable trail. MCP has no response-header channel
+                // (the REST drill's Sec-Audit-Failed), so the gap rides the body as
+                // audit_persisted:false — set-and-proceed, exactly as the sibling
+                // query_installed_software does (#1647; rest_audit.hpp's MCP contract).
+                // Absent on success: consumers key on the KEY's absence, not on `true`.
+                const bool audit_ok = mcp_audit("success", agent_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;

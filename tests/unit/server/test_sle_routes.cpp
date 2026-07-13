@@ -6,9 +6,11 @@
 ///     gate (in-scope 200 / out-of-scope 403, D-4), the per-open behavioural audit
 ///     (sle.agent.view) that FAILS CLOSED (503 + Sec-Audit-Failed) on a persist
 ///     failure (G-2), and 503-on-degrade (never an empty 200, Decision 4).
-///   * DELETE /sle/agents/{id} — the audited durable-erasure trigger: scoped
-///     SoftwareLicensing:Delete gate, AUDIT-BEFORE-ERASE fail-closed, and honest
-///     outcome (r.ok() → 200 decommissioned; a Failed store → 500).
+///   * DELETE /sle/agents/{id} — the audited durable-erasure trigger: the scoped
+///     SoftwareLicensing:Delete AND Inventory:Delete CONJUNCTION (the cascade erases
+///     the ADR-0016 Inventory stores too, so it must authorize for its full blast
+///     radius), AUDIT-BEFORE-ERASE fail-closed, and honest outcome (r.ok() → 200
+///     decommissioned; a Failed store → 500).
 /// Plus the SoftwareLicensing D-9 securable matrix, the G-1 fail-closed primitive,
 /// and one [pg] end-to-end drill through a real SoftwareLicensingStore.
 ///
@@ -83,6 +85,10 @@ struct SleHarness {
 
     bool allow_scoped_all = false;          // scoped gate admits every agent
     std::vector<std::string> scoped_agents; // ...or just these agents (D-4 in-scope set)
+    // "type|op" pairs the principal does NOT hold — denied regardless of scope. Models
+    // an operator-authored custom role (the erase conjunction's whole point: the seeded
+    // roles hold both securables, a custom one need not).
+    std::vector<std::string> denied_perms;
     bool degrade_agent = false;
     bool audit_should_fail = false;
 
@@ -104,6 +110,9 @@ struct SleHarness {
             for (const auto& a : scoped_agents)
                 if (a == agent_id)
                     ok = true;
+            for (const auto& d : denied_perms) // a permission the role simply lacks
+                if (d == type + "|" + op)
+                    ok = false;
             if (!ok)
                 res.status = 403;
             return ok;
@@ -262,6 +271,46 @@ TEST_CASE("sle erase: scoped SoftwareLicensing:Delete gate — out-of-scope 403,
     REQUIRE(h.scoped_calls.size() == 1);
     CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-out"); // Delete, not Read
     CHECK(h.audits.empty()); // denied before the attempt audit / cascade
+}
+
+TEST_CASE("sle erase: requires Inventory:Delete TOO — the cascade's real blast radius",
+          "[sle_routes]") {
+    // The route is named for licences, but the cascade erases five per-agent stores —
+    // three of them (inventory, software_inventory, device_inventory) are ADR-0016
+    // stores governed by the Inventory securable. A custom role granted
+    // SoftwareLicensing:Delete WITHOUT Inventory:Delete must NOT be able to erase
+    // inventory data it cannot otherwise touch. Latent on the seeded matrix (both
+    // Delete-holding roles hold full Inventory CRUD), but RBAC is operator-editable.
+    SleHarness h;
+    h.allow_scoped_all = true;                     // in scope for the device...
+    h.denied_perms = {"Inventory|Delete"};         // ...but the role lacks Inventory:Delete
+    h.decommission_result = ok_result();
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // Both halves of the conjunction were ASKED, in order, and the second one refused.
+    REQUIRE(h.scoped_calls.size() == 2);
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-1");
+    CHECK(h.scoped_calls[1] == "Inventory|Delete|agent-1");
+    // Refused BEFORE the attempt audit and the cascade — nothing was erased.
+    CHECK(h.audits.empty());
+    CHECK_FALSE(contains(res->body, "decommissioned"));
+}
+
+TEST_CASE("sle erase: holding BOTH securables erases — the conjunction is not a wall",
+          "[sle_routes]") {
+    // The other half of the conjunction test: a role holding both (the seeded
+    // Administrator / ITServiceOwner shape) still erases, so the new gate is a
+    // narrowing of custom roles, not a regression of the shipped matrix.
+    SleHarness h;
+    h.allow_scoped_all = true; // holds both SoftwareLicensing:Delete and Inventory:Delete
+    h.decommission_result = ok_result();
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(h.scoped_calls.size() == 2);
+    CHECK(h.scoped_calls[1] == "Inventory|Delete|agent-1");
+    CHECK(json::parse(res->body)["data"]["decommissioned"] == true);
 }
 
 TEST_CASE("sle erase: audit-before-erase FAILS CLOSED — 503, cascade never invoked", "[sle_routes]") {

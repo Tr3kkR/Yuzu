@@ -92,6 +92,27 @@ struct HiveUnloadGuard {
     ~HiveUnloadGuard() { RegUnLoadKeyW(HKEY_USERS, mount.c_str()); }
 };
 
+// ── environment expansion ──────────────────────────────────────────────────
+
+// Two-pass ExpandEnvironmentStringsW. The single-pass form SILENTLY TRUNCATES:
+// on overflow the API does not fail — it returns the REQUIRED wchar count
+// (including the terminating NUL), which a bare `> 0` test reads as success, so
+// an over-long ProfileImagePath yields a valid-LOOKING but wrong path. Pass 1
+// sizes (dest=nullptr, size=0); pass 2 fills. Returns `in` unchanged if the API
+// fails, or if the environment grew between the two calls — an unexpanded
+// literal is a VISIBLY wrong path, never a plausible-but-wrong one.
+std::wstring expand_env_strings(const std::wstring& in) {
+    const DWORD needed = ExpandEnvironmentStringsW(in.c_str(), nullptr, 0);
+    if (needed == 0)
+        return in;
+    std::wstring buf(needed, L'\0'); // `needed` INCLUDES the terminating NUL
+    const DWORD written = ExpandEnvironmentStringsW(in.c_str(), buf.data(), needed);
+    if (written == 0 || written > needed)
+        return in;
+    buf.resize(written - 1); // drop the NUL from the string's size
+    return buf;
+}
+
 // ── ProbeHost with Reg*W registry access (R17) ─────────────────────────────
 
 class WinRegProbeHost final : public ProbeHost {
@@ -372,13 +393,9 @@ std::vector<ProfileEntry> enumerate_profiles(std::string& error) {
                 size_t nch = path_size / sizeof(wchar_t);
                 while (nch > 0 && path_buf[nch - 1] == L'\0')
                     --nch;
-                std::wstring raw(path_buf, nch);
+                const std::wstring raw(path_buf, nch);
                 // ProfileImagePath may be REG_EXPAND_SZ — expand once, here.
-                wchar_t expanded[1024]{};
-                if (ExpandEnvironmentStringsW(raw.c_str(), expanded, 1024) > 0)
-                    entry.profile_path_w.assign(expanded);
-                else
-                    entry.profile_path_w = std::move(raw);
+                entry.profile_path_w = expand_env_strings(raw);
                 const std::string path_utf8 =
                     from_wide(entry.profile_path_w.c_str(),
                               static_cast<int>(entry.profile_path_w.size()));

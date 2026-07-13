@@ -236,7 +236,10 @@ void RbacStore::seed_defaults() {
                            "Inventory",
                            // SLE (ADR-0024 Decision 9). DISTINCT from the existing
                            // `License` securable (Yuzu's OWN product licence, §22.3) —
-                           // this gates the SLE page + /api/v1/sle/*. Seeding it here
+                           // this gates the /api/v1/sle/* discovery reads + the erasure
+                           // DELETE (there is NO in-server SLE page; the Licences view and
+                           // the compliance sub-views are the SAM UCE module's, ADR-1005).
+                           // Seeding it here
                            // also grants Administrator full CRUD via the loop below.
                            "SoftwareLicensing"};
     for (auto* t : types) {
@@ -257,7 +260,8 @@ void RbacStore::seed_defaults() {
     // seed-once posture of the rest of seed_defaults().
     sqlite3_exec(db_,
                  "UPDATE securable_types SET description = "
-                 "'gates the SLE page and /api/v1/sle/*; the /inventory software catalog "
+                 "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission "
+                 "erasure; the /inventory software catalog "
                  "remains under Inventory:Read' "
                  "WHERE name = 'SoftwareLicensing' AND description = '';",
                  nullptr, nullptr, nullptr);

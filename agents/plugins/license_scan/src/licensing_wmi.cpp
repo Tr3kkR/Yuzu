@@ -59,6 +59,34 @@ template <typename T> struct ComReleaser {
     ComReleaser& operator=(const ComReleaser&) = delete;
 };
 
+// RAII for the BSTR + VARIANT that IWbemClassObject::Next hands back — same
+// contract as ComReleaser above: own the resource, free it on EVERY exit. The
+// per-property body ALLOCATES (variant_to_string, from_wide, and WmiRow::emplace
+// — WmiRow is a std::map, so an emplace allocates a node), so the old manual
+// SysFreeString/VariantClear pair leaked both on a std::bad_alloc thrown
+// mid-row.
+struct BstrGuard {
+    BSTR b = nullptr;
+    BstrGuard() = default;
+    ~BstrGuard() {
+        if (b)
+            SysFreeString(b);
+    }
+    BstrGuard(const BstrGuard&) = delete;
+    BstrGuard& operator=(const BstrGuard&) = delete;
+};
+
+// VariantInit in the ctor is load-bearing: the destructor VariantClears
+// unconditionally, so the VARIANT must be a valid VT_EMPTY even on the Next()
+// call that FAILS and never writes it (the old code left it uninitialised).
+struct VariantGuard {
+    VARIANT v;
+    VariantGuard() { VariantInit(&v); }
+    ~VariantGuard() { VariantClear(&v); }
+    VariantGuard(const VariantGuard&) = delete;
+    VariantGuard& operator=(const VariantGuard&) = delete;
+};
+
 std::string hr_hex(HRESULT hr) {
     static constexpr char hexc[] = "0123456789abcdef";
     std::string out = "0x";
@@ -188,15 +216,19 @@ BoundedQueryResult run_bounded_wmi_query(const std::string& wmi_namespace, const
 
         WmiRow row;
         obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
-        BSTR prop_name = nullptr;
-        VARIANT prop_val;
-        while (obj->Next(0, &prop_name, &prop_val, nullptr, nullptr) == WBEM_S_NO_ERROR) {
-            std::string value = variant_to_string(prop_val);
+        while (true) {
+            // Guards are scoped PER ITERATION: Next() overwrites both out-params
+            // each time, so ownership binds to the row-property body that
+            // allocates. EndEnumeration is skipped on an exceptional unwind, but
+            // obj_guard releases the object immediately after, taking the
+            // enumeration state with it.
+            BstrGuard prop_name;
+            VariantGuard prop_val;
+            if (obj->Next(0, &prop_name.b, &prop_val.v, nullptr, nullptr) != WBEM_S_NO_ERROR)
+                break;
+            std::string value = variant_to_string(prop_val.v);
             if (!value.empty())
-                row.emplace(from_wide(prop_name), std::move(value));
-            SysFreeString(prop_name);
-            prop_name = nullptr;
-            VariantClear(&prop_val);
+                row.emplace(from_wide(prop_name.b), std::move(value));
         }
         obj->EndEnumeration();
         result.rows.push_back(std::move(row));

@@ -367,8 +367,25 @@ Decision numbers are stable, since other documents cite them.
    **`DELETE /api/v1/sle/agents/{id}`** erasure (Decision 11) is deliberately **REST-only**
    — a device purge is withheld from the agentic surface, so it is a *recorded exception*
    to ADR-1005 Decision 1's both-surfaces rule rather than a twin gap: the exception row
-   (surface + tracking issue #2102 + revisit-by date) lands in ADR-1005's twin-existence
-   exception ledger at ratification, alongside the SCIM-v2 REST-only precedent. Per Placement under
+   (surface + tracking issue #2102 + revisit-by date) **is recorded** in ADR-1005's
+   twin-existence exception ledger, alongside the SCIM-v2 REST-only precedent — entered
+   pre-acceptance as voluntary early compliance, which ADR-1005's Binding-status note
+   expressly invites. That erasure is authorized by a **CONJUNCTION**: the caller must
+   hold the per-device scoped **`SoftwareLicensing:Delete` AND `Inventory:Delete`**. The
+   cascade's blast radius is wider than the route's name — three of the five per-agent
+   stores it erases (`InventoryStore`, `SoftwareInventoryStore`, `DeviceInventoryStore`)
+   are ADR-0016 stores governed by the **`Inventory`** securable, not by
+   `SoftwareLicensing`. Gating on the licensing securable alone would let an
+   operator-authored role holding `SoftwareLicensing:Delete` *without* `Inventory:Delete`
+   erase inventory data it cannot otherwise touch. This is latent under the seeded matrix
+   (both Delete-holding roles — Administrator, ITServiceOwner — hold full `Inventory` CRUD
+   too), so the conjunction changes nothing that ships, but RBAC is operator-editable and
+   the gate must authorize for what the operation *destroys*, not for what it is *named*.
+   *Rejected: a dedicated device-level `Decommission` securable — the honest modelling of
+   a cross-securable destructive operation, and the right answer once a second caller
+   (enrollment removal, a fleet-management purge) needs it; deferred because it is a new
+   seeded securable with a migration and a matrix change, for zero behavioural gain over
+   the conjunction today.* Per Placement under
    ADR-1005, the **Compliance, Entitlements, and Reclamation** sub-views and the
    **compliance MCP tool `get_license_compliance_summary`** are the SAM UCE host's UI and
    read API — not built in-server. The software
@@ -430,7 +447,11 @@ Decision numbers are stable, since other documents cite them.
     `SoftwareLicensingStore`) and removes **only agent-scoped rows/links**;
     `ProductRegistryStore` holds fleet-wide canonical identities shared across agents and
     is **never** in the cascade (decommission drops an agent's match links, never a shared
-    canonical product). There is **no row-level erasure API**, a stated gap. The effective mode is **centrally verifiable**: the
+    canonical product). There is **no row-level erasure API**, a stated gap. The cascade's
+    production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
+    `SoftwareLicensing:Delete` **AND** `Inventory:Delete` conjunction (Decision 9) —
+    because this fan-out reaches the `Inventory`-securable stores, not only the licensing
+    one. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
     flapping surface diagnostics never touch the blob and are fetched live via the

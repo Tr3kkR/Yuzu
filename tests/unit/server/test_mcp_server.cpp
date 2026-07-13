@@ -4417,6 +4417,88 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
     CHECK(saw_failure);
 }
 
+// The SUCCESS path is the one that actually serves data, so it is the one whose
+// audit row is the SOC 2 evidence. #1647: the persistence bool must NOT be dropped —
+// a licence read served with no durable trail has to say so. MCP has no header
+// channel (the REST drill's Sec-Audit-Failed), so it set-and-proceeds and rides the
+// gap in the body as audit_persisted:false, exactly as query_installed_software and
+// get_dex_signal_detail do. Both arms of try_persist_audit are covered: the sink that
+// RETURNS false, and the sink that THROWS (the catch arm is what turns a bad_alloc-class
+// throw into `false` rather than letting it escape as a 500).
+TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persisted:false (#1647)",
+          "[mcp][pg][sle][audit]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
+
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.audit_succeeds_ = false; // the mcp.query_software_licenses row cannot persist
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":96,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // set-and-proceed, NOT a refusal
+
+    // On the wire in BOTH channels (content[].text and structuredContent).
+    CHECK(res->body.find("\"audit_persisted\":false") != std::string::npos);
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload.at("audit_persisted") == false);
+    // Data is STILL SERVED alongside the flag — that is the set-and-proceed half.
+    CHECK(payload.at("count").get<std::int64_t>() == 1);
+    // And the Decision-11 PII omission still holds on the flagged path.
+    CHECK(res->body.find("user_ref") == std::string::npos);
+}
+
+TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_persisted:false",
+          "[mcp][pg][sle][audit]") {
+    // try_persist_audit's catch arm: a bad_alloc-class throw from the audit sink must
+    // become `false` (→ audit_persisted:false), never escape the handler as a 500.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
+
+    yuzu::server::RbacStore rbac(":memory:");
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.audit_throws_ = true;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":97,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // caught, not a 500
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload.at("audit_persisted") == false);
+    CHECK(payload.at("count").get<std::int64_t>() == 1);
+}
+
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──
 //
 // aggregate_responses folds rows into COUNT/SUM/AVG totals, so an out-of-scope
