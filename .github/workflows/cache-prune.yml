@@ -7,6 +7,11 @@ name: Cache prune
 # port — acceptable, since stale-by-mtime ports are by definition not in
 # the active build's working set.
 #
+# Also sweeps leaked yuzu_test_* databases off the persistent self-hosted
+# Postgres instances (#1367, scripts/ci/sweep-test-databases.sh) — the
+# out-of-band counterpart to the suite-start sweeper from PR #2091, so
+# leaks reclaim even on a box that stops running [pg] legs.
+#
 # Does NOT touch:
 #   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache) — its own LRU at
 #     CCACHE_MAXSIZE=30G already handles eviction without our help.
@@ -71,6 +76,13 @@ jobs:
           after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           echo "buildx chisel cache: before=${before} after=${after}"
 
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Sweep leaked yuzu_test_* databases (#1367)
+        run: bash scripts/ci/sweep-test-databases.sh
+
   prune-windows:
     name: "Prune Windows runner cache"
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
@@ -98,3 +110,15 @@ jobs:
           deleted=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
           after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
           echo "before=${before_total} deleted=${deleted} after=${after_total}"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Sweep leaked yuzu_test_* databases (#1367)
+        # `source`, not `bash`: same idiom as ci.yml's ensure-postgres step —
+        # the bare `bash` resolves to the System32 WSL stub under LOCAL
+        # SYSTEM, while this step already runs inside MSYS2 bash (job
+        # default shell). The script ends in an explicit exit, so sourcing
+        # is safe.
+        run: source scripts/ci/sweep-test-databases.sh
