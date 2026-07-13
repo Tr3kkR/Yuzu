@@ -1,14 +1,38 @@
 /**
  * test_agent_health_store.cpp — Unit tests for AgentHealthStore fleet health aggregation
  *
- * The real AgentHealthStore lives inside server.cpp (detail namespace) and uses
- * google::protobuf::Map in its interface, so we test a standalone reproduction
- * that exercises the same MetricsRegistry output contract.
+ * TWO KINDS OF TEST LIVE HERE, AND THE DIFFERENCE MATTERS.
+ *
+ * 1. `TestAgentHealthStore` (below) is a standalone REPRODUCTION. The real store's upsert()
+ *    takes a `google::protobuf::Map`, so the reproduction exists to exercise the
+ *    MetricsRegistry output contract without dragging protobuf into every case. It reuses the
+ *    SHIPPED helpers (network_perf_rules.hpp, spark_fleet_tags.hpp) rather than re-deriving
+ *    their logic, so helper drift IS caught.
+ *
+ *    But a reproduction can only ever catch MODEL drift, never a COVERAGE gap: delete the
+ *    spark rollup from agent_registry.cpp and every mirror-based case here still passes. A
+ *    previous version of this file carried a comment asserting the opposite — that the
+ *    four-posture bucketing was covered because the mirror had been taught the four postures.
+ *    It was not. Overclaiming coverage in a comment is how this branch shipped bugs through
+ *    five review rounds; do not do it again.
+ *
+ * 2. The `[spark][rollup][real]` case at the bottom drives the REAL
+ *    `yuzu::server::detail::AgentHealthStore::recompute_metrics` through a real
+ *    `protobuf::Map` upsert. That is the only case in this file that would fail if the
+ *    shipped rollup were deleted — and it has been verified to do so.
+ *    (governance Gate-8 round 7 consistency S-1.)
+ *
+ * The real store lives in `server/core/src/agent_registry.hpp` (namespace
+ * yuzu::server::detail) — NOT inside server.cpp, as this header used to claim.
  */
 
+#include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+#include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 
 #include <yuzu/metrics.hpp>
+
+#include <google/protobuf/map.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -248,6 +272,78 @@ public:
             set_stats_os("yuzu_fleet_net_throughput_bps", os, vals);
     }
 
+    // Spark rollup MIRROR (gov qe-S1) — the same bucketing + gauge glue as
+    // AgentRegistry::recompute_metrics, reusing the SHIPPED spark_fleet_tags.hpp
+    // helpers (no parallel repro of the parse logic, per the net precedent above).
+    //
+    // It mirrors the FOUR-POSTURE split (running / disabled / failed / absent), so MODEL
+    // drift between the mirror and the shipped helpers is caught.
+    //
+    // WHAT IT CANNOT CATCH: a coverage gap. This is a reproduction — deleting the spark
+    // rollup from agent_registry.cpp leaves every case that uses it green. The
+    // "[spark][rollup][real]" case at the bottom of this file is the one that pins the
+    // SHIPPED code. See the file header. (governance Gate-8 round 7 consistency S-1.)
+    void recompute_spark(yuzu::MetricsRegistry& metrics) {
+        namespace sd = yuzu::server::detail;
+        std::lock_guard lock(mu_);
+        for (const char* f : {"yuzu_fleet_spark_reporting", "yuzu_fleet_spark_disabled",
+                              "yuzu_fleet_spark_failed", "yuzu_fleet_spark_mechanisms",
+                              "yuzu_fleet_spark_watch_rejected"})
+            metrics.clear_gauge_family(f);
+        auto norm_os = [](const std::string& os) -> std::string {
+            if (os == "windows" || os == "linux" || os == "darwin")
+                return os;
+            return os.empty() ? "unknown" : "other";
+        };
+        std::unordered_map<std::string, int> reporting;
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> mechs;
+        std::unordered_map<std::string, std::unordered_map<std::string, double>> rejected;
+        std::unordered_map<std::string, int> disabled;
+        std::unordered_map<std::string, int> failed;
+        for (auto& [id, snap] : snapshots_) {
+            auto get = [&](const std::string& k) -> std::string {
+                auto it = snap.status_tags.find(k);
+                return it != snap.status_tags.end() ? it->second : "";
+            };
+            const std::string os = norm_os(get("yuzu.os"));
+            // STRICT: only "1"/"0" mean anything. Garbage is NotReported and contributes
+            // to nothing — it must NOT fall into `failed`, the gauge operators alert on.
+            const sd::SparkRunState state = sd::parse_spark_running(get(sd::kSparkTagRunning));
+            if (state == sd::SparkRunState::NotRunning) {
+                // The DISABLED vs FAILED split — a deliberate opt-out must never be
+                // confused with an engine that threw at boot.
+                if (get(sd::kSparkTagDisabled) == "1")
+                    ++disabled[os];
+                else
+                    ++failed[os];
+                continue;
+            }
+            if (state != sd::SparkRunState::Running)
+                continue; // ABSENT / unparseable — contributes to nothing at all
+            ++reporting[os];
+            for (const auto& tok : sd::spark_mechs_from_csv(get(sd::kSparkTagMechs)))
+                ++mechs[os][tok];
+            for (const char* m : sd::kSparkMechTokens)
+                if (auto v = sd::parse_spark_count(
+                        get(sd::spark_type_metric_tag(m, sd::kSparkMetricWatchRejected))))
+                    rejected[os][m] += *v;
+        }
+        for (auto& [os, n] : reporting)
+            metrics.gauge("yuzu_fleet_spark_reporting", {{"os", os}}).set(n);
+        for (auto& [os, n] : disabled)
+            metrics.gauge("yuzu_fleet_spark_disabled", {{"os", os}}).set(n);
+        for (auto& [os, n] : failed)
+            metrics.gauge("yuzu_fleet_spark_failed", {{"os", os}}).set(n);
+        for (auto& [os, mm] : mechs)
+            for (auto& [mech, n] : mm)
+                metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", os}, {"mechanism", mech}})
+                    .set(n);
+        for (auto& [os, mm] : rejected)
+            for (auto& [mech, v] : mm)
+                metrics.gauge("yuzu_fleet_spark_watch_rejected", {{"os", os}, {"mechanism", mech}})
+                    .set(v);
+    }
+
 private:
     struct Snapshot {
         std::string agent_id;
@@ -287,6 +383,35 @@ TEST_CASE("AgentHealthStore: multiple agents aggregate correctly", "[health_stor
     CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "windows"}}).value() == 1.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", "x86_64"}}).value() == 2.0);
     CHECK(metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", "aarch64"}}).value() == 1.0);
+}
+
+TEST_CASE("AgentHealthStore: spark rollup buckets per os and mechanism", "[health_store][spark]") {
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // linux agent: service only, one watch rejection.
+    store.upsert("a1", {{"yuzu.os", "linux"},
+                        {"yuzu.spark_running", "1"},
+                        {"yuzu.spark_mechs", "service"},
+                        {"yuzu.spark_service_watch_rejected", "2"}});
+    // windows agent: all three mechanisms, quiescent (no counters).
+    store.upsert("a2", {{"yuzu.os", "windows"},
+                        {"yuzu.spark_running", "1"},
+                        {"yuzu.spark_mechs", "file,service,registry"}});
+    // ABSENT: no spark tags at all (a pre-rung-1 agent, or one mid-graceful-shutdown) —
+    // contributes to NOTHING, not even the disabled bucket.
+    store.upsert("a3", {{"yuzu.os", "linux"}});
+    store.recompute_spark(metrics);
+
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "linux"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "windows"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", "linux"}, {"mechanism", "service"}})
+              .value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_mechanisms", {{"os", "windows"}, {"mechanism", "file"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .gauge("yuzu_fleet_spark_watch_rejected", {{"os", "linux"}, {"mechanism", "service"}})
+              .value() == 2.0);
 }
 
 TEST_CASE("AgentHealthStore: stale entries are pruned", "[health_store]") {
@@ -564,4 +689,142 @@ TEST_CASE("AgentHealthStore: agent-controlled os is allowlisted (anti cardinalit
     CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "other"}}).value() == 1.0);  // collapsed
     CHECK(metrics.gauge("yuzu_fleet_agents_by_os", {{"os", "linux"}}).value() == 1.0);  // canonical kept
     CHECK(metrics.gauge("yuzu_fleet_net_reporting", {{"os", "other"}}).value() == 1.0); // net too
+}
+
+TEST_CASE("spark rollup: the four postures bucket separately", "[spark][fleet][health]") {
+    // Governance Gate-4 consistency C-1. Before this, the disabled/failed bucketing — the
+    // whole justification of the round — had ZERO coverage: you could delete that branch
+    // from agent_registry.cpp's rollup and every test still passed.
+    //
+    // The split is what makes a fleet-wide spark BOOT FAILURE visible. Conflate FAILED with
+    // DISABLED and a failed fleet looks like a deliberate opt-out; conflate FAILED with
+    // ABSENT and it emits nothing at all.
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    // RUNNING x2 (windows)
+    store.upsert("run1", {{"yuzu.os", "windows"},
+                          {"yuzu.spark_running", "1"},
+                          {"yuzu.spark_mechs", "file,registry,service"}});
+    store.upsert("run2", {{"yuzu.os", "windows"},
+                          {"yuzu.spark_running", "1"},
+                          {"yuzu.spark_mechs", "file,registry,service"}});
+    // DISABLED — a deliberate opt-out. Expected to be non-zero; never alert on it.
+    store.upsert("off1", {{"yuzu.os", "windows"},
+                          {"yuzu.spark_running", "0"},
+                          {"yuzu.spark_disabled", "1"}});
+    // FAILED — enabled, but the engine threw at boot. THE gauge operators alert on.
+    store.upsert("bad1", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "0"}});
+    // ABSENT — no spark tags at all (pre-rung-1 agent, or mid-graceful-shutdown).
+    store.upsert("old1", {{"yuzu.os", "windows"}});
+    // A CONTAINER: running, but its only mechanism is inert -> empty capability CSV.
+    store.upsert("ctr1", {{"yuzu.os", "linux"},
+                          {"yuzu.spark_running", "1"},
+                          {"yuzu.spark_mechs", ""}});
+
+    store.recompute_spark(metrics);
+
+    // Assert on VALUES, not on serialize() substrings: `find("} 1")` also matches "} 10"
+    // and "} 12", so a substring assertion silently passes on a wrong count the moment the
+    // fixture grows past 9 agents (governance Gate-8 quality).
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "windows"}}).value() == 2.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_disabled", {{"os", "windows"}}).value() == 1.0);
+    CHECK(metrics.gauge("yuzu_fleet_spark_failed", {{"os", "windows"}}).value() == 1.0);
+    // The container reports, but claims no capability: no {os=linux,mechanism=*} series.
+    CHECK(metrics.gauge("yuzu_fleet_spark_reporting", {{"os", "linux"}}).value() == 1.0);
+    const bool linux_mech_series =
+        metrics.serialize().find("yuzu_fleet_spark_mechanisms{os=\"linux\"") != std::string::npos;
+    CHECK_FALSE(linux_mech_series);
+}
+
+TEST_CASE("spark rollup: a garbage spark_running value must NOT page as FAILED",
+          "[spark][fleet][health]") {
+    // Governance Gate-4 UP-6 / consistency C-2. The rollup used to bucket `== "1"` as
+    // running and ANY other non-empty string as not-running -> with no `spark_disabled` key
+    // that landed in yuzu_fleet_spark_failed{os}, the ONE gauge documented "alert on it".
+    // So "true", " 1", "01", "2" or "x" from a single buggy or forked agent build could page
+    // on-call. It is also a forward-compat trap: a third posture value added in a later rung
+    // would make an OLD server alarm the whole fleet during a rolling upgrade.
+    TestAgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    store.upsert("g1", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "true"}});
+    store.upsert("g2", {{"yuzu.os", "windows"}, {"yuzu.spark_running", " 1"}});
+    store.upsert("g3", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "01"}});
+    store.upsert("g4", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "2"}});
+    store.upsert("g5", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "x"}});
+    // ...and one agent that HAS genuinely failed, to prove the gauge still works.
+    store.upsert("real", {{"yuzu.os", "windows"}, {"yuzu.spark_running", "0"}});
+
+    store.recompute_spark(metrics);
+
+    // Exactly ONE failure — the real one. The five garbage values contribute NOTHING: not to
+    // failed (which would page), not to reporting, not to disabled.
+    CHECK(metrics.gauge("yuzu_fleet_spark_failed", {{"os", "windows"}}).value() == 1.0);
+    const bool any_reporting =
+        metrics.serialize().find("yuzu_fleet_spark_reporting{os=\"windows\"}") !=
+        std::string::npos;
+    CHECK_FALSE(any_reporting);
+}
+
+// ── The REAL rollup ─────────────────────────────────────────────────────────
+//
+// Everything above this line drives TestAgentHealthStore, a reproduction. This case drives
+// the SHIPPED yuzu::server::detail::AgentHealthStore through a real protobuf::Map upsert, so
+// it is the only one that fails if the spark bucketing is deleted from agent_registry.cpp.
+//
+// VERIFIED to fail without the shipped code: commenting out the spark block in
+// recompute_metrics turns this red (the reproduction-based cases stay green — which is
+// exactly the blind spot this case exists to remove). governance Gate-8 round 7, S-1.
+TEST_CASE("REAL AgentHealthStore: the four spark postures reach the shipped gauges",
+          "[spark][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // RUNNING — reports spark_running=1 and a capability CSV.
+    beat("run-1", {{"yuzu.spark_running", "1"}, {"yuzu.spark_mechs", "file,registry"}});
+    beat("run-2", {{"yuzu.spark_running", "1"}, {"yuzu.spark_mechs", "file"}});
+    // DISABLED — spark_running=0 AND spark_disabled=1 (operator turned it off).
+    beat("dis-1", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", "1"}});
+    // FAILED — spark_running=0 with NO spark_disabled (boot-time instantiation threw).
+    beat("fail-1", {{"yuzu.spark_running", "0"}});
+    // ABSENT — no spark keys at all (a pre-rung-1 agent, or one shutting down). Must land in
+    // NO bucket: absent-not-zero.
+    beat("absent-1", {});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+
+    // The bucketing this round exists to add. Deleting it from agent_registry.cpp makes
+    // these three lines fail — which no mirror-based case in this file can do.
+    CHECK(val("yuzu_fleet_spark_reporting{os=\"linux\"} ") == 2.0); // RUNNING only
+    CHECK(val("yuzu_fleet_spark_disabled{os=\"linux\"} ") == 1.0);
+    CHECK(val("yuzu_fleet_spark_failed{os=\"linux\"} ") == 1.0);
+
+    // Capability CSV fans out per mechanism, and only from RUNNING agents.
+    // Label order is the gauge's own ({os}, then {mechanism}) — asserted against the shipped
+    // serialization, not a guess. (My first draft guessed the reverse order and this test
+    // caught it, which is the point of driving the real store.)
+    CHECK(val("yuzu_fleet_spark_mechanisms{os=\"linux\",mechanism=\"file\"} ") == 2.0);
+    CHECK(val("yuzu_fleet_spark_mechanisms{os=\"linux\",mechanism=\"registry\"} ") == 1.0);
+
+    // ABSENT is not a zero: the absent agent must not appear in any spark bucket, and a
+    // never-seen OS must not be seeded at 0 (the absent-not-zero convention).
+    CHECK(out.find("yuzu_fleet_spark_reporting{os=\"windows\"}") == std::string::npos);
+    CHECK(out.find("yuzu_fleet_spark_failed{os=\"windows\"}") == std::string::npos);
 }
