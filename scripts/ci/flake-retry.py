@@ -131,6 +131,69 @@ def meson_failed_suites(builddir):
     return _failed_testcase_names(xml_path)
 
 
+def _entry_durations(builddir):
+    """{meson-junit testcase name: wall seconds} from testlog.junit.xml.
+
+    Meson writes one <testcase> per test() entry with a per-entry `time`
+    attribute (the <testsuite> nodes carry aggregates we ignore). Defensive
+    by design — this feeds pure reporting (#2093), so a missing file, parse
+    error, or absent/garbled time attr degrades to "no row", never a crash.
+    Duplicate names are summed."""
+    xml_path = os.path.join(builddir, "meson-logs", "testlog.junit.xml")
+    if not os.path.exists(xml_path):
+        return {}
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return {}
+    durations = {}
+    for tc in tree.iter("testcase"):
+        name = tc.get("name", "")
+        try:
+            secs = float(tc.get("time"))
+        except (TypeError, ValueError):
+            continue
+        durations[name] = durations.get(name, 0.0) + secs
+    return durations
+
+
+def budget_rows(durations, tests):
+    """Pure: [(display_name, secs, budget_or_None, frac_or_None)] per junit
+    entry, mapping junit names to introspected entries via match_suite. The
+    budget is the entry's meson timeout; falsy (0 = meson's "no timeout")
+    becomes None, as does the whole budget for an unmappable name."""
+    rows = []
+    for junit_name in sorted(durations):
+        secs = durations[junit_name]
+        entry = match_suite(junit_name, tests)
+        name = entry.get("name") if entry and entry.get("name") else junit_name
+        budget = (entry.get("timeout") or None) if entry else None
+        rows.append((name, secs, budget, (secs / budget) if budget else None))
+    return rows
+
+
+def report_suite_budgets(builddir, tests, warn_frac=0.8):
+    """#2093: degrade duration creep toward a suite's meson timeout into a
+    visible ::warning instead of a discontinuous red wall (the server suite
+    crept 448s -> 512s/600 in green runs with zero signal before the
+    2026-07-12 timeouts). Runs on every invocation — green included, that is
+    the entire point — and never changes pass/fail semantics."""
+    rows = budget_rows(_entry_durations(builddir), tests)
+    if not rows:
+        return
+    for name, secs, budget, frac in rows:
+        if frac is not None and frac > warn_frac:
+            gh("warning",
+               f"{name} at {secs:.0f}/{budget}s ({frac:.0%}) of its meson timeout — "
+               f"split the suite or rebalance before this flakes (#2092, #2093)")
+    lines = ["### Suite durations vs meson budgets", "",
+             "| test entry | wall (s) | budget (s) | used |", "|---|---:|---:|---:|"]
+    for name, secs, budget, frac in rows:
+        lines.append(f"| {name} | {secs:.0f} | {budget if budget else '—'} | "
+                     f"{f'{frac:.0%}' if frac is not None else '—'} |")
+    summary("\n".join(lines))
+
+
 # ── meson introspection: suite name -> binary command ─────────────────────────
 def introspect_tests(builddir):
     out = subprocess.run(
@@ -253,6 +316,12 @@ def main(argv=None):
 
     # 1. Run meson test normally.
     rc = subprocess.run(["meson", "test", "-C", args.builddir] + args.meson_args).returncode
+
+    # 2. Duration-vs-budget watchdog (#2093) — before the green early-return,
+    #    because the creep it exists to surface happens in green runs.
+    tests = introspect_tests(args.builddir)
+    report_suite_budgets(args.builddir, tests)
+
     if rc == 0:
         return 0
 
@@ -262,8 +331,6 @@ def main(argv=None):
     if not failed_suites:
         gh("error", "test failed but no per-suite junit to classify — failing (no masking)")
         return rc or 1
-
-    tests = introspect_tests(args.builddir)
     blocked = []      # case names that must fail the job
     recovered = []    # (case, cross_platform) that recovered
     for suite_name in sorted(failed_suites):
@@ -353,6 +420,39 @@ def _selftest():
             f.write('<testsuites><testsuite><testcase name="A"/>'
                     '<testcase name="B"><failure>x</failure></testcase></testsuite></testsuites>')
         check(_failed_testcase_names(x) == {"B"}, "junit picks only failed cases")
+
+    # duration extraction + budget rows (#2093).
+    with tempfile.TemporaryDirectory() as d:
+        logs = os.path.join(d, "meson-logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:
+            f.write('<testsuites><testsuite>'
+                    '<testcase name="agent - yuzu:agent unit tests" time="200.5"/>'
+                    '<testcase name="agent - yuzu:agent unit tests" time="0.5"/>'   # dup: summed
+                    '<testcase name="docs - yuzu:changelog order"/>'                # no time: skipped
+                    '<testcase name="tar - yuzu:tar unit tests" time="garbled"/>'   # bad time: skipped
+                    '</testsuite></testsuites>')
+        durations = _entry_durations(d)
+        check(durations == {"agent - yuzu:agent unit tests": 201.0},
+              "durations: sums dups, skips missing/garbled time attrs")
+        check(_entry_durations(os.path.join(d, "nope")) == {}, "durations: missing junit -> {}")
+
+    bt = [{"name": "agent unit tests", "timeout": 240}, {"name": "docs check", "timeout": 0}]
+    rows = budget_rows({"agent - yuzu:agent unit tests": 201.0,
+                        "docs - yuzu:docs check": 5.0,
+                        "mystery - yuzu:unmapped entry": 1.0}, bt)
+    by_name = {r[0]: r for r in rows}
+    check(by_name["agent unit tests"][2] == 240 and abs(by_name["agent unit tests"][3] - 201.0 / 240) < 1e-9,
+          "budget rows: maps junit name, computes frac")
+    check(by_name["docs check"][2] is None and by_name["docs check"][3] is None,
+          "budget rows: timeout 0 (meson no-timeout) -> no budget/frac")
+    check(by_name["mystery - yuzu:unmapped entry"][2] is None,
+          "budget rows: unmappable junit name keeps its name, no budget")
+    # >80% predicate: 0.81 fires, 0.79 doesn't (frac > warn_frac).
+    frac_hi = budget_rows({"a - yuzu:agent unit tests": 0.81 * 240}, bt)[0][3]
+    frac_lo = budget_rows({"a - yuzu:agent unit tests": 0.79 * 240}, bt)[0][3]
+    check(frac_hi > 0.8, "watchdog fires above 80%")
+    check(not (frac_lo > 0.8), "watchdog silent below 80%")
 
     # catch2 exe detection.
     check(CATCH2_EXE.search("yuzu_agent_tests.exe") is not None, "catch2 exe matches (win)")

@@ -52,9 +52,9 @@ if a and a[0] == "test":
     logs = os.path.join(builddir, "meson-logs"); os.makedirs(logs, exist_ok=True)
     j = os.path.join(logs, "testlog.junit.xml")
     if os.environ.get("FAKE_MESON_TEST_PASS") == "1":
-        open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests"/></testsuite></testsuites>')
+        open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0"/></testsuite></testsuites>')
         sys.exit(0)
-    open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests">'
+    open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0">'
                        '<failure>boom</failure></testcase></testsuite></testsuites>')
     sys.exit(1)
 sys.exit(0)
