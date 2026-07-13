@@ -462,12 +462,16 @@ upgrade note for this enforcement-posture default change (not deferred to rung 5
 
 ## Dependencies & issue dispositions
 
-- **#2011 (HARD gate, rung 0):** downgrade the engine-wide `mech_ops_mu_`
-  (`spark_engine.hpp:370`, introduced by #1994's M2 fix) to per-mechanism-type
-  granularity, so a slow `watch()` on one mechanism can't block arm/disarm on
-  another. Harmless while unconsumed; load-bearing the moment a second live
-  mechanism arms. Its observability counters already exist in `SparkEngineStats`;
-  emission + alerts fold into the health surface above.
+- **#2011 (HARD gate, rung 0) — LANDED (lock half).** The engine-wide
+  `mech_ops_mu_` (introduced by #1994's M2 fix) is downgraded to per-mechanism-type
+  `mech_ops_mu_by_type_` (`std::map<SparkType, std::mutex>`), so a slow `watch()`
+  on one mechanism can no longer block arm/disarm on another. Cross-mechanism
+  coupling is closed; the residual same-type stall (an unbounded `watch()` still
+  blocks its own type's queue) is a distinct, deferred walk-off-`mu_` follow-up,
+  gated as a Stage-2/rung-3 pre-arm dependency (measured Registry/Service
+  `watch()` latency ceiling). The observability half of #2011 (per-type
+  `SparkEngineStats` emission + alerts) is DEFERRED to rung 1, where SparkEngine
+  is first instantiated.
 - **#2014 (BLOCKING-before-Stage-2):** resolved by the no-blocking-inline-consumer
   policy + never-drop enforce lane (§Enforce). Whether to *additionally* decouple
   the Windows file mechanism's emit-delivery from its completion-reap loop
@@ -530,9 +534,12 @@ Gates, applied at the marked rungs:
 Each rung is an independently-governed PR on `dev`, run through the full
 `/governance` pipeline.
 
-0. **#2011 gate** — per-mechanism-type `mech_ops_mu_`. Pure engine-internal
-   refactor; acceptance test: a blocking `watch()` on mechanism A does not delay
-   `unwatch()` on mechanism B.
+0. **#2011 gate — LANDED (lock half).** Per-mechanism-type `mech_ops_mu_by_type_`.
+   Pure engine-internal refactor; acceptance tests: a blocking `watch()` on
+   mechanism A does not delay `unwatch()` on mechanism B (cross-type decoupling),
+   and a blocking `watch()` DOES still serialise a second arm of the same type
+   (per-type control). Observability half (per-type stats + alerts) deferred to
+   rung 1.
 1. **Instantiate + observe** — SparkEngine constructed in `agent.cpp` behind
    `--spark-disable`; `yuzu.spark_*` heartbeat tags (incl. queue-drop/consumer-error
    + inert-mechanism signal) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
