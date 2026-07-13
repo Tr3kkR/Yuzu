@@ -148,16 +148,27 @@ tests)` step between Build and Test in ci.yml (linux / windows / macos) and
 nightly.yml (asan / tsan / coverage).
 Resolution order inside the script:
 
-1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — trusted
-   as-is. The escape hatch for any bespoke runner setup.
-2. **Docker** (self-hosted Linux: the `yuzu-bigtam-linux` pool) —
-   idempotent persistent container `yuzu-ci-postgres` on
-   `127.0.0.1:15432` (`docker start` || `docker run --restart
-   unless-stopped`, image pinned to the same digest as
-   `deploy/docker/Dockerfile.postgres`'s base). One-time cost per runner;
-   port 15432 avoids colliding with native clusters or UAT rigs on 5432.
-   Big Tam runs 4 runners on one host, so the create path is
-   `flock`-serialized (one shared container, not four).
+1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
+   hatch for any bespoke runner setup. On a **multi-agent box** (runner
+   name ending `-<n>`, i.e. the 4-runner pools) the pre-set DSN names the
+   *agent-0* cluster and agent `<n>` uses **port + `<n>`** when that
+   per-agent cluster answers a probe — one instance per agent, so
+   concurrent jobs never share a WAL/buffer pool (#2094, the 2026-07-12
+   Wee Tam server-suite timeouts). Until a box is provisioned with the
+   extra clusters the script falls back to the shared pre-set DSN with a
+   `::warning` — no flag day. Runners without a `-<n>` suffix use the DSN
+   as-is.
+2. **Docker** (self-hosted Linux) — idempotent persistent container
+   (`docker start` || `docker run --restart unless-stopped`, image pinned
+   to the same digest as `deploy/docker/Dockerfile.postgres`'s base;
+   one-time cost per runner). On the multi-agent `yuzu-bigtam-linux` pool
+   each agent gets **its own container** — `yuzu-ci-postgres-<n>` on
+   `127.0.0.1:15440+<n>`, `max_connections=400` (#2094/#2096),
+   self-created on the agent's first job. Single-agent boxes keep the
+   shared `yuzu-ci-postgres` on `127.0.0.1:15432`. The 15440+ base and
+   15432 avoid colliding with native clusters (5432), the dev pg-canary
+   (5433), and the UAT sidecar (15433). Lifecycle is `flock`-serialized
+   per container name.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -174,10 +185,13 @@ Resolution order inside the script:
    Postgres with different credentials.
 
    **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
-   provides a native PostgreSQL **18** service (`postgresql-x64-18-yuzu-ci`)
-   and a machine-level `YUZU_TEST_POSTGRES_DSN` that wins before the docker
-   probe, so the leg stays deterministic regardless of any Docker engine
-   state. Provisioning specifics live in
+   provides native PostgreSQL **18** services — agent 0's winget-installed
+   `postgresql-x64-18-yuzu-ci` on `:5433` plus one initdb'd cluster per
+   further agent (`postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`, #2094) —
+   and a machine-level `YUZU_TEST_POSTGRES_DSN` (the agent-0 DSN; path 1
+   derives the per-agent port) that wins before the docker probe, so the
+   leg stays deterministic regardless of any Docker engine state.
+   Provisioning specifics live in
    [`deploy/windows/`](../deploy/windows/README.md). (The retired
    `yuzu-local-windows` box ran a PG 16 binaries-zip service on 5433 — see
    git history if that bootstrap pattern is ever needed again.)
@@ -206,12 +220,17 @@ unset — the `[pg]` cases skip cleanly. The `/test` skill and CI
 deliberately hard-fail at the ensure-postgres step instead (that is the
 gate working, not a skill bug).
 
-Operational notes for shared instances: the `yuzu-ci-postgres`
-container is shared across concurrent jobs on a runner — the migration
-runner's advisory locks are **cluster-wide**, so same-named stores in
-different ephemeral test databases briefly serialize on each other
-(transaction-scoped locks: never deadlock, never cross-database
-corruption).
+Operational notes for shared instances: on a box where a Postgres
+instance IS still shared across concurrent jobs (single-agent boxes, or
+a multi-agent box before its per-agent instances are provisioned —
+the fallback `::warning`), the migration runner's advisory locks are
+**cluster-wide**, so same-named stores in different ephemeral test
+databases briefly serialize on each other (transaction-scoped locks:
+never deadlock, never cross-database corruption). The 4-agent pools run
+**one instance per agent** (#2094) precisely so no job shares WAL/fsync
+bandwidth — or advisory-lock space — with a concurrent job. After the
+Big Tam cutover the legacy shared `yuzu-ci-postgres` container on
+`:15432` is unused there and can be `docker rm -f`'d.
 
 **Test-database lifecycle (PR #2091).** Ephemeral per-case databases
 (`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`)

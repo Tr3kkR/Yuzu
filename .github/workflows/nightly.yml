@@ -179,10 +179,10 @@ jobs:
         run: meson compile -C build-linux-asan
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Idempotent persistent `yuzu-ci-postgres` docker container on
-      # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
-      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
-      # fails the job here, before the test step.
+      # Idempotent persistent docker container — per agent on the 4-runner
+      # pool (`yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>, #2094) — same
+      # step as ci.yml's linux job. Required since #1320 PR 1 (SOFT_EXIT=1):
+      # a missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
