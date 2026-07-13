@@ -321,9 +321,18 @@ def main(argv=None):
     rc = subprocess.run(["meson", "test", "-C", args.builddir] + args.meson_args).returncode
 
     # 2. Duration-vs-budget watchdog (#2093) — before the green early-return,
-    #    because the creep it exists to surface happens in green runs.
-    tests = introspect_tests(args.builddir)
-    report_suite_budgets(args.builddir, tests)
+    #    because the creep it exists to surface happens in green runs. Hard
+    #    exception-guarded: reporting must never turn a green run red (e.g.
+    #    introspect returning rc 0 with garbled stdout, or a non-numeric
+    #    timeout reaching the frac arithmetic).
+    tests = []
+    try:
+        tests = introspect_tests(args.builddir)
+        report_suite_budgets(args.builddir, tests)
+    except Exception as ex:  # noqa: BLE001 — watchdog is reporting-only by contract
+        # `tests` keeps whatever introspect managed to return ([] if it was
+        # introspect itself that threw) — the failure path below re-uses it.
+        gh("warning", f"suite-budget watchdog failed (reporting only, run unaffected): {ex}")
 
     if rc == 0:
         return 0
@@ -457,6 +466,44 @@ def _selftest():
     check(frac_hi > 0.8, "watchdog fires above 80%")
     check(not (frac_lo > 0.8), "watchdog silent below 80%")
 
+    # report_suite_budgets end-to-end (#2093): the ::warning line and summary
+    # table must actually emit — an inverted threshold or a formatting
+    # exception would otherwise ship silently, since the watchdog is
+    # reporting-only and nothing else exercises it.
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        logs = os.path.join(d, "meson-logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:
+            f.write('<testsuites><testsuite>'
+                    '<testcase name="server - yuzu:server unit tests" time="510.0"/>'
+                    '<testcase name="tar - yuzu:tar unit tests" time="12.0"/>'
+                    '</testsuite></testsuites>')
+        entries = [{"name": "server unit tests", "timeout": 600},
+                   {"name": "tar unit tests", "timeout": 90}]
+        summary_path = os.path.join(d, "summary.md")
+        old_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        os.environ["GITHUB_STEP_SUMMARY"] = summary_path
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                report_suite_budgets(d, entries)
+        finally:
+            if old_summary is None:
+                del os.environ["GITHUB_STEP_SUMMARY"]
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = old_summary
+        stdout = out.getvalue()
+        check("::warning::" in stdout and "server unit tests at 510/600s (85%)" in stdout,
+              "watchdog warning emits for the over-budget suite")
+        check("tar unit tests" not in stdout, "no warning for the under-budget suite")
+        with open(summary_path, encoding="utf-8") as f:
+            table = f.read()
+        check("| server unit tests | 510 | 600 | 85% |" in table
+              and "| tar unit tests | 12 | 90 | 13% |" in table,
+              "summary table rows written on green")
+
     # catch2 exe detection.
     check(CATCH2_EXE.search("yuzu_agent_tests.exe") is not None, "catch2 exe matches (win)")
     check(CATCH2_EXE.search("yuzu_server_tests") is not None, "catch2 exe matches (nix)")
@@ -485,6 +532,9 @@ def _selftest():
     check(_cmd_without_test_specs([]) == [], "empty cmd stays empty")
     check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
           "argv[0] untouched even when spec-shaped")
+    check(_cmd_without_test_specs(["x", "~[a][b]"]) == ["x"], "strips tilde compound spec")
+    check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
+    check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
     # Repo-hygiene guard (#2092): every positional arg on the server test()
     # entries in tests/meson.build must be a Catch2 tag-filter spec — the
@@ -495,12 +545,24 @@ def _selftest():
                                "..", "..", "tests", "meson.build")
     with open(meson_build, encoding="utf-8") as f:
         _src = f.read()
-    _arglists = re.findall(r"server_test_exe,\s*args:\s*\[(.*?)\],\s*suite:", _src)
-    check(bool(_arglists), "meson.build: server shard entries located")
-    for _arglist in _arglists:
-        for _arg in re.findall(r"'([^']*)'", _arglist):
+    # Entry-shaped parse (kwarg order and line breaks don't matter): grab
+    # every test(..., server_test_exe, ...) body, then any args: [...] list
+    # inside it. An args-less entry has no positional specs to strip, so it
+    # is correctly exempt; both shard entries must be found and args-carrying
+    # or the guard fails loudly instead of silently inspecting half the
+    # surface.
+    _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
+    check(len(_entries) >= 2, "meson.build: both server shard entries located")
+    _args_entries = 0
+    for _body in _entries:
+        _m = re.search(r"args:\s*\[(.*?)\]", _body, re.S)
+        if not _m:
+            continue
+        _args_entries += 1
+        for _arg in re.findall(r"'([^']*)'", _m.group(1)):
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
+    check(_args_entries >= 2, "meson.build: both tag-filtered shard entries carry args")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

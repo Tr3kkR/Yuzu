@@ -106,6 +106,9 @@ def run_scenario(label, env_extra, known_flaky, expect_zero):
         with open(kf, "w") as f:
             json.dump(known_flaky, f)
         env = dict(os.environ)
+        # The wrapper's summary() writes bypass capture_output — never let a
+        # fake scenario append to a real Actions job summary.
+        env.pop("GITHUB_STEP_SUMMARY", None)
         env["PATH"] = binroot + os.pathsep + env["PATH"]
         env["FAKE_CATCH2_BIN"] = catch2
         env.update(env_extra)

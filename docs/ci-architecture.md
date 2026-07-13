@@ -346,7 +346,7 @@ header).
 the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
 `actions/cache` for vcpkg — catches workflow regressions before main.
 
-## Cache pruning
+## Cache pruning + weekly maintenance
 
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
@@ -354,6 +354,9 @@ old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
 (`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
 built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
+on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
+databases (thresholds and semantics: "Test-database lifecycle" above).
 
 ## Chiselled demo images + agent bundle (release-time)
 

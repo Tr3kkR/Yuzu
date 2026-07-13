@@ -37,7 +37,24 @@
 # continues; only usage errors exit nonzero. Never touches a database whose
 # name doesn't both start with yuzu_test_ and match ^[a-z0-9_]+$ (names are
 # spliced into DROP statements — same charset guard as the C++ sweeper).
+#
+# Accepted trade-off (governance 2026-07-13): the DSN — password included —
+# is passed to psql as argv, briefly readable via /proc/*/cmdline by
+# co-tenant processes. It crosses no new trust boundary on these boxes: the
+# same DSN already sits in a machine-level env var readable under the shared
+# runner identity (#1883 topology).
 set -euo pipefail
+
+# System32 precedes /usr/bin on the Wee Tam runners' PATH (the same fact
+# that forces ci.yml's `source`-not-`bash` idiom), so bare `find`, `sort`
+# and `timeout` resolve to the Windows binaries and every psql call dies
+# quietly under the fail-soft contract. Prepend /usr/bin so coreutils win.
+# $OSTYPE is a bash builtin — unlike uname it needs no PATH to be sane yet.
+case "${OSTYPE:-}" in msys*|cygwin*) PATH="/usr/bin:$PATH" ;; esac
+
+# No filename globbing is ever intended; keeps a hostile '*' datname (which
+# the charset guards reject anyway) from expanding against the CWD.
+set -f
 
 DRY_RUN=0
 AGENTS=4          # runner agents per box (CLAUDE.md standing invariant)
@@ -235,11 +252,12 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   else
     dsn="$YUZU_TEST_POSTGRES_DSN"
     host="127.0.0.1"   # default when the DSN names no host
-    if [[ "$dsn" =~ ^(postgres(ql)?://([^/?@]*@)?([^:/?]+)):([0-9]+)(/[^?]*)?(\?.*)?$ ]]; then
-      # URI form: rewrite port and database per probed instance; probe the
-      # DSN's own host, not a hardcoded loopback.
+    if [[ "$dsn" =~ ^(postgres(ql)?://([^/?@]*@)?([^:/?]+))(:([0-9]+))?(/[^?]*)?(\?.*)?$ ]]; then
+      # URI form (port optional — defaults to 5432): rewrite port and
+      # database per probed instance; probe the DSN's own host, not a
+      # hardcoded loopback.
       base="${BASH_REMATCH[1]}" host="${BASH_REMATCH[4]}"
-      port="${BASH_REMATCH[5]}" query="${BASH_REMATCH[7]}"
+      port="${BASH_REMATCH[6]:-5432}" query="${BASH_REMATCH[8]}"
       mkconn() { echo "${base}:$1/postgres${query}"; }
     else
       # Keyword form: later keywords win in libpq conninfo strings.

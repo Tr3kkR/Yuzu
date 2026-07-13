@@ -79,6 +79,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # clean: false is load-bearing on the self-hosted agents: they share
+          # one per-repo workspace with ci.yml's build jobs (which also set it),
+          # and the default git clean -ffdx would wipe the warm build-*/ and
+          # vcpkg_installed/ trees this workflow's own header promises not to
+          # touch.
+          clean: false
 
       - name: Sweep leaked yuzu_test_* databases (#1367)
         run: bash scripts/ci/sweep-test-databases.sh
@@ -96,6 +102,12 @@ jobs:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
           set -eu
+          # System32 precedes /usr/bin on these runners' PATH (the same fact
+          # that forces the `source`-not-`bash` idiom below), so a bare `find`
+          # is Windows find.exe — its errors were swallowed by 2>/dev/null and
+          # this step pruned nothing while printing before=0 deleted=0.
+          # Prepend /usr/bin so coreutils win.
+          export PATH="/usr/bin:$PATH"
           # RUNNER_TOOL_CACHE on Windows is typically C:\actions-runner\_work\_tool
           # which msys2 bash sees as /c/actions-runner/_work/_tool. Use the
           # native env var directly; bash treats forward+back slashes equivalently
@@ -114,6 +126,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # clean: false is load-bearing on the self-hosted agents: they share
+          # one per-repo workspace with ci.yml's build jobs (which also set it),
+          # and the default git clean -ffdx would wipe the warm build-*/ and
+          # vcpkg_installed/ trees this workflow's own header promises not to
+          # touch.
+          clean: false
 
       - name: Sweep leaked yuzu_test_* databases (#1367)
         # `source`, not `bash`: same idiom as ci.yml's ensure-postgres step —
