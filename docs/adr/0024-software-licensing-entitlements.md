@@ -367,7 +367,7 @@ Decision numbers are stable, since other documents cite them.
    **`DELETE /api/v1/sle/agents/{id}`** erasure (Decision 11) is deliberately **REST-only**
    — a device purge is withheld from the agentic surface, so it is a *recorded exception*
    to ADR-1005 Decision 1's both-surfaces rule rather than a twin gap: the exception row
-   (surface + tracking issue + revisit-by date) lands in ADR-1005's twin-existence
+   (surface + tracking issue #2102 + revisit-by date) lands in ADR-1005's twin-existence
    exception ledger at ratification, alongside the SCIM-v2 REST-only precedent. Per Placement under
    ADR-1005, the **Compliance, Entitlements, and Reclamation** sub-views and the
    **compliance MCP tool `get_license_compliance_summary`** are the SAM UCE host's UI and
