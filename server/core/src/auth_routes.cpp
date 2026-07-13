@@ -378,8 +378,15 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
 
     // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
     //    always DEFINITIVE — there is no backend that could be unavailable.
-    if (const auto cookie = extract_session_cookie(req);
-        !cookie.empty() && cookie.size() <= auth::kMaxSessionTokenLength) {
+    const auto cookie = extract_session_cookie(req);
+    if (cookie.size() > auth::kMaxSessionTokenLength) {
+        // resolve_session hard-rejects an oversized cookie rather than falling through,
+        // so a fresh request carrying one would 401. The stream must die for the same
+        // reason, or the "lives iff a fresh request would authenticate" invariant is a
+        // fiction.
+        return R::kRevoked;
+    }
+    if (!cookie.empty()) {
         if (auto session = auth_mgr_.validate_session(cookie)) {
             // A credential that now resolves to a DIFFERENT principal is a rebind, and
             // a rebind revokes the stream's authority: the stream carries the original

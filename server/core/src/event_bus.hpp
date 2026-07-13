@@ -152,6 +152,14 @@ inline void enqueue_capped(const std::shared_ptr<SseSinkState>& state, SseEvent 
 // output cause silent truncation — only the first line reaches the browser.
 inline std::string format_sse(const SseEvent& ev) {
     std::string out;
+    // `id:` first, when the route sets one (0 = none). Emitted HERE rather than in a
+    // per-route wrapper so that a caller who populates SseEvent::id and reaches for the
+    // shared formatter gets the id on the wire instead of having it silently dropped.
+    if (ev.id != 0) {
+        out += "id: ";
+        out += std::to_string(ev.id);
+        out += '\n';
+    }
     out += "event: ";
     out += ev.event_type;
     out += '\n';
@@ -219,7 +227,15 @@ inline bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, siz
 
 inline void sse_resource_release(const std::shared_ptr<SseSinkState>& state, EventBus& bus,
                                  bool /*success*/) {
-    state->closed.store(true);
+    {
+        // `closed` is the provider's wait PREDICATE, so it must be modified while owning
+        // the mutex: a store issued between the provider's predicate check and its atomic
+        // release-and-block is a lost wakeup, and the provider then sleeps a full 3 s tick
+        // before it notices. Being atomic does not help — ownership of the mutex during
+        // the modification is what orders it against the wait.
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->closed.store(true);
+    }
     state->cv.notify_all();
     bus.unsubscribe(state->sub_id);
 }

@@ -433,6 +433,16 @@ public:
         metrics_.describe("yuzu_mcp_streams_handover_pending",
                           "Superseded MCP SSE streams still draining — each still pins a worker",
                           "gauge");
+        // The EFFECTIVE cap, after the boot-time clamp. Without this an operator who set
+        // --mcp-max-streams=16 and is being rejected at 12 has only a boot log line to
+        // tell them why.
+        metrics_.describe("yuzu_mcp_streams_cap",
+                          "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
+                          "Frames dropped from a slow consumer's per-connection queue", "counter");
         metrics_.describe("yuzu_mcp_stream_replay_ring_evictions_total",
                           "Frames evicted from a session's bounded replay ring — a client whose "
                           "cursor falls behind gets a 404 and must re-initialize",
@@ -443,6 +453,11 @@ public:
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
+        metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
+        for (auto reason : {"client_disconnect", "superseded", "session_terminated",
+                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+            metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
+        }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
@@ -5464,6 +5479,7 @@ private:
         }
         stream_budget_ = std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{
             effective_streams, cfg_.mcp_max_streams_per_principal});
+        metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         spdlog::info("HTTP worker pool: base={} max={}; held-open MCP SSE streams capped at {} "
                      "({} per principal). NOTE: the plain-REST reserve of {} bounds the MCP "
                      "surface only — GET /api/v1/events, the dashboard execution SSE, and the "
@@ -12246,10 +12262,12 @@ private:
     // opted out.
     //
     // DECLARED BEFORE mcp_sessions_ ON PURPOSE: every Lease borrows this budget, and a
-    // Lease can be reached from a session's stream state. Members destruct in reverse
-    // declaration order, so the budget must be declared FIRST to outlive its borrowers
-    // by construction — not merely because stop() happens to have released the leases
-    // first (stop() early-returns if another thread is already inside it).
+    // Lease is reachable both from a session's stream state and from a provider closure
+    // living on a worker stack. Members destruct in reverse declaration order, so the
+    // budget must be declared FIRST to outlive its borrowers. NOTE the borrowers on
+    // worker stacks are only reaped when web_server_'s pool is joined — that join is
+    // load-bearing and this ordering is defence in depth behind it, not a replacement
+    // for it (web_server_ is declared earlier still, so it destructs after this).
     std::unique_ptr<detail::StreamBudget> stream_budget_;
     // MCP Streamable HTTP session registry (2f). Captured by raw pointer into the
     // /mcp/v1/ handlers; safe because stop() joins web_server_ before members

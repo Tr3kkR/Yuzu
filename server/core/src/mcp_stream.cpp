@@ -40,6 +40,8 @@ constexpr const char* kMetricStreamsActive = "yuzu_mcp_streams_active";
 constexpr const char* kMetricStreamsHandover = "yuzu_mcp_streams_handover_pending";
 constexpr const char* kMetricRingEvictions = "yuzu_mcp_stream_replay_ring_evictions_total";
 constexpr const char* kMetricStreamRejects = "yuzu_mcp_stream_rejects_total";
+constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
+constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -47,18 +49,14 @@ void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     }
 }
 
-// SSE framing. Ring frames carry an `id:` so a broken stream can resume with
-// `Last-Event-ID`; heartbeats and the close frame deliberately do NOT (they are
-// not replayable state — resuming onto a heartbeat id would skip real frames).
-std::string format_frame(const sse_bus::SseEvent& ev) {
-    std::string out;
-    if (ev.id != 0) {
-        out += "id: ";
-        out += std::to_string(ev.id);
-        out += '\n';
+// Closes are counted BY REASON. Without this an operator cannot alert on
+// "auth_unavailable closes are spiking" (i.e. our auth store is sick and streams are
+// dying of it) without trawling the audit store — and that is precisely the signal the
+// tri-state re-validation exists to produce.
+void count_stream_close(yuzu::MetricsRegistry* metrics, McpStreamClose reason) {
+    if (metrics != nullptr) {
+        metrics->counter(kMetricStreamCloses, {{"reason", to_string(reason)}}).increment();
     }
-    out += sse_bus::format_sse(ev);
-    return out;
 }
 
 // SSE is a line protocol: a newline in `event_type` would terminate the field and
@@ -85,6 +83,9 @@ const char* close_remediation(McpStreamClose reason) {
                "by execution_id";
     case McpStreamClose::kSessionTerminated:
         return "re-initialize to mint a new session";
+    case McpStreamClose::kInternalError:
+        return "a server-side fault ended this stream — reconnect; durable results remain "
+               "fetchable by execution_id";
     case McpStreamClose::kClientGone:
     case McpStreamClose::kSuperseded:
     case McpStreamClose::kNone:
@@ -140,6 +141,8 @@ const char* to_string(McpStreamClose reason) {
         return "credential_revoked";
     case McpStreamClose::kAuthUnavailable:
         return "auth_unavailable";
+    case McpStreamClose::kInternalError:
+        return "internal_error";
     }
     return "unknown";
 }
@@ -155,16 +158,25 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
     std::shared_ptr<McpStreamSink> live;
     std::uint64_t id = 0;
     std::uint64_t evicted = 0;
+    bool oversized = false;
     {
+        // A single frame must not exceed the ring's byte budget, or the "always keep the
+        // newest frame" rule below would admit it whole and the byte cap would bound
+        // nothing. Truncate instead — a truncated frame the client can see is strictly
+        // better than an unbounded ring, and the eviction counter records that it happened.
+        if (data.size() > ring_bytes_cap_) {
+            data.resize(ring_bytes_cap_);
+            oversized = true;
+        }
         std::lock_guard<std::mutex> lk(mu_);
         id = next_id_++;
         ring_.push_back(sse_bus::SseEvent{sanitize_event_type(std::move(event_type)),
                                           std::move(data), id});
-        while (ring_.size() > ring_cap_ || (ring_bytes_ + frame_bytes(ring_.back()) > ring_bytes_cap_ &&
-                                            ring_.size() > 1)) {
-            // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a
-            // memory bound — one 5 MB frame would blow the budget the count says we
-            // are respecting. Always keep at least the newest frame.
+        while (ring_.size() > ring_cap_ ||
+               (ring_bytes_ + frame_bytes(ring_.back()) > ring_bytes_cap_ && ring_.size() > 1)) {
+            // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a memory
+            // bound — 1024 sessions x 500 frames only bounds memory if you also know what a
+            // frame weighs. Always keep at least the newest frame.
             ring_bytes_ -= frame_bytes(ring_.front());
             ring_.pop_front();
             ++evictions_;
@@ -189,6 +201,10 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
     }
     if (evicted > 0 && metrics_ != nullptr) {
         metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
+    }
+    if (oversized) {
+        spdlog::warn("MCP stream: truncated an oversized frame to the {}-byte ring budget",
+                     ring_bytes_cap_);
     }
     return id;
 }
@@ -395,15 +411,16 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              std::function<StreamRevalidate()> revalidate,
                              std::function<bool()> session_alive)
     : McpStreamPump(std::move(sink), std::move(stream), generation, std::move(revalidate),
-                    std::move(session_alive), Config{}, {}) {}
+                    std::move(session_alive), Config{}, {}, nullptr) {}
 
 McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              std::shared_ptr<McpStreamState> stream, std::uint64_t generation,
                              std::function<StreamRevalidate()> revalidate,
-                             std::function<bool()> session_alive, Config cfg, ClockFn clock)
+                             std::function<bool()> session_alive, Config cfg, ClockFn clock,
+                             yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      clock_(std::move(clock)) {}
+      clock_(std::move(clock)), metrics_(metrics) {}
 
 std::chrono::steady_clock::time_point McpStreamPump::now() const {
     return clock_ ? clock_() : std::chrono::steady_clock::now();
@@ -412,6 +429,7 @@ std::chrono::steady_clock::time_point McpStreamPump::now() const {
 bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     sink_->set_close_reason(reason);
     const McpStreamClose actual = sink_->close_reason.load();
+    count_stream_close(metrics_, actual);
 
     // A SUPERSEDED stream gets no final frame — deliberately. The client already has a
     // newer stream on this session, so the only thing that can be waiting on the far
@@ -443,14 +461,18 @@ bool McpStreamPump::pump_once(const WriteFn& write) {
     // and every frame build allocates.
     try {
         return pump_once_impl(write);
-    } catch (const std::exception& e) {
-        spdlog::warn("MCP stream pump: aborting stream after exception: {}", e.what());
-        sink_->set_close_reason(McpStreamClose::kClientGone);
-        return false; // httplib still runs the releaser → detach() → the lease comes back
     } catch (...) {
-        spdlog::warn("MCP stream pump: aborting stream after unknown exception");
-        sink_->set_close_reason(McpStreamClose::kClientGone);
-        return false;
+        // Record the reason FIRST — an internal fault must not be audited as a client
+        // disconnect, or the operator goes looking at the client for our bug. Only then
+        // log, and guard even that: spdlog's formatter allocates, and this catch exists
+        // precisely because we may be out of memory.
+        sink_->set_close_reason(McpStreamClose::kInternalError);
+        count_stream_close(metrics_, McpStreamClose::kInternalError);
+        try {
+            spdlog::warn("MCP stream pump: aborting stream after an exception");
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left to say
+        }
+        return false; // httplib still runs the releaser → detach() → the lease comes back
     }
 }
 
@@ -522,13 +544,24 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         }
     }
     if (dropped > 0) {
-        // The sink queue overflowed, but the RING still holds those frames — tell
-        // the client to reconnect with Last-Event-ID rather than pretend the gap
-        // does not exist.
+        // The sink queue overflowed. Tell the client — a silent gap is the one thing
+        // this channel must never produce. But do NOT promise a replay we may not be
+        // able to honour: the ring and the sink share a cap, so a consumer slow enough
+        // to overflow the queue has usually also fallen out of the replay window, and
+        // its reconnect will be answered with a 404 + re-initialize rather than the
+        // frames it lost. Say both.
+        // Field names match the `/api/v1/events` sibling's synthetic (dropped_count +
+        // reason) — one taxonomy, not a per-route format.
         const sse_bus::SseEvent ev{
             "events-dropped",
-            "{\"dropped\":" + std::to_string(dropped) +
-                ",\"remediation\":\"reconnect with Last-Event-ID to replay missed frames\"}"};
+            "{\"dropped_count\":" + std::to_string(dropped) +
+                ",\"reason\":\"slow consumer — the per-connection queue overflowed\""
+                ",\"remediation\":\"reconnect with Last-Event-ID; if the replay window has "
+                "also passed you will get a 404 — re-initialize, durable results remain "
+                "fetchable by execution_id\"}"};
+        if (metrics_ != nullptr) {
+            metrics_->counter(kMetricFramesDropped).increment(static_cast<double>(dropped));
+        }
         if (!write_all(write, sse_bus::format_sse(ev))) {
             return finish(write, McpStreamClose::kClientGone);
         }
@@ -537,7 +570,10 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         // The id rides on the frame (SseEvent::id) — it is NOT parsed back out of the
         // payload. Re-parsing put a throwing stoull inside this callback, which httplib
         // runs on an unguarded worker task.
-        if (!write_all(write, format_frame(ev))) {
+        // Ring frames carry an `id:` (SseEvent::id, emitted by the shared formatter) so a
+        // broken stream can resume; heartbeats and synthetics carry none — resuming onto
+        // a heartbeat's id would skip real frames.
+        if (!write_all(write, sse_bus::format_sse(ev))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
@@ -656,18 +692,21 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     // those and MCP streaming is dead until restart. httplib guarantees the releaser
     // runs once installed (~Response calls it unconditionally) — this guard covers the
     // window before that guarantee starts.
-    bool provider_installed = false;
-    const auto lease_guard = [&]() noexcept {
-        if (!provider_installed) {
-            stream->detach(sink);
+    //
+    // The guard is a POD, NOT a std::function: this lambda's captures exceed
+    // libstdc++'s 16-byte small-object buffer, so wrapping it would heap-allocate —
+    // planting a throw site inside the very window the guard exists to protect.
+    struct LeaseGuard {
+        McpStreamState* stream;
+        const std::shared_ptr<McpStreamSink>* sink;
+        bool installed = false;
+        ~LeaseGuard() noexcept {
+            if (!installed) {
+                stream->detach(*sink);
+            }
         }
     };
-    struct ScopeExit {
-        const std::function<void()>& fn;
-        ~ScopeExit() { fn(); }
-    };
-    const std::function<void()> guard_fn = lease_guard;
-    ScopeExit scope_exit{guard_fn};
+    LeaseGuard lease_guard{stream.get(), &sink};
 
     // Audit BEFORE the provider: set_chunked_content_provider seals the headers, so
     // Sec-Audit-Failed can only be set here (the /api/v1/events posture — signal the
@@ -675,7 +714,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     // operator's stream).
     if (!audit("mcp.stream.attach", "success",
                yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
-               "correlation_id=" + cid + " last_event_id=" + std::to_string(last_event_id) +
+               "cid=" + cid + " last_event_id=" + std::to_string(last_event_id) +
                    " generation=" + std::to_string(attached.generation))) {
         res.set_header("Sec-Audit-Failed", "true");
     }
@@ -705,7 +744,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                McpSessionRegistry::ValidateResult::kValid;
     };
     auto pump = std::make_shared<McpStreamPump>(sink, stream, generation, std::move(revalidate_fn),
-                                                std::move(session_alive));
+                                                std::move(session_alive), McpStreamPump::Config{},
+                                                McpStreamPump::ClockFn{}, metrics);
 
     res.set_chunked_content_provider(
         "text/event-stream",
@@ -721,14 +761,14 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                 stream->detach(sink); // returns this provider's worker to the budget
                 (void)yuzu::server::detail::try_persist_audit(
                     audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession", audit_sid,
-                    std::string("reason=") + to_string(sink->close_reason.load()) +
-                        " correlation_id=" + cid);
+                    std::string("reason=") + to_string(sink->close_reason.load()) + " cid=" + cid);
             } catch (...) {
                 // The lease is still returned: detach() is the first call, and Lease's
                 // destructor would return it even if that somehow threw.
             }
         });
-    provider_installed = true;
+    // The releaser now owns the lease's return path; the guard stands down.
+    lease_guard.installed = true;
 }
 
 }  // namespace yuzu::server::mcp

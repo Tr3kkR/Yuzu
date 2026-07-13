@@ -194,7 +194,12 @@ change: a notification POST now answers `202` instead of `204`).
   the stream within one tick (`credential_revoked`). Streams end with a final
   `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
-  auth store was unreachable for longer than the grace window).
+  auth store was unreachable for longer than the **60 s** grace window — the stream is not
+  cut the instant the store hiccups, but the exposure is bounded: a revoked credential
+  cannot outlive a coincident auth-store outage by more than that window).
+  Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
+  sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
+  need their own response-buffering opt-out.
   In this release the channel carries heartbeats and replayed frames;
   `notifications/progress` for long-running tools arrives in the next 2f rung (see
   `docs/mcp-server.md`).

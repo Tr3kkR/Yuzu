@@ -268,6 +268,11 @@ Track 2f PR 2. Three things change for an operator:
    a live stream is never evicted. Raise the caps only alongside
    `--http-worker-threads`.
 
+   **Sizing:** for N concurrent long-lived streaming workers, set
+   `--http-worker-threads >= N + 8` and `--mcp-max-streams >= N`. The effective cap after
+   the boot clamp is exported as `yuzu_mcp_streams_cap`, so you can alert on it rather
+   than reading boot logs.
+
 3. **The HTTP worker pool is now sized explicitly** (`--http-worker-threads`, default
    auto). The defaults reproduce httplib's previous implicit numbers exactly
    (`max(8, cores-1)` base, growing to 4x), so behaviour is unchanged unless you set the

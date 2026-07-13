@@ -418,26 +418,87 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     if (!db_)
         return {TokenCheck::kUnavailable, std::nullopt};  // store closed → we cannot know
 
-    if (auto token = validate_token(raw_token))
-        return {TokenCheck::kValid, std::move(token)};
+    // This does its OWN rc-aware lookup rather than calling validate_token and
+    // inferring from its nullopt. An earlier version did exactly that, then probed
+    // the store with a *different* trivial statement to decide whether the negative
+    // answer was real — and that is wrong in the precise case this function exists
+    // for: `validate_token` folds a failed `sqlite3_step` on the row SELECT (BUSY,
+    // I/O error) into the same nullopt as "no such row", while the probe statement
+    // can still succeed on a merely-contended database. The result was a healthy
+    // stream being killed as `credential_revoked` because the store was busy — the
+    // 60 s grace window (Decision 15(i)) unreachable for the most likely auth-store
+    // fault. Only the rc of the actual lookup can distinguish the two.
+    const auto hash = sha256_hex(raw_token);
+    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
 
-    // The negative answer came from one of two very different places: the row is
-    // absent/revoked/expired (definitive), or the read itself failed (SQLITE_BUSY,
-    // I/O error, corruption — `validate_token` folds those into nullopt too).
-    // Probe the store with a trivial read: if THAT works, the store is healthy and
-    // the negative answer was real. Fail-safe direction: a broken store reports
-    // kUnavailable, which grants a BOUNDED grace window — it never grants access.
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        auto it = token_cache_.find(hash);
+        if (it != token_cache_.end()) {
+            if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
+                const auto& cached = it->second.token;
+                const auto now = now_epoch();
+                if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
+                    token_cache_.erase(it);
+                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                    return {TokenCheck::kInvalid, std::nullopt}; // definitive
+                }
+                cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                return {TokenCheck::kValid, cached};
+            }
+            token_cache_.erase(it);
+        }
+    }
+    cache_misses_.fetch_add(1, std::memory_order_relaxed);
+
     std::unique_lock db_lock(db_mtx_);
     sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT 1 FROM api_tokens LIMIT 1;", -1, &raw, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT token_id, token_hash, name, principal_id, scope_service, "
+                           "created_at, expires_at, last_used_at, revoked, mcp_tier "
+                           "FROM api_tokens WHERE token_hash = ?;",
+                           -1, &raw, nullptr) != SQLITE_OK)
+        return {TokenCheck::kUnavailable, std::nullopt}; // could not even ask
+    SqliteStmt stmt{raw};
+    sqlite3_bind_text(stmt.get(), 1, hash.c_str(), -1, SQLITE_TRANSIENT);
+
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE)
+        return {TokenCheck::kInvalid, std::nullopt}; // the row genuinely is not there
+    if (rc != SQLITE_ROW) {
+        // BUSY / IOERR / CORRUPT: we asked and did not get an answer. This is NOT
+        // evidence of revocation — say so, and let the caller ride out its bounded
+        // grace window. Fail-safe: indeterminate never GRANTS access, it only defers
+        // the decision to cut an already-authenticated stream.
         return {TokenCheck::kUnavailable, std::nullopt};
-    // RAII from here: the next early return added to this block must not be able to
-    // leak a prepared statement on the shared connection.
-    SqliteStmt probe{raw};
-    const int rc = sqlite3_step(probe.get());
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
-        return {TokenCheck::kUnavailable, std::nullopt};
-    return {TokenCheck::kInvalid, std::nullopt};
+    }
+
+    ApiToken t;
+    t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    t.token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1)));
+    t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2)));
+    t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3)));
+    t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4)));
+    t.created_at = sqlite3_column_int64(stmt.get(), 5);
+    t.expires_at = sqlite3_column_int64(stmt.get(), 6);
+    t.last_used_at = sqlite3_column_int64(stmt.get(), 7);
+    t.revoked = sqlite3_column_int(stmt.get(), 8) != 0;
+    t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 9)));
+
+    if (t.revoked || (t.expires_at > 0 && now_epoch() > t.expires_at))
+        return {TokenCheck::kInvalid, std::nullopt}; // definitive
+
+    // Deliberately NO `UPDATE last_used_at` here. This runs on every heartbeat tick of
+    // every live stream: writing would (a) make last_used_at track heartbeats rather
+    // than actual calls, and (b) put an exclusive write on the shared connection every
+    // time a stream's cache entry expires — with streams' TTLs aligned by attach time,
+    // that is a thundering herd of writes that every token-authenticated request on the
+    // server then queues behind. Re-validation is a READ.
+    if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+        std::lock_guard cache_lock(cache_mtx_);
+        token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
+    }
+    return {TokenCheck::kValid, std::move(t)};
 }
 
 void ApiTokenStore::invalidate_cache(const std::string& token_hash) {

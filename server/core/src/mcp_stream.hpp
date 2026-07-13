@@ -90,10 +90,16 @@ inline constexpr std::chrono::milliseconds kMcpRevalidateGraceDefault{60000};
 /// succeed for a capacity reason.
 inline constexpr std::int64_t kMcpStreamCapRetryAfterMs = 5000;
 
-/// `retry_after_ms` when a session's previous stream is still draining. Short by
-/// design: the superseded provider exits on its next wake, so the handover clears in
-/// well under a tick — this is a "try again in a moment", not a capacity wait.
-inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 500;
+/// `retry_after_ms` when a session's previous stream is still draining.
+///
+/// The common case clears in microseconds: the superseded provider is woken under its
+/// own mutex and returns without writing. But if it was caught mid-write to a peer that
+/// has stopped reading — the exact case a takeover exists to rescue — it does not
+/// re-enter until httplib's `wait_writable` gives up, bounded by the 30 s write timeout.
+/// So this hint is deliberately the same as the capacity hint rather than an optimistic
+/// half-second that would have a flaky client 429-storming us sixty times while it
+/// dutifully obeyed our own advice.
+inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 5000;
 
 /// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries
 /// the per-session event id). Deliberately NOT a bespoke type: the id used to be
@@ -120,6 +126,7 @@ enum class McpStreamClose {
     kSessionTerminated,  ///< DELETE, idle GC, or replay-window termination
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
+    kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
 };
 const char* to_string(McpStreamClose reason);
 
@@ -304,7 +311,8 @@ public:
                   std::function<bool()> session_alive);
     McpStreamPump(std::shared_ptr<McpStreamSink> sink, std::shared_ptr<McpStreamState> stream,
                   std::uint64_t generation, std::function<StreamRevalidate()> revalidate,
-                  std::function<bool()> session_alive, Config cfg, ClockFn clock = {});
+                  std::function<bool()> session_alive, Config cfg, ClockFn clock = {},
+                  yuzu::MetricsRegistry* metrics = nullptr);
 
     /// One provider pass: wait up to a tick, re-validate, drain, heartbeat.
     /// Returns false when the stream is over (httplib then runs the release
@@ -329,6 +337,7 @@ private:
     std::function<bool()> session_alive_;
     Config cfg_;
     ClockFn clock_;
+    yuzu::MetricsRegistry* metrics_ = nullptr;
     std::optional<std::chrono::steady_clock::time_point> grace_start_;
 };
 

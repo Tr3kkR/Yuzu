@@ -310,7 +310,12 @@ struct Config {
     /// clamped at boot to `pool_max - plain-REST reserve`. Per-principal is
     /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
     /// cursor, a held-open worker is not.
-    std::size_t mcp_max_streams{16};
+    /// 12, not 16, on purpose: the smallest worker pool httplib will hand us (base 8 →
+    /// max 32) affords exactly 12 after the plain-REST reserve and the per-stream
+    /// handover allowance. A default of 16 would be clamped to 12 on every ordinary
+    /// 8-core box and warn about it on every boot — a warning about a setting the
+    /// operator never touched. Bigger boxes can raise it; the clamp still protects them.
+    std::size_t mcp_max_streams{12};
     std::size_t mcp_max_streams_per_principal{4};
     /// Base size of the shared httplib worker pool (0 = auto: max(8, hw−1), the
     /// same number httplib picks by default — but chosen explicitly so the stream
