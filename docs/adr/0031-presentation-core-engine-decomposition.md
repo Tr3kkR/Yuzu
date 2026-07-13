@@ -66,6 +66,12 @@ engine-capability registry all live in core. Core is the authority.
 **3. Presentation is a transport-and-render adapter.** It terminates HTTP and SSE, frames MCP,
 renders the HTMX dashboard — and it reaches the domain **only** through core's API, exactly as any
 external client does. The GUI becomes just another API client.
+**"Core's API" means the public, versioned API — nothing else** (grill decision, 2026-07-13).
+Presentation holds no private endpoints on core; a gap discovered while porting a dashboard
+fragment is, by definition, a missing public capability — the A1 forcing function working as
+designed. Where rendering wants batch/composite reads, those are added to the **public** surface
+(agentic workers want them too — A5); any exception goes in ADR-1005's exception ledger, not in a
+side API.
 
 **4. Engines are headless capability providers.** An engine has **no UI and no machine surface of
 its own**. It registers its tool schemas with core; core proxies invocations to it, injecting a
