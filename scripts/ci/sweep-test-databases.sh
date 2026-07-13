@@ -33,10 +33,15 @@
 #     and skip silently. Falls back to the docs/ci-architecture.md
 #     conventional native cluster on 127.0.0.1:5432 when no DSN is set.
 #
-# Fail-soft by contract: a wedged instance gets a ::warning and the loop
-# continues; only usage errors exit nonzero. Never touches a database whose
-# name doesn't both start with yuzu_test_ and match ^[a-z0-9_]+$ (names are
-# spliced into DROP statements — same charset guard as the C++ sweeper).
+# Failure contract (SRE gate 6): per-instance failures never stop the loop —
+# every remaining instance is still swept — but the script exits 1 at the end
+# when any instance failed, a pass query errored, or a precondition was
+# degraded (psql missing with a DB present), so the weekly run goes red as
+# the alert channel instead of degradation hiding in an unread cron log.
+# A box with genuinely nothing to sweep stays green. Usage errors exit 2.
+# Never touches a database whose name doesn't both start with yuzu_test_ and
+# match ^[a-z0-9_]+$ (names are spliced into DROP statements — same charset
+# guard as the C++ sweeper).
 #
 # Accepted trade-off (governance 2026-07-13): the DSN — password included —
 # is passed to psql as argv, briefly readable via /proc/*/cmdline by
@@ -186,12 +191,13 @@ drop_listed() { # runner conn label force names... -> echoes dropped count
       echo "sweep[dry-run] ${label}: would run: ${stmt}" >&2
       continue
     fi
-    if "$runner" "$conn" "$stmt" >/dev/null 2>&1; then
+    local err=""
+    if err=$("$runner" "$conn" "$stmt" 2>&1 >/dev/null); then
       dropped=$((dropped + 1))
       echo "sweep ${label}: dropped ${db}" >&2
     else
       # Pass B lands here when a connection raced in (no FORCE): correct veto.
-      echo "sweep ${label}: drop of ${db} failed — left in place" >&2
+      echo "sweep ${label}: drop of ${db} failed — left in place (${err})" >&2
     fi
   done
   echo "$dropped"
@@ -206,7 +212,13 @@ sweep_instance() { # label runner conn
     return 1
   }
 
-  stale=$("$runner" "$conn" "$SQL_PASS_A") || stale=""
+  # A failing pass query must not masquerade as "dropped 0" (UP-15/CH-10):
+  # warn per pass and mark the instance failed so the run exits red.
+  local pass_failed=0
+  if stale=$("$runner" "$conn" "$SQL_PASS_A"); then :; else
+    echo "::warning::sweep: ${label}: pass-A (epoch) query failed — epoch-named leaks are NOT being swept" >&2
+    stale="" pass_failed=1
+  fi
   if [[ -n "$stale" ]]; then
     # Unquoted on purpose: datnames are single tokens by the charset guard.
     # shellcheck disable=SC2086
@@ -215,7 +227,10 @@ sweep_instance() { # label runner conn
 
   is_super=$("$runner" "$conn" "$SQL_IS_SUPER") || is_super="f"
   if [[ "$is_super" == "t" ]]; then
-    orphan=$("$runner" "$conn" "$SQL_PASS_B") || orphan=""
+    if orphan=$("$runner" "$conn" "$SQL_PASS_B"); then :; else
+      echo "::warning::sweep: ${label}: pass-B (catalog-fact) query failed — orphaned names are NOT being swept" >&2
+      orphan="" pass_failed=1
+    fi
     if [[ -n "$orphan" ]]; then
       # shellcheck disable=SC2086
       dropped_b=$(drop_listed "$runner" "$conn" "$label" noforce $orphan)
@@ -230,10 +245,11 @@ sweep_instance() { # label runner conn
     # Parity with the in-process sweeper's accumulation warning.
     echo "::warning::sweep: ${label}: ${unsweepable} yuzu_test_* databases have unparseable/implausible epochs — pass B reclaims them at >${ORPHAN_DAYS}d, but a skewed stamper clock is feeding new ones (see #2097)" >&2
   fi
-  return 0
+  return "$pass_failed"
 }
 
 swept_any=0
+SWEEP_RC=0   # flips to 1 on any instance/pass failure or degraded precondition
 
 # docker mode (Big Tam / any docker-hosting Linux runner)
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -241,7 +257,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   for c in $containers; do
     swept_any=1
     sweep_instance "docker:${c}" run_psql_docker "$c" \
-      || echo "::warning::sweep-test-databases: docker:${c} sweep failed — continuing" >&2
+      || { echo "::warning::sweep-test-databases: docker:${c} sweep failed — continuing" >&2; SWEEP_RC=1; }
   done
 fi
 
@@ -278,12 +294,13 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
       if ! tcp_probe "$host" "$p"; then
         if (( n == 0 )); then
           echo "::warning::sweep-test-databases: DSN base port ${p} not answering — is the cluster down?" >&2
+          SWEEP_RC=1   # a box WITH a DSN whose cluster is dark is degradation
         fi
         continue  # higher ports dark = normal pre-#2114-cutover state
       fi
       swept_any=1
       sweep_instance "dsn:${host}:${p}" run_psql_dsn "$(mkconn "$p")" \
-        || echo "::warning::sweep-test-databases: dsn:${host}:${p} sweep failed — continuing" >&2
+        || { echo "::warning::sweep-test-databases: dsn:${host}:${p} sweep failed — continuing" >&2; SWEEP_RC=1; }
     done
   fi
 elif (( ! swept_any )) && tcp_probe 127.0.0.1 5432; then
@@ -292,7 +309,7 @@ elif (( ! swept_any )) && tcp_probe 127.0.0.1 5432; then
   if find_psql; then
     swept_any=1
     sweep_instance "native:127.0.0.1:5432" run_psql_dsn "postgresql://yuzu:yuzu@127.0.0.1:5432/postgres" \
-      || echo "::warning::sweep-test-databases: native:5432 sweep failed — continuing" >&2
+      || { echo "::warning::sweep-test-databases: native:5432 sweep failed — continuing" >&2; SWEEP_RC=1; }
   else
     # A listener we can see but no client to sweep it with is a precondition
     # failure worth signalling, not a quiet "no instances".
@@ -304,4 +321,7 @@ fi
 if (( ! swept_any && ! degraded )); then
   echo "::notice::sweep-test-databases: no Postgres instances to sweep on this host"
 fi
-exit 0
+if (( degraded )); then SWEEP_RC=1; fi
+# Red weekly run = the alert channel for sweep degradation (SRE gate 6);
+# a box with genuinely nothing to sweep exits 0.
+exit "$SWEEP_RC"

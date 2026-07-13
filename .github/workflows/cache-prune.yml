@@ -39,7 +39,7 @@ jobs:
   prune-linux:
     name: "Prune Linux runner cache"
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 10
+    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
     steps:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
@@ -92,7 +92,7 @@ jobs:
   prune-windows:
     name: "Prune Windows runner cache"
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
-    timeout-minutes: 10
+    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
     defaults:
       run:
         # MSYS2 bash for the same `find -mtime` semantics. Same shell

@@ -245,7 +245,13 @@ so leaks from killed runs self-heal within that window; the sweep prints a
 janitor complements it (#1367): `cache-prune.yml` (Sundays 04:00 UTC +
 `workflow_dispatch`) runs `scripts/ci/sweep-test-databases.sh` on both
 self-hosted boxes, so leaks reclaim even on a box that stops running `[pg]`
-legs. Epoch-named databases age by the same >6 h/server-clock rule; names
+legs. The janitor self-discovers the per-agent topology from #2094/#2114 —
+every running `yuzu-ci-postgres(-<n>)` container on the docker boxes, and in
+DSN mode the machine DSN's base port plus the next three per-agent ports
+(dark higher ports are the normal pre-cutover state and skip silently); a
+degraded sweep (psql missing, cluster dark, a pass query failing) exits
+nonzero so the weekly run goes red rather than rotting silently.
+Epoch-named databases age by the same >6 h/server-clock rule; names
 the epoch sweeper can never parse (pre-epoch format `yuzu_test_<salt>_<n>`,
 implausible clock stamps) are dropped only when the datdir's `PG_VERSION`
 mtime exceeds 7 days AND the database has zero active backends
