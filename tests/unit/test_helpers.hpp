@@ -35,6 +35,12 @@
 #include <string>
 #include <string_view>
 
+#if defined(_WIN32)
+#include <process.h> // _getpid — part of the process-salt seed (#486 UP-R12)
+#else
+#include <unistd.h> // getpid
+#endif
+
 #if defined(YUZU_TEST_ENABLE_PG)
 #include <chrono>
 #include <expected>
@@ -52,36 +58,76 @@
 
 namespace yuzu::test {
 
+/// Process-local random salt shared by every unique-name generator in this
+/// header (and by mirrored consumers such as test_guard_registry.cpp's
+/// next_unique_tag). Seeded from TWO std::random_device words XOR the process
+/// id: a single random_device draw is only 32 bits (its result_type), so the
+/// previous one-draw seed left ~32 bits of effective cross-process entropy —
+/// and on toolchains where random_device is weak or deterministic, the pid
+/// term still separates concurrent processes on one box (#486 UP-R12).
+inline std::uint64_t process_random_salt() {
+    static const std::uint64_t salt = [] {
+        std::random_device rd;
+        const auto hi = static_cast<std::uint64_t>(rd()) << 32;
+        const auto lo = static_cast<std::uint64_t>(rd());
+#if defined(_WIN32)
+        const auto pid = static_cast<std::uint64_t>(::_getpid());
+#else
+        const auto pid = static_cast<std::uint64_t>(::getpid());
+#endif
+        return hi ^ lo ^ (pid << 17);
+    }();
+    return salt;
+}
+
 /// Generate a unique filesystem path under the system temp directory.
 ///
-/// Uniqueness is guaranteed within a process by a monotonic atomic counter;
-/// the counter's initial value is seeded from a process-local 64-bit random
-/// salt so two concurrently-running test binaries (if meson ever runs `-j2`
-/// on a single suite) cannot collide with each other either. Clock-based
-/// uniqueness is explicitly NOT part of the scheme — MSVC's steady_clock on
-/// some Windows builds has coarse-enough resolution under Defender-induced
-/// I/O serialisation that two back-to-back fixture constructions produced
-/// identical paths, causing flake #473.
+/// Uniqueness is guaranteed within a process by a monotonic atomic counter,
+/// and across processes (concurrent test binaries, overlapping CI jobs on
+/// the shared-identity runner pools) by `process_random_salt()` embedded in
+/// the returned name. Clock-based uniqueness is explicitly NOT part of the
+/// scheme — MSVC's steady_clock on some Windows builds has coarse-enough
+/// resolution under Defender-induced I/O serialisation that two back-to-back
+/// fixture constructions produced identical paths, causing flake #473.
 ///
 /// The returned path does NOT exist on disk and has no parent directory
 /// created. Callers are responsible for creating parent directories and
 /// cleaning up (prefer `TempDbFile` RAII below for SQLite stores).
 inline std::filesystem::path unique_temp_path(std::string_view prefix = "yuzu-test-") {
-    static const std::uint64_t salt = [] {
-        std::mt19937_64 rng{std::random_device{}()};
-        return rng();
-    }();
     static std::atomic<std::uint64_t> counter{0};
     const auto n = counter.fetch_add(1, std::memory_order_relaxed);
 
     std::string name;
     name.reserve(prefix.size() + 40);
     name.append(prefix);
-    name.append(std::to_string(salt));
+    name.append(std::to_string(process_random_salt()));
     name.push_back('_');
     name.append(std::to_string(n));
     return std::filesystem::temp_directory_path() / name;
 }
+
+/// RAII temp DIRECTORY for tests that need a private scratch dir (e.g. a
+/// FileKeyProvider base dir). Created lazily by the consumer; recursively
+/// removed on destruction. Promoted from per-file copies in
+/// test_key_provider.cpp / test_secret_codec.cpp (governance CON-S4 — the
+/// promote-at-second-user rule; test_default_certs.cpp's local copy migrates
+/// opportunistically).
+///
+/// The prefix ctor exists so migrated fixtures can keep a name matching the
+/// Wee Tam Defender exclusion wildcard `yuzu_*`
+/// (scripts/windows-runner-defender-exclusions.ps1) — Defender-induced I/O
+/// serialisation was the amplifier behind flake #473.
+struct TempDir {
+    std::filesystem::path path;
+    TempDir() : path(unique_temp_path("yuzu-test-dir-")) {}
+    explicit TempDir(std::string_view prefix) : path(unique_temp_path(prefix)) {}
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+};
 
 /// RAII guard for a per-test SQLite database file. Cleans up the base
 /// `.db` plus the `-wal` and `-shm` companion files on destruction. Declare
@@ -91,30 +137,20 @@ inline std::filesystem::path unique_temp_path(std::string_view prefix = "yuzu-te
 /// (finding qe-B1 from Run 3).
 ///
 /// This is the preferred pattern for new tests. `unique_temp_path()` alone
-/// is a lower-level primitive exposed for tests that do not own a SQLite
-/// file (e.g. KV-store tests which open via `KvStore::open(path)` and do
-/// not generate WAL/SHM directly).
-/// RAII temp DIRECTORY for tests that need a private scratch dir (e.g. a
-/// FileKeyProvider base dir). Created lazily by the consumer; recursively
-/// removed on destruction. Promoted from per-file copies in
-/// test_key_provider.cpp / test_secret_codec.cpp (governance CON-S4 — the
-/// promote-at-second-user rule; test_default_certs.cpp's local copy migrates
-/// opportunistically).
-struct TempDir {
-    std::filesystem::path path;
-    TempDir() : path(unique_temp_path("yuzu-test-dir-")) {}
-    ~TempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-};
-
+/// is a lower-level primitive exposed for callers that only need a salted
+/// NAME (e.g. test_guardian_engine.cpp's `unique_kv_path`, which places the
+/// salted filename under a caller-managed per-UID directory and hands it to
+/// TempDbFile's adopt-a-path ctor).
 struct TempDbFile {
     std::filesystem::path path;
 
     explicit TempDbFile(std::string_view prefix = "yuzu-test-") : path(unique_temp_path(prefix)) {}
+
+    /// Exact-match overload so `TempDbFile db{"prefix-"}` compiles: a string
+    /// literal converts equally well to std::string_view (prefix ctor) and
+    /// std::filesystem::path (adopt ctor below), which is ambiguous — until
+    /// now every call site worked around it with std::string_view{...}.
+    explicit TempDbFile(const char* prefix) : TempDbFile(std::string_view{prefix}) {}
 
     /// Adopt a caller-computed path. Useful when the fixture needs to place
     /// the file under a subdirectory that `unique_temp_path` does not model
@@ -463,19 +499,17 @@ private:
     }
 
     static std::string unique_db_name() {
-        static const std::uint64_t salt = [] {
-            std::mt19937_64 rng{std::random_device{}()};
-            return rng();
-        }();
         static std::atomic<std::uint64_t> counter{0};
         const auto n = counter.fetch_add(1, std::memory_order_relaxed);
         // Leading epoch feeds the stale-sweep (test_db_is_stale); the salt +
-        // counter carry uniqueness exactly as before.
+        // counter carry uniqueness exactly as before. The % 1e9 truncation
+        // keeps names short — ~30 bits of the (pid-mixed, #486 UP-R12) salt
+        // is ample for the handful of concurrent DBs per box.
         const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-        return "yuzu_test_" + std::to_string(epoch) + "_" + std::to_string(salt % 1000000000) +
-               "_" + std::to_string(n);
+        return "yuzu_test_" + std::to_string(epoch) + "_" +
+               std::to_string(process_random_salt() % 1000000000) + "_" + std::to_string(n);
     }
 
     /// Re-emit `admin_dsn` as a keyword/value conninfo with dbname replaced.
@@ -923,11 +957,9 @@ private:
     }
 
     static std::uint64_t process_salt() {
-        static const std::uint64_t salt = [] {
-            std::mt19937_64 rng{std::random_device{}()};
-            return rng() % 1000000000;
-        }();
-        return salt;
+        // Same truncation rationale as PostgresTestDb::unique_db_name; the
+        // underlying salt is the shared pid-mixed one (#486 UP-R12).
+        return process_random_salt() % 1000000000;
     }
 
     std::string name_;

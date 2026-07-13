@@ -4,6 +4,8 @@
 
 #include "quarantine_store.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -13,12 +15,12 @@ using namespace yuzu::server;
 
 namespace {
 
-struct TempDb {
-    std::filesystem::path path;
-    TempDb() : path(std::filesystem::temp_directory_path() / "test_quarantine.db") {
-        std::filesystem::remove(path);
-    }
-    ~TempDb() { std::filesystem::remove(path); }
+// Per-test SQLite temp file. yuzu::test::TempDbFile carries the collision-safe
+// naming (process salt + atomic counter) and -wal/-shm cleanup — a fixed
+// filename is a cross-JOB shared resource on the shared-identity CI pools
+// (#1883). Prefix stays inside the Defender exclusion wildcard yuzu_*.
+struct TempDb : yuzu::test::TempDbFile {
+    TempDb() : TempDbFile("yuzu_test_quarantine-") {}
 };
 
 } // namespace

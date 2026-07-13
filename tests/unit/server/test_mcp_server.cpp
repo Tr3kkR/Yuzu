@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -4233,6 +4234,46 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
     CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
     // The #1717 refusal is audited (CC7.2) — a corrupt-authz refusal still leaves a trail.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #1717 fail closed",
+          "[mcp][sle]") {
+    // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
+    // the sibling test above leaves the store null; this one hands the twin a
+    // NON-NULL store whose backing file is garbage bytes, so sqlite3_open_v2
+    // succeeds but the schema migration hits SQLITE_NOTADB and RbacStore
+    // closes db_ — the literal #1717 corrupt-but-openable scenario. Both arms
+    // collapse into one boolean today, so only this case would catch a future
+    // null-prefix refactor (`if (rbac_store && ...)`) breaking the corrupt
+    // arm (#2104).
+    yuzu::test::TempDbFile db{"yuzu_test_mcp_rbac_corrupt-"};
+    {
+        // NON-empty garbage: SQLite treats a zero-byte file as a valid fresh
+        // database, which would open cleanly and defeat the test.
+        std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "not a valid sqlite database";
+    }
+    yuzu::server::RbacStore broken(db.path);
+    REQUIRE_FALSE(broken.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &broken; // non-null but unusable
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    // Same CC7.2 audit trail as the null arm.
     bool saw_failure = false;
     for (const auto& a : ts.audit_log)
         if (a == "mcp.query_software_licenses|failure")

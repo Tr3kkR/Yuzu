@@ -38,20 +38,17 @@ static std::string yuzu_test_uid_suffix() {
 #endif
 }
 
-// Helper: create a KvStore in a unique temp file, return it + the path for cleanup.
+// Helper: create a KvStore in a unique temp file. TempDbFile (adopt-a-path
+// ctor) owns cleanup of the .db + -wal/-shm companions, exception-safely —
+// the old manual dtor was the last of the #482-ported files still doing this
+// by hand (#486). Declared FIRST so it destructs LAST: the KvStore closes
+// its handle before the file is removed (Windows can't delete an open file).
 struct TestKvStore {
+    yuzu::test::TempDbFile db;
     KvStore store;
-    fs::path path;
+    fs::path path{db.path};
 
-    ~TestKvStore() {
-        // Move-from to close the db before deleting file
-        { KvStore discard = std::move(store); }
-        std::error_code ec;
-        fs::remove(path, ec);
-        // WAL and SHM files
-        fs::remove(fs::path{path.string() + "-wal"}, ec);
-        fs::remove(fs::path{path.string() + "-shm"}, ec);
-    }
+    TestKvStore(fs::path p, KvStore s) : db(std::move(p)), store(std::move(s)) {}
 };
 
 static TestKvStore make_test_store() {
@@ -63,7 +60,7 @@ static TestKvStore make_test_store() {
     const auto tmp = dir / (yuzu::test::unique_temp_path("kv_").filename().string() + ".db");
     auto result = KvStore::open(tmp);
     REQUIRE(result.has_value());
-    return TestKvStore{std::move(*result), tmp};
+    return TestKvStore{tmp, std::move(*result)};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -378,9 +375,13 @@ TEST_CASE("KvStore: multiple sets then clear returns correct count", "[kv_store]
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp =
-        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_ctor.db";
-    auto result = KvStore::open(tmp);
+    // Salted per-test path: the old fixed "move_ctor.db" filename lived in a
+    // USERNAME/uid-suffixed dir — identical for all 4 runner agents on a
+    // shared-identity CI box, so two concurrent jobs shared the exact path
+    // and cleaned up each other's live DB (#1883). TempDbFile declared FIRST
+    // so removal happens after the stores close.
+    yuzu::test::TempDbFile db{"yuzu_test_kv_move_ctor-"};
+    auto result = KvStore::open(db.path);
     REQUIRE(result.has_value());
 
     auto& original = *result;
@@ -390,23 +391,14 @@ TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle
     auto val = moved.get("p1", "k");
     REQUIRE(val.has_value());
     CHECK(*val == "v");
-
-    // Clean up
-    { KvStore discard = std::move(moved); }
-    std::error_code ec;
-    fs::remove(tmp, ec);
-    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
-    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
 
 TEST_CASE("KvStore: move assignment transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp1 =
-        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a1.db";
-    auto tmp2 =
-        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a2.db";
+    yuzu::test::TempDbFile db1{"yuzu_test_kv_move_a1-"};
+    yuzu::test::TempDbFile db2{"yuzu_test_kv_move_a2-"};
 
-    auto r1 = KvStore::open(tmp1);
-    auto r2 = KvStore::open(tmp2);
+    auto r1 = KvStore::open(db1.path);
+    auto r2 = KvStore::open(db2.path);
     REQUIRE(r1.has_value());
     REQUIRE(r2.has_value());
 
@@ -418,15 +410,6 @@ TEST_CASE("KvStore: move assignment transfers ownership", "[kv_store][lifecycle]
     auto val = r1->get("p1", "from");
     REQUIRE(val.has_value());
     CHECK(*val == "store2");
-
-    // Clean up
-    { KvStore discard = std::move(*r1); }
-    std::error_code ec;
-    for (auto& p : {tmp1, tmp2}) {
-        fs::remove(p, ec);
-        fs::remove(fs::path{p.string() + "-wal"}, ec);
-        fs::remove(fs::path{p.string() + "-shm"}, ec);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
