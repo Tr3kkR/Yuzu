@@ -230,7 +230,7 @@ def retry_case(test, case, retries):
 # ── orchestration ─────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="meson test with known-flaky case retry")
-    ap.add_argument("--builddir", required=True)
+    ap.add_argument("--builddir")  # required unless --selftest (validated below)
     ap.add_argument("--known-flaky", default="tests/known-flaky.json")
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--stale-days", type=int, default=90)
@@ -240,6 +240,8 @@ def main(argv=None):
 
     if args.selftest:
         return _selftest()
+    if not args.builddir:
+        ap.error("--builddir is required (unless --selftest)")
 
     this_os = detect_os()
     # Validate the list up front (fail-fast on a malformed list).
