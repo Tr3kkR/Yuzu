@@ -36,6 +36,7 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 
 namespace yuzu::server {
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 }
 
 namespace yuzu::server::detail {
@@ -222,7 +223,10 @@ public:
                             // stale [=]-over-const-bool& alias pattern.
                             McpSessionRegistry* sessions = nullptr,
                             const bool* mcp_streaming_disabled = nullptr,
-                            std::vector<std::string> allowed_origins = {});
+                            std::vector<std::string> allowed_origins = {},
+                            // ADR-0024: backs the query_software_licenses discovery read
+                            // (the MCP twin of GET /api/v1/sle/agents/{id}).
+                            SoftwareLicensingStore* software_licensing_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -265,7 +269,8 @@ public:
                          // temporary that would dangle once build_handler captures its address.
                          McpSessionRegistry* sessions = nullptr,
                          const bool* mcp_streaming_disabled = nullptr,
-                         std::vector<std::string> allowed_origins = {});
+                         std::vector<std::string> allowed_origins = {},
+                         SoftwareLicensingStore* software_licensing_store = nullptr);
 };
 
 } // namespace yuzu::server::mcp

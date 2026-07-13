@@ -568,7 +568,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "pg/pg_raii.hpp"               // PgResult
 #include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
-#include "software_inventory_store.hpp" // typed daily-sync store (ADR-0016)
+#include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
+#include "software_licensing_store.hpp"  // SLE discovery store (query_software_licenses, ADR-0024)
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
@@ -673,6 +674,14 @@ struct McpTestServer {
     /// "Software inventory store unavailable" path with no filter.
     yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
     yuzu::server::mcp::McpServer::InventoryScopeFn inventory_scope_fn_for_test{};
+
+    /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
+    /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
+    /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
+    /// omission (Decision 11), and the store-degrade A4 path. Default nullptr keeps
+    /// tests on the "Software licensing store unavailable" path. The per-device
+    /// SCOPED gate is driven by scoped_perm_fn_for_test (below), like set_tag.
+    yuzu::server::SoftwareLicensingStore* software_licensing_store_for_test{nullptr};
 
     /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
     /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
@@ -892,7 +901,8 @@ private:
             /*scoped_perm_fn=*/scoped_perm_fn_for_test,
             /*sessions=*/session_registry_for_test,
             /*mcp_streaming_disabled=*/&streaming_disabled_,
-            /*allowed_origins=*/allowed_origins_for_test);
+            /*allowed_origins=*/allowed_origins_for_test,
+            /*software_licensing_store=*/software_licensing_store_for_test);
     }
 };
 
@@ -4155,6 +4165,342 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── query_software_licenses (ADR-0024 SLE discovery — the MCP twin of the ──────
+//    GET /api/v1/sle/agents/{id} drill). Same per-device SCOPED SoftwareLicensing:
+//    Read gate (ADR-0017 confinement) as the REST drill, the same #1717 fail-closed
+//    guard, and — crucially — MACHINE-SCOPE FACTS ONLY: the per-user user_ref /
+//    user_scope personal data (Decision 11) is served ONLY by the audited REST drill,
+//    never here. These are the tests that guard those invariants.
+
+// A single fully-populated row (Decision-11 per-user fields SET) so the omission
+// assertions have real PII to prove is stripped. Built inline — full_row() lives in
+// test_software_licensing_store.cpp's anonymous namespace, out of this TU.
+namespace {
+yuzu::server::AgentLicenseRow sle_pii_row() {
+    yuzu::server::AgentLicenseRow r;
+    r.product = "Office 365 ProPlus";
+    r.vendor = "Microsoft";
+    r.version = "16.0.1";
+    r.license_type = "subscription";
+    r.state = "subscription_active";
+    r.expiry_at = 1893456000; // 2030-01-01
+    r.channel = "KMS";
+    r.key_hint = "XXXXX-B7GJQ";
+    r.detector = "wmi_slp";
+    r.confidence = "probable";
+    r.exe_hints = "winword.exe;excel.exe";
+    r.user_scope = "user";              // Decision-11 PII — must NOT reach the MCP twin
+    r.user_ref = "a1b2c3d4e5f60718";    // keyed-HMAC pseudonym — must NOT reach the MCP twin
+    r.collected_at = 1751000000;
+    return r;
+}
+} // namespace
+
+TEST_CASE("MCP query_software_licenses: scope gate unwired → fail closed (never legacy-open)",
+          "[mcp][sle]") {
+    // No scoped_perm_fn wired (default empty). The twin must REFUSE, not fall through
+    // to a global/legacy-open read of per-agent licence facts — parity with the REST
+    // drill's sle_gate_usable fail-closed posture.
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ the #1717 guard passes (it targets a
+    REQUIRE(rbac.is_open());                  // CORRUPT db; see the dedicated fail-close test)
+    McpTestServer ts; // no scoped gate, no store
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+}
+
+TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → #1717 fail closed",
+          "[mcp][sle]") {
+    // #1717 parity with the REST SLE gate: a null / load-failed rbac.db means
+    // enforcement cannot be evaluated, so the twin REFUSES rather than serving a
+    // legacy-open read of per-agent licence facts. rbac_enforcement_in_effect(nullptr)
+    // is true AND a null store is not is_open(), so the guard fires — the corrupt-db
+    // path FortitudeEtc/#1717 hardened, exercised here on the MCP surface.
+    McpTestServer ts; // rbac_store_for_test left null ⇒ enforcement in effect, store unusable
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":89,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    // The #1717 refusal is audited (CC7.2) — a corrupt-authz refusal still leaves a trail.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    // agent_id is required — a fleet-wide licence dump has no MCP surface (the drill is
+    // strictly per-device). Checked BEFORE the scoped gate, so it needs no agent context.
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("agent_id is required") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams, not kInternalError
+}
+
+TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scoped gate",
+          "[mcp][sle]") {
+    // The per-device confinement (ADR-0017): a group-scoped operator reading an agent
+    // OUTSIDE their management group is 403'd by the same scoped gate the REST drill
+    // takes — the licence facts are never served, and no store read is attempted.
+    std::vector<std::string> calls;
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        calls.push_back(sec + ":" + op + ":" + agent_id);
+        if (agent_id == "agent-outside") { // mimic require_scoped_permission's 403
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start(); // no store wired: proves the gate short-circuits BEFORE any store read
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-outside"}}})");
+    CHECK(res->status == 403);
+    CHECK(res->body.find("forbidden") != std::string::npos);
+    // Gate consulted the SoftwareLicensing:Read securable for the exact agent — and the
+    // handler returned before ever reaching the (unwired) store.
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0] == "SoftwareLicensing:Read:agent-outside");
+    CHECK(res->body.find("store unavailable") == std::string::npos);
+}
+
+TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error", "[mcp][sle]") {
+    // Scope gate PASSES (in-scope agent) but no store is configured on this deployment.
+    // The twin must return the A4 error envelope, never success+empty.
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start(); // software_licensing_store_for_test left null
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("Software licensing store unavailable") != std::string::npos);
+    CHECK(res->body.find("-32603") != std::string::npos);        // kInternalError
+    CHECK(res->body.find("correlation_id") != std::string::npos); // A4 envelope (C4/C6)
+    CHECK(res->body.find("\"retry_after_ms\":5000") != std::string::npos); // transient ⇒ back off + retry
+    CHECK(res->body.find("\"result\"") == std::string::npos);    // never success+[]
+    // CC7.2: the fail-closed refusal still leaves a behavioural trail (parity with the
+    // query_installed_software sibling's degrade audit and the REST drill's 503 audit).
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMITTED (Decision 11)",
+          "[mcp][pg][sle]") {
+    // THE PII-omission guard: the store holds a per-user row WITH user_scope/user_ref,
+    // but the MCP twin serves machine-scope FACTS only — that personal data is served
+    // solely by the audited REST drill and must never appear in the twin's payload.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
+
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res->status == 200);
+
+    // The Decision-11 personal data is nowhere in the raw body (defense in depth —
+    // covers both the content[].text string and the structuredContent object).
+    CHECK(res->body.find("user_ref") == std::string::npos);
+    CHECK(res->body.find("user_scope") == std::string::npos);
+    CHECK(res->body.find("a1b2c3d4e5f60718") == std::string::npos); // the pseudonym itself
+
+    // Structural: the machine-scope facts ARE present and correctly shaped.
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    CHECK(payload.at("agent_id").get<std::string>() == "agent-in");
+    CHECK(payload.at("count").get<std::int64_t>() == 1);
+    const auto& lic = payload.at("licenses").at(0);
+    CHECK(lic.at("product").get<std::string>() == "Office 365 ProPlus");
+    CHECK(lic.at("state").get<std::string>() == "subscription_active");
+    CHECK(lic.at("channel").get<std::string>() == "KMS");
+    CHECK(lic.at("exe_hints").get<std::string>() == "winword.exe;excel.exe");
+    CHECK_FALSE(lic.contains("user_ref"));  // the row-level omission, asserted structurally
+    CHECK_FALSE(lic.contains("user_scope"));
+
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|success")
+            saw_success = true;
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[]", "[mcp][pg][sle]") {
+    // Parity with the REST drill's 503 degrade and query_installed_software's guard: a
+    // store/pool/query failure (agent_licenses → nullopt) must surface a JSON-RPC error,
+    // NOT success with an empty array — a licence query must never read a transient
+    // outage as "nothing licensed" (authoritative reads, A4).
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Degrade: drop the schema so the next read's PGRES status is an error → nullopt.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA software_licensing_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+    CHECK(res->body.find("read failed") != std::string::npos);
+    CHECK(res->body.find("-32603") != std::string::npos);      // kInternalError
+    CHECK(res->body.find("\"retry_after_ms\":5000") != std::string::npos); // parity with REST 503 drill
+    CHECK(res->body.find("\"result\"") == std::string::npos);  // crucially NOT success+[]
+    // A degraded read leaves a behavioural trail (CC7.2), like the sibling + REST drill.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+// The SUCCESS path is the one that actually serves data, so it is the one whose
+// audit row is the SOC 2 evidence. #1647: the persistence bool must NOT be dropped —
+// a licence read served with no durable trail has to say so. MCP has no header
+// channel (the REST drill's Sec-Audit-Failed), so it set-and-proceeds and rides the
+// gap in the body as audit_persisted:false, exactly as query_installed_software and
+// get_dex_signal_detail do. Both arms of try_persist_audit are covered: the sink that
+// RETURNS false, and the sink that THROWS (the catch arm is what turns a bad_alloc-class
+// throw into `false` rather than letting it escape as a 500).
+TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persisted:false (#1647)",
+          "[mcp][pg][sle][audit]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
+
+    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.audit_succeeds_ = false; // the mcp.query_software_licenses row cannot persist
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":96,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // set-and-proceed, NOT a refusal
+
+    auto envelope = nlohmann::json::parse(res->body);
+    // BOTH channels carry the flag. The raw-body substring only ever matches
+    // structuredContent (content[].text is a JSON *string*, so its quotes are
+    // backslash-escaped) — so assert the text channel structurally, not by substring.
+    const auto& payload = envelope.at("result").at("structuredContent");
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload.at("audit_persisted") == false);
+    auto text_payload = nlohmann::json::parse(
+        envelope.at("result").at("content")[0].at("text").get<std::string>());
+    REQUIRE(text_payload.contains("audit_persisted"));
+    CHECK(text_payload.at("audit_persisted") == false);
+    // Data is STILL SERVED alongside the flag — that is the set-and-proceed half.
+    CHECK(payload.at("count").get<std::int64_t>() == 1);
+    // And the Decision-11 PII omission still holds on the flagged path.
+    CHECK(res->body.find("user_ref") == std::string::npos);
+}
+
+TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_persisted:false",
+          "[mcp][pg][sle][audit]") {
+    // try_persist_audit's catch arm: a bad_alloc-class throw from the audit sink must
+    // become `false` (→ audit_persisted:false), never escape the handler as a 500.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareLicensingStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
+
+    yuzu::server::RbacStore rbac(":memory:");
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.software_licensing_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.audit_throws_ = true;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":97,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // caught, not a 500
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload.at("audit_persisted") == false);
+    CHECK(payload.at("count").get<std::int64_t>() == 1);
 }
 
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──
