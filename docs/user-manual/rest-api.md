@@ -4638,9 +4638,9 @@ and `instruction.create` with `result=denied` / `duplicate_id` on conflict.
 
 Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
 Requires `InstructionDefinition:Read`. Runs the same validation contract as
-the Save endpoint above (required fields, `type`/`approval` enums, size cap,
-scope-walking gates), so a document that validates green is guaranteed to
-save.
+the Save endpoint above (required fields, `type`/`approval` enums, explicit
+`metadata.id` charset/length, size cap, scope-walking gates), so a document
+that validates green is guaranteed to save.
 
 #### `POST /api/instructions/{id}/execute`
 

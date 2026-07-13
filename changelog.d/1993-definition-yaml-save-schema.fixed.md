@@ -12,4 +12,6 @@
   field instead of a blanket error. The Save path now emits `instruction.create` /
   `instruction.update` audit events and `instruction.created`/`.updated` analytics
   events like every sibling write surface, and explicit definition ids are bounded
-  to `[A-Za-z0-9._-]{1,128}` at the store chokepoint.
+  to `[A-Za-z0-9._-]{1,128}` — enforced identically on Save and validate-yaml, so a
+  document with an out-of-charset or over-length `metadata.id` is caught at validate
+  time rather than passing validation and then 400ing on Save.

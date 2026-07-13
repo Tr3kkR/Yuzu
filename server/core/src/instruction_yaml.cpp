@@ -206,6 +206,28 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
         errors.push_back("Missing spec.execution.plugin (or spec.plugin) field");
     if (f.action.empty())
         errors.push_back("Missing spec.execution.action (or spec.action) field");
+    // Explicit-id charset/length gate, byte-identical to the store's
+    // create_definition_impl (instruction_store.cpp) so validate-pass ⇒
+    // save-pass holds for the id too: an operator-supplied metadata.id with a
+    // space or >128 bytes is rejected on Save, so validate must reject it
+    // here (Doomgoose blocker on #2010 — the id gate re-broke the #1993
+    // "YAML that validates always saves" contract). Store-generated ids are
+    // hex and never reach this path.
+    if (!f.id.empty()) {
+        if (f.id.size() > 128) {
+            errors.push_back("definition id too long (max 128 characters)");
+        } else {
+            for (char c : f.id) {
+                const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+                if (!ok) {
+                    errors.push_back(
+                        "definition id may only contain letters, digits, '.', '_', and '-'");
+                    break;
+                }
+            }
+        }
+    }
     // Enum checks match the store/JSON-route error strings byte-for-byte so
     // one denial has one shape everywhere (governance cons-S3).
     if (!f.type.empty() && f.type != "question" && f.type != "action")

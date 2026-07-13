@@ -250,6 +250,41 @@ TEST_CASE("instruction_yaml: validate names the specific missing field", "[instr
     }
 }
 
+TEST_CASE("instruction_yaml: explicit metadata.id charset/length gate matches Save",
+          "[instruction_yaml]") {
+    // The store's create_definition_impl rejects an explicit id that is >128
+    // bytes or contains anything outside [A-Za-z0-9._-]. validate-yaml must
+    // reject the same ids byte-for-byte, or a document that validates green
+    // 400s on Save (Doomgoose blocker on #2010 — the id gate re-broke #1993's
+    // "YAML that validates always saves" contract).
+    auto with_id = [](const std::string& id) {
+        return "apiVersion: yuzu.io/v1alpha1\n"
+               "kind: InstructionDefinition\n"
+               "metadata:\n"
+               "  id: " +
+               id +
+               "\n"
+               "spec:\n"
+               "  execution:\n"
+               "    plugin: os_info\n"
+               "    action: os_name\n";
+    };
+    SECTION("id with a space is rejected") {
+        auto errors = validate_definition_yaml(with_id("hello system info"));
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == "definition id may only contain letters, digits, '.', '_', and '-'");
+    }
+    SECTION("id longer than 128 bytes is rejected") {
+        auto errors = validate_definition_yaml(with_id(std::string(129, 'a')));
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == "definition id too long (max 128 characters)");
+    }
+    SECTION("a 128-byte id and canonical dotted ids validate") {
+        CHECK(validate_definition_yaml(with_id(std::string(128, 'a'))).empty());
+        CHECK(validate_definition_yaml(with_id("system.os.info-1_beta")).empty());
+    }
+}
+
 TEST_CASE("instruction_yaml: byte-level malformations are rejected outright",
           "[instruction_yaml]") {
     SECTION("NUL byte") {
