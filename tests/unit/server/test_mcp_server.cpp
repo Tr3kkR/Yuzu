@@ -5997,6 +5997,47 @@ TEST_CASE("MCP 2f PR2: a hostile Last-Event-ID never destroys the session",
     }
 }
 
+TEST_CASE("MCP 2f: an unsupported MCP-Protocol-Version is rejected on EVERY method",
+          "[mcp][transport][2f]") {
+    // The protocol-version contract is a property of the /mcp/v1/ ENDPOINT
+    // (docs/user-manual/mcp.md), not of POST alone. A strict client that sends the header
+    // on a GET should get the same 400 it would get on a POST — not a stream.
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    SECTION("GET") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"MCP-Protocol-Version", "1999-01-01"}});
+        CHECK(res->status == 400);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpBadProtocolVersion);
+    }
+    SECTION("DELETE") {
+        auto res = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid},
+                                              {"MCP-Protocol-Version", "1999-01-01"}});
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["code"] == mcp::kMcpBadProtocolVersion);
+        // …and the session survives a rejected request.
+        CHECK(reg.active_count() == 1);
+    }
+    SECTION("a SUPPORTED version is accepted on GET") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"MCP-Protocol-Version", "2025-06-18"}});
+        CHECK(res->status == 200);
+    }
+    SECTION("an ABSENT version is accepted on GET (the default revision is assumed)") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        CHECK(res->status == 200);
+    }
+}
+
 TEST_CASE("MCP 2f PR2: --mcp-no-streaming still 405s GET (kill switch beats the channel)",
           "[mcp][transport][2f][stream][ch7]") {
     mcp::McpSessionRegistry reg;

@@ -1179,6 +1179,33 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // invoke the returned function directly without spinning up an httplib::Server
 // (see #438 — the acceptor thread crashes under TSan).
 
+namespace {
+
+// Present-but-unsupported MCP-Protocol-Version → 400. Shared by POST, GET and DELETE:
+// docs/user-manual/mcp.md states this rule for the /mcp/v1/ ENDPOINT, not for POST alone,
+// and a strict client that sends the header on a GET deserves the same answer it would get
+// on a POST rather than a stream. Returns true iff it filled in the denial.
+template <typename AuditFn>
+bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::Response& res,
+                                         const AuditFn& session_audit) {
+    const auto pv = req.get_header_value("MCP-Protocol-Version");
+    if (pv.empty() || transport::protocol_version_supported(pv)) {
+        return false; // absent → the caller assumes the default revision
+    }
+    const auto cid = yuzu::server::detail::make_correlation_id();
+    session_audit("mcp.session.reject", "failure", std::string{},
+                  "reason=protocol_version cid=" + cid);
+    res.status = 400;
+    res.set_content(
+        error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version", cid,
+                               "send MCP-Protocol-Version: 2025-06-18 (or omit the "
+                               "header to accept the 2025-03-26 default)"),
+        "application/json");
+    return true;
+}
+
+} // namespace
+
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
     InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
@@ -1304,19 +1331,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     "application/json");
                 return;
             }
-            // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
-            const auto pv = req.get_header_value("MCP-Protocol-Version");
-            if (!pv.empty() && !transport::protocol_version_supported(pv)) {
-                const auto cid = yuzu::server::detail::make_correlation_id();
-                session_audit("mcp.session.reject", "failure", "",
-                              "reason=protocol_version cid=" + cid);
-                res.status = 400;
-                res.set_content(
-                    error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
-                                           cid,
-                                           "send MCP-Protocol-Version: 2025-06-18 (or omit the "
-                                           "header to accept the 2025-03-26 default)"),
-                    "application/json");
+            if (reject_unsupported_protocol_version(req, res, session_audit)) {
                 return;
             }
         }
@@ -6633,6 +6648,11 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 "application/json");
             return;
         }
+        // Same transport pre-check as POST: the protocol-version contract is a property of
+        // the ENDPOINT, not of one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
+            return;
+        }
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
@@ -6680,6 +6700,11 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                                        "remove the Origin header or add this origin to "
                                        "--mcp-allowed-origin"),
                 "application/json");
+            return;
+        }
+        // Same transport pre-check as POST/GET — the protocol-version contract belongs to
+        // the endpoint, not to one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
             return;
         }
         auto session = auth_fn(req, res);
