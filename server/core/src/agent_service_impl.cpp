@@ -23,6 +23,8 @@
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
+#include "software_licensing_ingestion.hpp"
+#include "software_licensing_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -704,8 +706,9 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     //
     // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
     // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
-    // The three live sources (installed_software, app_perf, device_ci) are TYPED and
-    // routed through their typed seams on both paths, so the two paths stay symmetric;
+    // The live sources (installed_software, app_perf, device_ci, software_licensing)
+    // are TYPED and routed through their typed seams on both paths, so the two paths
+    // stay symmetric;
     // a future GENERIC source must fold its upsert into ingest_inventory_report (pass the
     // InventoryStore&), not add a parallel loop here.
     if (software_inventory_store_ && software_inventory_store_->is_open()) {
@@ -743,6 +746,20 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
         } catch (...) {
             spdlog::warn("ReportInventory: device_ci ingest threw unknown exception for agent {} — "
                          "acked",
+                         agent_id);
+        }
+    }
+    if (software_licensing_store_ && software_licensing_store_->is_open()) {
+        try {
+            ingest_software_licensing_report(*software_licensing_store_, agent_id, *request,
+                                             *response, &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: software_licensing ingest threw for agent {} — "
+                         "acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: software_licensing ingest threw unknown exception for "
+                         "agent {} — acked",
                          agent_id);
         }
     }

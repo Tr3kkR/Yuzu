@@ -416,21 +416,24 @@ AppPerfDailyStore::get_agent_app_perf(std::string_view agent_id) {
     return out;
 }
 
-void AppPerfDailyStore::delete_agent(std::string_view agent_id) {
+bool AppPerfDailyStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
         spdlog::debug("AppPerfDailyStore: delete_agent skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(), "DELETE FROM app_perf_daily_store.app_perf_daily WHERE agent_id = $1",
         std::vector<std::string>{std::string(agent_id)});
-    if (res.status() != PGRES_COMMAND_OK)
+    if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("AppPerfDailyStore: delete_agent failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
 }
 
 } // namespace yuzu::server

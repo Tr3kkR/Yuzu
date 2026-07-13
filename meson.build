@@ -1,10 +1,12 @@
 project(
   'yuzu',
   'cpp',
-  # A pre-release suffix (-dev/-rcN) is handled by the numeric-component split
-  # below (search PROJECT_VERSION_PATCH); keep the suffix on dev — it is what
-  # keeps CI exercising the pre-release codepath.
-  version: '0.13.1-dev',
+  # Convention: plain X.Y.Z here, always — on dev this is the NEXT release's
+  # base version. No -dev/-rcN suffix (operator ruling 2026-07-13): a suffix
+  # once generated `int kVersionPatch = 1-dev;` and red-lined the whole C++
+  # matrix (fca69e34). The suffix-tolerant split below (search
+  # PROJECT_VERSION_PATCH) stays as defense-in-depth, not as licence.
+  version: '0.13.1',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -69,8 +71,9 @@ endif
 version_conf = configuration_data()
 # The three numeric components feed `int` fields in version.hpp
 # (`int kVersionMajor/Minor/Patch = @...@;`), so each MUST be a plain integer.
-# A pre-release version (e.g. 0.13.1-dev, the post-release bump) carries its
-# suffix on the patch element, which would emit `int kVersionPatch = 1-dev;` —
+# A pre-release version (e.g. a stray 0.13.1-dev — the convention is plain
+# X.Y.Z, see the version: line above) carries its suffix on the patch element,
+# which would emit `int kVersionPatch = 1-dev;` —
 # invalid C++ ("use of undeclared identifier 'dev'") that red-lines the whole
 # build matrix. Strip the pre-release suffix off the patch, then validate every
 # component with `.to_int()`: that turns any malformed version (typo, SemVer
@@ -405,6 +408,7 @@ if build_agent
     subdir('agents/plugins/wifi')
     subdir('agents/plugins/wol')
     subdir('agents/plugins/discovery')
+    subdir('agents/plugins/license_scan')
   endif
 endif
 

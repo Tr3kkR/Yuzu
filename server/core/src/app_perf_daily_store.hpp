@@ -136,8 +136,11 @@ public:
     [[nodiscard]] std::optional<std::vector<AppPerfDailyRow>>
     get_agent_app_perf(std::string_view agent_id);
 
-    /// Drop one agent's daily rows (e.g. on agent removal). Best-effort.
-    void delete_agent(std::string_view agent_id);
+    /// Drop one agent's daily rows (e.g. on agent removal). Returns true iff the
+    /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
+    /// a SQL failure — so the decommission cascade records Failed, not a false
+    /// "erased".
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// Retention horizon — rows with `day` older than this many days before the
     /// server's current UTC day are pruned on each `apply_daily`. Matches
