@@ -34,6 +34,7 @@ using yuzu::agent::spark_type_token;
 // agent emits in agents/core/src/agent.cpp. The agent composes the same strings
 // inline (it cannot include this header) — change both together.
 static_assert(std::string_view(detail::kSparkTagRunning) == "yuzu.spark_running");
+static_assert(std::string_view(detail::kSparkTagDisabled) == "yuzu.spark_disabled");
 static_assert(std::string_view(detail::kSparkTagMechs) == "yuzu.spark_mechs");
 static_assert(std::string_view(detail::kSparkTagArmedFaulted) == "yuzu.spark_armed_faulted");
 static_assert(std::string_view(detail::kSparkTagWatchFaults) == "yuzu.spark_watch_faults");
@@ -152,6 +153,14 @@ TEST_CASE("parse_spark_count enforces the forged-value posture", "[spark][fleet]
 
     // Absent / garbage / signed / fractional / overflow -> nullopt (never 0).
     CHECK_FALSE(parse_spark_count("").has_value());
+    // LENGTH CAP (governance Gate-3 performance S1): >10 digits is rejected in O(1),
+    // before from_chars scans it — a hostile multi-megabyte all-digit value must not
+    // be O(n)-scanned under AgentHealthStore::mu_ every sweep. 10-digit values still
+    // parse (then hit the 1e9 plausibility clamp where applicable).
+    CHECK(parse_spark_count("1000000000") == 1e9);        // kMax itself: 10 digits, allowed
+    CHECK_FALSE(parse_spark_count("9999999999").has_value()); // 10 digits, > kMax: clamped
+    CHECK_FALSE(parse_spark_count("10000000000").has_value()); // 11 digits: length-capped
+    CHECK_FALSE(parse_spark_count(std::string(4u << 20, '7')).has_value()); // 4 MiB of digits
     CHECK_FALSE(parse_spark_count("-1").has_value());
     CHECK_FALSE(parse_spark_count("12x").has_value());  // trailing garbage
     CHECK_FALSE(parse_spark_count("x12").has_value());  // leading garbage

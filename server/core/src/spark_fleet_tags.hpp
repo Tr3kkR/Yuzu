@@ -137,7 +137,7 @@ inline std::vector<std::string> spark_mechs_from_csv(std::string_view csv) {
     //   - AgentHealthStore::upsert, which still deep-copies the ENTIRE agent-controlled
     //     tag map on every heartbeat with no key-count or value-length bound. That is a
     //     cross-cutting fix benefiting every tag family (net / DEX / spark alike) and is
-    //     tracked separately — do not read this cap as "the ingest DoS is closed".
+    //     tracked as the heartbeat-tag ingest-bound follow-up (drafted at governance) — do not read this cap as "the ingest DoS is closed".
     if (csv.size() > kMaxSparkMechsCsvBytes)
         return out;
     for (std::size_t start = 0; start <= csv.size();) {
@@ -203,7 +203,16 @@ inline SparkRunState parse_spark_running(std::string_view s) {
 /// forged tag. No honest agent can reach this: these count watch rejections /
 /// quarantines / slow ops on one endpoint. (governance Gate-4 UP-7.)
 inline std::optional<double> parse_spark_count(std::string_view s) {
-    if (s.empty())
+    // LENGTH CAP BEFORE PARSE. kMaxPlausibleSparkCount (1e9) is 10 digits, so any
+    // longer token is implausible by construction — reject it in O(1) WITHOUT letting
+    // from_chars scan it. Without this, a hostile agent parking a multi-megabyte
+    // all-digit value in each of the 13 count tags gets them O(n)-scanned on every
+    // 15 s sweep UNDER AgentHealthStore::mu_ — the same unbounded-scan class the
+    // 64-byte CSV cap exists for (governance Gate-3 performance S1). The value bytes
+    // still sit in the tag map until the store-level ingest bound lands (tracked:
+    // heartbeat-tag ingest-bound follow-up); this cap only keeps the scan out of the
+    // sweep's critical section.
+    if (s.empty() || s.size() > 10)
         return std::nullopt;
     unsigned long long v = 0;
     const char* begin = s.data();

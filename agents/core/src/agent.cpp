@@ -866,7 +866,10 @@ public:
         // observability envelope can be measured before it carries any load.
         //
         // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
-        // when set, SparkEngine is never instantiated and no spark telemetry ships.
+        // when set, SparkEngine is never instantiated and watches nothing — but the
+        // heartbeat still carries the posture itself (spark_running=0 + spark_disabled=1),
+        // so the fleet can tell a deliberate opt-out apart from an engine that FAILED
+        // to start (see the DISABLED branch in the heartbeat emit block below).
         // The flag selects exactly one detection path at instantiation, establishing
         // the "old and new never both drive enforce" property the rung-2/3 cutover
         // leans on (moot at rung 1 — spark has no consumer — but pinned here).
@@ -918,6 +921,21 @@ public:
                              "continuing WITHOUT spark; legacy IGuard detection is unaffected");
             }
         }
+        // Publish "the spark slot is final" to cross-thread readers — REQUIRED, not
+        // advisory. Handlers are installed and g_agent is published BEFORE run() (so a
+        // wedged make_agent can still be interrupted), which means Agent::stop() on the
+        // shutdown-watcher / SCM / console thread is concurrent with THIS boot block —
+        // and the catch paths above FREE the engine via reset(). A bare `if
+        // (spark_engine_)` in stop() during that window is a load racing a store/free:
+        // TSan caught it for real (randomized-SIGTERM fuzz, 101 ms delay — read at
+        // stop()'s spark gate vs the make_unique store above). stop() therefore gates
+        // its spark access on this latch and SKIPS spark before it flips: that is safe,
+        // not a leak, because this thread's OWN ScopeExit (armed above) stops the
+        // engine on every run() exit — same thread, no race. After the latch flips the
+        // slot is never written again until ~AgentImpl, which runs after the watcher
+        // join / g_agent_mu barrier. (Governance Gate-3 cpp-safety SAFE-1; the same
+        // boot-window shape updater_ already handles with updater_mu_.)
+        spark_boot_done_.store(true, std::memory_order_release);
 
         // Wire trigger dispatch + start the engine. Plugins registered their
         // triggers during init() (above); the engine has been holding them
@@ -2546,8 +2564,15 @@ public:
             guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
-        if (spark_engine_)
-            spark_engine_->stop(); // single-shot + idempotent; ~SparkEngine also stops
+        // Gate on the boot latch BEFORE touching the pointer. This runs on the watcher /
+        // SCM / console thread; run()'s boot block stores AND (on the degrade path) FREES
+        // spark_engine_ until the latch flips — a bare `if (spark_engine_)` here raced
+        // that window (TSan-confirmed via the randomized-SIGTERM fuzz at 101 ms).
+        // Skipping spark pre-latch is safe: run()'s ScopeExit stops the engine on every
+        // run() exit, on run()'s own thread. Acquire pairs with the release store at the
+        // end of the boot block, so a post-latch read sees the final pointer value.
+        if (spark_boot_done_.load(std::memory_order_acquire) && spark_engine_)
+            spark_engine_->stop(); // idempotent; completion-barriered by lifecycle_mu_
         // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
         // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
         if (auto u = updater())
@@ -2985,6 +3010,18 @@ private:
     // construction and stop() destroys members directly. Free to fix now; a
     // use-after-free class to find later (governance Gate-3 architect).
     std::unique_ptr<SparkEngine> spark_engine_;
+    /// TRUE once run()'s spark boot block has finished mutating spark_engine_ (set on
+    /// every path: instantiated, --spark-disable, or degrade-to-no-spark). Agent::stop()
+    /// — which runs on the watcher/SCM/console thread and is reachable from the moment
+    /// g_agent is published, BEFORE run() — must acquire-load this latch before reading
+    /// spark_engine_: the boot block both stores and (on the catch paths) FREES the
+    /// pointer, and TSan caught the bare read racing that window for real (randomized-
+    /// SIGTERM fuzz, 101 ms delay). Pre-latch, stop() skips spark; run()'s own ScopeExit
+    /// covers teardown on that same thread. Post-latch, the slot is never written again
+    /// until ~AgentImpl (after the watcher join / g_agent_mu barrier). The heartbeat
+    /// thread needs no latch — it is spawned by run() AFTER the boot block, so its reads
+    /// are sequenced by thread creation. (Gate-3 cpp-safety SAFE-1.)
+    std::atomic<bool> spark_boot_done_{false};
     /// SHARED_PTR BEHIND A MUTEX, not a unique_ptr — and not a std::atomic<shared_ptr> either.
     ///
     /// WHY IT IS SHARED. run() REASSIGNS this on every reconnect (a fresh Updater per

@@ -603,10 +603,15 @@ public:
         // os-labelled (per-OS, never a cross-OS blend — File/Registry are Windows-only,
         // Service is Windows+Linux, macOS has none). ABSENT means no reporting agent of
         // that OS/mechanism this cycle — never read absence as 0-is-healthy. At rung 1
-        // (no consumer armed) every counter is 0, so only reporting + mechanisms carry
-        // signal; the counters go live at rung 2. The counter gauges are a fleet SUM of
-        // each cumulative agent counter, so alert on `> 0` (a rate needs a counter-typed
-        // metric — a rung-2 refinement).
+        // (no consumer armed) every counter is 0, so only reporting + mechanisms +
+        // failed/disabled carry signal; the counters go live at rung 2. ALERTING: the
+        // counter-derived gauges are a fleet SUM of cumulative per-agent counters — a
+        // bare `> 0` LATCHES forever once any agent ever counted one, and counter-typing
+        // the fleet sum is not implementable server-side (it needs per-agent deltas and
+        // a server-owned counter, #2083) — so their alert templates ship COMMENTED OUT
+        // until rung 2 (see the spark preamble in docs/prometheus/yuzu-alerts.yml). The
+        // exception is yuzu_fleet_spark_failed: a STATE gauge recomputed and cleared
+        // every sweep, live-actionable at rung 1 — its `> 0 for: 15m` rule ships ACTIVE.
         metrics_.describe("yuzu_fleet_spark_reporting",
                           "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
                           "running (spark_running=1) — the denominator for all spark telemetry",

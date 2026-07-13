@@ -1440,7 +1440,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // consumers still use `get()` — converting them is a wider change, and the REAL fix
         // is an INGEST bound (AgentHealthStore::upsert still deep-copies the entire tag map
         // with no key-count or value-length cap), which benefits every tag family at once
-        // and is tracked separately. Do not read this as "the ingest DoS is closed".
+        // and is tracked as the heartbeat-tag ingest-bound follow-up (issue drafted at
+        // governance; number assigned at filing). Do not read this as "the ingest DoS
+        // is closed".
         //
         // Safe: mu_ is held for the whole of recompute_metrics (lock at the top of the
         // function), so snap.status_tags is stable and the view outlives every use here.
@@ -1448,6 +1450,18 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             auto it = snap.status_tags.find(key);
             return it != snap.status_tags.end() ? std::string_view{it->second} : std::string_view{};
         };
+        // std::string twins of the fixed kSparkTag* C-string keys: get_view takes
+        // const std::string&, so passing the char* constants directly would heap-
+        // construct a temporary key per lookup, per spark-reporting agent, per sweep
+        // (7 lookups x agents x 4/min). Function-static: built once, same pattern as
+        // spark_mech_metric_keys above. (governance Gate-3 cpp-expert N-2.)
+        static const std::string kKeySparkRunning{kSparkTagRunning};
+        static const std::string kKeySparkMechs{kSparkTagMechs};
+        static const std::string kKeySparkArmedFaulted{kSparkTagArmedFaulted};
+        static const std::string kKeySparkWatchFaults{kSparkTagWatchFaults};
+        static const std::string kKeySparkQueuedDropped{kSparkTagQueuedDropped};
+        static const std::string kKeySparkConsumerErrors{kSparkTagConsumerErrors};
+        static const std::string kKeySparkDisabled{kSparkTagDisabled};
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -1558,22 +1572,22 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // NotReported and contributes to NOTHING. Bucketing unknown values as not-running
         // would drop them into yuzu_fleet_spark_failed{os}, the one gauge documented
         // "alert on it" (Gate-4 UP-6 / consistency C-2).
-        const SparkRunState spark_state = parse_spark_running(get_view(kSparkTagRunning));
+        const SparkRunState spark_state = parse_spark_running(get_view(kKeySparkRunning));
         if (spark_state == SparkRunState::Running) {
             ++spark_reporting_os[net_os];
             // Capability: split the mechs CSV, bucket each recognised token so the
             // fleet sees which mechanisms this OS supports (and, by absence of a
             // {os,mechanism} series, which it does not).
-            for (const auto& tok : spark_mechs_from_csv(get_view(kSparkTagMechs)))
+            for (const auto& tok : spark_mechs_from_csv(get_view(kKeySparkMechs)))
                 ++spark_mech_os[net_os][tok];
             // Engine-level cumulative counters (absent == 0).
-            if (auto v = parse_spark_count(get_view(kSparkTagArmedFaulted)))
+            if (auto v = parse_spark_count(get_view(kKeySparkArmedFaulted)))
                 spark_armed_faulted_os[net_os] += *v;
-            if (auto v = parse_spark_count(get_view(kSparkTagWatchFaults)))
+            if (auto v = parse_spark_count(get_view(kKeySparkWatchFaults)))
                 spark_watch_faults_os[net_os] += *v;
-            if (auto v = parse_spark_count(get_view(kSparkTagQueuedDropped)))
+            if (auto v = parse_spark_count(get_view(kKeySparkQueuedDropped)))
                 spark_queued_dropped_os[net_os] += *v;
-            if (auto v = parse_spark_count(get_view(kSparkTagConsumerErrors)))
+            if (auto v = parse_spark_count(get_view(kKeySparkConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
             // Per-mechanism-type health counters (the three that back the alerts).
             // Keys are the precomputed loop-invariants (perf-S1); index 0/1/2 =
@@ -1595,7 +1609,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // proving the engine runs at rest. The DEX sibling already reports
             // enabled-but-deaf as `dex_observer_armed=0` rather than going quiet.
             // (governance Gate-4 consistency + UP-10.)
-            if (get_view(kSparkTagDisabled) == "1")
+            if (get_view(kKeySparkDisabled) == "1")
                 ++spark_disabled_os[net_os];
             else
                 ++spark_failed_os[net_os];

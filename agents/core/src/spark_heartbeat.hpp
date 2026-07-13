@@ -25,13 +25,14 @@
 /// The DEX sibling already got this right: it emits `yuzu.dex_observer_armed = "0"`
 /// when enabled-but-deaf rather than going quiet.
 
-#include "spark_engine.hpp"    // SparkEngineStats, SparkType
-#include "spark_mechanism.hpp" // SparkMechanismStats
+#include <map>
+#include <string>
+#include <utility>
 
 #include <yuzu/agent/spark.hpp> // spark_type_token
 
-#include <map>
-#include <string>
+#include "spark_engine.hpp"    // SparkEngineStats, SparkType
+#include "spark_mechanism.hpp" // SparkMechanismStats
 
 namespace yuzu::agent {
 
@@ -109,7 +110,7 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
             mechs += ',';
         mechs += spark_type_token(type);
     }
-    tags["yuzu.spark_mechs"] = mechs;
+    tags["yuzu.spark_mechs"] = std::move(mechs); // last use
     // Engine-level counters (sparse).
     if (ss.armed_faulted > 0)
         tags["yuzu.spark_armed_faulted"] = std::to_string(ss.armed_faulted);

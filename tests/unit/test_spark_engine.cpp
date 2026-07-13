@@ -1071,3 +1071,81 @@ TEST_CASE("stop() on a started-but-never-armed engine releases every mechanism",
     engine.stop(); // idempotent, and must not block on itself
     SUCCEED("start-then-stop without arming is clean");
 }
+
+namespace {
+/// stop() throws on its FIRST call only, counting every call. Drives the
+/// teardown-retry contract: stop() is noexcept-with-catch, and a throw mid-teardown
+/// must leave teardown_complete_ FALSE so the NEXT caller re-drives the mechanism
+/// teardown instead of latching the failure away (governance Gate-3 QE-1 — this
+/// branch's headline teardown-safety claim, previously asserted only in comments).
+struct ThrowingStopMechanism : ISparkMechanism {
+    int& stop_calls;
+    explicit ThrowingStopMechanism(int& c) : stop_calls(c) {}
+    void start(SparkEmitFn, SparkFaultFn) override {}
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {
+        if (++stop_calls == 1)
+            throw std::runtime_error("teardown boom");
+    }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+
+/// Counting no-throw sibling: proves the retry re-drives mechanisms the first,
+/// throwing pass never reached.
+struct CountingStopMechanism : ISparkMechanism {
+    int& stop_calls;
+    explicit CountingStopMechanism(int& c) : stop_calls(c) {}
+    void start(SparkEmitFn, SparkFaultFn) override {}
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override { ++stop_calls; }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+} // namespace
+
+TEST_CASE("a throwing teardown is retried by the next stop(), not latched away",
+          "[spark][teardown]") {
+    // The early-out is on teardown_complete_, NOT stopped_ — conflating them was a
+    // regression during this fix's own review (Gate-8 security-guardian), and this
+    // test is what makes that regression go red instead of shipping green: if stop()
+    // early-outed on stopped_, the second stop() below would be a no-op and the
+    // Service mechanism (never reached on the throwing first pass — File < Service
+    // in the map) would never be stopped.
+    int file_stops = 0;
+    int service_stops = 0;
+    SparkEngine engine;
+    REQUIRE(engine
+                .register_mechanism(SparkType::File,
+                                    std::make_unique<ThrowingStopMechanism>(file_stops))
+                .has_value());
+    REQUIRE(engine
+                .register_mechanism(SparkType::Service,
+                                    std::make_unique<CountingStopMechanism>(service_stops))
+                .has_value());
+    engine.start();
+    REQUIRE(engine.is_running());
+
+    // First stop(): File's stop() throws mid-iteration. stop() is noexcept — the
+    // throw must be swallowed (a terminate here fails the whole test binary), and
+    // the teardown must NOT be marked complete.
+    engine.stop();
+    CHECK(file_stops == 1);
+    CHECK(service_stops == 0); // never reached past the throw — the honest failure shape
+    CHECK_FALSE(engine.is_running());
+
+    // Second stop() (in production: ~SparkEngine's) must RE-DRIVE the mechanism
+    // teardown — both mechanisms this time — and complete.
+    engine.stop();
+    CHECK(file_stops == 2);    // re-driven (idempotent contract), no throw this time
+    CHECK(service_stops == 1); // the leaked teardown is recovered
+
+    // Third stop(): teardown_complete_ is finally latched — a genuine no-op now.
+    engine.stop();
+    CHECK(file_stops == 2);
+    CHECK(service_stops == 1);
+}

@@ -470,9 +470,11 @@ if build_server
       # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
       # template — no link to yuzu_agent_core, just the include path.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts ~50 PRIVATE agent headers on
+      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
-      # zero basename collision between agents/core/src/*.hpp and server/core/src/*.hpp,
+      # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
+      # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
+      # and server/core/src/*.hpp,
       # and because server/core/src is listed FIRST so it would win a future clash. A
       # same-named header added on both sides later SILENTLY SHADOWS — there is no
       # diagnostic. Do NOT add a private-agent-src include for any other target, and do

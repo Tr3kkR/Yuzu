@@ -741,3 +741,52 @@ groups:
   #           On the observe lane this loses detections; once the enforce lane lands (rung 3)
   #           a drop is a silent compliance failure. Check consumer throughput + queue cap.
   #         runbook_url: "https://docs.yuzu.io/runbooks/spark-queued-dropped"
+
+  # ── yuzu-fleet-spark-rung1 — ACTIVE (the one live-actionable spark signal today) ──
+  # yuzu_fleet_spark_failed is NOT one of the latching counter-sums above: it is a STATE
+  # gauge recomputed and cleared on every 15s sweep (an agent that recovers or restarts
+  # leaves it within one sweep), and it carries real signal at rung 1 — boot-time
+  # instantiation failure, e.g. thread/pid exhaustion, which is exactly the degraded
+  # posture rung 1 exists to make visible (gov UP-11 / sre Gate-6). severity=warning,
+  # deliberately NOT critical: the value is agent-self-reported inside the heartbeat
+  # trust boundary, so ONE forged or buggy agent can set it to 1 — a warning routes to a
+  # ticket, not a page (gov Gate-2 security). Escalate per-fleet policy if failed
+  # exceeds a meaningful fraction of yuzu_fleet_spark_reporting + yuzu_fleet_spark_failed.
+  - name: yuzu-fleet-spark-rung1
+    rules:
+      - alert: YuzuSparkBootFailed
+        expr: |
+          yuzu_fleet_spark_failed > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} agent(s) on {{ $labels.os }} report SparkEngine FAILED"
+          description: >-
+            Agents reported spark_running=0 without spark_disabled=1 for 30+ minutes:
+            SparkEngine failed to instantiate at boot (commonly thread/handle exhaustion —
+            the agent deliberately degrades to no-spark instead of crash-looping) or the
+            posture was forged. Legacy Guardian detection is unaffected. Check the
+            affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
+            after resolving host pressure clears the posture within one sweep.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+  # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
+  # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
+  # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
+  # because every `> 0` rule above no-matches on absent series. But during a STAGED
+  # ROLLOUT (or a fleet with zero rung-1 agents) the series is legitimately absent, so
+  # enabling this before the fleet floor is upgraded guarantees a false page. Enable
+  # once yuzu_fleet_spark_reporting has a stable baseline:
+  #     - alert: YuzuSparkFleetSignalGone
+  #       expr: |
+  #         absent(yuzu_fleet_spark_reporting)
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "All spark fleet telemetry vanished"
+  #         description: >-
+  #           No agent reported any spark posture for 15m. Either the upgraded-agent
+  #           population is gone (mass agent outage, gateway partition) or the server
+  #           sweep stopped. Correlate with yuzu_fleet_net_*/agent-online gauges before
+  #           reading this as a spark problem.
