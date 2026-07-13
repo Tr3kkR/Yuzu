@@ -7,12 +7,20 @@
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
 /// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:
-/// `DELETE /api/v1/sle/agents/{id}` (gated on scoped `SoftwareLicensing:Delete`
-/// AND scoped `Inventory:Delete` — the cascade's blast radius is wider than its
-/// name, so it authorizes for BOTH securables it erases through; audit-before-erase
-/// fail-closed — see `sle_routes.cpp`) calls `ServerImpl::decommission_agent`,
-/// which builds this cascade. §27 builds the fan-out AND wires its first
-/// production caller.
+/// `DELETE /api/v1/sle/agents/{id}` — see `sle_routes.cpp`. It is gated on a SCOPED
+/// CONJUNCTION over every securable this cascade erases THROUGH, not just the one the
+/// route is named for: `SoftwareLicensing:Delete` (software_licensing) AND
+/// `Inventory:Delete` (inventory, software_inventory, device_inventory) AND
+/// `GuaranteedState:Delete` (app_perf_daily — DEX behavioural PII), plus
+/// audit-before-erase fail-closed. It calls `ServerImpl::decommission_agent`, which
+/// builds this cascade. §27 builds the fan-out AND wires its first production caller.
+///
+/// STANDING RULE — if you add a store to `AgentDecommissionStores`, you MUST add its
+/// governing securable's `Delete` to that conjunction (or state in a comment which
+/// existing conjunct already governs it). The drift guard in
+/// `test_agent_decommission.cpp` fails if the store list grows, so the two cannot
+/// silently diverge — they already did once, leaving `app_perf_daily` erasable by a
+/// principal with no GuaranteedState right at all.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure

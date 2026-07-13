@@ -113,8 +113,15 @@ struct SleHarness {
             for (const auto& d : denied_perms) // a permission the role simply lacks
                 if (d == type + "|" + op)
                     ok = false;
-            if (!ok)
+            if (!ok) {
                 res.status = 403;
+                // Mirror production (require_scoped_permission writes an A4 denial body
+                // naming the permission). Without a body the "no erasure" assertions
+                // below would pass vacuously against an empty string.
+                res.set_content(R"({"error":{"code":403,"permission":")" + type + ":" + op +
+                                    R"("}})",
+                                "application/json");
+            }
             return ok;
         };
         auto agents_fn = [this](const std::string&) -> std::optional<std::vector<AgentLicenseRow>> {
@@ -273,43 +280,60 @@ TEST_CASE("sle erase: scoped SoftwareLicensing:Delete gate — out-of-scope 403,
     CHECK(h.audits.empty()); // denied before the attempt audit / cascade
 }
 
-TEST_CASE("sle erase: requires Inventory:Delete TOO — the cascade's real blast radius",
-          "[sle_routes]") {
-    // The route is named for licences, but the cascade erases five per-agent stores —
-    // three of them (inventory, software_inventory, device_inventory) are ADR-0016
-    // stores governed by the Inventory securable. A custom role granted
-    // SoftwareLicensing:Delete WITHOUT Inventory:Delete must NOT be able to erase
-    // inventory data it cannot otherwise touch. Latent on the seeded matrix (both
-    // Delete-holding roles hold full Inventory CRUD), but RBAC is operator-editable.
-    SleHarness h;
-    h.allow_scoped_all = true;                     // in scope for the device...
-    h.denied_perms = {"Inventory|Delete"};         // ...but the role lacks Inventory:Delete
-    h.decommission_result = ok_result();
-    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    // Both halves of the conjunction were ASKED, in order, and the second one refused.
-    REQUIRE(h.scoped_calls.size() == 2);
-    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-1");
-    CHECK(h.scoped_calls[1] == "Inventory|Delete|agent-1");
-    // Refused BEFORE the attempt audit and the cascade — nothing was erased.
-    CHECK(h.audits.empty());
-    CHECK_FALSE(contains(res->body, "decommissioned"));
+// The route is NAMED for licences but the cascade erases FIVE per-agent stores spanning
+// THREE securables: SoftwareLicensing (software_licensing), Inventory (inventory,
+// software_inventory, device_inventory — ADR-0016), and GuaranteedState (app_perf_daily —
+// DEX behavioural PII, whose read routes gate on GuaranteedState:Read). The gate must
+// therefore authorize for what it DESTROYS, not for what it is named. Each conjunct is
+// tested for absence, because an operator-authored role may hold any subset (the seeded
+// Administrator / ITServiceOwner hold all three, so this is latent on the shipped matrix).
+TEST_CASE("sle erase: EVERY securable in the blast radius is required — missing any → 403",
+          "[sle_routes][authz]") {
+    struct Case {
+        const char* missing;    // the "type|op" the custom role lacks
+        const char* in_body;    // how the denial names it ("type:op")
+        std::size_t asked;      // gate calls made before the refusal (order is fixed)
+    };
+    // Ordered exactly as the route asks them; a refusal short-circuits the rest.
+    const Case cases[] = {
+        {"SoftwareLicensing|Delete", "SoftwareLicensing:Delete", 1},
+        {"Inventory|Delete", "Inventory:Delete", 2},
+        // app_perf_daily — the conjunct the first cut of this gate MISSED, letting a
+        // role destroy a device's DEX performance series it could not even read.
+        {"GuaranteedState|Delete", "GuaranteedState:Delete", 3},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.missing);
+        SleHarness h;
+        h.allow_scoped_all = true;    // in scope for the device...
+        h.denied_perms = {c.missing}; // ...but the role lacks this one permission
+        h.decommission_result = ok_result();
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(contains(res->body, c.in_body));      // the denial names the permission
+        REQUIRE(h.scoped_calls.size() == c.asked);  // short-circuited at the right conjunct
+        // Refused BEFORE the attempt audit and BEFORE the cascade — nothing was erased.
+        CHECK(h.audits.empty());
+        CHECK_FALSE(contains(res->body, "decommissioned"));
+    }
 }
 
-TEST_CASE("sle erase: holding BOTH securables erases — the conjunction is not a wall",
-          "[sle_routes]") {
-    // The other half of the conjunction test: a role holding both (the seeded
-    // Administrator / ITServiceOwner shape) still erases, so the new gate is a
-    // narrowing of custom roles, not a regression of the shipped matrix.
+TEST_CASE("sle erase: holding ALL THREE securables erases — the conjunction is not a wall",
+          "[sle_routes][authz]") {
+    // The seeded Administrator / ITServiceOwner shape (full CRUD on all three) still
+    // erases: the conjunction narrows custom roles, it does not regress the shipped matrix.
     SleHarness h;
-    h.allow_scoped_all = true; // holds both SoftwareLicensing:Delete and Inventory:Delete
+    h.allow_scoped_all = true;
     h.decommission_result = ok_result();
     auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    REQUIRE(h.scoped_calls.size() == 2);
+    // All three conjuncts asked, in order, each scoped to the device.
+    REQUIRE(h.scoped_calls.size() == 3);
+    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-1");
     CHECK(h.scoped_calls[1] == "Inventory|Delete|agent-1");
+    CHECK(h.scoped_calls[2] == "GuaranteedState|Delete|agent-1");
     CHECK(json::parse(res->body)["data"]["decommissioned"] == true);
 }
 

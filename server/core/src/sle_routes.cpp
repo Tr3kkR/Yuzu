@@ -202,15 +202,16 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // The agent-decommission cascade's production caller: fans delete_agent across
     // every registered per-agent store, durably erasing the machine's stored rows
     // (including the Decision-11 user_ref personal data — the reason this route
-    // exists). Gate: SCOPED SoftwareLicensing:Delete AND SCOPED Inventory:Delete —
-    // a CONJUNCTION (D-9), because the cascade erases more than licences: three of
-    // its five stores (InventoryStore, SoftwareInventoryStore, DeviceInventoryStore)
-    // are ADR-0016 stores governed by the Inventory securable. On the seeded matrix
-    // this changes nothing (Administrator + ITServiceOwner hold full CRUD on both),
-    // but RBAC is operator-editable, and a custom role granted SoftwareLicensing:Delete
-    // WITHOUT Inventory:Delete must not be able to erase inventory data it cannot
-    // otherwise touch. Authorize for the FULL blast radius, not just the route's name.
-    // Both checks are scoped, so a group-confined ITSO cannot erase an out-of-scope
+    // exists). Gate: a SCOPED CONJUNCTION over all THREE securables the cascade's
+    // five stores are governed by (D-9) — SoftwareLicensing:Delete (software_licensing)
+    // AND Inventory:Delete (inventory, software_inventory, device_inventory — the
+    // ADR-0016 stores) AND GuaranteedState:Delete (app_perf_daily — DEX behavioural
+    // PII). Authorize for the FULL blast radius, not just the route's name. On the
+    // seeded matrix this changes nothing (Administrator + ITServiceOwner hold full
+    // CRUD on all three), but RBAC is operator-editable, and a custom role holding
+    // only some of them must not be able to erase data it cannot otherwise touch —
+    // it could otherwise DESTROY a device's app-perf series it has no right to READ.
+    // Every check is scoped, so a group-confined ITSO cannot erase an out-of-scope
     // device, while require_scoped_permission's global step still admits global
     // holders fleet-wide.
     //
@@ -237,11 +238,20 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 send_json(res, 503, a4_error(503, "scope gate not configured", cid));
                 return;
             }
+            // THE FULL BLAST RADIUS — one Delete check per securable the cascade
+            // erases THROUGH, not one for the securable the route is NAMED for. Keep
+            // this list in lockstep with AgentDecommissionStores (the drift guard in
+            // test_agent_decommission.cpp fails if a store is added without a gate).
             if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
-            // The second half of the conjunction: the cascade also erases the ADR-0016
-            // Inventory-securable stores, so the caller must hold Delete on those too.
+            // inventory + software_inventory + device_inventory (ADR-0016 stores).
             if (!scoped_perm_fn_(req, res, "Inventory", "Delete", agent_id))
+                return; // the gate wrote its own 401/403
+            // app_perf_daily — DEX behavioural PII, governed by GuaranteedState (its
+            // read routes gate on GuaranteedState:Read). Without this check a role
+            // holding the two above but NOT GuaranteedState:Delete could DESTROY a
+            // device's per-app performance series it cannot even READ.
+            if (!scoped_perm_fn_(req, res, "GuaranteedState", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
                 send_json(res, 503, a4_error(503, "decommission cascade not configured", cid, 5000));

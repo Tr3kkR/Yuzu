@@ -116,7 +116,7 @@ securable — see [Access control](#access-control)):
 | Surface | Returns | Scope |
 |---|---|---|
 | `GET /api/v1/sle/agents/{agent_id}` | one device's discovered licences, **including any `user_ref` rows** | **per-device scoped** (403 outside your management-group scope) |
-| `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` |
+| `DELETE /api/v1/sle/agents/{agent_id}` | erases a device's stored rows (the audited decommission trigger — see [Erasure](#erasure-and-opt-out)) | **per-device scoped** `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and** `GuaranteedState:Delete` (see below) |
 | MCP `query_software_licenses` | one device's discovered-licence **facts** (machine-scope; **no `user_ref`**) | **per-device scoped** `SoftwareLicensing:Read` (the drill's confinement + #1717 fail-closed guard) |
 
 The **single-agent drill** (`GET /sle/agents/{id}`) takes a real per-device scoped gate
@@ -136,8 +136,9 @@ compliance / entitlement / reclamation views) lands with that work, not in this 
 ## Access control
 
 SLE reads and writes are governed by a new **`SoftwareLicensing`** RBAC securable. Its
-seeded description: *gates the SLE page and `/api/v1/sle/*`; the `/inventory` software
-catalog remains under `Inventory:Read`.* Default per-role grants:
+seeded description: *gates the `/api/v1/sle/*` detected-licence reads and the
+agent-decommission erasure; the `/inventory` software catalog remains under
+`Inventory:Read`.* Default per-role grants:
 
 | Role | Grant |
 |---|---|
@@ -166,9 +167,14 @@ enabling the SLE sources — deny-override wins).
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
   This knob-flip full-replace is the erasure path available today.
 - **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
-  the agent-decommission cascade to a gated (`SoftwareLicensing:Delete`), audited REST
-  route that clears **all** of a removed device's per-device stores (including its licence
-  rows). It is **audit-before-erase, fail-closed**: it records a durable
+  the agent-decommission cascade to an audited REST route that clears **all five** of a
+  removed device's per-agent stores (inventory, installed-software, device-CI, app-perf
+  and detected-licence rows). Because it erases well beyond licences, it is gated on a
+  **conjunction over every securable it destroys through** — the caller needs all of
+  `SoftwareLicensing:Delete`, `Inventory:Delete` and `GuaranteedState:Delete`, each scoped
+  to the device. (Administrator and ITServiceOwner hold all three by default; a custom role
+  holding only some of them is refused, so nobody can destroy data they cannot read.) It is
+  **audit-before-erase, fail-closed**: it records a durable
   `sle.agent.decommission|attempt` and refuses to erase if that evidence row cannot persist,
   then reports the per-store outcome. Because each store's delete now returns its committed
   status, a store whose delete rolled back is reported `failed` (HTTP 500 — re-issue the

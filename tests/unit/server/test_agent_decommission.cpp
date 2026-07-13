@@ -467,3 +467,42 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
     REQUIRE(post.has_value());
     CHECK(post->empty());
 }
+
+// ─────────────────────────── DRIFT GUARD (the root cause) ───────────────────────
+//
+// The erasure route's authorization gate is a CONJUNCTION over the securables the
+// cascade erases THROUGH — today SoftwareLicensing + Inventory + GuaranteedState
+// (sle_routes.cpp). That gate is hand-maintained, and NOTHING structurally ties it
+// to this store list: the first cut of the conjunction shipped covering four of the
+// five stores because `app_perf_daily` (GuaranteedState, DEX behavioural PII) was
+// silently unaccounted for, while the docs asserted "full blast radius".
+//
+// This test is the tie. It fails the moment a store joins AgentDecommissionStores,
+// forcing whoever adds it to answer: WHICH SECURABLE GOVERNS THE NEW STORE'S DATA,
+// and is that securable's Delete in the DELETE route's conjunction?
+//
+// If you are here because this test failed:
+//   1. Add the new store's governing securable to the conjunction in sle_routes.cpp
+//      (unless an existing conjunct already governs it — say which, in a comment).
+//   2. Update kCascadeStoreCount below, and the enumerations in sle_routes.hpp,
+//      agent_decommission.hpp, the OpenAPI `delete` block in rest_api_v1.cpp, and
+//      ADR-0024 Decisions 9/11.
+//   3. If the conjunction reaches a FOURTH securable, stop and promote it to the
+//      device-level `Decommission` securable ADR-0024 Decision 9 records as the
+//      rejected-for-now option — at that width the conjunction is the wrong shape.
+TEST_CASE("decommission cascade: store list is pinned to the DELETE route's authz gate",
+          "[decommission][authz]") {
+    // Every store null → all registered targets report Skipped, so target_count()
+    // is the cascade's registered-store count without needing a live store.
+    AgentDecommission cascade{AgentDecommissionStores{}};
+
+    constexpr std::size_t kCascadeStoreCount = 5; // inventory, software_inventory,
+                                                  // app_perf_daily, device_inventory,
+                                                  // software_licensing
+    CHECK(cascade.target_count() == kCascadeStoreCount);
+
+    const auto result = cascade.decommission("agent-x");
+    CHECK(result.skipped == kCascadeStoreCount);
+    CHECK(result.deleted == 0);
+    CHECK(result.failed == 0);
+}

@@ -3316,8 +3316,13 @@ public:
     /// skipped.
     ///
     /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
-    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on scoped
-    /// `SoftwareLicensing:Delete` and audit-before-erase fail-closed (Decision 11).
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on a SCOPED
+    /// CONJUNCTION over every securable the cascade erases through —
+    /// `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`
+    /// (app_perf_daily is DEX behavioural PII) — plus audit-before-erase fail-closed
+    /// (Decision 11). ADDING A STORE BELOW? Add its governing securable's Delete to
+    /// that conjunction too; the drift guard in test_agent_decommission.cpp fails
+    /// until you do.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must

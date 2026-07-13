@@ -11,8 +11,9 @@
   REST drill) — plus the audited GDPR-erasure **`DELETE /api/v1/sle/agents/{id}`**
   decommission cascade, which durably erases a decommissioned device's rows across
   **all five per-agent stores** (inventory, installed-software, device-CI, app-perf and
-  detected-licence) — gated on the per-device-scoped `SoftwareLicensing:Delete` **and**
-  `Inventory:Delete` conjunction, audit-before-erase fail-closed, and honest per-store
+  detected-licence) — gated on a per-device-scoped conjunction over every securable it erases
+  through (`SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
+  `GuaranteedState:Delete`), audit-before-erase fail-closed, and honest per-store
   committed status (a rolled-back store is reported failed, never a false erasure). Licence **compliance/entitlement/reclamation** evaluation and the fleet
   posture reads (the `/sle` page and the `summary`/`licenses`/per-product device fan-out)
   **interpret** discovered facts and ship with the future **SAM use-case-engine module**,

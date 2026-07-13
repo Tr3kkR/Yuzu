@@ -237,9 +237,9 @@ void RbacStore::seed_defaults() {
                            // SLE (ADR-0024 Decision 9). DISTINCT from the existing
                            // `License` securable (Yuzu's OWN product licence, §22.3) —
                            // this gates the /api/v1/sle/* discovery reads + the erasure
-                           // DELETE (there is NO in-server SLE page; the Licences view and
-                           // the compliance sub-views are the SAM UCE module's, ADR-1005).
-                           // Seeding it here
+                           // DELETE. (No SLE page ships yet — ADR-0024 D9 places the
+                           // Licences view in-server, but it is not built; the compliance
+                           // sub-views are the SAM UCE module's.) Seeding it here
                            // also grants Administrator full CRUD via the loop below.
                            "SoftwareLicensing"};
     for (auto* t : types) {

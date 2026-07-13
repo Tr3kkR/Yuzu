@@ -132,8 +132,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      fixed pre-merge because:
      - **The agentic surface is withheld deliberately, not overlooked.** The
        route is an irreversible per-device purge: it fans `delete_agent`
-       across every per-agent store, erasing the device's inventory,
-       device-CI, app-perf, and detected-licence rows, including the
+       across the five registered per-agent stores, erasing the device's
+       inventory, installed-software, device-CI, app-perf and
+       detected-licence rows, including the
        ADR-0024 Decision-11 pseudonymous `user_ref` personal data (this is
        the wired GDPR Art. 17 whole-device erasure path). Publishing a
        fleet-data destructor as an MCP tool hands an autonomous worker a
@@ -149,8 +150,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        twin gap.
      - **The exception relaxes no control.** The REST route keeps the
        per-device-scoped `SoftwareLicensing:Delete` **and** `Inventory:Delete`
-       conjunction (the cascade erases through both securables, so it
-       authorizes for both), audit-before-erase that **fails closed** (an
+       **and** `GuaranteedState:Delete` conjunction (the cascade erases through
+       all three securables, so it authorizes for all three),
+       audit-before-erase that **fails closed** (an
        attempt row that cannot persist means no erasure — an unaudited
        erasure would destroy its own evidence), and truthful per-store
        committed-delete status (a rolled-back store reports `Failed` → 500,
