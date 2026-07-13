@@ -73,8 +73,10 @@ STALE_SECONDS=$((EPOCH_HOURS * 3600))
 #    stamper clock, collapsing stamper-vs-sweeper skew) ─────────────────────
 # Epoch parse mirrors parse_test_db_epoch(): optional tpl_ infix, a 1..12
 # digit run (13+ overflows in C++ and fails the bounded regex here), then
-# '_' + a non-empty tail. Plausibility mirrors test_db_epoch_plausible().
-EPOCH_RE='^yuzu_test_(tpl_)?[0-9]{1,12}_.'
+# '_' — with an EMPTY tail allowed, exactly like the C++ parser (its
+# i == rest.size() check rejects a name with no separator at all, not one
+# ending in '_'). Plausibility mirrors test_db_epoch_plausible().
+EPOCH_RE='^yuzu_test_(tpl_)?[0-9]{1,12}_'
 EPOCH_CAP='^yuzu_test_(?:tpl_)?([0-9]{1,12})_'
 PLAUSIBLE="(regexp_match(datname, '${EPOCH_CAP}'))[1]::bigint
              BETWEEN 1600000000 AND extract(epoch FROM now())::bigint + 86400"
@@ -232,17 +234,20 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
     echo "::warning::sweep-test-databases: YUZU_TEST_POSTGRES_DSN is set but no psql found — DSN sweep skipped" >&2
   else
     dsn="$YUZU_TEST_POSTGRES_DSN"
-    if [[ "$dsn" =~ ^(postgres(ql)?://[^/?]*@?[^:/?]+):([0-9]+)(/[^?]*)?(\?.*)?$ ]]; then
-      # URI form: rewrite port and database per probed instance.
-      base="${BASH_REMATCH[1]}" port="${BASH_REMATCH[3]}" query="${BASH_REMATCH[5]}"
+    host="127.0.0.1"   # default when the DSN names no host
+    if [[ "$dsn" =~ ^(postgres(ql)?://([^/?@]*@)?([^:/?]+)):([0-9]+)(/[^?]*)?(\?.*)?$ ]]; then
+      # URI form: rewrite port and database per probed instance; probe the
+      # DSN's own host, not a hardcoded loopback.
+      base="${BASH_REMATCH[1]}" host="${BASH_REMATCH[4]}"
+      port="${BASH_REMATCH[5]}" query="${BASH_REMATCH[7]}"
       mkconn() { echo "${base}:$1/postgres${query}"; }
     else
       # Keyword form: later keywords win in libpq conninfo strings.
       port=5432
       if [[ "$dsn" =~ port=([0-9]+) ]]; then port="${BASH_REMATCH[1]}"; fi
+      if [[ "$dsn" =~ host=([^[:space:]]+) ]]; then host="${BASH_REMATCH[1]}"; fi
       mkconn() { echo "${dsn} port=$1 dbname=postgres"; }
     fi
-    host="127.0.0.1"
     for ((n = 0; n < AGENTS; n++)); do
       p=$((port + n))
       if ! tcp_probe "$host" "$p"; then
@@ -263,6 +268,10 @@ elif (( ! swept_any )) && tcp_probe 127.0.0.1 5432; then
     swept_any=1
     sweep_instance "native:127.0.0.1:5432" run_psql_dsn "postgresql://yuzu:yuzu@127.0.0.1:5432/postgres" \
       || echo "::warning::sweep-test-databases: native:5432 sweep failed — continuing" >&2
+  else
+    # A listener we can see but no client to sweep it with is a precondition
+    # failure worth signalling, not a quiet "no instances".
+    echo "::warning::sweep-test-databases: something listens on 127.0.0.1:5432 but no psql was found — native sweep skipped" >&2
   fi
 fi
 

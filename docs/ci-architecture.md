@@ -308,8 +308,12 @@ is shared. Closes #406.
 
 `scripts/ci/flake-retry.py` wraps the `meson test` step on `ci.yml`'s three
 test legs (PR fast-path + push matrix; **not** nightly/sanitizer, which stay
-fail-loud so a real ASan/TSan race is never masked). On a clean run it does
-nothing. On failure it isolates the failed **Catch2 case(s)** — it re-runs the
+fail-loud so a real ASan/TSan race is never masked). Every run — green
+included — first gets the #2093 duration watchdog: a per-suite
+duration/budget table in the step summary, plus a `::warning` for any suite
+past 80% of its meson timeout (reporting only; pass/fail semantics never
+change). On a clean run it does nothing further. On failure it isolates the
+failed **Catch2 case(s)** — it re-runs the
 failed suite binary (located via `meson introspect --tests`) with Catch2's own
 junit reporter, since meson's junit is only suite-level — then:
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """flake-retry.py — CI flake-retry wrapper around `meson test` (Yuzu).
 
-Runs `meson test`; on a clean pass, exits 0 and does nothing else. On failure
-it isolates the failed Catch2 case(s) and, for those listed in
+Runs `meson test`; every run — green included — then gets the #2093 duration
+watchdog (a per-suite duration/budget table in the step summary + a ::warning
+for any suite past 80% of its meson timeout; reporting only, pass/fail
+semantics never change). On a clean pass, exits 0 with no retry machinery.
+On failure it isolates the failed Catch2 case(s) and, for those listed in
 `tests/known-flaky.json` (scoped to the current OS), retries them in isolation.
 
 Outcome contract:
@@ -482,6 +485,22 @@ def _selftest():
     check(_cmd_without_test_specs([]) == [], "empty cmd stays empty")
     check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
           "argv[0] untouched even when spec-shaped")
+
+    # Repo-hygiene guard (#2092): every positional arg on the server test()
+    # entries in tests/meson.build must be a Catch2 tag-filter spec — the
+    # invariant the retry surgery relies on. A future case-name or comma-list
+    # spec would OR with the retried case and corrupt recovery verdicts; this
+    # catches it at test time instead of in a masked flake.
+    meson_build = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "..", "tests", "meson.build")
+    with open(meson_build, encoding="utf-8") as f:
+        _src = f.read()
+    _arglists = re.findall(r"server_test_exe,\s*args:\s*\[(.*?)\],\s*suite:", _src)
+    check(bool(_arglists), "meson.build: server shard entries located")
+    for _arglist in _arglists:
+        for _arg in re.findall(r"'([^']*)'", _arglist):
+            check(CATCH2_TAG_SPEC.match(_arg) is not None,
+                  f"meson.build server test arg {_arg!r} is not a tag-filter spec")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
