@@ -356,8 +356,8 @@ private:
     /// its siblings end-to-end.
     ///
     /// Two invariants ride on it:
-    ///   1. stop()'s `if (stopped_) return;` is a genuine COMPLETION barrier — the
-    ///      loser waits here for the winner to finish, so ~SparkEngine can never
+    ///   1. stop()'s teardown_complete_ early-out is a genuine COMPLETION barrier —
+    ///      the loser waits here for the winner to finish, so ~SparkEngine can never
     ///      outrun an in-flight stop() (Gate-3 B3).
     ///   2. stop() may iterate `mechanisms_` without `mu_` — no register_mechanism()
     ///      can be concurrently mutating the map, even during the boot window where
@@ -368,21 +368,6 @@ private:
     /// arm/disarm paths take only mu_, so they cannot deadlock against a lifecycle op.
     std::mutex lifecycle_mu_;
 
-    /// The thread currently INSIDE stop() (default-constructed id = nobody).
-    ///
-    /// Guards against SAME-THREAD RE-ENTRY, which lifecycle_mu_ (non-recursive) would turn
-    /// into a self-deadlock. It is reachable: `main.cpp`'s signal handler calls
-    /// Agent::stop() -> SparkEngine::stop(), and the signal can be delivered to a thread
-    /// that is ALREADY inside stop() — e.g. the main thread, sitting in run()'s ScopeExit
-    /// teardown, receiving SIGINT (SIGTERM being blocked inside its own handler does not
-    /// help; the other signal is not). Before lifecycle_mu_ existed, stop()'s bare
-    /// `if (stopped_) return;` made that re-entry a benign no-op; the mutex turned it into
-    /// a hang. A recursive_mutex is NOT the fix — it would let the nested call run a second,
-    /// concurrent teardown (double-join, double m->stop()).
-    ///
-    /// A re-entrant call simply returns: the outer stop() is already doing the work.
-    /// (governance Gate-3 cpp-safety.) The durable fix is to get Agent::stop() off the
-    /// signal-handler path entirely — a pre-existing agent-wide defect, tracked separately.
     // armed sparks + subscription index + wheel state, all under mu_.
     mutable std::mutex mu_;
     /// Serializes every mechanism watch()/unwatch() call PER MECHANISM TYPE

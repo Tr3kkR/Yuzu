@@ -740,10 +740,10 @@ void SparkEngine::stop() noexcept try {
     // teardown_complete_. Agent::stop() on the Windows SCM control thread genuinely races
     // ~SparkEngine on main, which is a real cross-thread hazard independent of signals.
     //
-    // lifecycle_mu_ is held for the WHOLE teardown. It makes the stopped_ early-out
-    // below a COMPLETION barrier rather than a bare flag check: a second stop() (or
-    // ~SparkEngine, which calls stop()) blocks HERE until the in-flight teardown has
-    // finished, then sees stopped_ and returns having genuinely waited.
+    // lifecycle_mu_ is held for the WHOLE teardown. It makes the teardown_complete_
+    // early-out below a COMPLETION barrier rather than a bare flag check: a second stop()
+    // (or ~SparkEngine, which calls stop()) blocks HERE until the in-flight teardown has
+    // finished, then sees teardown_complete_ and returns having genuinely waited.
     //
     // Without it, the loser returned immediately while the winner was still inside
     // wheel_thread_.join() / m->stop() — so ~SparkEngine could run on to
@@ -751,11 +751,12 @@ void SparkEngine::stop() noexcept try {
     // the thread still calling m->stop() on them → use-after-free. Reachable for real:
     // Agent::stop() runs on the Windows SCM control thread (service_win.cpp
     // handler_ex) concurrently with the main thread's shutdown. Gate-3 B3.
-    // SAME-THREAD RE-ENTRY GUARD, before we touch the non-recursive lifecycle_mu_.
-    // main.cpp's signal handler calls Agent::stop() -> this, and the signal can land on a
-    // thread ALREADY inside stop() (the main thread in run()'s ScopeExit teardown, taking
-    // a SIGINT). Re-entering would self-deadlock. The outer call is already doing the
-    // teardown, so the nested one simply returns. (governance Gate-3 cpp-safety)
+    //
+    // SAME-THREAD RE-ENTRY cannot happen: none of the three callers above can already be
+    // inside stop() on its own thread (the nested ScopeExit/destructor calls are
+    // SEQUENTIAL — the lock is released between them, and the second finds
+    // teardown_complete_ set). The re-entry guard that once sat here existed only for the
+    // signal-handler path and is deleted with it.
     std::lock_guard life(lifecycle_mu_);
 
     // 1) Stop the watcher side first so nothing new is produced.
@@ -781,16 +782,10 @@ void SparkEngine::stop() noexcept try {
         running_ = false;
     }
     wheel_cv_.notify_all();
-    // Self-join guard: joining the wheel thread FROM the wheel thread would throw
-    // std::system_error(resource_deadlock_would_occur), and stop() is noexcept.
-    //
-    // If we hit it, we MUST NOT go on to mark the teardown complete. An earlier version
-    // did, and that was strictly worse than the throw it was avoiding: skipping the join
-    // and then latching `teardown_complete_ = true` makes ~SparkEngine's stop() early-out,
-    // so the destructor runs ~std::thread on a STILL-JOINABLE wheel thread — a guaranteed
-    // std::terminate, silently, instead of a loud one. It converted a throw into a latched
-    // leak (governance Gate-3 cpp-safety).
-    //
+    // SELF-JOIN is unreachable: stop() never runs on a spark thread (see the caller
+    // inventory at the top of this function), so joining the wheel thread from itself —
+    // std::system_error(resource_deadlock_would_occur) out of a noexcept fn — cannot
+    // occur. joinable() guards the never-started and already-torn-down cases only.
     if (wheel_thread_.joinable())
         wheel_thread_.join();
 
