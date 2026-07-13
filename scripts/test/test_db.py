@@ -199,6 +199,15 @@ def connect(create_dirs: bool = False):
         log_root().mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=10.0, isolation_level=None)
     try:
+        # Per-connection resilience PRAGMAs (#1146): SCHEMA_V1 set these only
+        # on the fresh-init path, so a DB initialised before WAL landed (or a
+        # connection racing a concurrent writer — nightly + PR run sharing
+        # YUZU_TEST_DB on one runner box) ran without them. busy_timeout FIRST
+        # so the journal_mode switch itself retries under contention, and at
+        # 10000 to match the driver-level `timeout=10.0` above — a smaller
+        # value here would silently SHORTEN the effective timeout.
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         yield conn
     finally:
@@ -211,8 +220,14 @@ def schema_version(conn: sqlite3.Connection) -> Optional[int]:
             "SELECT version FROM schema_meta WHERE store='test_runs_db'"
         ).fetchone()
         return row[0] if row else None
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as e:
+        # Only the missing-table probe means "fresh DB" (#1146); a
+        # busy/locked timeout here is a real concurrency failure and must
+        # surface through the main() handler, not read as version=None
+        # (which would send callers down the schema-init path).
+        if "no such table" in str(e).lower():
+            return None
+        raise
 
 
 def stamp_version(conn: sqlite3.Connection, version: int) -> None:
@@ -1180,7 +1195,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 2
-    return args.func(args)
+    try:
+        return args.func(args)
+    except sqlite3.OperationalError as e:
+        # One central net for every subcommand's connect()/execute() (#1146):
+        # under concurrent writers (nightly + PR run sharing YUZU_TEST_DB on
+        # one runner box) a busy_timeout-exhausted 'database is locked' used
+        # to escape as a raw traceback. Exit 1 = operational failure; exit 2
+        # stays reserved for validation errors.
+        print(
+            f"test_db: SQLite busy/locked on {db_path()}: {e} — "
+            "concurrent writer (overlapping runs sharing YUZU_TEST_DB?); "
+            "busy_timeout exhausted",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
