@@ -126,6 +126,42 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        operator-facing behavior: `docs/user-manual/scim-provisioning.md`;
        wire reference: `docs/user-manual/rest-api.md#scim-v2-provisioning`.
 
+   - **2026-07-13 — SLE agent-decommission erasure
+     (`DELETE /api/v1/sle/agents/{id}`, PR #1950).** REST-only, no MCP twin —
+     a "no" on Decision 1's both-surfaces requirement. Recorded rather than
+     fixed pre-merge because:
+     - **The agentic surface is withheld deliberately, not overlooked.** The
+       route is an irreversible per-device purge: it fans `delete_agent`
+       across the five registered per-agent stores, erasing the device's
+       inventory, installed-software, device-CI, app-perf and
+       detected-licence rows, including the
+       ADR-0024 Decision-11 pseudonymous `user_ref` personal data (this is
+       the wired GDPR Art. 17 whole-device erasure path). Publishing a
+       fleet-data destructor as an MCP tool hands an autonomous worker a
+       one-call, unrecoverable data-loss primitive. The twin is withheld
+       until an MCP destructive-operation gate exists (human confirmation /
+       tier ceiling) that makes a guarded twin safe. Tracked as **#2102**;
+       **revisit by 2027-01-13**.
+     - **Scoped to the destructive verb only — the capability's read half
+       has its twin from day one.** `GET /api/v1/sle/agents/{id}` ships
+       alongside the MCP twin `query_software_licenses` (ADR-0024
+       Decision 9), so SLE *discovery* is fully reachable on both surfaces.
+       Only the erasure verb is REST-only; this is not a capability-wide
+       twin gap.
+     - **The exception relaxes no control.** The REST route keeps the
+       per-device-scoped `SoftwareLicensing:Delete` **and** `Inventory:Delete`
+       **and** `GuaranteedState:Delete` conjunction (the cascade erases through
+       all three securables, so it authorizes for all three),
+       audit-before-erase that **fails closed** (an
+       attempt row that cannot persist means no erasure — an unaudited
+       erasure would destroy its own evidence), and truthful per-store
+       committed-delete status (a rolled-back store reports `Failed` → 500,
+       never a false `decommissioned:true`).
+     - Design record: `docs/adr/0024-software-licensing-entitlements.md`
+       (Decisions 9 and 11); operator-facing behavior:
+       `docs/user-manual/software-licensing.md`; wire reference: the
+       OpenAPI document (`/sle/agents/{agent_id}`).
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

@@ -210,7 +210,7 @@ TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
             {.app_name = "a", .version = "1.0.0.0", .day = day, .samples = 1, .instances_max = 1,
              .cpu_avg = 1.0, .cpu_max = 1.0, .ws_avg_bytes = 1, .ws_max_bytes = 1}};
         CHECK(store.apply_daily("agent-e", rows));
-        store.delete_agent("agent-e");
+        CHECK(store.delete_agent("agent-e")); // committed → true
         auto got = store.get_agent_app_perf("agent-e");
         REQUIRE(got.has_value());
         CHECK(got->empty());

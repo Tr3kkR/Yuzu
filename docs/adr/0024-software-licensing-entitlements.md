@@ -21,9 +21,10 @@ under ADR-1005").
 
 **In-server (this ADR) — the discovery mechanism:**
 - **`license_scan` agent plugin** (D2) — probes every OS licensing surface (Windows WMI
-  `SoftwareLicensingProduct` + Office C2R + an extensible ProbeSpec table incl. Java and
-  ISO-19770-2 SWID tags + per-user hives; Linux rpm/dpkg/entitlement-certs/FlexLM; macOS
-  receipts); never persists or transmits key material.
+  `SoftwareLicensingProduct` + Office C2R + an extensible ProbeSpec table + per-user
+  hives; Linux rpm/dpkg/entitlement-certs/FlexLM; macOS receipts; the Java and
+  ISO-19770-2 SWID tag surfaces are the named fast-follow, #2112); never persists or
+  transmits key material.
 - **`software_licensing` daily-sync source** (D3) — transports records on the ADR-0016
   framework (raw-blob hash-skip, forward-compatible, no proto change).
 - **Two born-on-Postgres stores** (D4/D6) — `ProductRegistryStore` (canonical identities +
@@ -233,21 +234,25 @@ Decision numbers are stable, since other documents cite them.
 2. **Agent discovery is a new `license_scan` plugin that probes every available
    surface. [core]** Per-OS translation units with pure parsers split out; actions `list`
    (emit records) and `surfaces` (diagnostics — which surfaces are available and why
-   not). Surfaces v1: Windows WMI `SoftwareLicensingProduct` (own bounded COM, never
-   `WBEM_INFINITE`), Office ClickToRun registry, an extensible `ProbeSpec` table (MS
-   server products, Autodesk, security/backup agents, VMware, open-source
-   classification, and **Java runtimes** — vendor/distribution/version, Oracle JDK
-   vs the OpenJDK builds, the single most audit-relevant probe in the current
-   climate: the per-employee Java metric plus download-log enforcement makes "which
-   Java is on which machine" the first question every audited estate is asked), and
-   **per-user hives** (incl. `RegLoadKey` of offline
+   not). Surfaces v1 (as shipped): Windows WMI `SoftwareLicensingProduct` (own bounded
+   COM, never `WBEM_INFINITE`), Office ClickToRun registry, an extensible `ProbeSpec`
+   table (MS server products, Autodesk, security/backup agents, VMware, open-source
+   classification), and **per-user hives** (incl. `RegLoadKey` of offline
    `NTUSER.DAT`); Linux `rpm`/dpkg DEP-5 declared licence, RHEL entitlement certs,
-   FlexLM `.lic` expiry; macOS `_MASReceipt` + machine-scope vendor plists; and on
-   all three OSes **ISO 19770-2 SWID tag files** (`*.swidtag` in the standard tag
-   directories) — a cheap, standards-based surface whose parsed vendor artefacts
-   qualify for `authoritative` confidence and which the leading commercial suites
-   ingest as first-class recognition evidence. Adding a vendor later is one
-   `ProbeSpec` row. Vocabularies are **closed and
+   FlexLM `.lic` expiry; macOS `_MASReceipt` + machine-scope vendor plists.
+   **Two surfaces the industry-direction review (2026-07-08) added are the named
+   fast-follow, deliberately NOT in the shipped v1 (tracked #2112):** **Java
+   runtimes** — vendor/distribution/version, Oracle JDK vs the OpenJDK builds, the
+   single most audit-relevant probe in the current climate (the per-employee Java
+   metric plus download-log enforcement makes "which Java is on which machine" the
+   first question every audited estate is asked) — and, on all three OSes,
+   **ISO 19770-2 SWID tag files** (`*.swidtag` in the standard tag directories), a
+   cheap, standards-based surface whose parsed vendor artefacts qualify for
+   `authoritative` confidence and which the leading commercial suites ingest as
+   first-class recognition evidence. Both land as `ProbeSpec` extensions on the seam
+   this decision builds — deferring them keeps the recorded v1 surface list honest
+   against the shipped plugin (contract follows code) without shrinking the recorded
+   aim. Adding a vendor later is one `ProbeSpec` row. Vocabularies are **closed and
    unknown-preserving** (the plugin never fabricates): `license_type`, `status`,
    `source`, and a `confidence` of `authoritative | probable | heuristic`
    (`authoritative` only from an OS/vendor licensing API or a parsed vendor artefact).
@@ -363,7 +368,35 @@ Decision numbers are stable, since other documents cite them.
    **and their MCP twin `query_software_licenses`** (`SoftwareLicensing:Read`,
    management-group scoped like the raw drill — this is the both-REST-and-MCP twin
    ADR-1005 Decision 1 requires for the in-server discovery capability, shipped from day
-   one, not deferred), and the new **`SoftwareLicensing` securable**. Per Placement under
+   one, not deferred), and the new **`SoftwareLicensing` securable**. The destructive
+   **`DELETE /api/v1/sle/agents/{id}`** erasure (Decision 11) is deliberately **REST-only**
+   — a device purge is withheld from the agentic surface, so it is a *recorded exception*
+   to ADR-1005 Decision 1's both-surfaces rule rather than a twin gap: the exception row
+   (surface + tracking issue #2102 + revisit-by date) **is recorded** in ADR-1005's
+   twin-existence exception ledger, alongside the SCIM-v2 REST-only precedent — entered
+   pre-acceptance as voluntary early compliance, which ADR-1005's Binding-status note
+   expressly invites. That erasure is authorized by a **CONJUNCTION over every
+   securable the cascade erases THROUGH** — the caller must hold, per-device scoped, all
+   of **`SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`**.
+   The cascade's blast radius is wider than the route's name: of the five per-agent stores
+   it erases, `SoftwareLicensingStore` is the licensing one; `InventoryStore`,
+   `SoftwareInventoryStore` and `DeviceInventoryStore` are governed by the **`Inventory`**
+   securable; and `AppPerfDailyStore` is DEX behavioural PII governed by
+   **`GuaranteedState`** (its read routes gate on `GuaranteedState:Read`). Gating on the
+   licensing securable alone would let an operator-authored role erase inventory data it
+   cannot otherwise touch — and, worse, **destroy a device's per-app performance series it
+   has no right even to READ**. This is latent under the seeded matrix (both Delete-holding
+   roles — Administrator, ITServiceOwner — hold full CRUD on all three), so the conjunction
+   changes nothing that ships, but RBAC is operator-editable and the gate must authorize for
+   what the operation *destroys*, not for what it is *named*. The store list and the gate
+   are pinned together by a drift guard (`test_agent_decommission.cpp`): adding a store to
+   the cascade fails the build until its governing securable joins the conjunction.
+   *Rejected: a dedicated device-level `Decommission` securable — the honest modelling of a
+   cross-securable destructive operation, and the right answer once a second caller
+   (enrollment removal, a fleet-management purge) needs it; deferred because it is a new
+   seeded securable with a migration and a matrix change, for zero behavioural gain over the
+   conjunction today. **Revisit if the conjunction ever reaches a fourth securable** — at
+   that width the conjunction is the wrong shape and this decision reverses.* Per Placement under
    ADR-1005, the **Compliance, Entitlements, and Reclamation** sub-views and the
    **compliance MCP tool `get_license_compliance_summary`** are the SAM UCE host's UI and
    read API — not built in-server. The software
@@ -425,7 +458,12 @@ Decision numbers are stable, since other documents cite them.
     `SoftwareLicensingStore`) and removes **only agent-scoped rows/links**;
     `ProductRegistryStore` holds fleet-wide canonical identities shared across agents and
     is **never** in the cascade (decommission drops an agent's match links, never a shared
-    canonical product). There is **no row-level erasure API**, a stated gap. The effective mode is **centrally verifiable**: the
+    canonical product). There is **no row-level erasure API**, a stated gap. The cascade's
+    production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
+    `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
+    conjunction (Decision 9) — because this fan-out reaches the `Inventory`-securable
+    stores and the `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
+    one. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
     flapping surface diagnostics never touch the blob and are fetched live via the
@@ -537,7 +575,11 @@ strict-sanitised records; the `list` action yields, e.g.:
   "exe_hints": ["acad.exe"]
 }
 
-// Oracle JDK via an ISO 19770-2 SWID tag — the audit-relevant probe
+// Oracle JDK via an ISO 19770-2 SWID tag — the audit-relevant probe. NB: the
+// swidtag surface is the D-2 fast-follow (#2112), not emitted by the shipped v1
+// plugin; #2112 also extends the closed vocabularies this record needs — `source:
+// swidtag` and the Decision-12 metric-typed `license_type` here (`per_employee`) —
+// in BOTH validators (plugin kSources/kLicenseTypes + the server ingest's).
 {
   "kind": "lic", "product": "Oracle JDK 17", "publisher": "Oracle",
   "license_type": "per_employee", "status": "installed",

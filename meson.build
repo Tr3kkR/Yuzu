@@ -408,6 +408,7 @@ if build_agent
     subdir('agents/plugins/wifi')
     subdir('agents/plugins/wol')
     subdir('agents/plugins/discovery')
+    subdir('agents/plugins/license_scan')
   endif
 endif
 
