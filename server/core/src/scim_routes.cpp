@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -452,12 +453,42 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 ///      sessions) and audit `scim.user.role_changed` (set-and-proceed, same
 ///      posture as every other audit on this surface — see `audit()`'s doc
 ///      comment).
+///
+/// CONCURRENCY (TOCTOU role drift, Hermes security gate): steps 1-5 above are
+/// a non-atomic read-resolve-write — each of `ScimStore`'s `db_mtx_` and
+/// `AuthManager`'s `mu_` is taken and released independently per step. Two
+/// concurrent Group mutations affecting the SAME user (e.g. one removing
+/// them from the admin group, another concurrently adding them) can
+/// otherwise interleave so the second-committing recompute reads a stale
+/// `current` role, no-ops on `resolved == current`, and leaves the durable
+/// DB role contradicting the FINAL committed group membership. `kRecomputeMu`
+/// serializes the entire body below so recomputes for (in practice) any user
+/// are linearized process-wide — recompute is not a hot path (only Group ops
+/// + user create/revive, bounded by `kMaxGroupMembers`), so a single mutex is
+/// fine; per-user striping would be over-engineering here. Because each
+/// Group op commits its membership change to `ScimStore` BEFORE calling this
+/// function, serializing the critical section guarantees the
+/// last-scheduled recompute observes the final committed membership and
+/// applies the correct role — any earlier, now-stale role gets corrected by
+/// whichever recompute runs last.
+///
+/// LOCK ORDER (do not invert): `kRecomputeMu` → `ScimStore::db_mtx_` (taken
+/// and released inside `get_by_scim_id`/`list_group_display_names_for_user`)
+/// → `AuthManager::mu_` (taken and released inside `db_authoritative_role`/
+/// `update_role`). `kRecomputeMu` is acquired ACROSS both of those calls but
+/// is never itself acquired by any code reachable from within `db_mtx_` or
+/// `mu_` — this function is the only acquirer, so there is no path back into
+/// `kRecomputeMu` while either inner lock is held, and thus no inversion/
+/// deadlock. Do not add a second acquirer without re-checking this.
 void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
                               AuditStore* audit_store, const httplib::Request& req,
                               const std::string& user_scim_id,
                               const std::string& scim_admin_group) {
     if (!scim_store || !auth_mgr)
         return;
+
+    static std::mutex kRecomputeMu;
+    std::lock_guard<std::mutex> recompute_lock(kRecomputeMu);
 
     // Step 1: user_scim_id must resolve to a live SCIM User resource.
     auto resource = scim_store->get_by_scim_id(user_scim_id);

@@ -751,6 +751,109 @@ TEST_CASE("ScimRoutes: concurrent Group PATCH-promote + User DELETE on the same 
     }
 }
 
+TEST_CASE("ScimRoutes: concurrent conflicting Group membership ops on the same user never leave "
+         "the durable role out of sync with the final committed membership (TOCTOU role-drift "
+         "fix, recompute_scim_user_role serialization)",
+         "[scim][routes][groups][race][role_drift]") {
+    // Stress-based (not a fully deterministic repro — see NOTE at the end of
+    // this file's Groups-concurrency section): fires an add-to-admin-group
+    // PATCH and a remove-from-admin-group PATCH concurrently against the
+    // SAME user, looped, so the two recompute_scim_user_role calls have a
+    // real chance to interleave under the scheduler. Before the fix, the
+    // call that lost the race could read a stale `current` role and take
+    // the resolved==current no-op branch, stranding the durable role behind
+    // whichever membership state actually committed last. After the fix
+    // (recompute serialized end-to-end per call), the durable role must
+    // match the CURRENT membership after every single pair of racing ops —
+    // not just eventually after the whole loop.
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "wendy"}})->body);
+    auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}})->body);
+    auto group_id = group["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+
+    for (int i = 0; i < 100; ++i) {
+        std::atomic<bool> saw_unexpected{false};
+        std::vector<std::thread> threads;
+        threads.emplace_back([&] {
+            auto res = f.patch("/scim/v2/Groups/" + group_id, add_body);
+            if (!res || res->status != 200)
+                saw_unexpected.store(true);
+        });
+        threads.emplace_back([&] {
+            auto res = f.patch("/scim/v2/Groups/" + group_id, remove_body);
+            if (!res || res->status != 200)
+                saw_unexpected.store(true);
+        });
+        for (auto& t : threads)
+            t.join();
+        CHECK_FALSE(saw_unexpected.load());
+
+        auto groups = f.scim_store->list_group_display_names_for_user(user_id);
+        auto expected = auth::resolve_role_from_groups(groups, "Yuzu-Admins");
+        auto actual = f.auth_mgr.get_user_role("wendy");
+        REQUIRE(actual.has_value());
+        CHECK(*actual == expected);
+    }
+}
+
+TEST_CASE("ScimRoutes: two concurrent identical Group-add PATCHes promoting the same user write "
+         "exactly one scim.user.role_changed success row — no duplicate audit from a racing "
+         "no-op recompute",
+         "[scim][routes][groups][race][role_drift]") {
+    // Before the fix, both concurrent recomputes could observe current=user
+    // (both reading before either had applied update_role) and both apply +
+    // audit the user->admin transition, producing a duplicate success row.
+    // Serializing recompute end-to-end means the second-running recompute
+    // observes the first's already-applied 'admin' role and takes the
+    // resolved==current no-op branch (no second audit row).
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "xena"}})->body);
+    auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}})->body);
+    auto group_id = group["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+
+    std::atomic<bool> saw_unexpected{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back([&] {
+            auto res = f.patch("/scim/v2/Groups/" + group_id, add_body);
+            if (!res || res->status != 200)
+                saw_unexpected.store(true);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+    CHECK_FALSE(saw_unexpected.load());
+
+    REQUIRE(f.auth_mgr.get_user_role("xena").has_value());
+    CHECK(f.auth_mgr.get_user_role("xena").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.role_changed";
+    q.target_id = user_id;
+    auto rows = f.audit_store->query(q);
+    int success_to_admin = 0;
+    for (const auto& row : rows) {
+        if (row.result == "success" && row.detail.find("new_role=admin") != std::string::npos)
+            ++success_to_admin;
+    }
+    CHECK(success_to_admin == 1);
+}
+
 // ── M-DEPROV-ROLE ────────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM account to admin",
