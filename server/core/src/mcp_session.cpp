@@ -87,6 +87,12 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
     MintResult result;
     std::size_t active = 0;
     bool opened = false;
+    // Built BEFORE the lock. Constructing it resolves its metric gauges, which takes the
+    // process-global metrics mutex — and /metrics holds that one for a whole exposition
+    // build, so doing it under the registry lock would make every scrape stall every MCP
+    // session operation. The cost of building one we then discard on a cap reject is a
+    // single small allocation on a path that is already rejecting.
+    auto stream = std::make_shared<McpStreamState>(cfg_.ring_cap, metrics_, cfg_.ring_bytes_cap);
     {
         std::lock_guard<std::mutex> lk(mu_);
         reaped = gc_locked();  // reclaim idle sessions before enforcing caps
@@ -116,9 +122,7 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
                 result = {false, {}, "id_generation"};
             } else {
                 const auto t = now();
-                sessions_.emplace(id, Entry{principal, t, t,
-                                            std::make_shared<McpStreamState>(
-                                                cfg_.ring_cap, metrics_, cfg_.ring_bytes_cap)});
+                sessions_.emplace(id, Entry{principal, t, t, std::move(stream)});
                 opened = true;
                 result = {true, id, {}};
             }

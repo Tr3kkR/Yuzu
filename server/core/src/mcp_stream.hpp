@@ -117,6 +117,11 @@ using McpStreamEvent = sse_bus::SseEvent;
 /// at PR-3 progress-frame sizes (Decision 15(d): ALL in-memory state bounded).
 inline constexpr std::size_t kMcpRingBytesCapDefault = 64 * 1024;
 
+/// Floor for the ring byte cap. Below the size of the `frame_too_large` notice, every
+/// publish would count as oversized and the ring would collapse to a single frame —
+/// turning every resume into a gap.
+inline constexpr std::size_t kMinRingBytesCap = 256;
+
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
 /// to tell "your credential was revoked" from "our auth backend is down".
@@ -290,6 +295,9 @@ private:
     // there would strand a sink that already holds a lease. The families live in
     // node-based maps, so these references are stable for the registry's life; a
     // Gauge::increment through them takes only that gauge's own mutex.
+    /// Non-owning views into MetricsRegistry's node-based families: valid for the
+    /// registry's life, and invalidated ONLY by `clear_gauge_family()` (which is never
+    /// called on the `yuzu_mcp_streams_*` families — if that ever changes, these dangle).
     yuzu::Gauge* gauge_streams_active_ = nullptr;
     yuzu::Gauge* gauge_streams_handover_ = nullptr;
 };

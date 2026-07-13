@@ -154,7 +154,10 @@ const char* to_string(McpStreamClose reason) {
 McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metrics,
                                std::size_t ring_bytes_cap)
     : ring_cap_(ring_cap == 0 ? 1 : ring_cap),
-      ring_bytes_cap_(ring_bytes_cap == 0 ? 1 : ring_bytes_cap), metrics_(metrics) {
+      // Floored, not merely non-zero: below the size of the frame_too_large notice itself
+      // every publish would be "oversized", collapsing the ring to a single frame and
+      // making every resume a gap.
+      ring_bytes_cap_(std::max<std::size_t>(ring_bytes_cap, kMinRingBytesCap)), metrics_(metrics) {
     if (metrics_ != nullptr) {
         // Pay the allocation and the global-registry lock HERE, once, on a path that is
         // allowed to throw — not inside attach/detach, where a throw would strand a sink
@@ -396,10 +399,12 @@ void McpStreamState::detach(const std::shared_ptr<McpStreamSink>& sink) {
         return; // already detached (idempotent — httplib runs the releaser exactly once,
                 // but a caller must not be able to corrupt the accounting by re-running it)
     }
-    // Release the lease OUTSIDE mu_ so the global budget mutex is never nested under a
-    // per-stream one on this path. Each sink owns its own lease, so this returns exactly
-    // the worker THIS provider was pinning. The lease goes home BEFORE the metrics touch —
-    // that ordering is what lets the callers treat a throwing metric as ignorable.
+    // Release the lease outside mu_ on this path — not because the nesting would be unsafe
+    // (attach already establishes mu_ → budget mu_, and StreamBudget never calls back), but
+    // because there is no reason to hold a per-stream lock across a global one. Each sink
+    // owns its own lease, so this returns exactly the worker THIS provider was pinning. The
+    // lease goes home BEFORE the metrics touch — that ordering is what lets every caller
+    // treat a throwing metric as ignorable.
     sink->lease.release();
     if (gauge_streams_active_ != nullptr) {
         gauge_streams_active_->decrement();

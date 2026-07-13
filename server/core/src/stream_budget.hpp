@@ -168,17 +168,25 @@ public:
                 return {Lease{}, kRejectPerPrincipal};
             }
         }
-        // Build the Lease FIRST, then mutate the counters. Every allocating step —
-        // the map node, and the Lease's own by-value copy of `principal` — must happen
-        // BEFORE any counter moves, because a throw after a counter has moved leaks that
-        // slot for the life of the process: a cap that silently tightens every time the
-        // machine is under memory pressure, with no lease in existence to give it back.
-        // Once the lease exists and the map node is reserved, nothing below can throw.
-        Lease lease{this, principal};
+        // Every ALLOCATING step happens before any counter moves; every step after the
+        // first counter moves is noexcept. Get this order wrong in either direction and
+        // you get one of two bugs:
+        //
+        //   * counters first, then allocate — a throw leaks a slot for the life of the
+        //     process (a cap that silently tightens under memory pressure), with no lease
+        //     in existence to give it back;
+        //   * construct the Lease first — a throw from the map insert then unwinds
+        //     ~Lease, which calls release_slot(), which re-locks THIS mutex while we still
+        //     hold it. Self-deadlock on a non-recursive mutex.
+        //
+        // So: make the string copy and reserve the map node (both may throw, nothing has
+        // moved), then move the counters (cannot throw), then hand the already-owned
+        // string to the Lease by move (cannot throw).
+        std::string owner = principal;
         auto [entry, inserted] = per_principal_.try_emplace(principal, held);
         entry->second = held + 1;
         ++total_;
-        return {std::move(lease), nullptr};
+        return {Lease{this, std::move(owner)}, nullptr};
     }
 
     std::size_t active() const {
