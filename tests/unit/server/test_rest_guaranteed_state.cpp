@@ -44,13 +44,6 @@ using namespace yuzu::server;
 
 namespace {
 
-// Delegates to the shared salt + atomic counter helper — the stale
-// `thread::id hash ^ steady_clock::now()` pattern that flaked on Windows
-// MSVC debug + Defender (#473) is now extinct across the test tree (#482).
-fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
-
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -62,19 +55,24 @@ struct AuditRecord {
 struct RestGsHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path db_path;
+    // Each TempDbFile sits ABOVE its store unique_ptr: members destruct in
+    // reverse order, so the store closes its SQLite handle before the backing
+    // file (+ -wal/-shm) is removed. RAII replaces the old manual dtor and
+    // also covers a ctor REQUIRE throwing mid-construction, which previously
+    // leaked all three DBs (#486 / qe-B1).
+    yuzu::test::TempDbFile db_file{"rest-gs-"};
     std::unique_ptr<GuaranteedStateStore> store;
 
     // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
     // endpoint polls; the dispatch stub returns a deterministic command_id so a test
     // can pre-insert the matching response row. live_sent toggles the offline path.
-    fs::path resp_db_path;
+    yuzu::test::TempDbFile resp_db_file{"rest-gs-resp-"};
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
     std::string last_live_plugin, last_live_action;
 
     // BaselineStore for the baseline-anchored per-device status route.
-    fs::path bl_db_path;
+    yuzu::test::TempDbFile bl_db_file{"rest-gs-bl-"};
     std::unique_ptr<BaselineStore> baseline_store;
 
     std::string session_user{"alice"};
@@ -141,20 +139,15 @@ struct RestGsHarness {
     // path. Both default true so every existing test is unchanged.
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
                            bool wire_app_perf = true)
-        : db_path(unique_temp_path("rest-gs")), bl_db_path(unique_temp_path("rest-gs-bl")),
-          wire_live_deps(live_deps) {
-        fs::remove(db_path);
-        fs::remove(bl_db_path);
+        : wire_live_deps(live_deps) {
         // retention=0 keeps the reaper out of the way for ingest tests.
-        store = std::make_unique<GuaranteedStateStore>(db_path, /*retention_days=*/0,
+        store = std::make_unique<GuaranteedStateStore>(db_file.path, /*retention_days=*/0,
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
-        baseline_store = std::make_unique<BaselineStore>(bl_db_path);
+        baseline_store = std::make_unique<BaselineStore>(bl_db_file.path);
         REQUIRE(baseline_store->is_open());
 
-        resp_db_path = unique_temp_path("rest-gs-resp");
-        fs::remove(resp_db_path);
-        resp_store = std::make_unique<ResponseStore>(resp_db_path, /*retention_days=*/0);
+        resp_store = std::make_unique<ResponseStore>(resp_db_file.path, /*retention_days=*/0);
 
         // Deterministic dispatch stub: command_id = "<plugin>-live" so a test can
         // pre-insert the matching response row; live_sent toggles offline (0).
@@ -292,18 +285,6 @@ struct RestGsHarness {
                             /*inventory_scope_fn=*/{}, /*response_scope_fn=*/{}, app_perf_providers_);
     }
 
-    ~RestGsHarness() {
-        store.reset();
-        baseline_store.reset();
-        resp_store.reset();
-        for (const auto& p : {db_path, bl_db_path, resp_db_path}) {
-            fs::remove(p);
-            // sqlite WAL/SHM siblings
-            fs::remove(p.string() + "-wal");
-            fs::remove(p.string() + "-shm");
-        }
-    }
-
     // Seed a Guard rule (name resolves in the route's list_rules() lookup).
     void seed_rule(const std::string& rule_id, const std::string& name) {
         GuaranteedStateRuleRow r;
@@ -340,7 +321,7 @@ struct RestGsHarness {
     void seed_raw_status(const std::string& agent, const std::string& rule_id,
                          const std::string& state, const std::string& ts) {
         sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_open(db_file.path.string().c_str(), &raw) == SQLITE_OK);
         sqlite3_stmt* st = nullptr;
         REQUIRE(sqlite3_prepare_v2(
                     raw,

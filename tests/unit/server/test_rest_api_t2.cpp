@@ -50,14 +50,12 @@ static fs::path unique_temp_path(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
 
-// RAII guard to remove temp files on scope exit
-struct TempFileGuard {
-    fs::path path;
-    explicit TempFileGuard(fs::path p) : path(std::move(p)) {}
-    ~TempFileGuard() {
-        std::error_code ec;
-        fs::remove(path, ec);
-    }
+// RAII guard to remove temp files on scope exit. Thin wrapper over the
+// shared yuzu::test::TempDbFile (adopt-a-path ctor): the stores these tests
+// stand up run journal_mode=WAL, and the old local guard removed only the
+// base file — leaking -wal/-shm companions on an unclean close (#486).
+struct TempFileGuard : yuzu::test::TempDbFile {
+    explicit TempFileGuard(fs::path p) : TempDbFile(std::move(p)) {}
 };
 
 static Execution make_execution(const std::string& definition_id = "def-001",
