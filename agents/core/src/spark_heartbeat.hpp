@@ -17,7 +17,9 @@
 ///   RUNNING   yuzu.spark_running=1, yuzu.spark_mechs=<CSV>, sparse counters
 ///   FAILED    yuzu.spark_running=0                       (enabled, but boot threw)
 ///   DISABLED  yuzu.spark_running=0, yuzu.spark_disabled=1  (--spark-disable)
-///   ABSENT    no yuzu.spark_* key at all       (a pre-rung-1 agent, or a dead one)
+///   ABSENT    no yuzu.spark_* key at all (a pre-rung-1 agent, a dead one, or the
+///             final beats of a gracefully-stopping one — see the stop_requested_
+///             guard in agent.cpp's heartbeat block)
 ///
 /// Before this, FAILED emitted nothing — byte-identical to DISABLED and to ABSENT. A
 /// fleet where spark failed to boot on 30% of endpoints was therefore *unobservable*,

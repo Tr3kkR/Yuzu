@@ -23,7 +23,9 @@
 ///   RUNNING   spark_running=1, spark_mechs=<CSV>, sparse counters
 ///   FAILED    spark_running=0                       (enabled, but boot threw)
 ///   DISABLED  spark_running=0, spark_disabled=1       (--spark-disable)
-///   ABSENT    no yuzu.spark_* key at all   (a pre-rung-1 agent, or a dead one)
+///   ABSENT    no yuzu.spark_* key at all (a pre-rung-1 agent, a dead one, or the
+///             final beats of a gracefully-stopping one — a clean restart must never
+///             be bucketed as FAILED)
 ///
 /// So `--spark-disable` does NOT omit all spark tags — an earlier version of this
 /// comment said it did, and that WAS the behaviour, which is exactly why a fleet-wide
@@ -59,7 +61,8 @@ inline constexpr unsigned long long kMaxPlausibleSparkCount = 1'000'000'000ULL;
 // ── Fixed engine-level keys (at most one of each per reporting agent) ──────────
 /// "1" = engine constructed AND running. "0" = NOT running: either it was disabled
 /// (kSparkTagDisabled also present) or boot-time instantiation threw (it is not).
-/// ABSENT = the agent ships no spark telemetry at all (pre-rung-1, or dead).
+/// ABSENT = the agent ships no spark telemetry at all (pre-rung-1, dead, or
+/// mid-graceful-shutdown).
 /// Those three states must stay distinguishable — see spark_heartbeat.hpp.
 inline constexpr const char* kSparkTagRunning = "yuzu.spark_running";
 /// Present + "1" ONLY under --spark-disable. Its absence alongside running=="0" is

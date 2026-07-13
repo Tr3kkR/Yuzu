@@ -444,6 +444,14 @@ fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches*
 until the reporting agent restarts — the shipped alert templates (disabled until
 rung 2) use `increase(...[15m]) > 0` instead (see `docs/prometheus/yuzu-alerts.yml`).
 
+**Staged-rollout example:** these series only exist for agents that have been
+upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
+2,000-endpoint Linux fleet with 500 agents upgraded,
+`yuzu_fleet_spark_reporting{os="linux"}` reads **500, not 2,000** — the other
+1,500 agents are ABSENT (pre-rung-1), which is expected and is not a failure.
+`_reporting` approaches the enrolled count as the rollout completes; only
+`_failed` indicates something wrong.
+
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_spark_reporting{os}` | gauge | Agents **of that OS** whose latest heartbeat reported the engine running (`spark_running=1`) — the denominator for the engine-level counters |
