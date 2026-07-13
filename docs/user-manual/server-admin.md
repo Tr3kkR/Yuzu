@@ -249,6 +249,36 @@ bearer-token integrations break at once. A boot-time warning names the legacy fi
 removable). Full detail + multi-instance caveat: the `## ⚠️ Breaking` section in
 `docs/user-manual/upgrading.md` and ADR-0030.
 
+### vNEXT — `GET /mcp/v1/` is now a live SSE channel; concurrent-stream caps; explicit HTTP worker pool
+
+Track 2f PR 2. Three things change for an operator:
+
+1. **`GET /mcp/v1/` no longer returns `405`.** It is the session's server→client SSE
+   channel (heartbeats, `Last-Event-ID` resume). Nothing publishes onto it yet —
+   `notifications/progress` arrives in the next rung — so an existing client that never
+   issues a GET is unaffected. If you front the server with a reverse proxy, note that
+   these are held-open responses: the server sets `X-Accel-Buffering: no`, but a proxy
+   that buffers regardless will stall them.
+
+2. **Concurrent MCP SSE streams are now capped** — `--mcp-max-streams` (default 16) and
+   `--mcp-max-streams-per-principal` (default 4). This is not a taste setting: every
+   held-open stream pins one HTTP worker for its entire life, so the global cap is
+   **clamped at boot** to what the worker pool can spare (the startup log prints the
+   effective value). A cap hit rejects the *new* stream with `429` + `retry_after_ms`;
+   a live stream is never evicted. Raise the caps only alongside
+   `--http-worker-threads`.
+
+3. **The HTTP worker pool is now sized explicitly** (`--http-worker-threads`, default
+   auto). The defaults reproduce httplib's previous implicit numbers exactly
+   (`max(8, cores-1)` base, growing to 4x), so behaviour is unchanged unless you set the
+   flag — it exists so the stream budget above can be derived from a number you control
+   rather than one buried in a dependency.
+
+   **Known gap:** the reserve protects the pool from *MCP* streams only. `GET
+   /api/v1/events`, the dashboard execution SSE, and the legacy `/events` stream share
+   the same pool and are still uncapped (issue #2056). If you run many of those, size
+   the pool accordingly.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track

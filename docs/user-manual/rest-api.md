@@ -5927,6 +5927,47 @@ Uninstall a pack, removing all delegated items.
 
 The MCP endpoint enables AI models and automation tools to interact with Yuzu via JSON-RPC 2.0. Authentication is via Bearer token with an MCP tier. See [Authentication > MCP Tokens](authentication.md#mcp-tokens) for token creation details.
 
+#### `GET /mcp/v1/`
+
+The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
+`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
+(`notifications/progress`) arrive with the next 2f rung.
+
+**Permission:** the same credential as `POST /mcp/v1/`, plus the session's
+`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
+ends a *live* stream, not just future ones.
+
+**Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
+**Optional:** `Last-Event-ID` to resume.
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| `200` | SSE stream (`text/event-stream`, chunked, held open) |
+| `400` | `Mcp-Session-Id` absent (`-32600`) |
+| `404` | Session unknown, expired, another principal's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize |
+| `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
+| `405` | Streaming disabled (`--mcp-no-streaming`) |
+| `406` | `Accept` did not include `text/event-stream` (`-32011`) |
+| `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+     -H "Mcp-Session-Id: $SID" \
+     -H "Accept: text/event-stream" \
+     https://yuzu.example.com/mcp/v1/
+```
+
+Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
+`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+
+#### `DELETE /mcp/v1/`
+
+Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
+`404` if the session is unknown or belongs to another principal; `400` if the header is
+absent.
+
 #### `POST /mcp/v1/`
 
 JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
