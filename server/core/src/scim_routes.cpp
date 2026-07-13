@@ -67,6 +67,15 @@ constexpr const char* kScimJson = "application/scim+json";
 // provisioning surface.
 constexpr std::size_t kMaxBodyBytes = 64 * 1024;
 
+// sre-capacity (governance hardening round): every Group mutation fans out a
+// per-member `recompute_scim_user_role` call under the global AuthManager
+// lock (O(N members x |sessions_|) per op, via the session-invalidation
+// sweep in `AuthManager::update_role`/`remove_user`). Bound N so a single
+// pathological IdP-authored Group cannot turn one PUT/PATCH/POST into an
+// unbounded stall. 5000 is generous headroom over any real deployment's
+// admin/role-mapping group size while still bounding the worst case.
+constexpr std::size_t kMaxGroupMembers = 5000;
+
 void send_scim_error(httplib::Response& res, int status, std::string_view detail,
                      std::string_view scim_type = "") {
     res.status = status;
@@ -170,6 +179,16 @@ void bump_role_changed(auth::AuthManager* auth_mgr) {
         return;
     if (auto* m = auth_mgr->metrics_registry())
         m->counter("yuzu_scim_role_changes_total").increment();
+}
+
+/// CC6.7 evidence-gap fix (governance hardening round): bumped when
+/// `recompute_scim_user_role`'s `AuthManager::update_role` call reports a
+/// genuine AuthDB write failure — a durable role change that did not apply.
+void bump_role_change_failure(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_role_change_failures_total").increment();
 }
 
 // ── Audit ────────────────────────────────────────────────────────────────
@@ -352,19 +371,23 @@ std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
     return entry->role;
 }
 
-/// M-DEPROV-ROLE (sec MEDIUM): refuse to deprovision (deactivate/delete) an
-/// account whose CURRENT role is not `user` — an operator who elevated a
-/// SCIM-provisioned account to admin has taken its lifecycle out of SCIM's
-/// read-only ownership model; SCIM only ever tears down what it still
-/// recognises as its own. Checked only while the account is still ACTIVE.
-/// Role is read via `db_authoritative_role` (H2) — the DB row, never the
-/// AuthManager in-memory cache, which can be cold on a freshly-started
-/// process. Returns true iff the deprovision may proceed; FAILS CLOSED
-/// (refuses) if the role cannot be determined at all, not just when it
-/// resolves to something other than `user`. On refusal sends 404 (never
-/// 403 — matches the provenance guard's no-existence-oracle posture) and
-/// reuses `scim.user.provenance_denied` (same "SCIM does not own this
-/// account's lifecycle right now" refusal class).
+/// M-DEPROV-ROLE (sec MEDIUM): a demote-before-delete ORDERING GATE — refuse
+/// to deprovision (deactivate/delete) an account whose CURRENT role is not
+/// `user`, whether that elevation was applied by an operator (manual) or by
+/// `recompute_scim_user_role` (group-derived, Model A: IdP group membership
+/// is authoritative for role). Either way, the account must first be
+/// demoted back to `user` — by an operator, or by the IdP removing it from
+/// the admin group — before SCIM may tear it down; this is a sequencing
+/// requirement, not a permanent carve-out for operator-owned accounts.
+/// Checked only while the account is still ACTIVE. Role is read via
+/// `db_authoritative_role` (H2) — the DB row, never the AuthManager
+/// in-memory cache, which can be cold on a freshly-started process. Returns
+/// true iff the deprovision may proceed; FAILS CLOSED (refuses) if the role
+/// cannot be determined at all, not just when it resolves to something
+/// other than `user`. On refusal sends 404 (never 403 — matches the
+/// provenance guard's no-existence-oracle posture) and reuses
+/// `scim.user.provenance_denied` (same "SCIM does not own this account's
+/// lifecycle right now" refusal class).
 bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
                         const httplib::Request& req, const std::string& username,
                         const std::string& scim_id, httplib::Response& res) {
@@ -462,8 +485,12 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
     // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
     // posture, matching db_authoritative_role's every other caller).
     auto current = db_authoritative_role(auth_mgr, resource->username);
-    if (!current.has_value())
+    if (!current.has_value()) {
+        spdlog::warn("SCIM: recompute_scim_user_role — could not determine the DB-authoritative "
+                    "current role for '{}' (scim_id={}); declining to recompute (fail-closed)",
+                    resource->username, user_scim_id);
         return;
+    }
 
     // Step 5: apply only on an actual change.
     if (resolved == *current)
@@ -473,8 +500,11 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
     std::string new_role_str = auth::role_to_string(resolved);
     if (!auth_mgr->update_role(resource->username, resolved)) {
         spdlog::error("SCIM: recompute_scim_user_role — update_role failed for '{}' "
-                     "(scim_id={}, {} -> {})",
+                     "(scim_id={}, intended {} -> {}); role change did NOT apply",
                      resource->username, user_scim_id, old_role_str, new_role_str);
+        audit(auth_mgr, audit_store, req, "scim.user.role_changed", "failure", user_scim_id,
+             "reason=group old_role=" + old_role_str + " intended_new_role=" + new_role_str);
+        bump_role_change_failure(auth_mgr);
         return;
     }
     spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
@@ -1506,6 +1536,16 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         }
         const auto& input = *parsed;
 
+        // #7 (sre capacity): bound the member count before doing any further
+        // work — see kMaxGroupMembers's doc comment.
+        if (input.member_values.size() > kMaxGroupMembers) {
+            send_scim_error(res, 400, "members exceeds the maximum group size", "invalidValue");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
+                 "member count exceeds cap", "Group");
+            record_request(auth_mgr, "group_create", 400);
+            return;
+        }
+
         // Idempotent-create on displayName — no DB-level UNIQUE (ScimStore's
         // doc comment on get_group_by_display_name); the routes layer owns
         // the 409.
@@ -1688,6 +1728,30 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 }
                 const auto& input = *parsed;
 
+                // #7 (sre capacity): bound the member count before doing any
+                // further work — see kMaxGroupMembers's doc comment.
+                if (input.member_values.size() > kMaxGroupMembers) {
+                    send_scim_error(res, 400, "members exceeds the maximum group size", "invalidValue");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                         "member count exceeds cap", "Group");
+                    record_request(auth_mgr, "group_replace", 400);
+                    return;
+                }
+
+                // #4 (arch-S4/UP-2): a rename onto an existing (possibly
+                // admin) group's displayName is refused — mirrors the
+                // create-time 409 (S1526).
+                if (input.display_name != group->display_name) {
+                    if (auto existing = scim_store->get_group_by_display_name(input.display_name);
+                        existing && existing->scim_id != id) {
+                        send_scim_error(res, 409, "displayName already exists", "uniqueness");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                             "displayName already exists", "Group");
+                        record_request(auth_mgr, "group_replace", 409);
+                        return;
+                    }
+                }
+
                 // Snapshot membership BEFORE the replace so the recompute
                 // below can cover the union of old+new (a PUT replace can
                 // both add and remove members in the same call — spec
@@ -1697,6 +1761,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                 if (!scim_store->update_group(id, input.display_name, input.external_id)) {
                     send_scim_error(res, 500, "failed to update the SCIM group");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                         "Group");
                     record_request(auth_mgr, "group_replace", 500);
                     return;
                 }
@@ -1775,8 +1841,25 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   if (patch.display_name.has_value() || patch.external_id.has_value()) {
                       std::string new_display = patch.display_name.value_or(group->display_name);
                       std::string new_external = patch.external_id.value_or(group->external_id);
+
+                      // #4 (arch-S4/UP-2): a rename onto an existing
+                      // (possibly admin) group's displayName is refused —
+                      // mirrors the create-time 409 and the PUT-replace check.
+                      if (new_display != group->display_name) {
+                          if (auto existing = scim_store->get_group_by_display_name(new_display);
+                              existing && existing->scim_id != id) {
+                              send_scim_error(res, 409, "displayName already exists", "uniqueness");
+                              audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                                   "displayName already exists", "Group");
+                              record_request(auth_mgr, "group_patch", 409);
+                              return;
+                          }
+                      }
+
                       if (!scim_store->update_group(id, new_display, new_external)) {
                           send_scim_error(res, 500, "failed to update the SCIM group");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                               {}, "Group");
                           record_request(auth_mgr, "group_patch", 500);
                           return;
                       }
@@ -1786,6 +1869,33 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   // REMOVED by this PATCH gets a recompute below.
                   std::vector<std::string> affected_added;
                   std::vector<std::string> affected_removed;
+
+                  // #7 (sre capacity): bound the resulting member count
+                  // before mutating anything — see kMaxGroupMembers's doc
+                  // comment.
+                  {
+                      std::size_t resulting_count = 0;
+                      if (patch.replace_members.has_value()) {
+                          resulting_count = patch.replace_members->size();
+                      } else {
+                          std::size_t current_count =
+                              scim_store->list_group_member_user_scim_ids(id).size();
+                          std::size_t remove_count = patch.remove_all_members
+                                                          ? current_count
+                                                          : patch.members_to_remove.size();
+                          std::size_t after_remove =
+                              current_count > remove_count ? current_count - remove_count : 0;
+                          resulting_count = after_remove + patch.members_to_add.size();
+                      }
+                      if (resulting_count > kMaxGroupMembers) {
+                          send_scim_error(res, 400, "members exceeds the maximum group size",
+                                         "invalidValue");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                               "member count exceeds cap", "Group");
+                          record_request(auth_mgr, "group_patch", 400);
+                          return;
+                      }
+                  }
 
                   if (patch.replace_members.has_value()) {
                       // A `replace` on `members` in the same body as

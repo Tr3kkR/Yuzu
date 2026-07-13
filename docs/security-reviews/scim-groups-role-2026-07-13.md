@@ -65,21 +65,35 @@ slice 1, Users, shipped in PR #2018 — see
   carry `principal=scim-service`, `principal_role=scim-service`, and follow
   the existing `success`/`failure`/`denied` result vocabulary (not
   `ok`/`error`).
-- **New metric: `yuzu_scim_role_changes_total`**, pairing with
-  `scim.user.role_changed` audit rows. `yuzu_scim_requests_total{op,status}`
-  now also counts group operations. The existing
+- **New metrics: `yuzu_scim_role_changes_total` and
+  `yuzu_scim_role_change_failures_total`.** `yuzu_scim_role_changes_total`
+  pairs with `scim.user.role_changed` `success` audit rows.
+  `yuzu_scim_role_change_failures_total` is a **hardening-round fix, not
+  part of the original slice**: role changes are now audited on **both**
+  success and failure (`scim.user.role_changed` `success`/`failure`), and
+  the failure case bumps this dedicated metric. **Correction to an earlier
+  overclaim in this document:** the existing
   `yuzu_scim_audit_write_failures_total` CC6.8 evidence-integrity control
-  (alert on any nonzero value) now also covers group-lifecycle and
-  role-change audit writes — no new alert rule is required, the existing one
-  already fires on this failure mode.
-- **Deprovision-ordering decision (deliberate, not a defect).** The existing
-  Users-slice deprovision role-guard refuses to delete/deactivate an account
-  whose `role != "user"` (`404`, no oracle). Because Groups→role mapping can
-  now put a SCIM-provisioned user at `role=admin` through ordinary group
-  membership — not only via a manual dashboard promotion, the only way this
-  could happen before this slice — **a user who is admin via group
-  membership cannot be SCIM-deprovisioned until the IdP first removes them
-  from the admin group**, which demotes them back to `user` and unblocks the
+  does **not** cover this failure mode — it fires when an audit-log *write
+  itself* fails after a mutation already succeeded, which is a different
+  failure class from a role-apply-failure (the recompute decided on a new
+  role but `AuthManager::update_role` did not durably write it). Without
+  `yuzu_scim_role_change_failures_total`, a role-apply failure produced
+  neither a `failure` audit row nor a metric bump — a real evidence gap,
+  now closed by this fix, not by the pre-existing counter.
+  `yuzu_scim_requests_total{op,status}` now also counts group operations.
+- **Deprovision-ordering decision (deliberate, not a defect).** `deprovision_role_ok`
+  (`server/core/src/scim_routes.cpp`) refuses to delete/deactivate an
+  account whose `role != "user"` (`404`, no oracle) — this is a
+  **demote-before-delete ordering gate**, not a guarantee that a
+  dashboard-promoted or group-granted admin stays elevated forever (see
+  Model A below for what actually governs role durability). Because
+  Groups→role mapping can now put a SCIM-provisioned user at `role=admin`
+  through ordinary group membership — not only via a manual dashboard
+  promotion, the only way this could happen before this slice — **a user
+  who is admin via group membership cannot be SCIM-deprovisioned until the
+  IdP first removes them from the admin group**, which demotes them back
+  to `user` via the next `recompute_scim_user_role` call and unblocks the
   next deactivate/delete call. This was evaluated against two alternatives
   (special-casing group-granted admins to bypass the role guard; auto-
   demoting on delete before applying the guard) and both were rejected: both
@@ -93,6 +107,28 @@ slice 1, Users, shipped in PR #2018 — see
   a correctly-configured offboarding flow. Documented as required ordering in
   `docs/user-manual/scim-provisioning.md` "Deprovisioning order matters for
   group-granted admins".
+- **Model A: IdP group membership is authoritative for a SCIM account's
+  role.** A manual (out-of-band) role change on a SCIM-provisioned account
+  is reverted to the group-derived role on the next event that recomputes
+  that user's membership — a Group `POST`/`PUT`/`PATCH`/`DELETE` resolving
+  to that user, or a `User` reprovision — **not** on a plain
+  deactivate/delete (blocked outright by `deprovision_role_ok` before any
+  recompute runs), and **not** on server restart or on changing
+  `--scim-admin-group` itself. Full detail:
+  `docs/auth-architecture.md` "SCIM v2 provisioning" § Groups → role
+  mapping "Model A"; operator guidance:
+  `docs/user-manual/scim-provisioning.md` "Manual role changes to a SCIM
+  account are not durable". A manually-promoted admin who is a member of
+  no SCIM group is the one case this does not reach — see Residual risks
+  below.
+- **`displayName`-keyed matching, exact-case, whitespace-trimmed.**
+  `--scim-admin-group` is matched against a SCIM Group's mutable
+  `displayName` — a byte-exact, case-sensitive comparison
+  (`resolve_role_from_groups`); the config value itself is
+  whitespace-trimmed at load. `POST`/`PUT /scim/v2/Groups` now reject `409`
+  on a `displayName` collision (create) or a rename onto an existing
+  `displayName` (replace), and each Group operation enforces a bounded
+  maximum on `members[]`.
 
 ## Threats considered
 
@@ -143,6 +179,14 @@ slice 1, Users, shipped in PR #2018 — see
   RBAC expansion introduces them; this mirrors the same constraint SAML and
   OIDC group→role mapping already operate under, not a new limitation
   introduced by this slice.
+- **Manually-promoted admin with no SCIM group membership (carried from the
+  Users slice, not new here).** Model A's revert-on-recompute only fires
+  for a user a Group mutation or reprovision actually resolves to. A
+  SCIM-provisioned account manually promoted to `admin` that is a member of
+  *no* SCIM group is never touched by `recompute_scim_user_role`, so the
+  promotion is neither reverted nor is the account SCIM-deprovisionable
+  (`deprovision_role_ok` still blocks it) until an operator demotes it by
+  hand.
 
 ## Storage and code
 

@@ -17,9 +17,15 @@ namespace {
 /// sync if the column list changes.
 ScimResource row_to_resource(sqlite3_stmt* stmt) {
     ScimResource r;
+    // Explicit length, not implicit strlen() via the NUL-terminated char* —
+    // an IdP-supplied username/external_id containing an embedded NUL would
+    // otherwise silently truncate on READ even though the write path now
+    // stores every byte (UP-3, matches the write-side #2018 fix).
     auto text_col = [&](int idx) -> std::string {
         const unsigned char* t = sqlite3_column_text(stmt, idx);
-        return t ? reinterpret_cast<const char*>(t) : "";
+        return t ? std::string(reinterpret_cast<const char*>(t),
+                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, idx)))
+                : std::string();
     };
     r.scim_id = text_col(0);
     r.external_id = text_col(1);
@@ -38,9 +44,15 @@ constexpr const char* kResourceColumns =
 /// keep in sync if the column list changes.
 ScimGroup row_to_group(sqlite3_stmt* stmt) {
     ScimGroup g;
+    // Explicit length, not implicit strlen() via the NUL-terminated char* —
+    // an IdP-supplied display_name/external_id containing an embedded NUL
+    // would otherwise silently truncate on READ even though the write path
+    // now stores every byte (UP-3, matches the write-side #2018 fix).
     auto text_col = [&](int idx) -> std::string {
         const unsigned char* t = sqlite3_column_text(stmt, idx);
-        return t ? reinterpret_cast<const char*>(t) : "";
+        return t ? std::string(reinterpret_cast<const char*>(t),
+                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, idx)))
+                : std::string();
     };
     g.scim_id = text_col(0);
     g.external_id = text_col(1);
@@ -54,6 +66,30 @@ ScimGroup row_to_group(sqlite3_stmt* stmt) {
 
 constexpr const char* kGroupColumns =
     "scim_id, external_id, display_name, active, created_at, updated_at, etag_version";
+
+/// RAII transaction scope guard (safety-S1, governance hardening round):
+/// issues ROLLBACK on destruction unless `commit()` was called first.
+/// Replaces a manual `rollback()`-at-every-early-return lambda, which is
+/// silently skipped if a future edit adds a throwing call between BEGIN
+/// IMMEDIATE and COMMIT — the guard's destructor still runs during stack
+/// unwinding. Construct immediately after a successful `BEGIN IMMEDIATE`;
+/// call `commit()` immediately after a successful `COMMIT`.
+class SqliteTxnGuard {
+public:
+    explicit SqliteTxnGuard(sqlite3* db) : db_(db) {}
+    ~SqliteTxnGuard() {
+        if (!committed_ && db_)
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    }
+    SqliteTxnGuard(const SqliteTxnGuard&) = delete;
+    SqliteTxnGuard& operator=(const SqliteTxnGuard&) = delete;
+
+    void commit() { committed_ = true; }
+
+private:
+    sqlite3* db_;
+    bool committed_ = false;
+};
 
 } // namespace
 
@@ -219,7 +255,10 @@ bool ScimStore::validate_token(const std::string& raw) const {
     bool matched = false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const unsigned char* text = sqlite3_column_text(stmt, 0);
-        std::string candidate = text ? reinterpret_cast<const char*>(text) : "";
+        std::string candidate =
+            text ? std::string(reinterpret_cast<const char*>(text),
+                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
+                : std::string();
         if (candidate.size() == hash.size() &&
             CRYPTO_memcmp(candidate.data(), hash.data(), hash.size()) == 0) {
             matched = true;
@@ -488,7 +527,11 @@ std::optional<ScimGroup> ScimStore::create_group(const std::string& display_name
         // sqlite3_bind_text's strlen() scan (matches create_resource()).
         sqlite3_bind_text(stmt, 2, external_id.c_str(),
                           static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, display_name.c_str(), -1, SQLITE_TRANSIENT);
+    // Explicit length, not -1 — display_name is IdP-supplied and a value
+    // containing an embedded NUL would otherwise silently truncate at
+    // sqlite3_bind_text's strlen() scan (matches external_id above, #2018).
+    sqlite3_bind_text(stmt, 3, display_name.c_str(), static_cast<int>(display_name.size()),
+                      SQLITE_TRANSIENT);
 
     std::optional<ScimGroup> result;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -529,7 +572,11 @@ ScimStore::get_group_by_display_name(const std::string& display_name) const {
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
-    sqlite3_bind_text(stmt, 1, display_name.c_str(), -1, SQLITE_TRANSIENT);
+    // Explicit length, not -1 — display_name is IdP-supplied and a value
+    // containing an embedded NUL would otherwise silently truncate at
+    // sqlite3_bind_text's strlen() scan (matches external_id, #2018).
+    sqlite3_bind_text(stmt, 1, display_name.c_str(), static_cast<int>(display_name.size()),
+                      SQLITE_TRANSIENT);
 
     std::optional<ScimGroup> result;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -614,7 +661,11 @@ bool ScimStore::update_group(const std::string& scim_id, const std::string& disp
         spdlog::error("ScimStore::update_group: prepare failed: {}", sqlite3_errmsg(db_));
         return false;
     }
-    sqlite3_bind_text(stmt, 1, display_name.c_str(), -1, SQLITE_TRANSIENT);
+    // Explicit length, not -1 — display_name is IdP-supplied and a value
+    // containing an embedded NUL would otherwise silently truncate at
+    // sqlite3_bind_text's strlen() scan (matches external_id below, #2018).
+    sqlite3_bind_text(stmt, 1, display_name.c_str(), static_cast<int>(display_name.size()),
+                      SQLITE_TRANSIENT);
     if (external_id.empty())
         sqlite3_bind_null(stmt, 2);
     else
@@ -636,13 +687,12 @@ std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
         spdlog::error("ScimStore::delete_group: BEGIN failed: {}", sqlite3_errmsg(db_));
         return std::nullopt;
     }
-    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
+    SqliteTxnGuard txn(db_);
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM scim_groups WHERE scim_id = ?1 RETURNING scim_id",
                           -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::delete_group: prepare failed: {}", sqlite3_errmsg(db_));
-        rollback();
         return std::nullopt;
     }
     sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -655,7 +705,6 @@ std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
     // (mirrors delete_by_scim_id).
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
         spdlog::error("ScimStore::delete_group: step failed: {}", sqlite3_errmsg(db_));
-        rollback();
         return std::nullopt;
     }
     bool deleted = rc == SQLITE_ROW;
@@ -665,7 +714,6 @@ std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
                           &member_stmt, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::delete_group: member prepare failed: {}",
                      sqlite3_errmsg(db_));
-        rollback();
         return std::nullopt;
     }
     sqlite3_bind_text(member_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -673,15 +721,14 @@ std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
     sqlite3_finalize(member_stmt);
     if (member_rc != SQLITE_DONE) {
         spdlog::error("ScimStore::delete_group: member step failed: {}", sqlite3_errmsg(db_));
-        rollback();
         return std::nullopt;
     }
 
     if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::delete_group: COMMIT failed: {}", sqlite3_errmsg(db_));
-        rollback();
         return std::nullopt;
     }
+    txn.commit();
     return deleted;
 }
 
@@ -696,14 +743,13 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
         spdlog::error("ScimStore::set_group_members: BEGIN failed: {}", sqlite3_errmsg(db_));
         return false;
     }
-    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
+    SqliteTxnGuard txn(db_);
 
     sqlite3_stmt* del_stmt = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
                           &del_stmt, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::set_group_members: delete prepare failed: {}",
                      sqlite3_errmsg(db_));
-        rollback();
         return false;
     }
     sqlite3_bind_text(del_stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -712,7 +758,6 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
     if (del_rc != SQLITE_DONE) {
         spdlog::error("ScimStore::set_group_members: delete step failed: {}",
                      sqlite3_errmsg(db_));
-        rollback();
         return false;
     }
 
@@ -724,7 +769,6 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
                                -1, &ins_stmt, nullptr) != SQLITE_OK) {
             spdlog::error("ScimStore::set_group_members: insert prepare failed: {}",
                          sqlite3_errmsg(db_));
-            rollback();
             return false;
         }
         for (const auto& user_scim_id : user_scim_ids) {
@@ -734,7 +778,6 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
                 spdlog::error("ScimStore::set_group_members: insert step failed: {}",
                              sqlite3_errmsg(db_));
                 sqlite3_finalize(ins_stmt);
-                rollback();
                 return false;
             }
             sqlite3_reset(ins_stmt);
@@ -744,9 +787,9 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
 
     if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("ScimStore::set_group_members: COMMIT failed: {}", sqlite3_errmsg(db_));
-        rollback();
         return false;
     }
+    txn.commit();
     return true;
 }
 
@@ -814,7 +857,11 @@ ScimStore::list_group_member_user_scim_ids(const std::string& group_scim_id) con
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const unsigned char* t = sqlite3_column_text(stmt, 0);
-        results.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+        // Explicit length — see row_to_group's text_col doc comment (UP-3).
+        results.emplace_back(
+            t ? std::string(reinterpret_cast<const char*>(t),
+                            static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
+             : std::string());
     }
     sqlite3_finalize(stmt);
     return results;
@@ -838,7 +885,14 @@ ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) co
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const unsigned char* t = sqlite3_column_text(stmt, 0);
-        results.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+        // Explicit length, not implicit strlen() — this is the read
+        // `resolve_role_from_groups` consumes; a display_name containing an
+        // embedded NUL must not silently truncate to a shorter, possibly
+        // admin-matching, name (UP-3 privilege-escalation vector).
+        results.emplace_back(
+            t ? std::string(reinterpret_cast<const char*>(t),
+                            static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
+             : std::string());
     }
     sqlite3_finalize(stmt);
     return results;

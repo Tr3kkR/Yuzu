@@ -60,6 +60,13 @@ inline constexpr std::string_view kSchemaSchema = "urn:ietf:params:scim:schemas:
 /// is NOT implemented (out of scope for this slice).
 inline constexpr std::size_t kMaxExternalIdLength = 256;
 
+/// Bound on Group `displayName` (sec-L3/UP-9, governance hardening round):
+/// mirrors kMaxExternalIdLength's rationale — IdP-supplied group names are
+/// short human-readable strings; 256 bytes is generous headroom while
+/// refusing an absurdly oversized value on a field stored and echoed back,
+/// never interpreted (beyond the exact-byte --scim-admin-group comparison).
+inline constexpr std::size_t kMaxDisplayNameLen = 256;
+
 /// The `filter.maxResults` this server advertises in ServiceProviderConfig
 /// (S-CLAMP-COUNT). `ScimRoutes`'s GET /Users list handler clamps a
 /// caller-supplied `count` to this same constant so the advertised cap is

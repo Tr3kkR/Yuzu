@@ -150,15 +150,29 @@ and OIDC group→role mapping already work.
 `Group` is now advertised in `/scim/v2/ResourceTypes` and `/scim/v2/Schemas`
 (schema urn `urn:ietf:params:scim:schemas:core:2.0:Group`) alongside `User`.
 
+**Group size is bounded.** Each Group create/replace/patch enforces a
+bounded maximum on `members[]` — a request that would push a group past
+that bound is rejected rather than silently truncated or accepted
+unbounded. If your admin group is very large, split membership pushes
+across multiple `PATCH` calls.
+
 ### Configuration
 
 | Flag | Env var | Description |
 |---|---|---|
-| `--scim-admin-group` | `YUZU_SCIM_ADMIN_GROUP` | The `displayName` of the SCIM group whose members are granted `role=admin`. Default empty — no SCIM group grants admin, and every SCIM-provisioned user stays `role=user`. |
+| `--scim-admin-group` | `YUZU_SCIM_ADMIN_GROUP` | The `displayName` of the SCIM group whose members are granted `role=admin`. Default empty — no SCIM group grants admin, and every SCIM-provisioned user stays `role=user`. The value is whitespace-trimmed at load. |
 
 `--scim-admin-group` mirrors `--saml-admin-group`: set it to the exact
 `displayName` of the group in your IdP that should map to Yuzu admin
-(case-sensitive, exact match — no wildcard/prefix matching).
+(case-sensitive, exact byte match — no wildcard/prefix matching, and no
+leading/trailing whitespace tolerance beyond the trim above).
+
+**Requires a restart to take effect.** `--scim-admin-group` is read once at
+startup; changing it (or renaming the mapped group's `displayName` in the
+IdP) requires updating the flag and restarting the server — there is no
+live-reload or Settings-UI path. A restart alone does not re-evaluate any
+user's membership; see [Recovery and alerting](#recovery-and-alerting)
+below for how to force re-evaluation after a config fix.
 
 ### How role is resolved
 
@@ -182,6 +196,30 @@ account), that member is **never** role-changed. A compromised or
 misconfigured IdP cannot use Group push to elevate, demote, or otherwise
 touch a local principal.
 
+### Manual role changes to a SCIM account are not durable
+
+For a SCIM-provisioned account, IdP group membership — not a manual
+dashboard edit — is the authoritative, durable source of truth for role.
+If you (or another admin) manually change a SCIM-provisioned user's role
+from the dashboard, that change is **reverted back to the group-derived
+role the next time something recomputes that user's membership** — a
+Group `POST`/`PUT`/`PATCH`/`DELETE` that touches this user, or the user
+being reprovisioned (a `POST` reviving a deactivated account). It is
+**not** reverted by a plain deactivate/delete attempt (the deprovision
+guard blocks those against a non-`user` account before any recompute runs
+— see [Deprovisioning order matters for group-granted admins](#deprovisioning-order-matters-for-group-granted-admins)
+below), and it is **not** reverted by a server restart or by changing
+`--scim-admin-group` itself — both require a subsequent Group mutation to
+actually re-evaluate membership.
+
+**One residual case:** if you manually promote a SCIM-provisioned user to
+`admin` and that user is not a member of *any* SCIM group, there is no
+membership-recompute event that will ever touch them, so the manual
+promotion is neither reverted nor is the account SCIM-deprovisionable
+(the deprovision guard still blocks it) — an operator must demote it by
+hand. This is a pre-existing residual carried over from the Users slice,
+not new in Groups → role mapping.
+
 ### Deprovisioning order matters for group-granted admins
 
 The SCIM deprovision role-guard refuses to delete or deactivate an account
@@ -197,6 +235,37 @@ group) as part of unassigning the app, before or as part of deactivating
 the user. As long as your offboarding flow follows that normal order —
 remove from groups, then deactivate/delete — deprovisioning a group-granted
 admin behaves exactly like deprovisioning any other SCIM user.
+
+### Recovery and alerting
+
+Deploy these alert rules alongside SCIM Groups → role mapping:
+
+- **`yuzu_scim_role_change_failures_total > 0`** — a role change was decided
+  but did not durably apply (an AuthDB write failure during
+  `recompute_scim_user_role`). Investigate immediately; the account is
+  running with a role that does not match its IdP group membership until
+  fixed.
+- **A spike in `rate(yuzu_scim_role_changes_total[5m])`** — a sudden burst
+  of role changes is the signature of an IdP-side misconfiguration or
+  accidental mass group edit (e.g. someone attached the wrong group to the
+  Yuzu app, or bulk-edited the admin group's membership), not routine
+  churn. Alert on a rate threshold well above your organization's normal
+  onboarding/offboarding cadence.
+- **`yuzu_scim_audit_write_failures_total`** — the existing CC6.8
+  evidence-integrity alert; it also covers a lost audit row for a group
+  create/update/delete or role-change event (the SCIM call and the role
+  change themselves still succeeded — only the evidence row is missing).
+
+**Remediation for a misconfigured `--scim-admin-group`:** fix the flag
+value and restart the server (see [Configuration](#configuration) above —
+this flag is not live-reloadable). **A restart alone does not fix already
+wrong roles** — it only changes which group name new recomputes will
+check against; any user whose role drifted under the old value stays
+drifted until a recompute actually runs for them. To force re-evaluation
+of every member's role after correcting the flag, re-`PATCH` the affected
+group(s) (even a no-op add/remove of an already-current member triggers
+`recompute_scim_user_role` for every affected user) rather than waiting for
+the IdP's next natural sync.
 
 ### Example: Okta/Entra Group push
 
@@ -269,11 +338,16 @@ has the same effect:
 whether that admin role came from a dashboard promotion or from
 [Groups → role mapping](#groups--role-mapping) — that account drops out of
 SCIM's reach until it is back to `role=user`, and an IdP-side deactivate/
-delete call against it is refused in the meantime. This is deliberate for a
-dashboard promotion (a SCIM push should never be able to remove access from
-someone your own team has since elevated); for a group-granted admin, see
+delete call against it is refused in the meantime. This is a
+**demote-before-delete ordering gate**, not a guarantee that a manual
+promotion is permanently protected: SCIM simply must never be able to
+deprovision a non-`user` account without an explicit, auditable demotion
+happening first. For a group-granted admin, see
 [Deprovisioning order matters for group-granted admins](#deprovisioning-order-matters-for-group-granted-admins)
-above for the expected offboarding order.
+above for the expected offboarding order; for a manually-promoted account,
+see [Manual role changes to a SCIM account are not durable](#manual-role-changes-to-a-scim-account-are-not-durable)
+above — a manual promotion is not otherwise durable, but demotion is still
+a required, explicit step before SCIM can deprovision the account.
 
 If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is

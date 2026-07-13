@@ -39,6 +39,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -682,6 +683,71 @@ TEST_CASE("ScimRoutes: concurrent duplicate POST for a brand-new userName — ex
     auto page = f.scim_store->list(1, 100, total);
     CHECK(total == 1);
     CHECK(f.auth_mgr.get_user_role("race-user").has_value());
+}
+
+// ── Groups: concurrency (safety-S2) ─────────────────────────────────────
+
+TEST_CASE("ScimRoutes: concurrent Group PATCH-promote + User DELETE on the same SCIM user — no "
+         "crash, no torn state",
+         "[scim][routes][groups][race]") {
+    // Not a provenance-guard test (that's covered elsewhere — a group can
+    // only ever elevate a SCIM-provenanced account in the first place) —
+    // this purely proves the two mutations racing on the same user_scim_id
+    // never crash and never leave a torn/inconsistent final state,
+    // regardless of which one "wins" the race.
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "victor"}})->body);
+    auto user_id = user["id"].get<std::string>();
+
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}})->body);
+    auto group_id = group["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+
+    std::atomic<bool> saw_unexpected{false};
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] {
+        auto res = f.patch("/scim/v2/Groups/" + group_id, add_body);
+        if (!res || (res->status != 200 && res->status != 404))
+            saw_unexpected.store(true);
+    });
+    threads.emplace_back([&] {
+        auto res = f.del("/scim/v2/Users/" + user_id);
+        if (!res || (res->status != 204 && res->status != 404))
+            saw_unexpected.store(true);
+    });
+    for (auto& t : threads)
+        t.join();
+
+    // Both requests completed with an expected status (the mere fact we
+    // got here at all rules out a crash/deadlock/hang).
+    CHECK_FALSE(saw_unexpected.load());
+
+    // Consistent final state, whichever order the race resolved in: if the
+    // user still exists (DELETE lost the race, or PATCH ran first and left
+    // the account admin-elevated so DELETE 404'd via M-DEPROV-ROLE), its
+    // AuthDB role must match what its CURRENT group membership resolves to
+    // — never a stale/mismatched role.
+    //
+    // NOTE: if the user is gone instead, `scim_group_members` can still
+    // carry a row referencing the now-deleted user_scim_id — DELETE /Users
+    // (ScimStore::delete_by_scim_id) never cleans up group membership rows.
+    // That's pre-existing behavior unrelated to this race (recompute_scim_
+    // user_role's get_by_scim_id provenance check makes a ghost member
+    // inert — it can never again drive a role change), so this test does
+    // not assert on it; the orphaned row itself is a separate hygiene gap,
+    // not a race-specific correctness bug.
+    auto still_there = f.scim_store->get_by_scim_id(user_id);
+    if (still_there.has_value()) {
+        auto groups = f.scim_store->list_group_display_names_for_user(user_id);
+        auto expected = auth::resolve_role_from_groups(groups, "Yuzu-Admins");
+        auto actual = f.auth_mgr.get_user_role("victor");
+        REQUIRE(actual.has_value());
+        CHECK(*actual == expected);
+    }
 }
 
 // ── M-DEPROV-ROLE ────────────────────────────────────────────────────────
@@ -1822,6 +1888,376 @@ TEST_CASE("Groups integration: --scim-admin-group unset (empty) — group member
     REQUIRE(patch_res);
     CHECK(patch_res->status == 200);
     CHECK(ts.auth_mgr.get_user_role("ivy").value() == auth::Role::user);
+}
+
+TEST_CASE("Groups integration: DELETE demotes every member and audits the demotion (qa-4)",
+          "[scim][routes][integration][groups][delete]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "quinn");
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto promote_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                                 "application/scim+json");
+    REQUIRE(promote_res);
+    REQUIRE(promote_res->status == 200);
+    REQUIRE(ts.auth_mgr.get_user_role("quinn").value() == auth::Role::admin);
+
+    auto del = cli.Delete(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(del);
+    CHECK(del->status == 204);
+
+    // The member is demoted back to 'user' as soon as its only admin-
+    // granting group disappears (recompute_scim_user_role runs over the
+    // pre-delete membership snapshot).
+    CHECK(ts.auth_mgr.get_user_role("quinn").value() == auth::Role::user);
+
+    // A durable scim.user.role_changed=success audit row exists for the
+    // demotion, keyed on the user's scim_id (not the group's).
+    AuditQuery q;
+    q.action = "scim.user.role_changed";
+    q.target_id = user_id;
+    auto rows = ts.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    bool found_demotion = false;
+    for (const auto& row : rows) {
+        if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
+            found_demotion = true;
+    }
+    CHECK(found_demotion);
+
+    // The group itself is gone.
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    CHECK(get_res->status == 404);
+}
+
+TEST_CASE("Groups integration: PUT full-replace — dropped member demoted, added member promoted "
+          "(qa-5)",
+          "[scim][routes][integration][groups][put]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto old_member = create_scim_user_over_wire(cli, ts.token, "rex");
+    auto new_member = create_scim_user_over_wire(cli, ts.token, "sara");
+
+    auto group_post =
+        cli.Post("/scim/v2/Groups", hdr,
+                 json{{"displayName", "Yuzu-Admins"},
+                      {"members", json::array({{{"value", old_member}}})}}
+                     .dump(),
+                 "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("rex").value() == auth::Role::admin);
+    REQUIRE(ts.auth_mgr.get_user_role("sara").value() == auth::Role::user);
+
+    // Full replace: drop rex, add sara.
+    json put_body{{"displayName", "Yuzu-Admins"},
+                  {"members", json::array({{{"value", new_member}}})}};
+    auto put_res = cli.Put(("/scim/v2/Groups/" + group_id).c_str(), hdr, put_body.dump(),
+                           "application/scim+json");
+    REQUIRE(put_res);
+    CHECK(put_res->status == 200);
+
+    CHECK(ts.auth_mgr.get_user_role("rex").value() == auth::Role::user);
+    CHECK(ts.auth_mgr.get_user_role("sara").value() == auth::Role::admin);
+
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    auto members = json::parse(get_res->body)["members"];
+    REQUIRE(members.size() == 1);
+    CHECK(members[0]["value"] == new_member);
+}
+
+TEST_CASE("Groups integration: PATCH with both replace and add/remove ops — replace wins "
+          "(qa-6)",
+          "[scim][routes][integration][groups][patch-precedence]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto replace_member = create_scim_user_over_wire(cli, ts.token, "tina");
+    auto add_member = create_scim_user_over_wire(cli, ts.token, "uma");
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    // A single PATCH body mixing an `add` op with a `replace` op on members
+    // — parse_group_patch documents "last replace in the body wins" and the
+    // routes layer applies `replace_members` exclusively when present
+    // (ignoring the accumulated add/remove lists). Only replace_member
+    // should end up a member.
+    json mixed_body{
+        {"Operations",
+         json::array(
+             {{{"op", "add"},
+              {"path", "members"},
+              {"value", json::array({{{"value", add_member}}})}},
+             {{"op", "replace"},
+              {"path", "members"},
+              {"value", json::array({{{"value", replace_member}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, mixed_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    auto members = json::parse(get_res->body)["members"];
+    REQUIRE(members.size() == 1);
+    CHECK(members[0]["value"] == replace_member);
+    CHECK(ts.auth_mgr.get_user_role("tina").value() == auth::Role::admin);
+    CHECK(ts.auth_mgr.get_user_role("uma").value() == auth::Role::user);
+}
+
+TEST_CASE("Groups integration: PUT rename onto an existing group's displayName 409s, B unchanged "
+          "(arch-S4/UP-2)",
+          "[scim][routes][integration][groups][rename-409]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto a_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Group-A"})",
+                           "application/scim+json");
+    REQUIRE(a_post);
+    REQUIRE(a_post->status == 201);
+
+    auto b_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Group-B"})",
+                           "application/scim+json");
+    REQUIRE(b_post);
+    REQUIRE(b_post->status == 201);
+    auto b_id = json::parse(b_post->body)["id"].get<std::string>();
+    auto b_etag = json::parse(b_post->body)["meta"]["version"].get<std::string>();
+
+    auto put_res = cli.Put(("/scim/v2/Groups/" + b_id).c_str(), hdr,
+                           R"({"displayName":"Group-A"})", "application/scim+json");
+    REQUIRE(put_res);
+    CHECK(put_res->status == 409);
+
+    AuditQuery q;
+    q.action = "scim.group.updated";
+    q.target_id = b_id;
+    auto rows = ts.audit_store->query(q);
+    bool found_denied = false;
+    for (const auto& row : rows)
+        if (row.result == "denied")
+            found_denied = true;
+    CHECK(found_denied);
+
+    auto get_res = cli.Get(("/scim/v2/Groups/" + b_id).c_str(), hdr);
+    REQUIRE(get_res);
+    auto body = json::parse(get_res->body);
+    CHECK(body["displayName"] == "Group-B");
+    CHECK(body["meta"]["version"] == b_etag);
+}
+
+TEST_CASE("Groups integration: PATCH rename onto an existing group's displayName 409s, B "
+          "unchanged (arch-S4/UP-2)",
+          "[scim][routes][integration][groups][rename-409]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto a_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Group-C"})",
+                           "application/scim+json");
+    REQUIRE(a_post);
+    REQUIRE(a_post->status == 201);
+
+    auto b_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Group-D"})",
+                           "application/scim+json");
+    REQUIRE(b_post);
+    REQUIRE(b_post->status == 201);
+    auto b_id = json::parse(b_post->body)["id"].get<std::string>();
+
+    json patch_body{
+        {"Operations",
+         json::array({{{"op", "replace"}, {"path", "displayName"}, {"value", "Group-C"}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + b_id).c_str(), hdr, patch_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 409);
+
+    AuditQuery q;
+    q.action = "scim.group.updated";
+    q.target_id = b_id;
+    auto rows = ts.audit_store->query(q);
+    bool found_denied = false;
+    for (const auto& row : rows)
+        if (row.result == "denied")
+            found_denied = true;
+    CHECK(found_denied);
+
+    auto get_res = cli.Get(("/scim/v2/Groups/" + b_id).c_str(), hdr);
+    REQUIRE(get_res);
+    CHECK(json::parse(get_res->body)["displayName"] == "Group-D");
+}
+
+TEST_CASE("Groups integration: an embedded-NUL displayName is never truncated to the configured "
+         "admin group — no spurious promotion (UP-3)",
+         "[scim][routes][integration][groups][embedded-nul]") {
+    // "Admins\0decoy" — read-side truncation (the bug this guards) would
+    // silently turn this into the literal string "Admins", exactly
+    // matching --scim-admin-group and promoting the member to admin. The
+    // fixed read path returns the full 12 bytes, which != "Admins", so
+    // resolve_role_from_groups must not match.
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "walt");
+
+    std::string nul_name = std::string("Admins") + std::string(1, '\0') + std::string("decoy");
+    REQUIRE(nul_name.size() == 12);
+
+    json group_body{{"displayName", nul_name},
+                    {"members", json::array({{{"value", user_id}}})}};
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, group_body.dump(), "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    // No spurious promotion — the group's real name is NOT "Admins".
+    CHECK(ts.auth_mgr.get_user_role("walt").value() == auth::Role::user);
+
+    // The stored/returned displayName is the full 12 bytes, not truncated.
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    auto returned_name = json::parse(get_res->body)["displayName"].get<std::string>();
+    CHECK(returned_name.size() == 12);
+    CHECK(returned_name == nul_name);
+
+    // Control: a group actually named exactly "Admins" (no embedded NUL)
+    // DOES promote — confirms the guard above is about truncation, not
+    // about the admin-group feature being broken outright.
+    auto plain_group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Admins"})",
+                                     "application/scim+json");
+    REQUIRE(plain_group_post);
+    REQUIRE(plain_group_post->status == 201);
+    auto plain_group_id = json::parse(plain_group_post->body)["id"].get<std::string>();
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + plain_group_id).c_str(), hdr,
+                               add_body.dump(), "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+    CHECK(ts.auth_mgr.get_user_role("walt").value() == auth::Role::admin);
+}
+
+TEST_CASE("Groups integration: sec-L3 caps over HTTP — oversized displayName on POST and PATCH "
+          "400s",
+          "[scim][routes][integration][groups][caps]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    std::string oversized(scim::kMaxDisplayNameLen + 1, 'x');
+
+    auto post_res = cli.Post("/scim/v2/Groups", hdr,
+                             json{{"displayName", oversized}}.dump(), "application/scim+json");
+    REQUIRE(post_res);
+    CHECK(post_res->status == 400);
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"CapsGroup"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json patch_body{
+        {"Operations",
+         json::array({{{"op", "replace"}, {"path", "displayName"}, {"value", oversized}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, patch_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 400);
+
+    // Unchanged.
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    CHECK(json::parse(get_res->body)["displayName"] == "CapsGroup");
+}
+
+TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 400s + denied",
+          "[scim][routes][integration][groups][caps][members]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    // The cap check runs BEFORE any per-member resolution, so a synthetic
+    // list of ids that never resolve to real SCIM Users is sufficient —
+    // this proves the guard, not membership resolution semantics. Bare
+    // single-char string entries (parse_group tolerates the plain-string
+    // members shape) keep the body well under kMaxBodyBytes (64 KiB) even
+    // at 5001 entries — a `{"value":...}` object shape per entry would blow
+    // that budget first and mask the member-count guard behind a 413.
+    json members = json::array();
+    for (std::size_t i = 0; i < 5001; ++i)
+        members.push_back("x");
+
+    auto post_res =
+        cli.Post("/scim/v2/Groups", hdr,
+                 json{{"displayName", "HugeGroup"}, {"members", members}}.dump(),
+                 "application/scim+json");
+    REQUIRE(post_res);
+    CHECK(post_res->status == 400);
+
+    AuditQuery q;
+    q.action = "scim.group.created";
+    auto rows = ts.audit_store->query(q);
+    bool found_denied = false;
+    for (const auto& row : rows)
+        if (row.result == "denied" && row.detail.find("member count exceeds cap") != std::string::npos)
+            found_denied = true;
+    CHECK(found_denied);
+
+    // The group was never created.
+    auto by_name =
+        cli.Get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22HugeGroup%22)", hdr);
+    REQUIRE(by_name);
+    CHECK(json::parse(by_name->body)["totalResults"] == 0);
 }
 
 #endif // YUZU_SCIM_TSAN_BUILD

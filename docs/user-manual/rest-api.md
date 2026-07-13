@@ -5769,11 +5769,13 @@ Discovery — static capability document (patch/filter/bulk support flags).
 
 #### `GET /scim/v2/ResourceTypes`
 
-Discovery — a SCIM `ListResponse` describing the `User` resource type.
+Discovery — a SCIM `ListResponse` describing the User and Group resource
+types.
 
 #### `GET /scim/v2/Schemas`
 
-Discovery — a SCIM `ListResponse` describing the core `User` schema.
+Discovery — a SCIM `ListResponse` describing the core User and Group
+schemas.
 
 #### `POST /scim/v2/Users`
 
@@ -5907,8 +5909,9 @@ rejected `400` (`scim_type=invalidFilter`).
 
 #### `PUT /scim/v2/Groups/{id}`
 
-Replace a group (`displayName`, `members[]`). `200` + Group representation,
-or `404` if unknown.
+Replace a group (`displayName`, `members[]`). `200` + Group representation;
+`404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
+onto a `displayName` already used by a different group.
 
 #### `PATCH /scim/v2/Groups/{id}`
 
@@ -5938,8 +5941,8 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
-| `scim.group.created` | `success` / `failure` | `POST /scim/v2/Groups` succeeds / rolls back `500` |
-| `scim.group.updated` | `success` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / fails `500` |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision / rolls back `500` |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 
@@ -5947,7 +5950,10 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 
 `yuzu_scim_requests_total{op,status}` (now including group ops),
 `yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
-`yuzu_scim_provenance_denied_total`, `yuzu_scim_role_changes_total`.
+`yuzu_scim_provenance_denied_total`, `yuzu_scim_role_changes_total`,
+`yuzu_scim_role_change_failures_total` (a role change that was decided but
+failed to durably apply — pairs with `scim.user.role_changed` `failure`
+rows).
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics.
 

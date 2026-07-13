@@ -17,9 +17,12 @@
 
 #include <yuzu/server/scim_store.hpp>
 
+#include "migration_runner.hpp"
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <fstream>
@@ -71,6 +74,111 @@ TEST_CASE("ScimStore: migration to v2 creates scim_groups and scim_group_members
     auto members = f.store.list_group_member_user_scim_ids(created->scim_id);
     REQUIRE(members.size() == 1);
     CHECK(members[0] == "user-1");
+}
+
+namespace {
+
+bool table_exists(sqlite3* db, const char* table) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
+                          -1, &stmt, nullptr) != SQLITE_OK)
+        return false;
+    sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+} // namespace
+
+// qa-8: migration v1 -> v2 from a genuinely pre-existing v1 database (not a
+// freshly-created-at-v2 store, unlike the test above). Duplicates the v1-
+// only migration SQL (mirrors scim_store.cpp's kScimMigrations[0] — kept in
+// sync manually, same pattern as test_auth_sso_identity.cpp's kV1ToV5)
+// so a raw connection can be pinned at exactly v1 before ScimStore ever
+// touches the file.
+const std::vector<Migration> kScimV1Only = {
+    {1, R"(
+        CREATE TABLE IF NOT EXISTS scim_resources (
+            scim_id TEXT PRIMARY KEY,
+            external_id TEXT,
+            username TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            etag_version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_scim_resources_external_id
+            ON scim_resources(external_id);
+
+        CREATE TABLE IF NOT EXISTS scim_tokens (
+            id INTEGER PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            label TEXT,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_scim_tokens_active
+            ON scim_tokens(revoked_at) WHERE revoked_at IS NULL;
+    )"},
+};
+
+TEST_CASE("ScimStore: migration v1 -> v2 from an existing v1 db preserves scim_resources rows "
+         "(qa-8)",
+         "[scim][group][migration]") {
+    yuzu::test::TempDbFile db_file{std::string_view{"yuzu-scim-group-migration-"}};
+
+    // Build a genuine pre-#2021 (v1) scim schema and seed a scim_resources
+    // row, entirely via a raw connection — ScimStore never touches the file
+    // at this point. Inner scope: close the raw handle before ScimStore
+    // reopens the SAME file (Windows can't open a file another handle still
+    // holds — same rationale as test_auth_sso_identity.cpp's migration
+    // test).
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2(db_file.path.string().c_str(), &raw,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(MigrationRunner::run(raw, "scim", kScimV1Only));
+        REQUIRE(MigrationRunner::current_version(raw, "scim") == 1);
+        CHECK_FALSE(table_exists(raw, "scim_groups"));
+        CHECK_FALSE(table_exists(raw, "scim_group_members"));
+
+        char* err = nullptr;
+        int rc = sqlite3_exec(raw,
+                              "INSERT INTO scim_resources (scim_id, external_id, username, "
+                              "active, created_at, updated_at, etag_version) VALUES "
+                              "('res1', '', 'legacyuser', 1, '2026-01-01', '2026-01-01', 1)",
+                              nullptr, nullptr, &err);
+        REQUIRE(rc == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    // Open via the production path — this applies ONLY v2 (current==1).
+    ScimStore store(db_file.path);
+    REQUIRE(store.is_open());
+
+    // The pre-existing scim_resources row survived the migration untouched.
+    auto legacy = store.get_by_username("legacyuser");
+    REQUIRE(legacy.has_value());
+    CHECK(legacy->scim_id == "res1");
+
+    // The new Groups tables now exist and are fully functional.
+    {
+        sqlite3* ro = nullptr;
+        REQUIRE(sqlite3_open_v2(db_file.path.string().c_str(), &ro, SQLITE_OPEN_READONLY,
+                                nullptr) == SQLITE_OK);
+        CHECK(table_exists(ro, "scim_groups"));
+        CHECK(table_exists(ro, "scim_group_members"));
+        sqlite3_close(ro);
+    }
+
+    auto created = store.create_group("Engineering");
+    REQUIRE(created.has_value());
+    CHECK(store.add_group_member(created->scim_id, legacy->scim_id));
+    auto members = store.list_group_member_user_scim_ids(created->scim_id);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == legacy->scim_id);
 }
 
 // ── Group CRUD ────────────────────────────────────────────────────────────
@@ -297,4 +405,121 @@ TEST_CASE("ScimStore: list_group_display_names_for_user spans multiple groups",
 
     auto none = f.store.list_group_display_names_for_user("user-none");
     CHECK(none.empty());
+}
+
+// UP-3: embedded-NUL displayName round-trips at full byte length, not
+// truncated to the substring before the NUL. This is the store-level guard
+// for the fix in row_to_group's/list_group_display_names_for_user's
+// text_col construction (explicit-length std::string, not an implicit
+// strlen() via a NUL-terminated char*) — a truncating read would silently
+// turn "Admins\0decoy" into "Admins" for role-resolution purposes, a
+// privilege-escalation vector via a crafted SCIM group name.
+TEST_CASE("ScimStore: embedded-NUL displayName round-trips at full length, not truncated (UP-3)",
+         "[scim][group][embedded_nul]") {
+    ScimFixture f;
+    std::string name = std::string("Admins") + std::string(1, '\0') + std::string("decoy");
+    REQUIRE(name.size() == 12);
+
+    auto created = f.store.create_group(name);
+    REQUIRE(created.has_value());
+    CHECK(created->display_name.size() == 12);
+    CHECK(created->display_name == name);
+
+    auto by_id = f.store.get_group_by_id(created->scim_id);
+    REQUIRE(by_id.has_value());
+    CHECK(by_id->display_name.size() == 12);
+    CHECK(by_id->display_name == name);
+    CHECK(by_id->display_name != "Admins");
+
+    REQUIRE(f.store.add_group_member(created->scim_id, "nul-user"));
+    auto names = f.store.list_group_display_names_for_user("nul-user");
+    REQUIRE(names.size() == 1);
+    CHECK(names[0].size() == 12);
+    CHECK(names[0] == name);
+    CHECK(names[0] != "Admins");
+}
+
+// ── Transaction safety (safety-S2, SqliteTxnGuard rollback) ────────────────
+//
+// Both tests below install a `RAISE(ABORT, ...)` trigger via a second raw
+// connection to force a genuine step-time failure partway through a
+// multi-statement transaction, then confirm SqliteTxnGuard's destructor-time
+// ROLLBACK undid EVERY statement in that transaction — not just the one
+// that failed — so no partial/torn state is ever observable by a caller
+// that only sees the false/nullopt return.
+
+TEST_CASE("ScimStore: set_group_members rolls back fully on a mid-transaction failure "
+         "(safety-S2)",
+         "[scim][group][transaction]") {
+    ScimFixture f;
+    auto grp = f.store.create_group("Team");
+    REQUIRE(grp.has_value());
+    REQUIRE(f.store.set_group_members(grp->scim_id, {"old-a", "old-b"}));
+
+    // Poison a specific member id so the INSERT loop fails partway through
+    // (after "new-1" has already been inserted, before "new-2").
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2(f.db_file.path.string().c_str(), &raw, SQLITE_OPEN_READWRITE,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw,
+                            "CREATE TRIGGER poison_insert BEFORE INSERT ON scim_group_members "
+                            "WHEN NEW.user_scim_id = 'POISON' "
+                            "BEGIN SELECT RAISE(ABORT, 'induced failure'); END;",
+                            nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    CHECK_FALSE(f.store.set_group_members(grp->scim_id, {"new-1", "POISON", "new-2"}));
+
+    // The pre-existing membership (old-a, old-b) is UNCHANGED — the
+    // clearing DELETE that ran earlier in the SAME transaction was also
+    // rolled back, not just the failed INSERT. A half-applied outcome
+    // (e.g. just "new-1" persisted, or an empty set) would be the bug this
+    // test guards against.
+    auto members = f.store.list_group_member_user_scim_ids(grp->scim_id);
+    std::sort(members.begin(), members.end());
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "old-a");
+    CHECK(members[1] == "old-b");
+}
+
+TEST_CASE("ScimStore: delete_group rolls back fully on a mid-transaction failure (safety-S2)",
+         "[scim][group][transaction]") {
+    ScimFixture f;
+    auto grp = f.store.create_group("Doomed");
+    REQUIRE(grp.has_value());
+    REQUIRE(f.store.set_group_members(grp->scim_id, {"POISON", "member-b"}));
+
+    // delete_group deletes the scim_groups row FIRST, then the
+    // scim_group_members rows — poison the member-delete step so the
+    // scim_groups deletion (which already ran, in the same transaction)
+    // must also be undone.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2(f.db_file.path.string().c_str(), &raw, SQLITE_OPEN_READWRITE,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw,
+                            "CREATE TRIGGER poison_member_delete BEFORE DELETE ON "
+                            "scim_group_members WHEN OLD.user_scim_id = 'POISON' "
+                            "BEGIN SELECT RAISE(ABORT, 'induced failure'); END;",
+                            nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    auto result = f.store.delete_group(grp->scim_id);
+    REQUIRE_FALSE(result.has_value());
+
+    // The group row is STILL THERE — the earlier `DELETE FROM scim_groups`
+    // in the same transaction was rolled back too, not left applied
+    // alongside the failed membership cleanup.
+    auto still_there = f.store.get_group_by_id(grp->scim_id);
+    REQUIRE(still_there.has_value());
+    CHECK(still_there->display_name == "Doomed");
+
+    auto members = f.store.list_group_member_user_scim_ids(grp->scim_id);
+    std::sort(members.begin(), members.end());
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "POISON");
+    CHECK(members[1] == "member-b");
 }

@@ -809,6 +809,16 @@ public:
                           "role-recompute core — a sustained rate is a normal signal of IdP "
                           "group-membership churn, not itself an anomaly",
                           "counter");
+        // CC6.7 evidence-gap fix (governance hardening round): bumped when
+        // recompute_scim_user_role's AuthManager::update_role call reports a
+        // genuine AuthDB write failure (row missing/inactive/write error) —
+        // a durable role change that could not be applied, distinct from
+        // yuzu_scim_role_changes_total's success path.
+        metrics_.describe("yuzu_scim_role_change_failures_total",
+                          "Total SCIM-driven role changes that failed to write to AuthDB during "
+                          "group-membership recompute - a sustained non-zero rate means role "
+                          "changes are silently not taking effect",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -10264,6 +10274,15 @@ private:
         // entries at all. main.cpp already refuses to start if --scim-enable is
         // set without --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
+            // sec-L3/UP-9 (governance hardening round): trim leading/trailing
+            // ASCII whitespace from the admin-group config value — same
+            // trailing-space silent-lockout bug fixed for
+            // --oidc-admin-group/--saml-admin-group above. Mutate cfg_
+            // itself so every reader of cfg_.scim_admin_group (the routes
+            // registration below, recompute_scim_user_role) sees the
+            // trimmed value.
+            cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
+
             scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
             if (!scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,

@@ -1065,7 +1065,7 @@ account at the fixed, floor-privilege `user` role; slice 2 (this section's
 |---|---|---|
 | `--scim-enable` | `YUZU_SCIM_ENABLE` | Enable the `/scim/v2/*` route surface. Default `false` — SCIM is entirely inert when disabled (no routes registered, no boot-log line). |
 | `--scim-token` | `YUZU_SCIM_TOKEN` | The bearer credential the IdP's SCIM connector authenticates with. Secret — treat like a password. |
-| `--scim-admin-group` | `YUZU_SCIM_ADMIN_GROUP` | `displayName` of the SCIM group whose members are granted `role=admin`. Default empty — no SCIM group grants admin; every SCIM-provisioned user stays `role=user`. Mirrors `--saml-admin-group`. |
+| `--scim-admin-group` | `YUZU_SCIM_ADMIN_GROUP` | `displayName` of the SCIM group whose members are granted `role=admin`. Default empty — no SCIM group grants admin; every SCIM-provisioned user stays `role=user`. The value is whitespace-trimmed at load. Mirrors `--saml-admin-group`. **Requires a server restart to take effect** — there is no Settings-UI/live-reload path; renaming the group's `displayName` in the IdP likewise requires updating this flag and restarting. |
 
 **Prefer `YUZU_SCIM_TOKEN` over `--scim-token`.** A value passed on argv is
 visible to any local user via `ps`/`/proc/<pid>/cmdline`; the environment
@@ -1115,8 +1115,8 @@ concurrency-control token.
 | Endpoint | Purpose |
 |---|---|
 | `GET /scim/v2/ServiceProviderConfig` | Discovery — capability document |
-| `GET /scim/v2/ResourceTypes` | Discovery — describes the User resource type |
-| `GET /scim/v2/Schemas` | Discovery — the core User schema |
+| `GET /scim/v2/ResourceTypes` | Discovery — describes the User and Group resource types |
+| `GET /scim/v2/Schemas` | Discovery — the core User and Group schemas |
 | `POST /scim/v2/Users` | Provision a new user |
 | `GET /scim/v2/Users/{id}` | Read a single user (`404` if unknown) |
 | `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=` | Existence check + pagination (SCIM `ListResponse`) |
@@ -1289,23 +1289,81 @@ role-changed. A compromised or misconfigured IdP therefore cannot use
 Group push to elevate, demote, or otherwise touch a local principal, even
 by naming its SCIM-facing id in a group's membership list.
 
-**Deprovision-ordering interaction (deliberate, not a bug).** The existing
-deprovision role-guard (Provenance guard above) refuses to delete/deactivate
-an account whose `role != "user"`, returning `404` (never a `403`
-existence oracle). Because Groups → role mapping can now put a
-SCIM-provisioned user at `role=admin` through ordinary group membership
-(not just a manual dashboard promotion), **a user who is admin via group
-membership cannot be SCIM-deprovisioned until the IdP first removes them
-from the admin group** — that removal demotes them back to `user`, at
-which point the next deactivate/delete call proceeds normally. This was
-evaluated and accepted rather than special-cased: standard Okta/Entra
-offboarding already removes a departing employee from all group
-assignments (including any admin group) as part of unassigning the app,
-ahead of or alongside deactivating the user, so the required ordering
-matches the normal IdP-side offboarding flow rather than imposing an
-unusual one. Operator-facing guidance is
+**`deprovision_role_ok` is a demote-before-delete ordering gate, not a
+"manual elevation is protected" guarantee.** `deprovision_role_ok`
+(`server/core/src/scim_routes.cpp`) refuses to delete/deactivate any
+account whose DB-authoritative role is not `user`, returning `404` (never a
+`403` existence oracle) — regardless of *how* that account came to be
+non-`user` (a dashboard promotion or Groups → role mapping). Its job is
+purely sequencing: SCIM must never be able to deprovision an elevated
+account without an explicit, auditable demotion happening first. It is not
+a promise that a manually-elevated account stays elevated — see Model A
+below for what actually governs durability of a manual role change on a
+SCIM account. Because Groups → role mapping can now put a SCIM-provisioned
+user at `role=admin` through ordinary group membership (not just a manual
+dashboard promotion), **a user who is admin via group membership cannot be
+SCIM-deprovisioned until the IdP first removes them from the admin
+group** — that removal demotes them back to `user` via the next
+`recompute_scim_user_role` call, at which point the next deactivate/delete
+call proceeds normally. This was evaluated and accepted rather than
+special-cased: standard Okta/Entra offboarding already removes a departing
+employee from all group assignments (including any admin group) as part of
+unassigning the app, ahead of or alongside deactivating the user, so the
+required ordering matches the normal IdP-side offboarding flow rather than
+imposing an unusual one. Operator-facing guidance is
 `docs/user-manual/scim-provisioning.md` "Deprovisioning order matters for
 group-granted admins".
+
+**Model A — IdP group membership is authoritative for a SCIM account's
+role.** For any SCIM-provisioned account, `--scim-admin-group` membership,
+not a manual dashboard edit, is the durable source of truth for role. A
+manual (out-of-band, e.g. dashboard) role change to a SCIM-provisioned
+account is **reverted to the group-derived role on the next event that
+recomputes that user's membership** — i.e. a Group `POST`/`PUT`/`PATCH`/
+`DELETE` that resolves to this user via `recompute_scim_user_role`, or a
+`User` reprovision (`POST` reviving a deactivated account) — **not** on a
+plain deactivate/delete (`deprovision_role_ok` blocks those against a
+non-`user` account outright, so they never reach a recompute), and **not**
+on server restart or on changing `--scim-admin-group` itself (both require
+a subsequent Group mutation to actually re-evaluate membership — see
+Recovery/alerting in `docs/user-manual/scim-provisioning.md`). **Residual
+(carried from the Users slice, not new here):** a manually-promoted SCIM
+account that is a member of **no** SCIM group is neither reverted by this
+mechanism nor SCIM-deprovisionable (`deprovision_role_ok` still blocks it)
+until an operator demotes it by hand — there is no membership-recompute
+event that would ever touch it, because `recompute_scim_user_role` only
+acts on users a Group mutation or reprovision actually resolves to.
+
+**Architectural constraints, by design (not gaps):**
+
+- **`displayName`-keyed, not stable-ID-keyed.** `--scim-admin-group` matches
+  against a SCIM Group's mutable, non-unique-at-create `displayName` —
+  unlike OIDC's `sub`+`iss` stable-identity keying (#1837), there is no
+  IdP-durable group identifier in play here. A `displayName` rename in the
+  IdP requires the operator to update `--scim-admin-group` to match and
+  restart (see Configuration above) — the mapping does **not** follow a
+  renamed group automatically. Group `POST`/`PUT` now reject `409` (create
+  on an existing `displayName`, or a `PUT` rename onto one) rather than
+  silently permitting a second same-named group, but this only prevents
+  *duplicate* names — it does not make `displayName` a stable key.
+- **Binary `admin`|`user` only.** `auth.db`'s role model has exactly two
+  values; Groups → role mapping cannot express anything finer even if a
+  future RBAC expansion introduces more roles — the same constraint SAML
+  and OIDC group→role mapping already operate under.
+- **Deliberately does not reuse `directory_group_role_mappings`
+  (`directory_sync.cpp`).** That table is stable-`group_id`-keyed storage
+  built for the AD/Entra directory-sync path and does not apply here: SCIM
+  Groups → role mapping resolves live, per-request against
+  `--scim-admin-group` via `resolve_role_from_groups`, with no persisted
+  mapping row of its own. This was evaluated and rejected rather than
+  overlooked — reusing a stable-ID-keyed table for a `displayName`-keyed
+  mapping would either force a fabricated stable id onto SCIM Groups or
+  quietly change the matching semantics; a dedicated (if narrower)
+  resolution path was judged clearer than overloading a table built for a
+  different keying model.
+- **Bounded Group membership.** Each Group operation enforces a bounded
+  maximum on `members[]` size, refusing an unbounded membership push rather
+  than accepting an arbitrarily large list in one call.
 
 **Threat model addition: a compromised IdP cannot elevate a local
 account.** The provenance guard bounds Groups → role mapping to SCIM's own
@@ -1337,8 +1395,8 @@ that triggers a `500`).
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"` |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing/malformed/wrong token) on any `/scim/v2/*` route, including discovery |
-| `scim.group.created` | `success` / `failure` | `POST /scim/v2/Groups` succeeds / rolls back `500` |
-| `scim.group.updated` | `success` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / fails `500` |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision against an existing group / rolls back `500` |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value (user create, or a Group create/replace/patch/delete affecting admin-group membership); records `old_role`→`new_role`, `reason=group` |
 
@@ -1356,7 +1414,8 @@ Prometheus counters (all in the `yuzu_scim_*` namespace):
 | `yuzu_scim_auth_failures_total` | — | Bearer-auth failures on any `/scim/v2/*` route; pairs with `scim.auth.denied` audit rows. |
 | `yuzu_scim_audit_write_failures_total` | — | An audit-log write itself failed. All lifecycle actions (provision, update, deactivate, reactivate, delete, group create/update/delete, role change) are set-and-proceed on this failure mode — the SCIM call still succeeded and the bump is the only record that the evidence row is missing; alert on this counter rather than expecting a `500` (see "All lifecycle audit writes are set-and-proceed" above). |
 | `yuzu_scim_provenance_denied_total` | — | Provenance- or role-guard refusals; pairs with `scim.user.provenance_denied` audit rows. |
-| `yuzu_scim_role_changes_total` | — | A user's role was recomputed to a new value via Groups → role mapping; pairs with `scim.user.role_changed` audit rows. |
+| `yuzu_scim_role_changes_total` | — | A user's role was recomputed to a new value via Groups → role mapping; pairs with `scim.user.role_changed` audit rows (`success`). |
+| `yuzu_scim_role_change_failures_total` | — | `recompute_scim_user_role`'s `AuthManager::update_role` call reported a genuine AuthDB write failure — a role change that was decided but did **not** durably apply; pairs with `scim.user.role_changed` audit rows (`failure`). A sustained non-zero rate means role changes are silently not taking effect — alert on it distinctly from `yuzu_scim_audit_write_failures_total` (that counter covers a lost *evidence row* for an otherwise-successful mutation; this one covers the mutation itself failing). |
 
 ### Storage
 

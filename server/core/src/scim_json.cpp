@@ -348,6 +348,12 @@ std::expected<ScimGroupInput, ScimError> parse_group(const nlohmann::json& body)
     if (input.display_name.empty()) {
         return std::unexpected(ScimError{400, "invalidValue", "displayName is required"});
     }
+    if (input.display_name.size() > kMaxDisplayNameLen) {
+        return std::unexpected(
+            ScimError{400, "invalidValue",
+                     "displayName exceeds the maximum length of " +
+                         std::to_string(kMaxDisplayNameLen) + " bytes"});
+    }
 
     if (body.contains("externalId") && !body["externalId"].is_string()) {
         return std::unexpected(ScimError{400, "invalidValue", "externalId must be a string"});
@@ -408,12 +414,24 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                         ScimError{400, "invalidValue", "displayName value must be a string"});
                 }
                 patch.display_name = value.get<std::string>();
+                if (patch.display_name->size() > kMaxDisplayNameLen) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue",
+                                 "displayName exceeds the maximum length of " +
+                                     std::to_string(kMaxDisplayNameLen) + " bytes"});
+                }
             } else if (ieq(path, "externalId")) {
                 if (!value.is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
                 }
                 patch.external_id = value.get<std::string>();
+                if (patch.external_id->size() > kMaxExternalIdLength) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue",
+                                 "externalId exceeds the maximum length of " +
+                                     std::to_string(kMaxExternalIdLength) + " bytes"});
+                }
             } else {
                 return std::unexpected(
                     ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
@@ -463,6 +481,12 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                             ScimError{400, "invalidValue", "displayName value must be a string"});
                     }
                     patch.display_name = value["displayName"].get<std::string>();
+                    if (patch.display_name->size() > kMaxDisplayNameLen) {
+                        return std::unexpected(
+                            ScimError{400, "invalidValue",
+                                     "displayName exceeds the maximum length of " +
+                                         std::to_string(kMaxDisplayNameLen) + " bytes"});
+                    }
                 }
                 if (value.contains("externalId")) {
                     if (!value["externalId"].is_string()) {
@@ -470,6 +494,12 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                             ScimError{400, "invalidValue", "externalId value must be a string"});
                     }
                     patch.external_id = value["externalId"].get<std::string>();
+                    if (patch.external_id->size() > kMaxExternalIdLength) {
+                        return std::unexpected(
+                            ScimError{400, "invalidValue",
+                                     "externalId exceeds the maximum length of " +
+                                         std::to_string(kMaxExternalIdLength) + " bytes"});
+                    }
                 }
                 if (value.contains("members")) {
                     auto members = extract_member_values(value["members"]);
@@ -488,12 +518,24 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                         ScimError{400, "invalidValue", "displayName value must be a string"});
                 }
                 patch.display_name = value.get<std::string>();
+                if (patch.display_name->size() > kMaxDisplayNameLen) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue",
+                                 "displayName exceeds the maximum length of " +
+                                     std::to_string(kMaxDisplayNameLen) + " bytes"});
+                }
             } else if (ieq(path, "externalId")) {
                 if (!value.is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
                 }
                 patch.external_id = value.get<std::string>();
+                if (patch.external_id->size() > kMaxExternalIdLength) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue",
+                                 "externalId exceeds the maximum length of " +
+                                     std::to_string(kMaxExternalIdLength) + " bytes"});
+                }
             } else {
                 return std::unexpected(
                     ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
