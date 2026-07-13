@@ -63,7 +63,7 @@ Overall      [======================---------]   172/228 done (75%)
 | 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
-| 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
+| 27. Software Licensing & Entitlements (SLE) | 5 | 0 | 0 | 5 |
 | 28. Response Visualization | 9 | 0 | 3 | 6 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
@@ -1055,29 +1055,29 @@ Not implemented. WSUS database connector for patch compliance. CSV/TSV file uplo
 
 ---
 
-## 27. Software Catalog & Licensing
+## 27. Software Licensing & Entitlements (SLE)
 
-*Normalized software identification and license compliance management.*
+*Normalized software identification, agent-discovered software licences, entitlements, and compliance management. Renamed from "Software Catalog & Licensing" by ADR-0024 ("software catalog" keeps its existing `/inventory` meaning; design of record: `docs/adr/0024-software-licensing-entitlements.md`). Sub-capability descriptions below predate ADR-0024 and are stale where they conflict with it.*
 
-### 27.1 Software Catalog Store :x: `T2`
+### 27.1 Product Registry :x: `T2`
 
-Not implemented. Canonical software registry (vendor, title, version, edition, platform) with manual curation and automatic matching from raw inventory.
+Not implemented. Canonical software-identity registry (vendor, title, version, edition, platform) with deterministic automatic matching from raw inventory; manual curation layers on aliases later (ADR-0024 Decision 6).
 
 ### 27.2 Software Usage Tracking :x: `T2`
 
-Not implemented. Agent-side application usage metering (launch tracking, run time, last-used timestamp). Categorization: Used, Rarely Used, Unused, Unreported.
+Not implemented. Agent-side application usage metering — **opt-in** (`--usage-sync-enable`, default off) and **machine-scope** (user dimension dropped on-device), read locally from the agent's TAR warehouse (ADR-0024 Decision 15), not on-by-default launch tracking. Categorization (Used, Rarely, Unused, Unreported) is policy-computed server-side at read time; the reclamation verdicts derived from it are SAM use-case-engine-module work (ADR-0024 "Placement under ADR-1005").
 
 ### 27.3 License Entitlements & Compliance :x: `T2`
 
-Not implemented. Entitlement records (product, purchased_seats, license_type). Compliance calculation: installed vs. entitled with over/under-licensed reporting.
+Not implemented. Entitlement records (product, metric-typed quantity — seats in v1 — license_type, term/renewal, cost) from five sources. Compliance calculation: installed vs. entitled with over/under-licensed reporting (ADR-0024 Decision 12; non-seat metrics stored faithfully, evaluated per the ADR's Direction ladder).
 
 ### 27.4 Software Tags :x: `T2`
 
-Not implemented. Server-side tags on software catalog entries for categorization (approved, prohibited, eval). Usable in Management Group rules.
+Not implemented. Server-side tags on product registry entries for categorization (approved, prohibited, eval). Usable in Management Group rules.
 
 ### 27.5 License Compliance Dashboard :x: `T2`
 
-Not implemented. Per-product compliance summary with drill-down to device-level detail. Reclamation candidate identification from usage data.
+Not implemented, and **re-scoped** by ADR-0024's "Placement under ADR-1005": the per-product compliance summary, the compliance dashboard, and reclamation-candidate identification are **SAM use-case-engine (UCE) module** surfaces, not built in-server. §27 v1 so far ships the in-server discovery **API** only — the raw `/api/v1/sle/*` drill, its `query_software_licenses` MCP twin, and the audited erasure DELETE. **No SLE UI ships yet:** the in-server **Licences (discovery) view** that Decision 9 places in-server is still to be built, and the compliance / entitlement / reclamation views are the UCE module's, which reads the discovery API over the versioned interface.
 
 ---
 
