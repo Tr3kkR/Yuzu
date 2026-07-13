@@ -494,12 +494,20 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         CHECK_FALSE(store.replace_agent_licenses("agent-a", {small_row("P", "licensed")}, "h2",
                                                  "hash"));
         CHECK_FALSE(store.touch("agent-a"));
-        // The degraded authoritative reads above bumped the shared read-degrade
-        // counter under this source's label (#1675 convention).
+        // delete_agent (the live DELETE /sle/agents/{id} erasure primitive) must also
+        // fail SOFT on a degraded store — a rolled-back DELETE returns false, so the
+        // decommission cascade records `Failed`, never falsely confirming a GDPR-Art.17
+        // erasure that did not commit.
+        CHECK_FALSE(store.delete_agent("agent-a"));
+        // The degraded authoritative reads above bumped the shared read-degrade counter
+        // under this source's label (#1675 convention) EXACTLY twice — agent_licenses
+        // and distinct_products are the only two reads that emit the counter; stored_hash
+        // and count_stale_agents log without bumping, and the writes (replace/touch/
+        // delete_agent) are not read-degrades. Pin the exact value, not a lower bound.
         CHECK(metrics
                   .counter("yuzu_inventory_read_degrade_total",
                            {{"reason", "query_error"}, {"source", "software_licensing"}})
-                  .value() >= 2.0);
+                  .value() == 2.0);
     }
 }
 
@@ -532,4 +540,5 @@ TEST_CASE("SoftwareLicensingStore store_not_open: constructor failure degrades e
     CHECK_FALSE(store.count_stale_agents(1).has_value());
     CHECK_FALSE(store.replace_agent_licenses("agent-a", {}, "h", "hash"));
     CHECK_FALSE(store.touch("agent-a"));
+    CHECK_FALSE(store.delete_agent("agent-a")); // an unopened store never confirms erasure
 }

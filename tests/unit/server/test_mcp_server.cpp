@@ -4232,6 +4232,12 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
     REQUIRE(res->status == 200);
     CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    // The #1717 refusal is audited (CC7.2) — a corrupt-authz refusal still leaves a trail.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
 }
 
 TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
@@ -4300,9 +4306,17 @@ TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error"
                        R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
     REQUIRE(res->status == 200);
     CHECK(res->body.find("Software licensing store unavailable") != std::string::npos);
-    CHECK(res->body.find("-32603") != std::string::npos);       // kInternalError
+    CHECK(res->body.find("-32603") != std::string::npos);        // kInternalError
     CHECK(res->body.find("correlation_id") != std::string::npos); // A4 envelope (C4/C6)
+    CHECK(res->body.find("\"retry_after_ms\":5000") != std::string::npos); // transient ⇒ back off + retry
     CHECK(res->body.find("\"result\"") == std::string::npos);    // never success+[]
+    // CC7.2: the fail-closed refusal still leaves a behavioural trail (parity with the
+    // query_installed_software sibling's degrade audit and the REST drill's 503 audit).
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
 }
 
 TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMITTED (Decision 11)",
@@ -4393,7 +4407,14 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
     CHECK(res->body.find("\"error\"") != std::string::npos);
     CHECK(res->body.find("read failed") != std::string::npos);
     CHECK(res->body.find("-32603") != std::string::npos);      // kInternalError
+    CHECK(res->body.find("\"retry_after_ms\":5000") != std::string::npos); // parity with REST 503 drill
     CHECK(res->body.find("\"result\"") == std::string::npos);  // crucially NOT success+[]
+    // A degraded read leaves a behavioural trail (CC7.2), like the sibling + REST drill.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
 }
 
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──

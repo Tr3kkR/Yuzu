@@ -1622,11 +1622,19 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // retry_after_ms: pass a non-negative value on a TRANSIENT failure (a
+            // store degrade / transient outage) so an agentic worker backs off and
+            // retries rather than treating the error as terminal; leave the default
+            // (-1 ⇒ null) on non-retryable errors (tier/permission/validation). This
+            // matches the REST a4 envelope, which emits retry_after_ms:5000 on the
+            // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
-                                  std::string_view remediation = {}) {
+                                  std::string_view remediation = {}, long retry_after_ms = -1) {
                 const std::string cid = yuzu::server::detail::make_correlation_id();
-                std::string data = R"({"correlation_id":")" + cid +
-                                   R"(","retry_after_ms":null,"remediation":)";
+                std::string data = R"({"correlation_id":")" + cid + R"(","retry_after_ms":)" +
+                                   (retry_after_ms >= 0 ? std::to_string(retry_after_ms)
+                                                        : std::string("null")) +
+                                   R"(,"remediation":)";
                 if (remediation.empty()) {
                     data += "null";
                 } else {
@@ -2617,6 +2625,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
                 // legacy-open Read of per-agent licence facts.
                 if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
+                    // CC7.2: a fail-closed refusal still leaves a behavioural trail —
+                    // the sibling query_installed_software audits its store-degrade the
+                    // same way, and the REST drill persists a failure audit on 503.
+                    mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
                     res.set_content(a4_error(kInternalError, "authorization subsystem unavailable"),
                                     "application/json");
                     return;
@@ -2638,15 +2650,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!scoped_perm_fn(req, res, "SoftwareLicensing", "Read", agent_id))
                     return; // the gate wrote its own 401/403
                 if (!software_licensing_store) {
-                    res.set_content(a4_error(kInternalError, "Software licensing store unavailable"),
+                    mcp_audit("failure", "software licensing store unavailable; agent=" + agent_id);
+                    res.set_content(a4_error(kInternalError, "Software licensing store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
                                     "application/json");
                     return;
                 }
                 auto rows = software_licensing_store->agent_licenses(agent_id);
                 if (!rows) {
+                    // Authoritative read: a store/pool/query degrade is an ERROR, never
+                    // success+[] — a licence query must not read a transient outage as
+                    // "nothing licensed". retry_after_ms mirrors the REST drill's 503.
+                    mcp_audit("failure", "detected-licence store degraded; agent=" + agent_id);
                     res.set_content(
                         a4_error(kInternalError, "detected-licence store unavailable — read failed",
-                                 "retry the request"),
+                                 "retry the request", /*retry_after_ms=*/5000),
                         "application/json");
                     return;
                 }

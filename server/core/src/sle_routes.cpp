@@ -50,7 +50,8 @@ std::string make_cid() {
 /// docs/agentic-first-principle.md §A4; remediation/permission omitted when empty.
 std::string a4_error(int code, std::string_view message, std::string_view cid,
                      std::optional<std::int64_t> retry_after_ms = std::nullopt,
-                     std::string_view remediation = {}, std::string_view permission = {}) {
+                     std::string_view remediation = {}, std::string_view permission = {},
+                     const json& details = json::object()) {
     // nlohmann::json takes std::string, not std::string_view, so materialise.
     json err;
     err["code"] = code;
@@ -64,6 +65,11 @@ std::string a4_error(int code, std::string_view message, std::string_view cid,
         err["remediation"] = std::string(remediation);
     if (!permission.empty())
         err["permission"] = std::string(permission);
+    // Optional structured diagnosis merged under error.details (e.g. the per-store
+    // decommission breakdown on a partial-erasure 500 — so the operator learns WHICH
+    // store failed from the response itself, not only the audit log).
+    if (!details.empty())
+        err["details"] = details;
     json out;
     out["error"] = std::move(err);
     out["meta"] = json{{"api_version", "v1"}};
@@ -263,12 +269,20 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                     " failed=" + std::to_string(r.failed) + " cid=" + cid);
 
             if (!r.ok()) {
+                // Echo the per-store breakdown into the 500 body so the operator can
+                // see WHICH store failed (and which already erased) from the response
+                // itself — not only by pulling the audit log. Idempotent re-DELETE
+                // then targets the remaining failures.
                 send_json(res, 500,
                           a4_error(500,
                                    "agent decommission incomplete — one or more stores failed (" +
                                        std::to_string(r.failed) +
                                        " failed); re-issue the DELETE (the cascade is idempotent)",
-                                   cid, 5000, "retry the request"));
+                                   cid, 5000, "retry the request", /*permission=*/{},
+                                   json{{"stores", stores},
+                                        {"deleted", static_cast<std::int64_t>(r.deleted)},
+                                        {"skipped", static_cast<std::int64_t>(r.skipped)},
+                                        {"failed", static_cast<std::int64_t>(r.failed)}}));
                 return;
             }
             json data;
