@@ -42,6 +42,7 @@ class InventoryStore;
 class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
+class SoftwareLicensingStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -106,6 +107,11 @@ public:
     /// source via ReportInventory.
     void set_device_inventory_store(DeviceInventoryStore* store) {
         device_inventory_store_ = store;
+    }
+    /// Typed detected-licence projection (ADR-0024) — receives the
+    /// software_licensing daily-sync source via ReportInventory.
+    void set_software_licensing_store(SoftwareLicensingStore* store) {
+        software_licensing_store_ = store;
     }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
@@ -349,6 +355,7 @@ private:
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
+    SoftwareLicensingStore* software_licensing_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};

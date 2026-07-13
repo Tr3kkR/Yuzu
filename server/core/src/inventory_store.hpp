@@ -65,8 +65,11 @@ public:
     /// Get all inventory records for a specific agent.
     std::vector<InventoryRecord> get_agent_inventory(const std::string& agent_id) const;
 
-    /// Delete inventory data for an agent (e.g., on agent removal).
-    void delete_agent(const std::string& agent_id);
+    /// Delete inventory data for an agent (e.g., on agent removal). Returns true
+    /// iff the DELETE executed successfully (prepare + step both OK); false on a
+    /// prepare/step failure, so the decommission cascade can record the store as
+    /// Failed rather than a false "erased".
+    [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
     /// Count total inventory records.
     int64_t count() const;

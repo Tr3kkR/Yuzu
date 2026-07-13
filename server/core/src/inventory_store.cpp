@@ -249,17 +249,34 @@ std::vector<InventoryRecord> InventoryStore::get_agent_inventory(
 
 // ── Delete agent ────────────────────────────────────────────────────────────
 
-void InventoryStore::delete_agent(const std::string& agent_id) {
+bool InventoryStore::delete_agent(const std::string& agent_id) {
+    // Empty-id guard, matching the four PG stores: never run a
+    // `DELETE ... WHERE agent_id = ''` (a footgun, never a fleet wipe). The
+    // decommission cascade already short-circuits an empty id to all-Skipped, but
+    // guarding here keeps that safety local to the store, not solely at the seam.
+    if (agent_id.empty())
+        return false;
+
     std::unique_lock lock(mtx_);
 
     const char* sql = "DELETE FROM inventory_data WHERE agent_id = ?";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        // Store-level diagnostic on the failure branch, matching the four PG
+        // siblings' spdlog::debug — so the decommission cascade's `Failed` line
+        // has a locatable root cause (the return value alone is unrecoverable).
+        spdlog::debug("InventoryStore: delete_agent prepare failed for agent={}: {}", agent_id,
+                      sqlite3_errmsg(db_));
+        return false;
+    }
 
     sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
+    const int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE)
+        spdlog::debug("InventoryStore: delete_agent step failed for agent={}: rc={} ({})", agent_id,
+                      rc, sqlite3_errmsg(db_));
+    return rc == SQLITE_DONE;
 }
 
 // ── Count ───────────────────────────────────────────────────────────────────

@@ -974,6 +974,48 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     CHECK(inv.get("agent-gw-inv", "custom_source").has_value());   // generic source still works
 }
 
+TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the generic "
+          "InventoryStore (typed-registry same-change rule + SoftwareLicensing boundary)",
+          "[agent_service][gateway][inventory][software_licensing]") {
+    // Clone of the device_ci H1 parity case for the software_licensing typed key
+    // (ADR-0024 Decision 5 / roadmap C-9 pattern): the gateway generic-blob loop
+    // must skip every TYPED source (is_typed_inventory_source) — else detected-
+    // licence rows (incl. `user_ref`, the ADR-0024 D11 pseudonym) land in the
+    // generic InventoryStore, which is read on Infrastructure:Read, bypassing
+    // the SoftwareLicensing securable (and breaking direct/gateway parity,
+    // since the direct path has no generic loop).
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    InventoryStore inv{":memory:"}; // the generic blob store (read on Infrastructure:Read)
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+    // No SoftwareLicensingStore wired — the skip must hold regardless of the
+    // typed store's presence (the registry, not the store hook, is the guard).
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-lic", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+    const std::string session_id = rresp.session_id();
+    REQUIRE_FALSE(session_id.empty());
+
+    // A report carrying BOTH the typed source and a generic source.
+    apb::InventoryReport rpt;
+    rpt.set_session_id(session_id);
+    (*rpt.mutable_plugin_data())["software_licensing"] =
+        "lic\x1fSomeProduct\x1fSomeVendor\x1e";                // typed → must be skipped
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}"; // generic → must be stored
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+
+    CHECK_FALSE(inv.get("agent-gw-lic", "software_licensing").has_value()); // not double-stored
+    CHECK(inv.get("agent-gw-lic", "custom_source").has_value()); // generic source still works
+}
+
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",
           "[agent_service][register][gateway][pki][pr5d]") {
     // The pre-PR5d behavior, now the explicit fallback: a CSR with no signer

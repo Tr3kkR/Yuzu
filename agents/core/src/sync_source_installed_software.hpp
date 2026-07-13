@@ -50,9 +50,6 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 /// this source's. Takes its argument by value (it sorts a copy).
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
 
-/// SHA-256 hex of a byte string (matches the server's local sha256_hex).
-YUZU_EXPORT std::string sha256_hex(const std::string& in);
-
 /// Build the `installed_software` SyncSource. `descriptor` is the loaded
 /// `installed_apps` plugin descriptor; when null (plugin not built/loaded — e.g.
 /// `build_examples=false`) the source's collect returns std::nullopt and the

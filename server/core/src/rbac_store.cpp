@@ -233,7 +233,15 @@ void RbacStore::seed_defaults() {
                            "License",
                            "FileRetrieval",
                            "GuaranteedState",
-                           "Inventory"};
+                           "Inventory",
+                           // SLE (ADR-0024 Decision 9). DISTINCT from the existing
+                           // `License` securable (Yuzu's OWN product licence, §22.3) —
+                           // this gates the /api/v1/sle/* discovery reads + the erasure
+                           // DELETE. (No SLE page ships yet — ADR-0024 D9 places the
+                           // Licences view in-server, but it is not built; the compliance
+                           // sub-views are the SAM UCE module's.) Seeding it here
+                           // also grants Administrator full CRUD via the loop below.
+                           "SoftwareLicensing"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -243,6 +251,20 @@ void RbacStore::seed_defaults() {
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
+    // R18 (ADR-0024 Decision 9): the SoftwareLicensing securable's seeded
+    // description DEFUSES its name — it does NOT gate the /inventory installed-
+    // software catalog (that stays under Inventory:Read). Set it when empty (a
+    // fresh boot inserts the row above with an empty description; an upgrade
+    // inserts the new type fresh) — `AND description = ''` keeps this idempotent
+    // and never clobbers an operator-set value, matching the INSERT OR IGNORE
+    // seed-once posture of the rest of seed_defaults().
+    sqlite3_exec(db_,
+                 "UPDATE securable_types SET description = "
+                 "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission "
+                 "erasure; the /inventory software catalog "
+                 "remains under Inventory:Read' "
+                 "WHERE name = 'SoftwareLicensing' AND description = '';",
+                 nullptr, nullptr, nullptr);
 
     // Operations. "Push" is Guardian-specific — distributes a rule set to
     // scoped agents (design doc §9.2). It is a first-class operation in
@@ -332,9 +354,10 @@ void RbacStore::seed_defaults() {
             sqlite3_finalize(s);
         }
     }
-    // PlatformEngineer: read on operational types for context
-    const char* pe_read_types[] = {"Execution", "Schedule", "Approval", "Tag",
-                                   "AuditLog",  "Response",  "Inventory"};
+    // PlatformEngineer: read on operational types for context (incl. SLE —
+    // ADR-0024 Decision 9 D-9 matrix: PlatformEngineer Read).
+    const char* pe_read_types[] = {"Execution", "Schedule", "Approval",         "Tag",
+                                   "AuditLog",  "Response",  "SoftwareLicensing", "Inventory"};
     for (auto* t : pe_read_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -439,6 +462,18 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Inventory', 'Read', 'allow');",
         nullptr, nullptr, nullptr);
+    // Operator: read + write on SoftwareLicensing (ADR-0024 Decision 9 D-9 matrix:
+    // Operator Read + Write). Write is granted now even though PR1a ships no write
+    // endpoints — the matrix is seeded ONCE; entitlement CRUD arrives in PR2. NOT
+    // Execute/Delete/Approve (that is ITServiceOwner's full-CRUD tier).
+    sqlite3_exec(db_,
+                 "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', "
+                 "'SoftwareLicensing', 'Read', 'allow');",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
+                 "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', "
+                 "'SoftwareLicensing', 'Write', 'allow');",
+                 nullptr, nullptr, nullptr);
     // Operator: read + write on FileRetrieval
     sqlite3_exec(
         db_,
@@ -510,7 +545,11 @@ void RbacStore::seed_defaults() {
                                 "License",
                                 "FileRetrieval",
                                 "GuaranteedState",
-                                "Inventory"};
+                                "Inventory",
+                                // SLE full CRUD (ADR-0024 Decision 9 D-9 matrix:
+                                // ITServiceOwner full CRUD, as for its other
+                                // operational securables).
+                                "SoftwareLicensing"};
     // Same Push-restriction rationale as Administrator above: CRUD cross-type,
     // Push only on GuaranteedState where it is actually consulted.
     for (auto* t : itso_types) {
@@ -550,7 +589,13 @@ void RbacStore::seed_defaults() {
                                   "License",
                                   "FileRetrieval",
                                   "GuaranteedState",
-                                  "Inventory"};
+                                  "Inventory",
+                                  // SLE Read (ADR-0024 Decision 9 D-9 matrix: Viewer
+                                  // Read). R18 upgrade note: deployments restricting
+                                  // entitlement-cost visibility deny/remove this Viewer
+                                  // grant before enabling the SLE sources (deny-override
+                                  // wins) — see the seeded securable description.
+                                  "SoftwareLicensing"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

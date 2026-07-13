@@ -65,6 +65,15 @@ struct Config {
                                    // installed-software enumeration may be works-council
                                    // co-determination-relevant — this is the control for
                                    // jurisdictions/agreements that require it off.
+
+    // Software Licensing & Entitlements (SLE, ADR-0024) — the per-user `user_ref`
+    // knob for the `software_licensing` daily-sync source (Decision 11). One of
+    // "collect" | "hash" | "omit"; default "hash" (a per-agent keyed pseudonym).
+    // --license-scan-user-ref / YUZU_AGENT_LICENSE_SCAN_USER_REF. Validated to
+    // the closed set at parse (main.cpp). This governs only how a detected
+    // per-user licence's local profile name is recorded; it does not disable the
+    // per-user probe (that shares the inventory_disable opt-out above, roadmap R2).
+    std::string license_scan_user_ref{"hash"};
 };
 
 /**
