@@ -908,7 +908,9 @@ public:
                              "Guardian detection path = legacy IGuard (enforcing)");
             } catch (const std::exception& e) {
                 // ~SparkEngine (via reset) joins whatever already started; the
-                // heartbeat gate (spark_engine_ != nullptr) then ships no spark tags.
+                // heartbeat's else branch then ships the FAILED posture
+                // (spark_running=0, no disabled key) — a boot failure is visible
+                // on the wire, never silent.
                 spark_engine_.reset();
                 spdlog::warn("SparkEngine: instantiation failed ({}) — continuing WITHOUT "
                              "spark; legacy IGuard detection is unaffected",

@@ -611,7 +611,7 @@ public:
         // a server-owned counter, #2083) — so their alert templates ship COMMENTED OUT
         // until rung 2 (see the spark preamble in docs/prometheus/yuzu-alerts.yml). The
         // exception is yuzu_fleet_spark_failed: a STATE gauge recomputed and cleared
-        // every sweep, live-actionable at rung 1 — its `> 0 for: 15m` rule ships ACTIVE.
+        // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
         metrics_.describe("yuzu_fleet_spark_reporting",
                           "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
                           "running (spark_running=1) — the denominator for all spark telemetry",
