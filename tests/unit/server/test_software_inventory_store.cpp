@@ -1010,7 +1010,7 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
         REQUIRE(pre->size() == 2);
     }
 
-    store.delete_agent("agent-del");
+    CHECK(store.delete_agent("agent-del")); // committed → true
 
     auto post = store.get_agent_software("agent-del");
     REQUIRE(post.has_value()); // store still open + query OK → empty VALUE, not a degrade
@@ -1028,8 +1028,9 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     CHECK(store.apply_installed_software("agent-bystander", by_h, std::nullopt, 2000) ==
           InventoryIngestOutcome::kTouched);
 
-    // A delete of an unknown agent is a no-op (best-effort), not a throw or a degrade.
-    store.delete_agent("agent-never-existed");
+    // A delete of an unknown agent is a no-op (best-effort), not a throw or a
+    // degrade — a 0-row DELETE still commits, so it reports success.
+    CHECK(store.delete_agent("agent-never-existed"));
     auto other = store.get_agent_software("agent-never-existed");
     REQUIRE(other.has_value());
     CHECK(other->empty());

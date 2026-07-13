@@ -1077,7 +1077,7 @@ Not implemented. Server-side tags on product registry entries for categorization
 
 ### 27.5 License Compliance Dashboard :x: `T2`
 
-Not implemented, and **re-scoped** by ADR-0024's "Placement under ADR-1005": the per-product compliance summary, the compliance dashboard, and reclamation-candidate identification are **SAM use-case-engine (UCE) module** surfaces, not built in-server. §27 v1 ships the in-server discovery reads (the raw `/api/v1/sle/*` + Licences view + the `query_software_licenses` MCP twin); the UCE module reads them over the versioned API to derive compliance and reclamation.
+Not implemented, and **re-scoped** by ADR-0024's "Placement under ADR-1005": the per-product compliance summary, the compliance dashboard, and reclamation-candidate identification are **SAM use-case-engine (UCE) module** surfaces, not built in-server. §27 v1 so far ships the in-server discovery **API** only — the raw `/api/v1/sle/*` drill, its `query_software_licenses` MCP twin, and the audited erasure DELETE. **No SLE UI ships yet:** the in-server **Licences (discovery) view** that Decision 9 places in-server is still to be built, and the compliance / entitlement / reclamation views are the UCE module's, which reads the discovery API over the versioned interface.
 
 ---
 
