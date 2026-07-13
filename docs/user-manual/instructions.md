@@ -80,17 +80,16 @@ spec:
 ### Saving YAML via API
 
 ```bash
-# Save a definition from a YAML file
+# Save a definition from a YAML file (form-encoded; the yaml_source field
+# carries the document verbatim)
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/yaml \
-  -H "Content-Type: application/x-yaml" \
-  --data-binary @definitions/process-list.yaml
+  --data-urlencode "yaml_source@definitions/process-list.yaml"
 
 # Validate YAML without saving
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
-  -H "Content-Type: application/x-yaml" \
-  --data-binary @definitions/process-list.yaml
+  --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
 
 ### Dashboard YAML Editor
@@ -1141,6 +1140,10 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
+The reviewer must be a different operator than the submitter — self-approval
+is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
+and the denied attempt is recorded in the audit log.
+
 ```bash
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
@@ -1262,7 +1265,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
 | **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
 ### YAML Editor
 
@@ -1306,7 +1309,7 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 - **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
 - **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
 - **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
-- **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its lightweight line-scanner does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
+- **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its schema-aware field extractor (`instruction_yaml`, which indexes the id/name/plugin/action/type/description/concurrency/approval columns from both the canonical nested and flat schemas) does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 
 See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
 
