@@ -10,11 +10,13 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -161,6 +163,15 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
         m->counter("yuzu_scim_provenance_denied_total").increment();
 }
 
+/// #2021 slice 2: bumped every time `recompute_scim_user_role` actually
+/// changes a SCIM-provisioned user's role (promotion OR demotion).
+void bump_role_changed(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_role_changes_total").increment();
+}
+
 // ── Audit ────────────────────────────────────────────────────────────────
 
 /// Emit a SCIM audit row. AuditStore::log is [[nodiscard]] bool; per the
@@ -178,7 +189,7 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
 /// evidence gap) bumps regardless of the caller's response.
 bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::Request& req,
           const std::string& action, const std::string& result, const std::string& target_id,
-          const std::string& detail = {}) {
+          const std::string& detail = {}, const std::string& target_type = "User") {
     if (!audit_store) {
         bump_audit_write_failure(auth_mgr, action);
         return false;
@@ -187,7 +198,7 @@ bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::
     ev.principal = kScimPrincipal;
     ev.principal_role = kScimPrincipal; // S-PRINCIPAL-ROLE — every other machine principal sets one
     ev.action = action;
-    ev.target_type = "User";
+    ev.target_type = target_type; // "User" (default) or "Group" (#2021 group ops)
     ev.target_id = target_id;
     ev.detail = detail;
     ev.result = result;
@@ -213,6 +224,37 @@ std::string location_base(const httplib::Request& req) {
         scheme = "https";
     std::string host = req.get_header_value("Host");
     return scheme + "://" + host + "/scim/v2/Users";
+}
+
+/// Group counterpart of `location_base` — the `/scim/v2/Groups` collection
+/// URL for `meta.location`/`Location` header on the Group codec (#2021).
+std::string groups_location_base(const httplib::Request& req) {
+    std::string scheme = req.get_header_value("X-Forwarded-Proto");
+    if (scheme.empty())
+        scheme = "https";
+    std::string host = req.get_header_value("Host");
+    return scheme + "://" + host + "/scim/v2/Groups";
+}
+
+/// #2021: resolve raw Group `members[].value` strings against live SCIM
+/// User resources. VALIDATE-AND-SKIP: an unresolvable/unknown value (never
+/// provisioned, already deleted, or simply a typo/garbage from the IdP) is
+/// silently dropped rather than erroring the whole request — but a phantom
+/// membership pointing at nothing is NEVER persisted (`ScimStore::
+/// set_group_members`/`add_group_member` only ever see values this function
+/// already confirmed resolve to a real User resource). Deduplicates and
+/// preserves the relative order of `values`.
+std::vector<std::string> resolve_member_values(ScimStore* scim_store,
+                                               const std::vector<std::string>& values) {
+    std::vector<std::string> resolved;
+    resolved.reserve(values.size());
+    for (const auto& v : values) {
+        if (!scim_store->get_by_scim_id(v).has_value())
+            continue; // validate-and-skip
+        if (std::find(resolved.begin(), resolved.end(), v) == resolved.end())
+            resolved.push_back(v);
+    }
+    return resolved;
 }
 
 /// Bearer gate shared by every /scim/v2/* route. Reads ONLY the
@@ -326,6 +368,16 @@ std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
 bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
                         const httplib::Request& req, const std::string& username,
                         const std::string& scim_id, httplib::Response& res) {
+    // #2021 (Groups->role): deliberately NOT weakened for a group-elevated
+    // admin. A SCIM user promoted to admin via Group membership still fails
+    // this guard exactly like an operator-elevated one — the IdP must
+    // remove them from the admin group FIRST (recompute_scim_user_role then
+    // demotes them to 'user' on the next membership change), and only THEN
+    // can SCIM deprovision (deactivate/delete) them. This ordering is the
+    // point, not a gap: it stops a compromised/misconfigured IdP from
+    // group-promoting an account to admin and deprovisioning it in the same
+    // breath in a way that could race an operator's own admin actions on
+    // that account. Do not add a bypass for the group-elevated case.
     auto role = db_authoritative_role(auth_mgr, username);
     if (!role.has_value() || *role != auth::Role::user) {
         spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' or "
@@ -340,6 +392,99 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
         return false;
     }
     return true;
+}
+
+/// ⚠️ SECURITY-CRITICAL (#2021 slice 2) — the SCIM-group->Yuzu-role
+/// application core. Re-derives `user_scim_id`'s role from its CURRENT SCIM
+/// group memberships and applies the change if it differs from the
+/// authoritative DB role. Called after every mutation that could have
+/// changed a user's group membership (Group POST/PUT/PATCH/DELETE, User
+/// POST including the revive-on-reprovision path) — see scim_routes.hpp's
+/// header doc.
+///
+/// Steps (in order, each a hard gate — any failure means "return, no
+/// action"):
+///   1. Resolve `user_scim_id` to a live SCIM User resource (`ScimStore::
+///      get_by_scim_id`). If it doesn't resolve to a scim user resource
+///      (e.g. a Group member value that never matched a real User, or one
+///      that has since been deleted), there is nothing to recompute.
+///   2. PROVENANCE GUARD (LOAD-BEARING, do not weaken): the resolved
+///      username's `AuthDB::get_provisioning_source` MUST read exactly
+///      `"scim"` RIGHT NOW. A Group member `value` that happens to map to a
+///      local admin, a break-glass account, or any other non-SCIM-owned
+///      principal must NEVER cause a role change — this is the same
+///      provenance boundary `provenance_ok` enforces for every other
+///      mutation on this surface, checked independently here because this
+///      helper can be reached from a DIFFERENT resource's route (a Group
+///      mutation) than the one whose provenance was already checked by the
+///      caller's own guard.
+///   3. Resolve the role via `auth::resolve_role_from_groups` over
+///      `ScimStore::list_group_display_names_for_user` and
+///      `scim_admin_group` (empty ⇒ always `Role::user`, never promotes).
+///   4. Read the CURRENT role via `db_authoritative_role` (H2 — the DB row,
+///      never the in-memory cache). `nullopt` fails closed (no change) —
+///      matching every other role read on this surface.
+///   5. If the resolved role differs from the current role, apply it via
+///      `AuthManager::update_role` (which also invalidates the user's
+///      sessions) and audit `scim.user.role_changed` (set-and-proceed, same
+///      posture as every other audit on this surface — see `audit()`'s doc
+///      comment).
+void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+                              AuditStore* audit_store, const httplib::Request& req,
+                              const std::string& user_scim_id,
+                              const std::string& scim_admin_group) {
+    if (!scim_store || !auth_mgr)
+        return;
+
+    // Step 1: user_scim_id must resolve to a live SCIM User resource.
+    auto resource = scim_store->get_by_scim_id(user_scim_id);
+    if (!resource)
+        return;
+
+    AuthDB* db = auth_mgr->auth_db_ptr();
+    if (!db)
+        return;
+
+    // Step 2 — PROVENANCE GUARD (LOAD-BEARING): refuse to touch anything
+    // SCIM did not provision, no matter how a Group came to reference it.
+    auto source = db->get_provisioning_source(resource->username);
+    if (!source || *source != kProvisioningSourceScim) {
+        spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
+                    "provisioning_source is not 'scim' (a Group referenced a non-SCIM account)",
+                    resource->username, user_scim_id);
+        return;
+    }
+
+    // Step 3: resolve the role from CURRENT group membership.
+    auto groups = scim_store->list_group_display_names_for_user(user_scim_id);
+    auth::Role resolved = auth::resolve_role_from_groups(groups, scim_admin_group);
+
+    // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
+    // posture, matching db_authoritative_role's every other caller).
+    auto current = db_authoritative_role(auth_mgr, resource->username);
+    if (!current.has_value())
+        return;
+
+    // Step 5: apply only on an actual change.
+    if (resolved == *current)
+        return;
+
+    std::string old_role_str = auth::role_to_string(*current);
+    std::string new_role_str = auth::role_to_string(resolved);
+    if (!auth_mgr->update_role(resource->username, resolved)) {
+        spdlog::error("SCIM: recompute_scim_user_role — update_role failed for '{}' "
+                     "(scim_id={}, {} -> {})",
+                     resource->username, user_scim_id, old_role_str, new_role_str);
+        return;
+    }
+    spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
+                "via group membership",
+                resource->username, user_scim_id, old_role_str, new_role_str);
+    // Set-and-proceed (UP-N2) — see `audit()`'s doc comment; the role change
+    // above already committed.
+    audit(auth_mgr, audit_store, req, "scim.user.role_changed", "success", user_scim_id,
+         "reason=group old_role=" + old_role_str + " new_role=" + new_role_str);
+    bump_role_changed(auth_mgr);
 }
 
 /// Deactivate the auth account backing `resource` (provenance- and role-
@@ -442,13 +587,15 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
 } // namespace
 
 void ScimRoutes::register_routes(httplib::Server& svr, ScimStore* scim_store,
-                                 auth::AuthManager* auth_mgr, AuditStore* audit_store) {
+                                 auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                 std::string scim_admin_group) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, scim_store, auth_mgr, audit_store);
+    register_routes(sink, scim_store, auth_mgr, audit_store, std::move(scim_admin_group));
 }
 
 void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
-                                 auth::AuthManager* auth_mgr, AuditStore* audit_store) {
+                                 auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                 std::string scim_admin_group) {
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
@@ -481,8 +628,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     // ── POST /scim/v2/Users — provision. ──────────────────────────────────
 
-    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store,
+                                 scim_admin_group](const httplib::Request& req,
+                                                   httplib::Response& res) {
         if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
             record_request(auth_mgr, "create", res.status);
             return;
@@ -762,6 +910,18 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             record_request(auth_mgr, "create", 500);
             return;
         }
+
+        // #2021 (Groups->role, trigger (d)): a fresh-create is always
+        // provisioned at 'user' (see the fresh-create branch above) so this
+        // is a no-op there, but the REVIVE branch can hand back an account
+        // that is already referenced by an existing Group's membership (the
+        // IdP re-adds a member by the scim_id it learns from THIS response,
+        // and — defensively — in case any stale membership already points
+        // at this identity) — recompute now so the freshly (re)provisioned
+        // account's role reflects group membership immediately, not only
+        // after the next Group mutation.
+        recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, resource->scim_id,
+                                 scim_admin_group);
 
         // Honour an explicit active:false on create (some IdPs stage a user
         // deactivated) by immediately deactivating the account we just
@@ -1306,6 +1466,466 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
+               });
+
+    // ── SCIM v2 Groups (#2021, slice 2) ───────────────────────────────────
+    //
+    // Every mutation below that can change a user's group membership calls
+    // `recompute_scim_user_role` for every AFFECTED member (added AND
+    // removed) once its own ScimStore write has committed — see that
+    // function's doc comment for the provenance guard it enforces
+    // independently of this route's own checks.
+
+    // ── POST /scim/v2/Groups — create. ────────────────────────────────────
+
+    sink.Post("/scim/v2/Groups", [scim_store, auth_mgr, audit_store,
+                                  scim_admin_group](const httplib::Request& req,
+                                                    httplib::Response& res) {
+        if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+            record_request(auth_mgr, "group_create", res.status);
+            return;
+        }
+        if (req.body.size() > kMaxBodyBytes) {
+            send_scim_error(res, 413, "request body too large");
+            record_request(auth_mgr, "group_create", 413);
+            return;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception&) {
+            send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+            record_request(auth_mgr, "group_create", 400);
+            return;
+        }
+        auto parsed = scim::parse_group(body);
+        if (!parsed) {
+            send_scim_error(res, parsed.error());
+            record_request(auth_mgr, "group_create", parsed.error().status);
+            return;
+        }
+        const auto& input = *parsed;
+
+        // Idempotent-create on displayName — no DB-level UNIQUE (ScimStore's
+        // doc comment on get_group_by_display_name); the routes layer owns
+        // the 409.
+        if (scim_store->get_group_by_display_name(input.display_name).has_value()) {
+            send_scim_error(res, 409, "displayName already exists", "uniqueness");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
+                 "displayName already exists: " + input.display_name, "Group");
+            record_request(auth_mgr, "group_create", 409);
+            return;
+        }
+
+        auto group = scim_store->create_group(input.display_name, input.external_id);
+        if (!group) {
+            send_scim_error(res, 500, "failed to create the SCIM group");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
+                 input.display_name, "Group");
+            record_request(auth_mgr, "group_create", 500);
+            return;
+        }
+
+        auto members = resolve_member_values(scim_store, input.member_values);
+        if (!members.empty() && !scim_store->set_group_members(group->scim_id, members)) {
+            spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}",
+                         group->scim_id);
+            send_scim_error(res, 500, "failed to persist group membership");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", group->scim_id, {},
+                 "Group");
+            record_request(auth_mgr, "group_create", 500);
+            return;
+        }
+
+        // #2021 trigger (a): recompute role for every member on create.
+        for (const auto& uid : members)
+            recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                     scim_admin_group);
+
+        auto gbase = groups_location_base(req);
+        auto ubase = location_base(req);
+        res.status = 201;
+        res.set_header("Location", gbase + "/" + group->scim_id);
+        res.set_header("ETag", "W/\"" + std::to_string(group->etag_version) + "\"");
+        res.set_content(scim::group_to_json(*group, members, gbase, ubase).dump(), kScimJson);
+        audit(auth_mgr, audit_store, req, "scim.group.created", "success", group->scim_id, {},
+             "Group");
+        record_request(auth_mgr, "group_create", 201);
+    });
+
+    // ── GET /scim/v2/Groups/{id} ───────────────────────────────────────────
+
+    sink.Get(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+            [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+                                                httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_get", res.status);
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto group = scim_store->get_group_by_id(id);
+                if (!group) {
+                    send_scim_error(res, 404, "resource not found");
+                    record_request(auth_mgr, "group_get", 404);
+                    return;
+                }
+                auto members = scim_store->list_group_member_user_scim_ids(id);
+                res.set_content(scim::group_to_json(*group, members, groups_location_base(req),
+                                                    location_base(req))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_get", 200);
+            });
+
+    // ── GET /scim/v2/Groups — list / filter. ──────────────────────────────
+
+    sink.Get("/scim/v2/Groups",
+            [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+                                                httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_list", res.status);
+                    return;
+                }
+                auto gbase = groups_location_base(req);
+                auto ubase = location_base(req);
+
+                int start_index = 1;
+                if (req.has_param("startIndex")) {
+                    auto parsed =
+                        parse_scim_int_param(res, req.get_param_value("startIndex"), "startIndex");
+                    if (!parsed) {
+                        record_request(auth_mgr, "group_list", 400);
+                        return;
+                    }
+                    start_index = *parsed;
+                    if (start_index < 1)
+                        start_index = 1;
+                }
+                int count = 100;
+                if (req.has_param("count")) {
+                    auto parsed = parse_scim_int_param(res, req.get_param_value("count"), "count");
+                    if (!parsed) {
+                        record_request(auth_mgr, "group_list", 400);
+                        return;
+                    }
+                    count = *parsed;
+                }
+                if (count > scim::kMaxScimListResults)
+                    count = scim::kMaxScimListResults;
+
+                if (req.has_param("filter")) {
+                    auto filter_name = scim::parse_displayname_filter(req.get_param_value("filter"));
+                    if (!filter_name) {
+                        send_scim_error(res, filter_name.error());
+                        record_request(auth_mgr, "group_list", filter_name.error().status);
+                        return;
+                    }
+                    std::vector<json> resources;
+                    int total = 0;
+                    if (auto group = scim_store->get_group_by_display_name(*filter_name)) {
+                        auto members = scim_store->list_group_member_user_scim_ids(group->scim_id);
+                        resources.push_back(scim::group_to_json(*group, members, gbase, ubase));
+                        total = 1;
+                    }
+                    res.set_content(
+                        scim::list_response(resources, total, 1,
+                                           static_cast<int>(resources.size()))
+                            .dump(),
+                        kScimJson);
+                    record_request(auth_mgr, "group_list", 200);
+                    return;
+                }
+
+                int total = 0;
+                auto page = scim_store->list_groups(start_index, count, total);
+                std::vector<json> resources;
+                resources.reserve(page.size());
+                for (const auto& g : page) {
+                    auto members = scim_store->list_group_member_user_scim_ids(g.scim_id);
+                    resources.push_back(scim::group_to_json(g, members, gbase, ubase));
+                }
+                res.set_content(scim::list_response(resources, total, start_index,
+                                                    static_cast<int>(resources.size()))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_list", 200);
+            });
+
+    // ── PUT /scim/v2/Groups/{id} — full replace. ──────────────────────────
+
+    sink.Put(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+            [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_replace", res.status);
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto group = scim_store->get_group_by_id(id);
+                if (!group) {
+                    send_scim_error(res, 404, "resource not found");
+                    record_request(auth_mgr, "group_replace", 404);
+                    return;
+                }
+                if (req.body.size() > kMaxBodyBytes) {
+                    send_scim_error(res, 413, "request body too large");
+                    record_request(auth_mgr, "group_replace", 413);
+                    return;
+                }
+                json body;
+                try {
+                    body = json::parse(req.body);
+                } catch (const std::exception&) {
+                    send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+                    record_request(auth_mgr, "group_replace", 400);
+                    return;
+                }
+                auto parsed = scim::parse_group(body);
+                if (!parsed) {
+                    send_scim_error(res, parsed.error());
+                    record_request(auth_mgr, "group_replace", parsed.error().status);
+                    return;
+                }
+                const auto& input = *parsed;
+
+                // Snapshot membership BEFORE the replace so the recompute
+                // below can cover the union of old+new (a PUT replace can
+                // both add and remove members in the same call — spec
+                // trigger (a), "for PUT also the REMOVED members").
+                auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                auto new_members = resolve_member_values(scim_store, input.member_values);
+
+                if (!scim_store->update_group(id, input.display_name, input.external_id)) {
+                    send_scim_error(res, 500, "failed to update the SCIM group");
+                    record_request(auth_mgr, "group_replace", 500);
+                    return;
+                }
+                if (!scim_store->set_group_members(id, new_members)) {
+                    spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}", id);
+                    send_scim_error(res, 500, "failed to persist group membership");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                         "Group");
+                    record_request(auth_mgr, "group_replace", 500);
+                    return;
+                }
+
+                std::vector<std::string> affected = old_members;
+                for (const auto& m : new_members)
+                    if (std::find(affected.begin(), affected.end(), m) == affected.end())
+                        affected.push_back(m);
+                for (const auto& uid : affected)
+                    recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                             scim_admin_group);
+
+                auto updated = scim_store->get_group_by_id(id);
+                if (!updated) {
+                    spdlog::error("ScimRoutes: PUT Groups — group scim_id={} vanished "
+                                 "mid-request",
+                                 id);
+                    send_scim_error(res, 500, "resource state changed mid-request");
+                    record_request(auth_mgr, "group_replace", 500);
+                    return;
+                }
+                audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
+                     "Group");
+                res.set_content(scim::group_to_json(*updated, new_members,
+                                                    groups_location_base(req), location_base(req))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_replace", 200);
+            });
+
+    // ── PATCH /scim/v2/Groups/{id} — the critical role-driving path. ──────
+
+    sink.Patch(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+              [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+                  if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                      record_request(auth_mgr, "group_patch", res.status);
+                      return;
+                  }
+                  auto id = req.matches[1].str();
+                  auto group = scim_store->get_group_by_id(id);
+                  if (!group) {
+                      send_scim_error(res, 404, "resource not found");
+                      record_request(auth_mgr, "group_patch", 404);
+                      return;
+                  }
+                  if (req.body.size() > kMaxBodyBytes) {
+                      send_scim_error(res, 413, "request body too large");
+                      record_request(auth_mgr, "group_patch", 413);
+                      return;
+                  }
+                  json body;
+                  try {
+                      body = json::parse(req.body);
+                  } catch (const std::exception&) {
+                      send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+                      record_request(auth_mgr, "group_patch", 400);
+                      return;
+                  }
+                  auto parsed = scim::parse_group_patch(body);
+                  if (!parsed) {
+                      send_scim_error(res, parsed.error());
+                      record_request(auth_mgr, "group_patch", parsed.error().status);
+                      return;
+                  }
+                  const auto& patch = *parsed;
+
+                  if (patch.display_name.has_value() || patch.external_id.has_value()) {
+                      std::string new_display = patch.display_name.value_or(group->display_name);
+                      std::string new_external = patch.external_id.value_or(group->external_id);
+                      if (!scim_store->update_group(id, new_display, new_external)) {
+                          send_scim_error(res, 500, "failed to update the SCIM group");
+                          record_request(auth_mgr, "group_patch", 500);
+                          return;
+                      }
+                  }
+
+                  // #2021 trigger (b): every member ADDED and every member
+                  // REMOVED by this PATCH gets a recompute below.
+                  std::vector<std::string> affected_added;
+                  std::vector<std::string> affected_removed;
+
+                  if (patch.replace_members.has_value()) {
+                      // A `replace` on `members` in the same body as
+                      // add/remove ops is not a shape real IdPs send in
+                      // practice; `replace` wins if present.
+                      auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                      auto new_members = resolve_member_values(scim_store, *patch.replace_members);
+                      if (!scim_store->set_group_members(id, new_members)) {
+                          spdlog::error("ScimRoutes: set_group_members failed for group "
+                                       "scim_id={}",
+                                       id);
+                          send_scim_error(res, 500, "failed to persist group membership");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                               {}, "Group");
+                          record_request(auth_mgr, "group_patch", 500);
+                          return;
+                      }
+                      affected_added = new_members;
+                      for (const auto& m : old_members)
+                          if (std::find(affected_added.begin(), affected_added.end(), m) ==
+                              affected_added.end())
+                              affected_added.push_back(m);
+                  } else {
+                      if (patch.remove_all_members) {
+                          affected_removed = scim_store->list_group_member_user_scim_ids(id);
+                          if (!scim_store->set_group_members(id, {})) {
+                              spdlog::error("ScimRoutes: set_group_members(remove-all) failed "
+                                           "for group scim_id={}",
+                                           id);
+                              send_scim_error(res, 500, "failed to persist group membership");
+                              audit(auth_mgr, audit_store, req, "scim.group.updated", "failure",
+                                   id, {}, "Group");
+                              record_request(auth_mgr, "group_patch", 500);
+                              return;
+                          }
+                      } else {
+                          for (const auto& v : patch.members_to_remove) {
+                              if (!scim_store->remove_group_member(id, v)) {
+                                  spdlog::error("ScimRoutes: remove_group_member failed for "
+                                               "group scim_id={} member={}",
+                                               id, v);
+                                  send_scim_error(res, 500, "failed to persist group membership");
+                                  audit(auth_mgr, audit_store, req, "scim.group.updated",
+                                       "failure", id, {}, "Group");
+                                  record_request(auth_mgr, "group_patch", 500);
+                                  return;
+                              }
+                              affected_removed.push_back(v);
+                          }
+                      }
+
+                      auto members_to_add = resolve_member_values(scim_store, patch.members_to_add);
+                      for (const auto& v : members_to_add) {
+                          if (!scim_store->add_group_member(id, v)) {
+                              spdlog::error("ScimRoutes: add_group_member failed for group "
+                                           "scim_id={} member={}",
+                                           id, v);
+                              send_scim_error(res, 500, "failed to persist group membership");
+                              audit(auth_mgr, audit_store, req, "scim.group.updated", "failure",
+                                   id, {}, "Group");
+                              record_request(auth_mgr, "group_patch", 500);
+                              return;
+                          }
+                          affected_added.push_back(v);
+                      }
+                  }
+
+                  for (const auto& uid : affected_added)
+                      recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                               scim_admin_group);
+                  for (const auto& uid : affected_removed)
+                      recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                               scim_admin_group);
+
+                  auto updated = scim_store->get_group_by_id(id);
+                  if (!updated) {
+                      spdlog::error("ScimRoutes: PATCH Groups — group scim_id={} vanished "
+                                   "mid-request",
+                                   id);
+                      send_scim_error(res, 500, "resource state changed mid-request");
+                      record_request(auth_mgr, "group_patch", 500);
+                      return;
+                  }
+                  auto members = scim_store->list_group_member_user_scim_ids(id);
+                  audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
+                       "Group");
+                  res.set_content(scim::group_to_json(*updated, members, groups_location_base(req),
+                                                      location_base(req))
+                                      .dump(),
+                                  kScimJson);
+                  record_request(auth_mgr, "group_patch", 200);
+              });
+
+    // ── DELETE /scim/v2/Groups/{id} ────────────────────────────────────────
+
+    sink.Delete(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+               [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                       record_request(auth_mgr, "group_delete", res.status);
+                       return;
+                   }
+                   auto id = req.matches[1].str();
+                   auto group = scim_store->get_group_by_id(id);
+                   if (!group) {
+                       send_scim_error(res, 404, "resource not found");
+                       record_request(auth_mgr, "group_delete", 404);
+                       return;
+                   }
+                   // #2021 trigger (c): snapshot the full membership BEFORE
+                   // delete_group tears down the scim_group_members rows
+                   // alongside the group (ScimStore::delete_group's doc
+                   // comment) — these are the users who lose this group.
+                   auto former_members = scim_store->list_group_member_user_scim_ids(id);
+
+                   auto delete_result = scim_store->delete_group(id);
+                   if (!delete_result.has_value()) {
+                       spdlog::error("ScimRoutes: ScimStore::delete_group failed for scim_id={}",
+                                    id);
+                       send_scim_error(res, 500, "failed to remove the SCIM group");
+                       audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id, {},
+                            "Group");
+                       record_request(auth_mgr, "group_delete", 500);
+                       return;
+                   }
+                   if (!*delete_result) {
+                       spdlog::info("ScimRoutes: DELETE Groups scim_id={} — already gone "
+                                   "(concurrent/duplicate DELETE); treating as idempotent "
+                                   "success",
+                                   id);
+                   }
+
+                   for (const auto& uid : former_members)
+                       recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                scim_admin_group);
+
+                   audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id, {},
+                        "Group");
+                   res.status = 204;
+                   record_request(auth_mgr, "group_delete", 204);
                });
 }
 

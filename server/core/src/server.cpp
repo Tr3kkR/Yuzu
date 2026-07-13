@@ -771,8 +771,10 @@ public:
         // alert rules can be authored up front; the series simply never
         // increments on a disabled surface.
         metrics_.describe("yuzu_scim_requests_total",
-                          "Total /scim/v2/Users requests, by op "
-                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "Total /scim/v2/Users and /scim/v2/Groups (#2021) requests, by op "
+                          "(create|get|list|replace|patch|delete for Users; "
+                          "group_create|group_get|group_list|group_replace|group_patch|"
+                          "group_delete for Groups) and status (2xx|4xx|5xx)",
                           "counter");
         metrics_.describe("yuzu_scim_auth_failures_total",
                           "Total /scim/v2/* requests rejected by the bearer gate — a "
@@ -793,6 +795,19 @@ public:
                           "provisioning_source is not 'scim' (or its role was elevated outside "
                           "SCIM's ownership) — SCIM attempting to touch an account it does not "
                           "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
+        // SCIM v2 Groups->role application core (#2021). Bumped only when
+        // recompute_scim_user_role ACTUALLY changes a role (promotion or
+        // demotion via group membership) — never on a no-op recompute, and
+        // never for a value that fails the provenance guard (see
+        // yuzu_scim_provenance_denied_total for that refusal class, though
+        // this particular guard doesn't bump it — recompute_scim_user_role
+        // just silently declines).
+        metrics_.describe("yuzu_scim_role_changes_total",
+                          "Total SCIM-provisioned user role changes applied via SCIM Group "
+                          "membership (--scim-admin-group), by the group-membership-driven "
+                          "role-recompute core — a sustained rate is a normal signal of IdP "
+                          "group-membership churn, not itself an anomaly",
                           "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
@@ -10281,7 +10296,7 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get());
+                                          audit_store_.get(), cfg_.scim_admin_group);
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set

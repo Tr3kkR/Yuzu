@@ -74,7 +74,10 @@ struct Fixture {
     /// `AuditStore::log()` call returns false thereafter — used to exercise
     /// the set-and-proceed vs. fail-closed audit contract
     /// (M-AUDIT-FAILCLOSED) without needing mid-test fault injection.
-    explicit Fixture(bool broken_audit = false) {
+    /// `scim_admin_group` mirrors `Config::scim_admin_group` (#2021
+    /// Groups->role) — empty (the default) means no SCIM group ever
+    /// promotes to admin.
+    explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
         std::filesystem::create_directories(data_dir);
         auth_db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
         REQUIRE(auth_db->initialize().has_value());
@@ -94,7 +97,8 @@ struct Fixture {
         }
 
         routes = std::make_unique<ScimRoutes>();
-        routes->register_routes(sink, scim_store.get(), &auth_mgr, audit_store.get());
+        routes->register_routes(sink, scim_store.get(), &auth_mgr, audit_store.get(),
+                                std::move(scim_admin_group));
     }
 
     ~Fixture() {
@@ -1325,8 +1329,10 @@ struct ScimIntegrationServer {
     RateLimiter rate_limiter;
     yuzu::MetricsRegistry metrics;
     const std::string token{"integration-test-scim-bearer-0123456789"};
+    std::string scim_admin_group;
 
-    explicit ScimIntegrationServer(int rate_per_second = 100) : rate_limiter(rate_per_second) {}
+    explicit ScimIntegrationServer(int rate_per_second = 100, std::string admin_group = {})
+        : rate_limiter(rate_per_second), scim_admin_group(std::move(admin_group)) {}
 
     void start() {
         std::filesystem::create_directories(data_dir);
@@ -1379,7 +1385,8 @@ struct ScimIntegrationServer {
             });
 
         routes = std::make_unique<ScimRoutes>();
-        routes->register_routes(svr, scim_store.get(), &auth_mgr, audit_store.get());
+        routes->register_routes(svr, scim_store.get(), &auth_mgr, audit_store.get(),
+                                scim_admin_group);
 
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
@@ -1404,6 +1411,19 @@ struct ScimIntegrationServer {
         std::filesystem::remove_all(data_dir, ec);
     }
 };
+
+/// Provision a SCIM user over real HTTP and return its `id`. Fails the test
+/// (via REQUIRE) rather than returning an error — every caller needs a
+/// live scim_id to proceed.
+std::string create_scim_user_over_wire(httplib::Client& cli, const std::string& token,
+                                       const std::string& username) {
+    httplib::Headers hdr{{"Authorization", "Bearer " + token}};
+    auto r = cli.Post("/scim/v2/Users", hdr, json{{"userName", username}}.dump(),
+                      "application/scim+json");
+    REQUIRE(r);
+    REQUIRE(r->status == 201);
+    return json::parse(r->body)["id"].get<std::string>();
+}
 
 } // namespace
 
@@ -1531,6 +1551,277 @@ TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 
                        "application/scim+json");
     REQUIRE(r2);
     CHECK(r2->status == 201);
+}
+
+// ── SCIM v2 Groups (#2021, slice 2) — real httplib::Server + Client ─────────
+//
+// Same rationale as the H1 section above (PR #2018's HIGH bugs slipped
+// because tests bypassed the `pre_routing_handler`) — every Group-route
+// test in this section drives the surface over the wire, never through
+// TestRouteSink.
+
+TEST_CASE("Groups integration: POST creates a group — 201, GET finds it, unknown id is 404 not "
+         "403",
+         "[scim][routes][integration][groups]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto post_res = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Engineering"})",
+                             "application/scim+json");
+    REQUIRE(post_res);
+    CHECK(post_res->status == 201);
+    CHECK(post_res->has_header("Location"));
+    auto body = json::parse(post_res->body);
+    CHECK(body["displayName"] == "Engineering");
+    auto id = body["id"].get<std::string>();
+
+    auto get_res = cli.Get(("/scim/v2/Groups/" + id).c_str(), hdr);
+    REQUIRE(get_res);
+    CHECK(get_res->status == 200);
+    CHECK(json::parse(get_res->body)["displayName"] == "Engineering");
+
+    // Unknown id: 404, never 403 (no existence oracle — mirrors the Users
+    // surface's posture).
+    auto missing_get = cli.Get("/scim/v2/Groups/deadbeefdeadbeefdeadbeefdeadbeef", hdr);
+    REQUIRE(missing_get);
+    CHECK(missing_get->status == 404);
+
+    auto missing_del = cli.Delete("/scim/v2/Groups/deadbeefdeadbeefdeadbeefdeadbeef", hdr);
+    REQUIRE(missing_del);
+    CHECK(missing_del->status == 404);
+}
+
+TEST_CASE("Groups integration: bogus bearer against /scim/v2/Groups is 401, missing bearer is "
+         "401",
+         "[scim][routes][integration][groups][auth]") {
+    ScimIntegrationServer ts;
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+
+    httplib::Headers bogus{{"Authorization", "Bearer totally-wrong-token"}};
+    auto r1 = cli.Post("/scim/v2/Groups", bogus, R"({"displayName":"X"})",
+                       "application/scim+json");
+    REQUIRE(r1);
+    CHECK(r1->status == 401);
+
+    auto r2 = cli.Get("/scim/v2/Groups");
+    REQUIRE(r2);
+    CHECK(r2->status == 401);
+}
+
+TEST_CASE("Groups integration: promotion — PATCH-adding a SCIM user to the admin group promotes "
+         "them, removing demotes them back",
+         "[scim][routes][integration][groups][promotion]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "grace");
+    REQUIRE(ts.auth_mgr.get_user_role("grace").value() == auth::Role::user);
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+    // The group role-application core ran synchronously inside the PATCH
+    // handler (see recompute_scim_user_role) — no polling/eventual
+    // consistency needed.
+    CHECK(ts.auth_mgr.get_user_role("grace").value() == auth::Role::admin);
+
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    auto patch_res2 = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, remove_body.dump(),
+                                "application/scim+json");
+    REQUIRE(patch_res2);
+    CHECK(patch_res2->status == 200);
+    CHECK(ts.auth_mgr.get_user_role("grace").value() == auth::Role::user);
+}
+
+TEST_CASE("Groups integration: PROVENANCE — a group member value mapping to a local (non-SCIM) "
+         "admin never changes that account's role, and never audits scim.user.role_changed for "
+         "it",
+         "[scim][routes][integration][groups][provenance]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    // A local admin, created OUTSIDE the SCIM path — mirrors first-run-setup
+    // / an operator-run `yuzu-server --add-user`.
+    REQUIRE(ts.auth_mgr.upsert_user("root-admin", "correct-horse-battery-staple",
+                                    auth::Role::admin));
+    REQUIRE(ts.auth_db->get_provisioning_source("root-admin").value() == "local");
+    // Craft a scim_resource mapping pointing at the local account (the
+    // defense-in-depth scenario the Users provenance guard already covers —
+    // e.g. an operator hand-editing scim_resources, or a future bug) so a
+    // Group member `value` CAN reference it by scim_id.
+    auto local_admin_mapping = ts.scim_store->create_resource("root-admin");
+    REQUIRE(local_admin_mapping.has_value());
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json add_body{
+        {"Operations",
+         json::array({{{"op", "add"},
+                       {"path", "members"},
+                       {"value", json::array({{{"value", local_admin_mapping->scim_id}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+
+    // The local admin's role/provenance are COMPLETELY untouched.
+    CHECK(ts.auth_mgr.get_user_role("root-admin").value() == auth::Role::admin);
+    CHECK(ts.auth_db->get_provisioning_source("root-admin").value() == "local");
+
+    // No scim.user.role_changed audit row was ever written for this target.
+    AuditQuery q;
+    q.action = "scim.user.role_changed";
+    q.target_id = local_admin_mapping->scim_id;
+    auto rows = ts.audit_store->query(q);
+    CHECK(rows.empty());
+
+    // The membership ITSELF is a valid store operation (the local admin's
+    // scim_id IS a live scim_resource row — the routes layer's
+    // validate-and-skip only rejects a value that resolves to NO scim
+    // resource at all; it does not, and must not, need to know about
+    // provenance to decide what a Group's membership list contains). The
+    // security boundary is entirely at ROLE APPLICATION — proven above by
+    // the untouched role/provenance and the missing audit row.
+    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res);
+    auto members = json::parse(get_res->body)["members"];
+    bool found = false;
+    for (const auto& m : members)
+        if (m["value"] == local_admin_mapping->scim_id)
+            found = true;
+    CHECK(found);
+
+    // Control: a BOGUS member value (never resolves to any SCIM User
+    // resource at all) IS validate-and-skip'd — the PATCH still succeeds
+    // and simply never persists that membership.
+    json bogus_body{{"Operations",
+                     json::array({{{"op", "add"},
+                                   {"path", "members"},
+                                   {"value", json::array({{{"value", "deadbeefdeadbeef"}}})}}})}};
+    auto patch_res2 = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, bogus_body.dump(),
+                                "application/scim+json");
+    REQUIRE(patch_res2);
+    CHECK(patch_res2->status == 200);
+    auto get_res2 = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+    REQUIRE(get_res2);
+    auto members2 = json::parse(get_res2->body)["members"];
+    for (const auto& m : members2)
+        CHECK(m["value"] != "deadbeefdeadbeef");
+}
+
+TEST_CASE("Groups integration: deprovision ordering — a group-elevated admin cannot be SCIM-"
+         "deprovisioned until the IdP removes them from the admin group",
+         "[scim][routes][integration][groups][deprovision-ordering]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "hank");
+
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto promote_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                                 "application/scim+json");
+    REQUIRE(promote_res);
+    REQUIRE(promote_res->status == 200);
+    REQUIRE(ts.auth_mgr.get_user_role("hank").value() == auth::Role::admin);
+
+    // Group-elevated — deprovision_role_ok refuses exactly like an
+    // operator-elevated account. 404, never 403.
+    auto del1 = cli.Delete(("/scim/v2/Users/" + user_id).c_str(), hdr);
+    REQUIRE(del1);
+    CHECK(del1->status == 404);
+    CHECK(ts.auth_mgr.get_user_role("hank").value() == auth::Role::admin);
+
+    // The IdP removes them from the admin group — demotes back to 'user'.
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    auto demote_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, remove_body.dump(),
+                                "application/scim+json");
+    REQUIRE(demote_res);
+    REQUIRE(demote_res->status == 200);
+    REQUIRE(ts.auth_mgr.get_user_role("hank").value() == auth::Role::user);
+
+    // NOW the deprovision succeeds.
+    auto del2 = cli.Delete(("/scim/v2/Users/" + user_id).c_str(), hdr);
+    REQUIRE(del2);
+    CHECK(del2->status == 204);
+}
+
+TEST_CASE("Groups integration: --scim-admin-group unset (empty) — group membership never "
+         "promotes anyone",
+         "[scim][routes][integration][groups][admin-group-unset]") {
+    ScimIntegrationServer ts; // no admin_group argument — empty by default
+    ts.start();
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto user_id = create_scim_user_over_wire(cli, ts.token, "ivy");
+
+    // Even a group literally named "Yuzu-Admins" (or anything else) cannot
+    // promote when scim_admin_group is unconfigured — resolve_role_from_groups
+    // never matches against an empty admin_group.
+    auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"Yuzu-Admins"})",
+                               "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    auto patch_res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr, add_body.dump(),
+                               "application/scim+json");
+    REQUIRE(patch_res);
+    CHECK(patch_res->status == 200);
+    CHECK(ts.auth_mgr.get_user_role("ivy").value() == auth::Role::user);
 }
 
 #endif // YUZU_SCIM_TSAN_BUILD

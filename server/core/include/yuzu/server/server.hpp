@@ -281,6 +281,11 @@ struct Config {
     /// Required (fail-closed) whenever scim_enable is true. Wired via
     /// --scim-token / YUZU_SCIM_TOKEN.
     std::string scim_token;
+    /// SCIM Group `displayName` (from ScimStore's scim_groups table) that
+    /// maps to admin role — mirrors --saml-admin-group's group-to-role
+    /// pattern (#2021, slice 2). Empty (the default) means no SCIM group
+    /// grants admin. Wired via --scim-admin-group / YUZU_SCIM_ADMIN_GROUP.
+    std::string scim_admin_group;
 
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests

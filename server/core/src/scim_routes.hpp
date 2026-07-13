@@ -5,8 +5,20 @@
 ///
 /// Wires the storage layer (`ScimStore`, slice 1) and JSON codec (`yuzu::
 /// server::scim`, slice 2) into an HTTP surface an enterprise IdP (Okta/
-/// Entra) drives to auto-provision and auto-deprovision Yuzu operators.
-/// Users-only in this slice — no Groups resource.
+/// Entra) drives to auto-provision and auto-deprovision Yuzu operators, and
+/// (#2021, slice 2) auto-manage Group membership feeding SCIM-group->Yuzu-
+/// role resolution.
+///
+/// SECURITY-CRITICAL — role application core: `recompute_scim_user_role`
+/// (scim_routes.cpp) re-derives a SCIM-provisioned user's role from their
+/// CURRENT SCIM group memberships (via `auth::resolve_role_from_groups` and
+/// the configured `--scim-admin-group`) every time membership could have
+/// changed (Group POST/PUT/PATCH/DELETE, User POST/revive). It is gated on
+/// the SAME provenance guard as every other mutation on this surface
+/// (`AuthDB::get_provisioning_source(username) == "scim"`) — a Group
+/// `members[].value` that resolves to a local/break-glass/non-SCIM account
+/// NEVER changes that account's role, even if an IdP is compromised or
+/// misconfigured into referencing it.
 ///
 /// AUTH MODEL: every route (including discovery) is gated on a static Bearer
 /// token validated against `ScimStore` (sha256 + constant-time compare) —
@@ -59,13 +71,16 @@ public:
     /// only constructs/registers this class when `--scim-enable` is set, so in
     /// practice all three are always non-null on this path — the null checks in
     /// scim_routes.cpp are defense-in-depth for the test harness and any future
-    /// caller that constructs it before its deps are ready.
+    /// caller that constructs it before its deps are ready. `scim_admin_group`
+    /// is `Config::scim_admin_group` (`--scim-admin-group`/
+    /// `YUZU_SCIM_ADMIN_GROUP`) — empty means no SCIM group ever promotes to
+    /// admin (see `recompute_scim_user_role`).
     void register_routes(httplib::Server& svr, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store);
+                         AuditStore* audit_store, std::string scim_admin_group = {});
 
     /// Testable overload — register against an in-process sink (no socket).
     void register_routes(HttpRouteSink& sink, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store);
+                         AuditStore* audit_store, std::string scim_admin_group = {});
 };
 
 } // namespace yuzu::server

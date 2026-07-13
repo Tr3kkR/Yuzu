@@ -283,17 +283,25 @@ TEST_CASE("scim_json: resource_types shape", "[scim][json]") {
     auto j = resource_types();
     CHECK(j["schemas"][0] == std::string(kSchemaListResponse));
     REQUIRE(j["Resources"].is_array());
-    REQUIRE(j["Resources"].size() == 1);
+    // #2021 (Groups->role): now advertises BOTH User and Group resource
+    // types.
+    REQUIRE(j["Resources"].size() == 2);
     CHECK(j["Resources"][0]["id"] == "User");
     CHECK(j["Resources"][0]["endpoint"] == "/Users");
     CHECK(j["Resources"][0]["schema"] == std::string(kSchemaUser));
+    CHECK(j["Resources"][1]["id"] == "Group");
+    CHECK(j["Resources"][1]["endpoint"] == "/Groups");
+    CHECK(j["Resources"][1]["schema"] == std::string(kSchemaGroup));
 }
 
 TEST_CASE("scim_json: schemas shape", "[scim][json]") {
     auto j = schemas();
     CHECK(j["schemas"][0] == std::string(kSchemaListResponse));
     REQUIRE(j["Resources"].is_array());
-    REQUIRE(j["Resources"].size() == 1);
+    // #2021 (Groups->role): now advertises BOTH the User and Group schemas.
+    REQUIRE(j["Resources"].size() == 2);
     CHECK(j["Resources"][0]["id"] == std::string(kSchemaUser));
     REQUIRE(j["Resources"][0]["attributes"].is_array());
+    CHECK(j["Resources"][1]["id"] == std::string(kSchemaGroup));
+    REQUIRE(j["Resources"][1]["attributes"].is_array());
 }

@@ -19,6 +19,108 @@ bool ieq(std::string_view a, std::string_view b) {
            });
 }
 
+/// Shared `<attr> eq "<value>"` filter parser backing both
+/// `parse_username_filter` (attr "userName") and `parse_displayname_filter`
+/// (attr "displayName") — same trim/split/unescape logic, parameterized on
+/// the expected attribute name so neither public entry point's behavior
+/// changes.
+std::expected<std::string, ScimError> parse_eq_filter(std::string_view filter,
+                                                      std::string_view attr_name) {
+    auto fail = [] {
+        return std::unexpected(ScimError{400, "invalidFilter", "unsupported filter"});
+    };
+
+    std::string_view s = filter;
+    auto trim = [](std::string_view v) {
+        size_t b = v.find_first_not_of(" \t");
+        if (b == std::string_view::npos)
+            return std::string_view{};
+        size_t e = v.find_last_not_of(" \t");
+        return v.substr(b, e - b + 1);
+    };
+    s = trim(s);
+
+    size_t sp1 = s.find_first_of(" \t");
+    if (sp1 == std::string_view::npos)
+        return fail();
+    std::string_view attr = s.substr(0, sp1);
+    if (!ieq(attr, attr_name))
+        return fail();
+
+    s = trim(s.substr(sp1));
+
+    size_t sp2 = s.find_first_of(" \t");
+    if (sp2 == std::string_view::npos)
+        return fail();
+    std::string_view op = s.substr(0, sp2);
+    if (!ieq(op, "eq"))
+        return fail();
+
+    s = trim(s.substr(sp2));
+
+    if (s.size() < 2 || s.front() != '"' || s.back() != '"')
+        return fail();
+    std::string_view quoted = s.substr(1, s.size() - 2);
+
+    std::string value;
+    value.reserve(quoted.size());
+    for (size_t i = 0; i < quoted.size(); ++i) {
+        char c = quoted[i];
+        if (c == '\\' && i + 1 < quoted.size() &&
+            (quoted[i + 1] == '"' || quoted[i + 1] == '\\')) {
+            value.push_back(quoted[i + 1]);
+            ++i;
+        } else if (c == '"' || c == '\\') {
+            return fail();
+        } else {
+            value.push_back(c);
+        }
+    }
+
+    return value;
+}
+
+/// `members[value eq "<id>"]` valueFilter path parser (RFC 7644 §3.5.2) used
+/// only by `parse_group_patch`'s `remove` handling — not exported. Returns
+/// the unescaped member id, or `nullopt` for anything not matching this
+/// exact shape (caller treats that as "unsupported path", a 400).
+std::optional<std::string> parse_members_value_filter(std::string_view path) {
+    constexpr std::string_view kPrefix = "members[";
+    if (path.size() <= kPrefix.size() || path.back() != ']')
+        return std::nullopt;
+    if (!ieq(path.substr(0, kPrefix.size()), kPrefix))
+        return std::nullopt;
+    std::string_view inner = path.substr(kPrefix.size(), path.size() - kPrefix.size() - 1);
+    auto result = parse_eq_filter(inner, "value");
+    if (!result)
+        return std::nullopt;
+    return *result;
+}
+
+/// Extract member ids from a SCIM `members` value array — each entry is
+/// expected to be `{"value": "<id>", ...}` (extra IdP-sent attributes like
+/// `display`/`$ref`/`type` are ignored); a bare string entry is tolerated
+/// too, since some connectors send `members` as a plain array of ids rather
+/// than the full RFC shape. Any other entry shape is a 400.
+std::expected<std::vector<std::string>, ScimError> extract_member_values(const nlohmann::json& arr) {
+    if (!arr.is_array()) {
+        return std::unexpected(ScimError{400, "invalidValue", "members value must be an array"});
+    }
+    std::vector<std::string> out;
+    out.reserve(arr.size());
+    for (const auto& item : arr) {
+        if (item.is_object() && item.contains("value") && item["value"].is_string()) {
+            out.push_back(item["value"].get<std::string>());
+        } else if (item.is_string()) {
+            out.push_back(item.get<std::string>());
+        } else {
+            return std::unexpected(
+                ScimError{400, "invalidValue", "each members entry requires a string 'value'"});
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 // ── User resource codec ─────────────────────────────────────────────────────
@@ -199,6 +301,212 @@ std::expected<ScimPatch, ScimError> parse_patch(const nlohmann::json& body) {
     return patch;
 }
 
+// ── Group resource codec (#2021 slice 2) ────────────────────────────────────
+
+nlohmann::json group_to_json(const ScimGroup& g, const std::vector<std::string>& member_scim_ids,
+                             std::string_view group_location_base,
+                             std::string_view users_location_base) {
+    nlohmann::json j;
+    j["schemas"] = nlohmann::json::array({kSchemaGroup});
+    j["id"] = g.scim_id;
+    j["displayName"] = g.display_name;
+    if (!g.external_id.empty())
+        j["externalId"] = g.external_id;
+
+    nlohmann::json members = nlohmann::json::array();
+    for (const auto& uid : member_scim_ids) {
+        nlohmann::json m;
+        m["value"] = uid;
+        m["$ref"] = std::string(users_location_base) + "/" + uid;
+        m["type"] = "User";
+        members.push_back(std::move(m));
+    }
+    j["members"] = std::move(members);
+
+    nlohmann::json meta;
+    meta["resourceType"] = "Group";
+    meta["created"] = g.created_at;
+    meta["lastModified"] = g.updated_at;
+    meta["version"] = "W/\"" + std::to_string(g.etag_version) + "\"";
+    meta["location"] = std::string(group_location_base) + "/" + g.scim_id;
+    j["meta"] = std::move(meta);
+
+    return j;
+}
+
+std::expected<ScimGroupInput, ScimError> parse_group(const nlohmann::json& body) {
+    if (!body.is_object()) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "request body must be a JSON object"});
+    }
+
+    ScimGroupInput input;
+    if (body.contains("displayName") && !body["displayName"].is_string()) {
+        return std::unexpected(ScimError{400, "invalidValue", "displayName must be a string"});
+    }
+    input.display_name = body.value("displayName", std::string{});
+    if (input.display_name.empty()) {
+        return std::unexpected(ScimError{400, "invalidValue", "displayName is required"});
+    }
+
+    if (body.contains("externalId") && !body["externalId"].is_string()) {
+        return std::unexpected(ScimError{400, "invalidValue", "externalId must be a string"});
+    }
+    input.external_id = body.value("externalId", std::string{});
+    if (input.external_id.size() > kMaxExternalIdLength) {
+        return std::unexpected(
+            ScimError{400, "invalidValue",
+                     "externalId exceeds the maximum length of " +
+                         std::to_string(kMaxExternalIdLength) + " bytes"});
+    }
+
+    if (body.contains("members")) {
+        auto members = extract_member_values(body["members"]);
+        if (!members)
+            return std::unexpected(members.error());
+        input.member_values = std::move(*members);
+    }
+
+    return input;
+}
+
+std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json& body) {
+    if (!body.is_object() || !body.contains("Operations") ||
+        !body["Operations"].is_array() || body["Operations"].empty()) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "Operations array is required and must not be empty"});
+    }
+
+    ScimGroupPatch patch;
+
+    for (const auto& operation : body["Operations"]) {
+        if (!operation.is_object() || !operation.contains("op") ||
+            !operation["op"].is_string()) {
+            return std::unexpected(
+                ScimError{400, "invalidValue", "each operation requires a string 'op'"});
+        }
+        const std::string op = operation["op"].get<std::string>();
+
+        std::string path;
+        if (operation.contains("path") && operation["path"].is_string())
+            path = operation["path"].get<std::string>();
+
+        if (ieq(op, "add")) {
+            if (!operation.contains("value")) {
+                return std::unexpected(ScimError{400, "invalidValue", "'add' requires a 'value'"});
+            }
+            const auto& value = operation["value"];
+            if (path.empty() || ieq(path, "members")) {
+                auto members = extract_member_values(value);
+                if (!members)
+                    return std::unexpected(members.error());
+                patch.members_to_add.insert(patch.members_to_add.end(), members->begin(),
+                                            members->end());
+            } else if (ieq(path, "displayName")) {
+                if (!value.is_string()) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "displayName value must be a string"});
+                }
+                patch.display_name = value.get<std::string>();
+            } else if (ieq(path, "externalId")) {
+                if (!value.is_string()) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                patch.external_id = value.get<std::string>();
+            } else {
+                return std::unexpected(
+                    ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
+            }
+        } else if (ieq(op, "remove")) {
+            // Unlike Users' `remove` (a documented tolerant no-op — see
+            // parse_patch), Group `remove` on `members` is meaningful and
+            // load-bearing (it demotes a group-elevated admin), so a
+            // missing/unsupported path here is a 400, not a silent no-op.
+            if (path.empty()) {
+                return std::unexpected(
+                    ScimError{400, "invalidPath", "'remove' requires a path"});
+            }
+            if (ieq(path, "members")) {
+                if (operation.contains("value") && !operation["value"].is_null()) {
+                    auto members = extract_member_values(operation["value"]);
+                    if (!members)
+                        return std::unexpected(members.error());
+                    patch.members_to_remove.insert(patch.members_to_remove.end(),
+                                                   members->begin(), members->end());
+                } else {
+                    // `remove` with no filter/value on the bare `members`
+                    // path means "remove every member" (RFC 7644 §3.5.2.2).
+                    patch.remove_all_members = true;
+                }
+            } else if (auto id = parse_members_value_filter(path)) {
+                patch.members_to_remove.push_back(*id);
+            } else {
+                return std::unexpected(
+                    ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
+            }
+        } else if (ieq(op, "replace")) {
+            if (!operation.contains("value")) {
+                return std::unexpected(
+                    ScimError{400, "invalidValue", "'replace' requires a 'value'"});
+            }
+            const auto& value = operation["value"];
+            if (path.empty()) {
+                if (!value.is_object()) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue",
+                        "pathless PatchOp value must be an object of attribute:value pairs"});
+                }
+                if (value.contains("displayName")) {
+                    if (!value["displayName"].is_string()) {
+                        return std::unexpected(
+                            ScimError{400, "invalidValue", "displayName value must be a string"});
+                    }
+                    patch.display_name = value["displayName"].get<std::string>();
+                }
+                if (value.contains("externalId")) {
+                    if (!value["externalId"].is_string()) {
+                        return std::unexpected(
+                            ScimError{400, "invalidValue", "externalId value must be a string"});
+                    }
+                    patch.external_id = value["externalId"].get<std::string>();
+                }
+                if (value.contains("members")) {
+                    auto members = extract_member_values(value["members"]);
+                    if (!members)
+                        return std::unexpected(members.error());
+                    patch.replace_members = std::move(*members);
+                }
+            } else if (ieq(path, "members")) {
+                auto members = extract_member_values(value);
+                if (!members)
+                    return std::unexpected(members.error());
+                patch.replace_members = std::move(*members);
+            } else if (ieq(path, "displayName")) {
+                if (!value.is_string()) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "displayName value must be a string"});
+                }
+                patch.display_name = value.get<std::string>();
+            } else if (ieq(path, "externalId")) {
+                if (!value.is_string()) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                patch.external_id = value.get<std::string>();
+            } else {
+                return std::unexpected(
+                    ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
+            }
+        } else {
+            return std::unexpected(
+                ScimError{400, "invalidValue", "unsupported PatchOp op: " + op});
+        }
+    }
+
+    return patch;
+}
+
 // ── Envelopes ────────────────────────────────────────────────────────────────
 
 nlohmann::json error(int status, std::string_view detail, std::string_view scim_type) {
@@ -231,65 +539,13 @@ nlohmann::json list_response(const std::vector<nlohmann::json>& resources, int t
 std::expected<std::string, ScimError> parse_username_filter(std::string_view filter) {
     // Expected shape: `userName eq "value"` — attribute + operator
     // case-insensitive, value double-quoted with \" and \\ escapes.
-    auto fail = [] {
-        return std::unexpected(ScimError{400, "invalidFilter", "unsupported filter"});
-    };
+    return parse_eq_filter(filter, "userName");
+}
 
-    std::string_view s = filter;
-    // Trim leading/trailing whitespace.
-    auto trim = [](std::string_view v) {
-        size_t b = v.find_first_not_of(" \t");
-        if (b == std::string_view::npos)
-            return std::string_view{};
-        size_t e = v.find_last_not_of(" \t");
-        return v.substr(b, e - b + 1);
-    };
-    s = trim(s);
-
-    // Split off the attribute token (up to first whitespace).
-    size_t sp1 = s.find_first_of(" \t");
-    if (sp1 == std::string_view::npos)
-        return fail();
-    std::string_view attr = s.substr(0, sp1);
-    if (!ieq(attr, "userName"))
-        return fail();
-
-    s = trim(s.substr(sp1));
-
-    // Split off the operator token.
-    size_t sp2 = s.find_first_of(" \t");
-    if (sp2 == std::string_view::npos)
-        return fail();
-    std::string_view op = s.substr(0, sp2);
-    if (!ieq(op, "eq"))
-        return fail();
-
-    s = trim(s.substr(sp2));
-
-    // Remainder must be a double-quoted string.
-    if (s.size() < 2 || s.front() != '"' || s.back() != '"')
-        return fail();
-    std::string_view quoted = s.substr(1, s.size() - 2);
-
-    std::string value;
-    value.reserve(quoted.size());
-    for (size_t i = 0; i < quoted.size(); ++i) {
-        char c = quoted[i];
-        if (c == '\\' && i + 1 < quoted.size() &&
-            (quoted[i + 1] == '"' || quoted[i + 1] == '\\')) {
-            value.push_back(quoted[i + 1]);
-            ++i;
-        } else if (c == '"' || c == '\\') {
-            // An unescaped quote/backslash inside the value means the
-            // filter wasn't well-formed (a real closing quote would have
-            // ended the `quoted` slice already).
-            return fail();
-        } else {
-            value.push_back(c);
-        }
-    }
-
-    return value;
+std::expected<std::string, ScimError> parse_displayname_filter(std::string_view filter) {
+    // Expected shape: `displayName eq "value"` — same rules as
+    // `parse_username_filter`, different attribute.
+    return parse_eq_filter(filter, "displayName");
 }
 
 // ── Discovery documents ──────────────────────────────────────────────────────
@@ -321,7 +577,14 @@ nlohmann::json resource_types() {
     user_type["schema"] = kSchemaUser;
     user_type["meta"] = {{"resourceType", "ResourceType"}};
 
-    return list_response({user_type}, 1, 1, 1);
+    nlohmann::json group_type;
+    group_type["id"] = "Group";
+    group_type["name"] = "Group";
+    group_type["endpoint"] = "/Groups";
+    group_type["schema"] = kSchemaGroup;
+    group_type["meta"] = {{"resourceType", "ResourceType"}};
+
+    return list_response({user_type, group_type}, 2, 1, 2);
 }
 
 nlohmann::json schemas() {
@@ -338,7 +601,23 @@ nlohmann::json schemas() {
          {{"name", "externalId"}, {"type", "string"}, {"required", false}}});
     user_schema["meta"] = {{"resourceType", "Schema"}};
 
-    return list_response({user_schema}, 1, 1, 1);
+    nlohmann::json group_schema;
+    group_schema["id"] = kSchemaGroup;
+    group_schema["name"] = "Group";
+    group_schema["description"] = "Yuzu SCIM Group";
+    group_schema["attributes"] = nlohmann::json::array(
+        {{{"name", "displayName"},
+          {"type", "string"},
+          {"required", true},
+          {"uniqueness", "none"}},
+         {{"name", "externalId"}, {"type", "string"}, {"required", false}},
+         {{"name", "members"},
+          {"type", "complex"},
+          {"multiValued", true},
+          {"required", false}}});
+    group_schema["meta"] = {{"resourceType", "Schema"}};
+
+    return list_response({user_schema, group_schema}, 2, 1, 2);
 }
 
 } // namespace yuzu::server::scim

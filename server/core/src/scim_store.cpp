@@ -34,6 +34,27 @@ ScimResource row_to_resource(sqlite3_stmt* stmt) {
 constexpr const char* kResourceColumns =
     "scim_id, external_id, username, active, created_at, updated_at, etag_version";
 
+/// Column order shared by every SELECT/RETURNING clause on scim_groups —
+/// keep in sync if the column list changes.
+ScimGroup row_to_group(sqlite3_stmt* stmt) {
+    ScimGroup g;
+    auto text_col = [&](int idx) -> std::string {
+        const unsigned char* t = sqlite3_column_text(stmt, idx);
+        return t ? reinterpret_cast<const char*>(t) : "";
+    };
+    g.scim_id = text_col(0);
+    g.external_id = text_col(1);
+    g.display_name = text_col(2);
+    g.active = sqlite3_column_int(stmt, 3) != 0;
+    g.created_at = text_col(4);
+    g.updated_at = text_col(5);
+    g.etag_version = sqlite3_column_int64(stmt, 6);
+    return g;
+}
+
+constexpr const char* kGroupColumns =
+    "scim_id, external_id, display_name, active, created_at, updated_at, etag_version";
+
 } // namespace
 
 ScimStore::ScimStore(const std::filesystem::path& db_path) {
@@ -98,6 +119,25 @@ void ScimStore::create_tables() {
             );
             CREATE INDEX IF NOT EXISTS idx_scim_tokens_active
                 ON scim_tokens(revoked_at) WHERE revoked_at IS NULL;
+        )"},
+        {2, R"(
+            CREATE TABLE IF NOT EXISTS scim_groups (
+                scim_id TEXT PRIMARY KEY,
+                external_id TEXT,
+                display_name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                etag_version INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS scim_group_members (
+                group_scim_id TEXT NOT NULL,
+                user_scim_id TEXT NOT NULL,
+                PRIMARY KEY (group_scim_id, user_scim_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scim_group_members_user
+                ON scim_group_members(user_scim_id);
         )"},
     };
     if (!MigrationRunner::run(db_, "scim", kScimMigrations)) {
@@ -414,6 +454,394 @@ std::optional<bool> ScimStore::delete_by_scim_id(const std::string& scim_id) {
         return false;
     spdlog::error("ScimStore::delete_by_scim_id: step failed: {}", sqlite3_errmsg(db_));
     return std::nullopt;
+}
+
+// ── SCIM groups ───────────────────────────────────────────────────────────
+
+std::optional<ScimGroup> ScimStore::create_group(const std::string& display_name,
+                                                 const std::string& external_id) {
+    if (!db_ || display_name.empty())
+        return std::nullopt;
+
+    auto id_result = random_hex(16); // 16 CSPRNG bytes -> 32 hex chars
+    if (!id_result.has_value())
+        return std::nullopt;
+    std::string scim_id = *id_result;
+
+    std::lock_guard lock(db_mtx_);
+    std::string sql = std::string("INSERT INTO scim_groups (scim_id, external_id, display_name, "
+                                  "active, created_at, updated_at, etag_version) "
+                                  "VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1) "
+                                  "RETURNING ") +
+                     kGroupColumns;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::create_group: prepare failed: {}", sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (external_id.empty())
+        sqlite3_bind_null(stmt, 2);
+    else
+        // Explicit length, not -1 — external_id is IdP-supplied and a value
+        // containing an embedded NUL would otherwise silently truncate at
+        // sqlite3_bind_text's strlen() scan (matches create_resource()).
+        sqlite3_bind_text(stmt, 2, external_id.c_str(),
+                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, display_name.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ScimGroup> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        result = row_to_group(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::optional<ScimGroup> ScimStore::get_group_by_id(const std::string& scim_id) const {
+    if (!db_ || scim_id.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(db_mtx_);
+    std::string sql =
+        std::string("SELECT ") + kGroupColumns + " FROM scim_groups WHERE scim_id = ?1";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ScimGroup> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        result = row_to_group(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::optional<ScimGroup>
+ScimStore::get_group_by_display_name(const std::string& display_name) const {
+    if (!db_ || display_name.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(db_mtx_);
+    std::string sql =
+        std::string("SELECT ") + kGroupColumns + " FROM scim_groups WHERE display_name = ?1";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(stmt, 1, display_name.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ScimGroup> result;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        result = row_to_group(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::vector<ScimGroup> ScimStore::list_groups(int start_index, int count, int& total_out) const {
+    total_out = 0;
+    std::vector<ScimGroup> results;
+    if (!db_)
+        return results;
+
+    std::lock_guard lock(db_mtx_);
+
+    {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM scim_groups", -1, &stmt, nullptr) ==
+            SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                total_out = sqlite3_column_int(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    if (count <= 0)
+        return results;
+    // SCIM startIndex is 1-based (RFC 7644 §3.4.2); clamp anything below 1
+    // (including 0/negative from a malformed caller) to the first page.
+    int offset = start_index > 1 ? start_index - 1 : 0;
+
+    std::string sql = std::string("SELECT ") + kGroupColumns +
+                      " FROM scim_groups ORDER BY rowid ASC LIMIT ?1 OFFSET ?2";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        return results;
+    sqlite3_bind_int(stmt, 1, count);
+    sqlite3_bind_int(stmt, 2, offset);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        results.push_back(row_to_group(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+int ScimStore::count_groups() const {
+    if (!db_)
+        return 0;
+
+    std::lock_guard lock(db_mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM scim_groups", -1, &stmt, nullptr) !=
+        SQLITE_OK)
+        return 0;
+    int total = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return total;
+}
+
+bool ScimStore::update_group(const std::string& scim_id, const std::string& display_name,
+                             const std::string& external_id) {
+    if (!db_ || scim_id.empty() || display_name.empty())
+        return false;
+
+    std::lock_guard lock(db_mtx_);
+    static const char* sql = R"(
+        UPDATE scim_groups
+        SET display_name = ?1, external_id = ?2, etag_version = etag_version + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE scim_id = ?3
+        RETURNING scim_id
+    )";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::update_group: prepare failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, display_name.c_str(), -1, SQLITE_TRANSIENT);
+    if (external_id.empty())
+        sqlite3_bind_null(stmt, 2);
+    else
+        sqlite3_bind_text(stmt, 2, external_id.c_str(),
+                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW;
+}
+
+std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
+    if (!db_ || scim_id.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(db_mtx_);
+
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::delete_group: BEGIN failed: {}", sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_groups WHERE scim_id = ?1 RETURNING scim_id",
+                          -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::delete_group: prepare failed: {}", sqlite3_errmsg(db_));
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    // true = a row matched and was deleted; false = no row matched (already
+    // gone) — a real, idempotent-success outcome, not an error; nullopt = a
+    // genuine step-time error — must NOT be collapsed into "already gone"
+    // (mirrors delete_by_scim_id).
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        spdlog::error("ScimStore::delete_group: step failed: {}", sqlite3_errmsg(db_));
+        rollback();
+        return std::nullopt;
+    }
+    bool deleted = rc == SQLITE_ROW;
+
+    sqlite3_stmt* member_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
+                          &member_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::delete_group: member prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        rollback();
+        return std::nullopt;
+    }
+    sqlite3_bind_text(member_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int member_rc = sqlite3_step(member_stmt);
+    sqlite3_finalize(member_stmt);
+    if (member_rc != SQLITE_DONE) {
+        spdlog::error("ScimStore::delete_group: member step failed: {}", sqlite3_errmsg(db_));
+        rollback();
+        return std::nullopt;
+    }
+
+    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::delete_group: COMMIT failed: {}", sqlite3_errmsg(db_));
+        rollback();
+        return std::nullopt;
+    }
+    return deleted;
+}
+
+bool ScimStore::set_group_members(const std::string& group_scim_id,
+                                  const std::vector<std::string>& user_scim_ids) {
+    if (!db_ || group_scim_id.empty())
+        return false;
+
+    std::lock_guard lock(db_mtx_);
+
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::set_group_members: BEGIN failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
+
+    sqlite3_stmt* del_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
+                          &del_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::set_group_members: delete prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        rollback();
+        return false;
+    }
+    sqlite3_bind_text(del_stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int del_rc = sqlite3_step(del_stmt);
+    sqlite3_finalize(del_stmt);
+    if (del_rc != SQLITE_DONE) {
+        spdlog::error("ScimStore::set_group_members: delete step failed: {}",
+                     sqlite3_errmsg(db_));
+        rollback();
+        return false;
+    }
+
+    if (!user_scim_ids.empty()) {
+        sqlite3_stmt* ins_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
+                               "user_scim_id) VALUES (?1, ?2)",
+                               -1, &ins_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("ScimStore::set_group_members: insert prepare failed: {}",
+                         sqlite3_errmsg(db_));
+            rollback();
+            return false;
+        }
+        for (const auto& user_scim_id : user_scim_ids) {
+            sqlite3_bind_text(ins_stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins_stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
+                spdlog::error("ScimStore::set_group_members: insert step failed: {}",
+                             sqlite3_errmsg(db_));
+                sqlite3_finalize(ins_stmt);
+                rollback();
+                return false;
+            }
+            sqlite3_reset(ins_stmt);
+        }
+        sqlite3_finalize(ins_stmt);
+    }
+
+    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::set_group_members: COMMIT failed: {}", sqlite3_errmsg(db_));
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+bool ScimStore::add_group_member(const std::string& group_scim_id,
+                                 const std::string& user_scim_id) {
+    if (!db_ || group_scim_id.empty() || user_scim_id.empty())
+        return false;
+
+    std::lock_guard lock(db_mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
+                           "user_scim_id) VALUES (?1, ?2)",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::add_group_member: prepare failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    // INSERT OR IGNORE reports SQLITE_DONE whether it inserted a fresh row
+    // or silently ignored an existing one (idempotent add) — both are
+    // success from the caller's point of view.
+    return rc == SQLITE_DONE;
+}
+
+bool ScimStore::remove_group_member(const std::string& group_scim_id,
+                                    const std::string& user_scim_id) {
+    if (!db_ || group_scim_id.empty() || user_scim_id.empty())
+        return false;
+
+    std::lock_guard lock(db_mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "DELETE FROM scim_group_members WHERE group_scim_id = ?1 AND "
+                           "user_scim_id = ?2",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::remove_group_member: prepare failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    // DELETE reports SQLITE_DONE whether or not a row matched (idempotent
+    // remove) — both are success from the caller's point of view.
+    return rc == SQLITE_DONE;
+}
+
+std::vector<std::string>
+ScimStore::list_group_member_user_scim_ids(const std::string& group_scim_id) const {
+    std::vector<std::string> results;
+    if (!db_ || group_scim_id.empty())
+        return results;
+
+    std::lock_guard lock(db_mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT user_scim_id FROM scim_group_members WHERE group_scim_id = "
+                           "?1 ORDER BY user_scim_id ASC",
+                           -1, &stmt, nullptr) != SQLITE_OK)
+        return results;
+    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* t = sqlite3_column_text(stmt, 0);
+        results.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+std::vector<std::string>
+ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) const {
+    std::vector<std::string> results;
+    if (!db_ || user_scim_id.empty())
+        return results;
+
+    std::lock_guard lock(db_mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT g.display_name FROM scim_group_members m "
+                           "JOIN scim_groups g ON g.scim_id = m.group_scim_id "
+                           "WHERE m.user_scim_id = ?1 ORDER BY g.display_name ASC",
+                           -1, &stmt, nullptr) != SQLITE_OK)
+        return results;
+    sqlite3_bind_text(stmt, 1, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* t = sqlite3_column_text(stmt, 0);
+        results.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+    }
+    sqlite3_finalize(stmt);
+    return results;
 }
 
 } // namespace yuzu::server
