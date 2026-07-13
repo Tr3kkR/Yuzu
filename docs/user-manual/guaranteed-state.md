@@ -341,6 +341,38 @@ Guardian surfaces readiness and event counts via the standard observability endp
 - `yuzu_server_guardian_proj_failures_total` (server) counts DEX observation projection failures. The source event is always preserved (the read model degrades, never destroys); `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). `yuzu_server_guardian_observations_reaped_total` is the disposal-evidence counter for reaped DEX projection rows.
 - Broader Prometheus metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
+## SparkEngine — the next-generation detection engine (observe-only)
+
+Guardian is migrating its event-driven detection (file / service / registry watches) onto a new **SparkEngine** in incremental rungs (ADR-0021 Stage-2). **Today the agent stands SparkEngine up *observe-only*:** it runs and reports its own health, but it is **not** wired to drive Guardian — the existing detection path still does all detecting and **all enforcing**. Nothing about how your Guards detect or remediate changes in this build. The migration is deliberately staged so each rung can be measured and rolled back before the next.
+
+**`--spark-disable` / `YUZU_AGENT_SPARK_DISABLE`** is a **boot-time** agent opt-out: when set, SparkEngine is never instantiated and no `spark_*` telemetry is emitted. Like `--dex-disable` it takes effect only at agent start — a live change is ignored until the agent restarts. It is a deploy-time agent setting, **not** a server-side runtime toggle, and it does **not** affect the enforcing legacy path. **At rung 1, leaving it unset (the default) is recommended** — the engine is observe-only and safe; there is no rung-1 reason to disable it (if a boot exception is hit, e.g. thread exhaustion, the agent already degrades to no-spark on its own and continues).
+
+Per-rung default posture (recorded here so an upgrade never silently changes what enforces — this is safety-critical, keep it accurate against `docs/spark-stage2-guardian-consumer-design.md`):
+
+| Rung | SparkEngine | What enforces **by default** | `--spark-disable` effect |
+|------|-------------|------------------------------|--------------------------|
+| **1 (this build)** | instantiated, observe-only, no consumer | legacy IGuard (unchanged) | engine not instantiated |
+| 2 (later) | drives detection, observe-only (the default path) | **nothing** — a deliberate spark detect-only burn-in; the legacy path is *not* instantiated | selects the enforcing legacy path |
+| 3+ (later) | drives enforcement | legacy IGuard (enforcing), until per-fleet burn-in | recorded explicitly in that rung's PR |
+
+The rung-2 row is the load-bearing one: by default rung 2 **detects but does not enforce** for spark-managed rules (an accepted, greenfield burn-in window), and an operator who needs continued enforcement during that window sets `--spark-disable` to keep the enforcing legacy path. At rung 1 the agent logs the active detection path at startup (`SparkEngine: instantiated OBSERVE-ONLY … Guardian detection path = legacy IGuard (enforcing)`).
+
+**Fleet observability** (all os-labelled — File/Registry are Windows-only, Service is Windows + Linux, macOS has none — so **never aggregate across `os`**; **absent** means no reporting agent of that OS/mechanism, never "0 = healthy"):
+
+- `yuzu_fleet_spark_reporting{os}` — agents actually **running** the engine (the denominator).
+- `yuzu_fleet_spark_disabled{os}` — agents deliberately running with `--spark-disable`. An operator decision, expected to be non-zero in some fleets — **do not alert on it**.
+- `yuzu_fleet_spark_failed{os}` — agents where the engine was **enabled but boot-time instantiation threw**, so the agent degraded to no-spark. A fault, not a choice — **alert on this one**. It is deliberately separate from `_disabled`: without it, a fleet-wide spark boot failure would be indistinguishable from a deliberate opt-out (a failed agent used to emit nothing at all), which would defeat the entire point of an observe-only rung.
+- `yuzu_fleet_spark_mechanisms{os,mechanism}` — agents whose spark capability includes that mechanism. Counts only mechanisms that are registered **and functional**: one that started but could not bind its OS facility — most commonly a **containerised Linux host, which has no systemd system bus** — is reported inert and excluded, because every watch on it would be refused. An OS reporting but with no `{mechanism}` series either does not support it, or cannot use it there.
+- `yuzu_fleet_spark_armed_faulted{os}` — armed watches a mechanism reported deaf (a live gauge; `> 0` means detection is silently down for that many watches).
+- `yuzu_fleet_spark_watch_rejected{os,mechanism}`, `…_quarantined{os,mechanism}`, `…_slow_op{os,mechanism}` — per-type health counters (watch-cap rejection / mechanism quarantine / slow ops). `quarantined` should stay 0 (page-worthy).
+- `yuzu_fleet_spark_watch_faults{os}`, `…_queued_dropped{os}`, `…_consumer_errors{os}` — engine-level fault / drop / handler-error sums.
+
+A spark-capable agent's wire state maps to exactly **one of four postures**, never more than one at once: **running** (`_reporting`), **failed** (`_failed`), **disabled** (`_disabled`), or **absent** — no `yuzu.spark_*` tag at all, meaning a pre-rung-1 agent or one that has stopped heartbeating.
+
+At rung 1 the mechanism- and consumer-health counters (`armed_faulted`, `watch_rejected`, `quarantined`, `slow_op`, `watch_faults`, `queued_dropped`, `consumer_errors`) are all 0, because nothing is armed; they go live as later rungs arm rules. **`reporting`, `disabled`, `failed` and `mechanisms` carry live signal today** — none of them depends on a consumer being armed. The agent has no `/metrics` endpoint — these are rolled up server-side from heartbeat tags.
+
+**Alerts.** A reviewed `yuzu-fleet-spark` alert group ships **commented-out** in `docs/prometheus/yuzu-alerts.yml`, to be enabled at rung 2. It is disabled at rung 1 because the counters are all 0 (an enabled rule could only fire on a forged heartbeat), and because the mechanism counters (`watch_rejected` / `quarantined` / `slow_op` / `queued_dropped`) are fleet **sums of monotonic per-agent counters** — a `> 0` alert on them **latches**: once any agent reports a non-zero value it stays firing until that agent's process **restarts** (only `armed_faulted`, a live self-healing gauge, is latch-free). The rung-2 templates use `increase(...[15m]) > 0` over counter-typed metrics to avoid this; enable them when rung 2 arms real rules.
+
 ## Related documentation
 
 - [Design v1.1](../yuzu-guardian-design-v1.1.md) — the authoritative architecture document (engineering reference).

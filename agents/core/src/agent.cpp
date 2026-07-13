@@ -44,6 +44,9 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
+#include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
 
 #ifdef _WIN32
@@ -751,6 +754,16 @@ public:
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
         ScopeExit cleanup{[this]() {
+            // SparkEngine FIRST — before thread_pool_ is reset below. Rung 1's engine
+            // does not borrow the pool, but rung 2's queued Guardian consumer is expected
+            // to dispatch through it (#2037's bounded-dispatch pattern), and this guard
+            // resets the pool on every run() exit. Stopping spark here means its threads
+            // are quiesced before anything it may borrow goes away — on the exception and
+            // early-return paths too, not just the graceful one. Idempotent: Agent::stop()
+            // may already have called it. (Gate-8 cpp-safety: an earlier comment claimed
+            // this guard already covered spark. It did not — it never touched it.)
+            if (spark_engine_)
+                spark_engine_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
             // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
@@ -822,6 +835,88 @@ public:
                              "exception) — exiting with a startup failure rather than aborting.");
             startup_failed_ = true;
             return;
+        }
+
+        // SparkEngine (ADR-0021 Stage-2, rung 1 — INSTANTIATE + OBSERVE).
+        //
+        // POSITION IS LOAD-BEARING — this block must stay AFTER thread_pool_'s
+        // construction and AFTER the ScopeExit above. Two governance findings pin it:
+        //
+        //  (a) DEGRADATION PRIORITY (Gate-4 UP-3). Spark spawns up to 4 threads and
+        //      degrades gracefully if it cannot (the catch below). ThreadPool does NOT:
+        //      its ctor emplace_back()s std::threads, and on EAGAIN the throw destroys a
+        //      vector<std::thread> holding JOINABLE threads → std::terminate. Standing
+        //      spark up FIRST let the OPTIONAL subsystem eat the thread budget that the
+        //      MANDATORY one then died for — an optional feature crash-looping the agent
+        //      on a pids-capped host. Mandatory subsystems claim their threads first.
+        //
+        //  (b) SCOPEEXIT COVERAGE. Constructed before the guard was armed, a throw between
+        //      here and the guard left spark's threads running with no cleanup on the
+        //      run()-exit path. NOTE: the guard did not stop spark either until Gate-8
+        //      cpp-safety pointed out that it never touched it — it does now, as its FIRST
+        //      statement, ahead of thread_pool_.reset().
+        //
+        // See also the member declaration order (spark_engine_ AFTER thread_pool_) so
+        // spark is DESTROYED before the pool it may borrow at rung 2.
+        // The next-generation event-driven detection engine is stood up here
+        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
+        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
+        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
+        // up now proves the engine runs and reports at rest, so its resource +
+        // observability envelope can be measured before it carries any load.
+        //
+        // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
+        // when set, SparkEngine is never instantiated and no spark telemetry ships.
+        // The flag selects exactly one detection path at instantiation, establishing
+        // the "old and new never both drive enforce" property the rung-2/3 cutover
+        // leans on (moot at rung 1 — spark has no consumer — but pinned here).
+        if (cfg_.spark_disable) {
+            spdlog::info("SparkEngine: disabled by --spark-disable — not instantiated; "
+                         "Guardian detection path = legacy IGuard (enforcing)");
+        } else {
+            // DEGRADE-TO-NO-SPARK on any boot exception. SparkEngine::start() (and a
+            // mechanism start()) spawns threads; thread creation throws
+            // std::system_error under EAGAIN / thread-or-handle exhaustion — most
+            // likely on exactly the overloaded endpoint where the agent must SURVIVE,
+            // not crash-loop. run() is not wrapped by a catch at its call site
+            // (main.cpp `agent->run()`), and this block runs before run()'s own inner
+            // try, so an escape here would std::terminate the process (gov UP-1).
+            try {
+                spark_engine_ = std::make_unique<SparkEngine>();
+                // Register the platform event-driven mechanisms. Each factory returns
+                // nullptr off its platform (File/Registry: Windows-only; Service:
+                // Windows-SCM + Linux-systemd), so an unsupported type is simply left
+                // unregistered — SparkEngine then rejects any future arm() of it. The
+                // set actually registered IS the agent's spark capability, surfaced to
+                // the fleet via the yuzu.spark_mechs heartbeat tag.
+                const auto try_register = [&](SparkType type,
+                                             std::unique_ptr<ISparkMechanism> mech) {
+                    if (!mech)
+                        return; // unsupported on this OS — leave the type unregistered
+                    if (auto r = spark_engine_->register_mechanism(type, std::move(mech)); !r)
+                        spdlog::warn("SparkEngine: register {} mechanism failed: {}",
+                                     spark_type_token(type), r.error());
+                };
+                try_register(SparkType::File, make_file_mechanism());
+                try_register(SparkType::Registry, make_registry_mechanism());
+                try_register(SparkType::Service, make_service_mechanism());
+                spark_engine_->start();
+                spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
+                             "Guardian detection path = legacy IGuard (enforcing)");
+            } catch (const std::exception& e) {
+                // ~SparkEngine (via reset) joins whatever already started; the
+                // heartbeat gate (spark_engine_ != nullptr) then ships no spark tags.
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed ({}) — continuing WITHOUT "
+                             "spark; legacy IGuard detection is unaffected",
+                             e.what());
+            } catch (...) {
+                // Belt-and-braces: NOTHING may terminate the agent for an observe-only
+                // best-effort subsystem, even a non-std throw (gov re-review NICE).
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed (unknown exception) — "
+                             "continuing WITHOUT spark; legacy IGuard detection is unaffected");
+            }
         }
 
         // Wire trigger dispatch + start the engine. Plugins registered their
@@ -1943,6 +2038,72 @@ public:
                                         std::format("{:.0f}", ns.throughput_bps);
                             }
 
+                            // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
+                            // OBSERVE-ONLY). Keys are pinned to
+                            // server/core/src/spark_fleet_tags.hpp by
+                            // tests/unit/server/test_spark_fleet_tags.cpp — a drift is
+                            // silent zero-reporting. Counters ship SPARSELY (only when >0):
+                            // fleet-scale, and every counter is 0 at rung 1 (no consumer
+                            // armed), so a quiescent agent ships just the two always-present
+                            // capability keys.
+                            //
+                            // The FOUR postures are DISTINGUISHABLE on the wire (see
+                            // spark_heartbeat.hpp): RUNNING reports spark_running=1; FAILED and
+                            // DISABLED both report spark_running=0 and are told apart by
+                            // spark_disabled=1 on DISABLED only; ABSENT emits no spark keys at
+                            // all (a stopped engine, and any pre-rung-1 agent).
+                            // Emitting nothing on the failure path (the old behaviour) made
+                            // a fleet-wide boot failure invisible — the exact condition
+                            // rung 1 exists to detect (governance Gate-4 consistency/UP-10).
+                            //
+                            // try/catch: this runs on the heartbeat thread, whose callable
+                            // has NO top-level handler — an escaping bad_alloc from the
+                            // stats map or the tag strings would std::terminate the agent,
+                            // on precisely the memory-exhausted host where the boot-time
+                            // degrade guard was written to keep it alive. NOTHING may
+                            // terminate the agent for an observe-only subsystem
+                            // (governance Gate-4 UP-2).
+                            try {
+                                if (stop_requested_.load(std::memory_order_acquire)) {
+                                    // SHUTTING DOWN — emit NOTHING (the ABSENT posture).
+                                    //
+                                    // Agent::stop() and run()'s ScopeExit both call
+                                    // spark_engine_->stop(), and this thread can compose a
+                                    // beat AFTER that. STOPPED is not FAILED: bucketing a
+                                    // cleanly-stopping agent into yuzu_fleet_spark_failed{os}
+                                    // — the ONE gauge documented "alert on it" — would page
+                                    // on-call on every `systemctl restart` and every OTA cycle
+                                    // with a fault that never happened (governance Gate-2
+                                    // security). ABSENT is the honest wire state, and the
+                                    // server reads absence as "did not report", never as 0.
+                                    //
+                                    // THIS GUARD IS DEFENCE IN DEPTH, AND THE SECOND LAYER IS
+                                    // THE LOAD-BEARING ONE. An earlier version of this comment
+                                    // claimed a stopped engine "would fall through to the
+                                    // FAILED posture below" without this branch. It would not:
+                                    // `else if (spark_engine_)` is taken, and
+                                    // emit_spark_heartbeat_tags(running=false) early-returns
+                                    // emitting nothing — ABSENT either way. Do not delete THAT
+                                    // early-return on the strength of this guard, or this guard
+                                    // on the strength of it; and do not "simplify" by trusting
+                                    // a rationale (as this comment used to state one) that the
+                                    // code does not actually implement.
+                                } else if (cfg_.spark_disable) {
+                                    emit_spark_absent_tags(tags, /*disabled=*/true);
+                                } else if (spark_engine_) {
+                                    emit_spark_heartbeat_tags(tags, spark_engine_->is_running(),
+                                                              spark_engine_->stats(),
+                                                              spark_engine_->stats_by_type());
+                                } else {
+                                    // Enabled, but boot-time instantiation threw.
+                                    emit_spark_absent_tags(tags, /*disabled=*/false);
+                                }
+                            } catch (...) {
+                                // Best-effort telemetry: drop this beat's spark tags rather
+                                // than kill the agent. The server reads the absence as
+                                // "did not report", never as 0.
+                            }
+
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
                             // we last shipped. `last_attached_seq` is a
@@ -2385,6 +2546,8 @@ public:
             guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
+        if (spark_engine_)
+            spark_engine_->stop(); // single-shot + idempotent; ~SparkEngine also stops
         // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
         // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
         if (auto u = updater())
@@ -2805,6 +2968,23 @@ private:
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
+    // SparkEngine (ADR-0021 Stage-2, rung 1) — instantiated OBSERVE-ONLY with no
+    // consumer, so (unlike guardian_/dex_observer_) it does NOT emit through
+    // guardian_sink_stream_; ~SparkEngine only joins its own internal wheel/mechanism
+    // threads. Read by the heartbeat thread (stats()/stats_by_type()), which is joined
+    // in quiesce_run_workers() before member teardown. nullptr under --spark-disable,
+    // and also nullptr if boot-time instantiation threw (degrade-to-no-spark).
+    //
+    // DECLARATION ORDER IS LOAD-BEARING — spark_engine_ MUST stay AFTER thread_pool_.
+    // Members destroy in reverse declaration order, so this makes ~SparkEngine run
+    // BEFORE ~ThreadPool. Rung 1 does not borrow the pool, but rung 2's queued Guardian
+    // consumer is expected to dispatch through it (the agent's bounded-dispatch pattern,
+    // #2037). Declared the other way round, ~ThreadPool would run first and
+    // ~SparkEngine's join could then invoke a callback against a destroyed pool — and
+    // stop() sequencing masks that only on the graceful path, since a throw between
+    // construction and stop() destroys members directly. Free to fix now; a
+    // use-after-free class to find later (governance Gate-3 architect).
+    std::unique_ptr<SparkEngine> spark_engine_;
     /// SHARED_PTR BEHIND A MUTEX, not a unique_ptr — and not a std::atomic<shared_ptr> either.
     ///
     /// WHY IT IS SHARED. run() REASSIGNS this on every reconnect (a fresh Updater per

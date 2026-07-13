@@ -170,6 +170,13 @@ public:
     ~LinuxServiceMechanism() override { stop(); }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
+        // teardown_mu_ before mu_ (see the member note). start() must exclude stop(), not
+        // just stop-vs-stop: start() assigns thread_/bus_/wake_fd_ while stop() joins the
+        // thread and frees those same members holding only teardown_mu_. Without this the
+        // mechanism would still be relying on SparkEngine::lifecycle_mu_ to keep them
+        // apart — and ISparkMechanism is a public interface that must not depend on a
+        // caller's lock. (Gate-8 round 2 cpp-safety.)
+        std::lock_guard teardown(teardown_mu_);
         std::lock_guard lk(mu_);
         if (started_)
             return; // idempotent
@@ -233,10 +240,47 @@ public:
     }
 
     void stop() override {
+        // CLAIM the resources under mu_, in one atomic step: move them into locals and
+        // null the members. Whoever wins the lock owns the teardown; every later caller
+        // finds a cleared object and returns.
+        //
+        // Guarding on the RESOURCES rather than on started_ is what fixes the original
+        // leak: start() publishes bus_/wake_fd_ BEFORE spawning the poll thread, and the
+        // std::thread ctor throws std::system_error under EAGAIN — the very
+        // thread-exhaustion case agent.cpp's degrade-to-no-spark guard exists to survive.
+        // started_ is never reached on that throw, so a bool-only guard early-returned
+        // here and leaked the sd_bus connection AND the eventfd for the process lifetime
+        // (~this calls the same stop(), so it could not recover either). bus_/wake_fd_ are
+        // RAW members (void*/int) — unlike the Windows SCM twin below, whose scm_/wake_
+        // are RAII handles that self-release even on an early return, and unlike
+        // spark_file.cpp (guards on iocp_) / spark_registry.cpp (guards on pool_), which
+        // already guard on the resource. This mechanism was the only one that could leak.
+        //
+        // But a resource guard that READS the members while they are only cleared LATE,
+        // outside the lock, is merely SEQUENTIALLY idempotent: two concurrent stop()s
+        // would both see a live bus_ and both fall through — double sd_bus_unref, double
+        // close(), double join. The old !started_ guard was concurrency-safe precisely
+        // because started_ flipped under mu_. SparkEngine::lifecycle_mu_ happens to
+        // serialise stop() today, but ISparkMechanism::stop() is a public interface
+        // documented as idempotent and must not depend on a caller's lock. Claiming under
+        // mu_ restores that. (Gate-8 cpp-safety — a regression in the B1 fix itself.)
+        // teardown_mu_ serialises stop() END TO END — the same shape as
+        // SparkEngine::lifecycle_mu_, one level down. A second caller (the destructor, or
+        // a concurrent engine stop()) BLOCKS here until the first has finished, then finds
+        // a fully-cleared object and early-returns below. That is what makes the resource
+        // guard safe under concurrency without touching the resources early.
+        //
+        // Do NOT be tempted to "claim" bus_/wake_fd_ into locals under mu_ instead: the
+        // poll thread READS wake_fd_ in run() for as long as it is alive, so nulling the
+        // members before the join is a data race (TSan caught exactly that). The
+        // resources may only be released AFTER the thread has joined — which is precisely
+        // why the original code cleared them late, and why the fix belongs in a teardown
+        // lock rather than in an earlier claim.
+        std::lock_guard teardown(teardown_mu_);
         {
             std::lock_guard lk(mu_);
-            if (!started_)
-                return; // idempotent
+            if (!started_ && !bus_ && wake_fd_ < 0 && !thread_.joinable())
+                return; // nothing was ever acquired, or a previous stop() already cleared it
             started_ = false;
         }
         if (thread_.joinable()) {
@@ -244,10 +288,11 @@ public:
             wake();
             thread_.join();
         }
-        // The poll thread has joined — units_ is now safe to touch without a
-        // lock. Clearing it runs every UnitWatch's slot RAII (unref) BEFORE the
-        // bus itself is unref'd below (a slot holds a ref on the bus it matched
-        // against — the same ordering guard_systemd.cpp's reopen_bus enforces).
+        // The poll thread has joined — units_/bus_/wake_fd_ are now safe to touch without
+        // a lock, and nothing can be reading them. Clearing units_ runs every UnitWatch's
+        // slot RAII (unref) BEFORE the bus itself is unref'd below (a slot holds a ref on
+        // the bus it matched against — the same ordering guard_systemd.cpp's reopen_bus
+        // enforces).
         units_.clear();
         key_unit_.clear();
         if (bus_) {
@@ -264,6 +309,15 @@ public:
         fault_ = nullptr;
         inert_ = false;
         pending_.clear();
+    }
+
+    /// This mechanism tracks none of the File-mechanism counters (retiring/quarantine/
+    /// slow-op are ReadDirectoryChangesW-specific — #1979/#1980/#1982); its own
+    /// fault-tiering and retry counters are tracked separately (#1929/#1931). What it
+    /// MUST publish is `inert`, so the fleet can tell a service mechanism that bound
+    /// the system bus from one that never did (the container case).
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = inert_.load(std::memory_order_acquire)};
     }
 
 private:
@@ -722,12 +776,25 @@ private:
         spdlog::error("spark_service: poll thread unknown exception — mechanism stopping");
     }
 
+    /// Serialises start() and stop() END TO END against each other and against themselves,
+    /// so a second stop() (typically ~LinuxServiceMechanism) WAITS for an in-flight
+    /// teardown instead of racing it into a double sd_bus_unref / double close(), and a
+    /// start() cannot assign thread_/bus_/wake_fd_ while a stop() is joining and freeing
+    /// them. Held across the join; mu_ is NOT (the poll thread needs it).
+    /// LOCK ORDER: teardown_mu_ → mu_. Never the reverse.
+    std::mutex teardown_mu_;
     std::mutex mu_;                    ///< guards ONLY pending_ + the start/stop/inert flags
     SparkEmitFn emit_;
     SparkFaultFn fault_;
     std::deque<Cmd> pending_;
     bool started_{false};
-    bool inert_{false};                ///< the system bus never opened at start() — permanent for this instance
+    /// The system bus never opened at start() — permanent for this instance. THE
+    /// COMMON CASE IS A CONTAINER: Dockerfile.agent ships libsystemd0, but a container
+    /// has no system bus, so every containerized Linux agent lands here. Atomic so
+    /// stats() (const, heartbeat thread) can publish it without mu_ — otherwise the
+    /// mechanism stays REGISTERED and the fleet reads a service capability that can
+    /// never watch anything (governance Gate-3 cross-platform / Gate-6 sre).
+    std::atomic<bool> inert_{false};
     std::atomic<bool> stop_{false};
     std::thread thread_;
     void* bus_{nullptr};               ///< sd_bus* (void* keeps sd-bus.h out of the mechanism's shape)
@@ -927,6 +994,7 @@ public:
                          "this host",
                          GetLastError());
             scm_ok_ = false;
+            started_inert_.store(true, std::memory_order_release);
             started_ = true;
             return;
         }
@@ -934,10 +1002,12 @@ public:
         if (!wake_) {
             scm_.reset();
             scm_ok_ = false;
+            started_inert_.store(true, std::memory_order_release);
             started_ = true;
             return;
         }
         scm_ok_ = true;
+        started_inert_.store(false, std::memory_order_release);
         stop_.store(false, std::memory_order_release);
         thread_ = std::thread([this] { run(); });
         started_ = true;
@@ -994,7 +1064,15 @@ public:
         emit_ = nullptr;
         fault_ = nullptr;
         scm_ok_ = false;
+        started_inert_.store(false, std::memory_order_release);
         pending_.clear();
+    }
+
+    /// See the Linux twin: this mechanism tracks none of the File-mechanism counters,
+    /// but it MUST publish `inert` so an SCM-denied service mechanism is distinguishable
+    /// from a healthy idle one.
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = started_inert_.load(std::memory_order_acquire)};
     }
 
 private:
@@ -1357,7 +1435,14 @@ private:
     SparkFaultFn fault_;
     std::deque<Cmd> pending_;
     bool started_{false};
-    bool scm_ok_{false};
+    std::atomic<bool> scm_ok_{false};
+    /// Started, but the SCM / wake-event could not be acquired — every watch() will be
+    /// refused. Published separately from scm_ok_ (which is also false pre-start) so
+    /// stats() can report the mechanism as inert WITHOUT mu_, and so a never-started
+    /// mechanism is not misreported as inert. An SCM-denied mechanism stays REGISTERED
+    /// and would otherwise be indistinguishable from a healthy idle one on the wire
+    /// (governance Gate-3 cross-platform / Gate-6 sre).
+    std::atomic<bool> started_inert_{false};
     std::atomic<bool> stop_{false};
     std::thread thread_;
     yuzu::win::ScHandle scm_;

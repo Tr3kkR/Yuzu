@@ -430,6 +430,16 @@ int main(int argc, char* argv[]) {
                  "server-side runtime toggle.")
         ->envname("YUZU_AGENT_INVENTORY_DISABLE");
 
+    app.add_flag("--spark-disable", cfg.spark_disable,
+                 "Disable the SparkEngine detection engine (ADR-0021 Stage-2): it is never "
+                 "instantiated, watches nothing, and reports no capability or health "
+                 "counters. The heartbeat still carries two facts — that spark is off, and "
+                 "that this was deliberate (spark_running=0, spark_disabled=1) — so the "
+                 "fleet can tell a deliberate opt-out apart from an engine that FAILED to "
+                 "start. Deploy-time opt-out; the enforcing legacy Guardian path is "
+                 "unaffected. Not a server-side runtime toggle.")
+        ->envname("YUZU_AGENT_SPARK_DISABLE");
+
     // SLE (ADR-0024 Decision 11): how the software_licensing source records a
     // detected per-user licence's local profile name. hash (default) = a
     // per-agent keyed pseudonym HMAC-SHA256(k_agent, profile)/16-hex; collect =

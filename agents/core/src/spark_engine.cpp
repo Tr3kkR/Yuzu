@@ -88,6 +88,11 @@ SparkEngine::register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism>
     if (!is_event_driven(type))
         return std::unexpected(std::string("spark type '") + spark_type_token(type) +
                                "' is timer-driven — the wheel services it, it has no mechanism");
+    // lifecycle_mu_ before mu_ (see the header's LOCK ORDER note). This is the ONLY
+    // writer of mechanisms_; holding it here is what lets stop() iterate the map
+    // without mu_ even while the main thread is still registering during boot and the
+    // SCM control thread calls Agent::stop() (Gate-4 UP-1).
+    std::lock_guard life(lifecycle_mu_);
     std::lock_guard lk(mu_);
     if (running_ || stopped_)
         return std::unexpected("mechanisms must be registered before start()");
@@ -630,6 +635,11 @@ void SparkEngine::disarm(SubscriptionId id) {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 void SparkEngine::start() {
+    // lifecycle_mu_ before mu_ (header LOCK ORDER). Held for the whole of start() so a
+    // concurrent stop() — reachable from the Windows SCM control thread during boot —
+    // cannot interleave with mechanism bring-up and leave mechanisms started AFTER
+    // their stop() ran, which would destroy them with live threads (Gate-4 UP-1).
+    std::lock_guard life(lifecycle_mu_);
     std::size_t armed_count = 0;
     std::vector<ISparkMechanism*> mechs;
     struct Replay {
@@ -704,24 +714,93 @@ void SparkEngine::start() {
     spdlog::info("SparkEngine started ({} spark(s) armed)", armed_count);
 }
 
-void SparkEngine::stop() {
+void SparkEngine::stop() noexcept try {
+    // ── WHO CALLS THIS, AND WHY THERE IS NO SIGNAL-HANDLER MITIGATION ANY MORE ──────
+    //
+    // stop() is reachable from exactly three places, and NONE of them is a SparkEngine
+    // thread:
+    //   - `Agent::stop()`, called from main.cpp's shutdown WATCHER thread (POSIX) or
+    //     service_win.cpp's SCM control thread (Windows). Both ordinary threads.
+    //   - run()'s ScopeExit, on the run() thread.
+    //   - ~SparkEngine, on the thread that owns the engine (main).
+    //
+    // It used to ALSO be reachable from the POSIX signal handler, which called
+    // Agent::stop() inline — and a signal is delivered to an ARBITRARY thread, including
+    // the wheel, a mechanism poll thread, or a consumer dispatch thread. That forced a
+    // whole mitigation layer: masking SIGINT/SIGTERM on every spark thread, a same-thread
+    // re-entry guard (a signal could land on a thread already holding lifecycle_mu_ inside
+    // start()), and a lock-free self-join bail-out. Five governance rounds found five
+    // separate BLOCKING defects IN THAT MITIGATION LAYER.
+    //
+    // main.cpp now uses a self-pipe: the handler writes one byte and a dedicated watcher
+    // thread performs the teardown. stop() therefore CANNOT run on a spark thread, and all
+    // of that machinery is deleted. Do not re-add it — fix the caller instead.
+    //
+    // What REMAINS necessary, and must not be simplified away: lifecycle_mu_ +
+    // teardown_complete_. Agent::stop() on the Windows SCM control thread genuinely races
+    // ~SparkEngine on main, which is a real cross-thread hazard independent of signals.
+    //
+    // lifecycle_mu_ is held for the WHOLE teardown. It makes the stopped_ early-out
+    // below a COMPLETION barrier rather than a bare flag check: a second stop() (or
+    // ~SparkEngine, which calls stop()) blocks HERE until the in-flight teardown has
+    // finished, then sees stopped_ and returns having genuinely waited.
+    //
+    // Without it, the loser returned immediately while the winner was still inside
+    // wheel_thread_.join() / m->stop() — so ~SparkEngine could run on to
+    // ~std::thread(joinable) → std::terminate, and destroy mechanisms_ out from under
+    // the thread still calling m->stop() on them → use-after-free. Reachable for real:
+    // Agent::stop() runs on the Windows SCM control thread (service_win.cpp
+    // handler_ex) concurrently with the main thread's shutdown. Gate-3 B3.
+    // SAME-THREAD RE-ENTRY GUARD, before we touch the non-recursive lifecycle_mu_.
+    // main.cpp's signal handler calls Agent::stop() -> this, and the signal can land on a
+    // thread ALREADY inside stop() (the main thread in run()'s ScopeExit teardown, taking
+    // a SIGINT). Re-entering would self-deadlock. The outer call is already doing the
+    // teardown, so the nested one simply returns. (governance Gate-3 cpp-safety)
+    std::lock_guard life(lifecycle_mu_);
+
     // 1) Stop the watcher side first so nothing new is produced.
+    //
+    // The early-out is on teardown_complete_, NOT on stopped_. They mean different
+    // things and conflating them was a regression in this very fix (Gate-8
+    // security-guardian): stopped_ latches "accept no new work" BEFORE the risky
+    // teardown below (joins, map ops, spdlog — all of which can throw). Early-returning
+    // on stopped_ meant a throw mid-teardown made stop() report success having torn down
+    // nothing past the throw, AND made every later stop() — including ~SparkEngine's —
+    // a no-op. The destructor would then destroy a still-joinable wheel_thread_
+    // (std::terminate) and mechanisms_ with live threads (use-after-free): exactly the
+    // outcomes noexcept was added to prevent, converted from loud to silent.
+    //
+    // teardown_complete_ is set ONLY after the teardown actually finishes, so a failed
+    // teardown is retried by the next caller (in practice the destructor) instead of
+    // being latched away.
     {
         std::lock_guard lk(mu_);
-        if (stopped_)
+        if (teardown_complete_)
             return;
-        stopped_ = true;
+        stopped_ = true; // no new consumers / arms / registrations from here
         running_ = false;
     }
     wheel_cv_.notify_all();
+    // Self-join guard: joining the wheel thread FROM the wheel thread would throw
+    // std::system_error(resource_deadlock_would_occur), and stop() is noexcept.
+    //
+    // If we hit it, we MUST NOT go on to mark the teardown complete. An earlier version
+    // did, and that was strictly worse than the throw it was avoiding: skipping the join
+    // and then latching `teardown_complete_ = true` makes ~SparkEngine's stop() early-out,
+    // so the destructor runs ~std::thread on a STILL-JOINABLE wheel thread — a guaranteed
+    // std::terminate, silently, instead of a loud one. It converted a throw into a latched
+    // leak (governance Gate-3 cpp-safety).
+    //
     if (wheel_thread_.joinable())
         wheel_thread_.join();
 
     // 2) Stop event-driven mechanisms (producers, like the wheel) BEFORE the
-    // consumer threads they feed — a mechanism must quiesce before its
-    // downstream consumers. mechanisms_ is structurally stable post-start (no
-    // concurrent registration), so iterating without mu_ is safe; stop() is
-    // idempotent and a no-op if start() never ran.
+    // consumer threads they feed — a mechanism must quiesce before its downstream
+    // consumers. Iterating without mu_ is safe because lifecycle_mu_ (held above)
+    // excludes register_mechanism() — the ONLY writer of mechanisms_. The previous
+    // justification ("structurally stable post-start — no concurrent registration")
+    // was false during the boot window: the main thread registers while the SCM
+    // control thread can already be in stop(). Gate-4 UP-1.
     for (auto& [type, m] : mechanisms_)
         m->stop();
 
@@ -742,7 +821,37 @@ void SparkEngine::stop() {
                               std::memory_order_relaxed));
     for (auto& [id, consumer] : consumers)
         await_consumer(consumer, deadline);
+    {
+        std::lock_guard lk(mu_);
+        teardown_complete_ = true; // ONLY here — a throw above leaves it false, so the
+                                   // next stop() (the destructor's) retries the teardown
+    }
     spdlog::info("SparkEngine stopped");
+} catch (...) {
+    // stop() is noexcept and is called from ~SparkEngine. A throwing teardown
+    // (std::system_error from a join, bad_alloc from the consumer map, or spdlog
+    // itself) must not std::terminate the agent for an observe-only subsystem —
+    // that would defeat the very degrade-to-no-spark guard in agent.cpp that this
+    // engine's boot failure path depends on (Gate-3 cpp-expert SHOULD-1).
+    //
+    // LOUD, not silent (Gate-8 security-guardian): a swallowed teardown failure means a
+    // mechanism may not have released its OS handles. teardown_complete_ stays FALSE, so
+    // the next caller re-runs the teardown rather than latching the failure away. The log
+    // is itself wrapped — spdlog can throw, and a throw from this last-resort handler
+    // would re-open the terminate hole we are closing.
+    //
+    // HONEST SCOPE OF THE RETRY (Gate-8 round 2): re-running stop() re-drives the wheel
+    // join (joinable()-guarded, so no double-join) and the mechanism stop()s (idempotent).
+    // It CANNOT re-drive the consumer phase: consumers_ is swapped into a local BEFORE the
+    // signal/await loops, so a throw there loses them and the retry finds nothing to await.
+    // At rung 1 that phase is a no-op (no consumer is ever registered), but the retry
+    // guarantee must not be over-claimed for rung 2, which is when consumers arrive.
+    try {
+        spdlog::error("SparkEngine::stop() threw during teardown — OS handles may not have "
+                      "been released; the wheel + mechanism teardown will be re-run on "
+                      "destruction (the consumer phase, if reached, cannot be re-run)");
+    } catch (...) {
+    }
 }
 
 bool SparkEngine::is_running() const noexcept {
@@ -978,6 +1087,7 @@ SparkEngineStats SparkEngine::stats() const {
         for (const auto& [type, m] : mechanisms_) {
             const auto ms = m->stats();
             s.mech_retiring += ms.retiring;
+            s.mech_retiring_cap += ms.retiring_cap;
             s.mech_watch_rejected_total += ms.watch_rejected_total;
             s.mech_quarantined_total += ms.quarantined_total;
             s.mech_slow_op_total += ms.slow_op_total;
@@ -1000,6 +1110,18 @@ SparkEngineStats SparkEngine::stats() const {
     s.inline_over_100us_total = inline_over_100us_.load(std::memory_order_relaxed);
     s.inline_over_10ms_total = inline_over_10ms_.load(std::memory_order_relaxed);
     return s;
+}
+
+std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {
+    // Same shape as the mech_* sum in stats() (lines above) but the SparkType key
+    // is preserved instead of folded away. mu_-only (never shares a lock with
+    // watch/unwatch/stop) and m->stats() is atomic-only, so this cannot block or
+    // reenter the engine — identical safety to the stats() sum loop.
+    std::map<SparkType, SparkMechanismStats> out;
+    std::lock_guard lk(mu_);
+    for (const auto& [type, m] : mechanisms_)
+        out.emplace(type, m->stats());
+    return out;
 }
 
 void SparkEngine::set_disk_reader_for_test(DiskReaderFn reader) {
