@@ -72,6 +72,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 - Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. Inactivity timeout and explicit secure-cookie-attribute review remain open.
 - API token governance: scoped permissions, expiration defaults, rotation process, token inventory.
 - **Residual (#1836):** OIDC IdP-group→RBAC deprovisioning (#1832) propagates on the user's **next SSO login**, not immediately on IdP-side group removal — a live session/cookie or an already-issued token retains its prior roles until re-authentication. Session revocation (above) is the operator's manual mitigation in the interim; automatic mid-session role re-check is tracked in #1836.
+- **UCE surface (forward ref):** the use-case-engine host inherits SSO transitively through this server's OIDC (`docs/uce-host-requirements.md` §4.6/NF-9 — Yuzu-as-identity-provider). This **doubles #1836's blast surface**: a stale IdP group also gates UCE artifact-minting until the operator's Yuzu session is force-revoked or the ≤5-min artifact TTL / NF-9(d) liveness floor expires, and it adds a second login-event stream **outside** the server's audit perimeter (`uce-host-requirements.md` NF-6). An access-control reviewer working from this section must follow NF-9 for the second surface.
 
 ### Evidence
 
@@ -178,6 +179,42 @@ the SQLite table above. Each new server store registers here.
 Both PostgreSQL stores fail **closed** on an unreachable database (ADR-0007 — the server refuses to boot), and are gated into `/readyz` and `/healthz`. Beyond boot, `software_inventory_store` reads are **authoritative** (ADR-0016 §7): a transient query-time degradation after a healthy boot (pool-acquire timeout, query error) surfaces as a `kInternalError` from `query_installed_software` (and a `503` A4 envelope from the REST sibling `GET /api/v1/inventory/software`), never a successful empty result — so a fleet vulnerability query can never read a transient backend hiccup as "installed nowhere". **Both read channels (MCP + REST) carry a per-agent management-group drop filter** (out-of-scope device rows are dropped and the drop is audited — a distinct `denied` event with the dropped-device count). **However, this confinement is NOT yet verified effective and must NOT be cited as an affirmative CAIQ / CC6.1 answer for fleet list reads:** both channels gate on the *global* `Inventory:Read` permission, and under that global gate the per-agent filter does not narrow results (a management-group-confined operator is denied at the gate before the filter runs; a global operator's filter is a no-op) — the same inert-list-scoping class documented in **ADR-0017**. List-view management-group confinement is *designed for* here but becomes effective only once the ADR-0017 admit-then-filter gate lands and the #1713/#1676 UAT confirms it. Until then, treat operator read isolation on this surface as **per-device-only**, and answer the CAIQ confidentiality question for fleet list reads as "designed, not yet verified" — not affirmative. The shared decommission/retention-purge gap (no per-device delete across either store, matching the SQLite per-agent stores) is tracked as **#1666** (platform-lifecycle follow-up; the `offline_endpoint_store` half is **#1545**); until it lands, `last_seen` is the canonical "is this device still active" filter for asset-management counts.
 
 **Daily-sync PII carve-out (ADR-0024 Decision 11).** The ADR-0016 daily-sync framework was specified **machine-scope / no-end-user-PII**, and the `installed_software` and `device_ci` rows above still hold to that (no usernames, no per-user attribution — those statements remain true). The **`software_licensing` source deliberately deviates** — and only that source: at the owner's explicit direction it probes per-user licence surfaces, so its records may carry `user_scope=user` + a pseudonymous `user_ref` (see the `software_licensing_store` row above). This is a contained, **maintainer-signed-off** deviation confined to **two fields on this one source**. Default `hash` mode keeps `user_ref` pseudonymous (still personal data under **GDPR Recital 26**); `--license-scan-user-ref=omit` suppresses the identifier; `--inventory-disable` turns the source off entirely. It does **not** relax the machine-scope posture of any other daily-sync source (installed-software, device-CI, app-performance). Full per-surface disclosure — exactly what is probed on Windows / Linux / macOS, and the honest limits of the `hash` pseudonym — is in [`docs/user-manual/software-licensing.md`](user-manual/software-licensing.md), the works-council-reviewable transparency evidence.
+
+#### UCE host stores (`engines/`, own PostgreSQL — separate deployable, ADR-1005)
+
+Use-case-engine (UCE) modules run in a **separately-deployed host** with **its
+own PostgreSQL database, never the server's connection pool** (ADR-1005 plan
+Decision 11). Data a UCE re-serves or derives sits **outside the server's audit
+perimeter** (ADR-1005 Decision 5), so the UCE host carries its own
+audit/compliance controls for it. **Topology (2026-07-12, accepted trade-off):
+the UCE data layer is a separate database on the server's own PostgreSQL
+*instance* — not a separate instance — with a dedicated role/grants, cross-database
+access forbidden and mechanically revoked, and TLS-only remote access from the UCE
+VM (full design + isolation mechanics: `docs/uce-deployment-topology-design.md`);
+so this row's "separate database" MUST NOT be read as instance-level isolation
+for CAIQ/CC6.1 purposes.** This row registers the derived store here for
+inventory completeness. Entries are **forward-declared** — the store ships at the
+vuln module's store-ship milestone (requirements: `docs/uce-host-requirements.md` §7 + F-12, exec-plan
+item 2c) — following the `recommendations.db` *(proposed)* precedent above.
+
+**Confinement maturity caveat (same posture as the server-store note at the top
+of this section):** the findings-view management-group confinement this store
+depends on (`uce-host-requirements.md` §6) resolves through the ADR-0017
+admit-then-filter chokepoint, which is **chartered but unbuilt today** — so
+findings-view operator confinement is **designed, not yet verified effective**,
+and MUST NOT be cited as an affirmative CAIQ / CC6.1 answer until M3(d) verifies
+it (`uce-host-requirements.md` F-5/F-15). The same "designed, not verified"
+caveat applies to the **operator login / SSO surface** (`uce-host-requirements.md`
+NF-9, Verify = "stack ADR (T2b) / security-guardian" — not yet built): "UCE
+inherits Yuzu SSO" MUST NOT be cited as an affirmative CAIQ/CC6.x answer until
+T2b ships and security-guardian signs off. There is no collection-level off-switch
+row for this store because the UCE vuln module is itself a **separately-deployed,
+opt-in artifact** — a customer without works-council sign-off simply does not
+stand it up; the only per-store knob is retention.
+
+| Store | Schema (PostgreSQL) | Data class | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| Vulnerability findings (UCE vuln module) *(forward-declared — exec-plan 2c commitment; ships at the module's store-ship milestone, F-12)* | UCE host PostgreSQL (own database; table names settled at store-ship / stack ADR) | **Derived vulnerability findings — sensitive security data, device-attributable.** Per-device CVE exposure (`agent_id` × CVE × matched product/version, with severity/exploitability). Enumerates the fleet's exploitable attack surface, so treated as **more sensitive than the installed-software inventory it derives from** — a breach discloses what is *attackable*, not merely what is installed. **No direct username/SID** (machine-scope source, ADR-0016 §8), but device-attributable and therefore **personal data under GDPR when the device is person-assigned** — hence the subject-erasure path in the deletion column; device-attributability keeps the works-council capability-to-monitor posture of its source. Sits **outside the server audit perimeter** (ADR-1005 Decision 5) — governed by the UCE host's own controls. | Open findings retained **while current** (superseded/refreshed each sync cycle); resolved/superseded findings **90 days default** (mirrors `recommendations.db`). | Module-owned resolved-finding reaper **and device-decommission purge, both wired at the store-ship milestone**, plus a **subject-erasure (DSAR/Art. 17) path** distinct from decommission and a **legal-hold-aware reaper** (`uce-host-requirements.md` F-14) — explicitly not inheriting the #1666 unwired-decommission gap the server inventory stores carry. | `vuln_findings_resolved_retention_days` *(name provisional; final at store-ship)* |
 
 #### Agent-side edge warehouse (`tar.db`, per device — federated, ADR-0004)
 
