@@ -544,6 +544,24 @@ One full governance run on a non-trivial commit range is ~6-9 parallel agent cal
 
 Skipping Gate 4 or Gate 5 to save time is rarely worth it. Skipping Gate 3 domain agents is sometimes fine if the change is genuinely small in scope (one file, no public API change); use the decision matrix to judge.
 
-## Post-run follow-ups
+## Post-run follow-ups — file deferred findings per the issue standard
 
-After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items that should be filed as GitHub issues (SHOULD findings that were scoped out of the PR). See prior examples in issues #340..#353. Group by domain (tech-debt, chaos, observability, devops) and include full-context bodies so a future session can pick them up cold.
+After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items (SHOULD findings scoped out of the PR). Governance is the repo's largest issue-inflow source, so filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
+
+1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
+2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
+   ```bash
+   gh issue list --repo Tr3kkR/Yuzu --state open --search "<file-or-symbol>" --json number,title
+   gh search issues --repo Tr3kkR/Yuzu --state open "<title keywords>" --json number,title --limit 20
+   ```
+   An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
+3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
+   ```bash
+   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+     --label <type> --label governance-deferred --label "P1|P2" --label ready-for-agent \
+     --body-file <candidate>.md
+   ```
+   **Every governance filing carries `governance-deferred`** (that label is how agent inflow is counted). Add facet labels as they genuinely apply (`tech-debt`, `reliability` for chaos findings, `observability`, `devops`, `security` for hardening — never for exploitable vulnerabilities, which go to private advisories per `SECURITY.md`).
+4. **The run report enumerates BOTH lists** — filed (with issue numbers) and not-filed (with the duplicate verdict and the issue each deduped against) — so inflow is auditable run over run.
+
+Prior examples: issues #340..#353 (pre-standard; the body format is now the standard's four sections).

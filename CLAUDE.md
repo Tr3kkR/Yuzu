@@ -241,7 +241,7 @@ The `frontend-design` plugin is **marketing / sales / demo surfaces only** — i
 
 ### Issue tracker, triage labels, domain docs
 
-GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI (`docs/agents/issue-tracker.md`). Triage labels: the canonical five plus a broader categorization set (`docs/agents/triage-labels.md`). Domain docs: `CONTEXT.md` at the repo root, ADRs under `docs/adr/` (`docs/agents/domain.md`).
+Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`).
 
 ## CLAUDE.md updates
 

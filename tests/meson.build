@@ -537,3 +537,13 @@ test('flake-retry selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
+# do-not-close.txt parses clean (the never-close guard every automated close
+# path reads), and issue-standard.md keeps its never-close section.
+test('issue lifecycle docs',
+  _python3_test,
+  args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
