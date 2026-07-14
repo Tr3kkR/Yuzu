@@ -249,11 +249,17 @@ jobs:
           # flock serializes apt across the 4 runners sharing the Big Tam
           # host — DPkg::Lock::Timeout does NOT cover apt-get update's lists
           # lock — reusing ci.yml's lock path so all Big Tam jobs coordinate.
+          #
+          # gdb is in this list (not apt-installed inside the diagnostic step
+          # where it used to live) so the failure path costs no apt-get update
+          # round-trip, and so a broken apt mirror surfaces here — up front, on
+          # every run — rather than only on the run where we need a stack and
+          # cannot get one (#1038, build-ci N1).
           (
             flock -w 600 9 || { echo "::error::timed out waiting for apt lock"; exit 1; }
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
-              cmake ninja-build gcc-15 g++-15 \
+              cmake ninja-build gcc-15 g++-15 gdb \
               pkg-config curl zip unzip tar python3-pip ccache \
               bison flex libsystemd-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
@@ -336,13 +342,43 @@ jobs:
         # helper, no crash. Scoped to the TSan job only via LD_PRELOAD on
         # the Test and gdb steps; production keeps the non-blocking-DNS
         # behaviour (DNS timeouts still interruptible there).
+        #
+        # Built into RUNNER_TEMP, not /tmp: the Big Tam host is shared by 4
+        # persistent self-hosted runners, and a bare /tmp path is one global
+        # name for all of them. The `concurrency:` group makes a same-ref
+        # collision unlikely rather than impossible (a manual dispatch against
+        # a branch runs concurrently with the scheduled main nightly), and a
+        # half-written .so under LD_PRELOAD fails every exec in the job with a
+        # error that looks nothing like its cause. Per-job temp removes the
+        # shared name entirely (#1038, R-15 / CS-04).
         run: |
-          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
+          cat > "$RUNNER_TEMP/gai_sync_shim.c" << 'SHIM_EOF'
           #define _GNU_SOURCE
           #include <netdb.h>
           #include <stddef.h>
           #include <signal.h>
           #include <time.h>
+
+          /* struct gaicb::__return is glibc-internal — the header marks it
+             "private to the implementation", so writing it is layout-coupled to
+             whatever glibc we compiled against. The layout has been stable since
+             glibc 2.2.3, but stability is not a contract, and the failure mode if
+             it ever shifts is silent: we would scribble an int over whichever
+             field moved into that offset, inside a DNS path, under TSan — a bug
+             that would present as anything but its cause.
+             So assert the layout at compile time. A future glibc that reshuffles
+             gaicb then fails THIS step, loudly, with the offset in the message —
+             instead of producing a corrupt nightly (#1038, R-02/R-03/sec LOW-2). */
+          _Static_assert(sizeof(void *) == 8,
+                         "gai_sync_shim: expected an LP64 target (x86-64 runner)");
+          _Static_assert(offsetof(struct gaicb, ar_result) == 24,
+                         "gai_sync_shim: gaicb::ar_result moved — glibc layout changed");
+          _Static_assert(offsetof(struct gaicb, __return) == 32,
+                         "gai_sync_shim: gaicb::__return moved — glibc's internal layout "
+                         "changed; re-verify the shim against the new <netdb.h> before "
+                         "trusting it");
+          _Static_assert(sizeof(struct gaicb) == 56,
+                         "gai_sync_shim: sizeof(struct gaicb) changed — glibc layout changed");
 
           int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
                              struct sigevent *sig) {
@@ -373,9 +409,12 @@ jobs:
               return EAI_NOTCANCELED;
           }
           SHIM_EOF
-          gcc -shared -fPIC -O2 -Wall -Wextra \
-            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
-          file /tmp/libgai_sync_shim.so
+          # -Werror: the layout guards above are the entire safety story for the
+          # __return write. A warning here is not cosmetic.
+          gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -o "$RUNNER_TEMP/libgai_sync_shim.so" "$RUNNER_TEMP/gai_sync_shim.c"
+          file "$RUNNER_TEMP/libgai_sync_shim.so"
+          echo "::notice::gai_sync_shim built ok (glibc gaicb layout guards passed) -> $RUNNER_TEMP/libgai_sync_shim.so"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
@@ -385,73 +424,62 @@ jobs:
       - name: Test
         id: test
         env:
-          LD_PRELOAD: /tmp/libgai_sync_shim.so
+          LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
         # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets).
         run: meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs
 
       - name: Capture stack trace under gdb (#438 diagnostic)
         # With the gai_sync_shim active, the originally-documented #438
-        # getaddrinfo_a crash is suppressed and the TSan suite should pass.
-        # This step only runs when the Test step itself failed — so any
-        # stack captured here is a NEW failure mode worth investigating.
-        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so
-        # we replay the seed the meson run used when extractable.
+        # getaddrinfo_a crash is suppressed and the TSan suite should pass, so
+        # any stack captured here is a NEW failure mode worth investigating.
         #
-        # `if: steps.test.outcome == 'failure'` (rather than `failure()`)
-        # ensures we don't gdb against a non-test failure (e.g. ccache
-        # binary corrupt, artifact upload error) where there's no
-        # meaningful binary to inspect.
-        if: steps.test.outcome == 'failure'
+        # The `if:` needs care, and got it wrong before (#1038). The previous
+        # guard was a bare `steps.test.outcome == 'failure'`, which contains no
+        # status-check function — so GitHub ANDs an implicit `success()` onto it,
+        # and `success()` is false the moment Test fails. The condition was
+        # therefore unsatisfiable and the step skipped on every red nightly since
+        # #1034 (verified against runs 29312580979 / 29231499246 / 29183473414:
+        # "Test: failure" -> "Capture stack trace under gdb: skipped"). The whole
+        # diagnostic has been dead code.
+        #
+        # `failure() || cancelled()` restores reachability AND extends it to job
+        # cancellation — a TSan test stuck until the 60-min timeout is exactly the
+        # case a stack helps most, and `failure()` alone does not fire there
+        # (#1038, NICE-3). The outcome check is kept as the inner clause so we
+        # still don't gdb an unrelated failure (a corrupt ccache, a bad artifact
+        # upload) where there is no meaningful binary to inspect — which was the
+        # original, correct intent of the guard this replaces.
+        if: (failure() || cancelled()) && (steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled')
         env:
-          LD_PRELOAD: /tmp/libgai_sync_shim.so
+          LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          # Not interpolated into the shell directly: keeps the expression out of
+          # the script body (zizmor template-injection hygiene, and it is the
+          # pattern the rest of this file uses).
+          TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
-          # flock-wrapped (shared Big Tam host); best-effort, so a lock
-          # timeout must not fail this diagnostic step.
-          ( flock -w 120 9 || true
-            sudo apt-get -o DPkg::Lock::Timeout=120 install -y gdb >/dev/null 2>&1 || true
-          ) 9>/tmp/yuzu-ci-apt.lock
-          if ! command -v gdb >/dev/null; then
-            echo "gdb unavailable on this runner — skipping stack capture"
-            exit 0
-          fi
-          cd build-linux-tsan
-          seed=$(grep -oE 'Randomness seeded to: [0-9]+' meson-logs/testlog.txt 2>/dev/null | head -1 | awk '{print $NF}') || true
-          if [ -n "$seed" ]; then
-            echo "replaying Catch2 seed: $seed"
-            seed_args="--rng-seed $seed --order rand"
-          else
-            seed_args="--order rand"
-          fi
-          export TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
-          # gdb's default SIGSEGV disposition (stop + don't pass to inferior)
-          # leaves us at the crashing frame; subsequent commands then dump
-          # every thread's stack plus the crashing thread's registers.
-          # `timeout 300` caps a non-reproducing run so it can't consume
-          # the rest of the 60-min job budget (unhappy-path R-07).
-          timeout 300 gdb -batch \
-            -ex 'set pagination off' \
-            -ex 'set print thread-events off' \
-            -ex 'set backtrace limit 80' \
-            -ex "run $seed_args" \
-            -ex 'printf "\n=== thread backtraces (full) ===\n"' \
-            -ex 'thread apply all bt full' \
-            -ex 'printf "\n=== info registers ===\n"' \
-            -ex 'info registers' \
-            -ex 'quit' \
-            ./tests/yuzu_server_tests 2>&1 | tee stack-capture.log || true
-          # Match TSan-aborted runs (SIGABRT after a printed race report) and
-          # bus errors as well as SIGSEGV. Otherwise non-allocator TSan races
-          # produce a false-negative "did not crash" annotation (R-13).
-          if ! grep -qE 'received signal|SIGSEGV|SIGABRT|SIGBUS|ThreadSanitizer:' stack-capture.log; then
-            echo "(test binary did not crash this run — Catch2 shuffle non-determinism; re-dispatch nightly for another attempt)" >> stack-capture.log
-          fi
+          # Which binaries to gdb, with which Catch2 seed, is derived from the run
+          # itself — see scripts/ci/tsan-gdb-capture.py. It replaces a hardcoded
+          # `./tests/yuzu_server_tests`, which captured nothing at all when the
+          # crash was in agent/tar/transport (#1038, R-06). Best-effort by
+          # contract: the script always exits 0, so a diagnostic that cannot run
+          # never masks — or adds to — the real failure.
+          mode=failure
+          [[ "$TEST_OUTCOME" == "cancelled" ]] && mode=cancelled
+          python3 scripts/ci/tsan-gdb-capture.py \
+            --builddir build-linux-tsan \
+            --mode "$mode"
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog and stack capture (on failure)
-        if: failure()
+      - name: Upload meson testlog and stack capture (on failure or cancel)
+        # `|| cancelled()` for the same reason the gdb step has it: on a 60-min
+        # timeout the job is CANCELLED, not failed, so a plain `failure()` upload
+        # would throw away the very stack capture the step above just took for
+        # the stuck-test case. An `always()` here would also upload on green runs.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-tsan
