@@ -1,9 +1,10 @@
 name: Docker healthcheck invariants
 
-# Verifies that every published Yuzu image still provides the tool its compose
-# healthcheck invokes (#751): bash + /dev/tcp for the server image, busybox
-# wget --spider for the gateway image, /bin/busybox for the three FROM-scratch
-# chisel images.
+# Verifies that the five Yuzu APPLICATION images still provide the tool their
+# compose healthcheck invokes (#751): bash + /dev/tcp + grep for the server
+# image, busybox wget --spider for the gateway image, and /bin/busybox for the
+# three FROM-scratch chisel images. (yuzu-postgres is published and healthchecked
+# too, but is FROM postgres:* and out of scope — see the script's header.)
 #
 # Why this exists: those dependencies are invisible to the application. A base-
 # image swap, a dropped apt package, or a chisel slice change that stops
@@ -106,14 +107,26 @@ jobs:
 
           echo "Changed files:"; echo "$FILES" | sed 's/^/  /'
 
-          # The image surface: the five published Dockerfiles, every compose file
-          # that defines a healthcheck (a healthcheck edit can invalidate the
-          # probes in the script), the script itself, and this workflow.
+          # The image surface: the five gated Dockerfiles, EVERY file that defines
+          # a healthcheck for one of those images, the script itself, and this
+          # workflow.
+          #
+          # The healthcheck definitions matter because the script's probes are a
+          # hard-coded COPY of them. A compose edit cannot break the image, but it
+          # CAN silently invalidate the probe -- so it must at least force this
+          # gate to run and a human to look.
+          #
+          # KEEP IN SYNC with the healthcheck list in
+          # scripts/ci/verify-healthcheck-invariants.sh. The last two patterns are
+          # easy to forget: scripts/test/ and the compose heredocs inlined in
+          # pre-release.yml both healthcheck yuzu-server with bash + /dev/tcp.
           if echo "$FILES" | grep -qE \
             -e '^deploy/docker/Dockerfile\.(server|gateway)(\.chisel)?$' \
             -e '^deploy/docker/Dockerfile\.agent\.chisel$' \
             -e '^deploy/docker/docker-compose.*\.ya?ml$' \
             -e '^docker-compose\.uat\.yml$' \
+            -e '^scripts/test/docker-compose\.upgrade-test\.yml$' \
+            -e '^\.github/workflows/pre-release\.yml$' \
             -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
             -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
             echo "Image surface touched -- verifying."
@@ -229,7 +242,14 @@ jobs:
     # names will not match the required contexts.
     name: "Verify ${{ matrix.role }} healthcheck invariant"
     needs: changes
-    if: needs.changes.outputs.images_touched == 'false'
+    # NOT `== 'false'`. A bare `if:` is implicitly ANDed with success(), so if
+    # `changes` itself fails, BOTH this job and `verify` would be skipped,
+    # `images_touched` would be '' (neither 'true' nor 'false'), and — per
+    # runner#952 — neither matrix would emit any check-run name. The required
+    # contexts would hang at "Expected — waiting for status" exactly as they do
+    # under a path filter. `!cancelled()` re-arms this job on that path, and the
+    # step below turns it into an honest red X instead of a silent hang.
+    if: ${{ !cancelled() && needs.changes.outputs.images_touched != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -243,7 +263,19 @@ jobs:
       - name: Satisfy required check (image surface untouched)
         env:
           ROLE: ${{ matrix.role }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
         run: |
+          # The classifier died. We do not know whether the image surface changed,
+          # so we must NOT emit a green check -- but we must still emit the check
+          # NAME, or the required context hangs forever instead of failing. Emit
+          # it red.
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "The 'Detect image-surface changes' job did not succeed (result: ${CHANGES_RESULT})."
+            echo "Whether the ${ROLE} image surface changed is therefore UNKNOWN, and its"
+            echo "healthcheck invariant has NOT been verified. Failing closed: re-run the job."
+            exit 1
+          fi
+
           echo "No image-surface change in this PR, so the ${ROLE} image is not built."
           echo "Its healthcheck invariant cannot have regressed: neither the Dockerfile"
           echo "nor any compose healthcheck changed."

@@ -1219,15 +1219,12 @@ jobs:
       # at boot, only the healthcheck, so Compose parks every container in
       # `unhealthy` forever with no application error to point at.
       #
-      # This build populates the local buildcache (`cache-to`) ON PURPOSE, so
-      # "Build and push" below is a guaranteed full cache hit and pays only for
-      # the registry upload. Dropping the `cache-to` here to avoid the duplicate
-      # export would leave the push step reading the PREVIOUS release's cache: on
-      # any Dockerfile change that is a cache MISS, and the release would compile
-      # the image twice. The redundant export is the cheaper of the two.
-      #
-      # (The PR gate in docker-healthcheck-invariants.yml is the opposite case --
-      # it reads this cache but must never write it, so it has cache-from only.)
+      # No `cache-to` here. Both builds run against the SAME buildkitd instance
+      # (one `setup-buildx-action` builder per job), so "Build and push" below
+      # hits BuildKit's own in-memory solver cache from this build and rebuilds
+      # nothing -- it pays only for the registry upload. A second `mode=max` local
+      # export would be a full duplicate write of a cache that already includes
+      # the vcpkg builder stage, for no benefit.
       - name: Build for healthcheck verification (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -1240,7 +1237,6 @@ jobs:
           build-args: |
             TRIPLET=x64-linux
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
-          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }},mode=max
           provenance: false
           sbom: false
 
@@ -1653,10 +1649,12 @@ jobs:
       # ── Healthcheck runtime invariants (#751) ──────────────────────────
       # Same pre-push gate as docker-publish, and it matters MORE here: these
       # images are FROM scratch, so their healthcheck depends entirely on a
-      # busybox binary the chisel stage symlinks into place. A slice change
-      # that stops shipping it breaks every demo-stack healthcheck and nothing
-      # else. docker-compose.demo.yml invokes it by absolute path
-      # (`/bin/busybox wget --spider`), which is exactly what the script probes.
+      # busybox binary the chisel stage symlinks into place. A slice change that
+      # stops shipping it breaks the demo-stack healthchecks and nothing else.
+      # docker-compose.demo.yml invokes busybox by ABSOLUTE path
+      # (`/bin/busybox wget --spider`) for the server and gateway chisel images,
+      # which is exactly what the script probes. The `agent` leg of this matrix is
+      # pre-emptive — no compose healthchecks an agent image today.
       #
       # NO TRIPLET build-arg, matching "Build and push" below.
       - name: Build for healthcheck verification (no push)
@@ -1669,7 +1667,6 @@ jobs:
           load: true
           tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
-          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel,mode=max
           provenance: false
           sbom: false
 

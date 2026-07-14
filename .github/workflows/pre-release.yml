@@ -32,24 +32,27 @@ jobs:
   resolve:
     name: "Resolve version"
     runs-on: ubuntu-24.04
-    # Gate on the triggering Release run being a SUCCESSFUL TAG BUILD.
+    # `github.event.workflow_run.head_branch` is the TRIGGERING Release run's
+    # head_branch, which for a `v*` tag push IS the tag (`v0.13.0`) — do not
+    # confuse it with this workflow's own `head_branch`, which is always `main`
+    # because a `workflow_run` workflow always executes on the default branch.
+    # Reading the latter is what makes this gate look permanently dead when it
+    # is not: QA has run on every SUCCESSFUL Release (e.g. run 24937379958 for
+    # v0.11.0, where `resolve` succeeded and `integration` then failed on the
+    # uppercase-registry pull fixed below). It skips on the other runs only
+    # because `conclusion == 'success'` is false — 94 of the last 100 Release
+    # runs failed or were cancelled.
     #
-    # This used to read `startsWith(github.event.workflow_run.head_branch, 'v')`,
-    # which never matched: for a tag-triggered upstream run, GitHub reports
-    # `head_branch` as the BRANCH the tagged commit sits on (`main`) — never the
-    # tag. Every Release run since the workflow was written was a `v*` tag push,
-    # and every resulting Pre-release QA run reported `head_branch=main`, so this
-    # condition was false every single time. The whole suite — artifact
-    # verification, integration, soak, upgrade, Trivy and all four installer
-    # jobs — has therefore NEVER executed, while the workflow reported green.
-    #
-    # release.yml triggers on `push: tags: ['v*']` and workflow_dispatch, so an
-    # upstream run with `event == 'push'` is necessarily a `v*` tag build. The
-    # tag itself is recovered from the commit in "Determine version" below.
+    # `startsWith(..., 'v')` is also the condition that keeps the DISPATCH
+    # release path covered: release.yml can be run via workflow_dispatch on a
+    # tag ref (the documented fallback for when GitHub drops a tag-push webhook,
+    # used for v0.11.0-rc1), and such a run still reports head_branch=v0.11.0-rc1.
+    # Narrowing this to `workflow_run.event == 'push'` would silently skip QA on
+    # every manually-cut release — and report green while doing it.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push')
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
@@ -60,22 +63,26 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Check out the commit the Release workflow built, with full history
-          # and tags — "Determine version" maps that commit back to its tag.
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
-          fetch-depth: 0
           persist-credentials: false
 
       # `github.repository_owner` is `Tr3kkR` — mixed case. Docker rejects
       # uppercase in a repository name outright ("repository name must be
       # lowercase"), so `ghcr.io/${{ github.repository_owner }}/yuzu-server`
-      # cannot be pulled at all. release.yml lowercases the owner for exactly
-      # this reason; this workflow never did, and the bug stayed invisible
-      # because no job that pulls an image has ever run. Every consuming job
-      # below overrides the workflow-level REGISTRY with this value.
+      # cannot be pulled at all. This is not theoretical: the v0.11.0 QA run
+      # (24937379958) died with exactly `invalid reference format: repository
+      # name (Tr3kkR/yuzu-server) must be lowercase`. release.yml lowercases the
+      # owner for this reason; this workflow never did. Every job below that
+      # touches an image overrides REGISTRY with this value, and steps that
+      # cannot read env (action `with:` inputs, e.g. trivy's image-ref) use the
+      # output directly.
       - name: Lowercase registry owner
         id: reg
-        run: echo "registry=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+        env:
+          # Bound to env rather than interpolated into the run body — the next
+          # step documents why, and this step must not be the counter-example.
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "registry=ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: ver
@@ -86,21 +93,16 @@ jobs:
           # workflow_dispatch input can carry shell metacharacters, and
           # direct `${{ ... }}` expansion into a `run:` block is a code-
           # injection sink (CodeQL actions/code-injection/critical).
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          #
+          # EVENT_BRANCH is the TRIGGERING Release run's head_branch, which for a
+          # tag build is the tag itself (`v0.13.0`). See the `if:` above.
+          EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             TAG="$INPUT_TAG"
           else
-            # Recover the tag from the commit the Release workflow built. Sorted
-            # newest-first so a commit carrying several tags (a retag) resolves
-            # to the one that actually triggered this run.
-            TAG="$(git tag --points-at "$HEAD_SHA" --sort=-creatordate \
-                   | grep -E '^v[0-9]' | head -1)"
-            if [[ -z "$TAG" ]]; then
-              echo "::error::No v* tag points at $HEAD_SHA — cannot resolve the release under test." >&2
-              exit 1
-            fi
+            TAG="$EVENT_BRANCH"
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -1021,6 +1023,7 @@ jobs:
     steps:
       - name: Generate report
         env:
+          R_RESOLVE: ${{ needs.resolve.result }}
           R_INTEGRATION: ${{ needs.integration.result }}
           R_DEB: ${{ needs.install-deb.result }}
           R_RPM: ${{ needs.install-rpm.result }}
@@ -1061,9 +1064,33 @@ jobs:
 
           REPORT
 
-          # Determine overall result
+          # `resolve` is deliberately NOT in ALL_RESULTS below, because a skipped
+          # resolve must not be reported as a pass. This job is `if: always()`,
+          # so when `resolve` skips (the triggering Release failed or was
+          # cancelled — 94 of the last 100 Release runs) every one of the nine
+          # test jobs is `skipped`, nothing matches "failure", and this step used
+          # to print `### Result: PASSED` and exit 0. THAT is why Pre-release QA
+          # has looked permanently green while testing nothing: not a dead
+          # trigger, but a report that treats "never ran" as "passed".
+          if [ "$R_RESOLVE" = "skipped" ]; then
+            echo "### Result: NOT RUN" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No successful \`v*\` Release to test, so no QA was performed." >> "$GITHUB_STEP_SUMMARY"
+            echo "This is NOT a pass — nothing was verified." >> "$GITHUB_STEP_SUMMARY"
+            echo "Pre-release QA did not run: no successful release to test."
+            exit 0
+          fi
+
+          if [ "$R_RESOLVE" != "success" ]; then
+            echo "### Result: FAILED (could not resolve the release under test)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Pre-release QA could not resolve the release under test (resolve=$R_RESOLVE)."
+            exit 1
+          fi
+
+          # Determine overall result. `cancelled` counts as a failure: a cancelled
+          # suite has verified nothing, and must never read as a pass either.
           ALL_RESULTS="$R_INTEGRATION $R_DEB $R_RPM $R_WINDOWS $R_MACOS $R_ARTIFACT $R_SECURITY $R_SOAK $R_UPGRADE"
-          if echo "$ALL_RESULTS" | grep -q "failure"; then
+          if echo "$ALL_RESULTS" | grep -qE "failure|cancelled"; then
             echo "### Result: FAILED" >> "$GITHUB_STEP_SUMMARY"
             echo ""
             echo "QA FAILED for $TAG"

@@ -173,6 +173,8 @@ Three-tier split: Tier 1 PR fast-path (`ci.yml`, one Linux + Windows + macOS + `
 
 The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose-versions.sh` **first** — it rejects any tracked-compose `ghcr.io/<owner>/yuzu-{server,gateway,agent}(-chisel)?:X.Y.Z` that is a bare numeric tag or a `${YUZU_VERSION:-...}` default ≠ the tag being released (floating tags ignored). **Before tagging**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify: `bash scripts/check-compose-versions.sh 0.12.0` — else the job fails only after the full build matrix. New compose file ⇒ add it to the script's `FILES` array (auto-discovery is deliberately off).
 
+Additionally, `docker-publish`/`docker-publish-chisel` run `scripts/ci/verify-healthcheck-invariants.sh` **between build and push** (#751), so an image whose compose healthcheck tool (bash+`/dev/tcp`, busybox `wget --spider`) has silently gone missing is never published. The same gate runs on PRs via `docker-healthcheck-invariants.yml`. See `docs/ci-architecture.md` → "Gates outside the tier ladder".
+
 ## Changelog
 
 **Never edit `CHANGELOG.md`** — add one fragment file `changelog.d/<PR#>-<slug>.<section>.md` (body = the finished `- ` bullet), assembled at release. A hook + the `Changelog fragments` CI job enforce this; see `changelog.d/README.md`.

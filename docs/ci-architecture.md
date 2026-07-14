@@ -52,15 +52,26 @@ dormant until merged.
 
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 
-Every Yuzu image's compose healthcheck depends on a tool baked into the image,
-not on the application: **bash + `/dev/tcp`** for `yuzu-server`, **busybox `wget
---spider`** for `yuzu-gateway`, and **`/bin/busybox`** (by absolute path) for the
-three FROM-scratch chisel images. Nothing else exercises those tools. A base-image
-swap, a dropped apt package, or a chisel slice change that stops shipping the
-busybox symlink breaks nothing at build time and nothing at boot — it breaks only
-the healthcheck, so Compose parks every container `unhealthy` forever and anything
-with `depends_on: condition: service_healthy` never starts, with no application
-failure to point at.
+The five Yuzu **application** images' compose healthchecks depend on a tool baked
+into the image, not on the application: **bash + `/dev/tcp` + `grep`** for
+`yuzu-server`, **busybox `wget --spider`** for `yuzu-gateway`, and
+**`/bin/busybox`** (by absolute path) for the three FROM-scratch chisel images.
+Nothing else exercises those tools. A base-image swap, a dropped apt package, or a
+chisel slice change that stops shipping the busybox symlink breaks nothing at
+build time and nothing at boot — it breaks only the healthcheck, so Compose parks
+every container `unhealthy` forever and anything with `depends_on: condition:
+service_healthy` never starts, with no application failure to point at.
+
+`yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
+is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
+role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`
+is gated **pre-emptively**: no compose healthchecks an agent image today.
+
+The probes are a hard-coded copy of the healthcheck commands, so both the script
+and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
+defines one — including the two easy-to-miss ones,
+`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
+`pre-release.yml`.
 
 `scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
 real healthcheck probe **against a live HTTP listener** in a shared network
@@ -82,10 +93,22 @@ min and these builds are far too heavy. It is equally deliberately **not**
 `paths:`-filtered — per #1978, a path-filtered workflow that later becomes a
 *required* check never reports on PRs it filters out, so the check sits at
 "Expected — waiting for status" forever and a non-admin can never merge. Instead
-the workflow always runs and a cheap `changes` job skips the build matrix. The
-matrix reuses release.yml's local buildcache **read-only** (`cache-from` with no
-`cache-to`), so it never evicts release layers and adds no cache directory that
-`cache-prune.yml` doesn't know about.
+the workflow always runs and a cheap `changes` job skips the build matrix.
+
+That is necessary but **not sufficient for a matrix job**. Per `actions/runner#952`
+a matrix job skipped at the job level is skipped *before* the matrix expands, so it
+emits none of its inner check-run names — "skipped" never appears and the required
+context hangs anyway. A `required-check-stubs` job (mirroring `ci.yml`'s
+`docs-required-checks`) emits the five `Verify <role> healthcheck invariant` names
+when the matrix is skipped, and fails red rather than hanging if the classifier
+itself dies. **Only with that stub are the five contexts safe to add to branch
+protection.**
+
+The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
+with no `cache-to`), so it never evicts release layers and adds no cache directory
+`cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
+likewise has no `cache-to`: it shares one buildkitd instance with the push build,
+so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 ## Self-hosted runner topology
 
