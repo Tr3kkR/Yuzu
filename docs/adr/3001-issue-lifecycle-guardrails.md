@@ -3,6 +3,7 @@ status: proposed
 date: 2026-07-14
 owner: "@Doomgoose (Alex Young)"
 related: issue #2139 (auto-close gap, 29 leaked issues); docs/agents/issue-tracker.md; docs/agents/triage-labels.md; .github/workflows/nightly.yml (issue-automation precedent)
+ratification: no acceptance gates beyond the standing convention (docs/agents/domain.md) — a reviewed-PR merge to dev confers acceptance; status flips to accepted in the final pre-merge commit
 ---
 
 # 3001 — Issue-lifecycle guardrails: closing the dev-branch tracker loop
@@ -77,7 +78,9 @@ plus a scripted label migration and a recurring operational cadence:
    reopen what they closed. A daily reconcile pass covers fork merges, outages, and races; the
    same parsing logic ships as a local script that performs the one-time backfill of #2139's 29
    leaked issues and any pre-release reconciles (see Costs/risks: a dev-only workflow file
-   accepts neither cron nor `workflow_dispatch` until it reaches `main`).
+   accepts neither cron nor `workflow_dispatch` until it reaches `main`). A per-PR sanity cap
+   bounds blast radius: if a single PR's body resolves more than 10 issues, the workflow warns
+   and skips rather than mass-closing.
 3. **A PR "issue radar"** (`linked-issues.yml`, advisory-only): one sticky comment per PR that
    (a) flags `#N` mentions lacking a closing keyword and (b) matches the PR's changed file paths
    against open-issue bodies — `file:line` citations are common in the agent-drafted bodies and
@@ -101,6 +104,14 @@ plus a scripted label migration and a recurring operational cadence:
    closure-integrity spot-checks (sampling recent `not_planned` closures against the current
    codebase so closure decisions stay durable as the architecture moves) and posts weekly
    telemetry to a rolling tracking issue.
+
+Both new workflows follow the repo's least-privilege convention: workflow-level
+`permissions: contents: read`, with `issues: write` scoped per-job to the close job only and
+`pull-requests: write` scoped per-job to the radar's comment job only (the `ci.yml`/`nightly.yml`
+pattern — job-level permissions replace the workflow default). The issue standard and the
+`config.yml` contact link reference `SECURITY.md`'s private-advisory URL directly rather than
+paraphrasing it, and restate its hardening-only rule for public `security`-labelled issues
+verbatim.
 
 Supporting decisions: merge `priority-p*` into `P0/P1/P2` and create the automation labels
 (`fixed-on-dev`, `task`, `decision`, `triage-sweep`) via a one-time idempotent script;
@@ -147,7 +158,10 @@ work queue, directly recovering the dev-speed lost to re-verification.
   that the committed file returns under 40,000 characters.
 - The blocking hook adds friction to legitimate rapid filing; mitigated by fail-open behaviour,
   the `--web` escape, and the explicit `YUZU_ISSUE_STANDARD_ACK=1` bypass. Codex sessions do not run
-  Claude hooks and rely on the AGENTS.md pointer + the sweep as backstop.
+  Claude hooks and rely on the AGENTS.md pointer + the sweep as backstop. Being fail-open and
+  bypassable, the hook is an enforcement/teaching layer, never a security control — the
+  vulnerability-routing guarantee rests on SECURITY.md, the `config.yml` contact link, and
+  `blank_issues_enabled: false`, none of which sit on a fail-open path.
 - Autonomous sweep closures could mis-fire; bounded by the two-probe evidence requirement,
   the 15-per-run cap, hard guardrails (never touch `security`-labelled / assigned / recently
   active / open-linked-PR issues), append-only comments with idempotency markers, and a standing
@@ -186,5 +200,5 @@ PR 1 (policy) → PR 2 (workflows + label migration, then scratch-PR verificatio
 backfill + close #2139) → PR 3 (forms + CODEOWNERS) → PR 4 (hook) → PR 5 (sweep skill), followed
 by a four-week operational burn-down: leaked-issue closure and closure-integrity spot-checks
 first, then the 184 `needs-triage`/unlabelled in tranches, then a full duplicate pass, then
-bundling splits for P0/P1 — landing at a steady-state weekly sweep cadence. Full verification
-steps per artefact are recorded in the programme's working implementation plan.
+bundling splits for P0/P1 — landing at a steady-state weekly sweep cadence. Each implementing
+PR carries its own verification section with the acceptance tests for its artefacts.
