@@ -269,7 +269,14 @@ initial posture without a data-model dead end.
 Requester and approver must resolve to **distinct human roots**. Distinct *principals* alone never
 satisfies four-eyes:
 
-| Principal | Resolves to |
+**One caution before the table: this resolution is for FOUR-EYES ONLY.** It answers "which human is
+behind this actor", and it must never be reused as a general identity-collapsing rule. ADR-0032's
+admission idempotency namespace, for instance, keys on the **credential** (token id / session id), not
+on the owner — because collapsing an attenuated token onto its owner there would let the token inherit
+the owner's unattenuated authority, defeating §3 at the seam §3 exists for. Same human, different
+question.
+
+| Principal | Resolves to (for four-eyes) |
 |---|---|
 | API token | its owner |
 | engine principal | its named human owner |

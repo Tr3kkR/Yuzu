@@ -122,9 +122,16 @@ that over-reports), and for a mutating use case, **two Execution Plans**. So: co
 `idempotency_key`, and a repeat admission within the run's lifetime **returns the existing run and
 its grant** rather than minting a second.
 
-**The dedupe namespace is `(authenticated principal, idempotency_key)` — never the key alone.** This
-is not a detail; without it the idempotency key becomes the same attacker-chosen selector that filter
-(0) exists to kill, moved one seam earlier. A caller-supplied key with a global namespace lets
+**The dedupe namespace is `(admitting CREDENTIAL, idempotency_key)` — never the key alone, and never
+the human root.** This is not a detail; without it the idempotency key becomes the same
+attacker-chosen selector that filter (0) exists to kill, moved one seam earlier. **Credential-level,
+not owner-level, is the load-bearing word.** ADR-0033 §7 resolves an API token to *its owner* for
+four-eyes purposes, and an implementer who reuses that resolution here would key the namespace on the
+human — at which point Alice's broad browser session admits run R under key K, and Alice's
+**deliberately attenuated, read-only agentic-worker token** (precisely the credential ADR-0033 §3
+exists to distrust) replays K, **hits**, and is handed R's id and R's grant, admitted under her
+*unattenuated* authority. Attenuation would be defeated at the exact seam it was invented for. So:
+**two credentials of the same owner never collide.** The namespace is the token id or session id. A caller-supplied key with a global namespace lets
 operator B replay operator A's key, receive **A's run id and A's grant**, and read under A's authority
 — filter (0) binds the run to its *engine* caller, not to the operator, so nothing downstream would
 catch it, and the release log would attribute the disclosure to A. Therefore: **a key collision across
@@ -207,7 +214,18 @@ Core authorises each such call by looking the run up **server-side** and requiri
 3. the engine principal's **own grants** permit the capability;
 4. the **admitting operator's CURRENT authority** still permits it — re-evaluated per call, not
    frozen at admission;
-5. the module version and capability are still **live** (Decision 6).
+5. the module version and capability are still **live** (Decision 6);
+6. the **admitting credential's attenuated grants** still permit it — the token's own narrower grant
+   set, frozen into the run row at admission and re-intersected on every call.
+
+**Filter (6) exists because the narrowing law has four filters and this conjunction was quietly
+dropping one.** ADR-0033 §1: `effective authority = operator grants ∩ attenuated credential grants ∩
+Module envelope ∩ execution authorisation`. Filters (2)–(4) cover the operator and the module; nothing
+covered the **credential**. So a run admitted by a read-only, canary-ring-only token would, for its
+entire mid-run life, be authorised against its *owner's* full authority — the attenuation would apply
+at admission and evaporate immediately afterwards, which is worse than not having it, because the
+operator believes the worker is confined. The credential's grant set is bound into the run row at
+admission and is one side of every subsequent intersection.
 
 **Filter (0) is not a formality — without it the whole protocol inverts.** The engine supplies the
 `use_case_run_id` on every B4 call, and core resolves *whose authority to evaluate* by looking that
@@ -220,12 +238,27 @@ Two consequences, both normative: filter (0) as above, and **`use_case_run_id` m
 unguessable, ≥128-bit random identifier** — never a sequence, because a guessable selector re-opens
 the same hole from outside.
 
-**Two details filter (0) must get right, or it will be weakened by the first person it inconveniences.**
-The engine principal is **per-module-deployment, shared by every replica** — not per-instance, or a
-second replica would fail filter (0) on every call and someone would "fix" high availability by
-loosening the filter. And a filter-(0) failure is not a mere denial: the run is **aborted** (terminal
-`aborted`, reason `caller_mismatch`) with a security-relevant audit row, because a denial alone would
-leave the run sitting in `executing`, still read-authoritative, until the reaper noticed.
+**Three details filter (0) must get right, or it will be weakened by the first person it inconveniences.**
+
+- The engine principal is **per-module-deployment, shared by every replica** — not per-instance, or a
+  second replica would fail filter (0) on every call and someone would "fix" high availability by
+  loosening the filter.
+- **A foreign caller is DENIED, never allowed to abort.** Only a call from the run's **own bound
+  engine principal** that fails for another reason (module-version drift) aborts the run
+  (`aborted`, reason `caller_mismatch`). A call from a *different* principal is denied, audited and
+  alerted — it must never terminate someone else's run, or filter (0) becomes a remote kill switch
+  for anyone who learns a run id, and run ids leak into logs and correlation headers even when they
+  are unguessable.
+- **State what filter (0) does NOT close, because it is easy to over-read.** It stops a *cross-module*
+  pivot: module X cannot present module Y's run id. It does **not** separate two operators' runs
+  *within one module deployment*, because they share the engine principal — so a compromised or buggy
+  module can present the id of any run **it is itself concurrently executing** and read under that
+  operator's authority, up to that run's frozen ceiling. That is the honest residual, and the
+  containment for it is not another filter: it is the **scope ceiling** (the blast radius of the
+  compromise is bounded by what those runs were already allowed to see, and the module already holds
+  their data), plus **per-tenant or per-run process isolation** for any module whose concurrent
+  ceilings span operators who must not be blended. A module handling multiple operators' data in one
+  process is trusting that process; say so, rather than implying a filter has removed the trust.
 
 **And the operator identity is never an argument.** The evaluate-as-operator seam that filter (4)
 needs is server-internal impersonation, which is a dangerous thing to build: it must resolve the
@@ -427,11 +460,14 @@ Where that rule is enforced, normatively:
    - **All of this is ONE transaction** — the CAS, the re-check and the release-log write commit
      together or not at all. A CAS in one transaction and a check in another is a permitted reading
      of "then", and it is wrong: it would burn the grant on a check that later fails.
-   - **Redemption is replay-safe.** The same engine principal re-presenting the same grant for the
-     same serve-run within its TTL receives **the same authorization and writes no second
-     release-log row** — a crash after redemption but before the bytes reach the client must not
-     leave the operator permanently unable to read their own result, and must not record one
-     disclosure twice. A *different* caller, or a different serve-run, is refused.
+   - **Redemption is replay-safe, and a replay is re-checked.** The same engine principal
+     re-presenting the same grant for the same serve-run within its TTL **re-runs the subset check**
+     against the operator's authority *as it is now*: unchanged ⇒ the same authorization, and **no
+     second release-log row** (a crash after redemption but before the bytes reach the client must
+     not leave the operator unable to read their own result, nor record one disclosure twice);
+     **scope shrunk in the interim ⇒ DENY.** Returning a cached authorization on replay would make
+     the serve "as fresh as the TTL", which is the flaw this whole step exists to kill. A *different*
+     caller, or a different serve-run, is refused outright.
    - Core returns the authorization; only then does the engine serve.
 6. The re-admission **mints its own `use_case_run_id`**, recording `served_from_run_id`, and its
    release-log entry (written at step 5) inherits the source run's released-input set. Without this,

@@ -230,9 +230,19 @@ discovering it later:
   operate when core's auth/RBAC store is degraded.** If it did, it would be an unauthenticated
   fleet-administration door — and "the auth store is down" is exactly the condition an attacker would
   induce to open it. So be precise about what 6a delivers: it survives **presentation** failure, not
-  **authority** failure. When the authority itself is down, the platform fails closed (the posture
-  table below), and recovery is an operator-at-the-console database action, not a network endpoint.
-  A break-glass door that opens when the lock breaks is not a safety feature.
+  **authority** failure. A break-glass door that opens when the lock breaks is not a safety feature.
+- **"Degraded" is a testable predicate, not a feeling** — an undefined one becomes whatever the first
+  incident invents, under pressure, with no gate. It means: the auth/RBAC store is **unreachable**, or
+  **fails its integrity check**, or reports a **migration/schema mismatch**. In any of those states
+  core fails closed (the posture table below) and 6a refuses like every other surface.
+- **Which leaves a real question answered honestly: what recovers a corrupted RBAC store?** Not a
+  network endpoint — an **offline, operator-at-the-console tool**, run with filesystem access to the
+  host, which is its own authorisation boundary (if an attacker has that, they have the machine). It
+  carries the same evidence obligations as anything else that mutates authority: it writes an audit
+  record, and the record survives the recovery. Naming the tool and its evidence contract is a
+  deliverable, not a footnote — and inducing the degraded state is therefore a hard platform DoS
+  against recovery-by-API, which is the correct trade (fail closed) but **must be alerted on**, not
+  discovered.
 
 **7. One PostgreSQL instance, two databases, in its own sibling container** (2c D1, reaffirmed;
 ballot A2). Same host as the three binaries today; separate roles, separate pools, no cross-database
