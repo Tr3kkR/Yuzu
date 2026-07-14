@@ -11,8 +11,9 @@ related: issue #2139 (auto-close gap, 29 leaked issues); docs/agents/issue-track
 > full manual audit re-grouped the tracker and closed ~180 issues across two maintainer-run passes
 > (28 closed as `completed` with linked evidence on 07-13; a 153-issue bulk reset closed as
 > `not_planned` on 07-14), and filed #2139 quantifying the structural auto-close gap (29 issues
-> left open despite merged PRs claiming to close them). Even after that effort, **1,024 issues
-> remain open in a four-month-old repository**, and nothing prevents regrowth: the audit treated
+> left open despite merged PRs claiming to close them). Even after that effort, **over a thousand
+> issues remain open in a four-month-old repository** (1,024 at the 2026-07-14 audit snapshot),
+> and nothing prevents regrowth: the audit treated
 > symptoms. The backlog is a direct bottleneck on development speed — 683 issues are marked
 > `ready-for-agent` but their freshness cannot be trusted, so picking up work starts with
 > re-verification; governance runs re-file findings that already exist; maintainers burn sessions
@@ -25,11 +26,13 @@ related: issue #2139 (auto-close gap, 29 leaked issues); docs/agents/issue-track
 ### Where we are
 
 The repository works on a `dev` integration branch; `main` is release-only and is GitHub's default
-branch. Four structural gaps let the backlog grow unchecked:
+branch. Counts below are the 2026-07-14 audit snapshot — the tracker moves daily. Six structural
+gaps let the backlog grow unchecked:
 
 - **B1 — Fixed work stays open.** GitHub honours closing keywords only on default-branch merges,
   so every `Closes #N` in a dev PR is inert. Issue #2139 found 29 issues still open despite
-  merged PRs explicitly claiming them; 26% of recent dev PRs carry closing keywords that do
+  merged PRs explicitly claiming them; roughly one in four of the 50 most recently merged dev PRs
+  (≈18% of the last 300, by strict closing-keyword grammar) carry closing keywords that do
   nothing. The current substitute is periodic manual batch-close sweeps by maintainers.
 - **B2 — Unbounded batch inflow.** Agent skills file issues in volume (the governance pipeline
   alone produces 8–15 deferred-finding issues per run) with a prose-only convention and no
@@ -67,20 +70,27 @@ plus a scripted label migration and a recurring operational cadence:
    CLAUDE.md, AGENTS.md, CODEX.md, CONTRIBUTING.md, the governance and test skills, and the PR
    template.
 2. **Close-on-dev-merge automation** (`close-linked-issues.yml`): on every PR merged into `dev`,
-   resolve its linked issues via GraphQL `closingIssuesReferences` (GitHub's own grammar) and
-   close them as `completed` with an evidence comment (PR + merge SHA) and a `fixed-on-dev`
-   label. Revert PRs reopen what they closed. A daily reconcile pass (plus `workflow_dispatch`
-   with a `since` input) covers fork merges, outages, and the one-time backfill of #2139's 29
-   leaked issues.
+   parse the PR body with GitHub's documented closing-keyword grammar (chain-aware:
+   `Closes #1, #2, #3` / `Fixes` / `Resolves` and variants), validate each reference via the
+   REST API (same-repo, an issue not a PR, current state), and close the survivors as
+   `completed` with an evidence comment (PR + merge SHA) and a `fixed-on-dev` label. Revert PRs
+   reopen what they closed. A daily reconcile pass covers fork merges, outages, and races; the
+   same parsing logic ships as a local script that performs the one-time backfill of #2139's 29
+   leaked issues and any pre-release reconciles (see Costs/risks: a dev-only workflow file
+   accepts neither cron nor `workflow_dispatch` until it reaches `main`).
 3. **A PR "issue radar"** (`linked-issues.yml`, advisory-only): one sticky comment per PR that
    (a) flags `#N` mentions lacking a closing keyword and (b) matches the PR's changed file paths
-   against open-issue bodies — issue bodies cite `file:line` uniformly — so authors are told
-   "these open issues cite files you touched" and add `Closes #N` before merge.
-4. **Mechanical enforcement at creation**: YAML issue forms with required fields +
-   `blank_issues_enabled: false` + a private-advisory contact link for the web path; a committed
-   blocking PreToolUse hook (`issue-standard-guard.py`, modelled on the proven changelog-fragment
-   guard) that denies non-conformant `gh issue create` calls from agent sessions with a teaching
-   message (fail-open, `YUZU_ISSUE_STANDARD_ACK=1` operator bypass).
+   against open-issue bodies — `file:line` citations are common in the agent-drafted bodies and
+   the issue standard makes them mandatory going forward, so matching is best-effort where
+   citations exist — so authors are told "these open issues cite files you touched" and add
+   `Closes #N` before merge.
+4. **Mechanical enforcement at creation**: YAML issue forms with required fields (replacing the
+   two legacy Markdown templates) + `blank_issues_enabled: false` + a private-advisory contact
+   link for the web path; a committed blocking PreToolUse hook (`issue-standard-guard.py`,
+   reusing the changelog-fragment guard's proven fail-open JSON-deny pattern — the new hook
+   needs its own `Bash`/`PowerShell` matcher and command-string parsing, since the changelog
+   guard matches file-edit tools) that denies non-conformant `gh issue create` calls from agent
+   sessions with a teaching message (fail-open, `YUZU_ISSUE_STANDARD_ACK=1` operator bypass).
 5. **A recurring evidence-based triage sweep** (`/issue-triage` repo skill, run weekly from the
    maintainer's box): a five-category rubric — fixed-elsewhere / obsolete / too-trivial /
    unclear / duplicate — where every closure carries machine-parseable evidence (claiming PR
@@ -107,10 +117,10 @@ directory is deleted) — the tracker is the sole source of truth; CODEOWNERS ga
 | 2 | Pointer edits: `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, `CONTRIBUTING.md`, `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md` | PR 1 | Every Claude/Codex session and human contributor is routed to the standard at the moment they touch the tracker | B2 |
 | 3 | Governance + test skill rewrites (`.claude/skills/governance/SKILL.md`, `.claude/skills/test/SKILL.md`) | PR 1 | The largest inflow source dedupes against the open index before filing; run reports enumerate filed AND not-filed candidates, making inflow auditable | B2 |
 | 4 | PR-template issue-linkage checklist line (`.github/pull_request_template.md`) | PR 1 | Authors declare `Closes #N` / `Relates to #N` on every PR as a matter of routine | B3 |
-| 5 | `.github/workflows/close-linked-issues.yml` | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; reconcile + backfill retire #2139's 29 leaked issues; manual batch-close sweeps end | B1 |
+| 5 | `.github/workflows/close-linked-issues.yml` + local reconcile/backfill script | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; the script backfills #2139's 29 leaked issues and covers pre-release reconciles; manual batch-close sweeps end | B1 |
 | 6 | `.github/workflows/linked-issues.yml` (issue radar) | PR 2 | Silent fixes surfaced pre-merge: "these open issues cite files you touched"; missing closing keywords flagged while the PR is still editable | B3 |
 | 7 | `scripts/issues/migrate-labels.sh` | PR 2 | One priority scheme; automation labels exist before anything references them; idempotent and dry-run-first | B5 |
-| 8 | Issue forms + `config.yml` (`.github/ISSUE_TEMPLATE/`) | PR 3 | Web-path issues arrive structured and `needs-triage`-labelled; blank issues off; vulnerability reports deflected to private advisories | B2, B5 |
+| 8 | Issue forms + `config.yml` (`.github/ISSUE_TEMPLATE/`, legacy `.md` templates deleted) | PR 3 | Web-path issues arrive structured and `needs-triage`-labelled; blank issues off; vulnerability reports deflected to private advisories | B2, B5 |
 | 9 | CODEOWNERS `/.github/` entry | PR 3 | Automation control plane always gets owner review — guards artefacts 5–8 themselves | (protects all) |
 | 10 | `scripts/hooks/issue-standard-guard.py` + `.claude/settings.json` wiring | PR 4 | Non-conformant `gh issue create` denied at source with a teaching message, in every Claude session sharing the repo settings | B2, B5 |
 | 11 | `.claude/skills/issue-triage/` (SKILL.md + `dump-issues.sh`, `leak-scan.sh`, `build-citation-index.py`, comment templates) | PR 5 | Weekly evidence-based sweep: autonomous two-probe closures for claim-verified fixes, checkbox report for judgment calls, duplicate clustering, closure-integrity spot-checks | B1, B3, B4 |
@@ -125,9 +135,16 @@ work queue, directly recovering the dev-speed lost to re-verification.
 
 **Costs / risks.**
 - The close-on-dev-merge cron and the issue forms only activate once the files reach `main`
-  (GitHub evaluates both from the default branch); until the next release the reconcile runs via
-  manual `workflow_dispatch --ref dev` weekly, and forms gate nothing. Accepted — the
-  `pull_request [closed]` trigger (the main path) is live from the moment PR 2 merges to dev.
+  (GitHub evaluates both from the default branch), and a dev-only workflow file accepts neither
+  cron **nor** `workflow_dispatch` — new workflows on `dev` are fully dormant until the next
+  release promotes them (the repo's documented CI invariant; verified empirically: a dev-only
+  workflow is invisible to the Actions API). Accepted — the `pull_request [closed]` trigger (the
+  main path) is live from the moment PR 2 merges to dev, and the bundled local script covers
+  reconciles and the #2139 backfill from a maintainer checkout until the release.
+- `CLAUDE.md` is currently ~300 characters **over** its own self-imposed 40k cap, so PR 1's
+  pointer edit cannot be additive: it must rewrite the existing issue-tracker routing line
+  net-negative (routing detail out to `docs/agents/`), with an explicit acceptance criterion
+  that the committed file returns under 40,000 characters.
 - The blocking hook adds friction to legitimate rapid filing; mitigated by fail-open behaviour,
   the `--web` escape, and the explicit `YUZU_ISSUE_STANDARD_ACK=1` bypass. Codex sessions do not run
   Claude hooks and rely on the AGENTS.md pointer + the sweep as backstop.
@@ -147,9 +164,15 @@ work queue, directly recovering the dev-speed lost to re-verification.
 - **`pull_request_target` trigger** for fork coverage: rejected — adds a dangerous-trigger
   workflow to a zero-suppression zizmor repo; plain `pull_request` + daily reconcile covers the
   same ground.
-- **Regex keyword parsing**: rejected in favour of GraphQL `closingIssuesReferences` — GitHub's
-  own resolution, structurally immune to grammar drift, PR-vs-issue confusion, and cross-repo
-  references.
+- **GraphQL `closingIssuesReferences` as the resolution source**: rejected on empirical grounds —
+  GitHub only creates closing-issue references for PRs targeting the default branch, so the
+  field returns an empty set for exactly the dev-based PRs this automation exists to handle
+  (verified read-only on merged dev PRs #2125, #2126 and #1983, whose bodies carry explicit
+  `Closes`/`Fixes` lines yet all return zero nodes). Body parsing with the documented
+  closing-keyword grammar is therefore the only viable source — #2139's proposed fix already
+  prescribes it — hardened by validating every parsed reference via the REST API (same-repo,
+  issue-not-PR) before any close, and acceptance-tested against those known PRs before the
+  backfill runs.
 - **GitHub Actions-hosted LLM triage**: rejected — the sweep's core operation is grepping the
   current checkout, and an API-key secret would require admin provisioning; a repo skill run
   from the maintainer's box needs zero new credentials.
