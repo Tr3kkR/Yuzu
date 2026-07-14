@@ -179,8 +179,10 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   # Disposable CI cluster -> durability OFF. Every [pg] test does CREATE DATABASE
   # ... TEMPLATE + DROP DATABASE WITH (FORCE), both fsync-heavy, and Windows fsync
   # is ~20x costlier than Linux (the 2026-07-14 Wee Tam 600s [pg]-shard TIMEOUTs).
-  # A crash just re-runs the job. fsync/full_page_writes are postmaster params ->
-  # the restart below applies them. Removing these re-arms the timeout.
+  # A crash just re-runs the job. Removing these re-arms the timeout. All three
+  # are sighup/user context, so applying them to a LIVE cluster needs only a
+  # reload (`SELECT pg_reload_conf()`), no restart — the restart below is for
+  # max_connections (postmaster) and applies these in passing.
   & $psql @H -c 'ALTER SYSTEM SET fsync = off'
   & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
   & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
