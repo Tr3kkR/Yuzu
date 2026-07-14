@@ -30,6 +30,13 @@ Operator browser → UCE GUI origin (VM) AND Yuzu origin (server) — two origin
   **separate database on the server's existing PG instance** (not its own
   instance). "Never the server's connection pool" (plan Decision 11) stands
   unchanged — separate database, separate role, separate pool.
+> **D2 and D3 are SUPERSEDED by ADR-0031 (accepted 2026-07-14).** The engine is **headless** — no
+> GUI, no second origin. One origin, one session, one auth; §3's cross-origin design is void with the
+> origin it secured. Presentation, core and each engine are separate binaries, co-located by default.
+> **D1 is REAFFIRMED** (one PostgreSQL instance, two databases, separate roles and pools, no
+> cross-database grant) and becomes *more* load-bearing, because co-location removes the network as an
+> accidental barrier (ADR-0031 INV-31-3).
+
 - **D2 — UCE deployable = backend + GUI, one artifact, on its own VM**, same
   data centre as the server and the PG instance (intra-DC latency; the §6
   view-time read's 250 ms p95 budget is unaffected in practice).
@@ -119,7 +126,12 @@ Operator browser → UCE GUI origin (VM) AND Yuzu origin (server) — two origin
    ADR-0007 fail-closed applies); `pg_hba.conf` alone is reload-only. Schedule
    T1 accordingly.
 
-## 3. Cross-origin design (what makes D3 work)
+## 3. Cross-origin design (what makes D3 work) — [VOID — ADR-0031]
+
+> **VOID.** ADR-0031 makes the engine headless: there is no second origin, so there is no cross-origin
+> problem to solve. Retained as the historical record of a design that a merged decision required and
+> an accepted ADR removed.
+
 
 The 2c flows that touch the Yuzu origin from the operator's browser:
 - **§6 artifact acquisition** — browser obtains the short-lived read-purpose
