@@ -45,19 +45,21 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 FLAKE_RETRY = os.path.join(HERE, "flake-retry.py")
 
-# Per-binary gdb wall budget and how many binaries we are willing to replay.
-# The failure path runs inside the job's normal 60-min budget. The cancelled path
-# runs inside GitHub's post-cancellation grace window, which is short and not
-# contractually specified — so it gets a much tighter budget and replays fewer
-# candidates. Better a bounded partial capture than a grace window that expires
-# mid-gdb and uploads nothing.
+# Per-binary gdb wall budget, how many binaries we replay, and the grace we give
+# gdb to finish dumping after SIGINT before timeout(1) escalates to KILL.
+#
+# The failure path runs inside the job's normal 60-min budget, so it can afford
+# to be thorough. The cancelled path CANNOT: GitHub gives a cancelled job a
+# 5-minute window and then forcibly terminates whatever is still running — and
+# `Upload meson testlog and stack capture` is a LATER step, so every second spent
+# in gdb is a second the upload might not get. A capture we cannot upload is worth
+# nothing, so the cancelled budget is sized to leave the upload most of the window:
+# worst case here is 2 x (45 + 10) = 110s of gdb, leaving ~3 of the 5 minutes.
 BUDGETS = {
-    #                 per-binary   max binaries   total
-    "failure":  {"budget": 300, "max_bins": 4, "total": 900},
-    "cancelled": {"budget": 90, "max_bins": 2, "total": 200},
+    #                per-binary   max bins        total   SIGINT->KILL grace
+    "failure":   {"budget": 300, "max_bins": 4, "total": 900, "kill_after": 30},
+    "cancelled": {"budget": 45,  "max_bins": 2, "total": 110, "kill_after": 10},
 }
-# Grace for gdb to finish dumping after SIGINT before timeout escalates to KILL.
-KILL_AFTER = 30
 
 SEED_RE = re.compile(r"Randomness seeded to:\s*(\d+)")
 # meson's testlog.txt banners each entry: "===== 3/5 =====" then "test: <name>".
@@ -151,17 +153,26 @@ def targets_for_failure(fr, failed_names, tests, seeds):
 def targets_for_cancelled(fr, tests, sections):
     """No junit (meson was killed mid-run), so infer: a Catch2 entry with no
     testlog.txt section never finished, and the hung one is among those. Ordered
-    by introspect order for determinism; the caller bounds how many we take."""
+    by introspect order for determinism; the caller bounds how many we take.
+
+    "Finished" is resolved with the SAME longest-match mapping the failure path
+    uses (flake-retry's match_suite), not a plain `name in section_name` test. A
+    bare substring check is weaker than the contract in tests/meson.build, and it
+    fails in the one direction that costs us the bug: given entries `server unit
+    tests` and (hypothetically) `server unit tests pg`, a finished section for the
+    LONGER name would also "contain" the shorter one, marking a hung entry as
+    finished and skipping the very binary we needed a stack for."""
+    finished = set()
+    for sect_name in sections:
+        entry = fr.match_suite(sect_name, tests)
+        if entry and entry.get("name"):
+            finished.add(entry["name"])
+
     targets = []
     for entry in tests:
         name = entry.get("name") or ""
-        if not is_catch2(fr, entry):
+        if not is_catch2(fr, entry) or name in finished:
             continue
-        # sections are keyed by the junit-style name ("server - yuzu:server unit
-        # tests"); the introspect name ("server unit tests") is its substring —
-        # the same relationship match_suite() encodes, read in reverse.
-        if any(name and name in sect_name for sect_name in sections):
-            continue  # this entry finished; it is not the one that hung
         cmd = list(entry.get("cmd") or [])
         if cmd:
             targets.append((name, cmd, entry.get("env") or {}, None))
@@ -169,7 +180,7 @@ def targets_for_cancelled(fr, tests, sections):
 
 
 # ── gdb ───────────────────────────────────────────────────────────────────────
-def gdb_argv(cmd, seed, budget):
+def gdb_argv(cmd, seed, budget, kill_after):
     """timeout(1) + gdb batch argv for one replay.
 
     `--signal=INT` is what makes the cancelled/hang path produce anything: on a
@@ -177,22 +188,37 @@ def gdb_argv(cmd, seed, budget):
     *inferior*, `run` returns, and gdb goes on to execute the backtrace commands
     below. --kill-after guarantees we still exit if gdb itself wedges.
 
-    Program args go through `--args` (straight into argv, no gdb-side parsing) and
-    `set startup-with-shell off` keeps a shell out of the loop, so Catch2 tag specs
-    like `~[pg]` reach the binary literally instead of being tilde-expanded or
-    glob-eaten on the way in."""
+    Program args go through `--args`, and we deliberately DO NOT touch
+    `startup-with-shell`. That pairing is load-bearing and not obvious:
+
+      gdb builds the inferior's argument string at `--args` PARSE time, escaping
+      shell metacharacters (`~[pg]` is stored as `\\~\\[pg\\]` — `show args` will
+      tell you so) on the assumption that its startup shell will unescape them
+      again on the way to execve. Escaping and shell are one mechanism, not two.
+      Turning the shell off while still using `--args` therefore breaks the
+      round-trip and the inferior receives the BACKSLASHES: verified on gdb 15.1
+      (Ubuntu 24.04) — argv[1] came through as `5c 7e 5c 5b 70 67 5c 5d`, i.e.
+      literally `\\~\\[pg\\]`. gdb 17.1 (Ubuntu 26.04, the current Big Tam image)
+      happens to unescape anyway, which is exactly what makes this the nastiest
+      class of bug: a diagnostic that silently replays the WRONG Catch2 shard, and
+      reports its no-repro with total confidence, on any runner with an older gdb.
+
+    So: keep the shell, let gdb escape and the shell unescape, and the tag spec
+    arrives byte-identical (`7e 5b 70 67 5d`) on both gdb 15.1 and 17.1. The
+    escaping also means the shell never globs `[pg]` against the cwd. `_selftest`
+    asserts this end-to-end against a real gdb wherever one exists, rather than
+    trusting the Python list — asserting the list is what let this through."""
     replay = list(cmd)
     if seed is not None:
         replay += ["--rng-seed", str(seed)]
     replay += ["--order", "rand"]
     return [
-        "timeout", "--signal=INT", f"--kill-after={KILL_AFTER}", str(budget),
+        "timeout", "--signal=INT", f"--kill-after={kill_after}", str(budget),
         "gdb", "-batch",
         "-ex", "set pagination off",
         "-ex", "set confirm off",
         "-ex", "set print thread-events off",
         "-ex", "set backtrace limit 80",
-        "-ex", "set startup-with-shell off",
         "-ex", "run",
         "-ex", 'printf "\\n=== thread backtraces (full) ===\\n"',
         "-ex", "thread apply all bt full",
@@ -217,14 +243,14 @@ def classify(captured):
                         "re-dispatch the nightly for another attempt")
 
 
-def capture_one(name, cmd, env, seed, budget, builddir, out):
-    argv = gdb_argv(cmd, seed, budget)
+def capture_one(name, cmd, env, seed, budget, kill_after, builddir, out):
+    argv = gdb_argv(cmd, seed, budget, kill_after)
     run_env = dict(os.environ)
     run_env.update({k: str(v) for k, v in (env or {}).items()})
     try:
         proc = subprocess.run(argv, cwd=builddir, env=run_env,
                               capture_output=True, text=True,
-                              timeout=budget + KILL_AFTER + 30)
+                              timeout=budget + kill_after + 30)
         captured = (proc.stdout or "") + (proc.stderr or "")
     except (OSError, subprocess.SubprocessError) as exc:
         captured = f"(gdb could not be run: {exc})\n"
@@ -259,10 +285,28 @@ def main(argv=None):
         return _selftest()
 
     out_path = args.output or os.path.join(args.builddir, "stack-capture.log")
+
+    # The best-effort contract is STRUCTURAL, not a promise in a comment. Meson's
+    # junit can be present but truncated (the run was killed mid-write), and
+    # ET.parse would then raise straight out of here — replacing the capture with
+    # a Python traceback in an already-red job. Anything unexpected becomes a note
+    # in the capture file plus a ::warning::, and we still exit 0.
+    try:
+        return _capture(args, out_path)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never add a failure
+        gh("warning", f"stack capture failed internally ({exc!r}) — the job's real "
+                      f"failure is unaffected")
+        try:
+            with open(out_path, "a", encoding="utf-8") as out:
+                out.write(f"\n(stack capture failed internally: {exc!r})\n")
+        except OSError:
+            pass
+        return 0
+
+
+def _capture(args, out_path):
     limits = BUDGETS[args.mode]
 
-    # Everything below is best-effort; the job is already red. Any failure to
-    # introspect/parse becomes a line in the capture file, never an exit code.
     with open(out_path, "a", encoding="utf-8") as out:
         if not shutil.which("gdb"):
             gh("warning", "gdb unavailable on this runner — skipping stack capture")
@@ -326,6 +370,7 @@ def main(argv=None):
                       f"not captured: {', '.join(dropped)})\n")
             targets = targets[:limits["max_bins"]]
 
+        kill_after = limits["kill_after"]
         spent = 0
         for name, cmd, env, seed in targets:
             remaining = limits["total"] - spent
@@ -335,16 +380,67 @@ def main(argv=None):
                 out.write(f"\n(total gdb budget exhausted — {name} not captured)\n")
                 break
             budget = min(limits["budget"], remaining)
-            capture_one(name, cmd, env, seed, budget, args.builddir, out)
-            spent += budget
+            capture_one(name, cmd, env, seed, budget, kill_after, args.builddir, out)
+            # Charge the SIGINT->KILL grace too: a hung inferior really can burn
+            # budget+kill_after of wall clock, and on the cancelled path the thing
+            # this budget is protecting is the upload step's share of GitHub's
+            # 5-minute window. Undercounting it is how the capture survives but the
+            # artifact does not.
+            spent += budget + kill_after
 
     return 0
 
 
 # ── selftest ──────────────────────────────────────────────────────────────────
+def _gdb_roundtrip(check):
+    """Run a REAL gdb and assert the inferior receives the Catch2 tag spec
+    byte-for-byte.
+
+    This exists because the pure-logic argv assertions above cannot see the bug
+    they were supposed to prevent: gdb rewrites the inferior's arguments between
+    our argv list and execve, and an earlier version of this script delivered
+    `\\~\\[pg\\]` to Catch2 while every list-level assertion still passed. The only
+    honest test of "the shard filter survives" is to look at what the process
+    actually got.
+
+    Skipped where there is no POSIX gdb/timeout (Windows dev boxes). It DOES run on
+    the TSan nightly runner — which installs gdb — so the guard is live exactly
+    where the capture is."""
+    if os.name != "posix" or not shutil.which("gdb") or not shutil.which("timeout"):
+        print("  (gdb round-trip: SKIPPED — no POSIX gdb/timeout here)")
+        return
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        echo = os.path.join(td, "argv_echo.py")
+        with open(echo, "w", encoding="utf-8") as f:
+            f.write("import sys\nprint('ARGV=' + '|'.join(sys.argv[1:]))\n")
+
+        # Same code path the real capture uses — not a hand-written gdb command.
+        argv = gdb_argv([sys.executable, echo, "~[pg]"], 222, 60, 10)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            check(False, f"gdb round-trip could not run: {exc!r}")
+            return
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    line = next((l for l in out.splitlines() if l.startswith("ARGV=")), None)
+    if line is None:
+        print("  (gdb round-trip: SKIPPED — gdb produced no ARGV line; "
+              f"rc={proc.returncode})")
+        return
+
+    got = line[len("ARGV="):].split("|")
+    check(got == ["~[pg]", "--rng-seed", "222", "--order", "rand"],
+          f"gdb round-trip: inferior must receive the tag spec UNESCAPED, got {got!r} "
+          f"(a `\\~\\[pg\\]` here means gdb's escaping lost its startup shell)")
+
+
 def _selftest():
-    """Pure-logic checks: no gdb, no meson, no build dir. Mirrors flake-retry.py's
-    --selftest so both are enforced by `meson test` on every platform."""
+    """Pure-logic checks (no meson, no build dir) plus one real-gdb round-trip where
+    a gdb exists. Mirrors flake-retry.py's --selftest so both are enforced by
+    `meson test` on every platform."""
     failures = []
 
     def check(cond, label):
@@ -456,18 +552,37 @@ ThreadSanitizer: data race
     check(all("python3" not in c[0] for _, c, _, _ in t),
           "the python/hygiene entries are still never candidates")
 
+    # "Finished" must be resolved by LONGEST match, not bare substring. With a
+    # hypothetical overlapping pair, a finished section for the LONGER name also
+    # contains the shorter one — a substring test would mark the hung shorter entry
+    # as finished and skip the one binary we needed.
+    overlapping = [
+        {"name": "server unit tests", "cmd": ["/b/tests/yuzu_server_tests"], "env": {}},
+        {"name": "server unit tests pg",
+         "cmd": ["/b/tests/yuzu_server_tests", "[pg]"], "env": {}},
+    ]
+    t = targets_for_cancelled(
+        fr, overlapping, {"server - yuzu:server unit tests pg": "Randomness seeded to: 9"})
+    check([x[0] for x in t] == ["server unit tests"],
+          "cancelled: a finished LONGER-named entry does not mark the hung shorter "
+          "one as finished (longest-match, not substring)")
+
     # gdb argv: seed replay, args straight through --args, SIGINT-on-timeout.
-    argv = gdb_argv(["/b/tests/yuzu_server_tests", "~[pg]"], 222, 90)
-    check(argv[:4] == ["timeout", "--signal=INT", f"--kill-after={KILL_AFTER}", "90"],
+    argv = gdb_argv(["/b/tests/yuzu_server_tests", "~[pg]"], 222, 90, 10)
+    check(argv[:4] == ["timeout", "--signal=INT", "--kill-after=10", "90"],
           "timeout sends SIGINT (so a HUNG inferior still dumps stacks), then KILLs")
     check("--args" in argv and argv[argv.index("--args") - 1] == "quit",
           "program args are passed via --args, after every gdb -ex")
     check(argv[argv.index("--args") + 1:] ==
           ["/b/tests/yuzu_server_tests", "~[pg]", "--rng-seed", "222", "--order", "rand"],
           "replay argv keeps the shard's tag filter and appends the seed")
-    check("set startup-with-shell off" in argv,
-          "no startup shell — `~[pg]` must not be tilde-expanded or globbed")
-    argv_noseed = gdb_argv(["/b/tests/yuzu_agent_tests"], None, 300)
+    # REGRESSION GUARD. `set startup-with-shell off` alongside --args is precisely
+    # the bug: gdb escapes the args at --args parse time expecting its startup
+    # shell to unescape them, so killing the shell delivers `\~\[pg\]` to the
+    # inferior on gdb 15.1. Keep them paired. See gdb_argv's docstring.
+    check("set startup-with-shell off" not in argv,
+          "startup shell is NOT disabled — it is what unescapes gdb's own escaping")
+    argv_noseed = gdb_argv(["/b/tests/yuzu_agent_tests"], None, 300, 30)
     check("--rng-seed" not in argv_noseed, "an unrecovered seed degrades to a plain shuffle")
 
     # classify(): a TSan abort and a hang are captures, not "did not crash" (R-13).
@@ -475,6 +590,17 @@ ThreadSanitizer: data race
     check(classify("Program received signal SIGSEGV")[0] == "crash", "SIGSEGV counts")
     check(classify("Program received signal SIGINT")[0] == "hang", "SIGINT = the hang capture")
     check(classify("all tests passed")[0] == "no-repro", "a clean replay is honestly reported")
+
+    # Budgets must leave the LATER upload step room inside GitHub's 5-minute
+    # post-cancellation window, or the capture is taken and then thrown away.
+    c = BUDGETS["cancelled"]
+    worst = c["max_bins"] * (c["budget"] + c["kill_after"])
+    check(worst <= 120,
+          f"cancelled-path worst case ({worst}s of gdb) must leave most of GitHub's "
+          f"300s cancellation window for the artifact upload")
+
+    # The one assertion that would have caught the escaping bug.
+    _gdb_roundtrip(check)
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

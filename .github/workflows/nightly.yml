@@ -409,9 +409,18 @@ jobs:
               return EAI_NOTCANCELED;
           }
           SHIM_EOF
+          # gcc-15, not bare `gcc`: the install step above asks apt for `gcc-15`,
+          # which does NOT provide a /usr/bin/gcc symlink (verified on a clean
+          # ubuntu:26.04 image). This step has been passing only on an ambient gcc
+          # the persistent Big Tam runners happen to carry — an undeclared
+          # dependency that would fail the Tier-3 nightly (and open `nightly-broken`
+          # with no product regression) the first time a runner is reprovisioned
+          # from a clean image. gcc-15 is also what the meson build itself uses
+          # (`CC: ccache gcc-15`), so the shim now matches the job's real toolchain.
+          #
           # -Werror: the layout guards above are the entire safety story for the
           # __return write. A warning here is not cosmetic.
-          gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+          gcc-15 -shared -fPIC -O2 -Wall -Wextra -Werror \
             -o "$RUNNER_TEMP/libgai_sync_shim.so" "$RUNNER_TEMP/gai_sync_shim.c"
           file "$RUNNER_TEMP/libgai_sync_shim.so"
           echo "::notice::gai_sync_shim built ok (glibc gaicb layout guards passed) -> $RUNNER_TEMP/libgai_sync_shim.so"
