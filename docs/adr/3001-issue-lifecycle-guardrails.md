@@ -57,7 +57,7 @@ guardrails, and without structural change it will need repeating within months.
 Adopt five guardrail pillars, delivered as five PRs (each subject to the standard review gates),
 plus a scripted label migration and a recurring operational cadence:
 
-1. **A written issue bar** (`docs/agents/issue-bar.md`) governing when an issue is warranted,
+1. **A written issue standard** (`docs/agents/issue-standard.md`) governing when an issue is warranted,
    required body sections (Context / Evidence / Acceptance criteria / Origin), mandatory labels
    (one type + one of `P0/P1/P2` + one triage state), one-actionable-outcome-per-issue,
    mandatory duplicate search before filing (no volume cap — dedupe is the filter), typing for
@@ -78,9 +78,9 @@ plus a scripted label migration and a recurring operational cadence:
    "these open issues cite files you touched" and add `Closes #N` before merge.
 4. **Mechanical enforcement at creation**: YAML issue forms with required fields +
    `blank_issues_enabled: false` + a private-advisory contact link for the web path; a committed
-   blocking PreToolUse hook (`issue-bar-guard.py`, modelled on the proven changelog-fragment
+   blocking PreToolUse hook (`issue-standard-guard.py`, modelled on the proven changelog-fragment
    guard) that denies non-conformant `gh issue create` calls from agent sessions with a teaching
-   message (fail-open, `YUZU_ISSUE_BAR_ACK=1` operator bypass).
+   message (fail-open, `YUZU_ISSUE_STANDARD_ACK=1` operator bypass).
 5. **A recurring evidence-based triage sweep** (`/issue-triage` repo skill, run weekly from the
    maintainer's box): a five-category rubric — fixed-elsewhere / obsolete / too-trivial /
    unclear / duplicate — where every closure carries machine-parseable evidence (claiming PR
@@ -95,7 +95,7 @@ plus a scripted label migration and a recurring operational cadence:
 Supporting decisions: merge `priority-p*` into `P0/P1/P2` and create the automation labels
 (`fixed-on-dev`, `task`, `decision`, `triage-sweep`) via a one-time idempotent script;
 `phase-*` labels left untouched (open issues on both series; nothing keys on them); the ad-hoc
-`github-issues/` staging directory is retired (its one draft gets filed per the bar, then the
+`github-issues/` staging directory is retired (its one draft gets filed per the standard, then the
 directory is deleted) — the tracker is the sole source of truth; CODEOWNERS gains a
 `/.github/` entry so automation changes always get owner review.
 
@@ -103,8 +103,8 @@ directory is deleted) — the tracker is the sole source of truth; CODEOWNERS ga
 
 | # | Artefact (path) | PR | Value / output | Negates |
 |---|---|---|---|---|
-| 1 | `docs/agents/issue-bar.md` | PR 1 | Single canonical filing/labelling/closing standard for humans and agents; the document every other artefact cites | B2, B3, B5 |
-| 2 | Pointer edits: `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, `CONTRIBUTING.md`, `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md` | PR 1 | Every Claude/Codex session and human contributor is routed to the bar at the moment they touch the tracker | B2 |
+| 1 | `docs/agents/issue-standard.md` | PR 1 | Single canonical filing/labelling/closing standard for humans and agents; the document every other artefact cites | B2, B3, B5 |
+| 2 | Pointer edits: `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, `CONTRIBUTING.md`, `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md` | PR 1 | Every Claude/Codex session and human contributor is routed to the standard at the moment they touch the tracker | B2 |
 | 3 | Governance + test skill rewrites (`.claude/skills/governance/SKILL.md`, `.claude/skills/test/SKILL.md`) | PR 1 | The largest inflow source dedupes against the open index before filing; run reports enumerate filed AND not-filed candidates, making inflow auditable | B2 |
 | 4 | PR-template issue-linkage checklist line (`.github/pull_request_template.md`) | PR 1 | Authors declare `Closes #N` / `Relates to #N` on every PR as a matter of routine | B3 |
 | 5 | `.github/workflows/close-linked-issues.yml` | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; reconcile + backfill retire #2139's 29 leaked issues; manual batch-close sweeps end | B1 |
@@ -112,7 +112,7 @@ directory is deleted) — the tracker is the sole source of truth; CODEOWNERS ga
 | 7 | `scripts/issues/migrate-labels.sh` | PR 2 | One priority scheme; automation labels exist before anything references them; idempotent and dry-run-first | B5 |
 | 8 | Issue forms + `config.yml` (`.github/ISSUE_TEMPLATE/`) | PR 3 | Web-path issues arrive structured and `needs-triage`-labelled; blank issues off; vulnerability reports deflected to private advisories | B2, B5 |
 | 9 | CODEOWNERS `/.github/` entry | PR 3 | Automation control plane always gets owner review — guards artefacts 5–8 themselves | (protects all) |
-| 10 | `scripts/hooks/issue-bar-guard.py` + `.claude/settings.json` wiring | PR 4 | Non-conformant `gh issue create` denied at source with a teaching message, in every Claude session sharing the repo settings | B2, B5 |
+| 10 | `scripts/hooks/issue-standard-guard.py` + `.claude/settings.json` wiring | PR 4 | Non-conformant `gh issue create` denied at source with a teaching message, in every Claude session sharing the repo settings | B2, B5 |
 | 11 | `.claude/skills/issue-triage/` (SKILL.md + `dump-issues.sh`, `leak-scan.sh`, `build-citation-index.py`, comment templates) | PR 5 | Weekly evidence-based sweep: autonomous two-probe closures for claim-verified fixes, checkbox report for judgment calls, duplicate clustering, closure-integrity spot-checks | B1, B3, B4 |
 | 12 | `triage-sweep` rolling tracking issue + telemetry block | PR 5 (operational) | Weekly open/inflow/outflow/age/leak metrics with alert thresholds (leak >0 post-PR-2, needs-triage >100, net inflow >+50/wk×2) — drift visible in days, not months | B6 |
 
@@ -129,7 +129,7 @@ work queue, directly recovering the dev-speed lost to re-verification.
   manual `workflow_dispatch --ref dev` weekly, and forms gate nothing. Accepted — the
   `pull_request [closed]` trigger (the main path) is live from the moment PR 2 merges to dev.
 - The blocking hook adds friction to legitimate rapid filing; mitigated by fail-open behaviour,
-  the `--web` escape, and the explicit `YUZU_ISSUE_BAR_ACK=1` bypass. Codex sessions do not run
+  the `--web` escape, and the explicit `YUZU_ISSUE_STANDARD_ACK=1` bypass. Codex sessions do not run
   Claude hooks and rely on the AGENTS.md pointer + the sweep as backstop.
 - Autonomous sweep closures could mis-fire; bounded by the two-probe evidence requirement,
   the 15-per-run cap, hard guardrails (never touch `security`-labelled / assigned / recently
