@@ -446,8 +446,10 @@ TEST_CASE("scim_json: parse_group_patch add members (explicit path)", "[scim][js
                                  {"value", nlohmann::json::array({{{"value", "u1"}}})}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    REQUIRE(result->members_to_add.size() == 1);
-    CHECK(result->members_to_add[0] == "u1");
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::Add);
+    REQUIRE(result->member_ops[0].values.size() == 1);
+    CHECK(result->member_ops[0].values[0] == "u1");
 }
 
 TEST_CASE("scim_json: parse_group_patch remove members (explicit path, no value = remove all)",
@@ -456,8 +458,9 @@ TEST_CASE("scim_json: parse_group_patch remove members (explicit path, no value 
         {"Operations", nlohmann::json::array({{{"op", "remove"}, {"path", "members"}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    CHECK(result->remove_all_members);
-    CHECK(result->members_to_remove.empty());
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::RemoveAll);
+    CHECK(result->member_ops[0].values.empty());
 }
 
 TEST_CASE("scim_json: parse_group_patch remove members with an explicit value filter list",
@@ -469,9 +472,10 @@ TEST_CASE("scim_json: parse_group_patch remove members with an explicit value fi
                                  {"value", nlohmann::json::array({{{"value", "u1"}}})}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    REQUIRE(result->members_to_remove.size() == 1);
-    CHECK(result->members_to_remove[0] == "u1");
-    CHECK_FALSE(result->remove_all_members);
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::Remove);
+    REQUIRE(result->member_ops[0].values.size() == 1);
+    CHECK(result->member_ops[0].values[0] == "u1");
 }
 
 TEST_CASE("scim_json: parse_group_patch remove via members[value eq \"id\"] valueFilter",
@@ -481,8 +485,10 @@ TEST_CASE("scim_json: parse_group_patch remove via members[value eq \"id\"] valu
          nlohmann::json::array({{{"op", "remove"}, {"path", R"(members[value eq "u1"])"}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    REQUIRE(result->members_to_remove.size() == 1);
-    CHECK(result->members_to_remove[0] == "u1");
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::Remove);
+    REQUIRE(result->member_ops[0].values.size() == 1);
+    CHECK(result->member_ops[0].values[0] == "u1");
 }
 
 TEST_CASE("scim_json: parse_group_patch replace members (explicit path)",
@@ -495,10 +501,11 @@ TEST_CASE("scim_json: parse_group_patch replace members (explicit path)",
                                                                   {{"value", "u2"}}})}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    REQUIRE(result->replace_members.has_value());
-    REQUIRE(result->replace_members->size() == 2);
-    CHECK((*result->replace_members)[0] == "u1");
-    CHECK((*result->replace_members)[1] == "u2");
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::ReplaceAll);
+    REQUIRE(result->member_ops[0].values.size() == 2);
+    CHECK(result->member_ops[0].values[0] == "u1");
+    CHECK(result->member_ops[0].values[1] == "u2");
 }
 
 TEST_CASE("scim_json: parse_group_patch replace members (pathless value-object)",
@@ -510,9 +517,43 @@ TEST_CASE("scim_json: parse_group_patch replace members (pathless value-object)"
               {"value", {{"members", nlohmann::json::array({{{"value", "u1"}}})}}}}})}};
     auto result = parse_group_patch(body);
     REQUIRE(result.has_value());
-    REQUIRE(result->replace_members.has_value());
-    REQUIRE(result->replace_members->size() == 1);
-    CHECK((*result->replace_members)[0] == "u1");
+    REQUIRE(result->member_ops.size() == 1);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::ReplaceAll);
+    REQUIRE(result->member_ops[0].values.size() == 1);
+    CHECK(result->member_ops[0].values[0] == "u1");
+}
+
+TEST_CASE("scim_json: parse_group_patch preserves member-op ORDER across the Operations array "
+          "(#2127 review HIGH — the old bucketed design discarded this)",
+          "[scim][json][group]") {
+    nlohmann::json body = {
+        {"Operations",
+         nlohmann::json::array(
+             {{{"op", "add"},
+              {"path", "members"},
+              {"value", nlohmann::json::array({{{"value", "u1"}}})}},
+             {{"op", "remove"}, {"path", R"(members[value eq "u1"])"}}})}};
+    auto result = parse_group_patch(body);
+    REQUIRE(result.has_value());
+    REQUIRE(result->member_ops.size() == 2);
+    CHECK(result->member_ops[0].kind == ScimGroupMemberOp::Kind::Add);
+    CHECK(result->member_ops[0].values == std::vector<std::string>{"u1"});
+    CHECK(result->member_ops[1].kind == ScimGroupMemberOp::Kind::Remove);
+    CHECK(result->member_ops[1].values == std::vector<std::string>{"u1"});
+
+    // Reversed order in the body is a DIFFERENT patch (remove-then-add).
+    nlohmann::json reversed_body = {
+        {"Operations",
+         nlohmann::json::array(
+             {{{"op", "remove"}, {"path", R"(members[value eq "u1"])"}},
+             {{"op", "add"},
+              {"path", "members"},
+              {"value", nlohmann::json::array({{{"value", "u1"}}})}}})}};
+    auto reversed = parse_group_patch(reversed_body);
+    REQUIRE(reversed.has_value());
+    REQUIRE(reversed->member_ops.size() == 2);
+    CHECK(reversed->member_ops[0].kind == ScimGroupMemberOp::Kind::Remove);
+    CHECK(reversed->member_ops[1].kind == ScimGroupMemberOp::Kind::Add);
 }
 
 TEST_CASE("scim_json: parse_group_patch rejects an oversized displayName — all 3 op shapes "

@@ -277,6 +277,43 @@ std::vector<std::string> resolve_member_values(ScimStore* scim_store,
     return resolved;
 }
 
+/// #2127 review HIGH fix: fold an ORDERED list of `ScimGroupMemberOp`s onto
+/// a starting membership set, applying each op in the body's own document
+/// order — never all-removes-then-all-adds (the old bucketed-apply order,
+/// which made `[{add:U},{remove:U}]` and `[{remove:U},{add:U}]` produce the
+/// SAME wrong result: U left a member either way, because a `remove` on a
+/// not-yet-added id was an idempotent no-op and the `remove`/`add` buckets
+/// were applied in a fixed order regardless of which the caller sent last).
+/// Values are the RAW (unresolved) `value` strings from the request body —
+/// the caller resolves the final result against live SCIM Users in one pass
+/// (`resolve_member_values`), not per-op, per the reworked
+/// resolve-final -> validate-final -> persist design.
+std::vector<std::string> fold_group_member_ops(const std::vector<std::string>& current,
+                                               const std::vector<scim::ScimGroupMemberOp>& ops) {
+    std::vector<std::string> result = current;
+    for (const auto& op : ops) {
+        switch (op.kind) {
+        case scim::ScimGroupMemberOp::Kind::Add:
+            for (const auto& v : op.values) {
+                if (std::find(result.begin(), result.end(), v) == result.end())
+                    result.push_back(v);
+            }
+            break;
+        case scim::ScimGroupMemberOp::Kind::Remove:
+            for (const auto& v : op.values)
+                result.erase(std::remove(result.begin(), result.end(), v), result.end());
+            break;
+        case scim::ScimGroupMemberOp::Kind::RemoveAll:
+            result.clear();
+            break;
+        case scim::ScimGroupMemberOp::Kind::ReplaceAll:
+            result = op.values;
+            break;
+        }
+    }
+    return result;
+}
+
 /// Bearer gate shared by every /scim/v2/* route. Reads ONLY the
 /// `Authorization: Bearer <token>` header (no cookie/CSRF — there is no
 /// session on this surface) and validates it against ScimStore's hashed
@@ -1745,6 +1782,33 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 record_request(auth_mgr, "group_list", 200);
             });
 
+    // CONCURRENCY (lost-update on Group membership): PUT/PATCH/DELETE each do
+    // a read-modify-write of a group's membership — read the current members,
+    // fold/compute the final set, persist the WHOLE set via
+    // `replace_group_and_members`/`delete_group`. That read...persist is not
+    // atomic across two concurrent mutations of the SAME group: two requests
+    // touching DIFFERENT members can interleave read-then-write and last-
+    // writer-wins loses one (a lost REMOVAL leaves a member admin who should
+    // have been demoted). `kGroupMutationMu` serializes the entire
+    // read-modify-write critical section (current-members read through the
+    // store persist call through the old-union-final recompute loop) across
+    // all three handlers, process-wide — mirrors `recompute_scim_user_role`'s
+    // `kRecomputeMu` precedent above; Group mutation is not a hot path so a
+    // single mutex is fine, no per-group striping needed.
+    //
+    // LOCK ORDER (do not invert): `kGroupMutationMu` is the OUTER lock;
+    // `recompute_scim_user_role` (called from inside each critical section)
+    // takes `kRecomputeMu` internally, so the order is always
+    // `kGroupMutationMu` -> `kRecomputeMu`, never the reverse.
+    // `kGroupMutationMu`'s sole acquirers are the three critical sections
+    // below (PUT/PATCH/DELETE) — nothing reachable while it is held (the
+    // store calls, `resolve_member_values`, `fold_group_member_ops`,
+    // `recompute_scim_user_role`) acquires it again, so there is no
+    // self-deadlock. The User create/revive call site of
+    // `recompute_scim_user_role` takes only `kRecomputeMu`, never
+    // `kGroupMutationMu` — no inversion there either.
+    static std::mutex kGroupMutationMu;
+
     // ── PUT /scim/v2/Groups/{id} — full replace. ──────────────────────────
 
     sink.Put(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
@@ -1806,37 +1870,55 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     }
                 }
 
-                // Snapshot membership BEFORE the replace so the recompute
-                // below can cover the union of old+new (a PUT replace can
-                // both add and remove members in the same call — spec
-                // trigger (a), "for PUT also the REMOVED members").
-                auto old_members = scim_store->list_group_member_user_scim_ids(id);
-                auto new_members = resolve_member_values(scim_store, input.member_values);
+                std::vector<std::string> new_members;
+                {
+                    // CONCURRENCY: kGroupMutationMu's doc comment above —
+                    // serializes this read-modify-write critical section
+                    // (current-members read -> persist -> recompute) against
+                    // concurrent PUT/PATCH/DELETE.
+                    std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
 
-                if (!scim_store->update_group(id, input.display_name, input.external_id)) {
-                    send_scim_error(res, 500, "failed to update the SCIM group");
-                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
-                         "Group");
-                    record_request(auth_mgr, "group_replace", 500);
-                    return;
-                }
-                if (!scim_store->set_group_members(id, new_members)) {
-                    spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}", id);
-                    send_scim_error(res, 500, "failed to persist group membership");
-                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
-                         "Group");
-                    record_request(auth_mgr, "group_replace", 500);
-                    return;
-                }
+                    // Snapshot membership BEFORE the replace so the recompute
+                    // below can cover the union of old+new (a PUT replace can
+                    // both add and remove members in the same call — spec
+                    // trigger (a), "for PUT also the REMOVED members").
+                    auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                    new_members = resolve_member_values(scim_store, input.member_values);
 
-                std::vector<std::string> affected = old_members;
-                for (const auto& m : new_members)
-                    if (std::find(affected.begin(), affected.end(), m) == affected.end())
-                        affected.push_back(m);
-                for (const auto& uid : affected)
-                    recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                             scim_admin_group,
-                                             input.display_name + " op=group_replace");
+                    // #2127 review MEDIUM fix: persist the rename AND the
+                    // membership replace atomically, in ONE transaction (was
+                    // `update_group` + `set_group_members` as two separate
+                    // transactions — a membership-write failure after a
+                    // committed rename left partial state + stale roles).
+                    auto commit_result = scim_store->replace_group_and_members(
+                        id, input.display_name, input.external_id, new_members);
+                    if (!commit_result.has_value()) {
+                        spdlog::error("ScimRoutes: replace_group_and_members failed for group "
+                                     "scim_id={}",
+                                     id);
+                        send_scim_error(res, 500, "failed to update the SCIM group");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                             "Group");
+                        record_request(auth_mgr, "group_replace", 500);
+                        return;
+                    }
+                    if (!*commit_result) {
+                        // The group existed at the top of this handler but is
+                        // gone now — a concurrent DELETE won the race.
+                        send_scim_error(res, 404, "resource not found");
+                        record_request(auth_mgr, "group_replace", 404);
+                        return;
+                    }
+
+                    std::vector<std::string> affected = old_members;
+                    for (const auto& m : new_members)
+                        if (std::find(affected.begin(), affected.end(), m) == affected.end())
+                            affected.push_back(m);
+                    for (const auto& uid : affected)
+                        recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                 scim_admin_group,
+                                                 input.display_name + " op=group_replace");
+                }
 
                 auto updated = scim_store->get_group_by_id(id);
                 if (!updated) {
@@ -1895,30 +1977,53 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   }
                   const auto& patch = *parsed;
 
-                  // #7 (sre capacity): bound the resulting member count
-                  // before mutating ANYTHING — including the displayName
-                  // rename below — see kMaxGroupMembers's doc comment. Moved
-                  // above the rename/update_group so a PATCH that both
-                  // renames the group AND pushes membership over the cap
-                  // 400s without committing the rename, matching the PUT
-                  // handler's validate-before-mutate ordering (a rejected
-                  // PATCH must not leave a stale-privilege window from a
-                  // committed-then-abandoned rename).
+                  // #2127 review rework: resolve-final -> validate-final ->
+                  // atomic-persist -> recompute-union. Everything below reads
+                  // the CURRENT state once, computes what the FINAL state
+                  // would be, validates that FINAL state before touching the
+                  // store at all, then persists it in one transaction — no
+                  // partial-commit window between the rename and the
+                  // membership change (finding #3), no early-return that
+                  // skips recompute after a commit (finding #3), and no
+                  // stale-arithmetic cap bypass (finding #2).
+
+                  std::vector<std::string> final_members;
+                  std::string final_display;
+                  bool renamed = false;
                   {
-                      std::size_t resulting_count = 0;
-                      if (patch.replace_members.has_value()) {
-                          resulting_count = patch.replace_members->size();
-                      } else {
-                          std::size_t current_count =
-                              scim_store->list_group_member_user_scim_ids(id).size();
-                          std::size_t remove_count = patch.remove_all_members
-                                                          ? current_count
-                                                          : patch.members_to_remove.size();
-                          std::size_t after_remove =
-                              current_count > remove_count ? current_count - remove_count : 0;
-                          resulting_count = after_remove + patch.members_to_add.size();
-                      }
-                      if (resulting_count > kMaxGroupMembers) {
+                      // CONCURRENCY: kGroupMutationMu's doc comment above —
+                      // serializes this read-modify-write critical section
+                      // (current-members read -> persist -> recompute)
+                      // against concurrent PUT/PATCH/DELETE.
+                      std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
+
+                      // Step 1: fold the ORDERED member ops onto a copy of the
+                      // CURRENT membership (raw ids, not yet resolved against
+                      // live Users) — see fold_group_member_ops's doc comment
+                      // for why order matters ([HIGH] finding #1).
+                      auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                      auto final_members_raw =
+                          fold_group_member_ops(old_members, patch.member_ops);
+
+                      // Step 2: resolve/validate-and-skip the WHOLE final set
+                      // against live SCIM User resources in one pass (never
+                      // per-op) — an unresolvable id (never provisioned,
+                      // deleted, or garbage from the IdP) is silently dropped,
+                      // same validate-and-skip contract as before.
+                      final_members = resolve_member_values(scim_store, final_members_raw);
+
+                      const std::string pre_update_display_name = group->display_name;
+                      final_display = patch.display_name.value_or(group->display_name);
+                      const std::string final_external =
+                          patch.external_id.value_or(group->external_id);
+                      renamed = (final_display != pre_update_display_name);
+
+                      // Step 3a: member cap on the FINAL set — closes the
+                      // requested-remove-arithmetic bypass ([MEDIUM] finding #2):
+                      // N bogus removes no longer buy headroom for N real adds,
+                      // because the cap is checked against what would ACTUALLY
+                      // persist, not what the request claims to remove.
+                      if (final_members.size() > kMaxGroupMembers) {
                           send_scim_error(res, 400, "members exceeds the maximum group size",
                                          "invalidValue");
                           audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
@@ -1926,28 +2031,11 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           record_request(auth_mgr, "group_patch", 400);
                           return;
                       }
-                  }
 
-                  // [HIGH fix] Captured BEFORE update_group so the
-                  // rename-recompute logic below can tell whether THIS PATCH
-                  // actually changed displayName — a rename can move the
-                  // group across the --scim-admin-group boundary, which
-                  // affects every CURRENT member, not just ones the same
-                  // PATCH explicitly adds/removes (mirrors the PUT handler's
-                  // metadata-only-replace recompute above).
-                  const std::string pre_update_display_name = group->display_name;
-                  bool display_name_changed = false;
-                  std::string new_display_name = pre_update_display_name;
-
-                  if (patch.display_name.has_value() || patch.external_id.has_value()) {
-                      std::string new_display = patch.display_name.value_or(group->display_name);
-                      std::string new_external = patch.external_id.value_or(group->external_id);
-
-                      // #4 (arch-S4/UP-2): a rename onto an existing
-                      // (possibly admin) group's displayName is refused —
-                      // mirrors the create-time 409 and the PUT-replace check.
-                      if (new_display != group->display_name) {
-                          if (auto existing = scim_store->get_group_by_display_name(new_display);
+                      // Step 3b: rename-uniqueness — refused BEFORE any mutation
+                      // (arch-S4/UP-2), same as before.
+                      if (renamed) {
+                          if (auto existing = scim_store->get_group_by_display_name(final_display);
                               existing && existing->scim_id != id) {
                               send_scim_error(res, 409, "displayName already exists", "uniqueness");
                               audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
@@ -1957,126 +2045,52 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           }
                       }
 
-                      if (!scim_store->update_group(id, new_display, new_external)) {
-                          send_scim_error(res, 500, "failed to update the SCIM group");
-                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
-                               {}, "Group");
-                          record_request(auth_mgr, "group_patch", 500);
-                          return;
-                      }
-                      display_name_changed = (new_display != pre_update_display_name);
-                      new_display_name = new_display;
-                  }
-
-                  // #2021 trigger (b): every member ADDED and every member
-                  // REMOVED by this PATCH gets a recompute below.
-                  std::vector<std::string> affected_added;
-                  std::vector<std::string> affected_removed;
-
-                  if (patch.replace_members.has_value()) {
-                      // A `replace` on `members` in the same body as
-                      // add/remove ops is not a shape real IdPs send in
-                      // practice; `replace` wins if present.
-                      auto old_members = scim_store->list_group_member_user_scim_ids(id);
-                      auto new_members = resolve_member_values(scim_store, *patch.replace_members);
-                      if (!scim_store->set_group_members(id, new_members)) {
-                          spdlog::error("ScimRoutes: set_group_members failed for group "
+                      // Step 4: persist the rename AND the membership replace
+                      // atomically, in ONE transaction — the durable fix for
+                      // finding #3 (a mid-write failure could previously leave a
+                      // committed rename with stale/partial membership).
+                      auto commit_result =
+                          scim_store->replace_group_and_members(id, final_display, final_external,
+                                                                final_members);
+                      if (!commit_result.has_value()) {
+                          spdlog::error("ScimRoutes: replace_group_and_members failed for group "
                                        "scim_id={}",
                                        id);
-                          send_scim_error(res, 500, "failed to persist group membership");
-                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
-                               {}, "Group");
+                          send_scim_error(res, 500, "failed to update the SCIM group");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                               "Group");
                           record_request(auth_mgr, "group_patch", 500);
                           return;
                       }
-                      affected_added = new_members;
-                      for (const auto& m : old_members)
-                          if (std::find(affected_added.begin(), affected_added.end(), m) ==
-                              affected_added.end())
-                              affected_added.push_back(m);
-                  } else {
-                      if (patch.remove_all_members) {
-                          affected_removed = scim_store->list_group_member_user_scim_ids(id);
-                          if (!scim_store->set_group_members(id, {})) {
-                              spdlog::error("ScimRoutes: set_group_members(remove-all) failed "
-                                           "for group scim_id={}",
-                                           id);
-                              send_scim_error(res, 500, "failed to persist group membership");
-                              audit(auth_mgr, audit_store, req, "scim.group.updated", "failure",
-                                   id, {}, "Group");
-                              record_request(auth_mgr, "group_patch", 500);
-                              return;
-                          }
-                      } else {
-                          for (const auto& v : patch.members_to_remove) {
-                              if (!scim_store->remove_group_member(id, v)) {
-                                  spdlog::error("ScimRoutes: remove_group_member failed for "
-                                               "group scim_id={} member={}",
-                                               id, v);
-                                  send_scim_error(res, 500, "failed to persist group membership");
-                                  audit(auth_mgr, audit_store, req, "scim.group.updated",
-                                       "failure", id, {}, "Group");
-                                  record_request(auth_mgr, "group_patch", 500);
-                                  return;
-                              }
-                              affected_removed.push_back(v);
-                          }
+                      if (!*commit_result) {
+                          // The group existed at the top of this handler but is
+                          // gone now — a concurrent DELETE won the race.
+                          send_scim_error(res, 404, "resource not found");
+                          record_request(auth_mgr, "group_patch", 404);
+                          return;
                       }
 
-                      auto members_to_add = resolve_member_values(scim_store, patch.members_to_add);
-                      for (const auto& v : members_to_add) {
-                          if (!scim_store->add_group_member(id, v)) {
-                              spdlog::error("ScimRoutes: add_group_member failed for group "
-                                           "scim_id={} member={}",
-                                           id, v);
-                              send_scim_error(res, 500, "failed to persist group membership");
-                              audit(auth_mgr, audit_store, req, "scim.group.updated", "failure",
-                                   id, {}, "Group");
-                              record_request(auth_mgr, "group_patch", 500);
-                              return;
-                          }
-                          affected_added.push_back(v);
-                      }
+                      // Step 5: recompute is gated on the commit above actually
+                      // having happened — affected = old ∪ final, unconditional,
+                      // covers promotions, demotions, removed members, AND a
+                      // rename that flips the --scim-admin-group match, all in
+                      // one pass (no more separate display_name_changed-gated
+                      // "recompute everybody current" branch — folding old ∪
+                      // final already subsumes it, since a metadata-only PATCH
+                      // has final == old).
+                      std::vector<std::string> to_recompute = old_members;
+                      for (const auto& uid : final_members)
+                          if (std::find(to_recompute.begin(), to_recompute.end(), uid) ==
+                              to_recompute.end())
+                              to_recompute.push_back(uid);
+
+                      std::string trigger = final_display + " op=group_patch";
+                      if (renamed)
+                          trigger += " renamed_from='" + pre_update_display_name + "'";
+                      for (const auto& uid : to_recompute)
+                          recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                   scim_admin_group, trigger);
                   }
-
-                  // [HIGH fix] A displayName-changing PATCH can move this
-                  // group across the --scim-admin-group boundary, which can
-                  // add/remove EVERY current member from the admin group —
-                  // not just members this SAME PATCH explicitly added/
-                  // removed via member ops. Mirror the PUT handler's
-                  // metadata-only-replace recompute: read the CURRENT
-                  // membership (AFTER all membership mutations above, so a
-                  // rename onto the admin group promotes the group's actual
-                  // current members) and fold it into the affected set
-                  // whenever displayName changed. Leave the existing
-                  // add/remove-only fast path untouched when it did not —
-                  // no need to recompute the whole group for a pure
-                  // membership PATCH, that was already correct.
-                  auto current_members = scim_store->list_group_member_user_scim_ids(id);
-
-                  // De-duplicate added ∪ removed ∪ (rename ? current : {})
-                  // so no member is recomputed — and audited — twice for the
-                  // same PATCH.
-                  std::vector<std::string> to_recompute;
-                  auto add_unique = [&to_recompute](const std::string& uid) {
-                      if (std::find(to_recompute.begin(), to_recompute.end(), uid) ==
-                          to_recompute.end())
-                          to_recompute.push_back(uid);
-                  };
-                  for (const auto& uid : affected_added)
-                      add_unique(uid);
-                  for (const auto& uid : affected_removed)
-                      add_unique(uid);
-                  if (display_name_changed)
-                      for (const auto& uid : current_members)
-                          add_unique(uid);
-
-                  std::string trigger = new_display_name + " op=group_patch";
-                  if (display_name_changed)
-                      trigger += " renamed_from='" + pre_update_display_name + "'";
-                  for (const auto& uid : to_recompute)
-                      recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                               scim_admin_group, trigger);
 
                   auto updated = scim_store->get_group_by_id(id);
                   if (!updated) {
@@ -2087,10 +2101,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       record_request(auth_mgr, "group_patch", 500);
                       return;
                   }
-                  const auto& members = current_members;
                   audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
                        "Group");
-                  res.set_content(scim::group_to_json(*updated, members, groups_location_base(req),
+                  res.set_content(scim::group_to_json(*updated, final_members,
+                                                      groups_location_base(req),
                                                       location_base(req))
                                       .dump(),
                                   kScimJson);
@@ -2113,33 +2127,42 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        record_request(auth_mgr, "group_delete", 404);
                        return;
                    }
-                   // #2021 trigger (c): snapshot the full membership BEFORE
-                   // delete_group tears down the scim_group_members rows
-                   // alongside the group (ScimStore::delete_group's doc
-                   // comment) — these are the users who lose this group.
-                   auto former_members = scim_store->list_group_member_user_scim_ids(id);
+                   {
+                       // CONCURRENCY: kGroupMutationMu's doc comment above —
+                       // serializes this read-modify-write critical section
+                       // (former-members read -> delete -> recompute) against
+                       // concurrent PUT/PATCH/DELETE.
+                       std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
 
-                   auto delete_result = scim_store->delete_group(id);
-                   if (!delete_result.has_value()) {
-                       spdlog::error("ScimRoutes: ScimStore::delete_group failed for scim_id={}",
-                                    id);
-                       send_scim_error(res, 500, "failed to remove the SCIM group");
-                       audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id, {},
-                            "Group");
-                       record_request(auth_mgr, "group_delete", 500);
-                       return;
-                   }
-                   if (!*delete_result) {
-                       spdlog::info("ScimRoutes: DELETE Groups scim_id={} — already gone "
-                                   "(concurrent/duplicate DELETE); treating as idempotent "
-                                   "success",
-                                   id);
-                   }
+                       // #2021 trigger (c): snapshot the full membership
+                       // BEFORE delete_group tears down the
+                       // scim_group_members rows alongside the group
+                       // (ScimStore::delete_group's doc comment) — these are
+                       // the users who lose this group.
+                       auto former_members = scim_store->list_group_member_user_scim_ids(id);
 
-                   for (const auto& uid : former_members)
-                       recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
-                                                scim_admin_group,
-                                                group->display_name + " op=group_delete");
+                       auto delete_result = scim_store->delete_group(id);
+                       if (!delete_result.has_value()) {
+                           spdlog::error(
+                               "ScimRoutes: ScimStore::delete_group failed for scim_id={}", id);
+                           send_scim_error(res, 500, "failed to remove the SCIM group");
+                           audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id,
+                                {}, "Group");
+                           record_request(auth_mgr, "group_delete", 500);
+                           return;
+                       }
+                       if (!*delete_result) {
+                           spdlog::info("ScimRoutes: DELETE Groups scim_id={} — already gone "
+                                       "(concurrent/duplicate DELETE); treating as idempotent "
+                                       "success",
+                                       id);
+                       }
+
+                       for (const auto& uid : former_members)
+                           recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                    scim_admin_group,
+                                                    group->display_name + " op=group_delete");
+                   }
 
                    audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id, {},
                         "Group");

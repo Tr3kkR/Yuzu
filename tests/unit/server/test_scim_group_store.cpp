@@ -376,6 +376,117 @@ TEST_CASE("ScimStore: set_group_members with an empty vector clears membership",
     CHECK(f.store.list_group_member_user_scim_ids(grp->scim_id).empty());
 }
 
+// ── Atomic replace (replace_group_and_members, #2127 review fix) ──────────
+//
+// PUT/PATCH previously committed the display_name rename (update_group) and
+// the membership change (set_group_members) as separate transactions, so a
+// membership-write failure after a committed rename left partial state +
+// stale roles. replace_group_and_members is the durable one-transaction fix.
+
+TEST_CASE("ScimStore: replace_group_and_members updates identity and membership together",
+         "[scim][group][membership][atomic]") {
+    ScimFixture f;
+    auto grp = f.store.create_group("Sales", "ext-1");
+    REQUIRE(grp.has_value());
+    REQUIRE(f.store.add_group_member(grp->scim_id, "stale-1"));
+    REQUIRE(f.store.add_group_member(grp->scim_id, "stale-2"));
+
+    auto result =
+        f.store.replace_group_and_members(grp->scim_id, "Sales EMEA", "ext-2",
+                                          {"user-a", "user-b"});
+    REQUIRE(result.has_value());
+    CHECK(*result);
+
+    auto after = f.store.get_group_by_id(grp->scim_id);
+    REQUIRE(after.has_value());
+    CHECK(after->display_name == "Sales EMEA");
+    CHECK(after->external_id == "ext-2");
+    CHECK(after->etag_version == 2);
+
+    auto members = f.store.list_group_member_user_scim_ids(grp->scim_id);
+    std::sort(members.begin(), members.end());
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "user-a");
+    CHECK(members[1] == "user-b");
+}
+
+TEST_CASE("ScimStore: replace_group_and_members on unknown scim_id returns false, no side effects",
+         "[scim][group][membership][atomic]") {
+    ScimFixture f;
+    auto result =
+        f.store.replace_group_and_members("no-such-id", "X", "", {"user-a"});
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result);
+
+    // No stray group or membership row was created.
+    CHECK_FALSE(f.store.get_group_by_id("no-such-id").has_value());
+    CHECK(f.store.list_group_member_user_scim_ids("no-such-id").empty());
+}
+
+TEST_CASE("ScimStore: replace_group_and_members rolls back fully on a mid-transaction failure "
+         "(safety-S2)",
+         "[scim][group][membership][atomic][transaction]") {
+    ScimFixture f;
+    auto grp = f.store.create_group("Sales", "ext-1");
+    REQUIRE(grp.has_value());
+    REQUIRE(f.store.set_group_members(grp->scim_id, {"old-a", "old-b"}));
+
+    // Poison a specific member id so the INSERT loop fails partway through,
+    // AFTER the display_name UPDATE and the membership-clearing DELETE have
+    // already run in the same transaction.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2(f.db_file.path.string().c_str(), &raw, SQLITE_OPEN_READWRITE,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw,
+                            "CREATE TRIGGER poison_replace_insert BEFORE INSERT ON "
+                            "scim_group_members WHEN NEW.user_scim_id = 'POISON' "
+                            "BEGIN SELECT RAISE(ABORT, 'induced failure'); END;",
+                            nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    auto result = f.store.replace_group_and_members(grp->scim_id, "Sales EMEA", "ext-2",
+                                                     {"new-1", "POISON", "new-2"});
+    REQUIRE_FALSE(result.has_value());
+
+    // Neither half of the write leaked: the rename did NOT persist...
+    auto after = f.store.get_group_by_id(grp->scim_id);
+    REQUIRE(after.has_value());
+    CHECK(after->display_name == "Sales");
+    CHECK(after->external_id == "ext-1");
+    CHECK(after->etag_version == 1);
+
+    // ...and the pre-existing membership is UNCHANGED (the clearing DELETE
+    // that ran earlier in the same transaction was also rolled back).
+    auto members = f.store.list_group_member_user_scim_ids(grp->scim_id);
+    std::sort(members.begin(), members.end());
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "old-a");
+    CHECK(members[1] == "old-b");
+}
+
+TEST_CASE("ScimStore: replace_group_and_members embedded-NUL display_name round-trips at full "
+         "length",
+         "[scim][group][membership][atomic][embedded_nul]") {
+    ScimFixture f;
+    auto grp = f.store.create_group("Team");
+    REQUIRE(grp.has_value());
+
+    std::string name = std::string("Admins") + std::string(1, '\0') + std::string("decoy");
+    REQUIRE(name.size() == 12);
+
+    auto result = f.store.replace_group_and_members(grp->scim_id, name, "", {"user-a"});
+    REQUIRE(result.has_value());
+    CHECK(*result);
+
+    auto after = f.store.get_group_by_id(grp->scim_id);
+    REQUIRE(after.has_value());
+    CHECK(after->display_name.size() == 12);
+    CHECK(after->display_name == name);
+    CHECK(after->display_name != "Admins");
+}
+
 // ── Reverse lookup (role-application dependency) ─────────────────────────
 
 TEST_CASE("ScimStore: list_group_display_names_for_user spans multiple groups",

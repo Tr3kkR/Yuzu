@@ -406,8 +406,8 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                 auto members = extract_member_values(value);
                 if (!members)
                     return std::unexpected(members.error());
-                patch.members_to_add.insert(patch.members_to_add.end(), members->begin(),
-                                            members->end());
+                patch.member_ops.push_back(
+                    ScimGroupMemberOp{ScimGroupMemberOp::Kind::Add, std::move(*members)});
             } else if (ieq(path, "displayName")) {
                 if (!value.is_string()) {
                     return std::unexpected(
@@ -450,15 +450,17 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                     auto members = extract_member_values(operation["value"]);
                     if (!members)
                         return std::unexpected(members.error());
-                    patch.members_to_remove.insert(patch.members_to_remove.end(),
-                                                   members->begin(), members->end());
+                    patch.member_ops.push_back(
+                        ScimGroupMemberOp{ScimGroupMemberOp::Kind::Remove, std::move(*members)});
                 } else {
                     // `remove` with no filter/value on the bare `members`
                     // path means "remove every member" (RFC 7644 §3.5.2.2).
-                    patch.remove_all_members = true;
+                    patch.member_ops.push_back(
+                        ScimGroupMemberOp{ScimGroupMemberOp::Kind::RemoveAll, {}});
                 }
             } else if (auto id = parse_members_value_filter(path)) {
-                patch.members_to_remove.push_back(*id);
+                patch.member_ops.push_back(
+                    ScimGroupMemberOp{ScimGroupMemberOp::Kind::Remove, {*id}});
             } else {
                 return std::unexpected(
                     ScimError{400, "invalidPath", "unsupported PatchOp path: " + path});
@@ -505,13 +507,15 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                     auto members = extract_member_values(value["members"]);
                     if (!members)
                         return std::unexpected(members.error());
-                    patch.replace_members = std::move(*members);
+                    patch.member_ops.push_back(ScimGroupMemberOp{
+                        ScimGroupMemberOp::Kind::ReplaceAll, std::move(*members)});
                 }
             } else if (ieq(path, "members")) {
                 auto members = extract_member_values(value);
                 if (!members)
                     return std::unexpected(members.error());
-                patch.replace_members = std::move(*members);
+                patch.member_ops.push_back(
+                    ScimGroupMemberOp{ScimGroupMemberOp::Kind::ReplaceAll, std::move(*members)});
             } else if (ieq(path, "displayName")) {
                 if (!value.is_string()) {
                     return std::unexpected(

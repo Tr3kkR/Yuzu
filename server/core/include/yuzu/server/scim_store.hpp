@@ -179,6 +179,19 @@ public:
     bool set_group_members(const std::string& group_scim_id,
                            const std::vector<std::string>& user_scim_ids);
 
+    /// Atomically (single transaction) update the group's display_name/
+    /// external_id AND replace its entire membership set — the durable fix
+    /// for PUT/PATCH committing the rename and the membership change as
+    /// separate transactions (#2127 review), which could leave a committed
+    /// rename with a stale/partial membership set on a mid-write failure.
+    /// Tri-state return mirrors `delete_group`: `nullopt` on a genuine DB
+    /// error (rolled back — neither the rename nor the membership change
+    /// persists), `false` if no row matched `scim_id` (no side effects),
+    /// `true` if the group was updated.
+    std::optional<bool> replace_group_and_members(
+        const std::string& scim_id, const std::string& display_name,
+        const std::string& external_id, const std::vector<std::string>& member_user_scim_ids);
+
     /// Add a single member (SCIM PATCH `add`). Idempotent: adding an
     /// already-present member returns true (no-op), not an error.
     bool add_group_member(const std::string& group_scim_id, const std::string& user_scim_id);

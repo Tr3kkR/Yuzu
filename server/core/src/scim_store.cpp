@@ -793,6 +793,109 @@ bool ScimStore::set_group_members(const std::string& group_scim_id,
     return true;
 }
 
+std::optional<bool> ScimStore::replace_group_and_members(
+    const std::string& scim_id, const std::string& display_name,
+    const std::string& external_id, const std::vector<std::string>& member_user_scim_ids) {
+    if (!db_ || scim_id.empty() || display_name.empty())
+        return std::nullopt;
+
+    std::lock_guard lock(db_mtx_);
+
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::replace_group_and_members: BEGIN failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    SqliteTxnGuard txn(db_);
+
+    static const char* update_sql = R"(
+        UPDATE scim_groups
+        SET display_name = ?1, external_id = ?2, etag_version = etag_version + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE scim_id = ?3
+        RETURNING scim_id
+    )";
+    sqlite3_stmt* update_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, update_sql, -1, &update_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::replace_group_and_members: update prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    // Explicit length, not -1 — display_name/external_id are IdP-supplied and
+    // a value containing an embedded NUL would otherwise silently truncate at
+    // sqlite3_bind_text's strlen() scan (matches update_group/create_group,
+    // #2018).
+    sqlite3_bind_text(update_stmt, 1, display_name.c_str(),
+                      static_cast<int>(display_name.size()), SQLITE_TRANSIENT);
+    if (external_id.empty())
+        sqlite3_bind_null(update_stmt, 2);
+    else
+        sqlite3_bind_text(update_stmt, 2, external_id.c_str(),
+                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(update_stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int update_rc = sqlite3_step(update_stmt);
+    sqlite3_finalize(update_stmt);
+
+    // No row matched -> group doesn't exist. Not an error (#1033-safe: no
+    // sqlite3_changes() call on this shared connection) — return false, the
+    // guard rolls back (nothing was written anyway).
+    if (update_rc == SQLITE_DONE)
+        return false;
+    if (update_rc != SQLITE_ROW) {
+        spdlog::error("ScimStore::replace_group_and_members: update step failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+
+    sqlite3_stmt* del_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
+                          &del_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::replace_group_and_members: delete prepare failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    sqlite3_bind_text(del_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+    int del_rc = sqlite3_step(del_stmt);
+    sqlite3_finalize(del_stmt);
+    if (del_rc != SQLITE_DONE) {
+        spdlog::error("ScimStore::replace_group_and_members: delete step failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+
+    if (!member_user_scim_ids.empty()) {
+        sqlite3_stmt* ins_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
+                               "user_scim_id) VALUES (?1, ?2)",
+                               -1, &ins_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("ScimStore::replace_group_and_members: insert prepare failed: {}",
+                         sqlite3_errmsg(db_));
+            return std::nullopt;
+        }
+        for (const auto& user_scim_id : member_user_scim_ids) {
+            sqlite3_bind_text(ins_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins_stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
+                spdlog::error("ScimStore::replace_group_and_members: insert step failed: {}",
+                             sqlite3_errmsg(db_));
+                sqlite3_finalize(ins_stmt);
+                return std::nullopt;
+            }
+            sqlite3_reset(ins_stmt);
+        }
+        sqlite3_finalize(ins_stmt);
+    }
+
+    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ScimStore::replace_group_and_members: COMMIT failed: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    txn.commit();
+    return true;
+}
+
 bool ScimStore::add_group_member(const std::string& group_scim_id,
                                  const std::string& user_scim_id) {
     if (!db_ || group_scim_id.empty() || user_scim_id.empty())
