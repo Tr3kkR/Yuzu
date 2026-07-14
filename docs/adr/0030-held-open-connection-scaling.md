@@ -49,10 +49,13 @@ so did the arithmetic nobody had done before. The result is the reason this ADR 
 - Holding back a plain-REST reserve (8) and allowing for the one draining provider a stream
   can leave behind during a takeover (×2), the affordable number of concurrent streams is
   **12**.
-- The platform's own design notes size it for **"hundreds of agentic clients per server"**
-  (`server/core/src/event_bus.hpp:83`).
+- The only number the codebase records is **"hundreds of agentic clients per server"**
+  (`server/core/src/event_bus.hpp:83`, quoted again at `stream_budget.hpp:51`) — and it is
+  worth being precise about what that is: an **assumption inside a queue-cap rationale**, not
+  a sizing requirement. **No stream-count requirement exists.** Establishing one is a
+  deliverable of this ADR.
 
-**The transport can serve 12. The platform is designed for hundreds.** The cap is not a
+**The transport can serve 12. The only figure anyone has written down is hundreds.** The cap is not a
 safety feature; it is the visible edge of a self-inflicted scarcity. Rationing it more
 carefully — capping the other three surfaces so they cannot starve each other — makes the
 accounting honest but leaves the ceiling exactly where it is.
@@ -83,11 +86,13 @@ plan, and it is correct.
 **2. Derive the worker pool from the intended stream count — not the cap from the accidental
 pool.** This inverts the arrow. A thread blocked in `cv.wait_for` burns **zero CPU** — the only
 periodic cost is one wakeup per heartbeat interval per stream — and its resident cost is a
-fraction of the 8 MB stack, which is virtual. What that fraction actually *is* on our
-platforms is **not yet measured, and this ADR does not estimate it**: a **measured
-per-held-stream RSS baseline (Linux glibc, MSVC, macOS) is required before anyone sizes
-`--max-sse-streams` or a worker pool off it.** Sizing a fleet-scale resource off an
-unmeasured constant is how the 12-stream ceiling happened in the first place. The shape of
+fraction of the thread's **stack reservation — which is virtual, and differs per platform**
+(8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads; quoting "8 MB" as
+*the* stack size is itself a way to divide by the wrong constant). What the **resident**
+fraction actually is on our platforms is **not yet measured, and this ADR does not estimate
+it**: a **measured per-held-stream RSS baseline (Linux glibc, MSVC, macOS) is required before
+anyone sizes `--max-sse-streams` or a worker pool off it.** Sizing a fleet-scale resource off
+an unmeasured constant is how the 12-stream ceiling happened in the first place. The shape of
 the rule stands regardless of the number:
 
 ```
@@ -101,21 +106,29 @@ budget then binds only under abuse or genuine over-subscription, which is what a
 *held-open responses ÷ pool capacity* — it is the signal that says "raise the target", and no
 per-surface gauge can express it.
 
-**4. Record the ceiling, and name the durable fix.** (2) buys one to two thousand streams
-before thread memory and scheduler pressure become the binding constraint (the exact figure
-awaits the measured baseline in (2)). Beyond that, the answer is not a bigger pool — it is to
-**stop owning a thread per stream**. The durable fix is **an asynchronous presentation
+**4. Record the ceiling, and name the durable fix.** (2) raises the ceiling from 12 to
+whatever the **measured** per-held-stream cost supports — **a figure this ADR deliberately
+does not guess**, because guessing it here would be the same mistake (2) exists to correct,
+two decisions later. Wherever that ceiling lands, thread memory and scheduler pressure
+eventually bind, and beyond it the answer is not a bigger pool — it is to **stop owning a
+thread per stream**. The durable fix is **an asynchronous presentation
 binary**:
 
 - **Hold the connections in presentation, on an async C++ runtime (Drogon).** ADR-0031 splits
   presentation into its own binary, which makes its runtime a free choice; Drogon's
   non-blocking event loop and coroutines remove the thread-per-held-stream cost **in-language**
-  — the existing HTMX renderers and MCP framing port across without a ~5k-line re-home into
-  another runtime, and N stateless presentation replicas can sit behind the one MCP origin.
-  Core's HTTP runtime can remain as it is, behind short-lived bounded calls. This is ballot
-  A3 (amended), and it is **conditional on the G10 build canary**: Drogon is a heavyweight new
-  dependency landing on the most fragile part of the build (Windows MSVC static linking, the
-  #375 history), so it faces a vcpkg-port canary across the full matrix before it is ratified.
+  — the C++ stays C++, with no re-home into another runtime — and N stateless presentation
+  replicas can sit behind the one MCP origin. Core's HTTP runtime can remain as it is, behind
+  short-lived bounded calls. **This avoids a *language* port, not a *framework* port:** every
+  handler registration, the HTMX renderers and `mcp_server.cpp` move from httplib's synchronous
+  handler signature to Drogon's async/coroutine model, and **every SSE content-provider is
+  rewritten against a different concurrency model** — which is precisely the code this ADR is
+  about. It is the largest item in ADR-0031's migration and it needs its own estimate; "it
+  ports across" is true of the language and false of the effort. This is ballot A3 (amended),
+  and it is **conditional on the G10 build canary** — which gates the **linkage, not the
+  port**: Drogon is a heavyweight new dependency landing on the most fragile part of the build
+  (Windows MSVC static linking, the #375 history), so it faces a vcpkg-port canary across the
+  full matrix before it is ratified.
   Durable session identity and the replay ring live in core/Postgres, not in presentation.
 - **Not the Erlang gateway.** The BEAM would win the same ceiling, but it would mean re-homing
   the MCP framing and the HTMX renderers into a second language. The gateway stays what it is:
