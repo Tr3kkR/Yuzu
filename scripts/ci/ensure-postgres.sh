@@ -93,32 +93,16 @@ if [[ -n "$AGENT_IDX" ]]; then
   DOCKER_PG_ARGS+=(-c max_connections=400)
 fi
 
-# Connection-level durability relief, applied to EVERY emitted DSN. Unlike
-# fsync/full_page_writes, synchronous_commit is USERSET — settable per
-# connection with no restart and no privilege — so it is the one durability
-# knob we can turn on a cluster whose postgresql.conf we don't own (the pre-set
-# path: Wee Tam's native Windows service until deploy/windows/
-# Provision-Windows-Runner.ps1 is re-run). It rides through PostgresTestDb's
-# PQconninfoParse-based dbname rewrite (test_helpers.hpp) intact, so every
-# per-test DB inherits it. Idempotent; harmless where the server already sets
-# it off (docker/brew). Percent-encoded (%20=space, %3D='=') per RFC 3986.
-append_test_options() {
-  local dsn="$1"
-  case "$dsn" in
-    *synchronous_commit*) printf '%s' "$dsn"; return ;;  # already tuned
-  esac
-  case "$dsn" in
-    postgres://*|postgresql://*)
-      local sep='?'; case "$dsn" in *\?*) sep='&' ;; esac
-      printf '%s' "${dsn}${sep}options=-c%20synchronous_commit%3Doff" ;;
-    *)  # keyword/value conninfo (no current emitter uses this form)
-      printf '%s' "${dsn} options='-c synchronous_commit=off'" ;;
-  esac
-}
-
+# NOTE: durability-off is applied SERVER-SIDE only (docker/brew `-c` flags
+# below; the native Windows service via deploy/windows/Provision-Windows-Runner
+# .ps1 or a one-off `ALTER SYSTEM SET fsync/synchronous_commit/full_page_writes
+# = off` + reload). Do NOT inject it into the emitted DSN via the libpq
+# `options` keyword: PgPool only injects its statement_timeout/lock_timeout
+# GUCs "unless the conninfo sets its own `options`" (pg_pool.hpp), so a DSN-level
+# `options=` silently disables those safety bounds — the [pg][hardening] test
+# "PgPool injects statement_timeout and lock_timeout GUCs" catches it.
 emit_dsn() {
-  local dsn how="$2"
-  dsn="$(append_test_options "$1")"
+  local dsn="$1" how="$2"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "YUZU_TEST_POSTGRES_DSN=${dsn}" >> "$GITHUB_ENV"
   fi
