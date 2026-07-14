@@ -208,6 +208,19 @@ int main(int argc, char* argv[]) {
                  "server-side runtime toggle.")
         ->envname("YUZU_AGENT_INVENTORY_DISABLE");
 
+    // SLE (ADR-0024 Decision 11): how the software_licensing source records a
+    // detected per-user licence's local profile name. hash (default) = a
+    // per-agent keyed pseudonym HMAC-SHA256(k_agent, profile)/16-hex; collect =
+    // the raw profile name (opt-in); omit = no identifier (user_scope still marks
+    // the detection per-user). CLI::IsMember rejects anything else at parse.
+    app.add_option("--license-scan-user-ref", cfg.license_scan_user_ref,
+                   "How the software_licensing sync records per-user licence profile names: "
+                   "collect|hash|omit (default hash — a per-agent keyed pseudonym). "
+                   "Env: YUZU_AGENT_LICENSE_SCAN_USER_REF.")
+        ->default_val("hash")
+        ->check(CLI::IsMember({"collect", "hash", "omit"}))
+        ->envname("YUZU_AGENT_LICENSE_SCAN_USER_REF");
+
     // Windows service management
     bool install_service = false;
     bool remove_service = false;
@@ -394,6 +407,9 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+    // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
+    // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
+    spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
 
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the

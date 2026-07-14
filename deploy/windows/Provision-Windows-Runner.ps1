@@ -14,7 +14,9 @@
   What it does:
     - installs the pinned toolchain (Python+Meson+Ninja, Git, CMake, ccache,
       MSYS2, Erlang/OTP + rebar3, VS 2022 Build Tools C++ workload,
-      PostgreSQL, vcpkg @ pinned baseline);
+      PostgreSQL — ONE cluster per runner agent on :PostgresPort+agentIdx so
+      concurrent jobs never share a WAL/buffer pool (#2094) — vcpkg @ pinned
+      baseline);
     - sets machine env + PATH, INCLUDING the de-Shulgi-ified gateway contract
       (YUZU_ESCRIPT / YUZU_REBAR3 — scripts/build_gateway.py reads these instead
       of assuming a C:\Erlang junction + Chocolatey path) and the shared CI
@@ -45,7 +47,8 @@ param(
   [string]$VcpkgRoot       = 'C:\vcpkg',
   [string]$Msys2Root       = 'C:\msys64',
   [int]   $PostgresPort    = 5433,
-  [int]   $PostgresMaxConnections = 400,  # shared 4-runner instance: the default 100 exhausts (CH-9)
+  [int]   $PostgresMaxConnections = 400,  # PgPool fan-out headroom: the default 100 exhausts (CH-9)
+  [int]   $RunnerCount     = 4,           # agents on this box; agents 1..N-1 get per-agent PG clusters (#2094)
   [string]$ManifestPath    = 'C:\actions-runner\toolchain-manifest.json'
 )
 $ErrorActionPreference = 'Continue'
@@ -178,6 +181,65 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
   Remove-Item Env:\PGPASSWORD
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
+}
+
+Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($PostgresPort+1)..$($PostgresPort+$RunnerCount-1) (#2094)" {
+  # One instance PER runner agent: concurrent jobs sharing one cluster
+  # mutually DoS their [pg] server suites through the shared WAL/buffer pool
+  # (the 2026-07-12 server-suite timeouts). Agent 0 keeps the winget-installed
+  # service on :$PostgresPort (step above); agents 1..N-1 each get an initdb'd
+  # cluster + Windows service here. scripts/ci/ensure-postgres.sh derives
+  # "base port + agent index" from RUNNER_NAME at job time and probes before
+  # switching, so no runner .env / wrapper / re-registration is needed —
+  # provisioning these clusters IS the whole cutover.
+  $major = $PostgresVersion.Split('.')[0]
+  $pgbin = "C:\Program Files\PostgreSQL\$major\bin"
+  if(-not (Test-Path "$pgbin\initdb.exe")){ throw "initdb not found at $pgbin — the main PostgreSQL step must succeed first" }
+  $pw = Join-Path $env:TEMP 'yuzu-pg-pwfile.txt'
+  Set-Content $pw 'postgres' -Encoding Ascii
+  try {
+    for($n=1; $n -lt $RunnerCount; $n++){
+      $port = $PostgresPort + $n
+      $data = "$CacheRoot\pg\agent-$n"
+      $svc  = "postgresql-x64-$major-yuzu-ci-$n"
+      if(-not (Test-Path "$data\PG_VERSION")){
+        New-Item -ItemType Directory -Force $data | Out-Null
+        # initdb/pg_ctl drop admin rights via a restricted token, so the
+        # invoking user needs an EXPLICIT grant (its Administrators ACE no
+        # longer applies); NETWORK SERVICE (S-1-5-20 — the same account the
+        # EDB-installed agent-0 service runs as) owns the cluster at runtime.
+        icacls $data /grant "$($env:USERNAME):(OI)(CI)F" | Out-Null
+        icacls $data /grant '*S-1-5-20:(OI)(CI)F' | Out-Null
+        & "$pgbin\initdb.exe" -D $data -U postgres -A password --pwfile=$pw -E UTF8 | Out-Null
+        if(-not (Test-Path "$data\PG_VERSION")){ throw "initdb failed for $data" }
+        Add-Content "$data\postgresql.conf" "`n# yuzu CI per-agent cluster $n (#2094)`nlisten_addresses = '127.0.0.1'`nport = $port`nmax_connections = $PostgresMaxConnections`nlogging_collector = on`n"
+      }
+      if(-not (Get-Service $svc -EA SilentlyContinue)){
+        & "$pgbin\pg_ctl.exe" register -N $svc -D $data -S auto -U 'NT AUTHORITY\NetworkService'
+      }
+      Start-Service $svc
+      $deadline=(Get-Date).AddSeconds(90)
+      do {
+        & "$pgbin\pg_isready.exe" -q -h 127.0.0.1 -p $port 2>$null
+        if($LASTEXITCODE -eq 0){ break }
+        Start-Sleep 2
+      } while((Get-Date) -lt $deadline)
+      if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s (svc $svc, data $data)" }
+      $env:PGPASSWORD='postgres'
+      $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$port")
+      if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
+        & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+      }
+      if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
+        & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
+      }
+      Remove-Item Env:\PGPASSWORD
+      Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
+    }
+    "per-agent clusters 1..$($RunnerCount-1) ready on :$($PostgresPort+1)..:$($PostgresPort+$RunnerCount-1)"
+  } finally {
+    Remove-Item $pw -EA SilentlyContinue
+  }
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {

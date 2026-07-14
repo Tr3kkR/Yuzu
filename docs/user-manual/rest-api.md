@@ -78,6 +78,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
@@ -2908,6 +2909,91 @@ On a `503` the store could not be read; do **not** treat it as "not installed an
 
 ---
 
+### Software Licensing (SLE)
+
+The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
+
+#### `GET /api/v1/sle/agents/{agent_id}`
+
+One device's detected licences — the per-agent drill. This is the **only** surface that serves the per-user `user_scope`/`user_ref` fields (ADR-0024 Decision 11 personal data); its MCP twin `query_software_licenses` returns machine-scope facts with those fields omitted. Because it renders personal data, every open is **audited fail-closed**: if the `sle.agent.view` audit row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no licence data is served.
+
+**Permission:** `SoftwareLicensing:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "licenses": [
+      {"product": "Office 365 ProPlus", "vendor": "Microsoft", "version": "16.0.1",
+       "license_type": "subscription", "state": "subscription_active", "expiry_at": 1893456000,
+       "channel": "KMS", "key_hint": "XXXXX-B7GJQ", "detector": "wmi_slp",
+       "confidence": "probable", "exe_hints": "winword.exe;excel.exe",
+       "user_scope": "machine", "user_ref": "",
+       "collected_at": 1751000000, "first_seen": 1751000000, "last_seen": 1751600000}
+    ],
+    "count": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`key_hint` is an OS-provided partial key — full key material is never collected, stored, or served. `expiry_at` is epoch seconds (`0` = none). On a per-user row, `user_scope` is `"user"` and `user_ref` carries the profile identifier as minimised on-device (`hash` mode default — a per-agent keyed-HMAC pseudonym; see the [privacy limits](software-licensing.md#per-user-detection-and-privacy)). `first_seen`/`last_seen` are server receipt times.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `SoftwareLicensing:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` means the store could not be read — do **not** treat it as "nothing licensed".
+
+#### `DELETE /api/v1/sle/agents/{agent_id}`
+
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+
+**Permission:** a **per-device-scoped conjunction over every securable the cascade erases through** — `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and** `GuaranteedState:Delete`. A role missing any one of the three is `403`'d (the seeded Administrator/ITServiceOwner roles hold all three; a custom role must be granted the full set).
+
+Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
+
+**Response (200)** — every store's delete committed:
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "decommissioned": true,
+    "stores": {"inventory": "deleted", "software_inventory": "deleted",
+               "app_perf_daily": "deleted", "device_inventory": "skipped",
+               "software_licensing": "deleted"},
+    "deleted": 4,
+    "skipped": 1,
+    "failed": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not configured on this deployment), `failed` (rolled back or threw — the delete did **not** happen). Each store reports its true commit status, so a rolled-back erasure is never reported as done.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks any one of the three per-device-scoped `Delete` permissions |
+| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures |
+| 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
+| 503 | Scope gate or cascade not configured (A4 envelope) |
+
+A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first.
+
+---
+
 ### Execution Statistics
 
 Fleet-wide and per-entity execution metrics.
@@ -4607,11 +4693,40 @@ A failed signature ALWAYS rejects, even when enforcement is off — `--allow-uns
 
 #### `POST /api/instructions/yaml`
 
-Store raw YAML source for an instruction definition.
+Create or update an instruction definition from raw YAML source (the dashboard
+New Definition panel's Save endpoint). Form-encoded: `yaml_source` carries the
+document verbatim (stored as the definition's source of truth); an optional
+`id` parameter switches to update mode. Responses are HTML fragments (this is
+a dashboard surface), plus an `HX-Trigger` toast header. Requires
+`InstructionDefinition:Write`.
+
+The queryable columns are derived schema-aware from the YAML — both the
+canonical nested schema and the flat form the panel's structured form
+generates are accepted, with this precedence:
+
+| Column | Canonical | Fallback |
+|---|---|---|
+| id | `metadata.id` (create only; honoured, **409** on conflict) | store-generated |
+| name | `metadata.displayName` | `metadata.name`, then `metadata.id` |
+| plugin / action | `spec.execution.plugin` / `.action` | `spec.plugin` / `spec.action` |
+| approval | `spec.approval.mode` | scalar `spec.approval` (default `auto`) |
+| version / type / concurrency | `metadata.version` / `spec.type` / `spec.execution.concurrency` | defaults `1.0.0` / `question` / `per-device` |
+
+On update, a `yaml_source` whose `metadata.id` differs from the `id` parameter
+is rejected. Explicit ids must match `[A-Za-z0-9._-]{1,128}`. Save and
+validate-yaml share one validation contract — YAML that passes validation
+always saves.
+
+**Audit:** emits `instruction.create` / `instruction.update` (`result=success`),
+and `instruction.create` with `result=denied` / `duplicate_id` on conflict.
 
 #### `POST /api/instructions/validate-yaml`
 
 Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
+Requires `InstructionDefinition:Read`. Runs the same validation contract as
+the Save endpoint above (required fields, `type`/`approval` enums, explicit
+`metadata.id` charset/length, size cap, scope-walking gates), so a document
+that validates green is guaranteed to save.
 
 #### `POST /api/instructions/{id}/execute`
 

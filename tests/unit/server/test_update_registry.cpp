@@ -7,6 +7,8 @@
 
 #include "update_registry.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -17,19 +19,22 @@ namespace fs = std::filesystem;
 
 namespace {
 
-/// Helper: create a temporary directory for update_dir and return its path.
-fs::path make_temp_update_dir() {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_update_registry";
-    std::error_code ec;
-    fs::create_directories(tmp, ec);
-    return tmp;
-}
-
-/// Helper: remove the temporary directory.
-void cleanup_temp_dir(const fs::path& dir) {
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-}
+/// RAII per-test update_dir. Process-salted: a fixed dir name is a cross-JOB
+/// shared resource on the shared-identity CI pools — one job's cleanup
+/// remove_all would yank the dir out from under another job's live
+/// UpdateRegistry (#1883). RAII (vs the old trailing cleanup call) also
+/// removes the dir when a REQUIRE fails — with salted never-reused names a
+/// leaked dir is pure litter, not self-overwriting. Creation is asserted so
+/// a full temp volume can't silently hollow out the tests (gov safe-1/-2).
+struct TempUpdateDir {
+    yuzu::test::TempDir guard{"yuzu_test_update_registry-"};
+    TempUpdateDir() {
+        std::error_code ec;
+        fs::create_directories(guard.path, ec);
+        REQUIRE(fs::exists(guard.path));
+    }
+    const fs::path& path() const { return guard.path; }
+};
 
 /// Helper: build an UpdatePackage with sensible defaults.
 UpdatePackage make_pkg(const std::string& platform = "windows", const std::string& arch = "x86_64",
@@ -53,17 +58,18 @@ UpdatePackage make_pkg(const std::string& platform = "windows", const std::strin
 // ── Database Lifecycle ──────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: open in-memory", "[update_registry][db]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
     REQUIRE(reg.is_open());
-    cleanup_temp_dir(dir);
 }
 
 // ── Upsert & List ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: upsert_package + list_packages returns it",
           "[update_registry][upsert]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     auto pkg = make_pkg();
@@ -76,14 +82,14 @@ TEST_CASE("UpdateRegistry: upsert_package + list_packages returns it",
     REQUIRE(packages[0].version == "0.1.0");
     REQUIRE(packages[0].filename == "yuzu-agent-0.1.0-x64-windows.exe");
 
-    cleanup_temp_dir(dir);
 }
 
 // ── latest_for ──────────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: latest_for returns package for matching platform/arch",
           "[update_registry][latest]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "yuzu-agent-0.1.0-linux"));
@@ -93,12 +99,12 @@ TEST_CASE("UpdateRegistry: latest_for returns package for matching platform/arch
     REQUIRE(result->version == "0.1.0");
     REQUIRE(result->platform == "linux");
 
-    cleanup_temp_dir(dir);
 }
 
 TEST_CASE("UpdateRegistry: latest_for returns nullopt for unknown platform",
           "[update_registry][latest]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
@@ -106,12 +112,12 @@ TEST_CASE("UpdateRegistry: latest_for returns nullopt for unknown platform",
     auto result = reg.latest_for("freebsd", "x86_64");
     REQUIRE_FALSE(result.has_value());
 
-    cleanup_temp_dir(dir);
 }
 
 TEST_CASE("UpdateRegistry: latest_for returns newest version when multiple exist",
           "[update_registry][latest]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-0.1.0.exe"));
@@ -121,12 +127,12 @@ TEST_CASE("UpdateRegistry: latest_for returns newest version when multiple exist
     REQUIRE(result.has_value());
     REQUIRE(result->version == "0.2.0");
 
-    cleanup_temp_dir(dir);
 }
 
 TEST_CASE("UpdateRegistry: latest_for handles numeric version comparison (0.10.0 > 0.9.0)",
           "[update_registry][latest]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("linux", "aarch64", "0.9.0", "agent-0.9.0"));
@@ -136,14 +142,14 @@ TEST_CASE("UpdateRegistry: latest_for handles numeric version comparison (0.10.0
     REQUIRE(result.has_value());
     REQUIRE(result->version == "0.10.0");
 
-    cleanup_temp_dir(dir);
 }
 
 // ── Remove ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: remove_package makes latest_for return nullopt",
           "[update_registry][remove]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
@@ -152,12 +158,12 @@ TEST_CASE("UpdateRegistry: remove_package makes latest_for return nullopt",
     auto result = reg.latest_for("windows", "x86_64");
     REQUIRE_FALSE(result.has_value());
 
-    cleanup_temp_dir(dir);
 }
 
 TEST_CASE("UpdateRegistry: remove_package for nonexistent does not crash",
           "[update_registry][remove]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     // Should not throw or crash
@@ -166,7 +172,6 @@ TEST_CASE("UpdateRegistry: remove_package for nonexistent does not crash",
     auto packages = reg.list_packages();
     REQUIRE(packages.empty());
 
-    cleanup_temp_dir(dir);
 }
 
 // ── Rollout Eligibility ─────────────────────────────────────────────────────
@@ -212,21 +217,22 @@ TEST_CASE("UpdateRegistry: is_eligible distributes roughly 50% at rollout_pct=50
 // ── binary_path ─────────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_registry][path]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     auto pkg = make_pkg("windows", "x86_64", "0.1.0", "yuzu-agent.exe");
     auto path = reg.binary_path(pkg);
     REQUIRE(path == dir / "yuzu-agent.exe");
 
-    cleanup_temp_dir(dir);
 }
 
 // ── list_packages ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
           "[update_registry][list]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-win-0.1.0.exe"));
@@ -236,14 +242,14 @@ TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
     auto packages = reg.list_packages();
     REQUIRE(packages.size() == 3);
 
-    cleanup_temp_dir(dir);
 }
 
 // ── Upsert Replace ─────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: upsert same platform/arch/version replaces existing",
           "[update_registry][upsert]") {
-    auto dir = make_temp_update_dir();
+    TempUpdateDir tmp;
+    const auto& dir = tmp.path();
     UpdateRegistry reg(":memory:", dir);
 
     auto pkg = make_pkg("windows", "x86_64", "0.1.0", "agent-v1.exe");
@@ -262,5 +268,4 @@ TEST_CASE("UpdateRegistry: upsert same platform/arch/version replaces existing",
     REQUIRE(packages[0].filename == "agent-v1-rebuilt.exe");
     REQUIRE(packages[0].file_size == 2048);
 
-    cleanup_temp_dir(dir);
 }
