@@ -5,6 +5,7 @@
 #   ./scripts/run-tests.sh                    # Run all test tiers
 #   ./scripts/run-tests.sh checks             # Static checks only (hookify rules)
 #   ./scripts/run-tests.sh unit               # C++ unit tests only
+#   ./scripts/run-tests.sh agent-shutdown     # Agent graceful-shutdown smoke (SIGTERM)
 #   ./scripts/run-tests.sh erlang-unit        # Erlang EUnit tests only
 #   ./scripts/run-tests.sh erlang-ct          # Erlang Common Test suites only
 #   ./scripts/run-tests.sh erlang-perf        # Erlang performance tests only
@@ -81,6 +82,31 @@ run_cpp_unit() {
         pass "Server unit tests"
     else
         fail "Server unit tests"
+    fi
+}
+
+# ── Agent graceful shutdown (process-level; the Catch2 suite never drives main()) ──
+run_agent_shutdown() {
+    banner "AGENT GRACEFUL SHUTDOWN (SIGTERM)"
+
+    # POSIX only: the script drives real signals. Windows keeps the direct-call handler and has
+    # no equivalent coverage — tracked separately.
+    if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
+        skip "Agent shutdown smoke (POSIX only)"
+        return
+    fi
+
+    local agent="$BUILDDIR/agents/core/yuzu-agent"
+    if [[ ! -x "$agent" ]]; then
+        skip "Agent shutdown smoke (agent binary not built)"
+        return
+    fi
+
+    if YUZU_AGENT_BIN="$agent" YUZU_PLUGIN_DIR="$BUILDDIR/agents/plugins" \
+        bash "$(dirname "$0")/test/agent-shutdown-smoke.sh"; then
+        pass "Agent graceful shutdown"
+    else
+        fail "Agent graceful shutdown"
     fi
 }
 
@@ -203,6 +229,7 @@ run_integration() {
 case "$TIER" in
     checks)        run_checks ;;
     unit)          run_cpp_unit ;;
+    agent-shutdown) run_agent_shutdown ;;
     erlang-unit)   run_erlang_unit ;;
     erlang-ct)     run_erlang_ct ;;
     erlang-perf)   run_erlang_perf ;;
@@ -210,6 +237,7 @@ case "$TIER" in
     all)
         run_checks
         run_cpp_unit
+        run_agent_shutdown
         run_erlang_unit
         run_erlang_ct
         run_integration
