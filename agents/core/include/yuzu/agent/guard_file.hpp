@@ -1,14 +1,16 @@
 #pragma once
 
 /**
- * guard_file.hpp — Windows file-change Spark for Yuzu Guardian (Change B).
+ * guard_file.hpp — file-change Spark for Yuzu Guardian (Change B).
  *
- * Watches a target file in REAL TIME via ReadDirectoryChangesW on its parent
- * directory (kernel-notified, NO polling — unlike the Trigger Engine's mtime
- * poll). Resilient like RegistryGuard (C1/C2): the watch is live from arm until
- * the rule is disabled, survives the parent directory being deleted and
- * recreated (a nearest-existing-ancestor watch catches the recreation), and
- * reconciles the target's state from scratch on every wake.
+ * Watches a target file in REAL TIME (kernel-notified, NO polling — unlike the
+ * Trigger Engine's mtime poll): ReadDirectoryChangesW on the parent directory
+ * on Windows, an FSEvents stream (guard_fsevents.hpp) on macOS. Resilient like
+ * RegistryGuard (C1/C2) on both: the watch is live from arm until the rule is
+ * disabled, survives the parent directory being deleted and recreated (Windows
+ * re-arms via a nearest-existing-ancestor watch; FSEvents subscriptions are
+ * path-string based and keep delivering across the recreation), and reconciles
+ * the target's state from scratch on every wake.
  *
  * B1 implements the `file-exists` assertion: drift when the file's presence
  * (exists / absent) differs from the rule's expected state — i.e. realtime
@@ -18,10 +20,10 @@
  * Detection-only: a FileGuard never writes. File-content remediation (restore a
  * known-good copy) needs the Content Distribution subsystem and is deferred.
  *
- * Deliberately proto-free and windows.h-free (stop_event_ is a void* HANDLE).
- * On non-Windows the guard is a no-op (start() returns false) so the engine and
- * tests build everywhere; the watch is Windows-only for the MVP (Linux inotify /
- * macOS FSEvents are later platform work).
+ * Deliberately proto-free and OS-header-free (stop_event_ is an opaque void*:
+ * a Windows event HANDLE / the macOS wake state). On Linux the guard is a
+ * no-op (start() returns false) so the engine and tests build everywhere —
+ * inotify is later platform work.
  */
 
 #include <yuzu/plugin.h>          // YUZU_EXPORT
@@ -74,7 +76,7 @@ public:
 
     /// Canonicalise the path, arm the watch, run an initial compare, and start the
     /// watch thread. Returns false if the guard could not be started (empty path,
-    /// or non-Windows build).
+    /// or an unsupported-platform build — today that means Linux).
     bool start() override;
     void stop() override;
 
@@ -87,7 +89,7 @@ private:
     GuardSink sink_;
     std::atomic<bool> stop_{false};
     std::thread thread_;
-    void* stop_event_{nullptr}; ///< HANDLE (void* keeps windows.h out of this header)
+    void* stop_event_{nullptr}; ///< Windows event HANDLE / macOS wake state (void* keeps OS headers out)
 };
 
 } // namespace yuzu::agent

@@ -26,6 +26,15 @@ agent_crypto_deps = [agent_openssl_dep]
 # images where libsystemd is absent.
 agent_platform_deps = []
 agent_platform_args = []
+if host_machine.system() == 'darwin'
+  # macOS FileGuard: the FSEvents watch core (guard_fsevents.cpp) needs
+  # CoreServices (FSEventStream*) + CoreFoundation (CFString/CFArray). Both
+  # frameworks ship in the Command Line Tools SDK — unlike EndpointSecurity —
+  # so required: true is safe on every mac host (docs/darwin-compat.md).
+  agent_platform_deps += dependency('appleframeworks',
+                                    modules: ['CoreFoundation', 'CoreServices'],
+                                    required: true)
+endif
 if host_machine.system() == 'linux'
   libsystemd_dep = dependency('libsystemd', required: get_option('systemd_guard'),
                               include_type: 'system')
@@ -40,7 +49,7 @@ endif
 
 yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
-  files('src/agent.cpp', 'src/agent_csr.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/dex_event.cpp', 'src/dex_linux_collector.cpp', 'src/dex_linux_journal.cpp', 'src/dex_linux_kmsg.cpp', 'src/dex_linux_proc.cpp', 'src/dex_linux_storage.cpp', 'src/dex_linux_sysfs.cpp', 'src/dex_macos_collector.cpp', 'src/dex_macos_iokit.cpp', 'src/dex_macos_oslog.cpp', 'src/dex_macos_signals.cpp', 'src/dex_observer.cpp', 'src/dex_perf_breach.cpp', 'src/dex_rate_limiter.cpp', 'src/dex_signal_catalog.cpp', 'src/dex_win_poll.cpp', 'src/guard_file.cpp', 'src/guard_registry.cpp', 'src/guard_service.cpp', 'src/guard_systemd.cpp', 'src/guardian_engine.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/local_dispatcher.cpp', 'src/network_interfaces.cpp', 'src/net_quality_sampler.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/resilience_strategy.cpp', 'src/sdk_utilities.cpp', 'src/spark_disk.cpp', 'src/spark_engine.cpp', 'src/spark_file.cpp', 'src/spark_interval.cpp', 'src/spark_registry.cpp', 'src/spark_service.cpp', 'src/spark_spec.cpp', 'src/spark_startup.cpp', 'src/sync_canonical.cpp', 'src/sync_scheduler.cpp', 'src/sync_source_app_perf.cpp', 'src/sync_source_device_ci.cpp', 'src/sync_source_installed_software.cpp', 'src/sync_source_software_licensing.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
+  files('src/agent.cpp', 'src/agent_csr.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/dex_event.cpp', 'src/dex_linux_collector.cpp', 'src/dex_linux_journal.cpp', 'src/dex_linux_kmsg.cpp', 'src/dex_linux_proc.cpp', 'src/dex_linux_storage.cpp', 'src/dex_linux_sysfs.cpp', 'src/dex_macos_collector.cpp', 'src/dex_macos_iokit.cpp', 'src/dex_macos_oslog.cpp', 'src/dex_macos_signals.cpp', 'src/dex_observer.cpp', 'src/dex_perf_breach.cpp', 'src/dex_rate_limiter.cpp', 'src/dex_signal_catalog.cpp', 'src/dex_win_poll.cpp', 'src/guard_file.cpp', 'src/guard_fsevents.cpp', 'src/guard_registry.cpp', 'src/guard_service.cpp', 'src/guard_systemd.cpp', 'src/guardian_engine.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/local_dispatcher.cpp', 'src/network_interfaces.cpp', 'src/net_quality_sampler.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/resilience_strategy.cpp', 'src/sdk_utilities.cpp', 'src/spark_disk.cpp', 'src/spark_engine.cpp', 'src/spark_file.cpp', 'src/spark_interval.cpp', 'src/spark_registry.cpp', 'src/spark_service.cpp', 'src/spark_spec.cpp', 'src/spark_startup.cpp', 'src/sync_canonical.cpp', 'src/sync_scheduler.cpp', 'src/sync_source_app_perf.cpp', 'src/sync_source_device_ci.cpp', 'src/sync_source_installed_software.cpp', 'src/sync_source_software_licensing.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),

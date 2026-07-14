@@ -509,9 +509,12 @@ void GuardianEngine::stop_all_guards_locked() {
 }
 
 bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
-    // Spark dispatch. Each Spark type maps to a guard implementation, all no-op off
-    // Windows for the MVP. Returns true iff a guard was actually armed (so callers
-    // can count accurately).
+    // Spark dispatch. Each Spark type maps to a guard implementation. Per-OS
+    // support today: file-change arms on Windows + macOS (FSEvents); registry is
+    // Windows-only by nature; service arms on Windows (enforce) + Linux
+    // (observe-only) — everything else is a no-op whose start() returns false.
+    // Returns true iff a guard was actually armed (so callers can count
+    // accurately).
 
     // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
     if (rule.spark().type() == "file-change") {
@@ -590,7 +593,8 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                          log_path, log_mode);
             return true;
         }
-        spdlog::warn("Guardian: file guard for rule '{}' did not start (non-Windows or empty path)",
+        spdlog::warn("Guardian: file guard for rule '{}' did not start (unsupported platform or "
+                     "empty path)",
                      rule.rule_id());
         return false;
     }

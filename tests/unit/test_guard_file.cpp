@@ -1,10 +1,16 @@
 /**
  * test_guard_file.cpp — FileGuard file-exists watch (Change B / B1).
  *
- * Exercises the real ReadDirectoryChangesW watch against a real scratch
- * directory + file: arm the guard, mutate the filesystem, assert the drift
- * report. Windows-only (the guard is a no-op elsewhere — covered by the
- * non-Windows case). Detection-only: no write-back is asserted.
+ * Exercises the real kernel-notified watch (ReadDirectoryChangesW on Windows,
+ * FSEvents on macOS) against a real scratch directory + file: arm the guard,
+ * mutate the filesystem, assert the drift report. The cases are pure
+ * std::filesystem + sink assertions, so Windows and macOS share them verbatim
+ * — one behaviour, two watch plumbings. Linux (where the guard is a no-op) is
+ * covered by the no-op case. Detection-only: no write-back is asserted.
+ *
+ * macOS note: unique_temp_path yields /var/folders/... which the guard
+ * canonicalises to /private/var/... (darwin-compat pitfall) — every case here
+ * exercises that resolution implicitly.
  */
 
 #include <yuzu/agent/guard_file.hpp>
@@ -26,13 +32,14 @@
 
 using namespace yuzu::agent;
 
-// Ownership contract (cpp-safety): FileGuard owns a HANDLE + a std::thread; copy or
-// move would double-close / double-join. Must be non-copyable AND non-movable.
+// Ownership contract (cpp-safety): FileGuard owns an OS wake handle (Windows
+// event HANDLE / macOS wake state) + a std::thread; copy or move would
+// double-close / double-join. Must be non-copyable AND non-movable.
 static_assert(!std::is_copy_constructible_v<FileGuard>);
 static_assert(!std::is_copy_assignable_v<FileGuard>);
 static_assert(!std::is_move_constructible_v<FileGuard>);
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 
 namespace fs = std::filesystem;
 
@@ -375,8 +382,10 @@ TEST_CASE("FileGuard: stop() with a watch armed but no change in-flight returns"
 
 TEST_CASE("FileGuard: stop() races an in-flight change notification without crashing",
           "[guardian][guard][file][teardown]") {
-    // Tight start/change/stop loop exercises CancelIo + CloseHandle + join while a
-    // ReadDirectoryChangesW read is outstanding (the teardown UAF window).
+    // Tight start/change/stop loop exercises teardown while a change notification
+    // is in flight (the teardown UAF window): Windows — CancelIo + CloseHandle +
+    // join with a ReadDirectoryChangesW read outstanding; macOS — FSEvents stream
+    // invalidate + delivery-queue drain racing a callback.
     for (int i = 0; i < 25; ++i) {
         const auto dir = yuzu::test::unique_temp_path("fileguard-stoprace");
         fs::create_directories(dir);
@@ -420,7 +429,9 @@ TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
     REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
 
     // 2) recreate the parent + file (compliant again), then delete once more — the
-    //    guard must have re-armed via the nearest-ancestor watch and detect again.
+    //    guard must still be live and detect again (Windows: re-armed via the
+    //    nearest-ancestor watch; macOS: the path-based FSEvents stream survives
+    //    the recreation outright).
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     fs::create_directories(parent);
     write_file(target);
@@ -462,14 +473,14 @@ TEST_CASE("FileGuard file-hash-equals: continuous sub-settle writes still get ha
     fs::remove_all(dir);
 }
 
-#else // !_WIN32
+#else // Linux — the guard is a no-op stub
 
-TEST_CASE("FileGuard: no-op off Windows", "[guardian][guard][file]") {
+TEST_CASE("FileGuard: no-op on unsupported platforms", "[guardian][guard][file]") {
     FileGuard::Config cfg;
     cfg.rule_id = "fg-noop";
     cfg.path = "/tmp/whatever";
     FileGuard g(cfg, [](const GuardDrift&) {});
-    CHECK_FALSE(g.start()); // file-change Spark is Windows-only for the MVP
+    CHECK_FALSE(g.start()); // file-change Spark is Windows/macOS-only today (Linux inotify later)
 }
 
-#endif // _WIN32
+#endif // _WIN32 || __APPLE__
