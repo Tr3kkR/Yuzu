@@ -1,7 +1,15 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-13
 owner: "@dgr (Dave Rae)"
+deciders: >-
+  Ratified 2026-07-14 by @dgr and the engineering colleagues, as ballot row A3 (amended) of the
+  access-control ballot: the northbound connection holder is an asynchronous C++ presentation binary
+  (Drogon), not a BEAM re-home; the Erlang gateway stays southbound. Independent review of record:
+  the two-reviewer adversarial review (finding S11 — provenance labels and the measured-RSS caveat)
+  and a subsequent overclaim sweep. **Acceptance is conditional on G10** — the Drogon build canary
+  across the full Meson/vcpkg matrix, Windows MSVC static linking included (the #375 history). G10
+  gates the linkage; the framework port is separately estimated.
 depends-on: >-
   1005-headless-platform-use-case-engines (the machine-consumer surface this streaming
   transport serves; Decision 15 of `docs/adr-1005-execution-plan.md` is the MCP Streamable
