@@ -67,10 +67,20 @@ PLUGINS=${YUZU_PLUGIN_DIR:-build-linux/agents/plugins}
 # silently RECONFIGURES THE SYSTEM UNDER TEST. Keep the test's knob in its own namespace.
 HANG_TIMEOUT=${YUZU_SMOKE_TIMEOUT:-30}
 
-# The second-signal escalation leaves without unwinding via _exit(1) / TerminateProcess(...,1),
-# so its code is 1. (A startup failure is also 1 -- but every case below reaches the RUN LOOP
-# first, which a startup failure by definition never does, so within this script a 1 can only be
-# the escalation.)
+# The second-signal escalation leaves without unwinding via _exit(1) / TerminateProcess(...,1), so
+# its code is 1.
+#
+# BUT 1 IS NOW OVERLOADED THREE WAYS, AND THE OLD SCOPING ARGUMENT HERE WAS FALSE. It used to say
+# "every case reaches the run loop, and a startup failure never does, so a 1 can only be the
+# escalation". Both halves broke: a reconnect-path thread-pool exhaustion now sets startup_failed
+# from INSIDE the run loop, and -- worse for this suite -- a watcher that fails to CONSTRUCT (fd
+# pressure, i.e. exactly a loaded 4-runner shared box) installs a degrade handler that exits 1 on
+# the FIRST signal. In that state a COMPLETELY BROKEN escalation would still exit 1 and case 2
+# would go green for the wrong reason: a green light wired to the bug, which is rule 2 of this
+# file's own header, violated by a later commit.
+#
+# So every case now ALSO asserts the watcher was live (assert_watcher_live below). If it was not,
+# the run is void -- not passed. (governance: consistency-auditor.)
 readonly RC_SECOND_SIGNAL=1   # operator sent a second SIGINT/SIGTERM during teardown
 
 # A FIXED PORT IS A CROSS-JOB SHARED RESOURCE ON A SHARED RUNNER, and 59999 -- the value this
@@ -252,6 +262,16 @@ run_case() {
 
     wait "$pid"; local got=$?
     local took=$((SECONDS - start))
+
+    # THE WATCHER MUST HAVE BEEN LIVE, or the exit code proves nothing. A degraded watcher makes the
+    # agent exit 1 on the FIRST signal, which would make a broken escalation look like a pass.
+    if grep -qi "shutdown watcher unavailable" "$log" 2>/dev/null; then
+        echo "VOID [$name]: the shutdown watcher failed to construct — the agent was in its degraded" >&2
+        echo "  (exit-on-first-signal) posture, so this case's exit code proves NOTHING. Not a pass." >&2
+        tail -5 "$log" >&2
+        rm -rf "$work"
+        return 1
+    fi
     rm -rf "$work"
     _kill_if_ours "$_blackhole_pid"; _blackhole_pid=""
 
@@ -286,7 +306,16 @@ run_case "single SIGTERM in the run loop" 1 0 15 dead || rc=1
 # the assertion could not fail. Exactly one code, and a latency bound.
 run_case "double SIGTERM escalates" 2 $RC_SECOND_SIGNAL 5 dead || rc=1
 
-# THE REGRESSION TEST FOR THE 18-SECOND WEDGE. Against a server that accepts TCP and never
+# THE REGRESSION TEST FOR THE 18-SECOND WEDGE -- AND *ONLY* THAT.
+#
+# IT DOES NOT COVER THE PUBLISH-THEN-RE-CHECK ORDERING FIX, and an earlier version of this comment
+# implied it did. A reviewer mutation-proved otherwise: delete the `stop_requested_` re-check after
+# the CtxSlot publish in agent.cpp and ALL THREE CASES STILL PASS. Of course they do -- this script
+# signals ~1s after boot, and that race window is a few INSTRUCTIONS wide. What this case really
+# covers is the Register deadline + cancellable context in steady state, which is the 18.0s -> 8-9s
+# fix. The ordering fix needs a synchronisation hook (a stub RPC that blocks exactly at publish
+# time) and has NO coverage today. Say so rather than let a green case imply otherwise.
+# (governance: quality-engineer.) Against a server that accepts TCP and never
 # answers, the agent parks in Register. Before the cancellable CtxSlot + Register deadline, SIGTERM
 # could not reach that RPC at all and shutdown took 18.0s. Measured here now: 8-9s (n=4).
 # Bound 15s -- above the measured 9s with room for a slower CI box, and below the 18.0s regression

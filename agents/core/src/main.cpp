@@ -720,6 +720,20 @@ int main(int argc, char* argv[]) {
 
     g_agent.store(agent.get(), std::memory_order_release);
 
+    // UNPUBLISH ON EVERY PATH, INCLUDING AN UNWIND — and BEFORE the watcher is destroyed.
+    //
+    // ~ShutdownWatcher's detach path is justified in its own header by "g_agent is already null by
+    // then". That was FALSE on the exception path: the explicit g_agent.store(nullptr) below sits
+    // AFTER agent->run(), so a throw out of run() skips it, and a detached watcher's callback could
+    // then load a LIVE g_agent and call stop() on an Agent that is being destroyed.
+    // This guard is declared AFTER `agent` and BEFORE the watcher, so reverse-order destruction
+    // runs it BEFORE ~ShutdownWatcher on every path — which makes the header's stated reason
+    // actually true, structurally, instead of by argument. (governance: cpp-safety S1.)
+    struct AgentUnpublisher {
+        ~AgentUnpublisher() { g_agent.store(nullptr, std::memory_order_release); }
+    } agent_unpublisher;
+
+
 #ifndef _WIN32
     // ONLY install the handlers if the watcher is live. If it is not (pipe or thread
     // creation failed), on_signal would catch the signal, find no pipe, and RETURN —

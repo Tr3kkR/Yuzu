@@ -2273,12 +2273,23 @@ public:
                                          "reconnect ({}) — the host is out of threads. Stopping "
                                          "cleanly rather than aborting.",
                                          e.what());
-                        // AND MARK IT A FAILURE. Without this the agent returns EXIT_SUCCESS and
-                        // simply vanishes from the fleet: the Windows SCM reads a clean stop and
-                        // runs no recovery action, and any `Restart=on-failure` unit never
-                        // restarts it. Dev at least aborted (134), which DID trigger recovery — so
-                        // stopping "cleanly" here was a regression dressed as a fix.
-                        // (governance: unhappy-path B, this PR.)
+                        // AND MARK IT A FAILURE, so the exit code says "I could not continue"
+                        // rather than "I was asked to stop".
+                        //
+                        // BE PRECISE ABOUT WHAT THIS BUYS, because the first version of this
+                        // comment overstated it and was itself a false claim: the Windows SCM does
+                        // NOT read this as a clean stop today — service_win.cpp already reports
+                        // specific-error 2 for a run() that returns unsolicited, and the failure
+                        // actions flag is set, so recovery ALREADY fires there. Likewise
+                        // `Restart=always` (the shipped systemd unit) and compose's
+                        // `restart: unless-stopped` both restart on exit 0 anyway.
+                        // What this actually fixes: a `Restart=on-failure` unit (or a k8s
+                        // OnFailure policy), which is the posture a customer with their own unit
+                        // file is most likely to use, and which would NEVER have restarted the
+                        // agent; and it makes the failure DISTINGUISHABLE from an operator stop in
+                        // any log or monitor that reads the exit code.
+                        // (governance: unhappy-path B / B-6 — the second of which caught the first
+                        // version of this very comment asserting something the tree contradicts.)
                         startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
                         break;
@@ -2286,12 +2297,23 @@ public:
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect (non-std exception) — stopping cleanly rather "
                                          "than aborting.");
-                        // AND MARK IT A FAILURE. Without this the agent returns EXIT_SUCCESS and
-                        // simply vanishes from the fleet: the Windows SCM reads a clean stop and
-                        // runs no recovery action, and any `Restart=on-failure` unit never
-                        // restarts it. Dev at least aborted (134), which DID trigger recovery — so
-                        // stopping "cleanly" here was a regression dressed as a fix.
-                        // (governance: unhappy-path B, this PR.)
+                        // AND MARK IT A FAILURE, so the exit code says "I could not continue"
+                        // rather than "I was asked to stop".
+                        //
+                        // BE PRECISE ABOUT WHAT THIS BUYS, because the first version of this
+                        // comment overstated it and was itself a false claim: the Windows SCM does
+                        // NOT read this as a clean stop today — service_win.cpp already reports
+                        // specific-error 2 for a run() that returns unsolicited, and the failure
+                        // actions flag is set, so recovery ALREADY fires there. Likewise
+                        // `Restart=always` (the shipped systemd unit) and compose's
+                        // `restart: unless-stopped` both restart on exit 0 anyway.
+                        // What this actually fixes: a `Restart=on-failure` unit (or a k8s
+                        // OnFailure policy), which is the posture a customer with their own unit
+                        // file is most likely to use, and which would NEVER have restarted the
+                        // agent; and it makes the failure DISTINGUISHABLE from an operator stop in
+                        // any log or monitor that reads the exit code.
+                        // (governance: unhappy-path B / B-6 — the second of which caught the first
+                        // version of this very comment asserting something the tree contradicts.)
                         startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
                         break;
@@ -2636,7 +2658,10 @@ private:
     // TLS posture refused to connect, or an unreadable cert/key) — not a normal
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
     // before the connect loop, read after run() returns; no atomic needed.
-    bool startup_failed_{false};
+    /// Set on the run() thread, read by main()/service_win after run() returns. ATOMIC because it
+    /// sits behind a PUBLIC VIRTUAL accessor: no race today, but the next cross-thread reader (a
+    /// health probe, a log line in stop()) would silently create one. (governance: cpp-safety.)
+    std::atomic<bool> startup_failed_{false};
     /// Serialises the three ClientContext pointers below against every cross-thread cancel.
     ///
     /// ALL THREE point at STACK objects — `&sub_ctx` in the reconnect-loop frame, `&ctx` in
