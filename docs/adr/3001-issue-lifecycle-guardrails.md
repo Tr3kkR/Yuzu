@@ -94,6 +94,8 @@ operational cadence:
    **Failure is loud:** an `if: failure()` alert job opens or updates an `automation-broken`
    issue (the `nightly-broken` pattern from `nightly.yml`) — this, not the weekly sweep's
    leak count, is the primary liveness signal; leak-count>0 is the correctness backstop.
+   Alert and cap-skip issue bodies are public: they carry the workflow name, run URL, and a
+   non-sensitive summary only — never raw logs, step outputs, or error stacks.
 3. **A PR "issue radar"** (`linked-issues.yml`, advisory-only): one sticky comment per PR that
    (a) flags `#N` mentions lacking a closing keyword and (b) matches the PR's changed file paths
    against open-issue bodies — `file:line` citations are common in the agent-drafted bodies and
