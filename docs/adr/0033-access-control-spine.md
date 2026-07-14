@@ -24,6 +24,16 @@ related: >-
 
 # ADR-0033 — The access-control spine
 
+## Binding status
+
+Nothing here binds reviews or blocks PRs until this ADR's status is **accepted**. On acceptance the
+Decisions bind **prospectively** — including §4's prohibition on new approval gates outside the core
+primitive, which is a rule about the *next* gate, not a demand that the four existing ones be
+rewritten (they migrate opportunistically, §4).
+
+Tag families used throughout (ballot **A**/**D** rows, **P** pins, **G** open questions, **S**
+adversarial-review findings) are indexed in **ADR-0031**.
+
 ## Context
 
 RBAC, attribution, approvals and audit are usually treated as four features. They are not. They are
@@ -75,6 +85,11 @@ action if any filter does not allow it**:
 | **Credential** — explicit attenuated grants (§3) | Was this token deliberately minted for this power? |
 | **Module** — declared maximum envelope (§2) | Was this capability reviewed for this Module version? |
 | **Execution authorisation** — exact plan or bounded envelope (§4–§8) | When risk requires it, did a qualified supervisor approve? |
+
+The **Module envelope** is not the manifest. It is **core's ratified copy** of the module's
+declarations, taken at manifest approval and version-locked at admission — the same object ADR-0032
+Decision 13 names "core's ratified mapping". One object, and it is core's, or the filter is
+self-certified by the thing it filters.
 
 The same law, stated from the identity axis (it is one law, not two):
 
@@ -155,11 +170,14 @@ A capability declaration may carry `requires_approval`. When it does, invocation
 durable pending-approval object in core rather than executing:
 
 - Approving requires the **`Approve` operation on that securable**, an **MFA step-up**, and
-  **requester ≠ approver**.
+  **requester ≠ approver** — meaning distinct **human roots** (§7), never merely distinct
+  principals.
 - Execution audits **both** principals — requester and approver.
 - Over MCP the call returns a **pending** state and resolution rides the **existing** SSE/progress
   spine the executions ladder already uses (`docs/executions-history-ladder.md`). No parallel
-  notification path is created for approvals.
+  notification path is created for approvals. **Once presentation is a separate binary, that spine
+  needs a cross-process transport it does not have today (G1) — a prerequisite, per ADR-0032
+  Decision 9, not an assumption.**
 - **Pending-approval hygiene:** approvals expire (7 days), and an approved-but-stale request
   **re-resolves its scope at execution** (§8) — approving yesterday does not authorize against
   today's larger cohort.

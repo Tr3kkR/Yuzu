@@ -2,10 +2,12 @@
 status: proposed
 date: 2026-07-14
 owner: "@dgr (Dave Rae)"
+deciders: pending — acceptance requires the access-control ballot (A1–A5, D1–D12) and at least one recorded independent review (SOC 2 Workstream F change-management evidence)
 scope: >-
   platform — the protocol by which a Use-Case run is admitted, authorised mid-flight, evidenced,
-  finalised and reaped. Pins ballot A5's protocol semantics (P1–P10) and closes the adversarial
-  review's S2/S3/S4/S6/S7/S8 findings.
+  finalised and reaped. Pins ballot A5's protocol semantics (pins P1–P10; pin P11 is owned by
+  ADR-0033 §7) and closes the adversarial review's S2/S3/S4/S6/S7/S8 findings. Tag families
+  (ballot A/D · pins P · open questions G · review findings S) are indexed in ADR-0031.
 depends-on: >-
   0031-presentation-core-engine-decomposition (the topology this protocol runs on: core admits and
   mints the grant; presentation calls the engine directly; the engine reaches facts and effects only
@@ -60,8 +62,9 @@ Both are fixed by writing the protocol down normatively. That is this ADR.
 attenuation (D2/G8), the approval primitive (D4/D5), four-eyes and the run-scoped requester root
 (D9/P11), execution under the requester's authority (D10), Execution Plans, the coverage envelope
 and compensating recovery (D11) — all **ADR-0033**. The binary decomposition, the credential-pipe
-invariant (D3), the presentation TCB statement and the failure-posture table — **ADR-0031**. This
-ADR cross-references those by number and never restates them.
+invariant (ballot D3, named there as **INV-31-1**), the presentation TCB statement and the
+failure-posture table — **ADR-0031**. This ADR cross-references those by number and never restates
+them.
 
 ## Terminology
 
@@ -92,8 +95,9 @@ One admission, one input hash, one scope ceiling, one finalisation. Multi-step w
 Iterative agentic triage is therefore **many small runs**, which makes the cost of admitting a run
 a first-class design constraint: the admit path is a **single round trip and one audit row**.
 
-A **fast lane**, declared per use case in the manifest (and projected into the A5 annotations that
-describe the capability), applies to low-risk read-only use cases: no approval routing, no plan, no
+A **fast lane**, declared per use case in the manifest (and projected into the agentic-context
+capability annotations of track 2g — *not* to be confused with ballot row A5, this ADR's topology),
+applies to low-risk read-only use cases: no approval routing, no plan, no
 mutation path. It is a cheaper admission, not a skipped one — it still authenticates, still
 authorises, still writes `use_case.run.admitted`, still mints a grant.
 
@@ -253,6 +257,11 @@ Where that rule is enforced, normatively:
    set. Without this, a second disclosure — to a different principal, at a different time — would
    leave no evidence anywhere core can read. (Adjudicated: the sources pin the check and the grant;
    the run id and the release-log entry are what make the second disclosure provable.)
+6. A **serve-run is short and terminal**: it transits `admitted → finalised` on delivery of the
+   stored result (its finalisation receipt carries the *source* run's canonical result hash — the
+   bytes are the same bytes), or `denied` if the subset check fails. It never enters `executing`,
+   because no engine composition happens. Decision 5's "every admitted run reaches a terminal audit
+   state" therefore holds for serve-runs too.
 
 ### 11. Disclosure accountability is core's release log, not the engine's journal (P7)
 
@@ -298,6 +307,9 @@ They are joined by **immutable identifiers, never by a shared transaction**:
 run_id · plan_id · execution_id · causation_id
 ```
 
+(`run_id` here is the `use_case_run_id` — the two names denote one identifier, and the schema uses
+`use_case_run_id` throughout.)
+
 **The evidence envelope (D12) is a named schema deliverable, not a convention.** Today's
 `AuditEvent` (`audit_store.hpp:16`) carries a single `principal` field alongside `principal_role`
 and the `principal_class` actor-class column (landed on `dev`, c5bbbe23, Phase 3a — with `engine`
@@ -332,16 +344,16 @@ Module packaging and activation, adopted from the counter-proposal:
 | Package element | Contents |
 |---|---|
 | Signed module package | immutable version · publisher identity · manifest hash · compatibility range · entitlement |
-| Module manifest | use cases · capabilities · risk tiers · mutability classes · schemas · retention · licence — **permission expansion is reviewable data** |
-| UCE contribution | domain logic · UCE migrations · derived state · optional worker (absent for a declarative-only module) |
-| Presentation contribution | declarative views · forms · result renderers — the same use case on dashboard, REST and MCP; **no private UI-only capability** |
+| Module manifest | use cases · capabilities · risk tiers · mutability classes · schemas · retention · licence |
+| Engine contribution | domain logic · `uce` migrations · derived state · optional worker (absent for a declarative-only module) |
+| Presentation contribution | declarative views, forms and result renderers only — the rule and its rationale are **ADR-0033 §11** |
 | Core Product Pack | Instructions · Workflows · Policies — a signed content bundle on the existing content plane |
 | External capability declarations | registered outbound connector calls: schemas · destinations · egress policy — **no arbitrary module network access** |
 
 | Activation check | Rule |
 |---|---|
 | signature · compatibility · entitlement | verified before activation |
-| permission diff | a permission expansion is a **visible security change** — it cannot arrive as an incidental module upgrade |
+| permission diff | vetted per **ADR-0033 §2** (namespace-bound, approved-then-diffed) — the gate this ADR's ratified copy is taken *at* |
 | migrations · recovery plan | present and applied, or activation is refused |
 | ambiguity | **fail closed** |
 
@@ -371,13 +383,16 @@ A device deleted in core leaves `agent_id`-tagged personal data in the `uce` dat
 role cannot read. G4's contract — core emits a durable **tombstone**; every engine purges within a
 declared SLA and reports completion — relies, as drafted, on engine honesty. Reports are not proof.
 
-The engine must supply **one** of:
+The engine must supply **signed deletion receipts** — the purged tombstone ids, signed by the
+engine principal's key, submitted to core through the same B4 seam as everything else. Core
+verifies the signature and records the purge. **Core still reads nothing in the `uce` database.**
 
-- **signed deletion receipts** — the purged tombstone ids, signed by the engine principal's key, so
-  core can verify what was purged without reading the `uce` database; **or**
-- a **purpose-limited, core-readable deletion-audit table** — the single object in the `uce`
-  database on which core's role holds a `SELECT` grant, containing tombstone ids and purge
-  timestamps and nothing else.
+That last sentence is the reason for the choice. S7 offered a second option — a purpose-limited,
+core-readable deletion-audit table inside `uce` — and it is **rejected here**: it would require
+core's role to hold a `SELECT` grant on the `uce` database, which **ADR-0031's INV-31-3 forbids
+outright** (no cross-component database access; core holds no grant on `uce`). A purge-proof
+mechanism that dissolves the role boundary buys evidence by spending the isolation the two-database
+split exists to provide. Receipts cost one signature and keep the boundary intact.
 
 Core audits per-engine purge compliance against the declared SLA and **alerts on breach**. Signing
 up to this is part of being an engine (a 2c-style hosting requirement).
@@ -490,7 +505,7 @@ indistinguishable, in an audit, from no admission at all.
   authority-as-of-a-past-moment. Decision 4's server-side lookup is what makes mid-flight revocation
   possible at all, and mid-flight revocation is what makes a long run safe.
 - **Serve a cached result on run id, with presentation checking scope.** Rejected (S3): it puts an
-  authority decision in presentation, which ADR-0031's D3 invariant forbids and which "no authority
+  authority decision in presentation, which ADR-0031's INV-31-1 forbids and which "no authority
   in presentation" tests against directly.
 - **The engine's journal as the disclosure record**, with core reading it for DSAR. Rejected (P7):
   it requires core to hold a grant on the `uce` database — dissolving the role boundary that makes
@@ -500,5 +515,8 @@ indistinguishable, in an audit, from no admission at all.
   backstop). Rejected (S4): a review artifact is not an enforcement artifact. Core's ratified copy
   costs one table and converts a review promise into a runtime property.
 - **Trust the engine's purge report.** Rejected (S7): "we deleted it" is a claim; a signed receipt
-  or a core-readable deletion-audit table is evidence. The difference matters exactly once, in
-  front of a regulator.
+  is evidence. The difference matters exactly once, in front of a regulator.
+- **A core-readable deletion-audit table inside `uce`** (S7's second option). Rejected: it requires
+  core to hold a grant on the `uce` database — the same reason the engine's journal is rejected as
+  the disclosure record below. Signed receipts give the same proof without spending the role
+  boundary.

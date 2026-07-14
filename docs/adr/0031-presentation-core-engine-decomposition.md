@@ -2,6 +2,8 @@
 status: proposed
 date: 2026-07-13
 owner: "@dgr (Dave Rae)"
+deciders: pending — acceptance requires the access-control ballot (A1–A5, D1–D12) and at least one recorded independent review (SOC 2 Workstream F change-management evidence)
+scope: platform — process decomposition, the seams between the three binaries, and the invariants they exist to make structural
 supersedes: >-
   docs/uce-deployment-topology-design.md D2 (UCE deployable = backend + GUI, one artifact, on its
   own VM) and D3 (two browser origins) — both merged via PR #2079. D1 (one PostgreSQL instance,
@@ -25,11 +27,40 @@ related: >-
 
 # ADR-0031 — Presentation, core and engines are separate binaries
 
+## Binding status
+
+Nothing here binds reviews or blocks PRs until this ADR's status is **accepted**. On acceptance the
+Decisions and Invariants bind **prospectively**, and the migration below is the order in which they
+become true. ADR-0032's sequencing interlock binds *immediately* on acceptance — a precondition can
+only be honoured before the code exists.
+
+## Terms and tag families
+
+This ADR set is the output of a ballot, four grill rounds and an adversarial review, and it carries
+their tags as **provenance labels**. The tags are not a dependency: every rule they label is stated
+normatively in one of these ADRs. Because three of the families collide with identifiers already in
+the tree, they are always written with their family:
+
+| Family | Means | Do not confuse with |
+|---|---|---|
+| **ballot A1–A5** | the five architecture ratifications (A5 = the split control/data plane) | **agentic-first A1–A4** (ADR-1005: dashboard parity, discovery, observability, error envelope), and **track 2g's** agentic-context annotations |
+| **ballot D1–D12** | the twelve product/access decisions (D3 = presentation as a credential pipe) | **2c D1–D3** (the merged topology design: one Postgres/two databases; engine's own VM; two origins) |
+| **pins P1–P11** | the admission-protocol semantics pinned in the grill rounds | — |
+| **G1–G10** | open questions (G1 cross-process event transport; G10 the Drogon build canary) | — |
+| **S1–S11** | the 2026-07-14 adversarial-review findings | — |
+
+Vocabulary, fixed for the set: an **engine** is a use-case engine binary (the 2c documents call it
+the **UCE**; the terms denote one thing). A **module** is a use-case module activated inside an
+engine. **Core** and **presentation** are the other two binaries. A **run** is one admitted episode
+of one use case (ADR-0032).
+
 ## Context
 
-**Today the server is one binary that is both the domain and its own front end.** Nine route
-families register on a single `httplib::Server` inside `yuzu-server`: REST v1, MCP, the HTMX
-dashboard, settings, workflow, device, viz. The dashboard renderers can reach stores in-process.
+**Today the server is one binary that is both the domain and its own front end.** Twenty-three route
+families register on a single `httplib::Server` inside `yuzu-server` — REST v1, MCP, the HTMX
+dashboard, settings, workflow, device, viz, DEX, Guardian, inventory, preflight, deployment,
+network, CA, SCIM, webhooks and the rest (`server.cpp`'s `register_routes` call sites). The
+dashboard renderers can reach stores in-process.
 
 That means ADR-1005's central claim — *no UI-only capabilities; a dashboard fragment is not an API
 twin* — is a **rule enforced by review**. The `consistency-auditor` asks the standing question on
@@ -145,7 +176,7 @@ one. The seam inventory is normative:
 | **B1** | Operator → presentation | One origin, one discoverable product surface for people, REST clients and MCP clients. Transport authentication on every request. Presentation never accepts a caller-authored "act as" identity. Carries: `credential · channel · correlation_id · request_deadline · client_protocol_version`. |
 | **B2** | Presentation → engine (Use Case request) | Channel-neutral, versioned, separately published. Presentation passes a **core-verifiable grant**, never a self-authored identity. Result carries facts, coverage, provenance, decisions and any proposed plan reference. Carries: `use_case_id@version · module_id@version · normalised_inputs · grant · request_id · result_schema_version`. |
 | **B3** | Presentation → core (platform request) | The public, versioned core API — used for admission, platform administration, direct expert operations and **all** core reads. Core validates the real credential and remains the source of every security decision. Carries: `principal_credential · securable · operation · scope · correlation_id`. |
-| **B4** | Engine → core (facts, capabilities, effects) | The engine reads fleet facts through typed core capabilities, confined per read. For protected effects it submits an immutable **Execution Plan** (ADR-0033); core verifies plan hash, capability versions, scope, the **admitting operator's** authority, the module envelope and any execution authorisation. Carries: `plan_id · plan_hash · use_case_run_id · module_manifest_hash · capabilities[] · parameters[] · scope · fact_refs[] · expiry · provenance`. |
+| **B4** | Engine → core (facts, capabilities, effects) | On the **public, versioned core API** — INV-31-4 admits no engine-only private surface either. The engine reads fleet facts through typed core capabilities, confined per read. For protected effects it submits an immutable **Execution Plan** (ADR-0033); core verifies plan hash, capability versions, scope, the **admitting operator's** authority, the module envelope and any execution authorisation. Carries: `plan_id · plan_hash · use_case_run_id · module_manifest_hash · capabilities[] · parameters[] · scope · fact_refs[] · expiry · provenance`. |
 | **B5** | Engine → `uce` database | The engine role connects only to `uce`. A `uce_system` schema holds host state; each module gets its own schema and migration ledger. Core has no grant here. Carries: `module_schema · migration_version · journal_id · derived_state_version · retention_class`. |
 | **B6** | Core → `yuzu` database | Identity, authorisation, fleet truth, execution state, audit. The engine has no grant here. Cross-application data is exposed through a **core capability**, never a SQL view shared across roles. Carries: `principal · grants · fleet_fact · execution · pending_command · retry · audit_event`. |
 | **B7** | Core → gateway → agent | Core sends already-authorised commands with stable identities, deadlines and idempotency keys. The gateway routes and applies backpressure without becoming durable. The agent suppresses duplicates and returns correlated results. Carries: `execution_id · command_id · idempotency_key · target_agent · deadline · payload_schema · result_schema`. |
@@ -202,7 +233,7 @@ correlation id (without which session peer-binding and lockout break). Core trus
 | Gateway unavailable | Core retains pending commands and retry deadlines, every command identity unchanged. | Gateway state is disposable. |
 | Endpoint reconnects after an uncertain result | Core may redeliver the same command identity; the agent suppresses the duplicate effect and returns the remembered outcome where it has one. | At-least-once delivery without repeated effect. |
 | Partial distributed query | Return a coverage envelope, then apply the Use Case's completeness policy (ADR-0033 D11). | Missing evidence must never be read as a negative finding. |
-| Audit or release log cannot persist | State-changing work fails closed. Reads follow the declared posture for their data classification and report the evidence failure — for engine reads of device-attributable data, that posture is **fail closed on every surface, MCP included** (ADR-0032). | Prevents an unattributable mutation and an unrecorded disclosure. |
+| Audit or release log cannot persist | State-changing work fails closed. Reads keep **their surface's** posture (ADR-0033 §9) — with one tightening: engine reads of device-attributable data fail closed on **every** surface, MCP included (ADR-0032 Decision 14), and a failed release-log write fails that read closed (ADR-0032 Decision 11). | Prevents an unattributable mutation and an unrecorded disclosure. |
 | External connector unavailable | Return a typed dependency failure and mark the result incomplete. Never substitute invented data. | Assurance depends on honest provenance and completeness. |
 
 ## Consequences
@@ -236,7 +267,7 @@ operator equals what that operator could have read directly (the evaluate-as-ope
 ADR-0017 / #1716). The test moves; the interlock survives. `docs/uce-host-requirements.md` F-5 and
 `docs/adr-1005-execution-plan.md` Decision 14 / M3(d) need amendment notices to say so.
 
-### D3's cross-origin problem disappears
+### 2c D3's cross-origin problem disappears
 
 One origin, one session, one auth. The 2c §6 artifact-acquisition and F-8 hand-off flows stop being
 cross-origin by construction.
@@ -247,8 +278,9 @@ Presentation is a separate binary, so **its runtime is a free choice**. What mak
 connections expensive is cpp-httplib's thread-per-connection model — a property of *that process*,
 not of the domain. ADR-0030's answer is therefore not "put a gateway in front of the server" but
 **"the presentation layer is the connection holder"**, and Decision 5 names Drogon as what it is
-built on. The `StreamBudget` cap shipped in track 2f stays exactly what it was sold as: a stopgap
-that keeps the fused server from exhausting its thread pool until this lands.
+built on. The `StreamBudget` cap landing with track 2f PR 2 (built, not yet merged) stays exactly
+what it was sold as: a stopgap that keeps the fused server from exhausting its thread pool until
+this lands.
 
 ### Costs, honestly
 
