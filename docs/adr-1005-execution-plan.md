@@ -116,6 +116,9 @@ Gated on Phase 2b's design being accepted **and Phase 3a** (actor-class attribut
 
 ### Phase 5 — Delegation (write-back only, off the P6/P7 critical path)
 
+> **PARTIALLY PULLED FORWARD by ADR-0031/0032 (accepted 2026-07-14).** The Use-Case **invocation grant** IS the RFC-8693 server-issued delegation artifact — the same family as 2b's engine principals, not a second token species — so grant minting, audience binding and TTL semantics land with ADR-0032's admission path rather than waiting for this phase. Phase 5 still owns delegated **write-back**. Authority only ever narrows: engine ∩ operator ∩ operator's scope.
+
+
 Gated on Phase 3b (full audit shape) and Phase 4 (principals exist). Server-issued delegation artifact and verification (an engine-*asserted* delegation is rejected permanently, at every point in this program); effective authority computed as permissions ∩ scope through the existing ADR-0017 list-read chokepoint; self-target destruction guards re-keyed on the effective delegated identity; audit producers begin emitting the full Decision 9 fields, with pre-enforcement rows carrying `delegation_verification_status=unverified` per ADR-1005's incremental-shipping rule. This phase unlocks write-back/orchestration (Decision 13) — it is not required for the module's v1 read-only operation, autonomous sync, or the NVD strangler removal.
 
 ### Phase 6 — Module moves to engine auth

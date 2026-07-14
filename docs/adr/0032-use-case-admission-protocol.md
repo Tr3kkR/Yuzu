@@ -120,10 +120,19 @@ happens on the admission path. Without an idempotency key, one operator intent b
 grants, two engine executions, **two release-log entries recording one disclosure twice** (a DSAR
 that over-reports), and for a mutating use case, **two Execution Plans**. So: core dedupes on
 `idempotency_key`, and a repeat admission within the run's lifetime **returns the existing run and
-its grant** rather than minting a second. The natural key is available if the caller supplies none —
-`principal + use_case_id@version + module_id@version + input_hash + resolved scope` — but an
-explicit key is required, because "same inputs" and "same intent" are not the same thing and only
-the caller knows which it meant.
+its grant** rather than minting a second.
+
+**The dedupe namespace is `(authenticated principal, idempotency_key)` — never the key alone.** This
+is not a detail; without it the idempotency key becomes the same attacker-chosen selector that filter
+(0) exists to kill, moved one seam earlier. A caller-supplied key with a global namespace lets
+operator B replay operator A's key, receive **A's run id and A's grant**, and read under A's authority
+— filter (0) binds the run to its *engine* caller, not to the operator, so nothing downstream would
+catch it, and the release log would attribute the disclosure to A. Therefore: **a key collision across
+principals is a MISS, never a hit**, and **no admission ever returns a run or a grant admitted by a
+different principal.** The natural key (`principal + use_case_id@version + module_id@version +
+input_hash + resolved scope`) is used when the caller supplies none; an explicit key is preferred,
+because "same inputs" and "same intent" are not the same thing and only the caller knows which it
+meant.
 
 **Admission is one transaction.** The run row, the audit row and the grant are written together or
 not at all. Three transactions would permit a partial admit — a live run with no audit row — which
@@ -152,8 +161,10 @@ Two properties are load-bearing:
 
 - **It is the same artifact family as 2b delegation** (RFC 8693 token exchange, audience-bound,
   short-TTL, server-issued). A5 deliberately pulls a bounded slice of Phase-5 delegation forward;
-  it does not invent a second credential type. Opaque-vs-signed grant *format* is deferred — the
-  binding, the audience and the TTL are not.
+  it does not invent a second credential type. The **invocation** grant's format (opaque vs signed)
+  may stay deferred, because its one-use property comes from the run state machine
+  (`admitted → executing`), not from the token: either format works. The **result-scoped** grant's
+  format is *not* deferred — see below.
 - **The invocation grant gates starting the run, nothing else.** Its TTL is not the run's authority.
   Every subsequent core call is authorised by Decision 4's server-side lookup, so a long-lived run
   does not need a long-lived credential, and a **stolen invocation grant expires without carrying
@@ -173,11 +184,12 @@ one-use ticket whose one-use property was enforced by the engine — the compone
 constrain — and whose theft, inside its TTL, yielded rows. It is now **a ticket core adjudicates**,
 not a token that authorises. No grant, of either kind, entitles anyone to bytes without a core call.
 
-**Grant format follows from that** (and this settles the deferral): a stateless *signed* grant cannot
-be one-use, because nothing consumes it. The grant is therefore **opaque and server-side**, with core
-holding the record it CASes. Signed-vs-opaque was listed as a deferrable detail; Decision 10 decides
-it, and pretending otherwise would let an implementer pick the format that silently downgrades
-one-use to advisory.
+**The RESULT-SCOPED grant's format follows from that, and Decision 10 settles it:** a stateless
+*signed* grant cannot be one-use, because nothing consumes it. The result-scoped grant is therefore
+**opaque and server-side**, with core holding the record it CASes. Leaving *that* format deferred
+would let an implementer pick signed, silently downgrading one-use to advisory and re-opening S3.
+(The invocation grant is unaffected: its one-use comes from the state transition, so its format
+remains an implementation choice.)
 
 The UCE rejects a grant that is missing, expired, wrong-audience, or mismatched against the request
 it accompanies — and, for a result-scoped grant, one that core refuses to redeem.
@@ -208,6 +220,13 @@ Two consequences, both normative: filter (0) as above, and **`use_case_run_id` m
 unguessable, ≥128-bit random identifier** — never a sequence, because a guessable selector re-opens
 the same hole from outside.
 
+**Two details filter (0) must get right, or it will be weakened by the first person it inconveniences.**
+The engine principal is **per-module-deployment, shared by every replica** — not per-instance, or a
+second replica would fail filter (0) on every call and someone would "fix" high availability by
+loosening the filter. And a filter-(0) failure is not a mere denial: the run is **aborted** (terminal
+`aborted`, reason `caller_mismatch`) with a security-relevant audit row, because a denial alone would
+leave the run sitting in `executing`, still read-authoritative, until the reaper noticed.
+
 **And the operator identity is never an argument.** The evaluate-as-operator seam that filter (4)
 needs is server-internal impersonation, which is a dangerous thing to build: it must resolve the
 operator **only** from the server-side run row. **No core API may accept an operator identity as a
@@ -236,7 +255,10 @@ Each use case declares a TTL in its manifest; core reads that TTL from **its rat
 next core call fails filter (1) of Decision 4.
 
 The invariant this buys: **every admitted run reaches a terminal audit state.** No run merely stops
-being mentioned.
+being mentioned. Reaping a run revokes its **read** authority instantly — it does **not** void an
+Execution Plan the run already produced and a human already approved: an approved plan is authorised
+in its own right and is re-checked against the *requester's* current authority at execution
+(ADR-0033 §8). A reaper must never be able to silently un-approve a human's decision.
 
 **It is bought by a reaper, not by construction** — and a reaper is a background thread, which is a
 thing that can die quietly (the `PolicyEvaluator` precedent). So the invariant carries three
@@ -286,11 +308,19 @@ would be a comforting sentence and a wrong one.
 
 Automation and agentic workers reach use cases through the **projected REST/MCP capability** on the
 one public surface — never by calling the UCE. Scheduled and background runs enter through the same
-internal path with the same admission — and **the human who armed the schedule IS the admitting
-operator of every run it produces** (ADR-0033 §7 makes that human the requester root; this is the
-same human, and the two ADRs must not be read as naming different people). Every filter in Decision
-4 therefore evaluates against the armer's **current** authority: a schedule whose armer is demoted
-or deleted stops producing runs. There is no system principal that admits runs on nobody's behalf. Direct-to-UCE access for any other caller requires a later
+internal path with the same admission — and **the human who armed the schedule is the ADMITTING
+OPERATOR of every run it produces.** Every filter in Decision 4 therefore evaluates against the
+armer's **current** authority: a schedule whose armer is demoted or deleted stops producing runs.
+There is no system principal that admits runs on nobody's behalf.
+
+**Admitting operator and four-eyes requester root are two different questions, and a scheduled run is
+where they come apart.** The *admitting operator* is the armer — that is whose live authority confines
+every read. The *requester root* for four-eyes is the *set of humans who authored the schedule's
+effect-bearing definition* (ADR-0033 §7), which includes the armer only if they authored it. Alice can
+author an effect-bearing schedule and Bob can arm it: Bob's authority governs the runs, and **neither
+Alice nor Bob may approve the effect** — Alice because she designed it, Bob because he requested it.
+Collapsing the two roles into "the same human, named twice" is precisely the laundering §7 exists to
+prevent, so this ADR does not do it. Direct-to-UCE access for any other caller requires a later
 ADR; it is never a default that erodes.
 
 ### 8. Fact acquisition versus effects: mutating by default (P5 + P9)
@@ -394,14 +424,23 @@ Where that rule is enforced, normatively:
      is only as fresh as the TTL, which is exactly the S3 hole re-opened at a smaller size.
    - Core **writes the serve's release-log entry** as part of the same transaction, so the
      disclosure is recorded by the component that authorised it.
+   - **All of this is ONE transaction** — the CAS, the re-check and the release-log write commit
+     together or not at all. A CAS in one transaction and a check in another is a permitted reading
+     of "then", and it is wrong: it would burn the grant on a check that later fails.
+   - **Redemption is replay-safe.** The same engine principal re-presenting the same grant for the
+     same serve-run within its TTL receives **the same authorization and writes no second
+     release-log row** — a crash after redemption but before the bytes reach the client must not
+     leave the operator permanently unable to read their own result, and must not record one
+     disclosure twice. A *different* caller, or a different serve-run, is refused.
    - Core returns the authorization; only then does the engine serve.
 6. The re-admission **mints its own `use_case_run_id`**, recording `served_from_run_id`, and its
    release-log entry (written at step 5) inherits the source run's released-input set. Without this,
    a second disclosure — to a different principal, at a different time — would leave no evidence
    anywhere core can read.
-7. A **serve-run is short and terminal**: it transits `admitted → finalised` on redemption and
-   delivery (its finalisation receipt carries the *source* run's canonical result hash — the bytes
-   are the same bytes), or `denied` if either subset check fails. It never enters `executing`,
+7. A **serve-run is short and terminal**: it transits `admitted → finalised` **on redemption** (core
+   cannot observe delivery, so it must not pretend to — the receipt attests what core authorised, and
+   it carries the *source* run's canonical result hash because the bytes are the same bytes), or
+   `denied` if either subset check fails. It never enters `executing`,
    because no engine composition happens. Decision 5's "every admitted run reaches a terminal audit
    state" therefore holds for serve-runs too.
 
@@ -424,8 +463,15 @@ uniform of its own fix. So:
 - The run row carries a **`released_input_digest`** written at finalisation. A subset check whose
   release-log rows do not reproduce that digest — because they were pruned, or because the read
   failed — is **not a pass with an empty set; it is a DENY**, with the result offered for re-run.
-- **Absent evidence is never a pass.** "No rows released" and "rows released, then pruned" must be
-  distinguishable, and the digest is what distinguishes them.
+- **A MISSING digest denies, exactly like a mismatched one.** This is the third state, and it is the
+  one a naive implementation skips: "compare the rows to the digest" with no digest present reads as
+  *nothing to check*, which is the vacuous pass wearing a different hat. So: **only a `finalised` run
+  has a servable result** (a run that read facts and never finalised has no digest and serves
+  nothing), and the retention ordering extends to the run row — **run-row retention ≥ result
+  retention**, alongside release-log retention ≥ result retention. Prune the evidence and you have
+  pruned the result's right to be served.
+- **Absent evidence is never a pass.** "No rows released", "rows released then pruned", and "no digest
+  at all" must be distinguishable, and each of the last two is a deny.
 
 ### 11. Disclosure accountability is core's release log, not the engine's journal (P7)
 
@@ -463,6 +509,7 @@ of behavioural reads, and it must not inherit that pattern. **No release without
   engine's journal. Note the precision: the release log records the *devices, classes and verbs*,
   **not the field-level payload**. That is the honest scope, and it is what a DSAR actually needs;
   promising field-level recall the log does not hold would be worse than a precise answer.
+
 **Every confined fact read returns a confinement envelope, and core — not the engine — computes it.**
 This is the quietest and most dangerous hole in the protocol, so it is closed here explicitly.
 Confinement *removes rows*. If core hands back only the rows the operator may see, then "the engine
@@ -592,6 +639,9 @@ Module packaging and activation, adopted from the counter-proposal:
 | signature · compatibility · entitlement | verified before activation |
 | permission diff | vetted per **ADR-0033 §2** (namespace-bound, approved-then-diffed) — the gate this ADR's ratified copy is taken *at* |
 | migrations · recovery plan | present and applied, or activation is refused |
+| **retention ordering** | **release-log retention ≥ result retention**, and **run-row retention ≥ result retention** (Decisions 9 and 10) — a module whose result outlives its own evidence is refused |
+| **backup retention** | **≤ the tombstone SLA** (Decision 15) — an engine whose backups outlive its erasure promise cannot keep the promise |
+| **completeness policy** | **≥ core's ceiling for the declared risk tier** (ADR-0033 §10) — a module may not declare its own honesty threshold |
 | ambiguity | **fail closed** |
 
 Versions install side by side. **An in-flight run retains the exact module, use-case, workflow and
@@ -659,7 +709,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | # | Prerequisite | Why A5 cannot ship without it | Status today |
 |---|---|---|---|
 | **(a)** | **Phase-4 engine principals** (ADR-1005 exec plan) | Decision 4's mid-run caller is the engine principal. Without it there is no authenticated identity for the UCE to hold. | `engine` is a **reserved** `principal_class` label; the class is not live. |
-| **(b)** | **The ADR-0017 admit-then-filter gate (#1716) + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. | No `authorize_list_read` symbol exists in the server tree — only comments naming it a convergence target (#1716, #1634 remainder). |
+| **(b)** | **The ADR-0017 admit-then-filter gate (#1716) + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. | **Zero occurrences** of `authorize_list_read` in the server tree; the comments that reference the gate name #1716, never the symbol. |
 | **(c)** | **The D12 audit schema** (acting principal · authority ref · **indexed** `use_case_run_id`) | Decision 12. Without it, "no unjoined evidence" is not merely untested — it is **unqueryable**. Rides the audit-store Postgres migration. | `AuditEvent` has a single `principal` field. |
 | **(d)** | **The P7 release-log schema** | Decision 11 *is* the disclosure evidence, and Decision 10's subset check **reads it**. Ship A5 without it and admitted runs exist whose disclosure cannot be proven from core-owned evidence. | Does not exist. Born-on-PG store, ADR-0012. |
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
@@ -755,10 +805,13 @@ platform's agentic-throughput ceiling. One round trip, one audit row, one grant 
 lane that skips approval routing entirely — that budget is a design constraint on every future
 change to admission, not an implementation detail.
 
-### Three new core stores, all born on Postgres
+### Six new core stores, all born on Postgres
 
-The run store (Decision 5), the release log (Decision 11) and the grant/receipt records
-(Decisions 3 and 12) are new, core-owned, and born on Postgres under ADR-0012's contract —
+The run store (Decision 5), the release log (Decision 11), the grant/receipt records (Decisions 3
+and 12), and — from ADR-0033 — the pending-approval objects, the Execution Plan records and the
+capability-declaration tables: **six**, and the count matters because every one of them must appear in
+the readiness conjunction (ADR-0031 INV-31-6, interlock item (k)). They are new, core-owned, and born
+on Postgres under ADR-0012's contract —
 fail-closed construction — and **all three are AUTHORITATIVE stores, not durability-on-top ones**.
 That distinction is the difference between a working design and a fail-open one, so it is spelled
 out here rather than left to the reader of ADR-0012: a durability-on-top store returns empty or

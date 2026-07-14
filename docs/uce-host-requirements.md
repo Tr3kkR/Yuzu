@@ -822,6 +822,13 @@ are not re-litigated:
 | NF-8 | Observability floor (existence now) | host | stack ADR / sre |
 | NF-9 | Operator login & session security | host | stack ADR (T2b) / security-guardian |
 
+> **RETARGETED by ADR-0031/0032 (accepted 2026-07-14).** The summary rows and the restated interlock
+> below still route confinement through the **§6 mechanism**, which is RELOCATED (see §6 and F-5/F-6):
+> the engine does not confine — **core confines the inputs it releases** (INV-31-2) and logs each
+> release (ADR-0032 Decision 11). M3(d) survives and now tests **core's release gate**, not a
+> module-side re-derivation. Read F-5/F-6/F-15 and the interlock below with that substitution; F-10
+> and NF-9 rows are VOID.
+
 **Hard interlock (restated):** F-5/F-6/F-11 (confinement) and their §6 mechanism
 gate M3's condition (d) and Phase 6 **unconditionally** — Phase 6 cuts the
 module to fleet-wide-reading engine-principal credentials regardless of which

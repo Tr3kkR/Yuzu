@@ -204,16 +204,35 @@ localhost; the public versioned API only (INV-31-4); and **no cross-component da
 isolation (2c D1) is reaffirmed and becomes *more* load-bearing, because co-location removes the
 network as an accidental barrier.
 
-**6a. Core keeps a break-glass ingress of its own.** ADR-1005 makes the in-server console a
-deliberately closed set of bootstrap and recovery capabilities that must work with **zero dependency
-on any engine** — the thing you use when everything else is broken. The split quietly puts it behind
-presentation, so a presentation failure would lock operators out of RBAC and principal management
-*during an incident*, which is precisely when they need it. So core exposes a **minimal, local,
-separately-bound break-glass surface** — authentication, RBAC and principal administration, health —
-reachable without presentation. It is not a second product surface and not a private API for
-presentation's use (INV-31-4 stands): it is the recovery door, it is loud in the audit log, and it is
-bound to localhost or an admin interface by default. Without it, the bootstrap property ADR-1005
-relies on is lost the day this ADR lands.
+**6a. Core keeps a break-glass ingress of its own — and it is a door, so it is built like one.**
+ADR-1005 makes the in-server console a deliberately closed set of bootstrap and recovery capabilities
+that must work with **zero dependency on any engine** — the thing you use when everything else is
+broken. The split quietly puts it behind presentation, so a presentation failure would lock operators
+out of RBAC and principal management *during an incident*, which is precisely when they need it. So
+core exposes a **minimal break-glass surface** — authentication, RBAC and principal administration,
+health — reachable without presentation.
+
+This is a **fleet-administration ingress**, which means naming its posture here rather than
+discovering it later:
+
+- **It authenticates and authorises exactly like every other ingress.** Every filter in ADR-0033 §1
+  applies, every approval gate applies, `on_behalf_guard` applies, and the audit posture is the
+  platform's. **No filter and no gate is skipped because the surface is called "break-glass".** It is
+  not a private core API (INV-31-4 stands): it is the *same* authority, reachable by a second door.
+- **It inherits `docs/auth-architecture.md`'s hard invariants** — TLS, the standard header bundle, the
+  A4 error envelope, session/CSRF handling, lockout and rate limiting. NF-9 (the engine's login and
+  session security requirements) was voided with the engine's GUI; **its ingress-security *class* does
+  not disappear, it re-homes here.**
+- **It binds to loopback by default**, and exposing it on a network interface is an explicit,
+  documented act.
+- **Every use is loud**: a security-relevant audit event on every request, not merely on failure.
+- **And the question that actually matters, decided rather than deferred: break-glass does NOT
+  operate when core's auth/RBAC store is degraded.** If it did, it would be an unauthenticated
+  fleet-administration door — and "the auth store is down" is exactly the condition an attacker would
+  induce to open it. So be precise about what 6a delivers: it survives **presentation** failure, not
+  **authority** failure. When the authority itself is down, the platform fails closed (the posture
+  table below), and recovery is an operator-at-the-console database action, not a network endpoint.
+  A break-glass door that opens when the lock breaks is not a safety feature.
 
 **7. One PostgreSQL instance, two databases, in its own sibling container** (2c D1, reaffirmed;
 ballot A2). Same host as the three binaries today; separate roles, separate pools, no cross-database

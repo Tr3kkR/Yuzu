@@ -275,7 +275,7 @@ satisfies four-eyes:
 | engine principal | its named human owner |
 | delegated call | the delegating operator |
 | **any run-scoped effect** | **the admitting operator (P11)** |
-| **a scheduled or background run** | **the humans who authored its effect-bearing definition** — recorded at arming time, re-checked at execution (§8) |
+| **a scheduled or background run** | **the humans who authored its effect-bearing definition** (the *armer* is the run's admitting operator, whose live authority confines it — ADR-0032 Decision 7 — but the armer is a four-eyes root only if they also authored the effect) |
 
 Alice's worker can never approve Alice's other worker.
 
@@ -384,7 +384,8 @@ only rows; it must state how much of the intended fleet answered:
 | `responded` | endpoints returning a valid result before the deadline |
 | `failed` | endpoints returning a terminal error |
 | `timed_out` / `offline` | known non-responses, kept **distinct** from an empty or negative result |
-| `completeness` | `complete` · `partial` · `insufficient` · `unknown` |
+| `withheld_by_confinement` | records the operator's authority **removed** from the answer before the engine ever saw them (ADR-0032 Decision 11 returns matched/released/withheld on every confined fact read). Without this row, a confined read and a clean fleet are the same bytes — the envelope would report honestly on the devices that *answered* while silently omitting the ones the operator was not allowed to *ask about*. |
+| `completeness` | `complete` · `partial` · `insufficient` · `unknown` — and a result whose inputs were **confinement-truncated may never be `complete`** |
 | `policy` | the declared threshold, and whether incomplete evidence blocks the next step — **subject to a core-owned ceiling** (below) |
 
 **Missing evidence is never a negative finding.** "No vulnerable devices found" and "62 devices never
