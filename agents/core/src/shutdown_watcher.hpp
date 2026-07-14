@@ -57,10 +57,13 @@
 /// `docker stop` each send exactly ONE SIGTERM and then SIGKILL. No supervisor ever sends a
 /// second. The OTA self-stop path (the update thread calls Agent::stop() itself) gets no
 /// signal at all and no supervisor timeout, because nobody asked us to stop.
-/// The bound that actually covers production is the INTERNAL shutdown deadline in Agent::stop()
-/// (--shutdown-timeout), deliberately set below every supervisor timeout so WE win the race and
-/// the failure is observable as our own error + exit code rather than a silent SIGKILL.
-/// (governance: sre + unhappy-path, independently.)
+/// SO THERE IS NO INTERNAL BOUND ON A WEDGED STOP, AND THIS PR DOES NOT ADD ONE. Say it plainly
+/// rather than gesture at machinery that is not here: stop() drains guardian_/dex_observer_ with
+/// an UNBOUNDED wait, and the only thing that ends a wedged teardown is the supervisor's SIGKILL
+/// (and on the OTA self-stop path, nothing at all). An internal deadline is the right answer and
+/// is being built separately — it failed review three times because it was designed against an
+/// IDLE agent, and a running command holds a worker that nothing can cancel across the plugin ABI.
+/// Do not write a comment here claiming a bound exists until one does.
 
 #ifndef _WIN32
 

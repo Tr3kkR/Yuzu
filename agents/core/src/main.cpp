@@ -2,7 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
-#include <process.h> // _exit — the second-signal escalation in on_signal (round 9)
+#include <process.h> // _wexecv for the OTA relaunch (the escalation uses TerminateProcess)
 #pragma section(".CRT$XCB", read)
 [[maybe_unused]] static void __cdecl diag_before_static_init() {
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
@@ -44,6 +44,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <format>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -132,6 +133,21 @@ static_assert(std::atomic<int>::is_always_lock_free);
 // created thread, so it is already an ordinary thread context; SIGTERM is not meaningfully
 // raised there, and the service path goes through service_win.cpp's SCM control thread.
 // ─────────────────────────────────────────────────────────────────────────────────
+/// LAST-RESORT HANDLER, used ONLY when the shutdown watcher could not be constructed (fd or thread
+/// exhaustion at boot). It does not try to be graceful — it cannot, there is no watcher to run the
+/// teardown — it only guarantees the process remains KILLABLE, including as PID 1 in a container
+/// where a default disposition is discarded by the kernel. Async-signal-safe: no locks, no stdio.
+static void on_signal_hard_exit(int sig) {
+    (void)sig;
+#ifdef _WIN32
+    // Never ::_exit() here: it routes via ExitProcess -> DLL_PROCESS_DETACH across ~49 plugin DLLs
+    // -> the loader lock a wedged thread may hold. TerminateProcess runs no DllMain.
+    ::TerminateProcess(::GetCurrentProcess(), 1);
+#else
+    ::_exit(1); // exit_group(2): async-signal-safe, no atexit, no dtors, cannot block.
+#endif
+}
+
 static void on_signal(int sig) {
     // A process-directed signal lands on an ARBITRARY unmasked thread — possibly one sitting
     // between a failing syscall and its `errno` check. Every write() below can set errno (the
@@ -180,13 +196,16 @@ static void on_signal(int sig) {
         // BLOCKING pipe under Docker's json-logger and under journald, so a stalled collector or
         // a full log disk blocks the write INSIDE THE HANDLER — and the escape hatch whose whole
         // purpose is to work when everything else is wedged became the thing that wedged. The
-        // operator still gets out: the process dies immediately, and the exit code says so.
-        // Diagnosis belongs to the INTERNAL shutdown deadline (--shutdown-timeout), which runs
-        // on an ordinary thread and can log safely before it exits.
-        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7.)
+        // operator still gets out: the process dies immediately. BE HONEST ABOUT WHAT IS LOST —
+        // the banner is not relocated anywhere, it is GONE, and exit 1 here is indistinguishable
+        // from a startup failure. A second signal therefore produces no diagnostic at all. The
+        // internal shutdown deadline that was meant to carry that diagnosis (on an ordinary
+        // thread, where logging is safe) is deferred to a separate PR; until it lands, a wedged
+        // stop is diagnosed from the supervisor's log and the absence of "Yuzu agent stopped".
+        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
 #ifdef _WIN32
         // ::_exit() routes through ExitProcess, which terminates every other thread and THEN
-        // runs DLL_PROCESS_DETACH for each of the ~47 loaded plugin DLLs — taking the loader
+        // runs DLL_PROCESS_DETACH for each of the ~49 loaded plugin DLLs — taking the loader
         // lock a wedged thread may already hold. The one path whose entire job is unconditional
         // escape could itself deadlock. TerminateProcess runs no DllMain and takes no loader
         // lock. (governance: cross-platform SHOULD-1.)
@@ -643,7 +662,16 @@ int main(int argc, char* argv[]) {
     // call stop() on a destroyed Agent. RAII rather than a bare thread because
     // `agent->run()` below is NOT wrapped in a try at its call site: a throw would unwind
     // past a joinable std::thread and std::terminate. Do not reorder.
-    yuzu::agent::ShutdownWatcher shutdown_watcher{
+    // CONSTRUCTED INSIDE A TRY, in an optional, because its own construction can throw on exactly
+    // the host it exists to survive. `state_`'s make_shared sits in the mem-init-list — OUTSIDE the
+    // ctor body's firewall — and `main()` has no enclosing handler, so a bad_alloc/EAGAIN there
+    // escaped main and std::terminate'd WITHOUT UNWINDING: no plugin shutdown(), no SQLite close.
+    // That is the identical hole this branch wraps make_unique<ThreadPool> to close, in the same
+    // file, for the same reason. If it throws we leave SIG_DFL standing — ungraceful, but killable.
+    // (governance: cpp-expert, this PR.)
+    std::optional<yuzu::agent::ShutdownWatcher> shutdown_watcher;
+    try {
+        shutdown_watcher.emplace(
         g_shutdown_wfd,
         [] {
             auto* a = g_agent.load(std::memory_order_acquire);
@@ -661,7 +689,12 @@ int main(int argc, char* argv[]) {
             // ordinary thread, not in a handler context.
             std::signal(SIGINT, SIG_DFL);
             std::signal(SIGTERM, SIG_DFL);
-        }};
+        });
+    } catch (...) {
+        spdlog::error("could not construct the shutdown watcher (out of memory or threads) — "
+                      "leaving SIGINT/SIGTERM at their default disposition. The process still dies "
+                      "promptly on a signal, but shutdown will NOT be graceful.");
+    }
 #endif
 
     g_agent.store(agent.get(), std::memory_order_release);
@@ -674,13 +707,28 @@ int main(int argc, char* argv[]) {
     // a fail-open-to-hang regression, on exactly the exhausted host this path exists for.
     // Leaving SIG_DFL means the process at least dies promptly, ungracefully.
     // (governance Gate-8 cpp-safety.)
-    if (shutdown_watcher.ok()) {
+    if (shutdown_watcher && shutdown_watcher->ok()) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
     } else {
-        spdlog::warn("shutdown watcher unavailable — leaving SIGINT/SIGTERM at their default "
-                     "disposition so the process still dies promptly on a signal (shutdown "
-                     "will NOT be graceful)");
+        // SIG_DFL IS NOT A SAFE FALLBACK IN A CONTAINER, AND THE AGENT IS PID 1 THERE.
+        //
+        // The kernel DISCARDS a default-action signal for PID 1 — a signal with no installed
+        // handler is ignored, not fatal. So "leave SIG_DFL, the process still dies promptly" is
+        // simply FALSE in every shipped agent image (exec-form ENTRYPOINT, no init): SIGTERM would
+        // be swallowed and `docker stop` would hang the full grace before SIGKILL. That is WORSE
+        // than the behaviour this branch replaced, which installed a handler unconditionally.
+        //
+        // Install a handler that does nothing but LEAVE. It needs no pipe and no watcher, and
+        // _exit()/TerminateProcess are async-signal-safe, so it is >= SIG_DFL everywhere and
+        // strictly better on PID 1. Ungraceful — but killable, which is the whole point.
+        // (governance: unhappy-path A, this PR.)
+        std::signal(SIGINT, on_signal_hard_exit);
+        std::signal(SIGTERM, on_signal_hard_exit);
+        spdlog::warn("shutdown watcher unavailable — SIGINT/SIGTERM will now exit the process "
+                     "IMMEDIATELY and UNGRACEFULLY (no plugin shutdown, no clean DB close). A "
+                     "default disposition would be IGNORED by PID 1 in a container, so this is "
+                     "the killable posture.");
     }
 #else
     std::signal(SIGINT, on_signal);

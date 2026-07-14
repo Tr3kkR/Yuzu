@@ -28,8 +28,8 @@
 #    could not. First it took a single expected code and RE-RAN the case with the opposite
 #    expectation on mismatch (a broken escalation failed run 1, passed run 2, reported PASS).
 #    Then it accepted the SET {0,1} for the escalation case -- and BOTH members were reachable by
-#    a defect: a broken escalation exits 0, and the shutdown deadline also exited 1. An assertion
-#    that accepts the failure mode is a green light wired to the bug.
+#    a defect: a broken escalation exits 0, and a since-deferred shutdown deadline also exited 1.
+#    An assertion that accepts the failure mode is a green light wired to the bug.
 #    (governance: quality-engineer, twice.)
 #
 # 3. A TIMEOUT MUST BE JUSTIFIED AGAINST A MEASURED BASELINE. An earlier harness called the agent
@@ -257,9 +257,8 @@ run_case() {
 
     # ONE code, and a latency bound. 143 = SIGTERM's default disposition (the handler never ran,
     # so shutdown was never graceful). 134 = std::terminate. 141 = SIGPIPE from the shutdown pipe
-    # itself. 139 = segv. 3 = the shutdown deadline expired, which on these cases means a healthy
-    # teardown took >20s and something is badly wrong. Each is a real defect this suite exists to
-    # catch, and each now FAILS instead of being absorbed into an accepted set.
+    # itself. 139 = segv. Each is a real defect this suite exists to catch, and each now FAILS
+    # instead of being absorbed into an accepted set.
     if [[ $got -ne $expect_rc ]]; then
         echo "FAIL [$name]: exit $got, expected exactly $expect_rc" >&2
         echo "  (143=handler never ran  134=terminate  141=SIGPIPE  139=segv)" >&2

@@ -1167,11 +1167,24 @@ public:
                 //     (this is also the OTA self-stop path, which gets no signal at all); and
                 //   * a CtxSlot, so stop() can cancel an in-flight Register immediately rather
                 //     than waiting the deadline out.
-                // Measured: shutdown against a black-hole server was 18.0s (gRPC's own transport
-                // timeout); it is ~1s with these.
+                // MEASURED against a black-hole server (accepts TCP, never answers), Linux, 49
+                // plugins: 18.0s -> 8-9s (n=4). The 18.0s was gRPC's own transport timeout
+                // expiring. An earlier version of this comment said "~1s", which was the
+                // second-signal figure pasted onto the wrong case; it is corrected here rather
+                // than left to justify a bound nobody measured.
                 // (governance: cpp-safety BLOCKING, unhappy-path UP-C11/C12, enterprise C1.)
                 ctx.set_deadline(std::chrono::system_clock::now() + kRegisterTimeout);
                 CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx};
+
+                // PUBLISH, THEN RE-CHECK. The loop tested stop_requested_ above, but a stop()
+                // landing in the window between that test and the publish above finds
+                // register_ctx_ still NULL — so it cancels nothing, and this Register runs to its
+                // full 30s deadline while the supervisor's grace (Docker's is 10s) expires and
+                // SIGKILLs us mid-teardown. The window is a few instructions wide; the fix is one
+                // line, and it closes it structurally rather than by argument.
+                // (governance: security-guardian, cpp-safety — independently, this PR.)
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
                 info->set_agent_id(cfg_.agent_id);
@@ -2260,12 +2273,26 @@ public:
                                          "reconnect ({}) — the host is out of threads. Stopping "
                                          "cleanly rather than aborting.",
                                          e.what());
+                        // AND MARK IT A FAILURE. Without this the agent returns EXIT_SUCCESS and
+                        // simply vanishes from the fleet: the Windows SCM reads a clean stop and
+                        // runs no recovery action, and any `Restart=on-failure` unit never
+                        // restarts it. Dev at least aborted (134), which DID trigger recovery — so
+                        // stopping "cleanly" here was a regression dressed as a fix.
+                        // (governance: unhappy-path B, this PR.)
+                        startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
                         break;
                     } catch (...) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect (non-std exception) — stopping cleanly rather "
                                          "than aborting.");
+                        // AND MARK IT A FAILURE. Without this the agent returns EXIT_SUCCESS and
+                        // simply vanishes from the fleet: the Windows SCM reads a clean stop and
+                        // runs no recovery action, and any `Restart=on-failure` unit never
+                        // restarts it. Dev at least aborted (134), which DID trigger recovery — so
+                        // stopping "cleanly" here was a regression dressed as a fix.
+                        // (governance: unhappy-path B, this PR.)
+                        startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
                         break;
                     }
