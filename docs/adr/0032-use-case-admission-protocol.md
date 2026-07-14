@@ -1,8 +1,15 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-14
 owner: "@dgr (Dave Rae)"
-deciders: pending — acceptance requires the access-control ballot (A1–A5, D1–D12) and at least one recorded independent review (SOC 2 Workstream F change-management evidence)
+deciders: >-
+  Ratified 2026-07-14 by @dgr and the engineering colleagues, via the access-control ballot
+  (A1–A5, D1–D12, pins P1–P11, open questions G1–G10). Independent review of record (SOC 2
+  Workstream F change-management evidence): a two-reviewer adversarial review (findings S1–S11,
+  three blockers, all closed by this ADR set), a convergence pass over the finished set, and an
+  overclaim sweep. Open questions G1 (cross-process event transport), G6/G7 (MCP session and
+  replay-ring placement) and G10 (the Drogon build canary) remain open by design and are named
+  as prerequisites, not resolved by this acceptance.
 scope: >-
   platform — the protocol by which a Use-Case run is admitted, authorised mid-flight, evidenced,
   finalised and reaped. Pins ballot A5's protocol semantics (pins P1–P10; pin P11 is owned by
