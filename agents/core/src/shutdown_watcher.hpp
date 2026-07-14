@@ -72,6 +72,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <unistd.h>
 
@@ -93,7 +94,7 @@ public:
     /// SIGINT/SIGTERM back to SIG_DFL: see trap 6.
     ShutdownWatcher(std::atomic<int>& wfd_slot, std::function<bool()> on_shutdown,
                     std::function<void()> on_watcher_died = {})
-        : wfd_slot_{wfd_slot} {
+        : wfd_slot_{wfd_slot}, state_{std::make_shared<WatcherState>(&wfd_slot)} {
         // Trap 4: O_CLOEXEC on both ends. Trap 3: O_NONBLOCK on the WRITE end ONLY.
 #ifdef __linux__
         if (::pipe2(fds_, O_CLOEXEC) != 0) {
@@ -136,10 +137,28 @@ public:
 
         wfd_slot_.store(fds_[1], std::memory_order_release);
 
+        // TRAP 7 — LIVENESS IS PUBLISHED BEFORE THE THREAD EXISTS, AND ONLY EVER CLEARED.
+        //
+        // It used to be published AFTER the std::thread ctor returned. A thread that died
+        // immediately (a read() error on the very first pass) cleared `alive` and returned, and
+        // then the ctor's store(true) RESURRECTED it — reinstating trap 6 through the very flag
+        // added to close it: ok() reports a live watcher, main installs the handlers, and every
+        // SIGTERM is written into a pipe with no reader. Publishing FIRST makes the flag
+        // MONOTONIC (true -> false, never back), so whoever observes the death wins.
+        // (governance round 2: cpp-expert, cpp-safety.)
+        state_->alive.store(true, std::memory_order_release);
+
         // Trap 2: a throw from HERE (std::thread's ctor, EAGAIN) means the destructor never
-        // runs, so RAII cannot save us — clean up by hand and degrade.
+        // runs, so RAII cannot save us — clean up by hand and degrade (which clears `alive`).
         try {
-            thread_ = std::thread([this, rfd = fds_[0], cb = std::move(on_shutdown),
+            // TRAP 8 — THE THREAD MUST NOT CAPTURE `this`. It used to, and the destructor has a
+            // DETACH path (see below): after detaching, main returns, this stack-owned object
+            // dies, and the thread then writes `alive_`/`wfd_slot_` through a dangling `this`.
+            // The dtor's own comment says in capitals that the callback must not capture anything
+            // that can die — while the watcher itself did exactly that. The state the thread
+            // touches now lives on the HEAP and is captured BY VALUE, so it outlives the object
+            // by construction. (governance round 2: cpp-safety BLOCKING-1, cpp-expert.)
+            thread_ = std::thread([st = state_, rfd = fds_[0], cb = std::move(on_shutdown),
                                    died = std::move(on_watcher_died)] {
                 for (;;) {
                     char byte = 0;
@@ -161,8 +180,8 @@ public:
                         // to remove, reached through a different door.
                         // Retract the slot and hand the signals back to the kernel.
                         const int err = (n < 0) ? errno : 0;
-                        wfd_slot_.store(-1, std::memory_order_release);
-                        alive_.store(false, std::memory_order_release);
+                        st->wfd_slot->store(-1, std::memory_order_release);
+                        st->alive.store(false, std::memory_order_release);
                         log_quietly("the shutdown watcher died unexpectedly — restoring the "
                                     "default signal disposition (shutdown will NOT be graceful)",
                                     err);
@@ -172,15 +191,13 @@ public:
                     }
 
                     if (cb && cb()) {
-                        alive_.store(false, std::memory_order_release);
+                        st->alive.store(false, std::memory_order_release);
                         return; // teardown ran (it BLOCKS until complete); nothing more to do
                     }
                     // cb() said "not yet" (the Agent is not published): keep waiting rather
                     // than being consumed, or every LATER signal becomes a silent no-op.
                 }
             });
-            // Published only once the thread really exists. ok() reads THIS, never joinable().
-            alive_.store(true, std::memory_order_release);
         } catch (const std::exception& e) {
             degrade();
             log_quietly("could not start the shutdown watcher", 0, e.what());
@@ -243,12 +260,16 @@ public:
             // DETACH IS SAFE HERE — but not for the reason an earlier comment gave. It claimed
             // "no byte can arrive because wfd_slot_ is already -1". That is wrong: a handler
             // that loaded the fd BEFORE the store(-1) above can still write() afterwards, and
-            // the byte lands. The real invariant is that the callback is safe to run late:
-            // main's is capture-free and g_agent is already null by then. THE CALLBACK MUST NOT
-            // CAPTURE ANYTHING THAT CAN DIE — the tests' `[&]` lambdas would be a use-after-free
-            // if this path were ever reachable from them (it is not: we own both fds and never
-            // close them, so write() cannot fail with anything but EINTR/EAGAIN).
-            // (governance Gate-8 round 8 cpp-safety.)
+            // the byte lands. Two things make a late-running detached thread safe:
+            //   * IT NO LONGER TOUCHES `this`. Everything it writes lives in the heap-allocated
+            //     WatcherState it captured BY VALUE (trap 8). The previous version captured
+            //     `this` — a stack object in main() — so this very detach was a use-after-free
+            //     waiting on a lost sentinel byte. (governance round 2: cpp-safety.)
+            //   * THE CALLBACK MUST NOT CAPTURE ANYTHING THAT CAN DIE. main's is capture-free
+            //     and g_agent is already null by then; the tests' `[&]` lambdas would not be
+            //     safe here, and are not reachable (we own both fds and never close them, so
+            //     write() cannot fail with anything but EINTR/EAGAIN).
+            // (governance Gate-8 round 8 cpp-safety; round 2 of this branch.)
             if (!retired) {
                 // The exhaustion case reports EAGAIN, so a bare `last_err ? strerror : "full"`
                 // could never print the full-pipe message it named. Distinguish them properly —
@@ -276,7 +297,7 @@ public:
     /// TRUE iff the watcher thread is actually running. If FALSE the caller MUST NOT install
     /// the signal handlers — see the header note (a swallowed signal leaves the agent
     /// unkillable by SIGTERM).
-    [[nodiscard]] bool ok() const { return alive_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool ok() const { return state_->alive.load(std::memory_order_acquire); }
 
     [[nodiscard]] int read_fd_for_test() const { return fds_[0]; }
     [[nodiscard]] int write_fd_for_test() const { return fds_[1]; }
@@ -306,6 +327,10 @@ private:
     /// strength of it. (governance Gate-8 round 9 cpp-safety.)
     void degrade() noexcept {
         assert(!thread_.joinable() && "degrade() on a live watcher would hang the agent at exit");
+        // Clearing `alive` is the ONLY direction this flag ever moves after construction — see
+        // trap 7. The ctor publishes it true BEFORE spawning, so the thread-creation failure
+        // paths below must take it back down here.
+        state_->alive.store(false, std::memory_order_release);
         wfd_slot_.store(-1, std::memory_order_release);
         for (int& fd : fds_) {
             if (fd >= 0) {
@@ -333,12 +358,25 @@ private:
         }
     }
 
+    /// EVERYTHING THE WATCHER THREAD TOUCHES, ON THE HEAP. Held by shared_ptr and captured BY
+    /// VALUE by the thread, so a DETACHED watcher (see the destructor) cannot outlive the state
+    /// it writes to — `this` is a stack object in main() and dies when main returns. Trap 8.
+    ///
+    /// `wfd_slot` points at the caller's signal-handler slot. It must outlive the process: in
+    /// main.cpp it is a file-static atomic, which is the only supported shape.
+    struct WatcherState {
+        explicit WatcherState(std::atomic<int>* slot) noexcept : wfd_slot{slot} {}
+        std::atomic<int>* wfd_slot;
+        /// LIVENESS, not joinable(). Published BEFORE the thread is spawned and only ever
+        /// cleared thereafter (trap 7 — publishing it after the spawn let the ctor resurrect a
+        /// thread that had already died). ok() reads this.
+        std::atomic<bool> alive{false};
+    };
+
     std::atomic<int>& wfd_slot_;
     int fds_[2]{-1, -1};
     std::thread thread_;
-    /// LIVENESS, not joinable(). Set once the thread exists; cleared by the thread when it
-    /// exits. ok() reads this -- see trap 6.
-    std::atomic<bool> alive_{false};
+    std::shared_ptr<WatcherState> state_;
 };
 
 } // namespace yuzu::agent
