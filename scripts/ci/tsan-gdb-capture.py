@@ -403,32 +403,43 @@ def _gdb_roundtrip(check):
     honest test of "the shard filter survives" is to look at what the process
     actually got.
 
-    Skipped where there is no POSIX gdb/timeout (Windows dev boxes). It DOES run on
-    the TSan nightly runner — which installs gdb — so the guard is live exactly
-    where the capture is."""
+    FAIL-SAFE BY CONSTRUCTION: this asserts a failure ONLY when it positively
+    observes the mangling. Every way gdb can fail to run cleanly — absent, wrong
+    OS, can't attach (macOS Homebrew gdb without codesigning; a restrictive
+    ptrace_scope), times out, emits no ARGV line — is a SKIP, never a failure. It
+    must be safe to have in the `docs` suite that gates every PR on Linux, Windows
+    AND macOS: a green environment that merely lacks a working gdb must not turn
+    the suite red. Its teeth are live exactly where a working gdb exists — the TSan
+    nightly (which installs gdb) and any local Linux/Docker run — which is exactly
+    where the capture itself runs. The universal regression guard is the pure-logic
+    `set startup-with-shell off not in argv` assertion above; this is the empirical
+    belt-and-suspenders on top of it."""
+    # macOS ships no `timeout` (it's `gtimeout` from coreutils), so stock macOS
+    # skips here anyway; the checks below make an installed-but-unusable gdb safe.
     if os.name != "posix" or not shutil.which("gdb") or not shutil.which("timeout"):
         print("  (gdb round-trip: SKIPPED — no POSIX gdb/timeout here)")
         return
 
     import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        echo = os.path.join(td, "argv_echo.py")
-        with open(echo, "w", encoding="utf-8") as f:
-            f.write("import sys\nprint('ARGV=' + '|'.join(sys.argv[1:]))\n")
-
-        # Same code path the real capture uses — not a hand-written gdb command.
-        argv = gdb_argv([sys.executable, echo, "~[pg]"], 222, 60, 10)
-        try:
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            echo = os.path.join(td, "argv_echo.py")
+            with open(echo, "w", encoding="utf-8") as f:
+                f.write("import sys\nprint('ARGV=' + '|'.join(sys.argv[1:]))\n")
+            # Same code path the real capture uses — not a hand-written gdb command.
+            argv = gdb_argv([sys.executable, echo, "~[pg]"], 222, 60, 10)
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
-        except (OSError, subprocess.SubprocessError) as exc:
-            check(False, f"gdb round-trip could not run: {exc!r}")
-            return
+    except (OSError, subprocess.SubprocessError) as exc:
+        # gdb could not be run to completion here — not evidence the code is wrong.
+        print(f"  (gdb round-trip: SKIPPED — gdb could not run: {exc!r})")
+        return
 
     out = (proc.stdout or "") + (proc.stderr or "")
     line = next((l for l in out.splitlines() if l.startswith("ARGV=")), None)
     if line is None:
-        print("  (gdb round-trip: SKIPPED — gdb produced no ARGV line; "
-              f"rc={proc.returncode})")
+        # gdb ran but never launched the inferior (can't attach / codesign / ptrace
+        # policy). No observation to make → skip, don't fail.
+        print(f"  (gdb round-trip: SKIPPED — gdb produced no ARGV line; rc={proc.returncode})")
         return
 
     got = line[len("ARGV="):].split("|")

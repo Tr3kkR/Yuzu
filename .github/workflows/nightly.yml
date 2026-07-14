@@ -326,104 +326,16 @@ jobs:
         run: meson compile -C build-linux-tsan
 
       - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
-        # cpp-httplib enables CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO by
-        # default (HTTPLIB_IS_USING_NON_BLOCKING_GETADDRINFO=ON in
-        # httplibConfig.cmake), routing Client::create_socket through
-        # getaddrinfo_a(). glibc implements that by spawning an async DNS
-        # helper thread via clone3 directly — bypassing TSan's
-        # pthread_create interceptor — so the helper's per-thread
-        # allocator state never initialises and its first malloc() segfaults
-        # inside __tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8).
-        # That bare SIGSEGV (#438) is what the #1031 race fix was unmasking;
-        # the diagnostic step below captured the stack in run 25901174628.
-        #
-        # The shim interposes getaddrinfo_a/gai_suspend/gai_error/gai_cancel
-        # with synchronous getaddrinfo on the calling thread — no async
-        # helper, no crash. Scoped to the TSan job only via LD_PRELOAD on
-        # the Test and gdb steps; production keeps the non-blocking-DNS
-        # behaviour (DNS timeouts still interruptible there).
-        #
-        # Built into RUNNER_TEMP, not /tmp: the Big Tam host is shared by 4
-        # persistent self-hosted runners, and a bare /tmp path is one global
-        # name for all of them. The `concurrency:` group makes a same-ref
-        # collision unlikely rather than impossible (a manual dispatch against
-        # a branch runs concurrently with the scheduled main nightly), and a
-        # half-written .so under LD_PRELOAD fails every exec in the job with a
-        # error that looks nothing like its cause. Per-job temp removes the
-        # shared name entirely (#1038, R-15 / CS-04).
-        run: |
-          cat > "$RUNNER_TEMP/gai_sync_shim.c" << 'SHIM_EOF'
-          #define _GNU_SOURCE
-          #include <netdb.h>
-          #include <stddef.h>
-          #include <signal.h>
-          #include <time.h>
-
-          /* struct gaicb::__return is glibc-internal — the header marks it
-             "private to the implementation", so writing it is layout-coupled to
-             whatever glibc we compiled against. The layout has been stable since
-             glibc 2.2.3, but stability is not a contract, and the failure mode if
-             it ever shifts is silent: we would scribble an int over whichever
-             field moved into that offset, inside a DNS path, under TSan — a bug
-             that would present as anything but its cause.
-             So assert the layout at compile time. A future glibc that reshuffles
-             gaicb then fails THIS step, loudly, with the offset in the message —
-             instead of producing a corrupt nightly (#1038, R-02/R-03/sec LOW-2). */
-          _Static_assert(sizeof(void *) == 8,
-                         "gai_sync_shim: expected an LP64 target (x86-64 runner)");
-          _Static_assert(offsetof(struct gaicb, ar_result) == 24,
-                         "gai_sync_shim: gaicb::ar_result moved — glibc layout changed");
-          _Static_assert(offsetof(struct gaicb, __return) == 32,
-                         "gai_sync_shim: gaicb::__return moved — glibc's internal layout "
-                         "changed; re-verify the shim against the new <netdb.h> before "
-                         "trusting it");
-          _Static_assert(sizeof(struct gaicb) == 56,
-                         "gai_sync_shim: sizeof(struct gaicb) changed — glibc layout changed");
-
-          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
-                             struct sigevent *sig) {
-              (void)mode; (void)sig;
-              for (int i = 0; i < nitems; ++i) {
-                  if (!list[i]) continue;
-                  list[i]->ar_result = NULL;
-                  list[i]->__return = getaddrinfo(list[i]->ar_name,
-                                                    list[i]->ar_service,
-                                                    list[i]->ar_request,
-                                                    &list[i]->ar_result);
-              }
-              return 0;
-          }
-
-          int gai_suspend(const struct gaicb *const list[], int nitems,
-                           const struct timespec *timeout) {
-              (void)list; (void)nitems; (void)timeout;
-              return 0; /* already completed synchronously */
-          }
-
-          int gai_error(struct gaicb *req) {
-              return req ? req->__return : 0;
-          }
-
-          int gai_cancel(struct gaicb *req) {
-              (void)req;
-              return EAI_NOTCANCELED;
-          }
-          SHIM_EOF
-          # gcc-15, not bare `gcc`: the install step above asks apt for `gcc-15`,
-          # which does NOT provide a /usr/bin/gcc symlink (verified on a clean
-          # ubuntu:26.04 image). This step has been passing only on an ambient gcc
-          # the persistent Big Tam runners happen to carry — an undeclared
-          # dependency that would fail the Tier-3 nightly (and open `nightly-broken`
-          # with no product regression) the first time a runner is reprovisioned
-          # from a clean image. gcc-15 is also what the meson build itself uses
-          # (`CC: ccache gcc-15`), so the shim now matches the job's real toolchain.
-          #
-          # -Werror: the layout guards above are the entire safety story for the
-          # __return write. A warning here is not cosmetic.
-          gcc-15 -shared -fPIC -O2 -Wall -Wextra -Werror \
-            -o "$RUNNER_TEMP/libgai_sync_shim.so" "$RUNNER_TEMP/gai_sync_shim.c"
-          file "$RUNNER_TEMP/libgai_sync_shim.so"
-          echo "::notice::gai_sync_shim built ok (glibc gaicb layout guards passed) -> $RUNNER_TEMP/libgai_sync_shim.so"
+        # cpp-httplib's non-blocking DNS routes through glibc's getaddrinfo_a(),
+        # whose clone3-spawned helper thread bypasses TSan's pthread_create
+        # interceptor and segfaults on its first malloc() (#438). The shim
+        # interposes it with a synchronous getaddrinfo() on the calling thread.
+        # Full rationale, the glibc-private-ABI guard, and the gcc-15/-Werror
+        # reasoning live in the script — ONE copy, shared with sanitizer-tests.yml,
+        # so the two can't drift (#1038 CS-03). Built into $RUNNER_TEMP, not /tmp,
+        # because the 4-agent Big Tam pool shares one filesystem and a fixed path
+        # is a cross-job collision class (#1038 R-15 / CS-04).
+        run: bash scripts/ci/build-gai-sync-shim.sh "$RUNNER_TEMP/libgai_sync_shim.so"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
