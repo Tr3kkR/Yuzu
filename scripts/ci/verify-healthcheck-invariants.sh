@@ -98,21 +98,21 @@ EOF
     exit "$rc"
 }
 
+# Remove THIS run's listener, and only this run's. Trapped on the cancellation
+# signals as well as EXIT: the PR gate sets cancel-in-progress, and a superseded
+# run is signalled before it is killed, so trapping TERM/INT/HUP is what actually
+# prevents a leaked listener.
+#
+# Deliberately NOT a broad sweep of `^yuzu-hc-probe-*`. Big Tam runs four runners
+# against ONE dockerd and the verify matrix is 5-wide, so sibling jobs' listeners
+# are live on the same daemon at the same time: a startup sweep would `docker rm
+# -f` a sibling's listener mid-probe, and that job would fail with "the tool is
+# missing" for an image that is perfectly fine. A flaky gate that blocks merges
+# and releases is far worse than the thing it was cleaning up -- a leaked 4 MB
+# busybox container. The $RANDOM-suffixed name already makes collisions
+# impossible, so a leak is inert.
 cleanup() {
     docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
-}
-
-# Sweep listeners leaked by an earlier run that was killed before its EXIT trap
-# could fire (the PR gate cancels superseded runs, and Big Tam's four runners
-# share one dockerd). Only ever removes this script's own probe containers.
-sweep_stale_listeners() {
-    local stale
-    stale="$(docker ps -aq --filter 'name=^yuzu-hc-probe-' 2>/dev/null || true)"
-    if [ -n "$stale" ]; then
-        echo "note: removing $(echo "$stale" | wc -l) leaked probe listener(s) from a previous run" >&2
-        # shellcheck disable=SC2086  # word-splitting is intended: one id per arg
-        docker rm -f $stale >/dev/null 2>&1 || true
-    fi
 }
 
 # Start the known-good HTTP listener. Serves a 200 on /healthz, which is what
@@ -211,8 +211,7 @@ main() {
         fi
     done
 
-    trap cleanup EXIT
-    sweep_stale_listeners
+    trap cleanup EXIT INT TERM HUP
     start_listener
 
     local failures=0 rc
