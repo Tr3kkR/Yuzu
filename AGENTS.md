@@ -310,7 +310,7 @@ GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. Filing, labelling, a
 
 ### Triage labels
 
-Every issue carries exactly one type label and one triage state; the `gh` path additionally sets one of `P0`/`P1`/`P2` — or `roadmap` for parked scope, which carries neither priority nor triage state. The canonical five triage roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) map 1:1 to labels, unchanged. Active backlog = `is:open -label:roadmap`. Full taxonomy and axes: `docs/agents/triage-labels.md`.
+Every issue carries exactly one type label; every non-`roadmap` issue also carries exactly one triage state. The `gh` path additionally sets one of `P0`/`P1`/`P2` — or `roadmap` for parked scope, which carries neither priority nor triage state. The canonical five triage roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) map 1:1 to labels, unchanged. Active backlog = `is:open -label:roadmap`. Full taxonomy and axes: `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

@@ -169,12 +169,15 @@ directory is deleted) — the tracker is the sole source of truth; CODEOWNERS ga
 | 4 | PR-template issue-linkage checklist line (`.github/pull_request_template.md`) | PR 1 | Authors declare `Closes #N` / `Relates to #N` on every PR as a matter of routine | B3 |
 | 5 | `.github/workflows/close-linked-issues.yml` + local reconcile/backfill script | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; the script backfills #2139's 29 leaked issues and covers pre-release reconciles; manual batch-close sweeps end | B1 |
 | 6 | `.github/workflows/linked-issues.yml` (issue radar) | PR 2 | Silent fixes surfaced pre-merge: "these open issues cite files you touched"; missing closing keywords flagged while the PR is still editable **[A1 §13]** | B3 |
-| 7 | `scripts/issues/migrate-labels.sh` | PR 2 | One priority scheme; automation labels exist before anything references them; idempotent and dry-run-first **[A1 §7]** | B5 |
+| 7 | `scripts/issues/migrate-labels.sh` | PR 2 | One priority scheme; automation labels exist before anything references them; idempotent and dry-run-first **[A1 §7: superseded — `scripts/tracker/bootstrap-labels.sh`, PR 1]** | B5 |
 | 8 | Issue forms + `config.yml` (`.github/ISSUE_TEMPLATE/`, legacy `.md` templates deleted) | PR 3 | Web-path issues arrive structured and `needs-triage`-labelled; blank issues off; vulnerability reports deflected to private advisories | B2, B5 |
 | 9 | CODEOWNERS `/.github/` entry | PR 3 | Automation control plane always gets owner review — guards artefacts 5–8 themselves **[A1 §9: descoped]** | (protects all) |
 | 10 | `scripts/hooks/issue-standard-guard.py` + `.claude/settings.json` wiring | PR 4 | Non-conformant `gh issue create` denied at source with a teaching message, in every Claude session sharing the repo settings | B2, B5 |
 | 11 | `.claude/skills/issue-triage/` (SKILL.md + `dump-issues.sh`, `leak-scan.sh`, `build-citation-index.py`, comment templates) | PR 5 | Weekly evidence-based sweep: autonomous two-probe closures for claim-verified fixes, checkbox report for judgment calls, duplicate clustering, closure-integrity spot-checks **[A1 §10]** | B1, B3, B4 |
 | 12 | `triage-sweep` rolling tracking issue + telemetry block | PR 5 (operational) | Weekly open/inflow/outflow/age/leak metrics plus operational gauges (telemetry staleness >10 days = dead-man's-switch, workflow failure-run count, issue-standard conformance count so hook-bypass drift is visible); threshold breaches (leak >0 post-PR-2, needs-triage >100, net inflow >+50/wk×2) open or update a P1 issue assigned to the maintainer rather than only commenting — drift visible in days, not months **[A1 §10]** | B6 |
+
+> **[A1]** The PR assignments in this table (rows 5–12) and the row-7 script path are superseded
+> by Amendment A1 — see §7 (label bootstrap) and §13 (corrected PR map).
 
 ## Consequences
 
@@ -338,9 +341,9 @@ open issues, parked on the roadmap Project, excluded from triage via `is:open -l
 This ADR never mentions it. Consequences: the sweep's judgment categories (obsolete /
 too-trivial / unclear) run on the **active** set only — 334 deliberately-parked issues must not
 be churned; telemetry gauges key on the active set; and the mandatory-label rule becomes
-three-tier — every issue carries one type + one triage state; the `gh` path additionally carries
-`roadmap` XOR (one of `P0/P1/P2` + the triage state); `roadmap` never coexists with a priority
-or a triage state. Roadmap issues stay in the duplicate-detection snapshot (excluding them would
+three-tier — every issue carries one type; every non-`roadmap` issue carries one triage state;
+the `gh` path additionally carries `roadmap` XOR (one of `P0/P1/P2` + the triage state);
+`roadmap` never coexists with a priority or a triage state. Roadmap issues stay in the duplicate-detection snapshot (excluding them would
 blind a third of the corpus) but are eligible for fixed-elsewhere advisory comments only.
 
 ### §7 — Label migration becomes a six-label bootstrap, owned by PR 1
@@ -408,8 +411,10 @@ never happens, nor on a green run whose parser silently regresses to matching no
 is three mechanisms: the `if: failure()` alert (execution failures), a **per-push leak scan
 pulled forward from pillar 5 into PR 2** (completeness — merged-PR claims vs still-open issues,
 same never-close and cap rules as the close job), and a frozen parser fixture corpus in `tests/`
-(regression). Revert-reopen is cut: zero revert PRs exist in ~2,150 merged PRs, and the
-marker-query mechanism it depended on is unreliable (§10). Its replacement is
+(regression). Revert-reopen is cut: no GitHub-generated revert PR (body `Reverts …#N`) exists
+among the ~2,150 merged PRs — the only "revert"-titled merge, PR #23, reverts a build flag, not
+an issue-closing merge — and the marker-query mechanism it depended on is unreliable (§10). Its
+replacement is
 `--undo-push <before>...<after>`, which recomputes the closure set deterministically for an
 exact push range and reverses it.
 

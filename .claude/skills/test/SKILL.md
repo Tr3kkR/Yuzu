@@ -712,7 +712,7 @@ After a successful run, the operator typically wants to:
 
 1. **Commit and push** — the green run is the gate. Reference `RUN_ID` in the commit message for traceability.
 2. **Compare to the prior run** — `test-db-query.sh --diff <prev> <current>` shows what changed in gate status and timings.
-3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first (`gh issue list --state open --search "<gate name>"`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
+3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --state open --search "<gate name>"` and `gh search issues --repo Tr3kkR/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
 4. **Bump the coverage baseline** if a legitimate drop or trade-off is intentional — `coverage-gate.sh --capture-baselines` and commit the updated `tests/coverage-baseline.json`. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against `tests/perf-baseline-provenance-N300.{jsonl,json}` and is not blocking.
 
 After a failed run:

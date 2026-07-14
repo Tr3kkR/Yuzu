@@ -37,6 +37,7 @@
       "Bash(python3 tests/test_changelog_order.py:*)",
       "Bash(python3 tests/test_gen_proto_version.py:*)",
       "Bash(python3 tests/test_issue_docs.py:*)",
+      "Bash(python tests/test_issue_docs.py:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",

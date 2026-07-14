@@ -96,7 +96,8 @@ Issue filing, labelling, and closing follow the repo standard:
   than filing a twin.
 - One actionable outcome per issue, with Context / Evidence / Acceptance criteria / Origin
   sections in the body.
-- Every issue carries exactly one type label and one triage state. Priority (`P0`/`P1`/`P2`)
+- Every issue carries exactly one type label; every non-`roadmap` issue also carries one triage
+  state (`roadmap` = parked scope: no triage state, no priority). Priority (`P0`/`P1`/`P2`)
   is a triage decision: set it if you have the context (agents and regular contributors do);
   leave it off a drive-by report and triage will add it.
 - **Never file an exploitable security vulnerability as a public issue.** Use

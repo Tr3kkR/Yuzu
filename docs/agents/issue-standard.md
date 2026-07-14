@@ -21,6 +21,7 @@ Type the work honestly:
 - a choice to be made, whose outcome is a recorded decision rather than code → `decision`
 - proof-of-concept / plumbing exploration → `spike`
 - docs-only work → `documentation`
+- a question needing an answer → `question`
 - infra / runners / CI plumbing → `operational`
 
 **Never file an exploitable vulnerability as a public issue** — see section 6.
@@ -79,8 +80,9 @@ whether the defect is still present — and they feed duplicate detection.
 Three mandatory axes; the full taxonomy with meanings is [`triage-labels.md`](triage-labels.md).
 
 - **Every issue, any path:** exactly one **type** label (`bug`, `enhancement`, `task`, `decision`,
-  `spike`, `documentation`, `question`, `operational`) and exactly one **triage state**
-  (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
+  `spike`, `documentation`, `question`, `operational`). Every **non-`roadmap`** issue additionally
+  carries exactly one **triage state** (`needs-triage`, `needs-info`, `ready-for-agent`,
+  `ready-for-human`, `wontfix`); `roadmap` issues carry a type only.
 - **`gh` path (agents and maintainers), additionally:** either `roadmap` (parked scope — no
   priority, no triage state) **or** exactly one priority (`P0`/`P1`/`P2`) alongside the triage
   state. A drive-by web reporter cannot know the priority — priority is a triage decision; agents
