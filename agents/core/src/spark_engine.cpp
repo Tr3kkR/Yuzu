@@ -91,6 +91,16 @@ SparkEngine::register_mechanism(SparkType type, std::unique_ptr<ISparkMechanism>
     std::lock_guard lk(mu_);
     if (running_ || stopped_)
         return std::unexpected("mechanisms must be registered before start()");
+    // Populate the per-type mech-ops lock FIRST, then mechanisms_ — both under
+    // the same mu_ so they stay in lockstep (#2011). Order matters for the
+    // .at()-can't-throw invariant every call site relies on: if the second
+    // try_emplace throws std::bad_alloc, the surviving state must never be
+    // "mechanisms_ has the type but mech_ops_mu_by_type_ does not" (which would
+    // make a later arm/disarm reach .at(type) → std::out_of_range on a live
+    // path). Emplacing the lock first means a throw leaves at most an unused
+    // mutex entry for a type with no mechanism — harmless, since arm() of a
+    // type with no mechanism is rejected before any .at() (cpp-safety Gate 3).
+    mech_ops_mu_by_type_.try_emplace(type);
     auto [it, inserted] = mechanisms_.try_emplace(type, std::move(mechanism));
     if (!inserted)
         return std::unexpected(std::string("a mechanism is already registered for spark type '") +
@@ -201,6 +211,7 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
     struct PendingUnwatch {
         ISparkMechanism* mech;
         std::string key;
+        SparkType type; // picks this type's mech-ops lock at consumption
     };
     std::vector<PendingUnwatch> to_unwatch;
     {
@@ -220,7 +231,7 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
                 if (running_ && is_event_driven(it->second.spec.type)) {
                     auto mit = mechanisms_.find(it->second.spec.type);
                     if (mit != mechanisms_.end())
-                        to_unwatch.push_back({mit->second.get(), it->first});
+                        to_unwatch.push_back({mit->second.get(), it->first, it->second.spec.type});
                 }
                 it = armed_.erase(it);
             } else {
@@ -229,17 +240,18 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
         }
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
-    // takes mu_) — mirrors disarm(). Serialized via mech_ops_mu_ with a
-    // staleness re-check immediately before each call (#1994 M2): a
-    // concurrent re-arm of an equal spec may have already renewed this key
-    // between our erase above and here, in which case this unwatch is stale
-    // and must be skipped rather than tearing down the fresh watch.
+    // takes mu_) — mirrors disarm(). Serialized via this type's
+    // mech_ops_mu_by_type_ entry with a staleness re-check immediately before
+    // each call (#1994 M2): a concurrent re-arm of an equal spec may have
+    // already renewed this key between our erase above and here, in which case
+    // this unwatch is stale and must be skipped rather than tearing down the
+    // fresh watch.
     for (auto& pu : to_unwatch) {
-        // Hook fires BEFORE mech_ops_mu_ is taken (never while held) — see
+        // Hook fires BEFORE the mech-ops lock is taken (never while held) — see
         // disarm()'s identical placement rationale.
         if (disarm_race_hook_for_test_)
             disarm_race_hook_for_test_();
-        std::lock_guard ops(mech_ops_mu_);
+        std::lock_guard ops(mech_ops_mu_by_type_.at(pu.type));
         {
             std::lock_guard lk(mu_);
             if (armed_.contains(pu.key))
@@ -492,14 +504,14 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
     // and an inline emit from the mechanism re-enters under mu_. `mech` is set
     // only for a NEWLY-INSERTED event-driven key, so a failure here means the
-    // watcher for this whole key never came up. Serialized via mech_ops_mu_
-    // with a staleness re-check immediately before the call (#1994 M2): a
-    // concurrent disarm/unregister may have torn this brand-new key down
-    // already (its sole subscriber — ours — removed, e.g. by
+    // watcher for this whole key never came up. Serialized via this type's
+    // mech_ops_mu_by_type_ entry with a staleness re-check immediately before
+    // the call (#1994 M2): a concurrent disarm/unregister may have torn this
+    // brand-new key down already (its sole subscriber — ours — removed, e.g. by
     // unregister_consumer racing our own consumer), in which case watching it
     // now would leave an orphaned OS watch with no armed_ entry.
     if (mech) {
-        std::lock_guard ops(mech_ops_mu_);
+        std::lock_guard ops(mech_ops_mu_by_type_.at(spec.type));
         {
             std::lock_guard lk(mu_);
             if (!armed_.contains(key))
@@ -562,6 +574,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
 void SparkEngine::disarm(SubscriptionId id) {
     ISparkMechanism* mech = nullptr;
     std::string unwatch_key;
+    SparkType unwatch_type{}; // carried forward to pick this type's mech-ops lock
     {
         std::lock_guard lk(mu_);
         auto ki = sub_keys_.find(id);
@@ -582,6 +595,7 @@ void SparkEngine::disarm(SubscriptionId id) {
                     if (mit != mechanisms_.end()) {
                         mech = mit->second.get();
                         unwatch_key = key;
+                        unwatch_type = ai->second.spec.type;
                     }
                 }
                 armed_.erase(ai);
@@ -591,19 +605,19 @@ void SparkEngine::disarm(SubscriptionId id) {
         wheel_cv_.notify_all();
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
-    // takes mu_). Serialized via mech_ops_mu_ with a staleness re-check
-    // immediately before the call (#1994 M2): a concurrent re-arm of an equal
-    // spec may have already renewed this key between our unlock above and
-    // here, in which case this unwatch is stale and must be skipped rather
-    // than tearing down the fresh watch.
+    // takes mu_). Serialized via this type's mech_ops_mu_by_type_ entry with a
+    // staleness re-check immediately before the call (#1994 M2): a concurrent
+    // re-arm of an equal spec may have already renewed this key between our
+    // unlock above and here, in which case this unwatch is stale and must be
+    // skipped rather than tearing down the fresh watch.
     if (mech) {
-        // Hook fires BEFORE mech_ops_mu_ is taken (never while held): a test
+        // Hook fires BEFORE the mech-ops lock is taken (never while held): a test
         // hook that re-arms from here calls back into arm_impl(), which takes
         // this same non-recursive mutex — invoking the hook any later would
         // self-deadlock.
         if (disarm_race_hook_for_test_)
             disarm_race_hook_for_test_();
-        std::lock_guard ops(mech_ops_mu_);
+        std::lock_guard ops(mech_ops_mu_by_type_.at(unwatch_type));
         {
             std::lock_guard lk(mu_);
             if (armed_.contains(unwatch_key))
@@ -622,6 +636,7 @@ void SparkEngine::start() {
         ISparkMechanism* mech;
         std::string key;
         SparkParams params;
+        SparkType type; // picks this type's mech-ops lock at replay
     };
     std::vector<Replay> replays;
     {
@@ -642,7 +657,7 @@ void SparkEngine::start() {
             } else if (is_event_driven(armed.spec.type)) {
                 auto mit = mechanisms_.find(armed.spec.type);
                 if (mit != mechanisms_.end())
-                    replays.push_back({mit->second.get(), key, armed.spec.params});
+                    replays.push_back({mit->second.get(), key, armed.spec.params, armed.spec.type});
             }
         }
         for (auto& [type, m] : mechanisms_)
@@ -659,10 +674,10 @@ void SparkEngine::start() {
                      report_fault(key, faulted, reason);
                  });
     for (auto& r : replays) {
-        // Serialized via mech_ops_mu_ with a staleness re-check (#1994 M2): a
-        // concurrent disarm() may have torn this key down between start()'s
-        // collection pass above (mu_ released since) and here.
-        std::lock_guard ops(mech_ops_mu_);
+        // Serialized via this type's mech_ops_mu_by_type_ entry with a staleness
+        // re-check (#1994 M2): a concurrent disarm() may have torn this key down
+        // between start()'s collection pass above (mu_ released since) and here.
+        std::lock_guard ops(mech_ops_mu_by_type_.at(r.type));
         {
             std::lock_guard lk(mu_);
             if (!armed_.contains(r.key))

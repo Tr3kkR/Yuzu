@@ -9,16 +9,23 @@
 # outside Actions, e.g. by the /test skill or a dev shell). Resolution
 # order:
 #
-#   1. Pre-set YUZU_TEST_POSTGRES_DSN — runner-level/env override, trusted
-#      as-is (the documented hook for a self-hosted box with a bespoke
-#      native install; see docs/ci-architecture.md "Postgres for server
-#      tests").
+#   1. Pre-set YUZU_TEST_POSTGRES_DSN — runner-level/env override (the
+#      documented hook for a self-hosted box with a bespoke native install;
+#      see docs/ci-architecture.md "Postgres for server tests"). On a
+#      multi-agent box (runner name ending "-<n>", e.g. the 4-runner
+#      yuzu-weetam-windows pool) the pre-set DSN names the agent-0 cluster
+#      and agent <n> uses port+<n> when that per-agent cluster answers —
+#      one instance per agent, no cross-job contention (#2094). Falls back
+#      to the shared pre-set DSN (with a ::warning) until the box is
+#      provisioned with the extra clusters.
 #   2. Docker available -> idempotent `yuzu-ci-postgres` container on
-#      127.0.0.1:15432 (self-hosted Linux: yuzu-wsl2-linux / yuzu-shulgi —
-#      the same boxes run the docker-publish jobs, so docker is a given).
-#      Port 15432 deliberately avoids colliding with any native cluster or
-#      UAT rig on 5432. `--restart unless-stopped` + `docker start` makes
-#      this a one-time cost per runner.
+#      127.0.0.1:15432 (self-hosted Linux — the same boxes run the
+#      docker-publish jobs, so docker is a given). Port 15432 deliberately
+#      avoids colliding with any native cluster or UAT rig on 5432.
+#      `--restart unless-stopped` + `docker start` makes this a one-time
+#      cost per runner. Multi-agent boxes (yuzu-bigtam-linux pool) get a
+#      container PER AGENT — `yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>,
+#      self-created on the agent's first job (#2094).
 #   3. macOS (GHA-hosted, no docker): brew postgresql@18, throwaway
 #      trust-auth cluster under $RUNNER_TEMP on port 15432.
 #   4. Native cluster on 127.0.0.1:5432 (self-hosted Windows precondition —
@@ -40,6 +47,39 @@ PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185f
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432
 
+# ── Per-agent instance selection (#2094) ─────────────────────────────────
+# Both self-hosted pools run 4 runner agents on ONE box (CLAUDE.md standing
+# invariant), and a single shared Postgres is a cross-job contention
+# multiplier: the WAL/fsync-heavy [pg] fixture traffic of concurrent jobs
+# mutually DoSes their server suites (the 2026-07-12 Wee Tam 900 s
+# server-suite timeouts). Pool runner names carry the agent index as a
+# trailing "-<n>" (yuzu-weetam-windows-2, yuzu-bigtam-linux-0); derive it
+# and give every agent its OWN instance — the database-shaped case of the
+# fixed-port/named-object cross-JOB collision pattern (#1871). Single-agent
+# boxes (yuzu-wsl2-linux) and GHA-hosted runners have no such suffix and
+# keep the shared-instance behaviour.
+AGENT_IDX=""
+if [[ "${RUNNER_NAME:-}" =~ -([0-9]+)$ ]]; then
+  AGENT_IDX=$((10#${BASH_REMATCH[1]}))
+  if (( AGENT_IDX > 9 )); then
+    # Pool agent indexes are single-digit; a larger trailing number (some
+    # hosted-runner naming schemes) is not an agent index.
+    AGENT_IDX=""
+  fi
+fi
+if [[ -n "$AGENT_IDX" ]]; then
+  # Container-per-agent on 15440+<n>: base deliberately OFF 15432/15433 so
+  # agent 0 collides with neither a legacy shared container (15432) nor the
+  # UAT postgres sidecar (15433) — port map in scripts/start-UAT.sh.
+  CONTAINER="yuzu-ci-postgres-${AGENT_IDX}"
+  DOCKER_PORT=$((15440 + AGENT_IDX))
+  # Wee-Tam-parity connection headroom (#2096): the server suite's PgPool
+  # fan-out can exhaust the postgres default of 100 (the CH-9 flake).
+  DOCKER_PG_ARGS=(-c max_connections=400)
+else
+  DOCKER_PG_ARGS=()
+fi
+
 emit_dsn() {
   local dsn="$1" how="$2"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
@@ -57,6 +97,34 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
 
 # ── 1. Pre-set DSN wins ──────────────────────────────────────────────────
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+  # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
+  # (machine env on Wee Tam) names the agent-0 cluster; agent <n> shifts
+  # the port by <n> (Wee Tam: 5433 -> 5434..5436, provisioned by
+  # deploy/windows/Provision-Windows-Runner.ps1). Probe before switching
+  # and fall back LOUDLY to the shared DSN while a box has not been
+  # provisioned with per-agent clusters yet — the cutover needs no flag
+  # day, and the warning is the provisioning reminder.
+  if [[ -n "$AGENT_IDX" && "$AGENT_IDX" != "0" \
+        && "$YUZU_TEST_POSTGRES_DSN" =~ ^(.*@([^:/@]+)):([0-9]+)(/.*)$ ]]; then
+    PA_HOST="${BASH_REMATCH[2]}"
+    PA_PORT=$((BASH_REMATCH[3] + AGENT_IDX))
+    PA_DSN="${BASH_REMATCH[1]}:${PA_PORT}${BASH_REMATCH[4]}"
+    PA_HOW=""
+    if command -v psql >/dev/null 2>&1; then
+      # Authenticate the exact DSN we are about to export (same rationale
+      # as path 4's SELECT 1 gate, PR #1334 S5).
+      if psql "$PA_DSN" -tA -c 'SELECT 1' >/dev/null 2>&1; then
+        PA_HOW="psql SELECT 1 verified"
+      fi
+    elif tcp_probe "$PA_HOST" "$PA_PORT"; then
+      PA_HOW="TCP probe only — psql unavailable, credential unverified"
+    fi
+    if [[ -n "$PA_HOW" ]]; then
+      emit_dsn "$PA_DSN" "pre-set runner env, per-agent port ${PA_PORT} for ${RUNNER_NAME} (${PA_HOW}; #2094)"
+      exit 0
+    fi
+    echo "::warning::ensure-postgres: no per-agent Postgres on ${PA_HOST}:${PA_PORT} for ${RUNNER_NAME} — falling back to the SHARED pre-set DSN (cross-job contention multiplier, #2094). Provision the per-agent clusters (deploy/windows/Provision-Windows-Runner.ps1) to remove it." >&2
+  fi
   emit_dsn "$YUZU_TEST_POSTGRES_DSN" "pre-set runner env"
   exit 0
 fi
@@ -64,9 +132,11 @@ fi
 # ── 2. Docker (self-hosted Linux) ────────────────────────────────────────
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   if command -v flock >/dev/null 2>&1; then
-    exec 9>/tmp/yuzu-ci-postgres.lock
+    # Lock name embeds the (possibly per-agent) container name, so agents
+    # managing their own containers never serialize on each other (#2094).
+    exec 9>"/tmp/${CONTAINER}.lock"
     if ! flock -w 120 9; then
-      echo "::error::ensure-postgres: timed out waiting for /tmp/yuzu-ci-postgres.lock — another runner may be stuck managing ${CONTAINER}" >&2
+      echo "::error::ensure-postgres: timed out waiting for /tmp/${CONTAINER}.lock — another runner may be stuck managing ${CONTAINER}" >&2
       exit "$SOFT_EXIT"
     fi
   else
@@ -82,12 +152,14 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
+    # ${arr[@]+...} guarded expansion: empty-array-safe under `set -u` on
+    # bash 3.2 (macOS /bin/bash) too.
     docker start "$CONTAINER" >/dev/null 2>&1 || docker run -d \
       --name "$CONTAINER" \
       --restart unless-stopped \
       -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu_test \
       -p "127.0.0.1:${DOCKER_PORT}:5432" \
-      "$PG_IMAGE" >/dev/null
+      "$PG_IMAGE" ${DOCKER_PG_ARGS[@]+"${DOCKER_PG_ARGS[@]}"} >/dev/null
   fi
   # 120 s budget (60 × 2 s): a cold PG18 first boot runs the init scripts +
   # pgvector extension install, which on a loaded self-hosted runner can take

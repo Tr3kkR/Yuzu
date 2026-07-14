@@ -97,6 +97,73 @@ TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_stor
     CHECK(!result.has_value());
 }
 
+TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instruction_store]") {
+    // Explicit ids are operator-controlled (JSON create #402, YAML Save
+    // metadata.id #1993) and are interpolated into dashboard fragments,
+    // route paths, and audit rows — the store is the single chokepoint that
+    // bounds them (governance sec-M1).
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "Charset Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+
+    SECTION("dotted canonical id is accepted") {
+        def.id = "tutorial.service.inspect_v2-a";
+        auto result = store.create_definition(def);
+        REQUIRE(result.has_value());
+        CHECK(*result == "tutorial.service.inspect_v2-a");
+    }
+    SECTION("quote/attribute-breakout characters are rejected") {
+        def.id = "x' onmouseover='alert(1)";
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() ==
+              "definition id may only contain letters, digits, '.', '_', and '-'");
+    }
+    SECTION("path separators are rejected") {
+        def.id = "a/b";
+        CHECK(!store.create_definition(def).has_value());
+    }
+    SECTION("overlong id is rejected") {
+        def.id = std::string(129, 'a');
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error() == "definition id too long (max 128 characters)");
+    }
+    SECTION("empty id still store-generates") {
+        def.id = "";
+        auto result = store.create_definition(def);
+        REQUIRE(result.has_value());
+        CHECK(!result->empty());
+    }
+}
+
+TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepoint",
+          "[instruction_store]") {
+    // sqlite3_bind_text(-1) truncates at the first NUL, so a NUL-bearing
+    // source would persist a blob that diverges from the extracted columns
+    // (and, on the signed-import path, from the signature-verified bytes).
+    // The store rejects it for every surface, not just the dashboard
+    // validator (governance UP-2 / Gate 8).
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "Nul Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+    def.yaml_source = std::string("apiVersion: yuzu.io/v1alpha1\n") + '\0' + "kind: x\n";
+
+    auto result = store.create_definition(def);
+    REQUIRE(!result.has_value());
+    CHECK(result.error() == "yaml_source contains a NUL byte");
+}
+
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
 
 namespace {
@@ -151,9 +218,8 @@ TEST_CASE("InstructionStore: update_definition enforces the same scope validatio
     // not silently stored (the bypass governance arch-B1/UP-4 closed).
     InstructionDefinition edit = def;
     edit.id = created.value();
-    edit.yaml_source =
-        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
-        "  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: dynamic\n";
+    edit.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
+                       "  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: dynamic\n";
     auto updated = store.update_definition(edit);
     REQUIRE_FALSE(updated.has_value());
     CHECK(updated.error().find("requires assignment.mode: static") != std::string::npos);
