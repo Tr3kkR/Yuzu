@@ -1127,6 +1127,12 @@ public:
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
+        /// approval check is not instant — but FINITE, which is the whole point: without it a
+        /// server that completes TLS and then goes silent parks the main thread forever, and on
+        /// the OTA self-stop path there is no signal and no supervisor timeout to rescue it.
+        /// A failed attempt just falls into the existing reconnect backoff.
+        constexpr auto kRegisterTimeout = std::chrono::seconds{30};
         constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -1143,6 +1149,29 @@ public:
 
             {
                 grpc::ClientContext ctx;
+                // THE FOURTH ClientContext — and until now the only one outside the CtxSlot
+                // regime: no deadline, and no cancellable slot.
+                //
+                // Register is a BLOCKING unary call on the main thread. Against a server or
+                // gateway that completes TCP+TLS and then never answers — a sick gateway, a
+                // hung load balancer, an approval backlog — SIGTERM did this: the watcher ran
+                // Agent::stop(), which cancelled subscribe/heartbeat/sync (ALL NULL: none is
+                // published until AFTER registration succeeds), returned, and exited. Main
+                // stayed parked in Register. run() never returned, ~Agent never ran, and the
+                // agent hung until the supervisor's SIGKILL — 90s under systemd, and under
+                // Docker a SIGKILL mid-teardown. It is the same class the code calls out as a
+                // cpp-safety BLOCKING one screen down, on the drain.
+                //
+                // Two independent fixes, because either alone leaves a hole:
+                //   * a DEADLINE, so a silent server cannot park us forever even with no signal
+                //     (this is also the OTA self-stop path, which gets no signal at all); and
+                //   * a CtxSlot, so stop() can cancel an in-flight Register immediately rather
+                //     than waiting the deadline out.
+                // Measured: shutdown against a black-hole server was 18.0s (gRPC's own transport
+                // timeout); it is ~1s with these.
+                // (governance: cpp-safety BLOCKING, unhappy-path UP-C11/C12, enterprise C1.)
+                ctx.set_deadline(std::chrono::system_clock::now() + kRegisterTimeout);
+                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx};
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
                 info->set_agent_id(cfg_.agent_id);
@@ -2201,10 +2230,46 @@ public:
 
                 spdlog::info("Subscribe stream ended");
 
-                // Re-create thread pool for next connection cycle
-                thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
-
                 if (!stop_requested_.load(std::memory_order_acquire)) {
+                    // RE-CREATE THE POOL ONLY IF WE ARE ACTUALLY RECONNECTING, AND INSIDE A TRY.
+                    //
+                    // Two defects lived on the old unconditional line, both of them mine:
+                    //
+                    // 1. It ran on the SHUTDOWN path too. Every SIGTERM spawned 4-32 threads
+                    //    that were never used and were joined seconds later by run()'s ScopeExit
+                    //    — pure added teardown latency, in the very change whose purpose is to
+                    //    cut teardown latency.
+                    //
+                    // 2. It was inside NO try. The exception-safe ThreadPool ctor earlier in this
+                    //    branch converted thread exhaustion from a terminate-in-~vector into a
+                    //    THROW — and the boot site (see the ctor at the top of run()) catches it
+                    //    and degrades to startup_failed_. This site did not. Under EAGAIN, or a
+                    //    docker `--pids-limit`, the throw escaped run(), and main.cpp calls
+                    //    `agent->run()` bare — so it was std::terminate WITHOUT UNWINDING: the
+                    //    ScopeExit never ran, plugins never got shutdown(), the SQLite stores
+                    //    never closed, the watcher thread was never joined. A pid-pressure event
+                    //    took the endpoint out hard, and systemd's Restart= then hot-looped it.
+                    //
+                    // Degrade the way the boot site does: stop, and let the supervisor restart us
+                    // cleanly. (governance: cpp-safety BLOCKING, sre OR-5, happy-path F1.)
+                    try {
+                        thread_pool_ =
+                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+                    } catch (const std::exception& e) {
+                        spdlog::critical("could not re-create the command dispatch thread pool on "
+                                         "reconnect ({}) — the host is out of threads. Stopping "
+                                         "cleanly rather than aborting.",
+                                         e.what());
+                        stop_requested_.store(true, std::memory_order_release);
+                        break;
+                    } catch (...) {
+                        spdlog::critical("could not re-create the command dispatch thread pool on "
+                                         "reconnect (non-std exception) — stopping cleanly rather "
+                                         "than aborting.");
+                        stop_requested_.store(true, std::memory_order_release);
+                        break;
+                    }
+
                     ++reconnect_count;
                     metrics_.counter("yuzu_agent_reconnections_total").increment();
                     spdlog::warn("Connection lost — will attempt reconnect");
@@ -2253,6 +2318,10 @@ public:
         // sync_ctx_ was missed entirely by the first ctx_mu_ patch.
         cancel_ctx(heartbeat_ctx_);
         cancel_ctx(sync_ctx_);
+        // Registration wedge: on a stop during registration this is the ONLY live context —
+        // subscribe/heartbeat/sync are not published until Register has SUCCEEDED, so cancelling
+        // only those three left main parked in Register with nothing to interrupt it.
+        cancel_ctx(register_ctx_);
     }
 
     std::string_view agent_id() const noexcept override { return cfg_.agent_id; }
@@ -2527,6 +2596,7 @@ private:
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
+
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
@@ -2576,6 +2646,11 @@ private:
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> sync_ctx_{nullptr}; // ADR-0016 daily-sync RPC (cancel on teardown)
+    /// The Register RPC. Blocking, on the MAIN thread, and the only one of the four that runs
+    /// BEFORE the others are published — so on a registration wedge it is the ONLY context
+    /// stop() has to cancel. It carries a deadline too (kRegisterTimeout): the OTA self-stop
+    /// path gets no signal at all, so cancellation alone would not bound it.
+    std::atomic<grpc::ClientContext*> register_ctx_{nullptr};
 
     /// Publishes a STACK-owned ClientContext into one of the slots above for exactly the
     /// lifetime of the enclosing scope, and retracts it under ctx_mu_ on the way out —

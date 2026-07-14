@@ -22,7 +22,7 @@
 /// ordinary thread — one stop() never joins — makes the whole class structurally impossible,
 /// and is what let SparkEngine delete its entire signal-mitigation layer.
 ///
-/// ── FIVE TRAPS. All hit for real by an earlier attempt. Do not "simplify" past them. ──
+/// ── SIX TRAPS. All hit for real. Do not "simplify" past them. ──
 ///   1. A bare joinable std::thread in main's scope: `agent->run()` is NOT wrapped in a try
 ///      at its call site, so a throw unwinds past it -> ~std::thread on a joinable thread ->
 ///      std::terminate. Hence RAII, declared AFTER the Agent so it is destroyed FIRST.
@@ -38,18 +38,29 @@
 ///   5. Closing the read end while the write end lives makes any late write raise SIGPIPE,
 ///      whose disposition here is SIG_DFL: it KILLS the agent (exit 141). The fds are never
 ///      closed; two held to process exit is the correct trade.
+///   6. `ok()` MUST test liveness, never `joinable()` — which stays TRUE for a FINISHED thread.
+///      If the watcher died on a read() error, a joinable()-based ok() went on reporting true,
+///      the handlers stayed installed, and every later SIGTERM was written into a pipe with NO
+///      READER: swallowed. The agent became UNKILLABLE by SIGTERM. Hence `alive_`, plus the
+///      `on_watcher_died` callback that hands the signals back to the kernel (SIG_DFL).
+///
+/// AND: nothing may throw out of the CONSTRUCTOR BODY (trap 2) — including a LOG. spdlog
+/// rethrows non-std exceptions, so every failure-path log goes through log_quietly()'s
+/// try/catch firewall. thread_pool.hpp carries the same firewall for the same reason.
 ///
 /// AND: if construction fails, `ok()` is false and the caller MUST NOT install the signal
 /// handlers — otherwise the handler catches the signal, finds no pipe, returns, and the
 /// signal is SWALLOWED with no default disposition left, so SIGTERM stops working entirely.
 ///
-/// ESCALATION IS THE HANDLER'S JOB, NOT THE WATCHER'S. The watcher's callback runs
-/// Agent::stop(), which BLOCKS until teardown completes — so the watcher cannot read a second
-/// byte while a teardown is wedged, which is precisely when escalation is needed. (stop()
-/// drains guardian_/dex_observer_ with an UNBOUNDED wait, so a stuck worker can hang shutdown
-/// indefinitely.) The SECOND signal is therefore handled in on_signal itself, which calls
-/// _exit() — async-signal-safe, and the only thing that can still act once the watcher is
-/// parked inside a stuck stop().
+/// ── THE SECOND-SIGNAL ESCALATION IS AN INTERACTIVE-OPERATOR FEATURE ONLY. ────────
+/// It is NOT the production mitigation, and must never be relied on as one: systemd and
+/// `docker stop` each send exactly ONE SIGTERM and then SIGKILL. No supervisor ever sends a
+/// second. The OTA self-stop path (the update thread calls Agent::stop() itself) gets no
+/// signal at all and no supervisor timeout, because nobody asked us to stop.
+/// The bound that actually covers production is the INTERNAL shutdown deadline in Agent::stop()
+/// (--shutdown-timeout), deliberately set below every supervisor timeout so WE win the race and
+/// the failure is observable as our own error + exit code rather than a silent SIGKILL.
+/// (governance: sre + unhappy-path, independently.)
 
 #ifndef _WIN32
 
@@ -77,7 +88,11 @@ public:
     /// called at most once. If it returns false the watcher keeps waiting — used when the
     /// Agent is not published yet, so a signal arriving during boot cannot CONSUME the
     /// watcher and leave every later signal a no-op.
-    ShutdownWatcher(std::atomic<int>& wfd_slot, std::function<bool()> on_shutdown)
+    /// `on_watcher_died` runs if the watcher thread exits UNEXPECTEDLY — a read() error, as
+    /// opposed to the destructor's kQuit or a completed teardown. The caller MUST use it to put
+    /// SIGINT/SIGTERM back to SIG_DFL: see trap 6.
+    ShutdownWatcher(std::atomic<int>& wfd_slot, std::function<bool()> on_shutdown,
+                    std::function<void()> on_watcher_died = {})
         : wfd_slot_{wfd_slot} {
         // Trap 4: O_CLOEXEC on both ends. Trap 3: O_NONBLOCK on the WRITE end ONLY.
 #ifdef __linux__
@@ -92,7 +107,7 @@ public:
             // own thing. (No fd is open on this path, so degrade() only retracts the slot.)
             // (governance Gate-8 round 9 cpp-safety.)
             degrade();
-            spdlog::warn("could not create the shutdown pipe ({})", std::strerror(err));
+            log_quietly("could not create the shutdown pipe", err);
             return;
         }
 #ifndef __linux__
@@ -101,16 +116,22 @@ public:
         // silently-failed F_SETFD restores the subprocess-inherit lever it exists to remove.
         if (::fcntl(fds_[0], F_SETFD, FD_CLOEXEC) < 0 ||
             ::fcntl(fds_[1], F_SETFD, FD_CLOEXEC) < 0) {
-            spdlog::warn("could not set FD_CLOEXEC on the shutdown pipe ({}) — the fds will be "
-                         "inherited by child processes",
-                         std::strerror(errno));
+            // Fail CLOSED: a pipe whose fds leak into every popen()/fork+exec child hands each
+            // subprocess a lever to stop the agent. degrade() -> ok()==false -> the caller leaves
+            // SIG_DFL standing, which is still killable, just not graceful.
+            const int err = errno;
+            degrade();
+            log_quietly("could not set FD_CLOEXEC on the shutdown pipe", err);
+            return;
         }
 #endif
         const int wfl = ::fcntl(fds_[1], F_GETFL);
         if (wfl < 0 || ::fcntl(fds_[1], F_SETFL, wfl | O_NONBLOCK) < 0) {
-            spdlog::warn("could not set O_NONBLOCK on the shutdown pipe's write end ({}) — a "
-                         "signal handler could block on a full pipe",
-                         std::strerror(errno));
+            // Fail CLOSED: a blocking write end can BLOCK THE SIGNAL HANDLER on a full pipe.
+            const int err = errno;
+            degrade();
+            log_quietly("could not set O_NONBLOCK on the shutdown pipe's write end", err);
+            return;
         }
 
         wfd_slot_.store(fds_[1], std::memory_order_release);
@@ -118,31 +139,58 @@ public:
         // Trap 2: a throw from HERE (std::thread's ctor, EAGAIN) means the destructor never
         // runs, so RAII cannot save us — clean up by hand and degrade.
         try {
-            thread_ = std::thread([rfd = fds_[0], cb = std::move(on_shutdown)] {
+            thread_ = std::thread([this, rfd = fds_[0], cb = std::move(on_shutdown),
+                                   died = std::move(on_watcher_died)] {
                 for (;;) {
                     char byte = 0;
                     ssize_t n = 0;
                     do {
                         n = ::read(rfd, &byte, 1); // BLOCKS — trap 3
                     } while (n < 0 && errno == EINTR);
-                    if (n != 1 || byte == kQuit)
-                        return; // normal exit or EOF — teardown is the main thread's job
-                    if (cb && cb())
+
+                    if (n == 1 && byte == kQuit)
+                        return; // the destructor retiring us — the expected quiet exit
+
+                    if (n != 1) {
+                        // TRAP 6 — UNEXPECTED DEATH. `n < 0` (EBADF/EIO) or a short read used
+                        // to take the same `return` as kQuit: the thread vanished, ok() went on
+                        // reporting TRUE (it tested joinable(), which stays true for a FINISHED
+                        // thread), the handlers stayed installed, and every later SIGTERM was
+                        // written into a pipe with NO READER — swallowed. The agent became
+                        // unkillable by SIGTERM, exactly the fail-open-to-hang this class exists
+                        // to remove, reached through a different door.
+                        // Retract the slot and hand the signals back to the kernel.
+                        const int err = (n < 0) ? errno : 0;
+                        wfd_slot_.store(-1, std::memory_order_release);
+                        alive_.store(false, std::memory_order_release);
+                        log_quietly("the shutdown watcher died unexpectedly — restoring the "
+                                    "default signal disposition (shutdown will NOT be graceful)",
+                                    err);
+                        if (died)
+                            died(); // caller restores SIG_DFL
+                        return;
+                    }
+
+                    if (cb && cb()) {
+                        alive_.store(false, std::memory_order_release);
                         return; // teardown ran (it BLOCKS until complete); nothing more to do
+                    }
                     // cb() said "not yet" (the Agent is not published): keep waiting rather
                     // than being consumed, or every LATER signal becomes a silent no-op.
                 }
             });
+            // Published only once the thread really exists. ok() reads THIS, never joinable().
+            alive_.store(true, std::memory_order_release);
         } catch (const std::exception& e) {
             degrade();
-            spdlog::warn("could not start the shutdown watcher ({})", e.what());
+            log_quietly("could not start the shutdown watcher", 0, e.what());
         } catch (...) {
             // Degrading is this class's whole purpose, and a throw escaping a CONSTRUCTOR BODY
             // skips the destructor (trap 2) — so nothing may escape, not even a non-std throw.
             // std::thread only throws std::system_error today, but a caller-supplied
             // std::function copy could throw anything. (Gate-8 round 7 cpp-expert S-3.)
             degrade();
-            spdlog::warn("could not start the shutdown watcher (unknown exception)");
+            log_quietly("could not start the shutdown watcher (unknown exception)");
         }
     }
 
@@ -205,10 +253,13 @@ public:
                 // The exhaustion case reports EAGAIN, so a bare `last_err ? strerror : "full"`
                 // could never print the full-pipe message it named. Distinguish them properly —
                 // another string that asserted a case it did not cover. (Gate-8 round 10.)
-                spdlog::warn("could not retire the shutdown watcher ({}) — detaching it rather "
-                             "than blocking process exit on a join that cannot complete",
-                             stayed_full ? "pipe stayed full after 1000 attempts"
-                                         : std::strerror(last_err));
+                // Firewalled like every other log here: ~ShutdownWatcher is implicitly noexcept,
+                // and spdlog rethrows non-std exceptions — a throw from a destructor is an
+                // immediate std::terminate. (governance: cpp-safety, this range.)
+                log_quietly("could not retire the shutdown watcher — detaching it rather than "
+                            "blocking process exit on a join that cannot complete",
+                            stayed_full ? 0 : last_err,
+                            stayed_full ? "pipe stayed full after 1000 attempts" : nullptr);
                 thread_.detach();
                 return;
             }
@@ -225,7 +276,7 @@ public:
     /// TRUE iff the watcher thread is actually running. If FALSE the caller MUST NOT install
     /// the signal handlers — see the header note (a swallowed signal leaves the agent
     /// unkillable by SIGTERM).
-    [[nodiscard]] bool ok() const { return thread_.joinable(); }
+    [[nodiscard]] bool ok() const { return alive_.load(std::memory_order_acquire); }
 
     [[nodiscard]] int read_fd_for_test() const { return fds_[0]; }
     [[nodiscard]] int write_fd_for_test() const { return fds_[1]; }
@@ -264,9 +315,30 @@ private:
         }
     }
 
+    /// Every log on a failure path goes through here. spdlog RETHROWS non-std exceptions, and
+    /// a throw escaping a CONSTRUCTOR BODY skips the destructor (trap 2) -- which would leak both
+    /// pipe fds and then std::terminate, on precisely the exhausted host this class exists to
+    /// survive. thread_pool.hpp carries the same firewall for the same reason.
+    /// (governance: cpp-safety, this range.)
+    static void log_quietly(const char* what, int err = 0, const char* extra = nullptr) noexcept {
+        try {
+            if (extra)
+                spdlog::warn("{} ({})", what, extra);
+            else if (err != 0)
+                spdlog::warn("{} ({})", what, std::strerror(err));
+            else
+                spdlog::warn("{}", what);
+        } catch (...) {
+            // Nothing to do and nowhere to say it. Never let a logger kill the agent.
+        }
+    }
+
     std::atomic<int>& wfd_slot_;
     int fds_[2]{-1, -1};
     std::thread thread_;
+    /// LIVENESS, not joinable(). Set once the thread exists; cleared by the thread when it
+    /// exits. ok() reads this -- see trap 6.
+    std::atomic<bool> alive_{false};
 };
 
 } // namespace yuzu::agent

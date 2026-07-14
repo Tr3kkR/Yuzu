@@ -174,13 +174,26 @@ static void on_signal(int sig) {
     // (Deliberately NOT re-arming with std::signal(sig, on_signal) here: that would be new,
     // unverifiable behaviour on the one platform this session cannot build or test.)
     if (g_signal_count.fetch_add(1, std::memory_order_acq_rel) >= 1) {
-        const char hard[] = "Second signal — graceful stop is not completing; exiting now.\n";
+        // NOTHING MAY PRECEDE THE EXIT — not even a log.
+        //
+        // This used to write a "Second signal ..." banner to stderr first. But stderr is a
+        // BLOCKING pipe under Docker's json-logger and under journald, so a stalled collector or
+        // a full log disk blocks the write INSIDE THE HANDLER — and the escape hatch whose whole
+        // purpose is to work when everything else is wedged became the thing that wedged. The
+        // operator still gets out: the process dies immediately, and the exit code says so.
+        // Diagnosis belongs to the INTERNAL shutdown deadline (--shutdown-timeout), which runs
+        // on an ordinary thread and can log safely before it exits.
+        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7.)
 #ifdef _WIN32
-        _write(2, hard, sizeof(hard) - 1);
+        // ::_exit() routes through ExitProcess, which terminates every other thread and THEN
+        // runs DLL_PROCESS_DETACH for each of the ~47 loaded plugin DLLs — taking the loader
+        // lock a wedged thread may already hold. The one path whose entire job is unconditional
+        // escape could itself deadlock. TerminateProcess runs no DllMain and takes no loader
+        // lock. (governance: cross-platform SHOULD-1.)
+        ::TerminateProcess(::GetCurrentProcess(), 1);
 #else
-        (void)::write(STDERR_FILENO, hard, sizeof(hard) - 1);
+        ::_exit(1); // exit_group(2): no atexit, no dtors, no loader lock. Cannot block.
 #endif
-        ::_exit(1);
     }
 
 #ifdef _WIN32
@@ -212,15 +225,23 @@ static void on_signal(int sig) {
             a->stop();
     }
 #else
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
-
+    // ── THE PIPE BYTE GOES FIRST. THE LOG IS NEVER ALLOWED TO GATE THE TEARDOWN. ──────
+    //
+    // stderr is a BLOCKING pipe under Docker's json-logger and under journald. A stalled log
+    // consumer, a full log disk, or a wedged collector makes this write() block INSIDE THE
+    // SIGNAL HANDLER — and glibc masks the signal while its handler runs, so the operator's
+    // second SIGTERM cannot even be delivered. Logging first therefore defeated BOTH the
+    // graceful stop AND the escalation that exists to rescue it, on a fleet-correlated fault
+    // (disk-full hits every endpoint at once). The pipe write is O_NONBLOCK and cannot block;
+    // the log is best-effort and comes after. (governance: security-guardian + unhappy-path.)
     const int wfd = g_shutdown_wfd.load(std::memory_order_acquire);
     if (wfd >= 0) {
         const char byte = yuzu::agent::ShutdownWatcher::kSignal;
-        ssize_t n = ::write(wfd, &byte, 1); // the ONLY async-signal-safe call in here
-        (void)n; // write end is O_NONBLOCK: EAGAIN on a full pipe just means a shutdown is
-                 // already pending, which is exactly what we wanted.
+        ssize_t n = ::write(wfd, &byte, 1); // async-signal-safe, and CANNOT block (O_NONBLOCK)
+        (void)n; // EAGAIN on a full pipe just means a shutdown is already pending — which is
+                 // exactly what we wanted.
     }
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1); // best-effort; may block, harmlessly now
 #endif
     errno = saved_errno;
 }
@@ -366,6 +387,7 @@ int main(int argc, char* argv[]) {
                    "Update check interval in seconds (default: 21600 = 6h)")
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
+
     app.add_flag("--dex-disable", cfg.dex_disable,
                  "Disable the Guardian DEX crash recorder (collect no process-crash "
                  "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
@@ -621,13 +643,25 @@ int main(int argc, char* argv[]) {
     // call stop() on a destroyed Agent. RAII rather than a bare thread because
     // `agent->run()` below is NOT wrapped in a try at its call site: a throw would unwind
     // past a joinable std::thread and std::terminate. Do not reorder.
-    yuzu::agent::ShutdownWatcher shutdown_watcher{g_shutdown_wfd, [] {
-        auto* a = g_agent.load(std::memory_order_acquire);
-        if (!a)
-            return false; // not published yet — keep waiting, do not consume the watcher
-        a->stop(); // ordinary thread: safe to lock, join, malloc, log
-        return true;
-    }};
+    yuzu::agent::ShutdownWatcher shutdown_watcher{
+        g_shutdown_wfd,
+        [] {
+            auto* a = g_agent.load(std::memory_order_acquire);
+            if (!a)
+                return false; // not published yet — keep waiting, do not consume the watcher
+            a->stop();        // ordinary thread: safe to lock, join, malloc, log
+            return true;
+        },
+        [] {
+            // TRAP 6 — the watcher died on a read() error. If we leave the handlers installed,
+            // on_signal keeps writing bytes into a pipe with NO READER and every SIGTERM is
+            // SWALLOWED: the agent becomes unkillable by anything but SIGKILL. Hand the signals
+            // back to the kernel. Ungraceful, but killable beats unkillable.
+            // Async-signal-safety is not a concern here: this runs on the watcher thread, an
+            // ordinary thread, not in a handler context.
+            std::signal(SIGINT, SIG_DFL);
+            std::signal(SIGTERM, SIG_DFL);
+        }};
 #endif
 
     g_agent.store(agent.get(), std::memory_order_release);
