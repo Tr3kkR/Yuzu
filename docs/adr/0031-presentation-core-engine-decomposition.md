@@ -235,6 +235,13 @@ discovering it later:
   incident invents, under pressure, with no gate. It means: the auth/RBAC store is **unreachable**, or
   **fails its integrity check**, or reports a **migration/schema mismatch**. In any of those states
   core fails closed (the posture table below) and 6a refuses like every other surface.
+- **A successfully-migrated but EMPTY store is healthy, not degraded** — and this distinction is load
+  bearing, because the tempting hole is right here: *"no principals exist yet, so let the first caller
+  create one."* That is an unauthenticated fleet-administration door with a friendly name, and an
+  attacker who can reach a freshly-provisioned server would walk through it. **6a has no
+  unauthenticated mode, ever, including at first boot.** First-admin seeding is the same offline,
+  operator-at-the-console tool as recovery — which is the right authorisation boundary, because
+  someone with filesystem access to the host already owns the machine.
 - **Which leaves a real question answered honestly: what recovers a corrupted RBAC store?** Not a
   network endpoint — an **offline, operator-at-the-console tool**, run with filesystem access to the
   host, which is its own authorisation boundary (if an attacker has that, they have the machine). It

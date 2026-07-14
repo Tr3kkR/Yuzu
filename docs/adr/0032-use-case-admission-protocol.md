@@ -95,6 +95,36 @@ them.
 
 ## Decision
 
+### 0. Authority is evaluated at FOUR seams, and every seam runs the WHOLE conjunction
+
+This decision exists because the drafting of this ADR kept getting it wrong in the same way, and the
+mistake is invisible one seam at a time.
+
+Authority is evaluated in exactly four places: **admission** (Decision 1), **every mid-run core call**
+(Decision 4), **the mint of a cached-result grant**, and **its redemption** (Decision 10). Each of them
+must evaluate the **full four-filter conjunction of ADR-0033 §1** —
+
+```
+operator grants ∩ attenuated credential grants ∩ Module envelope ∩ execution authorisation
+```
+
+— and **a seam that omits a filter is a bug, not an optimisation.** Successive drafts dropped the
+**credential** term at three of the four seams; each omission independently let a deliberately
+attenuated token act with its owner's full authority, which is worse than having no attenuation at
+all, because the operator believes the worker is confined.
+
+Two corollaries, both normative:
+
+- **Every filter reads LIVE, except the ceiling.** A frozen snapshot may only ever *narrow*: it is the
+  ceiling the run may not exceed. Anything that can be *revoked* — the operator's authority, the
+  engine's grants, the module's liveness, **and the credential** — is re-read at every seam. A frozen
+  input is an input revocation cannot reach, and revocation that cannot reach a live run is not
+  revocation.
+- **Whatever admits a run supplies a credential.** If a seam has no credential to filter on, the
+  answer is never "then that filter is vacuous" — it is that the seam is under-specified. Scheduled
+  runs (Decision 7) therefore record an **arming credential**, and it is the admitting credential of
+  every run they produce.
+
 ### 1. A run is one declared episode (P1)
 
 One admission, one input hash, one scope ceiling, one finalisation. Multi-step work happens
@@ -215,13 +245,19 @@ Core authorises each such call by looking the run up **server-side** and requiri
 4. the **admitting operator's CURRENT authority** still permits it — re-evaluated per call, not
    frozen at admission;
 5. the module version and capability are still **live** (Decision 6);
-6. the **admitting credential's attenuated grants** still permit it — the token's own narrower grant
-   set, frozen into the run row at admission and re-intersected on every call.
+6. the **admitting credential's attenuated grants** still permit it — **the snapshot frozen into the
+   run row at admission ∩ that credential's CURRENT grants**. The snapshot is the ceiling (the run can
+   never widen beyond what the credential could do when it admitted); the live read is what makes
+   revocation work. A credential that has been **revoked, deleted or narrowed to empty ABORTS the run**
+   (terminal `aborted`, reason `credential_revoked`) — symmetric with filter (4)'s operator revocation
+   and Decision 6's module revocation. Freezing alone would make the credential the one input in this
+   conjunction that revocation cannot reach: kill a leaked worker token and its in-flight runs would
+   keep acquiring facts and driving effects for the whole TTL.
 
 **Filter (6) exists because the narrowing law has four filters and this conjunction was quietly
 dropping one.** ADR-0033 §1: `effective authority = operator grants ∩ attenuated credential grants ∩
-Module envelope ∩ execution authorisation`. Filters (2)–(4) cover the operator and the module; nothing
-covered the **credential**. So a run admitted by a read-only, canary-ring-only token would, for its
+Module envelope ∩ execution authorisation`. Filters (2)–(5) covered the operator, the engine and the
+module; nothing covered the **credential**. So a run admitted by a read-only, canary-ring-only token would, for its
 entire mid-run life, be authorised against its *owner's* full authority — the attenuation would apply
 at admission and evaporate immediately afterwards, which is worse than not having it, because the
 operator believes the worker is confined. The credential's grant set is bound into the run row at
@@ -342,7 +378,14 @@ would be a comforting sentence and a wrong one.
 Automation and agentic workers reach use cases through the **projected REST/MCP capability** on the
 one public surface — never by calling the UCE. Scheduled and background runs enter through the same
 internal path with the same admission — and **the human who armed the schedule is the ADMITTING
-OPERATOR of every run it produces.** Every filter in Decision 4 therefore evaluates against the
+OPERATOR of every run it produces, while the credential they armed it with is the ADMITTING
+CREDENTIAL of every one of them.** The schedule records both. This is not bookkeeping: without a
+recorded arming credential, Decision 0's credential filter has no input on a scheduled run, and an
+attenuated read-only worker token that arms a schedule would **launder every run it produces out of
+its own attenuation** — the token cannot do the thing, but the schedule it armed can. Revoking the
+arming credential **stops the schedule**, exactly as demoting the armer does. And the idempotency
+namespace (Decision 1) keys on that credential, so a scheduled run is never a hole in that rule
+either. Every filter in Decision 4 therefore evaluates against the
 armer's **current** authority: a schedule whose armer is demoted or deleted stops producing runs.
 There is no system principal that admits runs on nobody's behalf.
 
@@ -439,8 +482,12 @@ never partially re-served.**
 Where that rule is enforced, normatively:
 
 1. A cached-result read **is a fast-lane re-admission**. Presentation calls core, not the UCE.
-2. **Core runs the subset check** — the requesting principal's current authority against the source
-   run's released-input set, read from core's own release log.
+2. **Core runs the subset check** — and it is the **full four-filter conjunction of Decision 0**,
+   credential term included, against the source run's released-input set as read from core's own
+   release log. Not "the operator's authority": *the requesting credential's* authority. This is the
+   path that actually hands bytes to a caller, so it is the last place that can afford to drop a
+   filter — a read-only, canary-ring-only token whose **owner** happens to be allowed the production
+   blend must not be able to request the cached result of a run that spans production.
 3. On success, core mints a **result-scoped grant**: audience-bound to the intended caller,
    one-use, short-TTL, naming the **source `use_case_run_id`**, the digest of the released-input set
    it was checked against, and the requesting principal.
@@ -451,10 +498,11 @@ Where that rule is enforced, normatively:
      one-way-transition pattern as Decision 5's state machine, in Postgres). The CAS is what makes
      "one-use" **true**: two concurrent redemptions, or two engine replicas, produce exactly one
      winner, and core — not the engine — is the one holding the fact.
-   - Core **re-evaluates the subset check against the requesting operator's authority as it is at
-     redemption**, not as it was at mint. This closes the window between the two: an operator whose
-     scope shrinks after the grant is minted is denied at redemption. Without this step the check
-     is only as fresh as the TTL, which is exactly the S3 hole re-opened at a smaller size.
+   - Core **re-evaluates the subset check — the same full conjunction, credential term included —
+     against authority as it is AT REDEMPTION**, not as it was at mint. This closes the window between
+     the two: an operator whose scope shrinks, or a credential that is revoked, after the grant is
+     minted is denied at redemption. Without this step the check is only as fresh as the TTL, which is
+     exactly the S3 hole re-opened at a smaller size.
    - Core **writes the serve's release-log entry** as part of the same transaction, so the
      disclosure is recorded by the component that authorised it.
    - **All of this is ONE transaction** — the CAS, the re-check and the release-log write commit
@@ -751,9 +799,10 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
 | **(f)** | **Per-action mutability in the plugin ABI** | Gates **the fact-acquisition dispatch path only** (Decision 8). Without it the agent-side plugin host cannot refuse a non-read-only action, and the mutating-by-default posture has the human manifest diff as its **only** backstop — which Decision 8 itself says must never be the case. | `plugin.h` carries action **names** only (`const char* const* actions`); no mutability metadata. An ABI change (v3 → v4) across the 49 in-tree plugins. |
 | **(g)** | **Derived-state confinement** — per-run provenance on derived rows, or a ban on cross-run derived state | Gates **any module that persists derived state across runs**. ADR-0031's INV-31-2 confines what the engine *receives*, not what it *retains*: a rollup computed under a wide run and read inside a narrower operator's run is confined by **nothing** in this set. ADR-0031 says it must close "before a module persists its first cross-run rollup" — that sentence is prose, and prose is what this interlock exists to replace. | Nothing exists. Not a line of engine code has been written, so this is free to fix now and a cross-operator disclosure to fix later. |
-| **(h)** | **The runtime capability-declaration registry** (core's ratified-mapping table) | Gates **admission itself**. Decisions 1, 5 and 13 read the risk tier, the TTL and the mutability class from *core's ratified copy*. There is no such copy: securable types are a hard-coded C++ array (`rbac_store.cpp:217-244`, 21 entries) with **no runtime create path**. Without (h) the first implementation reads the manifest — which is the S4 failure this ADR rejects by name. | Unbuilt. ADR-0033 §2 calls it "the precondition for every rule in this section" and it appeared in no gate until now. |
+| **(h)** | **The runtime capability-declaration registry** (core's ratified-mapping table), **and the run row's credential columns** (admitting credential id + its frozen grant snapshot — Decision 0's credential filter has nowhere to live without them) | Gates **admission itself**. Decisions 1, 5 and 13 read the risk tier, the TTL and the mutability class from *core's ratified copy*. There is no such copy: securable types are a hard-coded C++ array (`rbac_store.cpp:217-244`, 21 entries) with **no runtime create path**. Without (h) the first implementation reads the manifest — which is the S4 failure this ADR rejects by name. | Unbuilt. ADR-0033 §2 calls it "the precondition for every rule in this section" and it appeared in no gate until now. |
 | **(i)** | **Execution semantics: outcome correlation + the coverage envelope** | Gates **every distributed fact read and every effect**. ADR-0033 §10 requires `intended/contacted/responded/failed/timed_out`, and D11's Execution Plan requires a real outcome. The workflow engine marks a step **successful on dispatch** (`workflow_engine.cpp`) and does not correlate an `execution_id`. A finalisation receipt over that attests effects nobody confirmed, and "no vulnerable devices found" becomes indistinguishable from "62 devices never answered" — the exact sentence ADR-0033 §10 exists to forbid. | Coverage fields: zero occurrences in the tree. Dispatch-vs-outcome correlation: unwired. This is the memorandum's "repair execution semantics" step, now a gate. |
 | **(j)** | **Capability projection** — generated OpenAPI + generated `tools/list` from core's registry | Gates **the agentic surface**, i.e. the thing voiding F-10 was for. `tools/list` iterates a **compile-time array** (`mcp_server.cpp`) and the OpenAPI document is a hand-typed literal (`rest_api_v1.cpp`). Activate a module today and its capabilities appear on **neither**. Without (j), an engine is reachable by nobody, and INV-31-4's contract test cannot exist either — you cannot diff registered routes against a hand-written document. | Unbuilt. |
+| **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
 | **(k)** | **Operational readiness** — the new stores in the readiness conjunction, and the reaper's liveness alert | Gates **admitting a run in anger**. Six new stores (run, release log, grants/receipts, approvals, plans, declarations) and none is in `/readyz`'s `stores_ok` conjunction; the reaper fails **open** (every un-reaped run stays read-authoritative) and has no liveness signal. Every row in that conjunction was added because a store died and the server reported healthy. | Unbuilt. Metric names in Decision 5. |
 
 **Rule:** no ballot-A5 code path ships until **(a)–(d)** and **(h)** have landed — (h) joins the
