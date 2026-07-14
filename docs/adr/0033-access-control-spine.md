@@ -117,8 +117,16 @@ Each registered tool or capability declares, at registration, a triple plus a ti
   gate for declared tools is prohibited: extend the existing chokepoint, never parallel it.
 
 Role administration therefore stays at securable granularity — the role UX does not become a wall of
-per-tool checkboxes — while individual tools still carry an operation and a risk tier. **A new engine
-is data, not core code.**
+per-tool checkboxes — while individual tools still carry an operation and a risk tier. The goal is
+that **a new engine's permissions are data, not C++**.
+
+**They are not, today, and that gap is this section's precondition.** Securable types are a
+hard-coded C++ array seeded `is_system` into the RBAC store (`rbac_store.cpp:217-236`, 20 entries);
+`RbacStore` offers `list_securable_types()` and **no runtime create path**. So §2's own escape hatch
+— "a Module mints a new securable only when nothing fits" — is a C++ edit, a recompile and a
+release. **Building the runtime capability-declaration registry is core work, it is the precondition
+for every rule in this section, and it lands on a store ADR-0006 also requires be migrated to
+Postgres.** Until it exists, an engine ships with a core release.
 
 **The declaration is the security boundary, so the declaration is vetted (G3):**
 
@@ -145,8 +153,15 @@ effective = (token roles ∩ owner roles)  within  (token scope ∩ owner scope)
 
 - The scope cap is expressed **in the existing scope language** — the single-scope-engine rule holds;
   no new dialect. "Read-only vuln triage, canary ring only" must be expressible at mint time.
-- Narrowing only. Escalation is impossible by construction, because the owner's *current* grants are
-  one side of every intersection — a token does not outlive a demotion.
+- Narrowing only: the owner's **current** grants are one side of every intersection, so a token does
+  not outlive a demotion. **This is enforced by code, not by construction** — the formula's *shape*
+  guarantees nothing on its own. It is real only once M5.3's contract test exists, and only if
+  **every** authority-shrinking path invalidates `RbacStore`'s permission cache (`perm_cache_`,
+  keyed `user:type:op`, bumped on permission and role mutation) — **including scope and
+  management-group changes**, not just role changes. A cache that misses one of those paths is a
+  token that *does* outlive its demotion. (Saying "impossible by construction" here would contradict
+  the migration rule below, which is written on the premise that the intersection is decorative
+  storage until a test proves otherwise.)
 - Same intersection machinery as delegation (2b) and as the invocation grant (ADR-0032). One
   narrowing model everywhere, not three.
 
@@ -331,9 +346,12 @@ by the side door — an authority-widening path that no filter in §1 evaluates.
 - **Deciding attenuation now is cheaper than deciding it later.** It is a schema change on
   `ApiToken`; after the auth store's Postgres migration it is a schema change *plus* a data
   migration under load.
-- **Works-council counters come free.** Once §2's declarations exist, every capability that reads
-  device-attributable data can carry its own audit verb (the shipped `device.live.*` pattern), so
-  each kind of sensitive read stays separately countable.
+- **Works-council counters become possible and cheap — not free.** §2's declarations give every
+  capability a place to hang its own audit verb (the shipped `device.live.*` /
+  `emit_behavioral_audit` pattern), but the verb is still declared per capability and routed through
+  the `rest_audit.hpp` chokepoint by hand, and the counting/reporting surface does not exist. What
+  §2 actually buys is that **no capability can arrive unclassified — so none can arrive
+  uncountable.**
 - **Every capability declaration becomes a security-review artifact.** That is the cost of Modules
   being data: the manifest diff is now something a human must actually read, and it is the last human
   check before core's registry copy becomes binding.

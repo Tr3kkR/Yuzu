@@ -157,16 +157,25 @@ agent connections; it does not move northbound.
 linkage included — must pass before this leg is committed to. The `#375` history (grpc/protobuf/
 abseil static linkage on Windows MSVC) is the reason this is a gate and not an assumption.
 
+**Size this honestly: G10 gates the linkage, not the port.** Choosing Drogon avoids a *language*
+port — the C++ stays C++ — but it is still a **framework** port. Every handler registration across
+the 23 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of
+`mcp_server.cpp` move from `httplib::Server`'s synchronous `Get`/`Post(path, handler)` signature to
+Drogon's async/coroutine controller model, and **every SSE content-provider is rewritten against a
+different concurrency model** — which is exactly the code whose semantics this ADR set cares most
+about. This is the **largest single item in the decomposition** and it needs its own estimate. "It
+ports across" is true of the language and false of the effort.
+
 **6. Isolation is enforced as if remote, from day one.** Components authenticate to each other over
 the network protocol even when they are co-located. **Co-location is a deployment default, not the
 mechanism** — nothing in the design rests on it, which is why any component can move to its own host
 with no code change. Three invariants are what make that true, and they are load-bearing precisely
 because co-location makes it tempting to skip them: authenticate over the network protocol even on
-localhost; the public versioned API only (INV-31-4); no cross-component database access (INV-31-3). **No cross-component database access** — the
-engine never touches the `yuzu` database, core holds no grant on `uce`, and **presentation owns no
-database at all.** ADR-1005's `REVOKE CONNECT … FROM PUBLIC` + separate-role isolation (2c D1) is
-reaffirmed and becomes *more* load-bearing, because co-location removes the network as an
-accidental barrier.
+localhost; the public versioned API only (INV-31-4); and **no cross-component database access**
+(INV-31-3) — the engine never touches the `yuzu` database, core holds no grant on `uce`, and
+**presentation owns no database at all**. ADR-1005's `REVOKE CONNECT … FROM PUBLIC` + separate-role
+isolation (2c D1) is reaffirmed and becomes *more* load-bearing, because co-location removes the
+network as an accidental barrier.
 
 **7. One PostgreSQL instance, two databases, in its own sibling container** (2c D1, reaffirmed;
 ballot A2). Same host as the three binaries today; separate roles, separate pools, no cross-database
@@ -210,15 +219,32 @@ strength from now on.
 **INV-31-2 — Core confines the inputs; the engine composes them** (the relocation of INV-7). Core
 is the only component that decides which devices, which rows and which data classes an engine may
 see, and it records that release at the moment of the read (ADR-0032's release log). The engine
-therefore **cannot disclose what it was never given** — safety by construction, not by the engine
-re-deriving ADR-0017 correctly. Aggregation and interpretation are the engine's job; confinement
-never is.
+therefore cannot disclose device data **core never released to it** — a real narrowing, and one the
+engine cannot get wrong by re-deriving ADR-0017 badly, because it never re-derives it. Aggregation
+and interpretation are the engine's job; confinement never is.
+
+Two honest qualifications, because this invariant is the one most likely to be over-read:
+
+- **Its mechanism does not exist yet.** Core's release gate *is* the ADR-0017 admit-then-filter
+  chokepoint evaluated as the admitting operator — and `authorize_list_read` has **zero occurrences
+  in the server tree** (#1716 unlanded). Until that gate and its evaluate-as-operator seam land
+  (ADR-0032's interlock, prerequisite (b)), this invariant is a specification, not a property.
+- **It bounds what the engine *receives*, not what it *retains*.** Everything core has ever released
+  to a module persists in the `uce` database — results, journal, and **derived state**. ADR-0032
+  Decision 10 closes the stored-result path (a cached serve is re-admitted and subset-checked).
+  **Derived state is an open gap**: a rollup computed under a wide run's release, read later inside a
+  narrower operator's run, is not confined by anything in this set today. It must be closed —
+  per-run provenance on derived rows, or a ban on cross-run derived state — **before a module
+  persists its first cross-run rollup.** Naming it here so it is not discovered by a works council.
 
 **INV-31-3 — No cross-component database access.** Decision 6, restated as an invariant because it
 is the one a "just this once, for performance" patch will attack first.
 
 **INV-31-4 — There is no private core API.** Decision 3, restated for the same reason. A build or
-contract test detects undeclared endpoints.
+contract test **must** detect undeclared endpoints — enumerating every registered route and failing
+the build on any that is absent from the published OpenAPI. **That test does not exist today**; it is
+a deliverable of migration step 3, and until it lands this invariant is enforced by review, like the
+rule it replaces.
 
 **INV-31-5 — Presentation's service identity attests infrastructure, not people** (ballot G2).
 Presentation authenticates to core with its own mTLS service identity and may attest peer IP and
@@ -233,7 +259,7 @@ correlation id (without which session peer-binding and lockout break). Core trus
 | Core unavailable | No new protected operation proceeds. Engine results needing fresh authority or fleet facts **fail closed** rather than serving an unconfined answer. | Core is the only authority and the only source of fleet truth. |
 | `uce` database unavailable | The affected module cannot start or advance a run. Core does **not** reconstruct engine domain state. | Avoids a hidden second owner of that state. |
 | `yuzu` database unavailable | Authentication, authorisation and new state-changing work fail closed; health endpoints report the condition. | Every fleet effect must remain attributed and authorised. |
-| Presentation unavailable | The product surface is down; the fleet keeps running. Sessions and replay survive, because they live in core/Postgres, not in presentation memory. | Presentation is replaceable by design. |
+| Presentation unavailable | The product surface is down; the fleet keeps running. Sessions and replay survive — **once** they have moved to core/Postgres (see Costs; today they are in `AuthManager`'s memory). That move is decided *with* the split, not after it, precisely because this row is otherwise false. | Presentation is replaceable by design. |
 | Gateway unavailable | Core retains pending commands and retry deadlines, every command identity unchanged. | Gateway state is disposable. |
 | Endpoint reconnects after an uncertain result | Core may redeliver the same command identity; the agent suppresses the duplicate effect and returns the remembered outcome where it has one. | At-least-once delivery without repeated effect. |
 | Partial distributed query | Return a coverage envelope, then apply the Use Case's completeness policy (ADR-0033 D11). | Missing evidence must never be read as a negative finding. |
@@ -242,11 +268,29 @@ correlation id (without which session peer-binding and lockout break). Core trus
 
 ## Consequences
 
-### The headless claim stops being a promise and becomes a property
+### The headless claim stops being a promise and becomes a property — but only half of it, and not yet
 
-The GUI cannot bypass the API because it is a different process. Parity is no longer a question the
-`consistency-auditor` has to remember to ask — the build answers it. This is the point of the ADR;
-the deployment flexibility is a bonus.
+**What the process boundary really buys:** the GUI cannot reach a store **in-process**, because it
+is a different process. Every dashboard capability must therefore exist as a core API endpoint.
+That much *is* structural, and it is the point of the ADR.
+
+**What it does not buy, and what a hurried reader will assume it does.** ADR-1005 parity is a bigger
+claim than "no in-process store access": it is *every capability reachable via versioned REST **and**
+MCP, discoverable, A4-enveloped*. The split leaves three ways to violate that, and the build detects
+none of them today:
+
+1. **A private core endpoint.** INV-31-4 forbids it; nothing enforces it. The contract test that
+   would — enumerate every registered route (23 `register_routes` families, and the handler
+   registrations under them) and fail the build on any not present in the published OpenAPI —
+   **does not exist**. It is a deliverable of migration step 3.
+2. **A REST route with no MCP twin.** Structurally invisible to the build.
+3. **A database grant handed to presentation or the engine.** Prevented by Postgres role
+   configuration (2c D1), not by the compiler.
+
+So: **the `consistency-auditor`'s standing question still carries the rule.** It is not retired by
+this ADR — it is retired by the contract test, and until that test exists, saying "the build answers
+it" would delete a governance control on the strength of a property the build does not have. The
+deployment flexibility is a bonus; the parity guarantee is *work*.
 
 ### F-10 is void, and the agentic gap closes as a side-effect
 
@@ -316,7 +360,15 @@ being structural.
   (`execution_event_bus.hpp`). Streaming progress from core to presentation across a process
   boundary is **new work and a prerequisite**, not an assumption — ballot G1, and a gate on
   ADR-0032's P4.
-- **Latency.** A localhost hop per request (~100 µs) against a 250 ms p95 view budget. Irrelevant.
+- **Latency — and the fan-out nobody has measured.** The hop is per **core call**, not per user
+  request. A view that today does K in-process store reads becomes **K authenticated localhost
+  calls** (Decision 6 admits no in-process shortcut), and an engine run adds admission, the
+  presentation→engine call, one core call per confined fact read, **a release-log write on the
+  fail-closed critical path of every one of them** (ADR-0032 Decision 11), and finalisation. A
+  single localhost round trip is genuinely small against a 250 ms p95 view budget. **K is not
+  measured.** Measuring it on the busiest existing dashboard fragment is a **gate on migration step
+  4**, not a footnote — sizing a fleet-scale resource off an unmeasured constant is precisely what
+  ADR-0030 records going wrong.
 - **Observability.** Three `/metrics` endpoints to scrape and one trace context to thread through.
 
 ### Migration — not a big bang
@@ -332,8 +384,11 @@ being structural.
    client), never stores directly. This is checkable, and it is most of the value.
 4. **Extract presentation** into its own Drogon binary against that seam (after G10), with durable
    sessions and replay behind the boundary.
-5. **Extract the engine** — nearly free, because it is new code that already talks to the server as
-   an external principal.
+5. **Extract the engine** — the cheapest of the five, because it is new code with no in-process
+   store access to unwind. **It is not free, and it is not first.** Engine principals are a
+   *reserved* `principal_class` that is **never emitted today** (`principal_class.hpp`), the
+   engine's GUI must go (superseding 2c D2), and no engine code path may ship before ADR-0032's
+   interlock (a)–(d) has landed.
 
 ### The acceptance tests live in ADR-0032
 

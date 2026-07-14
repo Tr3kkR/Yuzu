@@ -132,9 +132,17 @@ Two properties are load-bearing:
   short-TTL, server-issued). A5 deliberately pulls a bounded slice of Phase-5 delegation forward;
   it does not invent a second credential type. Opaque-vs-signed grant *format* is deferred — the
   binding, the audience and the TTL are not.
-- **It gates starting the run, nothing else.** The grant's TTL is not the run's authority. Every
-  subsequent core call is authorised by Decision 4's server-side lookup, so a long-lived run does
-  not need a long-lived credential, and a stolen grant expires without carrying the run with it.
+- **The invocation grant gates starting the run, nothing else.** Its TTL is not the run's authority.
+  Every subsequent core call is authorised by Decision 4's server-side lookup, so a long-lived run
+  does not need a long-lived credential, and a **stolen invocation grant expires without carrying
+  the run with it**.
+
+**One grant in this protocol is different, and the difference must not be blurred:** the
+**result-scoped grant** of Decision 10 **is** a release capability. Core runs the subset check
+*before* minting it, so the engine releases the cached bytes **on the grant alone** — Decision 4's
+server-side lookup is not in that path. Its safety therefore rests entirely on being **one-use,
+short-TTL and audience-bound** to the intended caller. Treat it as a bearer token over data, and
+test it as one. It is the one artifact in this design whose theft, inside its TTL, yields rows.
 
 The UCE rejects a grant that is missing, expired, wrong-audience, or mismatched against the request
 it accompanies.
@@ -173,8 +181,21 @@ Each use case declares a TTL in its manifest; core reads that TTL from **its rat
 (`use_case.run.expired`), and **revokes the run's read authority at that instant** — an expired run's
 next core call fails filter (1) of Decision 4.
 
-The invariant this buys: **every admitted run reaches a terminal audit state by construction.** No
-run merely stops being mentioned.
+The invariant this buys: **every admitted run reaches a terminal audit state.** No run merely stops
+being mentioned.
+
+**It is bought by a reaper, not by construction** — and a reaper is a background thread, which is a
+thing that can die quietly (the `PolicyEvaluator` precedent). So the invariant carries three
+requirements, and it is worth exactly as much as they are:
+
+- **A ceiling on the module-declared TTL** in core's ratified copy. A module must not be able to
+  declare a run that outlives the evidence for it.
+- **A liveness metric on the reaper, and an alert on stranded runs** (`admitted` past its TTL). If
+  the reaper dies, every run stays open and read-authoritative — the failure mode is silent, and it
+  fails *open*.
+- **A retry on a failed terminal audit write.** D6's mutation rule means a failed audit write fails
+  the transition closed — which for a reaper leaves the run non-terminal. Retry, or the run is
+  stranded by the very rule meant to protect it.
 
 ### 6. Revocation symmetry: a pulled module or capability aborts the run (P10)
 
@@ -188,8 +209,15 @@ capability liveness**; pulling either **aborts** the run (terminal `aborted`, re
 
 The UCE's invocation endpoint is internal and reachable **only** from presentation's mTLS service
 identity. The grant records its **intended caller**, so a leaked grant is useless off-path. This is
-defence in depth, not the primary control: the primary control is that the UCE can obtain nothing
-without core (Decision 4).
+defence in depth, not the primary control: the primary control is that the UCE can obtain **no fresh
+fleet fact and no effect** without core (Decision 4).
+
+**Say that precisely, because the looser version is false.** The engine is not empty. Everything
+core has ever released to it persists in the `uce` database — stored results, its journal, and
+derived state — in a database core's role cannot read. A compromised engine yields that corpus. It
+is *why* Decision 10 re-admits every cached serve rather than trusting a run id, and *why* Decision
+15 demands signed purge receipts rather than a report. "The engine can obtain nothing without core"
+would be a comforting sentence and a wrong one.
 
 Automation and agentic workers reach use cases through the **projected REST/MCP capability** on the
 one public surface — never by calling the UCE. Scheduled and background runs enter through the same
@@ -238,6 +266,16 @@ The UCE posts **run-scoped progress** to core; core fans it out subscriber-tagge
 event spine — one bus, one taxonomy, no second stream protocol
 (`docs/executions-history-ladder.md`'s standing invariant). Presentation routes by tag and makes no
 event-level permission decision.
+
+**But be honest about what "routes by tag" means for the TCB.** If core multiplexes one tagged
+stream to presentation and presentation demultiplexes it to subscribers, then **presentation's
+routing table is the confidentiality boundary between operators** — a routing bug is a cross-operator
+leak, which is an authority-shaped failure, which INV-31-1 says presentation never performs. Two
+honest resolutions, and G1's design must pick one explicitly: a **per-subscriber channel** (core
+never hands presentation an event that subscriber may not see — the boundary stays in core), or the
+multiplexed channel **with event confidentiality named as inside presentation's TCB**, alongside the
+bearer-credential exposure ADR-0031 already admits. What is not acceptable is claiming the boundary
+is in core while the demultiplexer is in presentation.
 
 Results persist in the `uce` database keyed by `use_case_run_id`. Retrieval of a past result is a
 re-admission (Decision 10), never a read of a durable object on run id. Retention rides the declared
@@ -304,8 +342,11 @@ compaction that stores a count, a scope expression, or a range that cannot be ex
 exact `agent_id` set answers neither. Compact the *encoding* (a roaring bitmap, a compressed id
 list); never compact the *content*. A rounded answer to a DSAR is not an answer.
 
-- *"Which device data went to which principal in which run"* is answerable **from core alone**.
-  DSAR and works-council evidence never depend on the engine's journal.
+- *"**Which devices**, of which data classes, under which verbs, went to which principal in which
+  run"* is answerable **from core alone** — DSAR and works-council evidence never depend on the
+  engine's journal. Note the precision: the release log records the *devices, classes and verbs*,
+  **not the field-level payload**. That is the honest scope, and it is what a DSAR actually needs;
+  promising field-level recall the log does not hold would be worse than a precise answer.
 - The finalisation disclosure summary (Decision 12) becomes **corroboration plus result
   schema/coverage** — not the evidence.
 - **A failed release-log write fails the read closed.** Rows do not leave core unrecorded. (This is
@@ -462,9 +503,12 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(c)** | **The D12 audit schema** (acting principal · authority ref · **indexed** `use_case_run_id`) | Decision 12. Without it, "no unjoined evidence" is not merely untested — it is **unqueryable**. Rides the audit-store Postgres migration. | `AuditEvent` has a single `principal` field. |
 | **(d)** | **The P7 release-log schema** | Decision 11 *is* the disclosure evidence, and Decision 10's subset check **reads it**. Ship A5 without it and admitted runs exist whose disclosure cannot be proven from core-owned evidence. | Does not exist. Born-on-PG store, ADR-0012. |
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
+| **(f)** | **Per-action mutability in the plugin ABI** | Gates **the fact-acquisition dispatch path only** (Decision 8). Without it the agent-side plugin host cannot refuse a non-read-only action, and the mutating-by-default posture has the human manifest diff as its **only** backstop — which Decision 8 itself says must never be the case. | `plugin.h` carries action **names** only (`const char* const* actions`); no mutability metadata. An ABI change (v3 → v4) across 47 plugins. |
 
 **Rule:** no A5 code path ships until **(a)–(d)** have landed. **(e)** gates Decision 9
-specifically.
+specifically; **(f)** gates Decision 8's fact-acquisition dispatch path specifically. A module may
+therefore be admitted, confined, evidenced and finalised over core-store facts before (f) lands —
+but it may not dispatch a fact-acquisition action to an endpoint.
 
 **Falsifier (what a violation looks like):** a merged PR that admits runs, mints grants or serves
 results while the audit row cannot carry an indexed `use_case_run_id`, or while no release-log write
