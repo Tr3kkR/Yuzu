@@ -93,8 +93,10 @@ public:
     /// Agent is not published yet, so a signal arriving during boot cannot CONSUME the
     /// watcher and leave every later signal a no-op.
     /// `on_watcher_died` runs if the watcher thread exits UNEXPECTEDLY — a read() error, as
-    /// opposed to the destructor's kQuit or a completed teardown. The caller MUST use it to put
-    /// SIGINT/SIGTERM back to SIG_DFL: see trap 6.
+    /// opposed to the destructor's kQuit or a completed teardown. The caller MUST use it to make
+    /// the process KILLABLE again (see trap 6). Note that "back to SIG_DFL" is NOT sufficient: the
+    /// agent is pid 1 in every shipped container, and the kernel DISCARDS a default-disposition
+    /// signal for pid 1 — main.cpp therefore installs a hard-exit handler instead.
     ShutdownWatcher(std::atomic<int>& wfd_slot, std::function<bool()> on_shutdown,
                     std::function<void()> on_watcher_died = {})
         : wfd_slot_{wfd_slot}, state_{std::make_shared<WatcherState>(&wfd_slot)} {
@@ -181,12 +183,13 @@ public:
                         // written into a pipe with NO READER — swallowed. The agent became
                         // unkillable by SIGTERM, exactly the fail-open-to-hang this class exists
                         // to remove, reached through a different door.
-                        // Retract the slot and hand the signals back to the kernel.
+                        // Retract the slot and make the process killable again — NOT via SIG_DFL,
+                        // which pid 1 discards; main.cpp installs a hard-exit handler.
                         const int err = (n < 0) ? errno : 0;
                         st->wfd_slot->store(-1, std::memory_order_release);
                         st->alive.store(false, std::memory_order_release);
-                        log_quietly("the shutdown watcher died unexpectedly — restoring the "
-                                    "default signal disposition (shutdown will NOT be graceful)",
+                        log_quietly("the shutdown watcher died unexpectedly — SIGINT/SIGTERM will "
+                                    "now exit the process immediately and UNGRACEFULLY",
                                     err);
                         if (died)
                             died(); // caller restores SIG_DFL

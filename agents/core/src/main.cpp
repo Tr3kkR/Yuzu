@@ -2,7 +2,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
-#include <process.h> // _wexecv for the OTA relaunch (the escalation uses TerminateProcess)
 #pragma section(".CRT$XCB", read)
 [[maybe_unused]] static void __cdecl diag_before_static_init() {
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
@@ -137,6 +136,18 @@ static_assert(std::atomic<int>::is_always_lock_free);
 /// exhaustion at boot). It does not try to be graceful — it cannot, there is no watcher to run the
 /// teardown — it only guarantees the process remains KILLABLE, including as PID 1 in a container
 /// where a default disposition is discarded by the kernel. Async-signal-safe: no locks, no stdio.
+/// spdlog allocates and RETHROWS non-std exceptions, and main() has NO enclosing handler — so a
+/// throw from a log call on an OOM/exhausted host is a std::terminate WITHOUT unwinding, which is
+/// the very thing the surrounding code exists to prevent. Every log on a failure path in this file
+/// goes through here. (thread_pool.hpp and ShutdownWatcher::log_quietly carry the same firewall.)
+static void log_quietly(const char* what) noexcept {
+    try {
+        spdlog::error("{}", what);
+    } catch (...) {
+        // Nothing to do, and nowhere to say it. A logger must never kill the agent.
+    }
+}
+
 static void on_signal_hard_exit(int sig) {
     (void)sig;
 #ifdef _WIN32
@@ -667,7 +678,8 @@ int main(int argc, char* argv[]) {
     // ctor body's firewall — and `main()` has no enclosing handler, so a bad_alloc/EAGAIN there
     // escaped main and std::terminate'd WITHOUT UNWINDING: no plugin shutdown(), no SQLite close.
     // That is the identical hole this branch wraps make_unique<ThreadPool> to close, in the same
-    // file, for the same reason. If it throws we leave SIG_DFL standing — ungraceful, but killable.
+    // file, for the same reason. If it throws, the !ok() branch below installs the hard-exit
+    // handler — NOT SIG_DFL, which pid 1 would discard.
     // (governance: cpp-expert, this PR.)
     std::optional<yuzu::agent::ShutdownWatcher> shutdown_watcher;
     try {
@@ -683,17 +695,26 @@ int main(int argc, char* argv[]) {
         [] {
             // TRAP 6 — the watcher died on a read() error. If we leave the handlers installed,
             // on_signal keeps writing bytes into a pipe with NO READER and every SIGTERM is
-            // SWALLOWED: the agent becomes unkillable by anything but SIGKILL. Hand the signals
-            // back to the kernel. Ungraceful, but killable beats unkillable.
-            // Async-signal-safety is not a concern here: this runs on the watcher thread, an
-            // ordinary thread, not in a handler context.
-            std::signal(SIGINT, SIG_DFL);
-            std::signal(SIGTERM, SIG_DFL);
+            // SWALLOWED: the agent becomes unkillable by anything but SIGKILL.
+            //
+            // AND SIG_DFL IS NOT THE ANSWER, for the same reason it is not the answer at the
+            // construction-failure site: the agent is PID 1 in every shipped container image, and
+            // the kernel DISCARDS a default-disposition signal for pid 1. Handing the signals
+            // "back to the kernel" there means SIGTERM is IGNORED — the exact unkillable state
+            // this callback exists to escape. Install the hard-exit handler instead: ungraceful,
+            // but genuinely killable, on every platform and as pid 1.
+            // (governance: security-guardian — the sibling site I fixed at one place and not here.)
+            std::signal(SIGINT, on_signal_hard_exit);
+            std::signal(SIGTERM, on_signal_hard_exit);
         });
     } catch (...) {
-        spdlog::error("could not construct the shutdown watcher (out of memory or threads) — "
-                      "leaving SIGINT/SIGTERM at their default disposition. The process still dies "
-                      "promptly on a signal, but shutdown will NOT be graceful.");
+        // Firewalled: an unguarded spdlog call here would terminate WITHOUT unwinding on exactly
+        // the OOM/exhausted host this try exists for. And the handlers are NOT left at SIG_DFL —
+        // the `!ok()` branch below installs the hard-exit handler, because pid 1 discards SIG_DFL.
+        log_quietly("could not construct the shutdown watcher (out of memory or threads) — SIGINT/"
+                    "SIGTERM will exit the process immediately and UNGRACEFULLY (no plugin "
+                    "shutdown, no clean DB close). That is the killable posture; a default "
+                    "disposition would be IGNORED by pid 1 in a container.");
     }
 #endif
 
@@ -751,8 +772,13 @@ int main(int argc, char* argv[]) {
     // already DONE — it runs in run()'s ScopeExit, not in ~Agent — and the graceful path is
     // spent. A signal arriving now means "you are taking too long"; dying promptly beats
     // hanging silently, and SQLite's WAL is crash-safe.
-    std::signal(SIGINT, SIG_DFL);
-    std::signal(SIGTERM, SIG_DFL);
+    // NOT SIG_DFL — pid 1 discards it (see on_signal_hard_exit). This window is not small: it
+    // spans the whole of ~Agent (the Guardian/DEX joins, the SQLite closes). A signal arriving here
+    // means "you are taking too long", and on pid 1 a default disposition would simply be ignored,
+    // so `docker stop` would hang the full grace. Leave a handler that guarantees we LEAVE.
+    // (governance: security-guardian — the second sibling site.)
+    std::signal(SIGINT, on_signal_hard_exit);
+    std::signal(SIGTERM, on_signal_hard_exit);
     // Unpublish BEFORE ~Agent, and only once the handlers are already SIG_DFL (so there is no
     // instant where a handler is installed AND g_agent is null).
     //
