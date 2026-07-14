@@ -113,6 +113,9 @@ extends this list; it never creates an exemption.**
 | 3 | **Mint** of a cached-result grant | Decision 10 |
 | 4 | **Redemption** of that grant — the seam that hands over bytes | Decision 10 |
 | 5 | **Authorisation and execution of an Execution Plan** — the seam that touches endpoints | ADR-0033 §8 |
+| 6 | **Granting an approval** (who may approve a plan) | ADR-0033 §4, §7 |
+| 7 | **Approving a capability manifest** — where permissions become data | ADR-0033 §2 |
+| 8 | **Authorising an event/progress subscription** | Decision 9 — **open**, owned by G1: until the cross-process transport is designed, presentation's routing table would be the confidentiality boundary between operators, which INV-31-1 says presentation never holds |
 
 Each of them must evaluate the **full four-filter conjunction of ADR-0033 §1** —
 

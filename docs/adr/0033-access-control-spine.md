@@ -322,6 +322,21 @@ only seam that touches endpoints:
   revocation cannot reach: an attenuated worker token leaks, drives a run that submits a plan, a human
   approves it, you revoke the token — **and the effect fires on the fleet anyway**. The plan therefore
   records the **requesting credential**, and execution re-reads its current grants.
+- **A voided plan is LOUD, and it is re-authorisable.** A control that stops without saying so is the
+  defect ADR-0032 Decision 7 fixes for schedules, and it would be the same defect here — worse, because
+  a plan can void **mid-rollout**, leaving the fleet partially changed (that partial state is visible
+  only through §10's coverage envelope, which is why it is interlock item (i) and not an optional
+  field). So: `yuzu_execution_plan_voided_total{reason=requester_revoked|credential_revoked|credential_expired}`
+  is a counter with an alert, and the operator is offered a **re-authorisation** path rather than a
+  dead end.
+- **Rotation is not a governance event, here as well as there.** ADR-0032 Decision 7 rules that
+  re-arming a schedule after a credential rotation is an audited authority change and *not* an
+  effect-bearing edit. §8 needs the twin rule or the asymmetry becomes approval fatigue: a routine
+  90-day token rotation would void every approved plan and demand **fresh four-eyes on an unchanged
+  effect**, which §5 calls worse than no gate at all. So — **re-binding a plan to a rotated credential
+  of the same owner, with the plan hash unchanged, is an audited authority change, not a new
+  approval.** A *different* requester, or any change to the plan hash, is a new plan and needs new
+  four-eyes.
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
 - Approvers need `Approve` on the securable and **never the underlying permission** — low-privilege
   reviewers stay possible, which is what makes four-eyes deployable at all.
