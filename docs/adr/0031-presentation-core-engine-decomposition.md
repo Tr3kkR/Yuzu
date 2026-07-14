@@ -13,11 +13,24 @@ deciders: >-
 scope: platform — process decomposition, the seams between the three binaries, and the invariants they exist to make structural
 supersedes: >-
   docs/uce-deployment-topology-design.md D2 (UCE deployable = backend + GUI, one artifact, on its
-  own VM) and D3 (two browser origins) — both merged via PR #2079. D1 (one PostgreSQL instance,
-  two databases, separate roles and pools) is REAFFIRMED, not superseded.
-  docs/uce-host-requirements.md F-10 ("no machine consumer; private UI seam") is VOIDED — its
-  premise disappears with the engine's UI. F-5 / INV-7 (the engine's own confinement and the
-  M3(d) equivalence test) are RELOCATED, not deleted; see "INV-7 moves, it does not vanish".
+  own VM), D3 (two browser origins) and §3 (the cross-origin login/redeem design) — all merged via
+  PR #2079. D1 (one PostgreSQL instance, two databases, separate roles and pools) is REAFFIRMED,
+  not superseded, and becomes MORE load-bearing.
+  docs/uce-host-requirements.md: F-10 ("no machine consumer; private UI seam") is VOIDED — its
+  premise disappears with the engine's UI. F-5 / F-6 / F-7 / §6 (the engine's own view-time
+  confinement mechanism) and INV-6 / INV-7 (the M3(d) equivalence test) are RELOCATED, not deleted —
+  confinement moves INTO core (INV-31-2 + ADR-0032 Decision 11); see "INV-7 moves, it does not
+  vanish". NF-9 (engine login/session/origin) is VOID in its entirety; NF-3, NF-7 and NF-8(vii) are
+  RE-SCOPED (a headless engine has no browser origin, no login and no session); NF-2, NF-5, NF-6
+  stand.
+  docs/adr-1005-execution-plan.md: Decision 3 ("no machine consumer of the UCE; the private UI
+  seam") is VOIDED; Decision 11's "backend + GUI, one artifact, on its own VM" is SUPERSEDED;
+  Decision 14 and M3(d) are RETARGETED (the confinement mechanism is core's release gate, not a
+  module-side re-derivation — the M3 parity gate itself SURVIVES); Phase 5 is PARTIALLY PULLED
+  FORWARD (the invocation grant IS the RFC-8693 delegation artifact, not a second token species).
+  docs/adr/1005-headless-platform-use-case-engines.md: Decision 6's "UI shell" clause is AMENDED —
+  the engine host is headless; the rest of Decision 6 (one host, many modules) stands. Decision 7's
+  break-glass console survives but re-homes: see Decision 6a below.
 depends-on: >-
   1005-headless-platform-use-case-engines (this ADR is how its central claim becomes structurally
   true rather than review-enforced).
@@ -50,10 +63,10 @@ the tree, they are always written with their family:
 
 | Family | Means | Do not confuse with |
 |---|---|---|
-| **ballot A1–A5** | the five architecture ratifications (A5 = the split control/data plane) | **agentic-first A1–A4** (ADR-1005: dashboard parity, discovery, observability, error envelope), and **track 2g's** agentic-context annotations |
+| **ballot A1–A5** | the five architecture ratifications (A5 = the split control/data plane) | **agentic-first A1–A5** (`docs/agentic-first-principle.md`: dashboard parity, discovery, observability, the error envelope, and **A5 — the agentic context contract**). The collision is total, so ballot rows are always written "ballot A*n*". |
 | **ballot D1–D12** | the twelve product/access decisions (D3 = presentation as a credential pipe) | **2c D1–D3** (the merged topology design: one Postgres/two databases; engine's own VM; two origins) |
 | **pins P1–P11** | the admission-protocol semantics pinned in the grill rounds | — |
-| **G1–G10** | open questions (G1 cross-process event transport; G10 the Drogon build canary) | — |
+| **G1–G10** | grill-round questions against the ballot. **Most were answered and became rules** — G2 → INV-31-5, G3/G9 → ADR-0033 §2, G4 → ADR-0032 Decision 15, G5 → the version-skew cost, G8 → ADR-0033 §3. **Still open by design:** G1 (cross-process event transport), G6/G7 (MCP session + replay-ring placement), G10 (the Drogon build canary). | — |
 | **S1–S11** | the 2026-07-14 adversarial-review findings | — |
 
 Vocabulary, fixed for the set: an **engine** is a use-case engine binary (the 2c documents call it
@@ -63,7 +76,7 @@ of one use case (ADR-0032).
 
 ## Context
 
-**Today the server is one binary that is both the domain and its own front end.** Twenty-four route
+**Today the server is one binary that is both the domain and its own front end.** Twenty-five route
 families register on a single `httplib::Server` inside `yuzu-server` — REST v1, MCP, the HTMX
 dashboard, settings, workflow, device, viz, DEX, Guardian, inventory, preflight, deployment,
 network, CA, SCIM, webhooks, software licensing and the rest (`server.cpp`'s `register_routes` call
@@ -150,6 +163,12 @@ Invocation works like this, and only like this:
   released to it, and finalises the run with core (canonical result hash + disclosure summary)
   before release.
 
+One exception to "only like this", named here so the two ADRs cannot be read as contradicting each
+other: serving a **cached** result skips the engine's composition step, but not core. It is a
+fast-lane **re-admission** — core re-runs the confinement check, the engine redeems a one-use grant
+**at core** before it releases a byte, and core writes the disclosure. The engine never serves stored
+bytes on its own authority (ADR-0032 Decision 10).
+
 The normative protocol — run lifecycle, grant semantics, the release log, cached-result
 re-admission, evidence and the sequencing interlock — is **ADR-0032**. This ADR fixes only the
 shape: core is the **admission and authority chokepoint, not the byte path**.
@@ -167,7 +186,7 @@ abseil static linkage on Windows MSVC) is the reason this is a gate and not an a
 
 **Size this honestly: G10 gates the linkage, not the port.** Choosing Drogon avoids a *language*
 port — the C++ stays C++ — but it is still a **framework** port. Every handler registration across
-the 24 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of
+the 25 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of
 `mcp_server.cpp` move from `httplib::Server`'s synchronous `Get`/`Post(path, handler)` signature to
 Drogon's async/coroutine controller model, and **every SSE content-provider is rewritten against a
 different concurrency model** — which is exactly the code whose semantics this ADR set cares most
@@ -184,6 +203,17 @@ localhost; the public versioned API only (INV-31-4); and **no cross-component da
 **presentation owns no database at all**. ADR-1005's `REVOKE CONNECT … FROM PUBLIC` + separate-role
 isolation (2c D1) is reaffirmed and becomes *more* load-bearing, because co-location removes the
 network as an accidental barrier.
+
+**6a. Core keeps a break-glass ingress of its own.** ADR-1005 makes the in-server console a
+deliberately closed set of bootstrap and recovery capabilities that must work with **zero dependency
+on any engine** — the thing you use when everything else is broken. The split quietly puts it behind
+presentation, so a presentation failure would lock operators out of RBAC and principal management
+*during an incident*, which is precisely when they need it. So core exposes a **minimal, local,
+separately-bound break-glass surface** — authentication, RBAC and principal administration, health —
+reachable without presentation. It is not a second product surface and not a private API for
+presentation's use (INV-31-4 stands): it is the recovery door, it is loud in the audit log, and it is
+bound to localhost or an admin interface by default. Without it, the bootstrap property ADR-1005
+relies on is lost the day this ADR lands.
 
 **7. One PostgreSQL instance, two databases, in its own sibling container** (2c D1, reaffirmed;
 ballot A2). Same host as the three binaries today; separate roles, separate pools, no cross-database
@@ -254,6 +284,16 @@ the build on any that is absent from the published OpenAPI. **That test does not
 a deliverable of migration step 3, and until it lands this invariant is enforced by review, like the
 rule it replaces.
 
+**INV-31-6 — Every store that a component depends on appears in that component's readiness probe.**
+Stated as an invariant rather than a habit, because the existing `stores_ok` conjunction in `/readyz`
+grew one row at a time, and every row was added after a store died while the server reported healthy.
+The split multiplies the problem: **core** `/readyz` = its stores + the Postgres pool + **the run
+reaper's liveness**; **presentation** `/readyz` = "core reachable at a compatible API version" (it
+must never be green while core is down, or a load balancer will route traffic to a surface that can
+only 502); **engine** `/readyz` = its own database + core reachable + module manifests ratified.
+`/livez` stays process-liveness on all three. ADR-0032 and ADR-0033 introduce six new stores; none is
+in a probe today, and ADR-0032's interlock item (k) is what stops that shipping.
+
 **INV-31-5 — Presentation's service identity attests infrastructure, not people** (ballot G2).
 Presentation authenticates to core with its own mTLS service identity and may attest peer IP and
 correlation id (without which session peer-binding and lockout break). Core trusts that metadata as
@@ -288,7 +328,7 @@ MCP, discoverable, A4-enveloped*. The split leaves three ways to violate that, a
 none of them today:
 
 1. **A private core endpoint.** INV-31-4 forbids it; nothing enforces it. The contract test that
-   would — enumerate every registered route (24 `register_routes` families, and the handler
+   would — enumerate every registered route (25 `register_routes` families, and the handler
    registrations under them) and fail the build on any not present in the published OpenAPI —
    **does not exist**. It is a deliverable of migration step 3.
 2. **A REST route with no MCP twin.** Structurally invisible to the build.
@@ -358,8 +398,18 @@ being structural.
   horizontally. **Sessions and the MCP replay ring move to core/Postgres** — decided *with* the
   split, not after it. This reworks the in-memory contracts around JIT elevation and inactivity
   timeout, and it is why the auth-store PG migration must be re-scoped before it starts.
-- **Supervision.** Three processes plus a Postgres sibling need a supervisor, or a pod of containers
-  sharing a network namespace (the better hygiene if Kubernetes is a target).
+- **Supervision, and a hard commitment: one deployment unit.** Three processes plus a Postgres
+  sibling need a supervisor, or a pod of containers sharing a network namespace (the better hygiene
+  if Kubernetes is a target). But the commitment matters more than the mechanism: a customer who
+  installs Yuzu today gets **one server and a database**, and under this ADR they must still get
+  **one thing to install, one health endpoint to watch, one upgrade to run, and one version to
+  quote**. "Independently deployable by construction" is a property of the *code*, not an instruction
+  to the *operator*. If a buyer experiences three of everything — three configs, three logs, three
+  certs, three probes — the split will read as three things to break, and the deployment-simplicity
+  comparison against a commercial competitor is one we would deserve to lose. **The endpoint fleet is
+  entirely unaffected** (the agent, and its GPO/SCCM/Intune/Jamf install path, do not change) — say
+  so plainly, or "we split the server into three binaries" will be heard as "your agent rollout
+  changes".
 - **Version skew.** The moment the binaries *can* be split, they *will* be, at different versions.
   The core API needs a compatibility contract from day one (ballot G5) — the same
   versioning/deprecation policy ADR-1005 Phase 0.3 already defines for the public API. The
@@ -390,6 +440,15 @@ being structural.
    behaviour before adding network failure modes.
 3. **Enforce the seam logically.** Dashboard, MCP and REST handlers call the API (or a local API
    client), never stores directly. This is checkable, and it is most of the value.
+   **Size it honestly, because "the missing endpoint is the forcing function" is a slogan, not an
+   estimate:** the tree has ~105 dashboard fragment routes against ~74 public REST v1 routes, and the
+   gap is not a tail of exotica — it includes `/devices` and `/device` (no `/api/v1/devices` exists at
+   all, on the most-used page in the product), the settings surface, and the `/auto`
+   preflight/deploy/verify pages. Each gap is not one endpoint: it is a REST route **plus** its MCP
+   twin, an OpenAPI entry, the A4 envelope, a securable and operation, and an audit verb. That is
+   roughly **40–60 new public capabilities** — a programme of work, not a step. It is the right work
+   (every one of them is a capability an agentic worker also wanted), but it must be planned as a
+   programme or it will be discovered as a delay.
 4. **Extract presentation** into its own Drogon binary against that seam (after G10), with durable
    sessions and replay behind the boundary.
 5. **Extract the engine** — the cheapest of the five, because it is new code with no in-process

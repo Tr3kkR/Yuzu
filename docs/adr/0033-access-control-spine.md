@@ -123,6 +123,16 @@ Each registered tool or capability declares, at registration, a triple plus a ti
   (`docs/mcp-server.md`) evaluates built-in and declared tools through **one chokepoint**. A new
   gate for declared tools is prohibited: extend the existing chokepoint, never parallel it.
 
+A declaration also carries what ADR-1005 requires of **every** capability, because a module-declared
+capability is not exempt from the platform's own rules: the **versioned REST twin and the MCP twin**
+(both, or a recorded exception in ADR-1005's ledger), its **discovery entry** (it must enumerate in
+`/api/v1/openapi.json` and MCP `tools/list` — ADR-0032's interlock (j) is what makes that possible),
+the **A4 error envelope**, its **agentic-context annotations** (track 2g), and its **`data_class` +
+`audit_verb`** so a device-attributable read is countable by construction (ADR-0032 Decision 11 emits
+it with the release-log write). Without these, a module could declare a capability that passes all
+four §1 filters and still ships MCP-only, undiscoverable, or silently uncounted — a second-class
+capability surface built by the same door we closed on ourselves.
+
 Role administration therefore stays at securable granularity — the role UX does not become a wall of
 per-tool checkboxes — while individual tools still carry an operation and a risk tier. The goal is
 that **a new engine's permissions are data, not C++**.
@@ -144,8 +154,26 @@ Postgres.** Until it exists, an engine ships with a core release.
   manifest for admin approval — the enrollment-queue pattern, reused. The diff is what an approver
   reads. A **permission expansion is a visible security change; it cannot arrive as an incidental
   Module upgrade.**
-- **Undeclared fails closed.** A missing or unparseable `mcp_tier_class` makes the tool **invisible to
-  MCP** and uninvocable — never "defaults to read". The same for a missing securable or operation.
+- **Manifest approval takes §4's full posture, four-eyes included.** This gate is where permissions
+  become data, so it is the highest-leverage approval in the platform — and an approval gate without
+  four-eyes is where a publisher approves their own privilege escalation. Approving a manifest
+  therefore requires `Approve` on the registry securable, an **MFA step-up**, and an approver whose
+  **human root differs from the module publisher's and owner's** (§7). Both principals are audited.
+  **No eligible approver ⇒ fail closed** — never auto-approve, and never fall back to the publisher.
+  §7 closes the *run-scoped* self-approval bypass; leaving this one open would close the small door
+  and leave the large one ajar.
+- **Undeclared means the capability does not register on ANY surface** — not "invisible to MCP but
+  callable over REST", which would be the very UI-only/one-surface split ADR-1005 forbids. A missing
+  or unparseable `mcp_tier_class`, securable or operation means the capability **does not exist**.
+  Never "defaults to read".
+- **Mind the chokepoint's existing default, because it is the opposite of this rule.** §2 says extend
+  the shipped tier-before-RBAC chokepoint rather than parallel it — and that chokepoint currently
+  reads: if the token carries no MCP tier, **allow** (it is not an MCP token, so tier policy does not
+  apply). That default is correct *for token tiers* and catastrophic *for tool classes*: the naive
+  extension — a second argument threaded through the same early return — inherits ALLOW for an
+  undeclared tool. The deny-on-absent guard for the **tool's** declared class must sit **before** that
+  early return, and a contract test must show an undeclared *tool class* denied while an absent
+  *token tier* still defers to RBAC. Two defaults, one function, opposite directions.
 
 How core's approved copy of the mapping becomes the *binding runtime input* — version-locked at
 admission, with the Module's manifest reduced to a request — is ADR-0032 (S4); how a capability's
@@ -163,24 +191,33 @@ effective = (token roles ∩ owner roles)  within  (token scope ∩ owner scope)
   no new dialect. "Read-only vuln triage, canary ring only" must be expressible at mint time.
 - Narrowing only: the owner's **current** grants are one side of every intersection, so a token does
   not outlive a demotion. **This is enforced by code, not by construction** — the formula's *shape*
-  guarantees nothing on its own. It is real only once M5.3's contract test exists, and only if
-  **every** authority-shrinking path invalidates `RbacStore`'s permission cache (`perm_cache_`,
-  keyed `user:type:op`, bumped on permission and role mutation) — **including scope and
-  management-group changes**, not just role changes. A cache that misses one of those paths is a
-  token that *does* outlive its demotion. (Saying "impossible by construction" here would contradict
-  the migration rule below, which is written on the premise that the intersection is decorative
-  storage until a test proves otherwise.)
+  guarantees nothing on its own, and it is real only once M5.3's contract test exists. (Saying
+  "impossible by construction" here would contradict the migration rule below, which is written on
+  the premise that the intersection is decorative storage until a test proves otherwise.)
+- **A standing constraint on caching, stated forward rather than against today's code.** Authority
+  decisions get cached — `RbacStore` already memoises permission decisions in `perm_cache_`, keyed
+  `user:type:op` and invalidated by a generation bump on role/permission mutation. That cache holds
+  no scope, so it has no stale-scope bug today. The rule that keeps it that way: **no authority cache
+  may key on anything the intersection reads unless every path that shrinks that input invalidates
+  it.** The moment a cache memoises a *scope-aware* decision, management-group and scope changes
+  become invalidation paths — and if that is missed, a token outlives its demotion silently. Write
+  the invalidation with the cache, not after the incident.
 - Same intersection machinery as delegation (2b) and as the invocation grant (ADR-0032). One
   narrowing model everywhere, not three.
 
 **Migration rule (M5 — the enforcement contract, not just the schema):**
 
 1. Existing owner-inherited tokens are migrated with an **explicit** `attenuation = owner_inherited`
-   marker written at migration time. Legacy behaviour becomes a *declared* state; it is never an
-   absence. No live token changes authority on migration day.
-2. After migration the column is `NOT NULL`: a token whose attenuation record is **missing,
-   unreadable or unparseable is denied** — absence is never read as owner-inheritance, and never as
-   a grant. The bounded mixed-row window is closed by the constraint, not by convention.
+   marker. Legacy behaviour becomes a *declared* state; it is never an absence. No live token changes
+   authority on migration day. **One statement, no window:**
+   `ADD COLUMN attenuation TEXT NOT NULL DEFAULT 'owner_inherited'` — every existing row is
+   attenuation-declared the instant the column exists. Drop the default afterwards so new tokens must
+   declare. Add-then-backfill would leave a NULL window during which the reader must guess, and
+   "guess" is how fail-open happens.
+2. The column is a **closed enum with an explicit `default: deny`**: a token whose attenuation value
+   is missing, unreadable or **unrecognised** is denied. `owner_inherited` is a *value*, not an
+   absence — which matters, because a reader is one `if (value.empty())` away from treating absence as
+   "no constraint". Contract test: a NULL and an unknown value both deny.
 3. **Contract test, not a comment:** an attenuated token is *denied* an operation its owner is
    *allowed*. Without that test the intersection is decorative storage.
 
@@ -238,17 +275,28 @@ satisfies four-eyes:
 | engine principal | its named human owner |
 | delegated call | the delegating operator |
 | **any run-scoped effect** | **the admitting operator (P11)** |
-| **a scheduled or background run** | **the human who armed the schedule** — recorded at arming time, re-checked at execution (§8) |
+| **a scheduled or background run** | **the humans who authored its effect-bearing definition** — recorded at arming time, re-checked at execution (§8) |
 
 Alice's worker can never approve Alice's other worker.
 
 **A scheduled run has no interactive operator, and that is exactly where a root goes missing.**
 P11 says the requester root is the admitting operator — but a 03:00 cron-style run admits itself.
-Its root is therefore **bound at arming time**: the human who created or last modified the schedule
-is recorded on it, becomes the run's requester root, and their authority is **re-checked at every
-execution** (§8), so a departed or demoted scheduler does not keep dispatching effects from beyond
-the grave. A schedule whose armer can no longer perform the action **stops**; it does not fall back
-to the engine's owner, and it does not run as a system principal. **There is no unrooted effect.**
+Its root is therefore **bound at arming time**, and it is the schedule's **admitting operator** for
+every run it produces (ADR-0032 Decision 7 — the same human, named twice, never two people). Their
+authority is **re-checked at every execution** (§8), so a departed or demoted scheduler does not keep
+dispatching effects from beyond the grave. A schedule whose armer can no longer perform the action
+**stops**; it does not fall back to the engine's owner, and it does not run as a system principal.
+**There is no unrooted effect.**
+
+**"Last modified" must never launder the root.** The naive rule — *the human who created or last
+modified the schedule* — is a four-eyes bypass with a one-character edit: Alice authors an
+effect-bearing schedule (root = Alice, so she cannot approve it), Bob renames it, the root becomes
+Bob, and **Alice now approves the effect she designed**. So the root is the **set of humans who
+authored the schedule's current effect-bearing definition** — its targets, scope, capability and
+parameters — and the approver must be outside that set. An **effect-bearing edit re-arms the
+schedule and re-requires approval**; a cosmetic edit (a rename, a description) changes no root and
+requires nothing. The question four-eyes asks is *who designed this effect*, not *who touched this
+row last*.
 
 **P11 closes a real bypass**, not a hypothetical one: a plan raised by `engine:vuln` (owned by Alice)
 *inside Bob's run* would otherwise resolve its human root to Alice — letting **Bob approve his own
@@ -263,6 +311,18 @@ An approved action executes under the **requester's** authority, **re-checked at
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
 - Approvers need `Approve` on the securable and **never the underlying permission** — low-privilege
   reviewers stay possible, which is what makes four-eyes deployable at all.
+
+**An approved plan outlives its run, and executes on the requester's authority — not the run's.**
+The ambiguity here is worth naming because both of its branches are bad. Runs are TTL'd and reaped
+(ADR-0032 Decision 5); approvals are durable for 7 days. If plan execution required a *live run*, a
+human's approval would become **silently unexecutable** the moment the reaper fired — an approval
+that visibly succeeded and did nothing. If it ignored the run entirely, an effect could execute with
+no live authority context at all. Neither is acceptable, so: **an Execution Plan is authorised in its
+own right.** Once core has accepted it, the plan carries its own frozen targets, its own plan hash and
+its own requester root; the run that *produced* it may reach a terminal state without voiding it. What
+is re-checked at execution is the **requester's current authority** (above), never the run's liveness.
+The run id remains on the plan as evidence — it is how the plan joins the chain — but it is not the
+plan's licence to execute.
 
 Deploy's re-authorize-every-tick behaviour is the shipped precedent for this rule; it becomes the
 platform's, rather than one feature's.
@@ -296,6 +356,15 @@ references and a **plan hash**. Prepared by a Module or by core; **authorised an
 
 - **Approval binds to the plan hash**, and to nothing looser. A material plan change invalidates the
   authorisation — it does not silently inherit it.
+- **Targets are frozen in the plan; execution may only narrow them.** These two rules look like they
+  fight, and an implementer must be told they do not: §4 says a stale approval "re-resolves its scope
+  at execution", and re-resolving could *add* a device, which would change the targets, change the
+  hash, and invalidate the approval that was just given. So: the plan's target set is **frozen at
+  authoring**, the hash covers it, and at execution core intersects that frozen set with the
+  requester's **current** authority — devices may **drop out, never in**. The hash never changes; the
+  run only ever gets smaller. This is exactly what the shipped `/auto` deploy path already does
+  (freeze the cohort, re-authorise every tick), and it is the reason "approve at 17:00, execute at
+  09:00" has one answer instead of two.
 - Execution authorisation is **time-limited** and one-use where appropriate.
 - The approving human may **approve, veto, narrow or escalate**. A supervising model may *recommend*
   those actions; it can never widen or authorise.
@@ -316,17 +385,33 @@ only rows; it must state how much of the intended fleet answered:
 | `failed` | endpoints returning a terminal error |
 | `timed_out` / `offline` | known non-responses, kept **distinct** from an empty or negative result |
 | `completeness` | `complete` · `partial` · `insufficient` · `unknown` |
-| `policy` | the declared threshold, and whether incomplete evidence blocks the next step |
+| `policy` | the declared threshold, and whether incomplete evidence blocks the next step — **subject to a core-owned ceiling** (below) |
 
 **Missing evidence is never a negative finding.** "No vulnerable devices found" and "62 devices never
 answered" are different sentences, and the platform must not be able to say the first when it means
 the second.
+
+**The completeness policy is declared by the module and CEILINGED by core.** ADR-0032 gives the
+module-declared run TTL a core ceiling for the same reason this one needs it: a module that may
+declare its own honesty threshold can declare `complete` at 1% coverage, and the platform would then
+render a lie *truthfully*. Core's ratified mapping (ADR-0032 Decision 13) carries a minimum
+completeness bar per risk tier; a manifest declaring a laxer one is **refused at activation**, not
+honoured at runtime. And coverage itself is **core-verified, never engine-asserted** (ADR-0032
+Decision 11) — core performed the dispatch, so core knows who answered.
 
 **Compensating recovery — never fictional rollback.** Endpoint effects cannot be rolled back
 atomically, and the product will not pretend otherwise. Each state-changing capability **declares its
 reversibility class**: *naturally reversible*, *compensatable*, *retry-safe*, *verification-only* or
 *irreversible*. A recovery plan that creates new effects is **separately authorised** — it is a plan,
 subject to every rule in this section, and it is linked to the effects it compensates.
+
+**A broken fleet must not be un-fixable because the person who broke it left.** Recovery is a plan,
+so it needs a requester root (§7) — and the obvious root, the operator who authored the original
+effect, may be exactly the person who has been offboarded or demoted, which under §8 **voids the
+approval** and strands the fleet mid-change. So: an **Administrator holding `Approve` may adopt the
+root of an orphaned recovery plan**, audited as an explicit adoption (both the original and the
+adopting root are recorded), with four-eyes then applying against the *adopter*. Without this rule,
+§7's "there is no unrooted effect" would be true and would mean "there is no recovery".
 
 ### 11. Module presentation contributions are declarative-only (D7)
 
