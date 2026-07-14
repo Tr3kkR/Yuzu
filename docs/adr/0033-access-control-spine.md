@@ -215,8 +215,17 @@ satisfies four-eyes:
 | engine principal | its named human owner |
 | delegated call | the delegating operator |
 | **any run-scoped effect** | **the admitting operator (P11)** |
+| **a scheduled or background run** | **the human who armed the schedule** — recorded at arming time, re-checked at execution (§8) |
 
 Alice's worker can never approve Alice's other worker.
+
+**A scheduled run has no interactive operator, and that is exactly where a root goes missing.**
+P11 says the requester root is the admitting operator — but a 03:00 cron-style run admits itself.
+Its root is therefore **bound at arming time**: the human who created or last modified the schedule
+is recorded on it, becomes the run's requester root, and their authority is **re-checked at every
+execution** (§8), so a departed or demoted scheduler does not keep dispatching effects from beyond
+the grave. A schedule whose armer can no longer perform the action **stops**; it does not fall back
+to the engine's owner, and it does not run as a system principal. **There is no unrooted effect.**
 
 **P11 closes a real bypass**, not a hypothetical one: a plan raised by `engine:vuln` (owned by Alice)
 *inside Bob's run* would otherwise resolve its human root to Alice — letting **Bob approve his own

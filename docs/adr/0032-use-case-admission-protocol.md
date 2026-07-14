@@ -216,6 +216,22 @@ non-read-only action arriving under that envelope. Core **quarantines the module
 A single mis-declaration must not be able to both collapse RBAC granularity and skip the
 plan/approval path with a human manifest diff as the only backstop.
 
+**What that costs, stated before the vote rather than after it.** The plugin host cannot enforce
+what the ABI cannot express, and **it cannot express this today**: `sdk/include/yuzu/plugin.h`
+declares a plugin's actions as a flat `const char* const* actions` — a name array with **no
+per-action metadata of any kind**, let alone a mutability class. So this leg is **an ABI change on
+the compiler-stable plugin boundary** (`YUZU_PLUGIN_ABI_VERSION` 3 → 4, with
+`YUZU_PLUGIN_ABI_VERSION_MIN` governing how long v3 plugins keep loading), rippling through the 47
+in-tree plugins and any out-of-tree one. That is the hardest boundary in the codebase to change,
+and it is on P9's critical path — not a detail to discover during implementation.
+
+**And it covers less than it sounds like.** The envelope binds only **agent-dispatched plugin
+actions**. A fact read that never reaches an endpoint — core's own stores, fleet truth, inventory,
+findings — has **no plugin host to refuse it**, so for those reads the mutability classification is
+core's alone: core's ratified mapping (Decision 13) decides, and the release log (Decision 11)
+records. The agent-side envelope is defence in depth on the one path that leaves the building; it is
+not the whole of P9.
+
 ### 9. Progress rides the one event spine; results are durable in the `uce` database (P4)
 
 The UCE posts **run-scoped progress** to core; core fans it out subscriber-tagged on the **existing**
@@ -226,6 +242,15 @@ event-level permission decision.
 Results persist in the `uce` database keyed by `use_case_run_id`. Retrieval of a past result is a
 re-admission (Decision 10), never a read of a durable object on run id. Retention rides the declared
 per-module SLA (Decision 15).
+
+**Retention has a mandatory ordering: the release log must outlive every result it re-confines.**
+Decision 10's subset check reads the source run's released-input set out of the release log. If the
+log is pruned while the cached result survives, the check has nothing to check against — and the
+only two outcomes are both bad: deny every cached serve (the cache silently dies) or serve it
+unchecked (the confidentiality rule silently dies). So **release-log retention ≥ result retention,
+per module, enforced at manifest ratification** — a module whose declared result retention outlives
+its release-log retention is refused at activation. A cached result whose release-log entry is gone
+is **not servable**: it is re-derived or it is denied.
 
 **Prerequisite, named (S8/G1):** the event spine's buses are **process-local today**
 (`execution_event_bus.hpp`, `server.cpp`). "On the existing spine" across a process boundary
@@ -271,6 +296,13 @@ the engine's own SLA. So the primary disclosure record must be core's own.
 **At each confined fact read, core records — per run, as it releases, never trusted from the
 engine — the released `agent_id` set (compact form), the data classifications, and the verbs.**
 This is the **release log**: a core-owned store, born on Postgres.
+
+**"Compact form" must stay lossless at device granularity.** The log's two consumers both ask
+per-device questions: a DSAR asks *"was THIS person's device disclosed, to whom"*, and Decision 10's
+subset check asks *"does the operator's current scope cover EVERY device in the released set"*. A
+compaction that stores a count, a scope expression, or a range that cannot be expanded back to the
+exact `agent_id` set answers neither. Compact the *encoding* (a roaring bitmap, a compressed id
+list); never compact the *content*. A rounded answer to a DSAR is not an answer.
 
 - *"Which device data went to which principal in which run"* is answerable **from core alone**.
   DSAR and works-council evidence never depend on the engine's journal.
@@ -324,6 +356,25 @@ reserved until Phase 4). What it has **no** representation of is the thing an ad
 It lands **with the audit-store Postgres migration** — the cheap moment, and the reason the
 migration must not be designed without it. "Every result, plan, approval and execution traceable
 through one `use_case_run_id`" is a query, and a query needs an index.
+
+**The envelope is wider than `audit_events`, and scoping it narrowly would defeat it.** The
+confidence condition says *every result, plan, approval and execution*. Those do not live in the
+audit table: executions and responses are their own records, plans and approvals are ADR-0033's new
+objects, and the composed result lives in the engine's journal in a database core cannot read. A
+run id present only on audit rows buys a chain with three links missing — you could prove a run was
+*admitted* and never reassemble what it *did*. So the run id is carried, as an indexed column, on:
+
+| Record | Owner | Why the chain breaks without it |
+|---|---|---|
+| `audit_events` (D12 proper) | core | who acted, under whose authority |
+| execution + response records | core | *what was dispatched and what came back* — the effects themselves |
+| release-log entries (Decision 11) | core | which device data was disclosed to the run |
+| Execution Plans + approvals (ADR-0033) | core | which effect was authorised, by whom, against which plan hash |
+| the engine's business journal | engine (`uce`) | the domain explanation — joined **by identifier**, never by a shared transaction |
+
+Each of these is cheap to add now and expensive after its own migration ships: retrofitting an
+indexed column onto a populated executions or audit table is a schema change *plus* a backfill under
+load. **The audit-store migration must not be the only one that gets the key.**
 
 ### 13. Core's ratified copy of the manifest is the binding runtime input; a manifest is a request (S4)
 
