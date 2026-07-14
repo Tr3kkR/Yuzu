@@ -558,9 +558,12 @@ After the run passes and the commits push, governance typically produces 8-15 de
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
-     --label <type> --label governance-deferred --label "P1|P2" --label ready-for-agent \
+     --label <type> --label governance-deferred --label <P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
+   (`<type>` and `<P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   `gh search issues` is rate-limited (~30/min): on a 403 mid-batch, wait 60 seconds and continue —
+   never skip the probe.)
    **Every governance filing carries `governance-deferred`** (that label is how agent inflow is counted). Add facet labels as they genuinely apply (`tech-debt`, `reliability` for chaos findings, `observability`, `devops`, `security` for hardening — never for exploitable vulnerabilities, which go to private advisories per `SECURITY.md`).
 4. **The run report enumerates BOTH lists** — filed (with issue numbers) and not-filed (with the duplicate verdict and the issue each deduped against) — so inflow is auditable run over run.
 

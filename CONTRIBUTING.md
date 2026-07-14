@@ -95,10 +95,11 @@ Issue filing, labelling, and closing follow the repo standard:
 - **Search for duplicates before filing** — comment new evidence on an existing issue rather
   than filing a twin.
 - One actionable outcome per issue, with Context / Evidence / Acceptance criteria / Origin
-  sections in the body.
+  sections in the body. (Reporting via the web templates? A description and reproduction steps
+  are enough — triage fills in the rest; the full format binds the `gh`/agent path.)
 - Every issue carries exactly one type label; every non-`roadmap` issue also carries one triage
   state (`roadmap` = parked scope: no triage state, no priority). Priority (`P0`/`P1`/`P2`)
-  is a triage decision: set it if you have the context (agents and regular contributors do);
+  is a triage decision: set it if you have the context (agents and maintainers do);
   leave it off a drive-by report and triage will add it.
 - **Never file an exploitable security vulnerability as a public issue.** Use
   [GitHub private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new)

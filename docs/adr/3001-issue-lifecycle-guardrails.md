@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-07-14
 owner: "@Doomgoose (Alex Young)"
-amended: 2026-07-14 (A1, post-merge audit) — close-on-merge trigger becomes `push: [dev]`; never-close goes programme-wide behind a committed allowlist; the sweep loses its autonomous tier and its reporting moves to a workflow; per-PR cap 6; CODEOWNERS artefact descoped; counts corrected against the post-consolidation tracker (see Amendment A1)
+amended: 2026-07-14 (A1, post-merge audit) — close-on-merge trigger becomes `push: [dev]`; never-close goes programme-wide behind a committed never-close list; the sweep loses its autonomous tier and its reporting moves to a workflow; per-PR cap 6; CODEOWNERS artefact descoped; counts corrected against the post-consolidation tracker (see Amendment A1)
 related: issue #2139 (auto-close gap, 29 leaked issues); docs/agents/issue-standard.md (the standard this ADR mandates); docs/agents/issue-tracker.md; docs/agents/triage-labels.md; .github/workflows/nightly.yml (issue-automation precedent)
 ---
 
@@ -87,7 +87,7 @@ operational cadence: **[A1 §7, §13]**
    PR's issues (reopen drops `fixed-on-dev` and re-adds `needs-triage`). A daily reconcile pass
    covers fork merges, outages, and races **[A1 §3]**; the same parsing logic ships as a local script **[A1 §12]** —
    bound to the identical evidence-comment schema and caps, and required to print a dry-run
-   diff before executing — that performs the one-time backfill of #2139's 29 leaked issues and
+   diff before executing — that performs the one-time backfill of #2139's 29 leaked issues **[A1 §2]** and
    any pre-release reconciles (see Costs/risks: a dev-only workflow file accepts neither cron
    nor `workflow_dispatch` until it reaches `main`). A per-PR sanity cap bounds blast radius:
    if a single PR's body resolves more than 10 issues **[A1 §5]**, the workflow skips the batch and posts
@@ -167,7 +167,7 @@ directory is deleted) — the tracker is the sole source of truth; CODEOWNERS ga
 | 2 | Pointer edits: `CLAUDE.md`, `AGENTS.md`, `CODEX.md`, `CONTRIBUTING.md`, `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md` | PR 1 | Every Claude/Codex session and human contributor is routed to the standard at the moment they touch the tracker | B2 |
 | 3 | Governance + test skill rewrites (`.claude/skills/governance/SKILL.md`, `.claude/skills/test/SKILL.md`) | PR 1 | The largest inflow source dedupes against the open index before filing; run reports enumerate filed AND not-filed candidates, making inflow auditable | B2 |
 | 4 | PR-template issue-linkage checklist line (`.github/pull_request_template.md`) | PR 1 | Authors declare `Closes #N` / `Relates to #N` on every PR as a matter of routine | B3 |
-| 5 | `.github/workflows/close-linked-issues.yml` + local reconcile/backfill script | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; the script backfills #2139's 29 leaked issues and covers pre-release reconciles; manual batch-close sweeps end | B1 |
+| 5 | `.github/workflows/close-linked-issues.yml` + local reconcile/backfill script | PR 2 | Linked issues close automatically on dev merge with an evidence trail; reverts reopen; the script backfills #2139's 29 leaked issues **[A1 §2]** and covers pre-release reconciles; manual batch-close sweeps end | B1 |
 | 6 | `.github/workflows/linked-issues.yml` (issue radar) | PR 2 | Silent fixes surfaced pre-merge: "these open issues cite files you touched"; missing closing keywords flagged while the PR is still editable **[A1 §13]** | B3 |
 | 7 | `scripts/issues/migrate-labels.sh` | PR 2 | One priority scheme; automation labels exist before anything references them; idempotent and dry-run-first **[A1 §7: superseded — `scripts/tracker/bootstrap-labels.sh`, PR 1]** | B5 |
 | 8 | Issue forms + `config.yml` (`.github/ISSUE_TEMPLATE/`, legacy `.md` templates deleted) | PR 3 | Web-path issues arrive structured and `needs-triage`-labelled; blank issues off; vulnerability reports deflected to private advisories | B2, B5 |
@@ -248,7 +248,7 @@ sweep, its telemetry, and leak detection pause until the next run.
 **[A1 §13]** PR 1 (policy) → PR 2 (workflows + label migration, then scratch-PR verification matrix, then
 backfill + close #2139) → PR 3 (forms + CODEOWNERS) → PR 4 (hook) → PR 5 (sweep skill), followed
 by a four-week operational burn-down: leaked-issue closure and closure-integrity spot-checks
-first, then the 184 `needs-triage`/unlabelled in tranches, then a full duplicate pass, then
+first, then the 184 `needs-triage`/unlabelled **[A1 §1]** in tranches, then a full duplicate pass, then
 bundling splits for P0/P1 — landing at a steady-state weekly sweep cadence. Each implementing
 PR carries its own verification section with the acceptance tests for its artefacts.
 
@@ -309,7 +309,7 @@ text contradicted each other about whether it was a workflow or a local script �
 `pull_request_target` alternative stays rejected; under `push:` the entire trigger-hazard class
 is moot.
 
-### §4 — Never-close is programme-wide, behind a committed allowlist
+### §4 — Never-close is programme-wide, behind a committed never-close list
 
 The original scopes the hard guardrails to pillar 5's sweep only, leaving pillar 2's close
 workflow and its backfill unguarded — and the backfill's candidate set includes **#520** (P1,
@@ -439,7 +439,7 @@ close #1634") is the canonical mandatory negative case in the frozen fixture cor
 | 2 | `close-linked-issues.yml` (`push:`) + `closing_refs.py` + backfill/undo + per-push leak scan + zizmor control-plane guard; its own merge closes #2139 | Everything |
 | 3 | `issue-standard-guard.py` PreToolUse hook + the first tests for `scripts/hooks/` + dormant `issue-conformance.yml` server-side backstop | Hook yes; backstop dormant |
 | 4 | `tracker-report.yml` + on-demand `/issue-triage` skill + fail-closed `apply_decisions.py` | Script + skill yes; cron dormant |
-| 5 | Issue forms + `config.yml` (private-advisory contact link, blank issues off) — parallel, independent, must never gate PRs 1–4 | Dormant until release |
+| 5 | Issue forms + `config.yml` (private-advisory contact link, blank issues off) — parallel, independent, must never gate PRs 1–4. Until the release promotes them, `SECURITY.md` is the only live web-path routing guard — unchanged from today | Dormant until release |
 
 The issue radar (`linked-issues.yml`, artefact 6) is **deferred behind a measured trigger** — it
 re-imports the `pull_request` token hazard §3 exists to escape, and it matches `file:line`

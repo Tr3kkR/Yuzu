@@ -67,9 +67,9 @@ carries it, which makes agent inflow countable without any extra machinery.
 | Label | Owner | Meaning |
 |---|---|---|
 | `do-not-close` | maintainer | Automation must never close this issue (issue-standard §5.1). The committed list `scripts/tracker/do-not-close.txt` is the authoritative twin; the label is the instant, no-PR marker. |
-| `fixed-on-dev` | close-on-merge workflow | Closed by dev-merge automation; the fix is not yet in a `main` release. Stripped at release promotion (informational until that wiring lands). |
-| `automation-broken` | close-on-merge alert job | The tracker automation itself failed; opened by the `if: failure()` alert job. |
-| `triage-sweep` | tracker report | Marks the rolling tracking issue the weekly report posts to. |
+| `fixed-on-dev` | close-on-merge workflow (ADR-3001 PR 2) | Closed by dev-merge automation; the fix is not yet in a `main` release. Stripped at release promotion (informational until that wiring lands). |
+| `automation-broken` | close-on-merge alert job (PR 2) | The tracker automation itself failed; opened by the `if: failure()` alert job. |
+| `triage-sweep` | tracker report (PR 4) | Marks the rolling tracking issue the weekly report posts to. |
 | `nightly-broken` | nightly.yml | Nightly failed; no merge to `main` while open. |
 | `runner-inventory-drift` | runner-inventory-sentinel.yml | Self-hosted runner drift detected. |
 
@@ -81,9 +81,10 @@ carries it, which makes agent inflow countable without any extra machinery.
 series; open issues still carry them and nothing keys on them. Do not add them to new filings; do
 not bulk-migrate them (ADR-3001 explicitly leaves `phase-*` untouched).
 
-## Invariants (measured by tracker telemetry)
+## Invariants (measured by tracker telemetry once ADR-3001 PR 4 lands)
 
 - Exactly one type + one triage state on every open non-`roadmap` issue; a priority once triaged.
 - `roadmap` never coexists with a priority or a triage state.
 - Nothing but automation applies the automation-owned labels (except `do-not-close`, which the
-  maintainer may apply at will).
+  maintainer may apply at will). Removing an automation-owned label disarms a never-close signal —
+  never do it without the maintainer's say-so; removals become telemetry-visible with PR 4.

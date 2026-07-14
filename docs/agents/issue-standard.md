@@ -2,9 +2,11 @@
 
 The single canonical standard for filing, labelling, and closing GitHub issues in `Tr3kkR/Yuzu`.
 Adopted by ADR-3001 (`docs/adr/3001-issue-lifecycle-guardrails.md`, as amended by A1). It binds
-humans and agents equally; the `gh` CLI path additionally carries mechanical enforcement (a
-PreToolUse hook, ADR-3001 pillar 4). Command mechanics live in [`issue-tracker.md`](issue-tracker.md);
-the full label taxonomy lives in [`triage-labels.md`](triage-labels.md).
+humans and agents equally, by this text and PR review; the `gh` CLI path will additionally carry
+mechanical enforcement (a PreToolUse hook — ADR-3001 pillar 4, PR 3 of the stack; Claude sessions
+only — other agents remain bound by this text alone). Command mechanics live in
+[`issue-tracker.md`](issue-tracker.md); the full label taxonomy lives in
+[`triage-labels.md`](triage-labels.md).
 
 ## 1. When an issue is warranted
 
@@ -37,7 +39,7 @@ least the first two probes, and record what you ran and what it returned in the 
 ```bash
 # probe 1 — by the file/symbol the issue cites
 gh issue list --repo Tr3kkR/Yuzu --state open --search "<file-or-symbol>" --json number,title
-# probe 2 — by title keywords
+# probe 2 — by title keywords (if all 20 results return, narrow the keywords and re-run)
 gh search issues --repo Tr3kkR/Yuzu --state open "<two or three keywords>" --json number,title --limit 20
 # probe 3 (when a type/facet is obvious) — label-scoped
 gh issue list --repo Tr3kkR/Yuzu --state open --label <label> --search "<keywords>" --json number,title
@@ -52,9 +54,10 @@ gh issue list --repo Tr3kkR/Yuzu --state open --label <label> --search "<keyword
 
 ## 3. Body format
 
-Four sections, in this order. Mandatory on the `gh`/agent path. (The web issue forms require only
-a minimal subset — description plus reproduction — so a drive-by human report is never lost to a
-schema; triage supplies the rest.)
+Four sections, in this order. Mandatory on the `gh`/agent path. (The web issue forms — PR 5 of
+the ADR-3001 stack — will require only a minimal subset, description plus reproduction, so a
+drive-by human report is never lost to a schema; triage supplies the rest. The same grace applies
+to web reports arriving via today's legacy templates.)
 
 ```markdown
 ## Context
@@ -94,7 +97,7 @@ Three mandatory axes; the full taxonomy with meanings is [`triage-labels.md`](tr
   maintainer — never set them on a new filing. (Exception: a maintainer may add `do-not-close` to
   any issue at any time; that is the label's purpose.)
 
-Invariants, measured by the tracker telemetry:
+Invariants (measured by tracker telemetry once ADR-3001 PR 4 lands):
 
 - every open non-`roadmap` issue carries a priority once triaged;
 - `roadmap` never coexists with a priority or a triage state.

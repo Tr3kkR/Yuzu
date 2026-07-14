@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # bootstrap-labels.sh -- create the ADR-3001 (A1 par.7) automation labels. Idempotent:
 # `gh label create --force` upserts, so re-running is always safe (same idiom as
-# scripts/create_issues.sh). Run once from any authenticated checkout before the
-# close-on-dev-merge workflow (PR 2 of the ADR-3001 stack) merges.
+# scripts/create_issues.sh). Run once from any authenticated checkout AT PR-1 MERGE,
+# before the first agent filing: `task`/`decision` become filing-valid types the moment
+# the issue standard lands, and a filing that names a nonexistent label fails at create.
+# Verify afterwards:
+#   gh label list --repo Tr3kkR/Yuzu --limit 100 | grep -E 'task|decision|do-not-close|fixed-on-dev|automation-broken|triage-sweep'
 #
 # Deliberately NOT a migration: the parallel priority-p* scheme was deleted in the
 # 2026-07-14 consolidation, so there is nothing to migrate -- only these six labels

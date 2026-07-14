@@ -23,11 +23,17 @@ Wired into tests/meson.build (suite: docs), mirroring test_changelog_order.py.
 """
 
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 CLAUDE_MD_CHAR_CAP = 40_000
+
+# ASCII digits only, no leading zero: `isdigit()` alone accepts Arabic-Indic
+# numerals a grep/bash consumer would miss, and `0318` would int() to 318 while
+# a string-comparing consumer looks for "318" — both are silent-shrink bugs.
+ISSUE_NUMBER_RE = re.compile(r"0|[1-9][0-9]*")
 
 
 def main() -> int:
@@ -40,7 +46,9 @@ def main() -> int:
         failures.append(
             f"CLAUDE.md is {n_chars} characters -- at/over its self-imposed "
             f"{CLAUDE_MD_CHAR_CAP} cap (see 'CLAUDE.md updates' in the file itself). "
-            f"Route detail to docs/ and keep only invariants + pointers."
+            f"Route detail to docs/ and keep only invariants + pointers. "
+            f"If this PR did not touch CLAUDE.md, dev is already over cap -- "
+            f"land a trim PR first; this failure is not your change's fault."
         )
 
     # 2. do-not-close.txt parses clean
@@ -52,19 +60,31 @@ def main() -> int:
         for lineno, line in enumerate(
             dnc_path.read_text(encoding="utf-8").splitlines(), start=1
         ):
-            body = line.split("#", 1)[0].strip()
+            body, _, comment = line.partition("#")
+            body = body.strip()
             if not body:
+                # A comment-only line whose text is purely a number is the
+                # `#318` typo class: the entry the author meant to protect
+                # silently became a comment. Prose comments never trip this.
+                if comment.strip().isdigit():
+                    failures.append(
+                        f"do-not-close.txt:{lineno}: comment-only line is a bare "
+                        f"number ({comment.strip()!r}) -- probably a '#'-prefixed "
+                        f"entry typo; the issue is NOT protected as written"
+                    )
                 continue
-            if not body.isdigit():
+            if not ISSUE_NUMBER_RE.fullmatch(body):
                 failures.append(
-                    f"do-not-close.txt:{lineno}: not a bare issue number: {body!r}"
+                    f"do-not-close.txt:{lineno}: not a bare ASCII issue number "
+                    f"(no leading zeros): {body!r}"
                 )
             else:
                 numbers.append(int(body))
         if not numbers:
             failures.append(
                 "do-not-close.txt parses to an EMPTY set -- the never-close "
-                "guard would be inert"
+                "guard would be inert. Restore the entries from git history "
+                "(git show origin/dev:scripts/tracker/do-not-close.txt)."
             )
         dupes = {n for n in numbers if numbers.count(n) > 1}
         if dupes:
