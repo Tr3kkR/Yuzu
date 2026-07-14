@@ -492,11 +492,18 @@ if build_server
   # hidden ([.]), so the shards partition the visible case set with nothing
   # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
   # meson runs the entries in parallel, so suite wall time is max(shards),
-  # and each shard gets its own budget. 600s each (was 900s combined): the
-  # quiet-leg worst case for the WHOLE suite was 512s, and per-agent Postgres
-  # (#2094/#2114) removed the cross-job contention that blew the old 600s
-  # cap. A real hang is still bounded by the job-level timeouts (90-120 min
-  # in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
+  # and each shard gets its own budget. ~[pg] keeps 600s (its Windows worst
+  # case is ~231s). [pg] gets 900s: the 600 assumed per-agent Postgres
+  # (#2094) had removed cross-job contention, but it is NOT yet provisioned on
+  # Wee Tam, and at full durability every [pg] case's CREATE DATABASE ...
+  # TEMPLATE + DROP DATABASE WITH (FORCE) is fsync-bound — ~20x costlier on
+  # Windows — so the [pg] shard hit exactly-600s TIMEOUTs on 2026-07-14
+  # (Fail:0, killed at the cap). The durable fix is durability-off on the
+  # disposable CI clusters (fsync/synchronous_commit/full_page_writes;
+  # scripts/ci/ensure-postgres.sh + deploy/windows/Provision-Windows-Runner.ps1)
+  # + finishing the #2094 per-agent provisioning; once both land on Wee Tam
+  # this returns to 600. A real hang is still bounded by the job-level timeouts
+  # (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
   # (test_pg_template_cleanup.cpp) fires in both shards — idempotent,
   # harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear in args (flake-retry.py strips
@@ -504,10 +511,12 @@ if build_server
   #     positional specs);
   #   - neither entry name may be a substring of the other (flake-retry maps
   #     meson-junit names by longest substring match).
-  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning,
-  # split further or rebalance the shards — don't just raise the number.
+  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the
+  # first move is the durability/per-agent fix above (attack the cost), then
+  # split or rebalance — raising the number is only the transitional net it is
+  # here for [pg] until durability-off + per-agent Postgres land on Wee Tam.
   test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
-  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 600)
+  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

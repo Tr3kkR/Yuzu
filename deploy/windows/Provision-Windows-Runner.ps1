@@ -176,6 +176,14 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
   & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
   & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
+  # Disposable CI cluster -> durability OFF. Every [pg] test does CREATE DATABASE
+  # ... TEMPLATE + DROP DATABASE WITH (FORCE), both fsync-heavy, and Windows fsync
+  # is ~20x costlier than Linux (the 2026-07-14 Wee Tam 600s [pg]-shard TIMEOUTs).
+  # A crash just re-runs the job. fsync/full_page_writes are postmaster params ->
+  # the restart below applies them. Removing these re-arms the timeout.
+  & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+  & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+  & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
   Restart-Service $svc -Force
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
@@ -212,7 +220,8 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
         icacls $data /grant '*S-1-5-20:(OI)(CI)F' | Out-Null
         & "$pgbin\initdb.exe" -D $data -U postgres -A password --pwfile=$pw -E UTF8 | Out-Null
         if(-not (Test-Path "$data\PG_VERSION")){ throw "initdb failed for $data" }
-        Add-Content "$data\postgresql.conf" "`n# yuzu CI per-agent cluster $n (#2094)`nlisten_addresses = '127.0.0.1'`nport = $port`nmax_connections = $PostgresMaxConnections`nlogging_collector = on`n"
+        # Durability off — disposable CI cluster (see the agent-0 tune block above).
+        Add-Content "$data\postgresql.conf" "`n# yuzu CI per-agent cluster $n (#2094)`nlisten_addresses = '127.0.0.1'`nport = $port`nmax_connections = $PostgresMaxConnections`nlogging_collector = on`nfsync = off`nsynchronous_commit = off`nfull_page_writes = off`n"
       }
       if(-not (Get-Service $svc -EA SilentlyContinue)){
         & "$pgbin\pg_ctl.exe" register -N $svc -D $data -S auto -U 'NT AUTHORITY\NetworkService'

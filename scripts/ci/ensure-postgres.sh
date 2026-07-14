@@ -46,6 +46,12 @@ SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf"
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432
+# Bump when the durability/-c tuning below changes: the docker container is
+# persistent (--restart unless-stopped), so a container born before a tuning
+# change keeps the OLD flags until recreated. The image-drift guard already
+# recreates on a PG_IMAGE bump; this label makes a tuning bump recreate too,
+# so fsync=off actually reaches runners that already have a container.
+PG_TUNE_LABEL="v1-durability-off"
 
 # ── Per-agent instance selection (#2094) ─────────────────────────────────
 # Both self-hosted pools run 4 runner agents on ONE box (CLAUDE.md standing
@@ -67,6 +73,15 @@ if [[ "${RUNNER_NAME:-}" =~ -([0-9]+)$ ]]; then
     AGENT_IDX=""
   fi
 fi
+# Disposable CI cluster -> durability OFF (fsync/synchronous_commit/
+# full_page_writes). Every [pg] test does CREATE DATABASE ... TEMPLATE + DROP
+# DATABASE WITH (FORCE) per case (~72 cases) — both fsync-heavy — so full
+# durability makes the [pg] shard the slowest-scaling part of the suite,
+# ~20x worse on Windows where fsync is dominant (the 2026-07-14 600s Windows
+# TIMEOUTs). The DBs are throwaway; a crash just re-runs the job. fsync and
+# full_page_writes are POSTMASTER params, so they must be set at the server
+# (the -c flags here / postgresql.conf), not per-connection.
+DOCKER_PG_ARGS=(-c fsync=off -c synchronous_commit=off -c full_page_writes=off)
 if [[ -n "$AGENT_IDX" ]]; then
   # Container-per-agent on 15440+<n>: base deliberately OFF 15432/15433 so
   # agent 0 collides with neither a legacy shared container (15432) nor the
@@ -75,13 +90,35 @@ if [[ -n "$AGENT_IDX" ]]; then
   DOCKER_PORT=$((15440 + AGENT_IDX))
   # Wee-Tam-parity connection headroom (#2096): the server suite's PgPool
   # fan-out can exhaust the postgres default of 100 (the CH-9 flake).
-  DOCKER_PG_ARGS=(-c max_connections=400)
-else
-  DOCKER_PG_ARGS=()
+  DOCKER_PG_ARGS+=(-c max_connections=400)
 fi
 
+# Connection-level durability relief, applied to EVERY emitted DSN. Unlike
+# fsync/full_page_writes, synchronous_commit is USERSET — settable per
+# connection with no restart and no privilege — so it is the one durability
+# knob we can turn on a cluster whose postgresql.conf we don't own (the pre-set
+# path: Wee Tam's native Windows service until deploy/windows/
+# Provision-Windows-Runner.ps1 is re-run). It rides through PostgresTestDb's
+# PQconninfoParse-based dbname rewrite (test_helpers.hpp) intact, so every
+# per-test DB inherits it. Idempotent; harmless where the server already sets
+# it off (docker/brew). Percent-encoded (%20=space, %3D='=') per RFC 3986.
+append_test_options() {
+  local dsn="$1"
+  case "$dsn" in
+    *synchronous_commit*) printf '%s' "$dsn"; return ;;  # already tuned
+  esac
+  case "$dsn" in
+    postgres://*|postgresql://*)
+      local sep='?'; case "$dsn" in *\?*) sep='&' ;; esac
+      printf '%s' "${dsn}${sep}options=-c%20synchronous_commit%3Doff" ;;
+    *)  # keyword/value conninfo (no current emitter uses this form)
+      printf '%s' "${dsn} options='-c synchronous_commit=off'" ;;
+  esac
+}
+
 emit_dsn() {
-  local dsn="$1" how="$2"
+  local dsn how="$2"
+  dsn="$(append_test_options "$1")"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "YUZU_TEST_POSTGRES_DSN=${dsn}" >> "$GITHUB_ENV"
   fi
@@ -147,8 +184,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # runners that already have one — tests would silently keep running the
   # old Postgres. Recreate when the recorded image differs.
   EXISTING_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-  if [[ -n "$EXISTING_IMAGE" && "$EXISTING_IMAGE" != "$PG_IMAGE" ]]; then
-    echo "ensure-postgres: ${CONTAINER} image ${EXISTING_IMAGE} != pinned ${PG_IMAGE} — recreating" >&2
+  EXISTING_TUNE="$(docker inspect -f '{{index .Config.Labels "yuzu-pgtune"}}' "$CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$EXISTING_IMAGE" && ( "$EXISTING_IMAGE" != "$PG_IMAGE" || "$EXISTING_TUNE" != "$PG_TUNE_LABEL" ) ]]; then
+    echo "ensure-postgres: ${CONTAINER} drift (image ${EXISTING_IMAGE} vs ${PG_IMAGE}, tune ${EXISTING_TUNE:-none} vs ${PG_TUNE_LABEL}) — recreating" >&2
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
@@ -156,6 +194,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     # bash 3.2 (macOS /bin/bash) too.
     docker start "$CONTAINER" >/dev/null 2>&1 || docker run -d \
       --name "$CONTAINER" \
+      --label "yuzu-pgtune=${PG_TUNE_LABEL}" \
       --restart unless-stopped \
       -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu_test \
       -p "127.0.0.1:${DOCKER_PORT}:5432" \
@@ -194,8 +233,9 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     "$PGBIN/initdb" --username=yuzu --auth=trust --no-instructions -D "$PGDATA" >/dev/null
   fi
   if ! "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+    # Durability off — throwaway per-job cluster (see DOCKER_PG_ARGS rationale).
     "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGLOG" \
-      -o "-p ${DOCKER_PORT} -c listen_addresses=127.0.0.1" start >/dev/null
+      -o "-p ${DOCKER_PORT} -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" start >/dev/null
   fi
   for _ in $(seq 1 15); do
     if "$PGBIN/pg_isready" -h 127.0.0.1 -p "$DOCKER_PORT" -U yuzu >/dev/null 2>&1; then
