@@ -58,7 +58,7 @@ so did the arithmetic nobody had done before. The result is the reason this ADR 
   can leave behind during a takeover (×2), the affordable number of concurrent streams is
   **12**.
 - The only number the codebase records is **"hundreds of agentic clients per server"**
-  (`server/core/src/event_bus.hpp:83`, quoted again at `stream_budget.hpp:51`) — and it is
+  (`server/core/src/event_bus.hpp:73`, quoted again at `stream_budget.hpp:51` on the PR-2 branch) — and it is
   worth being precise about what that is: an **assumption inside a queue-cap rationale**, not
   a sizing requirement. **No stream-count requirement exists.** Establishing one is a
   deliverable of this ADR.
@@ -137,7 +137,13 @@ binary**:
   port**: Drogon is a heavyweight new dependency landing on the most fragile part of the build
   (Windows MSVC static linking, the #375 history), so it faces a vcpkg-port canary across the
   full matrix before it is ratified.
-  Durable session identity and the replay ring live in core/Postgres, not in presentation.
+  Durable session identity and the replay ring belong **behind the presentation boundary, not in
+  presentation** — presentation owns live sockets, not the truth. **Whether** they become durable, and
+  where they live, is **G6/G7 and remains OPEN** (ADR-0031's terms index says so; this ADR does not
+  get to settle it in passing). Note what is already binding: exec-plan Decision 15(d) holds 2f's MCP
+  sessions **in memory**, with a bounded **non-durable** replay ring and **no new store** — so naming
+  Postgres here would have licensed a durable session store that no ballot approved and that track 2f
+  is explicitly forbidden from building.
 - **Not the Erlang gateway.** The BEAM would win the same ceiling, but it would mean re-homing
   the MCP framing and the HTMX renderers into a second language. The gateway stays what it is:
   the **southbound** fleet edge, unchanged by this ADR.
