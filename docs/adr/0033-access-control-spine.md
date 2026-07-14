@@ -128,7 +128,8 @@ per-tool checkboxes — while individual tools still carry an operation and a ri
 that **a new engine's permissions are data, not C++**.
 
 **They are not, today, and that gap is this section's precondition.** Securable types are a
-hard-coded C++ array seeded `is_system` into the RBAC store (`rbac_store.cpp:217-236`, 20 entries);
+hard-coded C++ array seeded `is_system` into the RBAC store (`rbac_store.cpp:217-244`, 21 entries —
+`SoftwareLicensing` was added to it by a code change, which is exactly the point);
 `RbacStore` offers `list_securable_types()` and **no runtime create path**. So §2's own escape hatch
 — "a Module mints a new securable only when nothing fits" — is a C++ edit, a recompile and a
 release. **Building the runtime capability-declaration registry is core work, it is the precondition

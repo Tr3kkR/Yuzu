@@ -63,11 +63,12 @@ of one use case (ADR-0032).
 
 ## Context
 
-**Today the server is one binary that is both the domain and its own front end.** Twenty-three route
+**Today the server is one binary that is both the domain and its own front end.** Twenty-four route
 families register on a single `httplib::Server` inside `yuzu-server` — REST v1, MCP, the HTMX
 dashboard, settings, workflow, device, viz, DEX, Guardian, inventory, preflight, deployment,
-network, CA, SCIM, webhooks and the rest (`server.cpp`'s `register_routes` call sites). The
-dashboard renderers can reach stores in-process.
+network, CA, SCIM, webhooks, software licensing and the rest (`server.cpp`'s `register_routes` call
+sites; the count grows with every feature, which is the trend this ADR is about). The dashboard
+renderers can reach stores in-process.
 
 That means ADR-1005's central claim — *no UI-only capabilities; a dashboard fragment is not an API
 twin* — is a **rule enforced by review**. The `consistency-auditor` asks the standing question on
@@ -166,7 +167,7 @@ abseil static linkage on Windows MSVC) is the reason this is a gate and not an a
 
 **Size this honestly: G10 gates the linkage, not the port.** Choosing Drogon avoids a *language*
 port — the C++ stays C++ — but it is still a **framework** port. Every handler registration across
-the 23 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of
+the 24 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of
 `mcp_server.cpp` move from `httplib::Server`'s synchronous `Get`/`Post(path, handler)` signature to
 Drogon's async/coroutine controller model, and **every SSE content-provider is rewritten against a
 different concurrency model** — which is exactly the code whose semantics this ADR set cares most
@@ -287,7 +288,7 @@ MCP, discoverable, A4-enveloped*. The split leaves three ways to violate that, a
 none of them today:
 
 1. **A private core endpoint.** INV-31-4 forbids it; nothing enforces it. The contract test that
-   would — enumerate every registered route (23 `register_routes` families, and the handler
+   would — enumerate every registered route (24 `register_routes` families, and the handler
    registrations under them) and fail the build on any not present in the published OpenAPI —
    **does not exist**. It is a deliverable of migration step 3.
 2. **A REST route with no MCP twin.** Structurally invisible to the build.

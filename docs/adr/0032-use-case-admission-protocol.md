@@ -256,7 +256,7 @@ what the ABI cannot express, and **it cannot express this today**: `sdk/include/
 declares a plugin's actions as a flat `const char* const* actions` — a name array with **no
 per-action metadata of any kind**, let alone a mutability class. So this leg is **an ABI change on
 the compiler-stable plugin boundary** (`YUZU_PLUGIN_ABI_VERSION` 3 → 4, with
-`YUZU_PLUGIN_ABI_VERSION_MIN` governing how long v3 plugins keep loading), rippling through the 47
+`YUZU_PLUGIN_ABI_VERSION_MIN` governing how long v3 plugins keep loading), rippling through the 49
 in-tree plugins and any out-of-tree one. That is the hardest boundary in the codebase to change,
 and it is on P9's critical path — not a detail to discover during implementation.
 
@@ -510,7 +510,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(c)** | **The D12 audit schema** (acting principal · authority ref · **indexed** `use_case_run_id`) | Decision 12. Without it, "no unjoined evidence" is not merely untested — it is **unqueryable**. Rides the audit-store Postgres migration. | `AuditEvent` has a single `principal` field. |
 | **(d)** | **The P7 release-log schema** | Decision 11 *is* the disclosure evidence, and Decision 10's subset check **reads it**. Ship A5 without it and admitted runs exist whose disclosure cannot be proven from core-owned evidence. | Does not exist. Born-on-PG store, ADR-0012. |
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
-| **(f)** | **Per-action mutability in the plugin ABI** | Gates **the fact-acquisition dispatch path only** (Decision 8). Without it the agent-side plugin host cannot refuse a non-read-only action, and the mutating-by-default posture has the human manifest diff as its **only** backstop — which Decision 8 itself says must never be the case. | `plugin.h` carries action **names** only (`const char* const* actions`); no mutability metadata. An ABI change (v3 → v4) across 47 plugins. |
+| **(f)** | **Per-action mutability in the plugin ABI** | Gates **the fact-acquisition dispatch path only** (Decision 8). Without it the agent-side plugin host cannot refuse a non-read-only action, and the mutating-by-default posture has the human manifest diff as its **only** backstop — which Decision 8 itself says must never be the case. | `plugin.h` carries action **names** only (`const char* const* actions`); no mutability metadata. An ABI change (v3 → v4) across the 49 in-tree plugins. |
 
 **Rule:** no A5 code path ships until **(a)–(d)** have landed. **(e)** gates Decision 9
 specifically; **(f)** gates Decision 8's fact-acquisition dispatch path specifically. A module may
