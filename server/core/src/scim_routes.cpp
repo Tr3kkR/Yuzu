@@ -1997,6 +1997,23 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // against concurrent PUT/PATCH/DELETE.
                       std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
 
+                      // Re-read the group's CURRENT metadata under the lock —
+                      // the pre-lock `group` snapshot (top of handler) can be
+                      // stale by the time we get here: a concurrent PATCH/PUT
+                      // may have renamed it between that read and acquiring
+                      // this lock. Using the stale snapshot as the `value_or`
+                      // baseline for a PATCH that omits displayName would
+                      // silently revert the concurrent rename (and, since
+                      // display_name drives the --scim-admin-group match,
+                      // could re-promote/un-demote members). Also covers the
+                      // group having been deleted entirely in that window.
+                      auto current = scim_store->get_group_by_id(id);
+                      if (!current) {
+                          send_scim_error(res, 404, "resource not found");
+                          record_request(auth_mgr, "group_patch", 404);
+                          return;
+                      }
+
                       // Step 1: fold the ORDERED member ops onto a copy of the
                       // CURRENT membership (raw ids, not yet resolved against
                       // live Users) — see fold_group_member_ops's doc comment
@@ -2012,10 +2029,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // same validate-and-skip contract as before.
                       final_members = resolve_member_values(scim_store, final_members_raw);
 
-                      const std::string pre_update_display_name = group->display_name;
-                      final_display = patch.display_name.value_or(group->display_name);
+                      const std::string pre_update_display_name = current->display_name;
+                      final_display = patch.display_name.value_or(current->display_name);
                       const std::string final_external =
-                          patch.external_id.value_or(group->external_id);
+                          patch.external_id.value_or(current->external_id);
                       renamed = (final_display != pre_update_display_name);
 
                       // Step 3a: member cap on the FINAL set — closes the

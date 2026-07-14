@@ -2783,6 +2783,107 @@ TEST_CASE("Groups integration: PATCH mixing a rename with a member add recompute
     CHECK(oscar_demotions == 1);
 }
 
+// ── Metadata TOCTOU: membership-only PATCH must not revert a concurrent
+//    rename ──────────────────────────────────────────────────────────────
+//
+// Re-review MEDIUM (caught by two reviewers): the group was fetched via
+// `get_group_by_id` at the TOP of the handler, BEFORE `kGroupMutationMu` was
+// acquired. Inside the lock, `final_display`/`final_external` defaulted to
+// that PRE-LOCK snapshot. So a membership-only PATCH (no displayName in the
+// request) that read the group BEFORE a concurrent rename committed would,
+// on winning `kGroupMutationMu` AFTER that rename, persist the STALE
+// displayName — silently reverting the rename. Because displayName drives
+// the --scim-admin-group match and recompute runs over every current
+// member, this could re-promote a just-demoted member. The fix re-reads the
+// group's CURRENT metadata inside the lock and uses THAT as the
+// `value_or` baseline. Looped so the two critical sections have a real
+// chance to interleave both ways under the scheduler.
+TEST_CASE("Groups integration: concurrent membership-only PATCH never reverts a concurrent "
+         "rename (metadata TOCTOU re-review MEDIUM, PR #2127)",
+         "[scim][routes][integration][groups][patch][group-concurrency]") {
+    ScimIntegrationServer ts(/*rate_per_second=*/1000, /*admin_group=*/"Yuzu-Admins");
+    ts.start();
+    httplib::Client setup_cli("127.0.0.1", ts.port);
+    setup_cli.set_connection_timeout(5);
+    setup_cli.set_read_timeout(5);
+    httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
+
+    auto x_id = create_scim_user_over_wire(setup_cli, ts.token, "xena-toctou");
+    auto y_id = create_scim_user_over_wire(setup_cli, ts.token, "yara-toctou");
+
+    auto group_post = setup_cli.Post(
+        "/scim/v2/Groups", hdr,
+        json{{"displayName", "Yuzu-Admins"}, {"members", json::array({{{"value", x_id}}})}}
+            .dump(),
+        "application/scim+json");
+    REQUIRE(group_post);
+    REQUIRE(group_post->status == 201);
+    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    REQUIRE(ts.auth_mgr.get_user_role("xena-toctou").value() == auth::Role::admin);
+
+    // (A) rename off the admin group — should demote x.
+    json rename_body{{"Operations",
+                      json::array({{{"op", "replace"},
+                                    {"value", json{{"displayName", "Former-Admins"}}}}})}};
+    // (B) membership-only — no displayName field at all.
+    json membership_body{{"Operations",
+                          json::array({{{"op", "add"},
+                                        {"path", "members"},
+                                        {"value", json::array({{{"value", y_id}}})}}})}};
+    // Reset between iterations: rename back onto the admin group (re-
+    // promotes x for the next iteration's assertion) and drop y (so the
+    // next iteration's "add y" is a genuine add, not a no-op).
+    json restore_body{
+        {"Operations",
+         json::array({{{"op", "replace"}, {"value", json{{"displayName", "Yuzu-Admins"}}}},
+                      {{"op", "remove"}, {"path", "members[value eq \"" + y_id + "\"]"}}})}};
+
+    for (int i = 0; i < 50; ++i) {
+        CAPTURE(i);
+        std::atomic<bool> saw_unexpected{false};
+
+        std::thread rename_thread([&] {
+            httplib::Client cli("127.0.0.1", ts.port);
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(5);
+            auto res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr,
+                                 rename_body.dump(), "application/scim+json");
+            if (!res || res->status != 200)
+                saw_unexpected.store(true);
+        });
+        std::thread membership_thread([&] {
+            httplib::Client cli("127.0.0.1", ts.port);
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(5);
+            auto res = cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr,
+                                 membership_body.dump(), "application/scim+json");
+            if (!res || res->status != 200)
+                saw_unexpected.store(true);
+        });
+        rename_thread.join();
+        membership_thread.join();
+        CHECK_FALSE(saw_unexpected.load());
+
+        auto get_res = setup_cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
+        REQUIRE(get_res);
+        REQUIRE(get_res->status == 200);
+        auto current_display = json::parse(get_res->body)["displayName"].get<std::string>();
+        // The falsifier: regardless of which PATCH wins `kGroupMutationMu`,
+        // the rename must stick — a membership-only PATCH must never
+        // silently revert it.
+        CHECK(current_display == "Former-Admins");
+        // ...and because displayName drives the --scim-admin-group match, a
+        // reverted rename would silently re-promote x back to admin here.
+        CHECK(ts.auth_mgr.get_user_role("xena-toctou").value() == auth::Role::user);
+
+        auto restore_res = setup_cli.Patch(("/scim/v2/Groups/" + group_id).c_str(), hdr,
+                                           restore_body.dump(), "application/scim+json");
+        REQUIRE(restore_res);
+        REQUIRE(restore_res->status == 200);
+        REQUIRE(ts.auth_mgr.get_user_role("xena-toctou").value() == auth::Role::admin);
+    }
+}
+
 // ── PATCH member-cap rejection must NOT commit a co-submitted rename ───────
 //
 // Re-review MEDIUM (same class as the [HIGH fix] above, on the error path):
