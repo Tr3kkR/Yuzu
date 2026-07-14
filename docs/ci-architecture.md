@@ -48,6 +48,45 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
 
+## Gates outside the tier ladder
+
+### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
+
+Every Yuzu image's compose healthcheck depends on a tool baked into the image,
+not on the application: **bash + `/dev/tcp`** for `yuzu-server`, **busybox `wget
+--spider`** for `yuzu-gateway`, and **`/bin/busybox`** (by absolute path) for the
+three FROM-scratch chisel images. Nothing else exercises those tools. A base-image
+swap, a dropped apt package, or a chisel slice change that stops shipping the
+busybox symlink breaks nothing at build time and nothing at boot — it breaks only
+the healthcheck, so Compose parks every container `unhealthy` forever and anything
+with `depends_on: condition: service_healthy` never starts, with no application
+failure to point at.
+
+`scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
+real healthcheck probe **against a live HTTP listener** in a shared network
+namespace, so exit 0 is the only passing outcome. Probing a *closed* port cannot
+distinguish a working bash from a bash built without net redirections — both
+return 1 — which is why the naive "accept 0 or 1" check that #751 originally
+proposed passes a broken image (verified against a bash compiled
+`--disable-net-redirections`).
+
+**Placement — it runs in two places, sharing one script:**
+
+| Where | When | Why |
+|---|---|---|
+| `docker-healthcheck-invariants.yml` | PRs + pushes to `dev`/`main` | Catches a base-image swap in the PR that introduces it, not weeks later at release. |
+| `release.yml` (`docker-publish`, `docker-publish-chisel`) | Between image build and registry push | A broken image is never published. Verifying after the push would leave a broken tag in GHCR. |
+
+It is deliberately **not** in `ci.yml`: the Tier-1 fast path must stay under 10
+min and these builds are far too heavy. It is equally deliberately **not**
+`paths:`-filtered — per #1978, a path-filtered workflow that later becomes a
+*required* check never reports on PRs it filters out, so the check sits at
+"Expected — waiting for status" forever and a non-admin can never merge. Instead
+the workflow always runs and a cheap `changes` job skips the build matrix. The
+matrix reuses release.yml's local buildcache **read-only** (`cache-from` with no
+`cache-to`), so it never evicts release layers and adds no cache directory that
+`cache-prune.yml` doesn't know about.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |

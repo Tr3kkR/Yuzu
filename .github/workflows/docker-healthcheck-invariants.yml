@@ -1,0 +1,202 @@
+name: Docker healthcheck invariants
+
+# Verifies that every published Yuzu image still provides the tool its compose
+# healthcheck invokes (#751): bash + /dev/tcp for the server image, busybox
+# wget --spider for the gateway image, /bin/busybox for the three FROM-scratch
+# chisel images.
+#
+# Why this exists: those dependencies are invisible to the application. A base-
+# image swap, a dropped apt package, or a chisel slice change that stops
+# shipping the busybox symlink breaks NOTHING at build time and nothing at boot
+# -- it breaks only the healthcheck. Compose then parks every container in
+# `unhealthy` forever and anything with `depends_on: condition: service_healthy`
+# never starts, with no application failure to point at. Until now no automated
+# gate exercised them.
+#
+# ── Placement (issue #751 asked for this choice to be justified) ─────────────
+# The gate runs in TWO places, sharing one script:
+#
+#   1. HERE, on PRs and on pushes to dev/main -- so a base-image swap is caught
+#      in the PR that introduces it, not weeks later during a release.
+#   2. In release.yml's docker-publish + docker-publish-chisel jobs, between the
+#      image build and the registry push -- so a broken image is never
+#      published, which is the bar the issue actually set.
+#
+# ── Why no `paths:` filter (this is a trap, see #1978) ───────────────────────
+# The obvious design -- `on.pull_request.paths: [deploy/docker/**]` -- is wrong
+# for this repo. ci.yml carries a long comment explaining why: a path-filtered
+# workflow that is also a REQUIRED check never reports on PRs it filters out, so
+# the check sits at "Expected -- waiting for status" forever and a non-admin can
+# never merge. A *skipped* required check is satisfied; an *absent* one is not.
+# So the workflow always runs, and the `changes` job below skips the expensive
+# matrix instead. This stays correct if the gate is later made required.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hc-invariants-${{ github.ref }}
+  # Supersede in-flight PR runs, but let a mainline push run to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Cheap GitHub-hosted gate: did this change touch the image surface or the
+  # healthcheck definitions? Fail-closed -- anything we cannot classify builds.
+  changes:
+    name: "Detect image-surface changes"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      images_touched: ${{ steps.classify.outputs.images_touched }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "images_touched=$1" >> "$GITHUB_OUTPUT"
+            echo "images_touched=$1"
+            exit 0
+          }
+
+          # Fail-closed: a manual dispatch, or any event we do not model,
+          # verifies rather than silently skipping.
+          case "$EVENT_NAME" in
+            pull_request) BASE="$BASE_SHA" ;;
+            push)         BASE="$BEFORE_SHA" ;;
+            *)            echo "Unmodelled event '$EVENT_NAME' -- verifying (fail-closed)."; emit true ;;
+          esac
+
+          # A force-push or an initial commit leaves an all-zero / unknown base.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "Base commit unavailable -- verifying (fail-closed)."
+            emit true
+          fi
+
+          if ! FILES="$(git diff --name-only "$BASE" "$HEAD_SHA" 2>/dev/null)"; then
+            echo "git diff failed -- verifying (fail-closed)."
+            emit true
+          fi
+
+          echo "Changed files:"; echo "$FILES" | sed 's/^/  /'
+
+          # The image surface: the five published Dockerfiles, every compose file
+          # that defines a healthcheck (a healthcheck edit can invalidate the
+          # probes in the script), the script itself, and this workflow.
+          if echo "$FILES" | grep -qE \
+            -e '^deploy/docker/Dockerfile\.(server|gateway)(\.chisel)?$' \
+            -e '^deploy/docker/Dockerfile\.agent\.chisel$' \
+            -e '^deploy/docker/docker-compose.*\.ya?ml$' \
+            -e '^docker-compose\.uat\.yml$' \
+            -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
+            -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
+            echo "Image surface touched -- verifying."
+            emit true
+          fi
+
+          echo "No image-surface changes -- skipping the build matrix."
+          emit false
+
+  verify:
+    name: "Verify ${{ matrix.role }} healthcheck invariant"
+    needs: changes
+    if: needs.changes.outputs.images_touched == 'true'
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
+    # Cold-cache worst case is a full vcpkg-from-source compile for the server /
+    # agent chisel images (release.yml allows 360 min for those, but that budget
+    # covered a QEMU-emulated arm64 leg this gate does not build). In the normal
+    # case the release job's local buildcache is warm and only the runtime stage
+    # -- the part that actually carries the invariant -- rebuilds.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: server
+            dockerfile: deploy/docker/Dockerfile.server
+            cache: server
+            build_args: TRIPLET=x64-linux
+          - role: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway
+            cache: gateway
+            build_args: TRIPLET=x64-linux
+          # NO TRIPLET for the chisel images: they derive the vcpkg triplet from
+          # buildx's TARGETARCH when TRIPLET is empty, and pinning it here would
+          # diverge from how release.yml builds them.
+          - role: server-chisel
+            dockerfile: deploy/docker/Dockerfile.server.chisel
+            cache: server-chisel
+            build_args: ""
+          - role: gateway-chisel
+            dockerfile: deploy/docker/Dockerfile.gateway.chisel
+            cache: gateway-chisel
+            build_args: ""
+          - role: agent-chisel
+            dockerfile: deploy/docker/Dockerfile.agent.chisel
+            cache: agent-chisel
+            build_args: ""
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image (load, do not push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+          build-args: ${{ matrix.build_args }}
+          # READ-ONLY reuse of release.yml's local buildcache: the expensive
+          # builder stages are already there, so a runtime-stage change (the
+          # kind that breaks these invariants) rebuilds in seconds.
+          #
+          # Deliberately NO cache-to. This gate must not write to the release
+          # job's cache -- a PR build would otherwise evict release layers, and
+          # a new cache directory here would be invisible to cache-prune.yml and
+          # grow unbounded on the runner.
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.cache }}
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.role }}
+          IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the loaded image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true

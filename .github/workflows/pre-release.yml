@@ -24,20 +24,50 @@ jobs:
   resolve:
     name: "Resolve version"
     runs-on: ubuntu-24.04
+    # Gate on the triggering Release run being a SUCCESSFUL TAG BUILD.
+    #
+    # This used to read `startsWith(github.event.workflow_run.head_branch, 'v')`,
+    # which never matched: for a tag-triggered upstream run, GitHub reports
+    # `head_branch` as the BRANCH the tagged commit sits on (`main`) — never the
+    # tag. Every Release run since the workflow was written was a `v*` tag push,
+    # and every resulting Pre-release QA run reported `head_branch=main`, so this
+    # condition was false every single time. The whole suite — artifact
+    # verification, integration, soak, upgrade, Trivy and all four installer
+    # jobs — has therefore NEVER executed, while the workflow reported green.
+    #
+    # release.yml triggers on `push: tags: ['v*']` and workflow_dispatch, so an
+    # upstream run with `event == 'push'` is necessarily a `v*` tag build. The
+    # tag itself is recovered from the commit in "Determine version" below.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
+       github.event.workflow_run.event == 'push')
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
+      registry: ${{ steps.reg.outputs.registry }}
       has_prev: ${{ steps.prev.outputs.has_prev }}
       prev_tag: ${{ steps.prev.outputs.prev_tag }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # Check out the commit the Release workflow built, with full history
+          # and tags — "Determine version" maps that commit back to its tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
+
+      # `github.repository_owner` is `Tr3kkR` — mixed case. Docker rejects
+      # uppercase in a repository name outright ("repository name must be
+      # lowercase"), so `ghcr.io/${{ github.repository_owner }}/yuzu-server`
+      # cannot be pulled at all. release.yml lowercases the owner for exactly
+      # this reason; this workflow never did, and the bug stayed invisible
+      # because no job that pulls an image has ever run. Every consuming job
+      # below overrides the workflow-level REGISTRY with this value.
+      - name: Lowercase registry owner
+        id: reg
+        run: echo "registry=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: ver
@@ -48,13 +78,21 @@ jobs:
           # workflow_dispatch input can carry shell metacharacters, and
           # direct `${{ ... }}` expansion into a `run:` block is a code-
           # injection sink (CodeQL actions/code-injection/critical).
-          EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             TAG="$INPUT_TAG"
           else
-            TAG="$EVENT_BRANCH"
+            # Recover the tag from the commit the Release workflow built. Sorted
+            # newest-first so a commit carrying several tags (a retag) resolves
+            # to the one that actually triggered this run.
+            TAG="$(git tag --points-at "$HEAD_SHA" --sort=-creatordate \
+                   | grep -E '^v[0-9]' | head -1)"
+            if [[ -z "$TAG" ]]; then
+              echo "::error::No v* tag points at $HEAD_SHA — cannot resolve the release under test." >&2
+              exit 1
+            fi
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -114,6 +152,11 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Override the workflow-level REGISTRY, which carries the mixed-case owner
+    # (`ghcr.io/Tr3kkR`) that Docker refuses to pull. See resolve's "Lowercase
+    # registry owner".
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -180,8 +223,15 @@ jobs:
                 - "50055:50055"
               volumes:
                 - /tmp/yuzu-qa/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
+              # \`curl\` is NOT in the server runtime image (it installs only
+              # libssl3, libpq5, ca-certificates and bash), so this healthcheck
+              # could never pass: the container would sit \`unhealthy\` forever and
+              # \`gateway\`, which waits on \`condition: service_healthy\`, would
+              # never start. Use bash's /dev/tcp pseudo-device — the same probe
+              # deploy/docker/docker-compose.reference.yml uses. The gate added
+              # in #751 verifies bash + /dev/tcp survive in the image.
               healthcheck:
-                test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+                test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10
@@ -498,6 +548,8 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -593,6 +645,8 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -661,6 +715,8 @@ jobs:
     needs: [resolve, integration]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -697,8 +753,10 @@ jobs:
               command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              # curl is NOT in the server runtime image — see the integration
+              # job's compose above. bash + /dev/tcp is the supported probe.
               healthcheck:
-                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10
@@ -820,6 +878,8 @@ jobs:
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -859,8 +919,10 @@ jobs:
               command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              # curl is NOT in the server runtime image — see the integration
+              # job's compose above. bash + /dev/tcp is the supported probe.
               healthcheck:
-                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10

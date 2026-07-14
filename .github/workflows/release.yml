@@ -1208,6 +1208,47 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Build WITHOUT pushing, verify the image still provides the tool its
+      # compose healthcheck invokes (bash + /dev/tcp for server; busybox wget
+      # --spider for gateway), and only then push.
+      #
+      # Verifying AFTER the push would be too late: a broken tag would already
+      # be in GHCR for users to pull. The failure mode is silent -- a base-image
+      # swap or a dropped apt package breaks nothing at build time and nothing
+      # at boot, only the healthcheck, so Compose parks every container in
+      # `unhealthy` forever with no application error to point at.
+      #
+      # This build populates the local buildcache, so "Build and push" below is
+      # a full cache hit and pays only for the registry upload.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          build-args: |
+            TRIPLET=x64-linux
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
+          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }},mode=max
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -1601,6 +1642,41 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Same pre-push gate as docker-publish, and it matters MORE here: these
+      # images are FROM scratch, so their healthcheck depends entirely on a
+      # busybox binary the chisel stage symlinks into place. A slice change
+      # that stops shipping it breaks every demo-stack healthcheck and nothing
+      # else. docker-compose.demo.yml invokes it by absolute path
+      # (`/bin/busybox wget --spider`), which is exactly what the script probes.
+      #
+      # NO TRIPLET build-arg, matching "Build and push" below.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
+          cache-to: type=local,dest=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}-chisel
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
 
       - name: Build and push
         id: build
