@@ -56,6 +56,9 @@
 # REGISTERS here, so the heartbeat / OTA / daily-sync threads (spawned only after a successful
 # Register) never exist. A connected agent's teardown is longer -- 0.5-8.5s measured. Do not quote
 # these numbers as production shutdown latency. (governance: consistency-auditor.)
+# Also NOT covered: the PID-1 hard-exit posture (main.cpp on_signal_hard_exit) -- this harness
+# never runs the agent as pid 1, and neither does any CI leg, so the pid-1 discard semantics
+# the fallback exists for are verified by inspection only. (governance gate round: QE-4.)
 set -uo pipefail
 
 AGENT=${YUZU_AGENT_BIN:-build-linux/agents/core/yuzu-agent}

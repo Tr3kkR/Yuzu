@@ -31,6 +31,12 @@
 using namespace std::chrono_literals;
 using yuzu::agent::ShutdownWatcher;
 
+// DELIBERATE CONTRACT DEVIATION, safe here only: these cases pass STACK atomics as
+// `wfd_slot` where the production contract requires static storage duration (the dtor's
+// detach path may touch the slot late). Safe in tests because every watcher is joined in
+// scope — the detach path needs pipe-write exhaustion, which none of these cases can hit.
+// Do not copy this shape into production code. (governance gate round: QE-6.)
+
 TEST_CASE("ShutdownWatcher: the READ end blocks, the WRITE end does not, both are CLOEXEC",
           "[shutdown]") {
     std::atomic<int> wfd{-1};
@@ -156,3 +162,33 @@ TEST_CASE("ShutdownWatcher: a late write on a retired watcher must not raise SIG
 }
 
 #endif // !_WIN32
+
+TEST_CASE("ShutdownWatcher: trap 6 — an unexpected read() death flips ok() and fires "
+          "on_watcher_died",
+          "[shutdown]") {
+    // Drives the n != 1 death branch deterministically: closing the WRITE end delivers EOF
+    // (n == 0) to the blocked read(). Closing the READ end would NOT work — a blocked read()
+    // is not woken by its own fd closing; EOF on last-write-end-close is guaranteed to wake.
+    // (governance gate round: QE-3 — this exact branch is the bug class 194c0eeb fixed, and
+    // no prior case forced it.)
+    std::atomic<int> wfd{-1};
+    std::atomic<bool> died{false};
+    std::atomic<bool> teardown_ran{false};
+    {
+        ShutdownWatcher w{wfd, [&] { teardown_ran = true; return true; },
+                          [&] { died.store(true, std::memory_order_release); }};
+        REQUIRE(w.ok());
+        REQUIRE(wfd.load() >= 0);
+        // TEST-ONLY fault injection: production never closes these fds. The dtor's kQuit
+        // write will then hit EBADF and take its detach path against an already-finished
+        // thread — safe, and exercised deliberately here.
+        ::close(w.write_fd_for_test());
+        for (int i = 0; i < 500 && !died.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(10ms);
+        CHECK(died.load());               // the death callback fired
+        CHECK_FALSE(w.ok());              // trap 6: ok() must not keep reporting healthy
+        CHECK(wfd.load() == -1);          // slot retracted — no handler writes a dead pipe
+        CHECK_FALSE(teardown_ran.load()); // death is not a shutdown
+    }
+    SUCCEED("death detected, liveness cleared, slot retracted, dtor safe on EBADF");
+}

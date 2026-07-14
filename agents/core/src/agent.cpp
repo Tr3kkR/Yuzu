@@ -1486,6 +1486,23 @@ public:
                 // owns the underlying call ref, so TryCancel after the stream dies is a no-op,
                 // not a UAF — and `sub_ctx` outlives every moment it is published.
                 CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx};
+                // PUBLISH-THEN-RE-CHECK, the register_slot pattern's SIBLING SITE. A stop()
+                // that ran to completion in the window between Register success and this
+                // publish — a WIDE window: CSR/TLS handling, Updater construction,
+                // rollback_if_needed()'s and cleanup_old_binary()'s file I/O — cancelled
+                // nothing (all slots were null) and is already consumed (the watcher callback
+                // fires once). Without this re-check, run() would open Subscribe against a
+                // HEALTHY server and park at stream->Read() with no in-process canceller
+                // left: the hb/sync/update threads see their stop flags and exit instantly,
+                // so nothing ever cancels the stream, and the only exits are server-side
+                // session reap or the supervisor's SIGKILL (Docker: 10s grace) — the exact
+                // class this PR removes for Register. A stop() landing AFTER this check and
+                // before the call binds is covered by gRPC's call_canceled_ latch, with the
+                // stream's own lifecycle as backstop. The original hand-split applied the
+                // re-check to register_slot only and orphaned this sibling.
+                // (governance gate round: cpp-safety BLOCKING, this branch.)
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
 
                 std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
                 if (!stream) {

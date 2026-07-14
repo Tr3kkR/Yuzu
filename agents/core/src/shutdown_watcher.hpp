@@ -42,7 +42,8 @@
 ///      If the watcher died on a read() error, a joinable()-based ok() went on reporting true,
 ///      the handlers stayed installed, and every later SIGTERM was written into a pipe with NO
 ///      READER: swallowed. The agent became UNKILLABLE by SIGTERM. Hence `alive_`, plus the
-///      `on_watcher_died` callback that hands the signals back to the kernel (SIG_DFL).
+///      `on_watcher_died` callback that installs the hard-exit handler (NOT SIG_DFL — pid 1
+///      discards default-action signals; see main.cpp's on_signal_hard_exit).
 ///
 /// AND: nothing may throw out of the CONSTRUCTOR BODY (trap 2) — including a LOG. spdlog
 /// rethrows non-std exceptions, so every failure-path log goes through log_quietly()'s
@@ -87,7 +88,10 @@ public:
     static constexpr char kQuit = 0;   ///< written by the destructor: just retire
 
     /// `wfd_slot` is the atomic the signal handler reads the write-fd from (it must be
-    /// lock-free — assert that at the definition site). `on_shutdown` runs on the watcher
+    /// lock-free — assert that at the definition site — and STATIC-STORAGE-DURATION in
+    /// production: the destructor's detach path can touch the slot after any narrower
+    /// scope has died; see WatcherState. Unit tests pass stack atomics, which is safe
+    /// ONLY because they join in scope and never exercise the detach path). `on_shutdown` runs on the watcher
     /// thread, an ORDINARY thread, so it may lock, join, allocate and log freely. It is
     /// called at most once. If it returns false the watcher keeps waiting — used when the
     /// Agent is not published yet, so a signal arriving during boot cannot CONSUME the
@@ -124,7 +128,7 @@ public:
             ::fcntl(fds_[1], F_SETFD, FD_CLOEXEC) < 0) {
             // Fail CLOSED: a pipe whose fds leak into every popen()/fork+exec child hands each
             // subprocess a lever to stop the agent. degrade() -> ok()==false -> the caller leaves
-            // SIG_DFL standing, which is still killable, just not graceful.
+            // the hard-exit fallback standing (killable everywhere incl. pid 1, not graceful).
             const int err = errno;
             degrade();
             log_quietly("could not set FD_CLOEXEC on the shutdown pipe", err);
@@ -192,7 +196,7 @@ public:
                                     "now exit the process immediately and UNGRACEFULLY",
                                     err);
                         if (died)
-                            died(); // caller restores SIG_DFL
+                            died(); // caller installs the hard-exit handler
                         return;
                     }
 
@@ -316,7 +320,7 @@ private:
     /// both ends.
     ///
     /// Closing the fds is safe ONLY here — where the thread never started, so `ok()` is false
-    /// and main leaves SIG_DFL standing, meaning no handler exists to write into a recycled
+    /// and main installs the hard-exit handler (never touches the pipe), so no handler exists to write into a recycled
     /// descriptor (trap 5). Call it on a LIVE watcher and it is a guaranteed hang: closing an
     /// fd does not wake a thread already blocked in read(), the destructor then sees
     /// `fds_[1] < 0`, skips the kQuit write entirely, and joins a thread that can never be

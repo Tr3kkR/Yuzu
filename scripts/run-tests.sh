@@ -101,7 +101,7 @@ run_agent_shutdown() {
     # `ps -o comm=`, and templates every mktemp) — but NO CI leg has ever executed it on macOS, and
     # docs/darwin-compat.md MANDATES `run-tests.sh all` after any cross-platform change. That made
     # every Mac contributor the first person ever to run it, on an unvalidated path, while the
-    # output implied it was vetted. Skip it here and wire it into the macOS CI leg as a follow-up:
+    # output implied it was vetted. Skip it here and wire it into the macOS CI leg as a follow-up (.spark-issues/governance-followups.md item 20, pending an issue number):
     # "mandated but never validated" is the worst of the three options.
     # (governance: build-ci, quality-engineer, cross-platform.)
     if [[ "$(uname -s)" == "Darwin" ]]; then

@@ -113,7 +113,8 @@ public:
      *     no pinnable CA), AND
      *   * a fatal MID-LIFE failure: a dispatch-thread-pool re-creation that fails on the reconnect
      *     path (host out of threads). That used to return EXIT_SUCCESS, so the agent simply
-     *     vanished from the fleet — the SCM read a clean stop and ran no recovery action.
+     *     vanished from the fleet — a clean exit fires no Restart=on-failure / k8s OnFailure
+     *     policy, and on Windows it denies FAILURE_ACTIONS the failure exit those actions key on.
      * The name is a historical narrowing; `Agent` is an exported interface, so it is not renamed
      * here. If you widen it further, widen this contract and the Windows SCM mapping with it
      * (service_win.cpp reports specific-error 1 for BOTH). (governance: consistency-auditor.)

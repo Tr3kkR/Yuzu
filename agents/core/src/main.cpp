@@ -726,9 +726,11 @@ int main(int argc, char* argv[]) {
     // then". That was FALSE on the exception path: the explicit g_agent.store(nullptr) below sits
     // AFTER agent->run(), so a throw out of run() skips it, and a detached watcher's callback could
     // then load a LIVE g_agent and call stop() on an Agent that is being destroyed.
-    // This guard is declared AFTER `agent` and BEFORE the watcher, so reverse-order destruction
+    // This guard is declared AFTER `agent` AND AFTER the watcher, so reverse-order destruction
     // runs it BEFORE ~ShutdownWatcher on every path — which makes the header's stated reason
-    // actually true, structurally, instead of by argument. (governance: cpp-safety S1.)
+    // actually true, structurally, instead of by argument. (Declared BEFORE the watcher it
+    // would be destroyed AFTER it — the detach path could then observe a live g_agent, the
+    // exact S1 UAF.) (governance: cpp-safety S1; order corrected in the gate-round fold.)
     struct AgentUnpublisher {
         ~AgentUnpublisher() { g_agent.store(nullptr, std::memory_order_release); }
     } agent_unpublisher;
@@ -740,11 +742,23 @@ int main(int argc, char* argv[]) {
     // swallowing it, with no default disposition left. SIGTERM and Ctrl-C would stop
     // working entirely and `systemctl stop` would hang to TimeoutStopSec before SIGKILL:
     // a fail-open-to-hang regression, on exactly the exhausted host this path exists for.
-    // Leaving SIG_DFL means the process at least dies promptly, ungracefully.
+    // The fallback is the hard-exit handler below (NOT SIG_DFL — pid 1 discards it).
     // (governance Gate-8 cpp-safety.)
     if (shutdown_watcher && shutdown_watcher->ok()) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
+        // RE-CHECK after the install (TOCTOU): a watcher dying between the ok() test above
+        // and these installs runs died() FIRST — it retracts the wfd slot and installs the
+        // hard-exit handler — and the two std::signal calls above then OVERWRITE it with
+        // on_signal, which finds wfd < 0 and returns: signal swallowed, agent unkillable —
+        // the exact trap-6 state this branch closes. Re-checking AFTER the install makes
+        // every interleaving converge: a died() that runs after this re-check installs
+        // last and wins; one that ran before is caught here.
+        // (governance gate round: cpp-expert SHOULD-1, this branch.)
+        if (!shutdown_watcher->ok()) {
+            std::signal(SIGINT, on_signal_hard_exit);
+            std::signal(SIGTERM, on_signal_hard_exit);
+        }
     } else {
         // SIG_DFL IS NOT A SAFE FALLBACK IN A CONTAINER, AND THE AGENT IS PID 1 THERE.
         //
@@ -781,11 +795,9 @@ int main(int argc, char* argv[]) {
     // systemd would wait out TimeoutStopSec before SIGKILL — the exact fail-open-to-hang this
     // self-pipe exists to remove, reintroduced at the tail. (Gate-8 round 7, unhappy-path UP-2.)
     //
-    // SIG_DFL is the honest posture here, not a hard-kill regression: run() has returned, so
-    // the operator-visible teardown (plugin shutdown(), trigger engine, thread-pool drain) is
-    // already DONE — it runs in run()'s ScopeExit, not in ~Agent — and the graceful path is
-    // spent. A signal arriving now means "you are taking too long"; dying promptly beats
-    // hanging silently, and SQLite's WAL is crash-safe.
+    // Run()'s ScopeExit has already done the operator-visible teardown (plugin shutdown(),
+    // trigger engine, thread-pool drain) — the graceful path is spent, and SQLite's WAL is
+    // crash-safe, so dying promptly here beats hanging silently.
     // NOT SIG_DFL — pid 1 discards it (see on_signal_hard_exit). This window is not small: it
     // spans the whole of ~Agent (the Guardian/DEX joins, the SQLite closes). A signal arriving here
     // means "you are taking too long", and on pid 1 a default disposition would simply be ignored,
@@ -793,8 +805,9 @@ int main(int argc, char* argv[]) {
     // (governance: security-guardian — the second sibling site.)
     std::signal(SIGINT, on_signal_hard_exit);
     std::signal(SIGTERM, on_signal_hard_exit);
-    // Unpublish BEFORE ~Agent, and only once the handlers are already SIG_DFL (so there is no
-    // instant where a handler is installed AND g_agent is null).
+    // Unpublish BEFORE ~Agent, and only once the handlers are already the hard-exit handler
+    // (which never touches g_agent — so there is no instant where a g_agent-dereferencing
+    // handler is installed while g_agent is null).
     //
     // ON WINDOWS THE STORE ALONE IS NOT ENOUGH, and an earlier version of this comment
     // wrongly claimed it was ("closes the Windows g_agent use-after-free"). Nulling an atomic
