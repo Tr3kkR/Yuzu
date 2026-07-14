@@ -96,6 +96,19 @@ run_agent_shutdown() {
         return
     fi
 
+    # DARWIN: SKIPPED, DELIBERATELY, AND THIS IS THE HONEST POSTURE.
+    # The script is written to be portable (it probes with ss/lsof/netstat, strips BSD's full-path
+    # `ps -o comm=`, and templates every mktemp) — but NO CI leg has ever executed it on macOS, and
+    # docs/darwin-compat.md MANDATES `run-tests.sh all` after any cross-platform change. That made
+    # every Mac contributor the first person ever to run it, on an unvalidated path, while the
+    # output implied it was vetted. Skip it here and wire it into the macOS CI leg as a follow-up:
+    # "mandated but never validated" is the worst of the three options.
+    # (governance: build-ci, quality-engineer, cross-platform.)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        skip "Agent shutdown smoke (unvalidated on macOS — not yet wired into the macOS CI leg)"
+        return
+    fi
+
     local agent="$BUILDDIR/agents/core/yuzu-agent"
     if [[ ! -x "$agent" ]]; then
         skip "Agent shutdown smoke (agent binary not built)"
