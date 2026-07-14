@@ -152,7 +152,13 @@ Step 'VS 2022 Build Tools (C++ workload)' {
 
 Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_test)" {
   $major = $PostgresVersion.Split('.')[0]
-  $pgbin = "C:\Program Files\PostgreSQL\$major\bin"
+  # Prefer an EXISTING install, whatever its layout: Wee Tam ships a zip install
+  # at C:\pgsql\bin, a winget install lands in Program Files. Hardcoding the
+  # Program Files path made the per-agent step throw "initdb not found" on Wee
+  # Tam — why #2094 was never provisioned there. Fall back to the winget target
+  # for a fresh box where psql does not exist yet (the agent-0 step installs it).
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   if(-not (Test-Path "$pgbin\psql.exe")){
     WG -id "PostgreSQL.PostgreSQL.$major" -ver $PostgresVersion -scope '' `
        -override "--mode unattended --unattendedmodeui none --superpassword postgres --servicename postgresql-x64-$major-yuzu-ci --serverport $PostgresPort"
@@ -203,7 +209,13 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   # switching, so no runner .env / wrapper / re-registration is needed —
   # provisioning these clusters IS the whole cutover.
   $major = $PostgresVersion.Split('.')[0]
-  $pgbin = "C:\Program Files\PostgreSQL\$major\bin"
+  # Prefer an EXISTING install, whatever its layout: Wee Tam ships a zip install
+  # at C:\pgsql\bin, a winget install lands in Program Files. Hardcoding the
+  # Program Files path made the per-agent step throw "initdb not found" on Wee
+  # Tam — why #2094 was never provisioned there. Fall back to the winget target
+  # for a fresh box where psql does not exist yet (the agent-0 step installs it).
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   if(-not (Test-Path "$pgbin\initdb.exe")){ throw "initdb not found at $pgbin — the main PostgreSQL step must succeed first" }
   $pw = Join-Path $env:TEMP 'yuzu-pg-pwfile.txt'
   Set-Content $pw 'postgres' -Encoding Ascii
@@ -251,6 +263,22 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   } finally {
     Remove-Item $pw -EA SilentlyContinue
   }
+}
+
+Step 'Windows Defender exclusions for PG data dirs (CI [pg]-shard perf, #2167)' {
+  # Every [pg] test does CREATE DATABASE ... TEMPLATE, which writes a whole
+  # directory of files; Defender real-time-scans each one, serialising the I/O
+  # (docs note "Defender-induced I/O serialisation", flake #473). This is the
+  # dominant [pg]-shard cost on Windows AFTER fsync=off — the shard stayed
+  # ~658s until the PG data dirs were excluded (like the vcpkg/ccache/work dirs
+  # this box already excludes). Disposable test data on a CI runner.
+  $major = $PostgresVersion.Split('.')[0]
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  $paths = @()
+  if($pgbin){ $paths += (Join-Path (Split-Path $pgbin -Parent) 'data') }  # agent-0 cluster data dir
+  $paths += (Join-Path $CacheRoot 'pg')                                    # per-agent cluster data dirs (D:\ci\pg\agent-*)
+  foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
+  "Defender exclusions added: " + ($paths -join ', ')
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
