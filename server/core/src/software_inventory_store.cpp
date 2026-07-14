@@ -932,13 +932,13 @@ std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
     return m;
 }
 
-void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
+bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
-        return;
+        return false;
     const std::string id{agent_id};
     // Both deletes in one transaction so an agent removal can't leave a parent
     // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
-    pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+    const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{id});
@@ -947,6 +947,10 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
             std::vector<std::string>{id});
         return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
     });
+    if (!committed)
+        spdlog::debug("SoftwareInventoryStore: delete_agent did not commit for agent={} ({})",
+                      agent_id, pool_.last_error());
+    return committed;
 }
 
 std::vector<std::string> SoftwareInventoryStore::list_agent_ids(std::string_view source,

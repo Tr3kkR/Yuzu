@@ -166,11 +166,14 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
+    'unit/test_licensing_parsers.cpp',
+    'unit/test_licensing_sync.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
+    include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
   ],
@@ -317,6 +320,7 @@ if build_server
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
+      'unit/server/test_instruction_yaml.cpp',
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -358,6 +362,7 @@ if build_server
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
@@ -433,7 +438,12 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
+      'unit/server/test_product_normalize.cpp',
+      'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_licensing_store.cpp',
+      'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_device_inventory_store.cpp',
+      'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
       'unit/server/test_app_perf_rollup.cpp',
@@ -474,18 +484,30 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  # 900s: recalibrated 2026-07-12 (Wee Tam server-suite timeouts) — the suite
-  # has grown to ~3500 cases (incl. the [pg] Postgres-substrate tests; per-OS
-  # counts differ slightly) and reached 512s on an otherwise-idle Windows MSVC
-  # debug leg, blowing the previous 600s cap whenever the box ran concurrent
-  # jobs (4 runner agents + one shared native Postgres on one host roughly
-  # double the wall time under contention). Sanitizer-instrumented nightly
-  # passes run slower still. A real hang is still bounded by the job-level
-  # timeouts (90-120 min in ci.yml, 60 min in nightly.yml for every job that
-  # runs this suite). If a quiet Windows debug leg crosses ~700s again, split
-  # the suite (e.g. '[pg]' / '~[pg]' shards, each with its own budget)
-  # instead of raising this number.
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 900)
+  # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
+  # promised): two test() entries over the SAME binary, partitioned by Catch2
+  # tag filter. '~[pg]' is everything not Postgres-backed; '[pg]' is the
+  # Postgres-substrate cases (~72 cases across 28 files). The complement is
+  # exact: every Postgres-touching test carries [pg] and no [pg] test is
+  # hidden ([.]), so the shards partition the visible case set with nothing
+  # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
+  # meson runs the entries in parallel, so suite wall time is max(shards),
+  # and each shard gets its own budget. 600s each (was 900s combined): the
+  # quiet-leg worst case for the WHOLE suite was 512s, and per-agent Postgres
+  # (#2094/#2114) removed the cross-job contention that blew the old 600s
+  # cap. A real hang is still bounded by the job-level timeouts (90-120 min
+  # in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
+  # (test_pg_template_cleanup.cpp) fires in both shards — idempotent,
+  # harmless without a DSN. Constraints the shards must keep:
+  #   - only tag-filter specs may appear in args (flake-retry.py strips
+  #     positional tag specs before an isolated case retry — Catch2 ORs
+  #     positional specs);
+  #   - neither entry name may be a substring of the other (flake-retry maps
+  #     meson-junit names by longest substring match).
+  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning,
+  # split further or rebalance the shards — don't just raise the number.
+  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
+  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -503,4 +525,15 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
+# parsing, budget rows). Wired here (#2092) so the shard-retry contract the
+# server entries above rely on is enforced on every platform, not just when
+# someone remembers to run it by hand.
+test('flake-retry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
 )

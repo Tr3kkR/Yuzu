@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,7 +53,7 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 20);
+    REQUIRE(types.size() == 21); // +SoftwareLicensing (ADR-0024)
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -67,10 +68,11 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("Policy"));
     CHECK(has("DeviceToken"));
     CHECK(has("SoftwareDeployment"));
-    CHECK(has("License"));
+    CHECK(has("License")); // Yuzu's OWN product licence (§22.3) — DISTINCT from SLE
     CHECK(has("FileRetrieval"));
     CHECK(has("GuaranteedState"));
     CHECK(has("Inventory"));
+    CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -84,11 +86,11 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 20 types * 5 CRUD ops = 100 permissions, plus a single targeted Push
-    // grant on GuaranteedState = 101 permissions total. Push is deliberately
+    // 21 types * 5 CRUD ops = 105 permissions, plus a single targeted Push
+    // grant on GuaranteedState = 106 permissions total. Push is deliberately
     // NOT cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults(). (20th type: Inventory, ADR-0016.)
-    CHECK(perms.size() == 101);
+    // rbac_store.cpp seed_defaults(). (21st type: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 106);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -106,8 +108,9 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 19 types * Read only (everything except Infrastructure; incl. Inventory)
-    CHECK(perms.size() == 19);
+    // 20 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024)
+    CHECK(perms.size() == 20);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -148,6 +151,23 @@ TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
         // produces, and indistinguishable by the enabled flag alone.
         const auto bogus = yuzu::test::unique_temp_path("rbac-loadfail-") / "rbac.db";
         RbacStore broken(bogus);
+        REQUIRE_FALSE(broken.is_open());
+        CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
+    }
+
+    SECTION("corrupt file (migration fails) → fail closed, not full-fleet") {
+        // The constructor's OTHER failure path (#2104): sqlite3_open_v2
+        // succeeds on the garbage file, then the schema migration hits
+        // SQLITE_NOTADB and create_tables closes db_ — the literal #1717
+        // corrupt-but-openable rbac.db. The garbage must be NON-empty:
+        // SQLite treats a zero-byte file as a valid fresh database.
+        yuzu::test::TempDbFile db{"yuzu_test_rbac_corrupt-"};
+        {
+            std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
+            REQUIRE(f.is_open());
+            f << "not a valid sqlite database";
+        }
+        RbacStore broken(db.path);
         REQUIRE_FALSE(broken.is_open());
         CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
     }
@@ -866,11 +886,12 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
     CHECK(role->description.find("IT Service") != std::string::npos);
 
     auto perms = store.get_role_permissions("ITServiceOwner");
-    // 17 types * 5 CRUD ops = 85 permissions, plus the targeted Push grant on
-    // GuaranteedState = 86 permissions total. Push is deliberately NOT
+    // 18 types * 5 CRUD ops = 90 permissions, plus the targeted Push grant on
+    // GuaranteedState = 91 permissions total. Push is deliberately NOT
     // cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults(). (17th type: Inventory, ADR-0016.)
-    CHECK(perms.size() == 86);
+    // rbac_store.cpp seed_defaults(). (18th type: SoftwareLicensing, ADR-0024 —
+    // ITServiceOwner full CRUD per the D-9 matrix.)
+    CHECK(perms.size() == 91);
     size_t push_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");
@@ -889,12 +910,12 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
-struct ScopedTestDb {
-    std::filesystem::path path;
-    ScopedTestDb() : path(std::filesystem::temp_directory_path() / "test_scoped_rbac.db") {
-        std::filesystem::remove(path);
-    }
-    ~ScopedTestDb() { std::filesystem::remove(path); }
+// Per-test SQLite temp file for the on-disk ManagementGroupStore — the fixed
+// "test_scoped_rbac.db" name was a cross-JOB shared resource on the
+// shared-identity CI pools (#1883); TempDbFile also picks up the -wal/-shm
+// cleanup the old fixture missed.
+struct ScopedTestDb : yuzu::test::TempDbFile {
+    ScopedTestDb() : TempDbFile("yuzu_test_scoped_rbac-") {}
 };
 } // namespace
 

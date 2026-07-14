@@ -153,6 +153,17 @@ meson test -C build-linux --print-errorlogs
 
 Tests use [Catch2](https://github.com/catchorg/Catch2) and live in `tests/unit/`.
 
+Tests that touch PostgreSQL are tagged `[pg]` and follow the recipe in step 7
+of [`docs/postgres-store-playbook.md`](docs/postgres-store-playbook.md) —
+fixtures, pre-migrated templates (`PgTestTemplate` + `YUZU_REQUIRE_PG_DB_TPL`
+for store-behaviour tests), and the local one-liner
+`docker run -d -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu -p 5433:5432 postgres:18`
+followed by `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
+Skip-vs-fail contract: with `YUZU_TEST_POSTGRES_DSN` **unset**, `[pg]` tests
+skip cleanly (no local database needed for non-Postgres work); **set but
+broken**, they FAIL — deliberate, since CI guarantees a database, so an
+unreachable DSN is breakage to surface, never to skip past.
+
 ## Build System
 
 Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory.** Do not use CMake as a build system (it exists only as a Meson dependency method).

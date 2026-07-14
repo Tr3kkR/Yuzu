@@ -260,7 +260,7 @@ TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]")
                 found = true;
         CHECK(found);
 
-        store.delete_agent("agent-d");
+        CHECK(store.delete_agent("agent-d")); // committed → true
         auto gone = store.get_device_ci("agent-d");
         REQUIRE(gone.has_value());  // read succeeded
         CHECK(!gone->has_value());  // absent

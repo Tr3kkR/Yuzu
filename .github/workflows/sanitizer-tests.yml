@@ -226,7 +226,9 @@ jobs:
         # with the test harness output so the ERROR line is visible.
         run: |
           set -o pipefail
-          meson test -C build-linux-asan --print-errorlogs --no-stdsplit \
+          # --timeout-multiplier 2: same rationale as nightly.yml — the #2092
+          # server shards carry 600s budgets sized for uninstrumented runs.
+          meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs --no-stdsplit \
               2>&1 | tee sanitizer-asan.log
 
       - name: ccache stats
@@ -418,7 +420,9 @@ jobs:
           LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: |
           set -o pipefail
-          meson test -C build-linux-tsan --print-errorlogs --no-stdsplit \
+          # --timeout-multiplier 2: same rationale as nightly.yml — the #2092
+          # server shards carry 600s budgets sized for uninstrumented runs.
+          meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs --no-stdsplit \
               2>&1 | tee sanitizer-tsan.log
 
       - name: ccache stats
