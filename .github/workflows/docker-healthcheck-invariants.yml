@@ -29,7 +29,14 @@ name: Docker healthcheck invariants
 # the check sits at "Expected -- waiting for status" forever and a non-admin can
 # never merge. A *skipped* required check is satisfied; an *absent* one is not.
 # So the workflow always runs, and the `changes` job below skips the expensive
-# matrix instead. This stays correct if the gate is later made required.
+# matrix instead.
+#
+# That is necessary but NOT sufficient for a matrix job: per actions/runner#952 a
+# matrix job skipped at the job level is skipped BEFORE the matrix expands, so it
+# emits none of its inner check-run names -- "skipped" never appears, and the
+# required context hangs. The `required-check-stubs` job at the bottom closes that
+# hole, exactly as ci.yml's `docs-required-checks` does. Only with the stub is the
+# gate safe to add to branch protection.
 
 on:
   pull_request:
@@ -200,3 +207,45 @@ jobs:
         env:
           IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
+
+  # ── Required-check stubs (#1978 / actions/runner#952) ────────────────────────
+  # `verify` is a MATRIX job, and a matrix job skipped at the job level is skipped
+  # BEFORE the matrix expands — so it emits none of its inner check-run names
+  # (actions/runner#952, documented at length in ci.yml). A *non-matrix* skipped
+  # job reports "skipped" and satisfies a required check; a skipped matrix job
+  # emits nothing at all, and the required context sits at "Expected — waiting for
+  # status" forever. So without this stub, the moment anyone adds the five
+  # "Verify <role> healthcheck invariant" contexts to branch protection, every PR
+  # that does not touch the image surface becomes unmergeable — the very #1978
+  # trap this workflow's header claims to sidestep.
+  #
+  # This mirrors ci.yml's `docs-required-checks`: emit those exact names as
+  # success when, and only when, the real matrix is skipped. It is itself a matrix
+  # job, so the same runner#952 behaviour makes it collision-free — on an
+  # image-surface PR it is skipped before expansion and emits nothing, leaving
+  # `verify` as the sole producer of each name. Exactly one producer per name.
+  required-check-stubs:
+    # MUST stay byte-identical to `verify`'s name template, or the emitted check
+    # names will not match the required contexts.
+    name: "Verify ${{ matrix.role }} healthcheck invariant"
+    needs: changes
+    if: needs.changes.outputs.images_touched == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # MUST stay in lockstep with `verify`'s matrix roles.
+        role: [server, gateway, server-chisel, gateway-chisel, agent-chisel]
+    steps:
+      - name: Satisfy required check (image surface untouched)
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          echo "No image-surface change in this PR, so the ${ROLE} image is not built."
+          echo "Its healthcheck invariant cannot have regressed: neither the Dockerfile"
+          echo "nor any compose healthcheck changed."
+          echo "This stub emits the required check name as success so the PR is not"
+          echo "blocked on a check that will never report (#1978 / actions/runner#952)."

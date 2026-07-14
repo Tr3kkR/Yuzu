@@ -1219,8 +1219,15 @@ jobs:
       # at boot, only the healthcheck, so Compose parks every container in
       # `unhealthy` forever with no application error to point at.
       #
-      # This build populates the local buildcache, so "Build and push" below is
-      # a full cache hit and pays only for the registry upload.
+      # This build populates the local buildcache (`cache-to`) ON PURPOSE, so
+      # "Build and push" below is a guaranteed full cache hit and pays only for
+      # the registry upload. Dropping the `cache-to` here to avoid the duplicate
+      # export would leave the push step reading the PREVIOUS release's cache: on
+      # any Dockerfile change that is a cache MISS, and the release would compile
+      # the image twice. The redundant export is the cheaper of the two.
+      #
+      # (The PR gate in docker-healthcheck-invariants.yml is the opposite case --
+      # it reads this cache but must never write it, so it has cache-from only.)
       - name: Build for healthcheck verification (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

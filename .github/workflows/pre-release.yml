@@ -16,8 +16,16 @@ permissions:
   contents: read
   packages: read
 
-env:
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+# NO workflow-level `env: REGISTRY`. It used to be
+# `ghcr.io/${{ github.repository_owner }}`, which renders as `ghcr.io/Tr3kkR` —
+# Docker rejects uppercase in a repository name outright ("repository name must
+# be lowercase"), so nothing could be pulled. GitHub expressions have no
+# lowercase function, so the owner must be folded in a shell step: the `resolve`
+# job does it once and publishes `needs.resolve.outputs.registry`. Every job that
+# touches an image sets `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`,
+# and steps that cannot read env (action `with:` inputs, e.g. trivy's image-ref)
+# reference the output directly. Defining a mixed-case default here again would
+# just re-arm the trap for the next job that forgets to override it.
 
 jobs:
   # ── Resolve version and download release artifacts ──────────────────
@@ -683,7 +691,7 @@ jobs:
       - name: Scan yuzu-server
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-server:${{ needs.resolve.outputs.version }}
+          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-server:${{ needs.resolve.outputs.version }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '0'
@@ -693,7 +701,7 @@ jobs:
       - name: Scan yuzu-gateway
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
+          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '0'

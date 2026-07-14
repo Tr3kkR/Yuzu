@@ -64,10 +64,24 @@ PROBE_IMAGE="${PROBE_IMAGE:-busybox:1.37@sha256:9532d8c39891ca2ecde4d30d7710e01f
 # published to the host, so it cannot collide with anything on the runner.
 PROBE_PORT="${PROBE_PORT:-18080}"
 
-SIDECAR="yuzu-hc-probe-$$"
+# Sidecar name. $$ alone is not enough: Big Tam runs four runners against ONE
+# dockerd, and the PR gate sets cancel-in-progress, so a cancelled job can be
+# killed before the EXIT trap fires and leak a still-running listener. A later
+# job that happened to draw the same PID would then collide on the name and fail
+# for a reason that has nothing to do with the image under test. $RANDOM makes
+# the name unique per run; stale leaks are swept below.
+SIDECAR="yuzu-hc-probe-$$-${RANDOM}"
 
 usage() {
-    cat >&2 <<EOF
+    # $1 = exit status. `--help` is a successful, deliberate request for the
+    # usage text; a malformed argument is an error. Same text, different status.
+    local rc="${1:-2}"
+    if [ "$rc" -eq 0 ]; then
+        exec 3>&1     # `--help`: usage is the requested output -> stdout
+    else
+        exec 3>&2     # bad invocation: usage is a diagnostic -> stderr
+    fi
+    cat >&3 <<EOF
 usage: $0 <role>=<image> [<role>=<image> ...]
 
 roles:
@@ -76,12 +90,29 @@ roles:
   server-chisel    requires: /bin/busybox with a wget applet supporting --spider
   gateway-chisel   requires: /bin/busybox with a wget applet supporting --spider
   agent-chisel     requires: /bin/busybox with a wget applet supporting --spider
+
+Each probe runs the image's REAL healthcheck command against a live listener, so
+a tool that is present but has lost the capability the healthcheck needs (a bash
+built without /dev/tcp, a wget without --spider) fails here rather than passing.
 EOF
-    exit 2
+    exit "$rc"
 }
 
 cleanup() {
     docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
+}
+
+# Sweep listeners leaked by an earlier run that was killed before its EXIT trap
+# could fire (the PR gate cancels superseded runs, and Big Tam's four runners
+# share one dockerd). Only ever removes this script's own probe containers.
+sweep_stale_listeners() {
+    local stale
+    stale="$(docker ps -aq --filter 'name=^yuzu-hc-probe-' 2>/dev/null || true)"
+    if [ -n "$stale" ]; then
+        echo "note: removing $(echo "$stale" | wc -l) leaked probe listener(s) from a previous run" >&2
+        # shellcheck disable=SC2086  # word-splitting is intended: one id per arg
+        docker rm -f $stale >/dev/null 2>&1 || true
+    fi
 }
 
 # Start the known-good HTTP listener. Serves a 200 on /healthz, which is what
@@ -90,7 +121,10 @@ start_listener() {
     docker run -d --rm --name "$SIDECAR" "$PROBE_IMAGE" \
         sh -c "mkdir -p /www && echo ok > /www/healthz && exec httpd -f -p ${PROBE_PORT} -h /www" >/dev/null
 
-    for _ in $(seq 1 50); do
+    # C-style loop, not `seq`: keeps the script dependent on bash alone, so it
+    # runs the same by hand on a dev box as it does on the Linux runners.
+    local i
+    for (( i = 0; i < 50; i++ )); do
         if docker exec "$SIDECAR" \
             wget -q -O /dev/null "http://127.0.0.1:${PROBE_PORT}/healthz" 2>/dev/null; then
             return 0
@@ -151,7 +185,11 @@ diagnose() {
 }
 
 main() {
-    [ "$#" -gt 0 ] || usage
+    case "${1:-}" in
+        -h|--help) usage 0 ;;
+    esac
+
+    [ "$#" -gt 0 ] || usage 2
     command -v docker >/dev/null 2>&1 || { echo "FATAL: docker not on PATH" >&2; exit 1; }
 
     # Validate arguments before doing any work, so a typo fails in <1s.
@@ -161,11 +199,11 @@ main() {
         image="${pair#*=}"
         if [ "$role" = "$pair" ] || [ -z "$role" ] || [ -z "$image" ]; then
             echo "FATAL: expected <role>=<image>, got '$pair'" >&2
-            usage
+            usage 2
         fi
         case "$role" in
             server|gateway|server-chisel|gateway-chisel|agent-chisel) ;;
-            *) echo "FATAL: unknown role '$role'" >&2; usage ;;
+            *) echo "FATAL: unknown role '$role'" >&2; usage 2 ;;
         esac
         if ! docker image inspect "$image" >/dev/null 2>&1; then
             echo "FATAL: image '$image' is not present locally (build or pull it first)" >&2
@@ -174,6 +212,7 @@ main() {
     done
 
     trap cleanup EXIT
+    sweep_stale_listeners
     start_listener
 
     local failures=0 rc
