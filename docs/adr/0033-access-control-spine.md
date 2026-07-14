@@ -312,9 +312,16 @@ named owner is recorded, and is never the root. (What a run is, and who admits i
 
 ### 8. Approval is a gate, not a grant (D10)
 
-An approved action executes under the **requester's** authority, **re-checked at execution time**:
+An approved action executes under the **requester's** authority **and the requesting credential's**,
+both **re-checked at execution time**. This is authority seam 5 (ADR-0032 Decision 0), and it is the
+only seam that touches endpoints:
 
 - Requester revoked → the approval is **void**, not merely stale.
+- **Requesting credential revoked, deleted or expired → the plan is VOID**, exactly as requester
+  revocation voids it. Without this, an approved plan is a frozen authorisation that credential
+  revocation cannot reach: an attenuated worker token leaks, drives a run that submits a plan, a human
+  approves it, you revoke the token — **and the effect fires on the fleet anyway**. The plan therefore
+  records the **requesting credential**, and execution re-reads its current grants.
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
 - Approvers need `Approve` on the securable and **never the underlying permission** — low-privilege
   reviewers stay possible, which is what makes four-eyes deployable at all.

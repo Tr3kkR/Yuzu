@@ -95,14 +95,26 @@ them.
 
 ## Decision
 
-### 0. Authority is evaluated at FOUR seams, and every seam runs the WHOLE conjunction
+### 0. Authority is evaluated at every seam in this inventory, and every seam runs the WHOLE conjunction
 
 This decision exists because the drafting of this ADR kept getting it wrong in the same way, and the
 mistake is invisible one seam at a time.
 
-Authority is evaluated in exactly four places: **admission** (Decision 1), **every mid-run core call**
-(Decision 4), **the mint of a cached-result grant**, and **its redemption** (Decision 10). Each of them
-must evaluate the **full four-filter conjunction of ADR-0033 §1** —
+**This is a seam INVENTORY, not a count.** An earlier draft of this decision said "exactly four" and
+was short by one — which is this decision's own defect, committed one level up, in the enumeration
+itself. So the rule is written to survive being incomplete: **any place the platform decides whether
+an actor may do a thing is an authority seam, and it runs the whole conjunction. Finding a new one
+extends this list; it never creates an exemption.**
+
+| # | Seam | Owner |
+|---|---|---|
+| 1 | **Admission** of a run | Decision 1 |
+| 2 | **Every mid-run core call** (fact reads, capability requests) | Decision 4 |
+| 3 | **Mint** of a cached-result grant | Decision 10 |
+| 4 | **Redemption** of that grant — the seam that hands over bytes | Decision 10 |
+| 5 | **Authorisation and execution of an Execution Plan** — the seam that touches endpoints | ADR-0033 §8 |
+
+Each of them must evaluate the **full four-filter conjunction of ADR-0033 §1** —
 
 ```
 operator grants ∩ attenuated credential grants ∩ Module envelope ∩ execution authorisation
@@ -124,6 +136,14 @@ Two corollaries, both normative:
   answer is never "then that filter is vacuous" — it is that the seam is under-specified. Scheduled
   runs (Decision 7) therefore record an **arming credential**, and it is the admitting credential of
   every run they produce.
+- **Seam 5 bites hardest, and it was the last one found.** An Execution Plan is authorised in its own
+  right and outlives the run that produced it (Decision 5) — so if its execution check reads only the
+  *human* requester's authority, the plan is **a frozen authorisation that credential revocation
+  cannot reach**, on the only path that touches endpoints. The attack is short: an attenuated worker
+  token leaks; within its own envelope it drives a run that submits a plan; a human approves it; the
+  leak is detected and **the token is revoked** — and the effect fires on the fleet anyway. ADR-0033
+  §8 therefore re-checks the **requesting credential's current grants** alongside the requester's
+  authority, and a revoked, deleted or expired requesting credential **voids the plan**.
 
 ### 1. A run is one declared episode (P1)
 
@@ -382,8 +402,15 @@ OPERATOR of every run it produces, while the credential they armed it with is th
 CREDENTIAL of every one of them.** The schedule records both. This is not bookkeeping: without a
 recorded arming credential, Decision 0's credential filter has no input on a scheduled run, and an
 attenuated read-only worker token that arms a schedule would **launder every run it produces out of
-its own attenuation** — the token cannot do the thing, but the schedule it armed can. Revoking the
-arming credential **stops the schedule**, exactly as demoting the armer does. And the idempotency
+its own attenuation** — the token cannot do the thing, but the schedule it armed can. **Revocation, deletion, expiry and rotation all read the
+same way — the credential no longer authorises, so the schedule STOPS.** Naming expiry explicitly
+matters twice: a nightly compliance scan armed with a 90-day token would otherwise fail *silently* on
+day 91 (a security control that stops without saying so), or tempt an implementer into ruling
+"expiry ≠ revocation" and keeping it running, which re-opens the laundering hole above. A stopped
+schedule is **loud** — `yuzu_use_case_schedules_stalled{reason=credential_expired|credential_revoked|armer_demoted}`
+is a gauge with an alert, not a log line. **Re-arming** is an authority change: audited and
+re-checked, and *not* an effect-bearing edit under ADR-0033 §7 unless the definition itself changed,
+so rotating a token does not re-trigger four-eyes on an unchanged effect. And the idempotency
 namespace (Decision 1) keys on that credential, so a scheduled run is never a hole in that rule
 either. Every filter in Decision 4 therefore evaluates against the
 armer's **current** authority: a schedule whose armer is demoted or deleted stops producing runs.
@@ -799,7 +826,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
 | **(f)** | **Per-action mutability in the plugin ABI** | Gates **the fact-acquisition dispatch path only** (Decision 8). Without it the agent-side plugin host cannot refuse a non-read-only action, and the mutating-by-default posture has the human manifest diff as its **only** backstop — which Decision 8 itself says must never be the case. | `plugin.h` carries action **names** only (`const char* const* actions`); no mutability metadata. An ABI change (v3 → v4) across the 49 in-tree plugins. |
 | **(g)** | **Derived-state confinement** — per-run provenance on derived rows, or a ban on cross-run derived state | Gates **any module that persists derived state across runs**. ADR-0031's INV-31-2 confines what the engine *receives*, not what it *retains*: a rollup computed under a wide run and read inside a narrower operator's run is confined by **nothing** in this set. ADR-0031 says it must close "before a module persists its first cross-run rollup" — that sentence is prose, and prose is what this interlock exists to replace. | Nothing exists. Not a line of engine code has been written, so this is free to fix now and a cross-operator disclosure to fix later. |
-| **(h)** | **The runtime capability-declaration registry** (core's ratified-mapping table), **and the run row's credential columns** (admitting credential id + its frozen grant snapshot — Decision 0's credential filter has nowhere to live without them) | Gates **admission itself**. Decisions 1, 5 and 13 read the risk tier, the TTL and the mutability class from *core's ratified copy*. There is no such copy: securable types are a hard-coded C++ array (`rbac_store.cpp:217-244`, 21 entries) with **no runtime create path**. Without (h) the first implementation reads the manifest — which is the S4 failure this ADR rejects by name. | Unbuilt. ADR-0033 §2 calls it "the precondition for every rule in this section" and it appeared in no gate until now. |
+| **(h)** | **The runtime capability-declaration registry** (core's ratified-mapping table), **and the credential columns** (the run row's admitting-credential id + frozen grant snapshot, and the Execution Plan's requesting-credential id — Decision 0's credential filter has nowhere to live without them, at seams 2 and 5) | Gates **admission itself**. Decisions 1, 5 and 13 read the risk tier, the TTL and the mutability class from *core's ratified copy*. There is no such copy: securable types are a hard-coded C++ array (`rbac_store.cpp:217-244`, 21 entries) with **no runtime create path**. Without (h) the first implementation reads the manifest — which is the S4 failure this ADR rejects by name. | Unbuilt. ADR-0033 §2 calls it "the precondition for every rule in this section" and it appeared in no gate until now. |
 | **(i)** | **Execution semantics: outcome correlation + the coverage envelope** | Gates **every distributed fact read and every effect**. ADR-0033 §10 requires `intended/contacted/responded/failed/timed_out`, and D11's Execution Plan requires a real outcome. The workflow engine marks a step **successful on dispatch** (`workflow_engine.cpp`) and does not correlate an `execution_id`. A finalisation receipt over that attests effects nobody confirmed, and "no vulnerable devices found" becomes indistinguishable from "62 devices never answered" — the exact sentence ADR-0033 §10 exists to forbid. | Coverage fields: zero occurrences in the tree. Dispatch-vs-outcome correlation: unwired. This is the memorandum's "repair execution semantics" step, now a gate. |
 | **(j)** | **Capability projection** — generated OpenAPI + generated `tools/list` from core's registry | Gates **the agentic surface**, i.e. the thing voiding F-10 was for. `tools/list` iterates a **compile-time array** (`mcp_server.cpp`) and the OpenAPI document is a hand-typed literal (`rest_api_v1.cpp`). Activate a module today and its capabilities appear on **neither**. Without (j), an engine is reachable by nobody, and INV-31-4's contract test cannot exist either — you cannot diff registered routes against a hand-written document. | Unbuilt. |
 | **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
@@ -818,6 +845,7 @@ only if it does not walk them:
 | **(g)** | any module that **persists derived state across runs**. |
 | **(i)** | any **distributed** fact read, and any **effect**. |
 | **(j)** | the **agentic surface** — REST/MCP projection of engine capabilities. |
+| **(l)** | any module serving **more than one operator's runs concurrently from one deployment**. |
 | **(k)** | admitting a run **in production**. |
 
 **This is not a delay tactic; it is the honest dependency graph.** Five reviewers, working
