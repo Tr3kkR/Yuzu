@@ -161,7 +161,6 @@ TEST_CASE("ShutdownWatcher: a late write on a retired watcher must not raise SIG
     SUCCEED("no SIGPIPE — the process survived a late write");
 }
 
-#endif // !_WIN32
 
 TEST_CASE("ShutdownWatcher: trap 6 — an unexpected read() death flips ok() and fires "
           "on_watcher_died",
@@ -192,3 +191,5 @@ TEST_CASE("ShutdownWatcher: trap 6 — an unexpected read() death flips ok() and
     }
     SUCCEED("death detected, liveness cleared, slot retracted, dtor safe on EBADF");
 }
+
+#endif // !_WIN32

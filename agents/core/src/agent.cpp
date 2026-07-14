@@ -2245,6 +2245,17 @@ public:
                     // for every early-return/exception exit, and re-invoking the
                     // helper there is a joinable()-guarded no-op.
                     quiesce_run_workers();
+                    // Stop the TRIGGER ENGINE before the plugin shutdown loop, for the same
+                    // reason the ScopeExit does (:766) — its workers dispatch into plugins_
+                    // from their own threads, so shutting plugins down (and clearing the
+                    // vector below) under running workers is a dispatch-into-dlclose race.
+                    // The ScopeExit's own trigger_engine_.stop() runs too LATE for this
+                    // branch (after the plugin loop below has already run) and re-invoking
+                    // it there is an idempotent no-op. PRE-EXISTING on dev, byte-identical —
+                    // fixed here because this branch's charter is exactly this shutdown
+                    // crash class. (adversarial review K3/C-P2-2 — found by one external
+                    // reviewer, adopted by the other on cross-examination.)
+                    trigger_engine_.stop();
                     for (auto& handle : plugins_) {
                         if (handle.descriptor()->shutdown) {
                             auto it = per_plugin_ctx_.find(handle.descriptor()->name);
