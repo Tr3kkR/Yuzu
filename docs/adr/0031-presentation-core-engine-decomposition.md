@@ -158,7 +158,11 @@ linkage included — must pass before this leg is committed to. The `#375` histo
 abseil static linkage on Windows MSVC) is the reason this is a gate and not an assumption.
 
 **6. Isolation is enforced as if remote, from day one.** Components authenticate to each other over
-the network protocol even when they are co-located. **No cross-component database access** — the
+the network protocol even when they are co-located. **Co-location is a deployment default, not the
+mechanism** — nothing in the design rests on it, which is why any component can move to its own host
+with no code change. Three invariants are what make that true, and they are load-bearing precisely
+because co-location makes it tempting to skip them: authenticate over the network protocol even on
+localhost; the public versioned API only (INV-31-4); no cross-component database access (INV-31-3). **No cross-component database access** — the
 engine never touches the `yuzu` database, core holds no grant on `uce`, and **presentation owns no
 database at all.** ADR-1005's `REVOKE CONNECT … FROM PUBLIC` + separate-role isolation (2c D1) is
 reaffirmed and becomes *more* load-bearing, because co-location removes the network as an
@@ -281,6 +285,19 @@ not of the domain. ADR-0030's answer is therefore not "put a gateway in front of
 built on. The `StreamBudget` cap landing with track 2f PR 2 (built, not yet merged) stays exactly
 what it was sold as: a stopgap that keeps the fused server from exhausting its thread pool until
 this lands.
+
+**State the claim precisely, because a looser version of it has already misled a reader.** The
+comparison is against *inserting a gateway* — nginx, envoy, a BEAM tier — in front of the server:
+a new thing to deploy, operate, version and secure, which would not even fix the ceiling (an SSE
+proxy holds one upstream connection per client, so the C++ pool still pins a thread per stream).
+Against that, the presentation split **adds no new component**: the code that terminates
+connections, frames MCP and renders HTMX already exists, and the split draws a process boundary
+around it. **It does add a hop** — one authenticated localhost call per request, costed under
+"Latency" above. Both sentences are true, and only the first was being claimed. "A process
+boundary, not a hop" is wrong, and the wrong inference it invites — that presentation and core
+share a runtime and can therefore call each other in-process — is precisely the shortcut this ADR
+exists to forbid: if it existed, the GUI could reach a store and the headless claim would stop
+being structural.
 
 ### Costs, honestly
 
