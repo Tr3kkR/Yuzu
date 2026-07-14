@@ -9,9 +9,12 @@ depends-on: >-
 related: >-
   #2056 (concurrent-stream caps for `GET /api/v1/events` — the follow-up this ADR
   supersedes in scope: the answer is not "cap the siblings too", it is "stop rationing a
-  self-inflicted scarcity"). `docs/erlang-gateway-build.md` and the gateway's supervision
-  model (the proposed long-term host for held-open connections). `docs/architecture.md`
-  (Operator/Server/Agent/Gateway boundaries this ADR would move).
+  self-inflicted scarcity"). ADR-0031 (presentation / core / engine as separate binaries —
+  the decomposition that makes the durable fix in Decision 4 reachable: presentation becomes
+  its own binary, so its runtime is a free choice). `docs/architecture.md`
+  (Operator/Server/Agent/Gateway boundaries this ADR would move). The Erlang gateway
+  (`docs/erlang-gateway-build.md`) remains the **southbound** fleet edge and is unchanged by
+  this ADR.
 ---
 
 # ADR-0030 — Held-open connections must not own a worker thread
@@ -31,6 +34,12 @@ Four surfaces hold responses open today, all on the same shared pool:
 | `GET /api/v1/events` | token (`Execution:Read`) | the agentic execution-event stream |
 | `GET /sse/executions/{id}` | cookie | the dashboard executions drawer |
 | `GET /events` | **none** | the legacy dashboard live-update stream |
+
+**Provenance.** Every claim below about `StreamBudget`, the `GET /mcp/v1/` channel and the
+admission arithmetic is stated **as of `feat/mcp-streamable-http-pr2` @ 3bac4647** — the branch
+this ADR lives on. `stream_budget.hpp` and the MCP GET channel do not exist on `dev`, so a
+reader checking these claims against a `dev` checkout will not find them; check them against
+that branch.
 
 Track 2f PR 2 added the first admission budget for these (`stream_budget.hpp`), and in doing
 so did the arithmetic nobody had done before. The result is the reason this ADR exists:
@@ -55,11 +64,12 @@ grow an unbounded per-connection queue. That is a pre-auth denial-of-service on 
 sharpest illustration of why "a held-open connection costs a thread" is the wrong primitive
 to build a fleet-scale platform on.
 
-**The gateway was never considered.** Track 2f's design record mentions the Erlang gateway
-exactly twice, both times to *rule it out as a risk* ("the Erlang gateway has no `/mcp`
-routing — verified"; "Gateway unaffected"). The question asked was "does this break the
-gateway?" The question never asked was "should the gateway be **holding** these
-connections?" That omission is the substance of this ADR.
+**Who should hold these connections was never asked.** Track 2f's design record mentions the
+Erlang gateway exactly twice, both times to *rule it out as a risk* ("the Erlang gateway has
+no `/mcp` routing — verified"; "Gateway unaffected"). The question asked was "does this break
+the gateway?" The question never asked was "should the C++ server be **holding** these
+connections at all?" That omission is the substance of this ADR. The answer it records
+(Decision 4) is **the presentation binary** — not the gateway, which stays southbound.
 
 ## Decision
 
@@ -71,10 +81,14 @@ surface that holds a response open takes a lease from the same counter
 plan, and it is correct.
 
 **2. Derive the worker pool from the intended stream count — not the cap from the accidental
-pool.** This inverts the arrow. A thread blocked in `cv.wait_for` costs roughly 8–16 KB
-resident (the 8 MB stack is virtual) and **zero CPU**; the only periodic cost is one wakeup
-per heartbeat interval per stream. Several hundred such threads is a few megabytes and a few
-hundred wakeups per second — unremarkable. So:
+pool.** This inverts the arrow. A thread blocked in `cv.wait_for` burns **zero CPU** — the only
+periodic cost is one wakeup per heartbeat interval per stream — and its resident cost is a
+fraction of the 8 MB stack, which is virtual. What that fraction actually *is* on our
+platforms is **not yet measured, and this ADR does not estimate it**: a **measured
+per-held-stream RSS baseline (Linux glibc, MSVC, macOS) is required before anyone sizes
+`--max-sse-streams` or a worker pool off it.** Sizing a fleet-scale resource off an
+unmeasured constant is how the 12-stream ceiling happened in the first place. The shape of
+the rule stands regardless of the number:
 
 ```
 workers = kMaxProvidersPerStream × target_streams + plain_rest_reserve
@@ -88,24 +102,33 @@ budget then binds only under abuse or genuine over-subscription, which is what a
 per-surface gauge can express it.
 
 **4. Record the ceiling, and name the durable fix.** (2) buys one to two thousand streams
-before thread memory and scheduler pressure become the binding constraint. Beyond that, the
-answer is not a bigger pool — it is to **stop owning a thread per stream**. Two candidate
-mechanisms, in order of fit:
+before thread memory and scheduler pressure become the binding constraint (the exact figure
+awaits the measured baseline in (2)). Beyond that, the answer is not a bigger pool — it is to
+**stop owning a thread per stream**. The durable fix is **an asynchronous presentation
+binary**:
 
-- **Terminate long-lived connections in the Erlang gateway.** The BEAM exists to hold very
-  large numbers of cheap, long-lived, supervised connections; a process per SSE subscriber is
-  its natural unit, not an extravagance. Yuzu already builds, ships, and supervises this
-  gateway. The C++ server would publish events over the channel it already has, and the
-  gateway would own fan-out, back-pressure, and the replay ring. This also moves the
-  slow-consumer problem to the runtime designed to survive it.
-- **An event-driven I/O path for streaming routes** (epoll/io_uring, or an async HTTP library
-  used only for the streaming endpoints). cpp-httplib cannot do this — thread-per-connection
-  is architectural, not configurable.
+- **Hold the connections in presentation, on an async C++ runtime (Drogon).** ADR-0031 splits
+  presentation into its own binary, which makes its runtime a free choice; Drogon's
+  non-blocking event loop and coroutines remove the thread-per-held-stream cost **in-language**
+  — the existing HTMX renderers and MCP framing port across without a ~5k-line re-home into
+  another runtime, and N stateless presentation replicas can sit behind the one MCP origin.
+  Core's HTTP runtime can remain as it is, behind short-lived bounded calls. This is ballot
+  A3 (amended), and it is **conditional on the G10 build canary**: Drogon is a heavyweight new
+  dependency landing on the most fragile part of the build (Windows MSVC static linking, the
+  #375 history), so it faces a vcpkg-port canary across the full matrix before it is ratified.
+  Durable session identity and the replay ring live in core/Postgres, not in presentation.
+- **Not the Erlang gateway.** The BEAM would win the same ceiling, but it would mean re-homing
+  the MCP framing and the HTMX renderers into a second language. The gateway stays what it is:
+  the **southbound** fleet edge, unchanged by this ADR.
+- **Not a reverse proxy.** An SSE proxy (nginx/envoy) holds one upstream connection per client,
+  so the C++ pool still pins a thread per stream — and buffering proxies break SSE outright.
+  The connection-holder must speak MCP itself.
 
 **Constraint that shapes the choice:** the MCP spec requires POST and GET on the **same
-endpoint** (`/mcp/v1/`). Streaming therefore cannot simply be moved to a second httplib
-server on another port without a method-aware proxy in front of it. The gateway is already a
-proxy in the deployment topology, which makes it the natural home rather than a new component.
+endpoint** (`/mcp/v1/`). Streaming therefore cannot be moved to a side port or a separate
+component on its own — it moves with the **whole** MCP surface, and that surface is
+presentation. This is why the durable fix is a property of the presentation binary rather
+than a box inserted in front of the server.
 
 ## Consequences
 
@@ -113,13 +136,12 @@ proxy in the deployment topology, which makes it the natural home rather than a 
   (12) and becomes an anti-abuse backstop against a pool sized for the declared workload.
 - The dashboard and `/api/v1/events` are bounded for the first time — closing a starvation
   path that exists on `dev` today, before MCP streaming ships at all.
-- (4) is **not** built here. It is a re-architecture with deployment-topology consequences
-  (the gateway becomes an operator-facing ingress for streaming, not only an agent-facing
-  one), and it needs its own ADR, its own governance, and a migration that does not strand
-  direct-connect deployments that run no gateway.
+- (4) is **not** built here. It rides ADR-0031's decomposition (presentation as its own
+  binary) and the G10 Drogon build canary; it needs its own governance and a migration that
+  strands no existing deployment. The Erlang gateway's role does not change.
 - Until (4) lands, the honest statement to an operator is: *streams are cheap but not free;
-  size `--max-sse-streams` for your fleet, watch utilisation, and know the ceiling is
-  thread-count.*
+  size `--max-sse-streams` for your fleet **off a measured baseline, not an estimate**, watch
+  utilisation, and know the ceiling is thread-count.*
 
 ## Alternatives considered
 
