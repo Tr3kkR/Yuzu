@@ -351,6 +351,80 @@ def build_cases(with_probe: str, no_probe: str):
             'GH_HOST=github.com gh issue create --title T --label P1,needs-triage',
             with_probe, "deny", ["no TYPE label"],
         ),
+
+        # --- governance (unhappy-path HIGH): command-substitution / grouping smuggle ---
+        (
+            "G-HIGH: URL=$(gh issue create ...) capture idiom is enforced",
+            'URL=$(gh issue create --title T --label bug,P1,needs-triage,do-not-close)',
+            with_probe, "deny", ["automation-owned"],
+        ),
+        (
+            "G-HIGH: bare $(gh issue create ...) capture is enforced",
+            'N=$(gh issue create --title T --label P1,needs-triage)',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: backtick capture is enforced",
+            'URL=`gh issue create --title T --label P1,needs-triage`',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: ( subshell ) is enforced",
+            '( gh issue create --title T --label P1,needs-triage )',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: `if ! gh issue create` is enforced",
+            'if ! gh issue create --title T --label P1,needs-triage; then echo x; fi',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: `{ ...; }` grouping is enforced",
+            '{ gh issue create --title T --label P1,needs-triage; }',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: leading redirection prefix is enforced",
+            '> out.txt gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: /usr/bin/env wrapper (basename) is enforced",
+            '/usr/bin/env gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH: `timeout 5 gh` (arg-wrapper) is enforced",
+            'timeout 5 gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "G-HIGH-neg: a VALID create captured in $() is allowed",
+            f'URL=$(gh issue create --title T --body "{GOOD_BODY}" --label bug,P1,needs-triage)',
+            with_probe, "allow", [],
+        ),
+
+        # --- governance (quality-engineer M2): equals / glued parse forms ---
+        (
+            "M2: `--label=` equals form parses",
+            f'gh issue create --title T --body "{GOOD_BODY}" --label=bug,P1,needs-triage',
+            with_probe, "allow", [],
+        ),
+        (
+            "M2: glued `-lX` short cluster parses",
+            f'gh issue create --title T --body "{GOOD_BODY}" -lbug -lP1 -lneeds-triage',
+            with_probe, "allow", [],
+        ),
+        (
+            "M2: typeless glued `-lX` is denied (no silent pass)",
+            f'gh issue create --title T --body "{GOOD_BODY}" -lP1 -lneeds-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "M2: `--body=` equals form is inspected (missing sections -> ask)",
+            'gh issue create --title T --label bug,P1,needs-triage --body=just-a-one-liner',
+            with_probe, "ask", ["missing required section"],
+        ),
     ]
 
 

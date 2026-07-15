@@ -37,14 +37,25 @@ What it enforces, and why only these three things (ADR-3001 A1, "PR 3"):
 
 Shell parsing is quote- and boundary-aware (see _split_shell_segments): the
 command is sliced into simple commands at UNQUOTED `;`, `&`, `|`, `&&`, `||` and
-newlines BEFORE tokenising each segment, so a second create on the next line
-cannot mask a bad first one and a quoted operator (`--title ";"`) cannot
-truncate the flag list. A heredoc / `--body-file -` body sits on its own lines,
+newlines -- plus the command-substitution / grouping delimiters `(` `)` and
+backtick -- BEFORE tokenising each segment, so a create hidden in the idiomatic
+`URL=$(gh issue create ...)`, a subshell `( gh ... )`, a backtick, or on the
+next line cannot mask a bad one, and a quoted operator (`--title ";"`) cannot
+truncate the flag list. `gh` must be the segment's command word (after
+assignments / wrappers / control keywords / redirections), so `echo gh issue
+create` is not a filing. A heredoc / `--body-file -` body sits on its own lines,
 which become their own (non-create) segments and are ignored -- deliberately
 WITHOUT a naive heredoc pre-strip, which misread a `<<` inside a quoted body
 (`cout << x`, a bit-shift, an Erlang `<<Bin>>`) as a redirect and corrupted the
-command. Line continuations are normalised first. Anything still mis-sliced
-degrades to a segment shlex rejects -> fail-open.
+command. Line continuations are normalised first.
+
+Static parsing is best-effort by design: shell-expansion of a label or the gh
+word itself (`--label $'security'`, `${x}`, `$(echo gh) issue create`) defeats
+resolution, so the security-label ask and the label-contract deny are
+best-effort against a deliberately-obfuscating command. Anything mis-sliced or
+unresolved degrades to allow -> fail-open. This is an enforcement/teaching layer,
+never a security control; the close-on-merge workflow and PR review are the
+backstops.
 
 Design (matches changelog-fragment-guard.py -- the PreToolUse sibling, NOT
 erl-dialyzer-reminder.py's Stop-hook `{"decision":"block"}` shape):
@@ -95,13 +106,25 @@ _PS_LINE_CONT = re.compile(r"`\r?\n")
 # "Mechanical enforcement at creation").
 ACK_ENV = "YUZU_ISSUE_STANDARD_ACK"
 
-# A command word may be preceded by `VAR=val` assignments and these wrappers;
-# `gh` must be the command word itself, so `echo gh issue create ...` (echo is
-# not a wrapper) is NOT treated as a filing.
+# A command word may be preceded by `VAR=val` assignments, control keywords,
+# redirections, and these wrappers (matched by BASENAME so `/usr/bin/env`
+# counts); `gh` must be the command word itself, so `echo gh issue create ...`
+# (echo is not a wrapper) is NOT treated as a filing.
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A redirection operator, optionally with a leading fd and/or a glued target:
+# `>`, `>>`, `2>`, `&>`, `>out.txt`, `2>err`.
+_REDIR_RE = re.compile(r"^(?:\d*(?:>>|<<|<|>)|&>)")
 WRAPPERS = frozenset({
     "command", "builtin", "exec", "env", "sudo", "doas",
-    "nice", "time", "xargs", "winpty", "stdbuf",
+    "nice", "time", "xargs", "winpty", "stdbuf", "timeout", "nohup", "ionice",
+})
+# Wrappers that consume a leading option/value token (best-effort): `timeout 5`,
+# `nice -n 10`, `stdbuf -oL`.
+ARG_WRAPPERS = frozenset({"timeout", "nice", "stdbuf", "ionice"})
+# Shell keywords / grouping tokens that precede a command in the same segment.
+CONTROL = frozenset({
+    "if", "then", "elif", "else", "fi", "do", "done", "while", "until",
+    "!", "{", "}", "[[", "]]", ":",
 })
 
 # Label taxonomy -- docs/agents/triage-labels.md. Lower-case; labels are
@@ -141,19 +164,22 @@ def _split_labels(value):
 def _split_shell_segments(command):
     """Slice a command into simple-command segments at UNQUOTED separators.
 
-    Splits on `;`, `&`, `&&`, `|`, `||` and newlines that are outside single
-    quotes, double quotes and backticks. A quoted operator (e.g. inside
-    `--title ";"`) is therefore NOT a boundary, and a create on the next line
-    does not merge into the previous one. A heredoc body sits on its own lines,
-    which become their own segments here and are dropped downstream because they
-    are not a `gh issue create`. An unquoted word-initial `#` starts a comment
-    (Bash and PowerShell both) -- the shell never passes it to gh, so we drop it
-    too, otherwise `--label P1 # --label bug` would count the commented label.
-    Escapes are honoured outside single quotes and inside double quotes/backticks.
+    Splits on `;`, `&`, `&&`, `|`, `||`, newlines, AND the command-substitution
+    / grouping delimiters `(` `)` and backtick -- all outside single/double
+    quotes. So the create inside `URL=$(gh issue create ...)`, `` `gh ...` ``,
+    `( gh ... )` or a `$(...)` capture becomes its own segment and is evaluated,
+    not hidden. A quoted operator (e.g. inside `--title ";"`) is NOT a boundary,
+    and a create on the next line does not merge into the previous one. A heredoc
+    body sits on its own lines, which become their own segments and are dropped
+    downstream because they are not a `gh issue create`. An unquoted word-initial
+    `#` starts a comment (Bash and PowerShell both) -- the shell never passes it
+    to gh, so we drop it too, else `--label P1 # --label bug` would count the
+    commented label. Escapes are honoured outside single quotes and inside double
+    quotes.
     """
     segments = []
     buf = []
-    quote = None  # "'", '"', "`" or None
+    quote = None  # "'" or '"' or None
     i = 0
     n = len(command)
     while i < n:
@@ -180,12 +206,15 @@ def _split_shell_segments(command):
             while i < n and command[i] != "\n":
                 i += 1
             continue
-        if c in ("'", '"', "`"):
+        if c in ("'", '"'):
             quote = c
             buf.append(c)
             i += 1
             continue
-        if c in ("\n", ";"):
+        # command-substitution / grouping delimiters are command boundaries:
+        # the `$` of `$(` stays behind harmlessly, the inner command is its own
+        # segment. Backtick is command substitution in Bash (not a quote here).
+        if c in ("\n", ";", "(", ")", "`"):
             segments.append("".join(buf))
             buf = []
             i += 1
@@ -213,14 +242,31 @@ def _is_gh_token(tok):
 
 
 def _command_word_index(tokens):
-    """Index of the command word: skip leading `VAR=val` assignments and wrappers.
+    """Index of the command word: skip leading assignments, control keywords,
+    redirections and wrappers.
 
-    Returns -1 if the tokens are all assignments/wrappers. This is what makes
-    `gh` have to BE the command (so `echo gh issue create ...` is not a filing)
-    while still allowing `sudo gh ...` / `command gh ...` / `VAR=1 gh ...`.
+    Returns -1 if the tokens are all prefixes. This is what makes `gh` have to
+    BE the command (so `echo gh issue create ...` is not a filing) while still
+    catching `sudo gh ...`, `command gh ...`, `VAR=1 gh ...`, `if ! gh ...`,
+    `timeout 5 gh ...`, `/usr/bin/env gh ...`, and (after the scanner splits on
+    `(`/backtick) `URL=$(gh ...)` and `( gh ... )`.
     """
-    for i, t in enumerate(tokens):
-        if _ASSIGN_RE.match(t) or t in WRAPPERS:
+    i, n = 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        if _ASSIGN_RE.match(t) or t in CONTROL:
+            i += 1
+            continue
+        if _REDIR_RE.match(t):
+            # a bare operator (`>`, `2>`) also swallows its target token
+            i += 2 if (t in (">", ">>", "<", "<<") or _REDIR_RE.fullmatch(t)) else 1
+            continue
+        base = t.replace("\\", "/").rsplit("/", 1)[-1]
+        if base in WRAPPERS:
+            i += 1
+            if base in ARG_WRAPPERS:
+                while i < n and (tokens[i].startswith("-") or tokens[i].isdigit()):
+                    i += 1
             continue
         return i
     return -1
@@ -441,6 +487,8 @@ def _looks_like_probe(command):
     quoted string/comment (it would be one token) and `-S` inside an unrelated
     value like `Foo-Section` (that is not a standalone token).
     """
+    if len(command) > MAX_COMMAND_LEN:
+        return False  # bound the O(n^2) shlex path, as the main path does
     try:
         toks = shlex.split(command, posix=True)
     except ValueError:
