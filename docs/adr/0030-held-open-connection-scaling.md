@@ -91,6 +91,16 @@ surface that holds a response open takes a lease from the same counter
 (`yuzu::server::detail::StreamBudget`). This is Decision 15(h) of the ADR-1005 execution
 plan, and it is correct.
 
+The single counter guarantees held-open streams cannot starve plain REST, but a single counter with a
+single reserve does **not** guarantee fairness *among* stream callers - one principal can hold every
+lease outside the reserve. A **per-principal lease cap** on the authenticated surfaces (`GET /mcp/v1/`,
+`/api/v1/events`, the dashboard drawer), keyed by authenticated credential or session, is required
+before the agentic surface is production-enabled. This is a **distinct** policy from ADR-0032's
+per-principal run/grant caps: a held-open stream lease is a different resource from a run admission or
+a delegation artifact, so it is sized and keyed on its own. The unauthenticated legacy `/events`
+stream cannot be principal-keyed at all; it needs a **separate pre-auth limit** (and its missing
+authentication is the pre-auth DoS filed separately below).
+
 **2. Derive the worker pool from the intended stream count — not the cap from the accidental
 pool.** This inverts the arrow. A thread blocked in `cv.wait_for` burns **zero CPU** — the only
 periodic cost is one wakeup per heartbeat interval per stream — and its resident cost is a

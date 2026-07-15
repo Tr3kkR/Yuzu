@@ -868,6 +868,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(j)** | **Capability projection** — generated OpenAPI + generated `tools/list` from core's registry | Gates **the agentic surface**, i.e. the thing voiding F-10 was for. `tools/list` iterates a **compile-time array** (`mcp_server.cpp`) and the OpenAPI document is a hand-typed literal (`rest_api_v1.cpp`). Activate a module today and its capabilities appear on **neither**. Without (j), an engine is reachable by nobody, and INV-31-4's contract test cannot exist either — you cannot diff registered routes against a hand-written document. | Unbuilt. |
 | **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
 | **(k)** | **Operational readiness** — the new stores in the readiness conjunction, and the reaper's liveness alert | Gates **admitting a run in anger**. Six new stores (run, release log, grants/receipts, approvals, plans, declarations) and none is in `/readyz`'s `stores_ok` conjunction; the reaper has no liveness signal, and its death strands terminal evidence and cleanup (read authority itself is denied inline by the `now < expires_at` check of Decision 4/5, not by the reaper). Every row in that conjunction was added because a store died and the server reported healthy. | Unbuilt. Metric names in Decision 5. |
+| **(m)** | **Per-principal quota caps on the invocation-grant family** (2b PR 4.4, #1973): the already-decided outstanding-artifact-count and issuance-rate caps, per principal | Gates **admitting a run in production**. "Many small runs" (Decision 1) makes the admit path the throughput ceiling, and idempotency does not bound a caller minting distinct keys; ADR-1005 already makes a per-principal cap a production prerequisite, and this interlock omitted it. **Scope note:** this row is only the 2b-decided artifact caps. Broader admission-rate / active-run / concurrent-fact-read / core-and-engine fan-out capacity policy - split by credential, engine principal, module and deployment - is a **separate** capacity decision, not settled here. | 2b names the artifact caps (#1973); no engine-principal quota is enforced today. |
 
 **Rule:** no ballot-A5 code path ships until **(a)–(d)** and **(h)** have landed — (h) joins the
 unconditional set because admission *cannot be built* without core's ratified mapping; it is not a
@@ -884,6 +885,7 @@ only if it does not walk them:
 | **(j)** | the **agentic surface** — REST/MCP projection of engine capabilities. |
 | **(l)** | any module serving **more than one operator's runs concurrently from one deployment**. |
 | **(k)** | admitting a run **in production**. |
+| **(m)** | admitting a run **in production** (joins (k)) - the per-principal invocation-grant caps. |
 
 **This is not a delay tactic; it is the honest dependency graph.** Five reviewers, working
 independently, each found a prerequisite the earlier interlock had missed — which is the strongest
@@ -974,9 +976,10 @@ ladder; they never land as SQLite.
 
 ### The interlock will feel like a delay, and that is the point
 
-Four prerequisites (a)–(d) sit between "A5 is ratified" and "A5 code merges". Every one of them
-exists because the alternative is an admitted run whose disclosure cannot be proven — which is
-indistinguishable, in an audit, from no admission at all.
+Five prerequisites sit unconditionally between "A5 is ratified" and "A5 code merges": (a)–(d), whose
+absence means an admitted run whose disclosure cannot be proven - indistinguishable, in an audit, from
+no admission at all - and (h), without which admission cannot be built at all. The rest gate specific
+paths, and (k)/(m) gate admitting a run in production.
 
 ## Alternatives considered
 
