@@ -262,10 +262,19 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
       # otherwise keep fsync=on forever and keep hitting the [pg]-shard
       # timeout on its port. Mirrors the agent-0 tune block above. All three
       # are sighup/user context -> reload suffices, no restart needed.
+      # $LASTEXITCODE is checked explicitly: $ErrorActionPreference='Continue'
+      # does not intercept a native exe's nonzero exit on this PS 5.1 host, so
+      # an unchecked psql.exe failure here would silently leave durability ON
+      # while the loop still reports the agent "ready" - exactly the kind of
+      # swallowed failure this PR's other fixes are closing elsewhere.
       & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed on agent $n (:$port)" }
       & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed on agent $n (:$port)" }
       & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed on agent $n (:$port)" }
       & $psql @H -c 'SELECT pg_reload_conf()' | Out-Null
+      if($LASTEXITCODE -ne 0){ throw "pg_reload_conf() failed on agent $n (:$port)" }
       Remove-Item Env:\PGPASSWORD
       Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
     }
@@ -289,7 +298,11 @@ Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
   # Path-scoped, not a bare filename: 'postgres.exe' alone excludes any
   # process with that name machine-wide. $pgbin is the one bin dir every
   # agent's service (agent-0 + agents 1..N-1) launches postgres.exe from.
-  if($pgbin){ Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue }   # per-connection backend spawn (the big one)
+  if($pgbin){
+    Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue   # per-connection backend spawn (the big one)
+  } else {
+    Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
+  }
   $paths = @()
   if($pgbin){
     $paths += $pgbin                                          # bin dir: postgres.exe not scanned on launch
