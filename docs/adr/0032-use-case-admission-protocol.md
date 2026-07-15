@@ -97,7 +97,7 @@ them.
 
 ## Decision
 
-### 0. Authority is evaluated at every seam in this inventory, and every seam runs the WHOLE conjunction
+### 0. Authority is evaluated at every seam in this inventory; each seam runs every filter that applies to it
 
 This decision exists because the drafting of this ADR kept getting it wrong in the same way, and the
 mistake is invisible one seam at a time.
@@ -105,7 +105,8 @@ mistake is invisible one seam at a time.
 **This is a seam INVENTORY, not a count.** An earlier draft of this decision said "exactly four" and
 was short by one — which is this decision's own defect, committed one level up, in the enumeration
 itself. So the rule is written to survive being incomplete: **any place the platform decides whether
-an actor may do a thing is an authority seam, and it runs the whole conjunction. Finding a new one
+an actor may do a thing is an authority seam, and it runs every filter of §1 that applies to it
+(applicability is core-typed, never a missing input; ADR-0033 §1). Finding a new one
 extends this list; it never creates an exemption.**
 
 | # | Seam | Owner |
@@ -114,18 +115,27 @@ extends this list; it never creates an exemption.**
 | 2 | **Every mid-run core call** (fact reads, capability requests) | Decision 4 |
 | 3 | **Mint** of a cached-result grant | Decision 10 |
 | 4 | **Redemption** of that grant — the seam that hands over bytes | Decision 10 |
+| 4b | **Release of a freshly composed result** to presentation (finalisation) | Decision 12 |
 | 5 | **Authorisation and execution of an Execution Plan** — the seam that touches endpoints | ADR-0033 §8 |
 | 6 | **Granting an approval** (who may approve a plan) | ADR-0033 §4, §7 |
 | 7 | **Approving a capability manifest** — where permissions become data | ADR-0033 §2 |
 | 8 | **Authorising an event/progress subscription** | Decision 9 — **open**, owned by G1: until the cross-process transport is designed, presentation's routing table would be the confidentiality boundary between operators, which INV-31-1 says presentation never holds |
 
-Each of them must evaluate the **full four-filter conjunction of ADR-0033 §1** —
+Each of them evaluates **every filter of ADR-0033 §1 that APPLIES to it** —
 
 ```
-operator grants ∩ attenuated credential grants ∩ Module envelope ∩ execution authorisation
+authenticated-actor grants
+  ∩ represented-operator grants      (when an operator is represented)
+  ∩ attenuated-credential grants     (when a credential is presented)
+  ∩ Module envelope                  (when a Module capability is invoked)
+  ∩ execution authorisation          (when the operation is a protected effect)
 ```
 
-— and **a seam that omits a filter is a bug, not an optimisation.** Successive drafts dropped the
+— and **a seam that omits an APPLICABLE filter is a bug, not an optimisation.** Applicability is
+**core-determined from the operation's class**, never inferred from a missing input a caller could
+omit; the create-authority seams (approving a manifest mints the Module envelope; granting an approval
+mints the execution authorisation) run every filter that applies to *them* and do not
+self-referentially require the authority they are about to create. Successive drafts dropped the
 **credential** term at three of the four seams; each omission independently let a deliberately
 attenuated token act with its owner's full authority, which is worse than having no attenuation at
 all, because the operator believes the worker is confined.
@@ -701,6 +711,23 @@ It proves **no authority**: nothing may be released *because* a receipt exists. 
 verification is exposed on the public API**, so any client — human, agentic, auditor — can verify a
 result independently.
 
+**Finalisation is authority seam 4b (Decision 0), not only an integrity checkpoint.** A freshly
+composed result is released to presentation exactly once, and that release is *authorised*, because the
+window between the last confined fact read and the render is a window in which the operator can be
+demoted, the requesting credential revoked, or the module pulled. So at finalisation core runs the
+**applicable live conjunction of Decision 0** - authenticated actor, the represented operator's CURRENT
+authority, the requesting credential, and module liveness (the execution-authorisation filter is
+not-applicable to a read) - and on success mints a **release authorization** bound to
+`(result_hash, use_case_run_id, requesting credential, engine principal, recipient)`. This is a
+*different* object from the integrity receipt: the receipt attests *what* was finalised; the release
+authorization attests that *this recipient* may receive it *now*. Presentation renders only when both
+agree. The release authorization is **one logical serve** with idempotent replay - a crash after
+authorization but before the bytes reach the client re-runs the conjunction against authority *as it is
+now* (unchanged authority re-authorises with no second release-log row; shrunk authority DENIES), the
+same replay rule as Decision 10's cached redemption. Core authorises the serve; it does not observe
+delivery. A demotion, credential revocation or module pull between the last fact read and this seam
+therefore denies the fresh result exactly as it denies a cached one.
+
 **Two journals, linked — not merged.** They answer different questions and live in different
 databases under different roles:
 
@@ -922,7 +949,10 @@ Two of these have a specific shape under this ADR worth naming:
 - **"No unadmitted run"** is testable at the UCE-checks-grant seam: a request with no grant, an
   expired grant, a wrong-audience grant, a grant whose `input_hash` does not match the inputs
   (Decision 2), or a cached-result request with no **result-scoped** grant (Decision 10) — each is
-  refused by the UCE, and each refusal is a test.
+  refused by the UCE, and each refusal is a test. A **fresh result whose represented operator was
+  demoted, whose requesting credential was revoked, or whose module was pulled between the last fact
+  read and finalisation** is denied release at seam 4b (Decision 12): core refuses the release
+  authorization and presentation renders nothing. That denial is a test too.
 - **"No unjoined evidence"** is a *query*, run against a live database: for a sampled
   `use_case_run_id`, the admission row, every release-log entry, every plan, every approval, every
   execution and the finalisation receipt must all return. That query is the D12 index's reason to

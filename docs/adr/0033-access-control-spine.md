@@ -82,18 +82,24 @@ machinery, it cites ADR-0032; where it needs the process boundary, it cites ADR-
 Every other layer — a credential, a Module, an approval — may only *reduce* it.
 
 ```
-effective authority = operator grants ∩ attenuated credential grants ∩ Module envelope ∩ execution authorisation
+effective authority =
+    authenticated-actor grants
+  ∩ represented-operator grants      (when the action represents an operator)
+  ∩ attenuated-credential grants     (when a credential is presented)
+  ∩ Module envelope                  (when a Module capability is invoked)
+  ∩ execution authorisation          (when the operation is a protected effect)
 ```
 
-A requested action (tool + parameters + scope) passes through four filters, and **core denies the
-action if any filter does not allow it**:
+A requested action (tool + parameters + scope) passes through the filters **that apply to its
+operation class**, and **core denies the action if any applicable filter does not allow it**:
 
-| Filter | Asks |
-|---|---|
-| **Operator** — RBAC + management scope | Can this principal perform this operation here? |
-| **Credential** — explicit attenuated grants (§3) | Was this token deliberately minted for this power? |
-| **Module** — declared maximum envelope (§2) | Was this capability reviewed for this Module version? |
-| **Execution authorisation** — exact plan or bounded envelope (§4–§8) | When risk requires it, did a qualified supervisor approve? |
+| Filter | Asks | Applies |
+|---|---|---|
+| **Authenticated actor** — the calling principal's own RBAC + scope | Can *this actor* (human, engine principal, service identity) perform this operation here? | always |
+| **Represented operator** — the admitting operator's CURRENT RBAC + management scope | When the actor acts *for* an operator (a run, a delegated call), does that operator still permit it? | when an operator is represented |
+| **Credential** — explicit attenuated grants (§3) | Was the presenting credential deliberately minted for this power? | when a credential is presented |
+| **Module** — declared maximum envelope (§2) | Was this capability reviewed for this Module version? | when a Module capability is invoked |
+| **Execution authorisation** — exact plan or bounded envelope (§4–§8) | When risk requires it, did a qualified supervisor approve? | when the operation is a protected effect |
 
 The **Module envelope** is not the manifest. It is **core's ratified copy** of the module's
 declarations, taken at manifest approval and version-locked at admission — the same object ADR-0032
@@ -111,7 +117,17 @@ means "may perform operation X on these devices" until core resolves it against 
 authorization store. The IdP answers *who*; Yuzu answers *may they*.
 
 Filters are **intersections, and intersection is fail-closed**: an unresolvable, missing or
-unparseable filter input denies. No filter may be skipped because another one passed.
+unparseable input for a filter that **applies** denies. No applicable filter may be skipped because
+another one passed.
+
+**Applicability is core-determined and typed, never a missing input.** A filter leaves the conjunction
+for an operation *only* when core marks it not-applicable from the operation's declared class - there
+is no represented operator on a direct expert call; no Module envelope when core *approves* a manifest
+(the approval is what mints the envelope); no execution authorisation on a read. That is the only way a
+factor drops out. Non-applicability is **never** inferred from a value a caller could have omitted, and
+a missing input for an *applicable* filter denies. This is what lets the create-authority seams exist
+without paradox: approving a manifest, or granting an approval, runs every filter that applies to
+*that* seam and does not self-referentially require the authority it is about to create.
 
 ### 2. The capability declaration is the RBAC unit (D1-C · G3 · G9)
 
