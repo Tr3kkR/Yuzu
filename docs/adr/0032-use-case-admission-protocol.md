@@ -733,17 +733,27 @@ the fresh result is **not** handed straight to presentation. Finalisation mints 
 authorization** - the same **result-scoped grant** object as Decision 10 (opaque, server-side,
 one-use, short-TTL, durable state core holds), bound to
 `(result_hash, use_case_run_id, requesting credential, engine principal, recipient)`, where `recipient`
-is the admitting operator's presentation session that requested the run - and the engine **redeems it
-at core before the first byte moves**, exactly as it redeems a cached serve (Decision 10 step 5):
+is the **admitting operator principal** (a durable identity, never the ephemeral presentation session -
+ADR-0031's sessions are G6/G7-open, so a presentation restart mid-run loses no result: the operator
+re-fetches, which is a Decision 10 re-admission) - and the engine **redeems it at core before the first
+byte moves**, exactly as it redeems a cached serve (Decision 10 step 5):
 
 - a **guarded CAS** on the grant (`unredeemed → redeemed`), which makes the one-use property true;
 - the **applicable live conjunction re-evaluated AT REDEMPTION** - authenticated engine principal, the
   represented operator's CURRENT authority, the requesting credential, module liveness, **and the run
   itself live and unexpired (`now < expires_at`, Decision 5)**; the execution-authorisation filter is
   not-applicable to a read;
+- the **subset check against the run's `released_input_digest`** (written at finalisation): the
+  requesting operator's CURRENT scope must still cover the run's released-input set, exactly as
+  Decision 10 step 5 checks a cached serve - a demotion between the last read and render fails HERE, not
+  merely on a weaker "is the operator still valid?" test;
 - the disclosure's **release-log row written in the same transaction**.
 
-This makes the first serve and every later re-fetch (Decision 10) **one mechanism**. The receipt still
+This makes the first serve and every later re-fetch (Decision 10) **one mechanism**. The run stays
+`executing` through finalisation and transitions `executing → finalised` **on successful redemption**
+(mirroring Decision 10's serve-run), so "run live" holds until the bytes are authorised, and an engine
+that finalises but never redeems is an `executing` run past its TTL - caught by
+`yuzu_use_case_runs_stranded` and denied inline (Decision 5), never a silently stuck result. The receipt still
 attests only *integrity* (that the bytes are the bytes finalised under this run); the redeemed release
 authorization is what says *this recipient may receive it now*, and presentation renders only when the
 redemption succeeds. Redemption is **replay-safe**: a crash after the CAS re-runs the conjunction
