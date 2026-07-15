@@ -27,6 +27,7 @@
 #include <expected>
 #include <latch>
 #include <optional>
+#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -588,6 +589,63 @@ TEST_CASE("ApiTokenStore: revoke_generation_ guard prevents a stale cache write 
     // the cache directly: a follow-up validate_token (strictly after both
     // threads have joined) must never resurrect a pre-revoke "still valid"
     // answer from a racy cache write.
+    auto after = store.validate_token(*raw);
+    CHECK_FALSE(after.has_value());
+}
+
+TEST_CASE("ApiTokenStore: the post-commit generation bump prevents a validate that read "
+          "pre-commit data from poisoning the cache",
+          "[pg][token][auth][toctou]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}}; // revoke + validate each need a lease concurrently
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("poison-token", "admin");
+    REQUIRE(raw.has_value());
+    auto id = store.list_tokens("admin").value().at(0).token_id;
+
+    // Do NOT validate raw before the race — its cache must start empty.
+
+    std::binary_semaphore first_bump_done{0};
+    std::binary_semaphore release_revoke{0};
+    std::binary_semaphore validate_selected{0};
+    std::binary_semaphore release_validate{0};
+
+    store.test_hook_after_first_revoke_bump_ = [&] {
+        first_bump_done.release(); // tell main the first bump landed
+        release_revoke.acquire();  // pause revoke here (before its UPDATE) until main lets it proceed
+    };
+    store.test_hook_after_validate_select_ = [&] {
+        validate_selected.release(); // tell main the SELECT (pre-commit read) is done
+        release_validate.acquire();  // pause validate before its generation re-check until main lets it proceed
+    };
+
+    std::expected<bool, std::string> revoked;
+    std::optional<ApiToken> validated;
+    std::thread t_revoke([&] { revoked = store.revoke_token(id); });
+    first_bump_done.acquire(); // first bump done; revoke paused before UPDATE (row still revoked=false)
+
+    std::thread t_validate([&] { validated = store.validate_token(*raw); });
+    validate_selected.acquire(); // validate snapshotted gen (post-first-bump), SELECTed revoked=false, paused before re-check
+
+    release_revoke.release(); // let revoke finish: UPDATE commit + SECOND bump + invalidate_cache
+    t_revoke.join();          // ensure revoke's invalidate ran BEFORE validate's re-check/insert
+
+    release_validate.release(); // let validate do its re-check (must observe the second bump -> skip cache write)
+    t_validate.join();
+
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // Clear hooks so the verification call runs normally.
+    store.test_hook_after_first_revoke_bump_ = nullptr;
+    store.test_hook_after_validate_select_ = nullptr;
+
+    // THE ASSERTION THAT ISOLATES THE FIX: no poisoned entry survives. Without the
+    // post-commit second bump, validate's re-check would have matched its snapshot
+    // and cached the stale revoked=false row (inserted after revoke's invalidate),
+    // and this next call would resurrect the revoked token from cache.
     auto after = store.validate_token(*raw);
     CHECK_FALSE(after.has_value());
 }

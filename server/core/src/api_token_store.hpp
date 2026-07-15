@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -147,6 +148,12 @@ public:
     /// Current number of distinct tokens cached in memory.
     std::size_t cache_size() const;
 
+    // Test-only seams (#2179) for the revoke/validate TOCTOU regression test.
+    // Null in production (zero overhead). Let a test deterministically
+    // interleave a concurrent revoke at the exact cache-poisoning point.
+    std::function<void()> test_hook_after_first_revoke_bump_;   // fired in revoke_token, right after the FIRST generation bump, before the lease/UPDATE
+    std::function<void()> test_hook_after_validate_select_;     // fired in validate_token, right after the SELECT (+last_used update), before the generation re-check block
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
@@ -165,35 +172,44 @@ private:
     mutable std::atomic<uint64_t> cache_misses_{0};
 
     // Defense-in-depth against a cache TOCTOU on revocation. Incremented
-    // before every UPDATE/DELETE in `revoke_token`, `revoke_for_principal`,
-    // and `delete_token`. `validate_token` snapshots the value before its DB
-    // SELECT and re-reads it UNDER `cache_mtx_`, in the same critical section
-    // as the cache write — if it moved, a revoke raced with us and we MUST NOT
-    // populate the cache with a stale (revoked=false) view that would survive
-    // for `kTokenCacheTtl` (60 s) and silently lie about "Sign out everywhere".
-    // The re-check being under the lock is load-bearing: `invalidate_cache`
-    // takes the same mutex and the generation bump precedes it, so a
-    // check-BEFORE-lock ordering left a window in which a revoke's erase ran
-    // between the check and the insert and the token re-authenticated for the
-    // full TTL (fixed 2026-07; the re-check + insert are now one locked step).
+    // bumped TWICE per revoke in `revoke_token`, `revoke_for_principal`, and
+    // `delete_token`: once BEFORE the UPDATE/DELETE and once AFTER it commits
+    // (before `invalidate_cache`). `validate_token` snapshots the value before
+    // its DB SELECT and re-reads it UNDER `cache_mtx_`, in the same critical
+    // section as the cache write — if it moved, a revoke raced with us and we
+    // MUST NOT populate the cache with a stale (revoked=false) view that would
+    // survive for `kTokenCacheTtl` (60 s) and silently lie about "Sign out
+    // everywhere". The re-check being under the lock is load-bearing:
+    // `invalidate_cache` takes the same mutex and the generation bump precedes
+    // it, so a check-BEFORE-lock ordering left a window in which a revoke's
+    // erase ran between the check and the insert and the token re-authenticated
+    // for the full TTL (fixed 2026-07; the re-check + insert are now one locked
+    // step).
+    //
+    // Why TWO bumps (PR #2188 round-3 review). The pre-UPDATE bump only catches
+    // a validate that snapshotted the generation BEFORE it. A validate that
+    // starts AFTER the pre-bump captures the already-incremented value as its
+    // baseline, and under Postgres READ COMMITTED its SELECT can still read the
+    // row's pre-commit revoked=false; with only one bump its post-SELECT
+    // re-check would match its own snapshot and cache the stale row for the full
+    // TTL. The post-commit bump moves the generation past that snapshot too, so
+    // BOTH classes of racing validate skip the stale cache write. The cache is
+    // therefore never poisoned past the TTL.
     //
     // Under the pool there is no single connection-wide mutex serializing a
     // caller's SELECT against another caller's UPDATE the way the old sqlite
     // `db_mtx_` did — a Postgres pool hands out independent connections per
-    // lease. The generation counter's job is therefore NARROW: it stops a
-    // validate that raced a revoke from CACHING a stale revoked=false entry.
-    // Holding `cache_mtx_` across the re-check and the insert serializes them
-    // against `invalidate_cache`'s erase, so the cache is never poisoned past
-    // the TTL. It does NOT restore the validate<->revoke serialization db_mtx_
-    // gave, so two bounded windows remain (see validate_token in the .cpp):
-    // (A) a cache-MISS validate may still return a token whose revoke committed
-    // during its own execution, and (B) the cache-HIT path returns the cached
-    // value during the revoke's UPDATE->invalidate_cache window. Both are
-    // single-in-flight-request windows — neither permits a NEW authentication
-    // after revoke_token() returns (the next uncached validate SELECTs
-    // revoked=true). A proper close of (A)/(B) (SELECT ... FOR UPDATE in the
+    // lease. The generation counter's job is NARROW: it stops a racing validate
+    // from CACHING a stale entry. It does NOT restore the validate<->revoke
+    // serialization db_mtx_ gave, so two bounded SINGLE-in-flight-request
+    // windows remain (see validate_token in the .cpp): (A) a cache-MISS validate
+    // may still RETURN (once, uncached) a token whose revoke committed during
+    // its own execution, and (B) the cache-HIT path may return a validly-cached
+    // value during the revoke's UPDATE->invalidate_cache gap. Neither permits a
+    // NEW authentication after the revoke's invalidate runs, and neither leaves
+    // a stale cache entry. A full close of (A)/(B) (SELECT ... FOR UPDATE in the
     // revoke txn, or a per-token version column) is tracked in #2173.
-    // Keep every fetch_add and every snapshot/re-check.
+    // Keep every fetch_add (both per call) and every snapshot/re-check.
     std::atomic<uint64_t> revoke_generation_{0};
 
     /// Generate a fresh `yuzu_` Bearer token from the platform CSPRNG.

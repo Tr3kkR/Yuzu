@@ -328,6 +328,9 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     // the two operations serialize against the erase: either we observe the
     // bumped generation and skip, or the revoke's erase runs strictly after our
     // insert and removes it. Neither leaves a stale entry.
+    if (test_hook_after_validate_select_)
+        test_hook_after_validate_select_();
+
     {
         std::lock_guard cache_lock(cache_mtx_);
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
@@ -420,6 +423,9 @@ std::expected<bool, std::string> ApiTokenStore::revoke_token(const std::string& 
     // generation move at its cache-write step and skip the stale write.
     revoke_generation_.fetch_add(1, std::memory_order_release);
 
+    if (test_hook_after_first_revoke_bump_)
+        test_hook_after_first_revoke_bump_();
+
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         // authoritative: a lease timeout is a WRITE FAILURE — never a silent
@@ -442,6 +448,17 @@ std::expected<bool, std::string> ApiTokenStore::revoke_token(const std::string& 
     if (rows == 0)
         return false; // DB write succeeded; no such token (already gone / unknown id)
 
+    // Second generation bump — AFTER the UPDATE has committed, BEFORE we
+    // invalidate. The pre-UPDATE bump alone only catches a validate_token that
+    // snapshotted revoke_generation_ *before* it. A validate that started AFTER
+    // that first bump captured the already-incremented value as its baseline,
+    // and under Postgres READ COMMITTED its SELECT can still read this row's
+    // pre-commit revoked=false; its post-SELECT re-check would then match its
+    // own snapshot and cache the stale row for the full TTL (PR #2188 round-3
+    // review). This second transition moves the generation past that snapshot,
+    // so the racing validate skips its cache write; invalidate_cache below then
+    // clears any entry that still beat us (both serialize on cache_mtx_).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     invalidate_cache(PQgetvalue(res.get(), 0, 0));
     return true;
 }
@@ -478,6 +495,11 @@ ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
                                PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
+    // Second generation bump after the UPDATE commits, before invalidating —
+    // see revoke_token for the full rationale (closes the post-first-bump /
+    // pre-commit READ COMMITTED cache-poisoning window).
+    if (rows > 0)
+        revoke_generation_.fetch_add(1, std::memory_order_release);
     for (int i = 0; i < rows; ++i)
         invalidate_cache(PQgetvalue(res.get(), i, 0));
     return static_cast<std::size_t>(rows);
@@ -511,6 +533,9 @@ std::expected<bool, std::string> ApiTokenStore::delete_token(const std::string& 
     if (rows == 0)
         return false; // DB write succeeded; no such token (already gone / unknown id)
 
+    // Second generation bump after the DELETE commits, before invalidating —
+    // see revoke_token for the full rationale.
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     invalidate_cache(PQgetvalue(res.get(), 0, 0));
     return true;
 }

@@ -5,6 +5,8 @@
   `api_tokens_db_persisted: false` field (previously it audited `success` and dropped the API-token
   outcome entirely), and the dashboard's token-revoke control shows a retry error rather than a
   success toast. An operator revoking a stolen device's credential is now told when the revoke did
-  not actually land (ADR-0030 §Posture). Token reads (`GET /api/v1/tokens`, the ownership check on a
-  single-token revoke, and the dashboard token panel) likewise surface a Postgres outage as a
-  retryable `503` rather than an empty list or a false `404` (ADR-0012 §1).
+  not actually land (ADR-0030 §Posture). Token reads on the REST surface (`GET /api/v1/tokens` and the
+  ownership check on a single-token revoke) likewise surface a Postgres outage as a retryable `503`
+  rather than an empty list or a false `404`; the dashboard token panel — an HTMX fragment, where a
+  non-2xx body would simply not render — instead shows an explicit "token store unavailable, please
+  retry" row rather than an empty "No API tokens" table that could hide a live credential (ADR-0012 §1).
