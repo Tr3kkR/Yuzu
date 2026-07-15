@@ -340,7 +340,7 @@ TEST_CASE("MCP Token: list includes mcp_tier", "[pg][mcp][token]") {
     store->create_token("MCP Read", "admin", expires, "", "readonly");
     store->create_token("MCP Supervised", "admin", expires, "", "supervised");
 
-    auto tokens = store->list_tokens();
+    auto tokens = store->list_tokens().value();
     REQUIRE(tokens.size() == 3);
 
     int mcp_count = 0;
