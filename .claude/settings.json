@@ -102,7 +102,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/changelog-fragment-guard.py\"",
+            "command": "if command -v py >/dev/null 2>&1; then py -3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/changelog-fragment-guard.py\"; else python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/changelog-fragment-guard.py\"; fi",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v py >/dev/null 2>&1; then py -3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/issue-standard-guard.py\"; else python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/issue-standard-guard.py\"; fi",
             "timeout": 10
           }
         ]
@@ -113,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/erl-dialyzer-reminder.py\"",
+            "command": "if command -v py >/dev/null 2>&1; then py -3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/erl-dialyzer-reminder.py\"; else python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/erl-dialyzer-reminder.py\"; fi",
             "timeout": 15
           }
         ]

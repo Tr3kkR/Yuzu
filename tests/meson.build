@@ -560,3 +560,17 @@ test('flake-retry selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Behavioural test for the issue-standard PreToolUse guard (ADR-3001 pillar 4).
+# The first tests scripts/hooks/ has ever had: a convention hook that silently
+# stops enforcing is invisible in normal use, and CI is Linux-only so the
+# Windows interpreter trap never surfaces here -- so the decision logic is
+# pinned on every platform. Spawns the hook with synthetic PreToolUse payloads
+# and asserts allow/ask/deny. (The Windows *wiring* is proved locally by
+# scripts/hooks/selfcheck-issue-guard.py -- CI cannot see that trap.)
+test('issue-guard hook',
+  _python3_test,
+  args: [files('test_issue_guard.py')],
+  suite: 'docs',
+  timeout: 20,
+)
