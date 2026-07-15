@@ -54,6 +54,8 @@ erl-dialyzer-reminder.py's Stop-hook `{"decision":"block"}` shape):
   - UTF-8 explicit on stdin and the transcript (never inherit cp1252 on Windows;
     see memory reference_hookify_ascii_only).
   - ALWAYS exit 0; the decision is carried in the JSON, never the exit code.
+  - Operator escape hatch (ADR-3001 charter): `YUZU_ISSUE_STANDARD_ACK=1` in the
+    environment short-circuits the hook to allow, for a deliberate override.
   - Claude sessions only. Other agents and humans remain bound by the text of
     the standard and by PR review.
 """
@@ -81,9 +83,26 @@ MAX_COMMAND_LEN = 20_000
 # parser decides; a false hit only costs one wasted tokenise.
 _CREATE_GATE = re.compile(r"gh(?:\.exe|\.cmd)?\s+issue\s+create\b", re.IGNORECASE)
 
-# Line continuation `\<newline>` -- a shell removes it entirely, so we normalise
-# it away before the gate/parser (else it splits the `gh issue create` phrase).
+# Line continuations -- a shell removes them entirely, so we normalise them away
+# before the gate/parser (else they split the `gh issue create` phrase). Bash
+# uses `\<newline>`; PowerShell uses `` `<newline> `` (backtick), stripped only
+# for the PowerShell tool since a backtick means command-substitution in Bash.
 _LINE_CONT = re.compile(r"\\\r?\n")
+_PS_LINE_CONT = re.compile(r"`\r?\n")
+
+# The ADR-3001 pillar-4 charter mandates an explicit operator escape hatch: set
+# this to "1" to proceed through a known non-conformant create (docs/adr/3001,
+# "Mechanical enforcement at creation").
+ACK_ENV = "YUZU_ISSUE_STANDARD_ACK"
+
+# A command word may be preceded by `VAR=val` assignments and these wrappers;
+# `gh` must be the command word itself, so `echo gh issue create ...` (echo is
+# not a wrapper) is NOT treated as a filing.
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+WRAPPERS = frozenset({
+    "command", "builtin", "exec", "env", "sudo", "doas",
+    "nice", "time", "xargs", "winpty", "stdbuf",
+})
 
 # Label taxonomy -- docs/agents/triage-labels.md. Lower-case; labels are
 # casefolded before comparison because GitHub resolves label names
@@ -127,8 +146,10 @@ def _split_shell_segments(command):
     `--title ";"`) is therefore NOT a boundary, and a create on the next line
     does not merge into the previous one. A heredoc body sits on its own lines,
     which become their own segments here and are dropped downstream because they
-    are not a `gh issue create`. Escapes are honoured outside single quotes and
-    inside double quotes/backticks.
+    are not a `gh issue create`. An unquoted word-initial `#` starts a comment
+    (Bash and PowerShell both) -- the shell never passes it to gh, so we drop it
+    too, otherwise `--label P1 # --label bug` would count the commented label.
+    Escapes are honoured outside single quotes and inside double quotes/backticks.
     """
     segments = []
     buf = []
@@ -152,6 +173,12 @@ def _split_shell_segments(command):
             buf.append(c)
             buf.append(command[i + 1])
             i += 2
+            continue
+        if c == "#" and (not buf or buf[-1] in " \t"):
+            # unquoted word-initial comment -> drop to end of line (the newline,
+            # if any, still splits the segment on the next iteration)
+            while i < n and command[i] != "\n":
+                i += 1
             continue
         if c in ("'", '"', "`"):
             quote = c
@@ -185,14 +212,29 @@ def _is_gh_token(tok):
     return base in ("gh", "gh.exe", "gh.cmd")
 
 
+def _command_word_index(tokens):
+    """Index of the command word: skip leading `VAR=val` assignments and wrappers.
+
+    Returns -1 if the tokens are all assignments/wrappers. This is what makes
+    `gh` have to BE the command (so `echo gh issue create ...` is not a filing)
+    while still allowing `sudo gh ...` / `command gh ...` / `VAR=1 gh ...`.
+    """
+    for i, t in enumerate(tokens):
+        if _ASSIGN_RE.match(t) or t in WRAPPERS:
+            continue
+        return i
+    return -1
+
+
 def _find_create_arg_lists(command):
     """Return the flag-token list for every real `gh issue create` invocation.
 
-    Segments the command first (so operators/newlines/heredocs are handled),
-    then within each segment finds `gh` `issue` `create` as three contiguous
-    tokens (a path-prefixed `/usr/bin/gh` counts; a create only inside a quoted
-    string does not, since it is one token). A segment shlex cannot parse is
-    skipped -> fail-open.
+    Segments the command first (so operators/newlines/comments are handled),
+    then requires `gh` (or `/path/to/gh`, `gh.exe`, `gh.cmd`) to be the segment's
+    COMMAND WORD followed by `issue create`. Requiring command position (not a
+    scan of every token) means `echo gh issue create ...` is not a filing, and a
+    create only inside a quoted string is not one either (it is a single token).
+    A segment shlex cannot parse is skipped -> fail-open.
     """
     out = []
     for segment in _split_shell_segments(command):
@@ -200,18 +242,16 @@ def _find_create_arg_lists(command):
             tokens = shlex.split(segment, posix=True)
         except ValueError:
             continue  # unbalanced quotes etc. -> skip this segment
-        i, n = 0, len(tokens)
-        while i < n:
-            if (
-                _is_gh_token(tokens[i])
-                and i + 2 < n
-                and tokens[i + 1] == "issue"
-                and tokens[i + 2] == "create"
-            ):
-                out.append(tokens[i + 3:])
-                i += 3
-            else:
-                i += 1
+        ci = _command_word_index(tokens)
+        if ci < 0:
+            continue
+        if (
+            _is_gh_token(tokens[ci])
+            and ci + 2 < len(tokens)
+            and tokens[ci + 1] == "issue"
+            and tokens[ci + 2] == "create"
+        ):
+            out.append(tokens[ci + 3:])
     return out
 
 
@@ -470,6 +510,11 @@ def _emit(decision, reason):
 
 
 def main():
+    # ADR-3001 pillar 4: explicit operator escape hatch. Checked first so it
+    # short-circuits every path, matching the charter's "operator bypass".
+    if os.environ.get(ACK_ENV) == "1":
+        return
+
     try:
         raw = sys.stdin.buffer.read()
         data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
@@ -482,6 +527,8 @@ def main():
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return
+    if data.get("tool_name") == "PowerShell":
+        command = _PS_LINE_CONT.sub("", command)  # PowerShell backtick-newline
     command = _LINE_CONT.sub("", command)  # a shell removes `\<newline>` entirely
     if not _CREATE_GATE.search(command):
         return  # cheap gate -- the vast majority of shell calls stop here

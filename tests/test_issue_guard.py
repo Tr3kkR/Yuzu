@@ -23,6 +23,7 @@ Windows) is proved separately by scripts/hooks/selfcheck-issue-guard.py.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,7 @@ def run_hook(
     transcript_path: str | None = None,
     tool_name: str = "Bash",
     raw_stdin: bytes | None = None,
+    env_extra: dict | None = None,
 ) -> tuple[str, str]:
     """Invoke the hook and return (decision, reason). No stdout => 'allow'."""
     if raw_stdin is not None:
@@ -74,11 +76,13 @@ def run_hook(
             obj["transcript_path"] = transcript_path
         payload = json.dumps(obj).encode("utf-8")
 
+    run_env = {**os.environ, **env_extra} if env_extra else None
     proc = subprocess.run(
         [sys.executable, str(HOOK)],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=run_env,
     )
     # A hook must ALWAYS exit 0 -- the decision is in the JSON, not the code.
     if proc.returncode != 0:
@@ -314,6 +318,39 @@ def build_cases(with_probe: str, no_probe: str):
             f'gh.exe issue create --title T --body "{GOOD_BODY}" --label P1,needs-triage',
             with_probe, "deny", ["no TYPE label"],
         ),
+
+        # --- adversarial-review (Codex) regressions ---
+        (
+            "C1: labels after a shell `#` comment are not counted (smuggle fixed)",
+            'gh issue create --title T --label P1 # --label bug,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "C1b: a prose trailing comment does not break a valid create",
+            f'gh issue create --title T --body "{GOOD_BODY}" '
+            '--label bug,P1,needs-triage # filing the parser bug',
+            with_probe, "allow", [],
+        ),
+        (
+            "C4: `echo gh issue create ...` is not a filing (over-block fixed)",
+            'echo gh issue create --title T --label P1,needs-triage',
+            with_probe, "allow", [],
+        ),
+        (
+            "C4b: `command gh issue create` (wrapper) is still enforced",
+            'command gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "C4c: `sudo gh issue create` (wrapper) is still enforced",
+            'sudo gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "C4d: `VAR=1 gh issue create` (assignment prefix) is still enforced",
+            'GH_HOST=github.com gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
     ]
 
 
@@ -398,6 +435,34 @@ def main() -> int:
                 failures.append(f"[R4: oversized command fails open] decision={decision!r} want allow")
         except AssertionError as exc:
             failures.append(f"[R4: oversized command fails open] {exc}")
+
+        # --- C2: PowerShell backtick-newline continuation is normalised ---
+        for label, cmd, want in [
+            ("C2: PS backtick-cont between issue and create",
+             "gh issue `\ncreate --title T --label P1,needs-triage", "deny"),
+            ("C2b: PS backtick-cont between flags",
+             "gh issue create --title T `\n--label P1,needs-triage", "deny"),
+        ]:
+            try:
+                decision, _ = run_hook(cmd, transcript_path=with_probe, tool_name="PowerShell")
+                if decision != want:
+                    failures.append(f"[{label}] decision={decision!r} want={want!r}")
+            except AssertionError as exc:
+                failures.append(f"[{label}] {exc}")
+
+        # --- C3: the ADR-mandated YUZU_ISSUE_STANDARD_ACK=1 operator bypass ---
+        bad = "gh issue create --title T --label P1,needs-triage"  # no type -> would deny
+        try:
+            decision, _ = run_hook(bad, transcript_path=with_probe,
+                                   env_extra={"YUZU_ISSUE_STANDARD_ACK": "1"})
+            if decision != "allow":
+                failures.append(f"[C3: ACK=1 bypass] decision={decision!r} want allow")
+            decision, _ = run_hook(bad, transcript_path=with_probe,
+                                   env_extra={"YUZU_ISSUE_STANDARD_ACK": "0"})
+            if decision != "deny":
+                failures.append(f"[C3: ACK=0 does not bypass] decision={decision!r} want deny")
+        except AssertionError as exc:
+            failures.append(f"[C3: ACK bypass] {exc}")
 
         # --- non-shell tool is ignored ---
         try:
