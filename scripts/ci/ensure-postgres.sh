@@ -184,6 +184,10 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   if [[ -n "$EXISTING_IMAGE" && ( "$EXISTING_IMAGE" != "$PG_IMAGE" || "$EXISTING_TUNE" != "$PG_TUNE_LABEL" ) ]]; then
     echo "ensure-postgres: ${CONTAINER} drift (image ${EXISTING_IMAGE} vs ${PG_IMAGE}, tune ${EXISTING_TUNE:-none} vs ${PG_TUNE_LABEL}) — recreating" >&2
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+      echo "::error::ensure-postgres: failed to remove stale ${CONTAINER} - old tuning still active" >&2
+      exit "$SOFT_EXIT"
+    fi
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
     # ${arr[@]+...} guarded expansion: empty-array-safe under `set -u` on
