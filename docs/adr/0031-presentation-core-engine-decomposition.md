@@ -120,14 +120,21 @@ is the alternative most likely to be re-proposed.
 
 ## Decision
 
-**1. Three kinds of binary: presentation, core, engine.** Co-located on one host today;
-independently deployable by construction, with no code change required to move any of them to its
-own host. Responsibilities are stable even if the deployment shape later changes.
+**1. Three kinds of binary: presentation, core, engine.** One fused binary today; co-located as
+three components on one host is the initial target of this decomposition, independently deployable by
+construction, with no code change required to move any of them to its own host. Responsibilities are
+stable even if the deployment shape later changes.
 
 **2. Core owns the API and is the sole authority.** Authentication, RBAC, tier policy, scope
 confinement (ADR-0017), approvals, protected effects, audit, fleet truth and the engine-capability
 registry all live in core. Every other component may **narrow** authority; none may **enlarge** it.
 The platform-wide spine that expresses this is ADR-0033.
+This is authority over the *mediated protocol*: every authorisation decision, every fact release,
+every effect. It is **not** a claim of containment over plaintext an engine already holds. Data core
+has released into the `uce` database persists there under the engine's own retention, so the engine
+stays inside the confidentiality TCB for what it retains (INV-31-2's receive-vs-retain split;
+ADR-0032 Decisions 7 and 15). "Sole authority" means nobody else may *create* authority, not that a
+compromised engine can disclose nothing.
 
 **3. Presentation is a transport-and-render adapter.** It terminates HTTP, SSE and MCP, frames
 protocol, renders the HTMX dashboard, and holds live connection state — and it reaches the domain
@@ -343,7 +350,7 @@ correlation id (without which session peer-binding and lockout break). Core trus
 | Core unavailable | No new protected operation proceeds. Engine results needing fresh authority or fleet facts **fail closed** rather than serving an unconfined answer. | Core is the only authority and the only source of fleet truth. |
 | `uce` database unavailable | The affected module cannot start or advance a run. Core does **not** reconstruct engine domain state. | Avoids a hidden second owner of that state. |
 | `yuzu` database unavailable | Authentication, authorisation and new state-changing work fail closed; health endpoints report the condition. | Every fleet effect must remain attributed and authorised. |
-| Presentation unavailable | The product surface is down; the fleet keeps running. Sessions and replay survive — **once** they have moved to core/Postgres (see Costs; today they are in `AuthManager`'s memory). That move is decided *with* the split, not after it, precisely because this row is otherwise false. | Presentation is replaceable by design. |
+| Presentation unavailable | The product surface is down; the fleet keeps running. Sessions and replay survive — **once** they have moved behind the core boundary (their durability and location are G6/G7, open; see Costs; today they are in `AuthManager`'s memory). That move is decided *with* the split, not after it, precisely because this row is otherwise false. | Presentation is replaceable by design. |
 | Gateway unavailable | Core retains pending commands and retry deadlines, every command identity unchanged. | Gateway state is disposable. |
 | Endpoint reconnects after an uncertain result | Core may redeliver the same command identity; the agent suppresses the duplicate effect and returns the remembered outcome where it has one. | At-least-once delivery without repeated effect. |
 | Partial distributed query | Return a coverage envelope, then apply the Use Case's completeness policy (ADR-0033 D11). | Missing evidence must never be read as a negative finding. |
@@ -431,9 +438,14 @@ being structural.
 
 - **Session state.** Operator sessions live in `AuthManager`'s memory today. If presentation held
   them, restarting presentation would log everyone out and presentation could never scale
-  horizontally. **Sessions and the MCP replay ring move to core/Postgres** — decided *with* the
-  split, not after it. This reworks the in-memory contracts around JIT elevation and inactivity
-  timeout, and it is why the auth-store PG migration must be re-scoped before it starts.
+  horizontally. **Sessions and the MCP replay ring move behind the core boundary, out of
+  presentation** - decided *with* the split, not after it. **Whether they become durable, and whether
+  that is core memory or Postgres, is G6/G7 and remains open** (ADR-0030 Decision 4; exec-plan
+  Decision 15(d) holds 2f's sessions in memory with a non-durable replay ring and no new store, so
+  naming Postgres here would license a durable session store no ballot approved). What is decided is
+  only that presentation stops *owning* them. This reworks the in-memory contracts around JIT
+  elevation and inactivity timeout, and it is why the auth-store PG migration must be re-scoped before
+  it starts.
 - **Supervision, and a hard commitment: one deployment unit.** Three processes plus a Postgres
   sibling need a supervisor, or a pod of containers sharing a network namespace (the better hygiene
   if Kubernetes is a target). But the commitment matters more than the mechanism: a customer who
@@ -485,8 +497,8 @@ being structural.
    roughly **40–60 new public capabilities** — a programme of work, not a step. It is the right work
    (every one of them is a capability an agentic worker also wanted), but it must be planned as a
    programme or it will be discovered as a delay.
-4. **Extract presentation** into its own Drogon binary against that seam (after G10), with durable
-   sessions and replay behind the boundary.
+4. **Extract presentation** into its own Drogon binary against that seam (after G10), with sessions
+   and replay moved behind the boundary (their durability and location are G6/G7).
 5. **Extract the engine** — the cheapest of the five, because it is new code with no in-process
    store access to unwind. **It is not free, and it is not first.** Engine principals are a
    *reserved* `principal_class` that is **never emitted today** (`principal_class.hpp`), the

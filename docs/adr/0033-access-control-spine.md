@@ -50,8 +50,10 @@ one **ordered pipeline** that every request transits at core's API:
 authenticate → attribute → authorize (RBAC ∩ scope) → approval gate → audit → execute
 ```
 
-All of it exists today — but fused into one binary, so every subsystem that needed a stage grew its
-own partial copy of it. There are already **four hand-built approval gates** (instruction approval
+The pipeline's *shape* exists today - fused into one binary, so every subsystem that needed a stage
+grew its own partial copy of it. The unifying mechanisms this ADR adds - declared attenuation (§3),
+the capability registry (§2), the single approval primitive (§4) and Execution Plans (§10) - do not
+exist yet. There are already **four hand-built approval gates** (instruction approval
 workflows, the agent enrollment queue, Guardian's dangerous-enforce gate, deploy's operator gate),
 two independent re-authorisation idioms, and a hand-maintained list of MFA step-up surfaces. Each
 was a reasonable local decision. Together they are a spine that was never named, and therefore never

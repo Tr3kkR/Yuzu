@@ -928,7 +928,7 @@ and 12), and — from ADR-0033 — the pending-approval objects, the Execution P
 capability-declaration tables: **six**, and the count matters because every one of them must appear in
 the readiness conjunction (ADR-0031 INV-31-6, interlock item (k)). They are new, core-owned, and born
 on Postgres under ADR-0012's contract —
-fail-closed construction — and **all three are AUTHORITATIVE stores, not durability-on-top ones**.
+fail-closed construction — and **all six are AUTHORITATIVE stores, not durability-on-top ones**.
 That distinction is the difference between a working design and a fail-open one, so it is spelled
 out here rather than left to the reader of ADR-0012: a durability-on-top store returns empty or
 `false` on error and lets an in-memory layer be the truth. **These stores have no in-memory truth to
