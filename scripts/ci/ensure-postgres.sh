@@ -116,18 +116,36 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
 }
 
+# PGOPTIONS is process-environment-level, not DSN content: pg_pool.cpp's
+# conninfo_has_options_ gate checks getenv("PGOPTIONS") unconditionally,
+# regardless of which of the 4 paths below built the connection string.
+# A set PGOPTIONS would silently disable PgPool's statement_timeout/
+# lock_timeout safety bounds even on the docker/brew/native paths, which
+# never see a caller-supplied DSN - so this runs unconditionally, before
+# path selection, not only inside the pre-set-DSN branch (path 1 below).
+if [[ -n "${PGOPTIONS:-}" ]]; then
+  echo "::error::ensure-postgres: PGOPTIONS must not be set in the job environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
+  exit 1
+fi
+
 # ── 1. Pre-set DSN wins ──────────────────────────────────────────────────
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # PgPool (pg_pool.cpp) only injects its statement_timeout/lock_timeout
-  # safety-bound GUCs when PQconninfoParse finds no `options` keyword and
-  # PGOPTIONS is unset - an `options=` in a pre-set DSN (URI query form OR
-  # keyword form) silently disables those bounds (the [pg][hardening] test
-  # "PgPool injects statement_timeout and lock_timeout GUCs"). This is the
-  # one path that takes a caller-supplied DSN (paths 2-4 build DSNs from
-  # constants), so gate it before the per-agent derivation below, which
-  # would otherwise carry an unsafe `options=` straight into PA_DSN.
-  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?\&[:space:]])options= ]] || [[ -n "${PGOPTIONS:-}" ]]; then
-    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options=/PGOPTIONS (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
+  # safety-bound GUCs when PQconninfoParse finds no `options` keyword (the
+  # PGOPTIONS half of that same gate is checked unconditionally above). An
+  # `options=` in a pre-set DSN (URI query form OR keyword form) silently
+  # disables those bounds (the [pg][hardening] test "PgPool injects
+  # statement_timeout and lock_timeout GUCs"). This is the one path that
+  # takes a caller-supplied DSN (paths 2-4 build DSNs from constants), so
+  # gate it before the per-agent derivation below, which would otherwise
+  # carry an unsafe `options=` straight into PA_DSN. DSN-literal match
+  # only - an indirect `service=` naming a pg_service.conf section that
+  # itself sets `options=` is out of scope for this string check. Case-
+  # sensitive is intentional: libpq's conninfo_storeval (fe-connect.c)
+  # matches keywords via a case-sensitive strcmp, so an "OPTIONS=" variant
+  # isn't honored as the `options` keyword by libpq either.
+  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options= ]]; then
+    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
     exit 1
   fi
   # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
