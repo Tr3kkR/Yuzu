@@ -373,6 +373,7 @@ if build_server
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
+      'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -463,6 +464,25 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
+      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
+      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
+      # template — no link to yuzu_agent_core, just the include path.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
+      # the include path of every server test TU. It is safe TODAY only because there is
+      # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
+      # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
+      # and server/core/src/*.hpp,
+      # and because server/core/src is listed FIRST so it would win a future clash. A
+      # same-named header added on both sides later SILENTLY SHADOWS — there is no
+      # diagnostic. Do NOT add a private-agent-src include for any other target, and do
+      # NOT solve a future collision by having server PRODUCTION code include an agent
+      # header: that would be an upward dependency edge (server → agent), which the build
+      # graph does not have and must not gain. The durable fix is to hoist the shared tag
+      # keys into one source of truth at rung 2, when the wire contract changes anyway.
+      include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -536,6 +556,21 @@ test('changelog order',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
+# entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
+# the cancelled-path "which entry never finished" inference. It reuses
+# flake-retry.py's junit-name -> introspected-entry mapping rather than keeping a
+# second copy, so the shard-naming contract documented above now has two
+# consumers — and this selftest is what makes a break in it loud. Wired here for
+# the same reason flake-retry's is: the alternative to failing in `meson test` is
+# failing silently at 06:00 UTC, in the one nightly that needed a stack trace.
+test('tsan-gdb-capture selftest',
+  _python3_test,
+  args: [files('../scripts/ci/tsan-gdb-capture.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
 )

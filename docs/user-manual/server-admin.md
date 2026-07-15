@@ -1297,6 +1297,23 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 | `deploy/systemd/yuzu-agent.service` | Yuzu agent unit |
 | `deploy/systemd/yuzu-gateway.service` | Erlang gateway unit |
 
+**Stopping a wedged agent (Linux/macOS).** `SIGTERM`/`SIGINT` (`systemctl stop`,
+Ctrl-C) triggers a graceful agent stop — plugin shutdown, thread joins, store
+close. If that teardown hangs (e.g. the server is unreachable and a drain is
+stuck), **send the signal a second time** (`kill -TERM <pid>` again, or a second
+Ctrl-C): the agent immediately hard-exits with code 1. This escalation is
+deliberate and has **no grace window** — the second signal always force-exits,
+even if the first stop was progressing normally — so double-signalling stop
+tooling will force-kill healthy agents; send one signal and wait. You no longer
+need `SIGKILL` to recover a stuck agent. SQLite state is WAL crash-safe across
+the hard exit. On Windows, a second Ctrl-C also terminates promptly (via the
+escalation or the CRT's default disposition); the service path (`sc stop`) is
+unchanged. If the agent logs `shutdown watcher unavailable` at boot (thread/fd
+exhaustion), a hard-exit handler is installed instead: the agent exits promptly
+on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
+(A default signal disposition would be discarded by PID 1 in a container, so
+the handler is the posture that stays killable.)
+
 **Installation:**
 
 ```bash

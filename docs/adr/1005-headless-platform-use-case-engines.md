@@ -93,6 +93,20 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 3. Exceptions recorded here accrete into the "exception ledger" the standing review question refers to:
    - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands.
 
+   - **2026-07-14 — class-level entry: Prometheus fleet-gauge families are
+     observability, not capability (spark rung 1; retroactively covering
+     `yuzu_fleet_net_*`, `yuzu_fleet_perf_*`, `yuzu_fleet_dex_*`).** New
+     `yuzu_fleet_*` gauge families surfaced ONLY via `/metrics` carry no
+     REST/MCP twin obligation: `/metrics` is a recognized platform machine
+     surface (see "Platform surfaces" above), the families are machine-readable
+     and enumerable by scrape, and no dashboard fragment ships alongside them —
+     so there is no UI-only asymmetry to correct. The twin obligation ATTACHES
+     when an operator-facing feature (a dashboard lens, a query surface, an
+     automation hook) is built OVER the same data — at that point Decision 1/4
+     applies in full to that feature. Recorded class-level so each future
+     gauge-family PR cites this entry instead of relitigating (governance
+     Gate-3 architect, spark rung-1 re-land).
+
    - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
      no MCP twin, and absent from route discovery (A2/A3) — a "no" on
      Decision 1/4's twin-surface requirement. Recorded rather than fixed

@@ -26,23 +26,39 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
-  The TSan leg preloads `/tmp/libgai_sync_shim.so` (built inline from a
-  ~30-line C file at job start) to replace glibc's `getaddrinfo_a()` async
-  DNS path with synchronous `getaddrinfo()` on the calling thread. Required
-  because cpp-httplib enables `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON`
-  by default (vcpkg port), which makes glibc spawn an async-DNS helper
-  thread via `clone3` directly — bypassing TSan's `pthread_create`
-  interceptor — so the helper's per-thread allocator state is never
-  initialised and the first `malloc()` from it segfaults inside
-  `__tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8)` (#438).
-  Scoped to the TSan job via step-level `env: LD_PRELOAD`; production
-  keeps the non-blocking-DNS behaviour. The same shim is mirrored into
-  `sanitizer-tests.yml` so `/test --full` benefits identically.
+  The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
+  `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
+  calling thread. Required because cpp-httplib enables
+  `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON` by default (vcpkg port), which
+  makes glibc spawn an async-DNS helper thread via `clone3` directly —
+  bypassing TSan's `pthread_create` interceptor — so the helper's per-thread
+  allocator state is never initialised and the first `malloc()` from it
+  segfaults inside `__tsan::SizeClassAllocator64LocalCache::Allocate
+  (this=0x8)` (#438). Scoped to the TSan job via step-level `env: LD_PRELOAD`;
+  production keeps the non-blocking-DNS behaviour. The shim is built by
+  `scripts/ci/build-gai-sync-shim.sh` — a **single** script shared by both this
+  workflow and `sanitizer-tests.yml` so the two can't drift (#1038 CS-03); it
+  compiles with `gcc-15 -Werror` and `_Static_assert`s glibc's private
+  `struct gaicb` layout (`ar_result`=24, `__return`=32, `sizeof`=56), so an ABI
+  reshuffle fails the build loudly instead of silently corrupting adjacent
+  memory. Built into `$RUNNER_TEMP`, not a fixed `/tmp` path, because Big Tam
+  runs 4 runner agents under one OS identity and a fixed path is a cross-job
+  collision class (#1038 R-15).
 
-  On Test failure, the TSan job's `Capture stack trace under gdb`
-  diagnostic re-runs `yuzu_server_tests` under `gdb -batch` with the
-  Catch2 seed replayed, dumps `thread apply all bt full` + `info
-  registers`, and rides the existing `meson-testlog-tsan` artifact.
+  On Test **failure or job cancellation**, the TSan job's `Capture stack trace
+  under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
+  failing test binary from the meson junit, maps each to its binary+args via
+  `meson introspect`, and replays each under `gdb -batch` with its own Catch2
+  seed and shard filter, dumping `thread apply all bt full` + `info registers`
+  into `build-linux-tsan/stack-capture.log`, which rides the `meson-testlog-tsan`
+  artifact (uploaded on `failure() || cancelled()`). The cancelled path is the
+  60-min-timeout **hang** case: it infers the unfinished entries and
+  SIGINT-interrupts gdb for a live backtrace. Best-effort — it always exits 0
+  and never changes pass/fail. **Guard note (#1038):** the step's `if:` must keep
+  an explicit `failure() || cancelled()`; a bare `steps.test.outcome ==
+  'failure'` gets an implicit `success()` ANDed on and is unreachable — that
+  defect silently skipped this step on every red nightly from 2026-05-15 to
+  2026-07-14.
 
 `workflow_dispatch` only works once a workflow file exists on the **default
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
