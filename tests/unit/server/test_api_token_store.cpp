@@ -153,13 +153,13 @@ TEST_CASE("ApiTokenStore: list tokens", "[pg][token][crud]") {
     store.create_token("Token B", "alice");
     store.create_token("Token C", "bob");
 
-    auto all = store.list_tokens();
+    auto all = store.list_tokens().value();
     CHECK(all.size() == 3);
 
-    auto alice_tokens = store.list_tokens("alice");
+    auto alice_tokens = store.list_tokens("alice").value();
     CHECK(alice_tokens.size() == 2);
 
-    auto bob_tokens = store.list_tokens("bob");
+    auto bob_tokens = store.list_tokens("bob").value();
     CHECK(bob_tokens.size() == 1);
 
     // Token hashes should never be exposed in listings
@@ -178,13 +178,14 @@ TEST_CASE("ApiTokenStore: delete token", "[pg][token][crud]") {
     auto valid = store.validate_token(*raw);
     REQUIRE(valid.has_value());
 
-    bool deleted = store.delete_token(valid->token_id);
-    CHECK(deleted);
+    auto deleted = store.delete_token(valid->token_id);
+    REQUIRE(deleted.has_value());
+    CHECK(*deleted);
 
     auto after = store.validate_token(*raw);
     CHECK(!after.has_value());
 
-    auto list = store.list_tokens();
+    auto list = store.list_tokens().value();
     CHECK(list.empty());
 }
 
@@ -196,13 +197,13 @@ TEST_CASE("ApiTokenStore: last_used_at updated on validation", "[pg][token][auth
     auto raw = store.create_token("Usage", "admin");
     REQUIRE(raw.has_value());
 
-    auto before = store.list_tokens();
+    auto before = store.list_tokens().value();
     REQUIRE(before.size() == 1);
     CHECK(before[0].last_used_at == 0);
 
     store.validate_token(*raw);
 
-    auto after = store.list_tokens();
+    auto after = store.list_tokens().value();
     REQUIRE(after.size() == 1);
     CHECK(after[0].last_used_at > 0);
 }
@@ -236,11 +237,11 @@ TEST_CASE("ApiTokenStore: get_token returns metadata for ownership check",
 
     auto raw = store.create_token("Alice's token", "alice");
     REQUIRE(raw.has_value());
-    auto listing = store.list_tokens("alice");
+    auto listing = store.list_tokens("alice").value();
     REQUIRE(listing.size() == 1);
     auto token_id = listing[0].token_id;
 
-    auto looked_up = store.get_token(token_id);
+    auto looked_up = store.get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->token_id == token_id);
     CHECK(looked_up->principal_id == "alice");
@@ -256,8 +257,8 @@ TEST_CASE("ApiTokenStore: get_token returns nullopt for unknown id",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
 
-    CHECK(!store.get_token("does-not-exist").has_value());
-    CHECK(!store.get_token("").has_value());
+    CHECK(!store.get_token("does-not-exist").value().has_value());
+    CHECK(!store.get_token("").value().has_value());
 }
 
 TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
@@ -280,10 +281,10 @@ TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
     REQUIRE(store.create_token("bob-a", "bob").has_value());
     REQUIRE(store.create_token("root-a", "root").has_value());
 
-    auto alice_tokens = store.list_tokens("alice");
-    auto bob_tokens = store.list_tokens("bob");
-    auto root_tokens = store.list_tokens("root");
-    auto all_tokens = store.list_tokens();
+    auto alice_tokens = store.list_tokens("alice").value();
+    auto bob_tokens = store.list_tokens("bob").value();
+    auto root_tokens = store.list_tokens("root").value();
+    auto all_tokens = store.list_tokens().value();
 
     REQUIRE(alice_tokens.size() == 2);
     REQUIRE(bob_tokens.size() == 1);
@@ -317,13 +318,13 @@ TEST_CASE("ApiTokenStore: get_token distinguishes owners for IDOR defense",
     REQUIRE(store.create_token("alice-key", "alice").has_value());
     REQUIRE(store.create_token("bob-key", "bob").has_value());
 
-    auto alice_tokens = store.list_tokens("alice");
-    auto bob_tokens = store.list_tokens("bob");
+    auto alice_tokens = store.list_tokens("alice").value();
+    auto bob_tokens = store.list_tokens("bob").value();
     REQUIRE(alice_tokens.size() == 1);
     REQUIRE(bob_tokens.size() == 1);
 
-    auto alice_looked_up = store.get_token(alice_tokens[0].token_id);
-    auto bob_looked_up = store.get_token(bob_tokens[0].token_id);
+    auto alice_looked_up = store.get_token(alice_tokens[0].token_id).value();
+    auto bob_looked_up = store.get_token(bob_tokens[0].token_id).value();
     REQUIRE(alice_looked_up.has_value());
     REQUIRE(bob_looked_up.has_value());
     CHECK(alice_looked_up->principal_id == "alice");
@@ -354,11 +355,11 @@ TEST_CASE("ApiTokenStore: principal_kind defaults to 'human' for a row inserted 
         REQUIRE(res.ok());
     }
 
-    auto looked_up = store.get_token("legacy-row");
+    auto looked_up = store.get_token("legacy-row").value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->principal_kind == "human");
 
-    auto listing = store.list_tokens("admin");
+    auto listing = store.list_tokens("admin").value();
     REQUIRE(listing.size() == 1);
     CHECK(listing[0].principal_kind == "human");
 }
@@ -384,7 +385,7 @@ TEST_CASE("ApiTokenStore: create_token pins principal_kind to 'human'; the CHECK
     auto v = store.validate_token(*raw);
     REQUIRE(v.has_value());
     CHECK(v->principal_kind == "human");
-    auto meta = store.get_token(v->token_id);
+    auto meta = store.get_token(v->token_id).value();
     REQUIRE(meta.has_value());
     CHECK(meta->principal_kind == "human");
 
@@ -441,16 +442,16 @@ TEST_CASE("ApiTokenStore: delete_token RETURNING contract — false for an unkno
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
 
-    CHECK_FALSE(store.delete_token("does-not-exist"));
+    CHECK_FALSE(store.delete_token("does-not-exist").value());
 
     auto raw = store.create_token("returning-delete", "admin");
     REQUIRE(raw.has_value());
     auto validated = store.validate_token(*raw);
     REQUIRE(validated.has_value());
 
-    CHECK(store.delete_token(validated->token_id));
+    CHECK(store.delete_token(validated->token_id).value());
     CHECK_FALSE(store.validate_token(*raw).has_value());
-    CHECK_FALSE(store.get_token(validated->token_id).has_value());
+    CHECK_FALSE(store.get_token(validated->token_id).value().has_value());
 }
 
 TEST_CASE("ApiTokenStore: revoke_for_principal returns the exact affected count and "
@@ -562,7 +563,7 @@ TEST_CASE("ApiTokenStore: revoke_generation_ guard prevents a stale cache write 
 
     auto raw = store.create_token("race-token", "admin");
     REQUIRE(raw.has_value());
-    auto listing = store.list_tokens("admin");
+    auto listing = store.list_tokens("admin").value();
     REQUIRE(listing.size() == 1);
     auto token_id = listing[0].token_id;
 

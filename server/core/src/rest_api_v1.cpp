@@ -1779,8 +1779,17 @@ void RestApiV1::register_routes(
                      return;
 
                  auto tokens = token_store->list_tokens(session->username);
+                 if (!tokens.has_value()) {
+                     // Authoritative store (ADR-0012 §1): surface a read failure
+                     // as retryable, never an empty "you have no tokens" list.
+                     res.status = 503;
+                     res.set_header("Retry-After", "2");
+                     res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& t : tokens) {
+                 for (const auto& t : *tokens) {
                      JObj item;
                      item.add("token_id", t.token_id)
                          .add("name", t.name)
@@ -1798,7 +1807,7 @@ void RestApiV1::register_routes(
                          item.add("mcp_tier", t.mcp_tier);
                      arr.add(item);
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
                                  "application/json");
              });
 
@@ -2037,12 +2046,23 @@ void RestApiV1::register_routes(
         // vs. no event) and the `owner=` detail so forensics can see who
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
-        bool denied = existing && existing->principal_id != session->username &&
+        if (!existing.has_value()) {
+            // DB error on the ownership pre-check — 503, not a misleading 404
+            // that reads "already gone" while the token may still be live
+            // (ADR-0012 §1; the store no longer returns nullopt on a DB error).
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                            "application/json");
+            return;
+        }
+        auto& tok = *existing; // std::optional<ApiToken>
+        bool denied = tok && tok->principal_id != session->username &&
                       auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
-        if (!existing || denied) {
+        if (!tok || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
-                         "owner=" + existing->principal_id);
+                         "owner=" + tok->principal_id);
             }
             res.status = 404;
             res.set_content(detail::a4_error(res, "token not found"), "application/json");
@@ -2056,7 +2076,7 @@ void RestApiV1::register_routes(
             // telling automation the token was already gone when it may still be
             // live. Surface a retryable failure and audit it (ADR-0030 §Posture).
             audit_fn(req, "api_token.revoke", "failure", "ApiToken", token_id,
-                     "owner=" + existing->principal_id + " db_error=true");
+                     "owner=" + tok->principal_id + " db_error=true");
             res.status = 503;
             res.set_header("Retry-After", "2");
             res.set_content(detail::a4_error(res, "token revoke did not persist — retry"),
@@ -2072,7 +2092,7 @@ void RestApiV1::register_routes(
             return;
         }
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
-                 "owner=" + existing->principal_id);
+                 "owner=" + tok->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
 

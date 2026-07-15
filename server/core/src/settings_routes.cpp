@@ -732,13 +732,21 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     // fleet view while regular users see only their own tokens. Closes the
     // cross-user token enumeration path that governance Gate 4 consistency
     // auditor flagged as BLOCKING (finding C1).
-    auto tokens = api_token_store_->list_tokens(filter_principal);
+    auto tokens_res = api_token_store_->list_tokens(filter_principal);
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Owner</th>"
                        "  <th>Created</th><th>Expires</th><th>Last Used</th>"
                        "  <th>Status</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    if (!tokens_res.has_value()) {
+        // Authoritative store (ADR-0012 §1): surface a read failure rather than
+        // render an empty "No API tokens" table that could hide a live credential.
+        html += "<tr><td colspan=\"9\" style=\"color:#f85149\">"
+                "Token store unavailable — please retry.</td></tr></tbody></table>";
+        return html;
+    }
+    const auto& tokens = *tokens_res;
     if (tokens.empty()) {
         html += "<tr><td colspan=\"9\" style=\"color:#484f58\">No API tokens created</td></tr>";
     } else {
@@ -4012,9 +4020,26 @@ void SettingsRoutes::register_routes(
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
-        bool denied = existing && existing->principal_id != session->username &&
+        if (!existing.has_value()) {
+            // DB error on the ownership pre-check — surface a retryable error,
+            // not a misleading "Token not found" that reads as already-gone
+            // while the token may still be live (ADR-0012 §1).
+            spdlog::error("API token '{}' ownership check failed for {}: {}", token_id,
+                          session->username, existing.error());
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
+                            "Token store unavailable — please retry.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto& tok = *existing; // std::optional<ApiToken>
+        bool denied = tok && tok->principal_id != session->username &&
                       auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
-        if (!existing || denied) {
+        if (!tok || denied) {
             if (denied && audit_store_) {
                 // [[nodiscard]] on AuditStore::log is the SOC 2 CC6.6
                 // evidence-integrity flag (PR #883 HIGH-2 pattern); the
@@ -4025,7 +4050,7 @@ void SettingsRoutes::register_routes(
                                          .action = "api_token.revoke",
                                          .target_type = "ApiToken",
                                          .target_id = token_id,
-                                         .detail = "owner=" + existing->principal_id,
+                                         .detail = "owner=" + tok->principal_id,
                                          .source_ip = req.remote_addr,
                                          .result = "denied"});
             }
@@ -4064,7 +4089,7 @@ void SettingsRoutes::register_routes(
                      .action = "api_token.revoke",
                      .target_type = "ApiToken",
                      .target_id = token_id,
-                     .detail = "owner=" + existing->principal_id + " db_error=true",
+                     .detail = "owner=" + tok->principal_id + " db_error=true",
                      .source_ip = req.remote_addr,
                      .result = "failure"});
             }
@@ -4099,7 +4124,7 @@ void SettingsRoutes::register_routes(
                                      .action = "api_token.revoke",
                                      .target_type = "ApiToken",
                                      .target_id = token_id,
-                                     .detail = "owner=" + existing->principal_id,
+                                     .detail = "owner=" + tok->principal_id,
                                      .source_ip = req.remote_addr,
                                      .result = "success"});
         }
