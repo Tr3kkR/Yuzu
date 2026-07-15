@@ -9,15 +9,37 @@ namespace yuzu::agent {
 
 namespace {
 
+/// The Unknown outcome: arm the recovery-force bit and hand back the read-error
+/// detail. EmitDeciderState is left UNTOUCHED - a read failure must never move
+/// last_compliant/last_emit (that would turn "can't tell" into a committed
+/// verdict). The runtime turns this into an edge-triggered guard.unhealthy.
+EvalOutcome unhealthy(RuleEvalState& state, std::string detail) {
+    state.in_unknown = true;
+    return EvalOutcome{EvalStatus::Unhealthy, GuardDrift{}, std::move(detail)};
+}
+
 /// Run the shared decide_emit tail and pack its result + the guard's
-/// detected/expected tokens into a GuardDrift, or nullopt if it said stay silent.
-std::optional<GuardDrift> pack(const RuleAssertion& a, const char* guard_type, bool compliant,
-                               std::string detected, std::string expected, RuleEvalState& state,
-                               std::chrono::steady_clock::time_point now, bool emit_compliant_edge,
-                               std::uint64_t detection_latency_us) {
+/// detected/expected tokens into an Emit outcome, or a Silent outcome if it said
+/// stay silent. On recovery from an Unknown gap, reset the decider's edge/debounce
+/// so the verdict is FORCED to emit even if the value equals its pre-error value.
+EvalOutcome pack(const RuleAssertion& a, const char* guard_type, bool compliant,
+                 std::string detected, std::string expected, RuleEvalState& state,
+                 std::chrono::steady_clock::time_point now, bool emit_compliant_edge,
+                 std::uint64_t detection_latency_us) {
+    if (state.in_unknown) {
+        // Recovery: force a fresh verdict. Clearing last_compliant makes a compliant
+        // read an edge again; clearing last_emit/suppressed lets a drift re-emit
+        // rather than debounce-fold against a pre-error drift. (A systemd rule that
+        // recovers to compliant with emit_compliant_edge=false still stays Silent on
+        // the compliance channel - its "recovered" signal rides the health channel.)
+        state.emit.last_compliant.reset();
+        state.emit.last_emit.reset();
+        state.emit.suppressed = 0;
+        state.in_unknown = false;
+    }
     const EmitResult r = decide_emit(compliant, state.emit, a.debounce_ms, now, emit_compliant_edge);
     if (r.kind == EmitKind::Silent)
-        return std::nullopt;
+        return EvalOutcome{EvalStatus::Silent, GuardDrift{}, {}};
     GuardDrift d;
     d.guard_type = guard_type;
     d.rule_id = a.rule_id;
@@ -27,14 +49,18 @@ std::optional<GuardDrift> pack(const RuleAssertion& a, const char* guard_type, b
     d.detection_latency_us = detection_latency_us;
     d.collapsed_count = r.collapsed_count;
     d.compliant = (r.kind == EmitKind::CompliantEdge);
-    return d;
+    return EvalOutcome{EvalStatus::Emit, std::move(d), {}};
 }
 
 } // namespace
 
-std::optional<GuardDrift> eval_file(const RuleAssertion& a, const FileSnapshot& snap,
-                                    RuleEvalState& state, std::chrono::steady_clock::time_point now,
-                                    bool emit_compliant_edge) {
+EvalOutcome eval_file(const RuleAssertion& a, const ReadResult<FileSnapshot>& read,
+                      RuleEvalState& state, std::chrono::steady_clock::time_point now,
+                      bool emit_compliant_edge) {
+    if (!read.known)
+        return unhealthy(state, read.error);
+    const FileSnapshot& snap = read.snapshot;
+
     bool compliant = false;
     std::string detected;
     std::string expected;
@@ -43,13 +69,19 @@ std::optional<GuardDrift> eval_file(const RuleAssertion& a, const FileSnapshot& 
         compliant = (snap.exists == a.expect_present);
         detected = snap.exists ? "<present>" : "<absent>";
         expected = a.expect_present ? "<present>" : "<absent>";
-    } else { // FileHashEquals
+    } else { // FileHashEquals - token precedence matches legacy: absent, unreadable, oversize, compare.
+        const bool oversize = snap.size > a.max_bytes; // per-rule projection off the shared snapshot
         if (!snap.exists) {
             detected = "<absent>";
         } else if (!snap.readable) {
             detected = "<unreadable>";
-        } else if (snap.oversize) {
+        } else if (oversize) {
             detected = "<oversize>";
+        } else if (snap.hash.empty()) {
+            // Admitting size + readable + present but no digest: the reader should
+            // have hashed it. Fail loud ("can't verify") rather than treat an empty
+            // digest as a match; a genuine transient failure would be Unknown, not here.
+            detected = "<unreadable>";
         } else {
             // baseline-on-arm: an empty expected_hash captures the first good read as
             // the baseline and reads compliant (a guard.compliant edge).
@@ -70,10 +102,13 @@ std::optional<GuardDrift> eval_file(const RuleAssertion& a, const FileSnapshot& 
                 emit_compliant_edge, /*detection_latency_us=*/0);
 }
 
-std::optional<GuardDrift> eval_registry(const RuleAssertion& a, const RegistrySnapshot& snap,
-                                        RuleEvalState& state, std::uint64_t detection_latency_us,
-                                        std::chrono::steady_clock::time_point now,
-                                        bool emit_compliant_edge) {
+EvalOutcome eval_registry(const RuleAssertion& a, const ReadResult<RegistrySnapshot>& read,
+                          RuleEvalState& state, std::uint64_t detection_latency_us,
+                          std::chrono::steady_clock::time_point now, bool emit_compliant_edge) {
+    if (!read.known)
+        return unhealthy(state, read.error);
+    const RegistrySnapshot& snap = read.snapshot;
+
     bool compliant = false;
     std::string detected;
     if (!snap.present) {
@@ -88,15 +123,17 @@ std::optional<GuardDrift> eval_registry(const RuleAssertion& a, const RegistrySn
                 emit_compliant_edge, detection_latency_us);
 }
 
-std::optional<GuardDrift> eval_service(const RuleAssertion& a, ServiceRunState observed,
-                                       RuleEvalState& state,
-                                       std::chrono::steady_clock::time_point now,
-                                       bool emit_compliant_edge) {
-    // ServiceRunState (spark payload) -> ServiceState (guard vocabulary). There is no
-    // Absent: a deleted service folds into Stopped at the mechanism (R5, accepted -
+EvalOutcome eval_service(const RuleAssertion& a, const ReadResult<ServiceRunState>& read,
+                         RuleEvalState& state, std::chrono::steady_clock::time_point now,
+                         bool emit_compliant_edge) {
+    if (!read.known)
+        return unhealthy(state, read.error);
+
+    // ServiceRunState (reader) -> ServiceState (guard vocabulary). There is no
+    // Absent: a deleted service folds into Stopped at the reader (R5, accepted -
     // the compliance verdict is identical, only detected_value differs from legacy).
     ServiceState st = ServiceState::Stopped;
-    switch (observed) {
+    switch (read.snapshot) {
     case ServiceRunState::Running:
         st = ServiceState::Running;
         break;

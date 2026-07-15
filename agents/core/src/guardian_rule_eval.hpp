@@ -2,21 +2,35 @@
 
 /**
  * guardian_rule_eval.hpp - the per-type Guardian rule evaluators for the spark
- * consumer (ADR-0021 Stage 2 rung 2 slice 2b).
+ * consumer (ADR-0021 Stage 2 rung 2).
  *
- * Each evaluator takes a rule's proto-free assertion, a state SNAPSHOT read once
- * per spark_key by the consumer, and the rule's mutable eval state, and returns a
- * GuardDrift to emit (or nullopt for silent). It computes `compliant` the guard's
- * way, then runs the shared decide_emit tail (guardian_emit_decider.hpp) and packs
- * the result into a GuardDrift with the legacy detected/expected token vocabulary
- * so GuardianEngine::emit_guard_event produces the SAME wire event as the legacy
- * guards (parity gate). Enforcement is NOT here - rung 2 is observe-only, so the
- * remediation fields stay default and no state is ever written.
+ * Each evaluator takes a rule's proto-free assertion, a tri-state live-state
+ * READ (Known snapshot | Unknown read-error), and the rule's mutable eval
+ * state, and returns an EvalOutcome the runtime acts on:
+ *
+ *   - Emit      -> a GuardDrift (a compliant edge OR a drift) to publish, packed
+ *                  with the legacy detected/expected token vocabulary so
+ *                  GuardianEngine::emit_guard_event produces the SAME wire event
+ *                  as the legacy guards (the parity gate).
+ *   - Silent    -> steady compliant / debounce-suppressed drift: nothing to emit.
+ *   - Unhealthy -> the read was Unknown (could not determine live state). The
+ *                  evaluator leaves EmitDeciderState UNTOUCHED - it does NOT turn
+ *                  "can't tell" into a false compliant/drift - and hands back the
+ *                  read-error detail. Emitting guard.unhealthy (edge-triggered +
+ *                  rate-limited) and mapping status -> errored is the runtime's
+ *                  job (a later rung); here we only refuse to commit a verdict.
+ *
+ * Unknown is distinct from a legitimately-absent target (a missing file / deleted
+ * service is a Known snapshot that drifts). It is reserved for "could not tell":
+ * a transient I/O error, or a file that mutated during hashing past the reader's
+ * bounded retry. On recovery (the first Known read after an Unknown), the
+ * evaluator FORCES a real verdict even when the value equals its pre-error value,
+ * so the server re-learns compliance after an errored gap (see `pack`).
  *
  * Proto-free (operates on RuleAssertion, extracted from the rule at arm time by
- * GuardianEngine) and platform-agnostic (the platform I/O that produces the
- * snapshot lives in the consumer's read-source seam, not here), so every branch is
- * unit-tested off-platform against synthetic snapshots.
+ * GuardianEngine) and platform-agnostic (the platform I/O that produces the read
+ * lives in the StateReader seam, not here), so every branch is unit-tested
+ * off-platform against synthetic reads.
  */
 
 #include <yuzu/plugin.h>        // YUZU_EXPORT
@@ -27,8 +41,8 @@
 
 #include <chrono>
 #include <cstdint>
-#include <optional>
 #include <string>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -50,51 +64,110 @@ struct RuleAssertion {
     // file-exists
     bool expect_present{true};
     // file-hash-equals
-    std::string expected_hash; ///< lowercase hex SHA-256; empty = baseline-on-arm
+    std::string expected_hash;                     ///< lowercase hex SHA-256; empty = baseline-on-arm
+    std::uint64_t max_bytes{64ull * 1024 * 1024};  ///< hash-DoS cap; size over it -> "<oversize>" for THIS
+                                                   ///< rule (legacy default 64 MiB). oversize is projected
+                                                   ///< per-rule because one key-relative snapshot serves
+                                                   ///< rules with different caps. 0 => everything oversize;
+                                                   ///< the arm-time construction site normalises 0 -> default
+                                                   ///< (matching legacy), so the evaluator stays a pure
+                                                   ///< function of its inputs.
     // registry-value-equals
     std::string expected_value;
+    std::string value_name;  ///< the registry value the reader reads + memoises per key across rules that
+                             ///< watch the same value_name; NOT part of the compliance verdict here.
 };
 
-/// File state read once per key by the consumer. Only presence/readability/size are
-/// resolved cheaply; `hash` is filled when the assertion needs it (hash-equals).
+/// Intrinsic file state read once per spark_key from a single owned handle (the
+/// #807 handle-scoped read, a later rung). Compliance is key-relative EXCEPT
+/// oversize, which each rule projects from its own `max_bytes` vs `size`. `hash`
+/// is the full-file SHA-256 computed once at the largest admitting cap; it is
+/// present whenever at least one watching rule admits the file's size, and a rule
+/// whose own cap is smaller than `size` reports "<oversize>" and ignores it.
 struct FileSnapshot {
     bool exists{false};
-    bool readable{true};  ///< false -> "<unreadable>" drift
-    bool oversize{false}; ///< size over the hash cap -> "<oversize>" drift
-    std::string hash;     ///< lowercase hex SHA-256 (empty when not hashed / n/a)
+    bool readable{true};        ///< false -> "<unreadable>" drift: the file exists but a genuine
+                                ///< permission/lock/type issue makes it unverifiable. A TRANSIENT read
+                                ///< failure (mutation-during-hash, retries exhausted) is NOT this - the
+                                ///< reader returns Unknown for that. Legacy conflated the two into one
+                                ///< "<unreadable>" token; spark splits persistent (Known drift) from
+                                ///< transient (Unknown).
+    std::uint64_t size{0};      ///< byte size; each rule compares vs its own max_bytes for oversize
+    std::string identity;       ///< reader change-detection token (dev+inode / volume+file-index); not
+                                ///< part of the verdict - convergence uses it to detect replace-in-place
+    std::int64_t mtime_ns{0};   ///< reader convergence size+mtime skip input; not part of the verdict
+    std::string hash;           ///< full-file lowercase hex SHA-256 (empty when not hashed / n/a)
 };
 
-/// Registry value read once per key by the consumer.
+/// Registry value read once per (key, value_name) by the reader.
 struct RegistrySnapshot {
     bool present{false};   ///< false -> "<absent>" drift
     bool supported{true};  ///< false -> "<unsupported-type>" drift
     std::string value;     ///< G4-encoded live value string
 };
 
+/// A live-state read that can fail to determine the value. `known == false`
+/// (Unknown) means "could not tell" (transient I/O, retries exhausted), distinct
+/// from a Known snapshot that reports an absent/stopped target. The evaluator maps
+/// Unknown to an Unhealthy outcome and never to a compliance verdict.
+template <typename Snapshot>
+struct ReadResult {
+    bool known{true};
+    Snapshot snapshot{};  ///< valid iff `known`
+    std::string error;    ///< read-error detail iff `!known` (guard.unhealthy detail)
+};
+
+template <typename S>
+[[nodiscard]] ReadResult<S> read_known(S s) {
+    return ReadResult<S>{true, std::move(s), {}};
+}
+template <typename S>
+[[nodiscard]] ReadResult<S> read_unknown(std::string why) {
+    return ReadResult<S>{false, S{}, std::move(why)};
+}
+
 /// Per-rule mutable eval state kept by the consumer, keyed by rule_id.
 struct RuleEvalState {
     EmitDeciderState emit;
     std::string baseline_hash;  ///< file-hash baseline-on-arm capture
     bool baseline_set{false};
+    bool in_unknown{false};     ///< the last eval was Unknown; the next Known eval FORCES a verdict even
+                                ///< if the value is unchanged, so the server re-learns compliance after an
+                                ///< errored gap. Set on Unknown (EmitDeciderState otherwise untouched),
+                                ///< cleared by the forced verdict in `pack`.
 };
 
-/// Evaluate a file rule against a snapshot. Returns a GuardDrift to emit or nullopt.
-[[nodiscard]] YUZU_EXPORT std::optional<GuardDrift>
-eval_file(const RuleAssertion& a, const FileSnapshot& snap, RuleEvalState& state,
+/// What an evaluation decided.
+enum class EvalStatus {
+    Silent,     ///< nothing to emit (steady compliant, or a debounce-folded drift)
+    Emit,       ///< publish `drift` (a drift OR a compliant edge)
+    Unhealthy,  ///< the read was Unknown; runtime emits guard.unhealthy - EmitDeciderState was left untouched
+};
+
+struct EvalOutcome {
+    EvalStatus status{EvalStatus::Silent};
+    GuardDrift drift{};         ///< meaningful iff status == Emit
+    std::string health_detail;  ///< read-error detail iff status == Unhealthy
+};
+
+/// Evaluate a file rule against a tri-state read. Returns Emit / Silent / Unhealthy.
+[[nodiscard]] YUZU_EXPORT EvalOutcome
+eval_file(const RuleAssertion& a, const ReadResult<FileSnapshot>& read, RuleEvalState& state,
           std::chrono::steady_clock::time_point now, bool emit_compliant_edge = true);
 
 /// Evaluate a registry rule. `detection_latency_us` is the measured read time
-/// (registry is the one type that records it, for parity).
-[[nodiscard]] YUZU_EXPORT std::optional<GuardDrift>
-eval_registry(const RuleAssertion& a, const RegistrySnapshot& snap, RuleEvalState& state,
+/// (registry is the one type that records it, for parity); ignored on Unknown.
+[[nodiscard]] YUZU_EXPORT EvalOutcome
+eval_registry(const RuleAssertion& a, const ReadResult<RegistrySnapshot>& read, RuleEvalState& state,
               std::uint64_t detection_latency_us, std::chrono::steady_clock::time_point now,
               bool emit_compliant_edge = true);
 
-/// Evaluate a service rule against the ServiceRunState the SparkEvent carried.
-/// (The Service mechanism already resolved terminal state, holding transitionals,
-/// and folds a deleted service into Stopped - R5, accepted.)
-[[nodiscard]] YUZU_EXPORT std::optional<GuardDrift>
-eval_service(const RuleAssertion& a, ServiceRunState observed, RuleEvalState& state,
+/// Evaluate a service rule against the live run-state the reader resolved. A
+/// deleted service folds into Stopped at the reader (R5, accepted - the verdict is
+/// identical, only detected_value differs from legacy); a service that could not be
+/// queried is Unknown, distinct from Stopped.
+[[nodiscard]] YUZU_EXPORT EvalOutcome
+eval_service(const RuleAssertion& a, const ReadResult<ServiceRunState>& read, RuleEvalState& state,
              std::chrono::steady_clock::time_point now, bool emit_compliant_edge = true);
 
 } // namespace yuzu::agent
