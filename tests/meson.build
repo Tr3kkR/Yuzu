@@ -359,6 +359,8 @@ if build_server
       'unit/server/test_engine_principal_integration.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
+      'unit/server/test_engine_store_error_class.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',

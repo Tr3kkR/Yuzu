@@ -348,6 +348,40 @@ for the tool to execute.
 | 52 | `assign_engine_role` (PR 4.2) | Grant a fleet-wide RBAC role to an engine principal (arg `principal_id` — the bare slug, WITHOUT the `engine:` prefix — and `role`). Engine principals can never hold `admin`/any built-in system role; such a request is rejected, never silently narrowed. Mirrors `POST /api/v1/engine-principals/{id}/roles`. Not read-only, not destructive (a grant expands, never removes, access). | `Security:Write` |
 | 53 | `unassign_engine_role` (PR 4.2) | Revoke a fleet-wide RBAC role from an engine principal (args `principal_id`, `role`). Destructive — removes standing authority a module may be relying on right now. Mirrors `DELETE /api/v1/engine-principals/{id}/roles/{role}`. | `Security:Write` |
 | 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. | `Security:Read` |
+| 55 | `create_engine_principal` | Create a new engine principal — the durable identity behind an autonomous use-case-engine module (ADR-1005 item 2b). Required args: `principal_id` (**note — unlike REST's `slug` field, this must already be the full `engine:<slug>` id**; the tool does not derive the `engine:` prefix for you, and the store rejects a `principal_id` outside that namespace), `display_name`, `owner_username`, `justification`, and `classification` — all five are checked non-empty at the tool layer (`kInvalidParams` if any is missing/empty), which is **stricter than the REST route**: `POST /api/v1/engine-principals` does not itself require `display_name` non-empty (it accepts and stores an empty one). `owner_username` is FK-validated against the user store; `classification` (`internal`/`external`) is required, no default. Mirrors `POST /api/v1/engine-principals`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 56 | `list_engine_principals` | List engine principals with each principal's active-credential **count** (`active_credentials`, an integer — note the field is named `active_credential_count` on the REST twin). Mirrors `GET /api/v1/engine-principals`. | `Security:Read` |
+| 57 | `get_engine_principal` | Get one engine principal's identity row plus its active-credential **count** (`active_credentials`, an integer). **Transport divergence:** the REST twin `GET /api/v1/engine-principals/{id}` returns a field with the *same name*, `active_credentials`, but as an **array** of full credential objects (token id, name, timestamps, rotation group, overlap-expiry) — a caller switching between the REST and MCP surfaces must not assume the shape carries over; check the type, not just the field name. Mirrors `GET /api/v1/engine-principals/{id}`. | `Security:Read` |
+| 58 | `revoke_engine_principal` | Terminally revoke an engine principal: revokes every active credential first, then flips `lifecycle_state` to revoked. TERMINAL and irreversible — a false-positive response mints a successor principal instead. Mirrors `DELETE /api/v1/engine-principals/{id}`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 59 | `mint_engine_credential` | Mint the FIRST credential for an engine principal (minted credential is hard-locked to MCP tier `readonly`, 90-day ceiling — design doc §7/§8). Returns the raw credential value exactly once; use `rotate_engine_credential` once a credential already exists (a second mint call errors). Mirrors `POST /api/v1/engine-principals/{id}/credentials`. Destructive — live credential issuance; requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 60 | `rotate_engine_credential` | Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): mints a successor (both credentials valid during a default/minimum 7-day overlap, 24h floor — rejected outright, never truncated, below it), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal, original or replay, is independently audited as `engine_principal.credential.reveal`); once the grace window lapses a re-call errors. Mirrors `POST /api/v1/engine-principals/{id}/credentials/rotate`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 62 | `transfer_engine_principal_owner` | Reassign an engine principal's named responsible owner. Admin-forced — independent of the outgoing owner's cooperation. `new_owner` is FK-validated against the user store. Mirrors `POST /api/v1/engine-principals/{id}/transfer-owner`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 63 | `audit_engine_no_admin` | Auditor-runnable proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — joins `principal_type=engine` against each principal's resolved role assignments AND effective permissions, and reports any violating row (literal admin/system role, or a full securable × operation wildcard grant). A `503`/internal-error result means the RBAC reference data needed to compute the wildcard bound could not be resolved — treat as "unable to verify," never as "clean." Mirrors `GET /api/v1/engine-principals/audit/no-admin` exactly (same checks — the two auditors must never diverge). | `AuditLog:Read` |
+
+> **Engine-principal tools — tier behavior (ADR-1005 item 2b, plan PR 4.3):**
+> the six **mutating** tools (`create_engine_principal`, `revoke_engine_principal`,
+> `mint_engine_credential`, `rotate_engine_credential`, `confirm_engine_rotation`,
+> `transfer_engine_principal_owner`) all gate on `Security:Write` (aligned with
+> their REST twins — `mint_engine_credential`/`rotate_engine_credential` do
+> **not** use `Security:Execute` despite issuing live credentials) and require
+> the `supervised` tier — `readonly`/`operator` are blocked by the tier gate
+> before RBAC is even consulted — and are **maker-checker approval-gated** via
+> the same ticket-then-recall flow as every other destructive `Security:Write`
+> op (approver must not be the submitter).
+>
+> The three **read** tools (`list_engine_principals`, `get_engine_principal`,
+> `audit_engine_no_admin`) are plain `Read`-class RBAC checks and, like every
+> other read-only MCP tool, are available on **every** tier including
+> `readonly` — they are **not** restricted to `supervised` and are **not**
+> approval-gated.
+>
+> **All nine tools** — mutating and read alike — carry the §9 structural
+> denial belt: a caller whose own MCP token is itself engine-classed
+> (`principal_kind="engine"` / `auth_source="engine_token"`) is denied on
+> every one of them, matching the REST surface's posture of denying an
+> engine-classed session on every route including the reads. An engine
+> principal can never introspect or mutate its own or another engine
+> principal's lifecycle surface via either transport.
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
