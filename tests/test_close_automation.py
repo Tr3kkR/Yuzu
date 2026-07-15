@@ -160,12 +160,142 @@ def run_cap_tests(failures):
         failures.append("cap: 7 refs must exceed the cap")
 
 
+# --------------------------------------------------------------------------
+# 3. build_plan / assert_plan_safe / leak-scan consistency (adversarial-review
+# findings K1/K2/K5, CDEX-P1-01/02/03/04 -- monkeypatched world, no network)
+
+class _FakeWorld:
+    """Monkeypatch harness: a fake tracker the driver's plumbing reads."""
+
+    def __init__(self, issues, timelines=None, comments=None):
+        self.issues = issues              # n -> issue json
+        self.timelines = timelines or {}  # n -> list of timeline events
+        self.comments = comments or {}    # n -> list of comment jsons
+        self._saved = {}
+
+    def __enter__(self):
+        self._saved = {
+            "issue_with_comments": cli.issue_with_comments,
+            "has_open_linked_pr": cli.has_open_linked_pr,
+            "gh_api": cli.gh_api,
+        }
+        cli.issue_with_comments = lambda n: (
+            self.issues.get(n),
+            cli.trusted_comment_blob(self.comments.get(n, [])),
+        )
+        cli.has_open_linked_pr = lambda n: any(
+            "pull_request" in ((ev.get("source") or {}).get("issue") or {})
+            and ((ev.get("source") or {}).get("issue") or {}).get("state") == "open"
+            for ev in self.timelines.get(n, [])
+        )
+        cli.gh_api = self._no_network
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self._saved.items():
+            setattr(cli, k, v)
+
+    @staticmethod
+    def _no_network(*a, **k):
+        raise AssertionError(f"unexpected network call during pure test: {a}")
+
+
+def _pr(number, body):
+    return {"number": number, "body": body, "merged_at": "2026-01-01T00:00:00Z",
+            "merge_commit_sha": "f" * 40, "merged_by": {"login": "tester"},
+            "base": {"ref": "dev"}}
+
+
+def _linked_open_pr_event():
+    return {"source": {"issue": {"state": "open", "pull_request": {}}}}
+
+
+def _linked_closed_pr_event():
+    return {"source": {"issue": {"state": "closed", "pull_request": {}}}}
+
+
+def run_plan_tests(failures):
+    dnc = {1634}
+
+    # K1 regression: open-linked-PR event AFTER 300 closed events must still protect.
+    world = _FakeWorld(
+        issues={77: _issue(77, labels=["bug"])},
+        timelines={77: [_linked_closed_pr_event()] * 300 + [_linked_open_pr_event()]},
+    )
+    with world:
+        plan = cli.build_plan([_pr(500, "Closes #77")], dnc)
+    actions = {(n, a) for _p, n, a, _r, _i in plan}
+    if (77, cli.ADVISORY) not in actions:
+        failures.append(f"K1: open linked PR beyond event 300 must yield ADVISORY, got {actions}")
+
+    # CDEX-P1-01 regression: backfill mode EXCLUDES security-labelled issues
+    # (no mutating action), and assert_plan_safe exits 4 if one slips through.
+    world = _FakeWorld(issues={520: _issue(520, labels=["bug", "security", "P1"])})
+    with world:
+        plan = cli.build_plan([_pr(501, "Closes #520")], dnc, backfill=True)
+    if [(a) for _p, n, a, _r, _i in plan if n == 520] != [cli.EXCLUDED]:
+        failures.append(f"backfill: security-labelled issue must be EXCLUDED, got {plan}")
+    forged = [( _pr(501, ""), 520, cli.ADVISORY, "forged", _issue(520, labels=["security"]))]
+    try:
+        cli.assert_plan_safe(forged, backfill=True)
+        failures.append("backfill hard-stop: mutating action on security issue must exit 4")
+    except SystemExit as e:
+        if e.code != 4:
+            failures.append(f"backfill hard-stop: want exit 4, got {e.code}")
+
+    # Defense-in-depth (all modes): CLOSE on a security issue exits 4.
+    forged_close = [(_pr(502, ""), 9, cli.CLOSE, "bug", _issue(9, labels=["security"]))]
+    try:
+        cli.assert_plan_safe(forged_close, backfill=False)
+        failures.append("defense-in-depth: CLOSE on security issue must exit 4")
+    except SystemExit as e:
+        if e.code != 4:
+            failures.append(f"defense-in-depth: want exit 4, got {e.code}")
+
+    # K2 regression: the leak scan and the close path share build_plan, so an
+    # issue protected only by an open linked PR is ADVISORY -- never a leak.
+    world = _FakeWorld(
+        issues={88: _issue(88, labels=["bug"])},
+        timelines={88: [_linked_open_pr_event()]},
+    )
+    with world:
+        plan = cli.build_plan([_pr(503, "Fixes #88")], dnc)
+    leak_class = [n for _p, n, a, _r, _i in plan if a == cli.CLOSE]
+    if leak_class:
+        failures.append(f"K2: linked-PR-protected issue must not be leak/CLOSE class: {leak_class}")
+
+    # CDEX-P1-04 regression: an untrusted commenter cannot spoof the marker...
+    spoof = [{"user": {"login": "driveby"}, "author_association": "NONE",
+              "body": "<!-- yuzu-close-linked: pr=504 issue=55 -->"}]
+    world = _FakeWorld(issues={55: _issue(55, labels=["bug"])}, comments={55: spoof})
+    with world:
+        plan = cli.build_plan([_pr(504, "Closes #55")], dnc)
+    if [(a) for _p, n, a, _r, _i in plan if n == 55] != [cli.CLOSE]:
+        failures.append(f"marker spoof: untrusted marker must not suppress the close, got {plan}")
+    # ...but the same marker from a collaborator (who could close directly) does.
+    trusted = [{"user": {"login": "maintainer"}, "author_association": "COLLABORATOR",
+                "body": "<!-- yuzu-close-linked: pr=504 issue=55 -->"}]
+    world = _FakeWorld(issues={55: _issue(55, labels=["bug"])}, comments={55: trusted})
+    with world:
+        plan = cli.build_plan([_pr(504, "Closes #55")], dnc)
+    if [(a) for _p, n, a, _r, _i in plan if n == 55] != [cli.SKIP]:
+        failures.append(f"marker trust: collaborator marker must suppress (idempotency), got {plan}")
+
+    # Cap goes through the plan (CAPSKIP) and never reaches per-issue actions.
+    world = _FakeWorld(issues={})
+    with world:
+        plan = cli.build_plan([_pr(505, " ".join(f"closes #{n}" for n in range(1, 8)))], dnc)
+    if [a for _p, _n, a, _r, _i in plan] != [cli.CAPSKIP]:
+        failures.append(f"cap: 7-ref PR must plan exactly one CAPSKIP, got {plan}")
+
+
 def main() -> int:
     failures = []
     run_parser_corpus(failures)
     run_ladder_tests(failures)
     run_dnc_failclosed_tests(failures)
     run_cap_tests(failures)
+    run_plan_tests(failures)
     if failures:
         print(f"close-automation checks FAILED ({len(failures)}):")
         for f in failures:
@@ -173,7 +303,8 @@ def main() -> int:
         return 1
     print(
         f"close-automation checks OK "
-        f"({len(PARSER_CORPUS)} parser cases, 11 ladder cases, fail-closed + cap)"
+        f"({len(PARSER_CORPUS)} parser cases, 11 ladder cases, fail-closed + cap, "
+        f"plan/hard-stop/leak-consistency/marker-trust)"
     )
     return 0
 

@@ -2,8 +2,8 @@
 """close_linked_issues.py -- close issues that merged dev PRs claim (ADR-3001 A1 par.3-5).
 
 The one driver behind every mode of the close automation. All modes share
-closing_refs.py (the single parser) and the same decision ladder, so the leak
-scan can never disagree with the close path it audits.
+closing_refs.py (the single parser) and ONE planning path (build_plan), so the
+leak scan can never disagree with the close path it audits.
 
 Modes (default is ALWAYS --dry-run; nothing mutates without --execute):
 
@@ -13,31 +13,47 @@ Modes (default is ALWAYS --dry-run; nothing mutates without --execute):
                           list still-open claimed issues. --execute
                           additionally requires --yes-i-reviewed (the dry-run
                           diff is reviewed per-issue by the maintainer on
-                          #2139 first -- never a count target).
+                          #2139 first -- never a count target). In backfill
+                          mode, `security`-labelled candidates are EXCLUDED
+                          (printed, never mutated -- not even an advisory):
+                          the maintainer reviews them in the diff instead.
   --undo-push BEFORE AFTER  recompute the closure set for an exact prior push
                           range and reopen what THIS automation closed there
                           (verified by its own idempotency marker).
   --leak-scan             completeness backstop: refs in recently-merged PR
-                          bodies that are still open with no marker and no
-                          never-close protection. Non-empty => exit 1 (the
-                          workflow's alert job fires).
+                          bodies that would be CLOSED by the ladder right now
+                          -- i.e. an earlier run failed. Non-empty => exit 1
+                          (the workflow's alert job fires). Shares build_plan,
+                          so protected/advisory items are never "leaks".
 
 Decision ladder, order load-bearing (issue-standard.md 5.1; A1 par.4-5):
-  cap (>6 refs on one PR => close NOTHING for that PR, file a cap-skip issue,
-  exit 0) -> self-ref -> not-an-issue/404 -> not-open -> already-marked
-  (idempotent) -> `security` label => ADVISORY ONLY -> `do-not-close` label or
-  scripts/tracker/do-not-close.txt => ADVISORY ONLY -> assigned => ADVISORY ->
-  open linked PR => ADVISORY -> close as completed + evidence comment +
+  cap (>6 refs on one PR => close NOTHING for that PR, plan a cap-skip issue)
+  -> self-ref -> not-an-issue/404 -> not-open -> already-marked (idempotent,
+  TRUSTED comments only) -> `security` label => ADVISORY (push) / EXCLUDED
+  (backfill) -> `do-not-close` label or scripts/tracker/do-not-close.txt =>
+  ADVISORY -> assigned => ADVISORY -> open linked PR (full timeline, no
+  truncation) => ADVISORY -> CLOSE as completed + evidence comment +
   `fixed-on-dev` (label tolerated missing).
+
+Marker idempotency trusts only comments whose author is github-actions[bot]
+or whose author_association is OWNER/MEMBER/COLLABORATOR -- a drive-by
+commenter cannot suppress the automation by pasting a marker (anyone who CAN
+plant a trusted marker already has write access and could close directly).
 
 FAIL-CLOSED invariants:
   - scripts/tracker/do-not-close.txt missing or unparseable => the run refuses
     to close ANYTHING (exit 3). A deleted never-close list must never mean
     "nothing is protected". (Also makes this PR safe to merge before/after the
     PR that introduces the file.)
-  - defense-in-depth assertion: if, after the ladder, any CLOSE action still
-    carries the `security` label, abort the whole run with zero mutations
-    (exit 4) -- that state is only reachable through a ladder bug.
+  - planning NEVER mutates: build_plan is read-only; every mutation (closes,
+    advisories, cap-skip issues) happens in apply_plan, strictly AFTER the
+    security assertions below have passed.
+  - backfill hard-stop (A1 par.4): if any `security`-labelled issue holds a
+    mutating action in the backfill plan, exit 4 with zero mutations.
+  - defense-in-depth (all modes): a CLOSE action still carrying the
+    `security` label after the ladder aborts the run, zero mutations, exit 4.
+  - compare API truncation (250-commit cap): an over-long push range aborts
+    loudly (the alert job fires) instead of silently skipping merged PRs.
 
 GitHub access goes through the `gh` CLI (repo convention -- never raw curl),
 authenticated by GH_TOKEN in CI or ambient `gh auth` locally. Mutations are
@@ -64,6 +80,7 @@ TARGET_BRANCH = "dev"
 PER_PR_CAP = 6  # A1 par.5: observed max on 360 merged dev PRs is 6; >6 is anomalous
 MUTATION_SLEEP_S = 2
 LEAK_SCAN_WINDOW = 50
+COMPARE_COMMIT_CAP = 250  # GitHub compare API hard cap; beyond it commits are silently dropped
 DNC_PATH = pathlib.Path(__file__).resolve().parent / "do-not-close.txt"
 
 CLOSE_MARKER = "yuzu-close-linked: pr={pr} issue={issue}"
@@ -71,8 +88,12 @@ ADVISORY_MARKER = "yuzu-close-linked-advisory: pr={pr} issue={issue}"
 CAPSKIP_MARKER = "yuzu-close-linked-capskip: pr={pr}"
 UNDO_MARKER = "yuzu-close-linked-undo: pr={pr} issue={issue}"
 
-# Actions
-CLOSE, ADVISORY, SKIP = "CLOSE", "ADVISORY", "SKIP"
+TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+TRUSTED_BOT = "github-actions[bot]"
+
+# Plan actions
+CLOSE, ADVISORY, SKIP, EXCLUDED, CAPSKIP = "CLOSE", "ADVISORY", "SKIP", "EXCLUDED", "CAPSKIP"
+MUTATING_ACTIONS = {CLOSE, ADVISORY, CAPSKIP}
 
 
 class GhError(RuntimeError):
@@ -83,8 +104,7 @@ def gh_api(path: str, *args: str, method: str = "GET", paginate: bool = False):
     """Call `gh api` and return parsed JSON (None for 404 on GET)."""
     cmd = ["gh", "api", path, "--method", method]
     if paginate:
-        cmd.append("--paginate")
-        cmd += ["--slurp"]
+        cmd += ["--paginate", "--slurp"]
     cmd += list(args)
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
@@ -95,8 +115,7 @@ def gh_api(path: str, *args: str, method: str = "GET", paginate: bool = False):
         return {}
     data = json.loads(proc.stdout)
     if paginate and isinstance(data, list) and data and isinstance(data[0], list):
-        # --slurp wraps each page in an array; flatten
-        data = [item for page in data for item in page]
+        data = [item for page in data for item in page]  # --slurp wraps pages
     return data
 
 
@@ -123,10 +142,24 @@ def load_do_not_close() -> set:
 # ---------------------------------------------------------------------------
 # Pure classification (unit-tested without network)
 
+def trusted_comment_blob(comments: list) -> str:
+    """Concatenate only comments whose author can be trusted for marker
+    idempotency: the Actions bot, or an OWNER/MEMBER/COLLABORATOR. Anyone able
+    to plant a trusted marker has write access and could close issues
+    directly -- so spoofing buys an attacker nothing."""
+    trusted = []
+    for c in comments:
+        login = ((c.get("user") or {}).get("login")) or ""
+        assoc = c.get("author_association") or ""
+        if login == TRUSTED_BOT or assoc in TRUSTED_ASSOCIATIONS:
+            trusted.append(c.get("body") or "")
+    return "\n".join(trusted)
+
+
 def classify(issue: dict, pr_number: int, dnc: set, comments_blob: str) -> tuple:
-    """Return (action, reason) for one referenced issue. `issue` is the REST
-    issue JSON (or None for 404); `comments_blob` is the concatenated comment
-    bodies used for marker idempotency."""
+    """Return (action, reason) for one referenced issue -- the network-free
+    part of the ladder. The open-linked-PR signal needs the timeline API, so
+    build_plan layers it on top of a CLOSE result."""
     n = None if issue is None else issue.get("number")
     if issue is None:
         return SKIP, "not found (404)"
@@ -151,23 +184,28 @@ def classify(issue: dict, pr_number: int, dnc: set, comments_blob: str) -> tuple
     return CLOSE, "claimed by merged PR"
 
 
+def has_security_label(issue: dict) -> bool:
+    return any(l["name"] == "security" for l in (issue or {}).get("labels", []))
+
+
+# ---------------------------------------------------------------------------
+# GitHub plumbing
+
 def has_open_linked_pr(issue_number: int) -> bool:
-    """Timeline check: any OPEN PR cross-references this issue. Bounded to the
-    first 300 timeline events -- enough for every issue in this tracker."""
+    """Timeline check: any OPEN PR cross-references this issue. Scans EVERY
+    paginated event -- no truncation: the events are chronological, so any
+    prefix cap would discard exactly the newest cross-references."""
     events = gh_api(
         f"repos/{REPO}/issues/{issue_number}/timeline",
         "-f", "per_page=100",
         paginate=True,
     ) or []
-    for ev in events[:300]:
+    for ev in events:
         src = (ev.get("source") or {}).get("issue") or {}
         if "pull_request" in src and src.get("state") == "open":
             return True
     return False
 
-
-# ---------------------------------------------------------------------------
-# GitHub plumbing
 
 def run_context() -> str:
     server = os.environ.get("GITHUB_SERVER_URL")
@@ -181,13 +219,21 @@ def run_context() -> str:
 
 def merged_prs_for_range(before: str, after: str) -> list:
     """PRs merged into TARGET_BRANCH whose merge/squash commit is inside the
-    pushed range, resolved via the compare API + commit-PR association."""
+    pushed range, resolved via the compare API + commit-PR association.
+    Fails loudly on compare truncation rather than silently skipping PRs."""
     if set(before) == {"0"}:  # branch-creation push: no meaningful range
         return []
     cmp_data = gh_api(f"repos/{REPO}/compare/{before}...{after}")
     if cmp_data is None:
         raise GhError(f"compare {before}...{after} not found")
-    shas = [c["sha"] for c in cmp_data.get("commits", [])]
+    commits = cmp_data.get("commits", [])
+    if len(commits) >= COMPARE_COMMIT_CAP:
+        raise GhError(
+            f"push range {before[:10]}..{after[:10]} returned {len(commits)} commits -- at the "
+            f"compare API's {COMPARE_COMMIT_CAP}-commit cap, so merged PRs may be missing. "
+            f"Refusing to run a possibly-partial close pass; run the backfill for this range."
+        )
+    shas = [c["sha"] for c in commits]
     prs, seen = [], set()
     for sha in shas:
         assoc = gh_api(f"repos/{REPO}/commits/{sha}/pulls") or []
@@ -207,21 +253,26 @@ def merged_prs_for_range(before: str, after: str) -> list:
 
 
 def all_merged_dev_prs() -> list:
+    """Every merged dev-base PR, most recently MERGED first (the pulls API
+    sorts by creation; a long-lived PR merged yesterday must not escape a
+    recency window)."""
     prs = gh_api(
         f"repos/{REPO}/pulls",
         "-f", "state=closed", "-f", f"base={TARGET_BRANCH}", "-f", "per_page=100",
         paginate=True,
     ) or []
-    return [p for p in prs if p.get("merged_at")]
+    merged = [p for p in prs if p.get("merged_at")]
+    merged.sort(key=lambda p: p["merged_at"], reverse=True)
+    return merged
 
 
 def issue_with_comments(n: int) -> tuple:
+    """Returns (issue_json_or_None, trusted_comment_blob)."""
     issue = gh_api(f"repos/{REPO}/issues/{n}")
     if issue is None:
         return None, ""
     comments = gh_api(f"repos/{REPO}/issues/{n}/comments", "-f", "per_page=100", paginate=True) or []
-    blob = "\n".join(c.get("body") or "" for c in comments)
-    return issue, blob
+    return issue, trusted_comment_blob(comments)
 
 
 def post_comment(n: int, body: str, execute: bool):
@@ -273,7 +324,7 @@ def advisory_comment(pr: dict, issue_n: int, reason: str) -> str:
     )
 
 
-def capskip_issue(pr: dict, refs: list, execute: bool):
+def create_capskip_issue(pr: dict, refs: list):
     title = f"close-linked-issues: cap-skip on PR #{pr['number']} ({len(refs)} closing refs)"
     existing = gh_api(
         "search/issues",
@@ -288,73 +339,83 @@ def capskip_issue(pr: dict, refs: list, execute: bool):
         f"NOTHING for this PR; a human should review and close the genuine ones by hand.\n\n"
         f"Run: {run_context()}\n\n<!-- {CAPSKIP_MARKER.format(pr=pr['number'])} -->"
     )
-    if execute:
-        gh_api(f"repos/{REPO}/issues", "-f", f"title={title}", "-f", f"body={body}", method="POST")
-        time.sleep(MUTATION_SLEEP_S)
-        # labels applied separately and tolerantly (they may not exist yet)
-        created = gh_api(
-            "search/issues", "-f",
-            f"q=repo:{REPO} is:issue is:open in:title \"cap-skip on PR #{pr['number']}\"",
-        ) or {}
-        items = created.get("items") or []
-        if items:
-            for lbl in ("needs-triage", "P2"):
-                add_label(items[0]["number"], lbl, execute)
-    else:
-        print(f"  [dry-run] would open cap-skip issue: {title}")
+    gh_api(f"repos/{REPO}/issues", "-f", f"title={title}", "-f", f"body={body}", method="POST")
+    time.sleep(MUTATION_SLEEP_S)
+    created = gh_api(
+        "search/issues", "-f",
+        f"q=repo:{REPO} is:issue is:open in:title \"cap-skip on PR #{pr['number']}\"",
+    ) or {}
+    items = created.get("items") or []
+    if items:
+        for lbl in ("needs-triage", "P2"):
+            add_label(items[0]["number"], lbl, True)
 
 
 # ---------------------------------------------------------------------------
-# Modes
+# Planning (READ-ONLY) and applying (the only mutating phase)
 
-def process_prs(prs: list, dnc: set, execute: bool, check_linked_pr: bool = True) -> tuple:
-    """Shared engine for --push and --backfill. Returns (actions, leaks)
-    where actions = list of (pr, issue_n, action, reason)."""
+def build_plan(prs: list, dnc: set, backfill: bool = False) -> list:
+    """The ONE planning path shared by push, backfill, and leak-scan modes.
+    Read-only by contract: no mutation happens here, so the security
+    assertions in assert_plan_safe() always run before anything changes.
+    Returns a list of (pr, issue_n_or_None, action, reason, issue_json)."""
     plan = []
     for pr in prs:
         refs = closing_refs.closing_numbers(pr.get("body") or "")
         if not refs:
             continue
         if len(refs) > PER_PR_CAP:
-            print(f"PR #{pr['number']}: {len(refs)} refs > cap {PER_PR_CAP} -- closing nothing for this PR")
-            capskip_issue(pr, refs, execute)
+            plan.append((pr, None, CAPSKIP, f"{len(refs)} refs > cap {PER_PR_CAP}", {"refs": refs}))
             continue
         for n in refs:
             issue, blob = issue_with_comments(n)
             action, reason = classify(issue, pr["number"], dnc, blob)
-            if action == CLOSE and check_linked_pr and has_open_linked_pr(n):
-                action, reason = ADVISORY, "an open PR still references this issue"
+            if action == CLOSE and has_open_linked_pr(n):
                 if ADVISORY_MARKER.format(pr=pr["number"], issue=n) in blob:
-                    action, reason = SKIP, reason + " (advisory already posted)"
+                    action, reason = SKIP, "an open PR still references this issue (advisory already posted)"
+                else:
+                    action, reason = ADVISORY, "an open PR still references this issue"
+            if backfill and action in (CLOSE, ADVISORY) and has_security_label(issue):
+                # Backfill never mutates a security-labelled issue, not even an
+                # advisory: the maintainer reviews these in the dry-run diff.
+                action = EXCLUDED
             plan.append((pr, n, action, reason, issue))
-
-    # Defense-in-depth: a CLOSE that still carries `security` is only reachable
-    # through a ladder bug -- abort the entire run, zero mutations (A1 par.4).
-    for pr, n, action, reason, issue in plan:
-        if action == CLOSE and issue and any(
-            l["name"] == "security" for l in issue.get("labels", [])
-        ):
-            print(f"FATAL: ladder bug -- CLOSE action for security-labelled #{n}. Aborting with zero mutations.")
-            sys.exit(4)
-
     return plan
+
+
+def assert_plan_safe(plan: list, backfill: bool):
+    """Runs BEFORE any mutation, every mode. Exit 4 = zero mutations happened."""
+    for pr, n, action, reason, issue in plan:
+        if action == CLOSE and has_security_label(issue):
+            print(f"FATAL: ladder bug -- CLOSE action for security-labelled #{n}. "
+                  f"Aborting with zero mutations.", file=sys.stderr)
+            sys.exit(4)
+        if backfill and action in MUTATING_ACTIONS and n is not None and has_security_label(issue):
+            print(f"FATAL: backfill hard-stop (A1 par.4) -- security-labelled #{n} holds a "
+                  f"mutating action ({action}). Aborting with zero mutations.", file=sys.stderr)
+            sys.exit(4)
 
 
 def print_plan(plan: list):
     def sort_key(item):
         pr, n, action, reason, issue = item
-        labels = {l["name"] for l in (issue or {}).get("labels", [])}
-        danger = ("security" in labels, "P0" in labels, "P1" in labels, bool((issue or {}).get("assignees")))
-        return (-sum(danger), action != ADVISORY, n)
+        labels = {l["name"] for l in (issue or {}).get("labels", [])} if n else set()
+        danger = ("security" in labels, "P0" in labels, "P1" in labels,
+                  bool((issue or {}).get("assignees")) if n else False)
+        return (-sum(danger), action not in (EXCLUDED, ADVISORY), n or 0)
 
     for pr, n, action, reason, issue in sorted(plan, key=sort_key):
+        if action == CAPSKIP:
+            print(f"  {action:8} PR #{pr['number']} -- {reason}: closes nothing, files a cap-skip issue")
+            continue
         labels = ",".join(l["name"] for l in (issue or {}).get("labels", [])) if issue else "-"
         title = (issue or {}).get("title", "?")[:60]
         print(f"  {action:8} #{n:<5} (PR #{pr['number']}) [{labels}] {title!r} -- {reason}")
 
 
 def apply_plan(plan: list, execute: bool):
-    closed = advised = 0
+    """The ONLY mutating phase. Callers must have run assert_plan_safe first."""
+    closed = advised = capskips = 0
     for pr, n, action, reason, issue in plan:
         if action == CLOSE:
             post_comment(n, evidence_comment(pr, n), execute)
@@ -364,10 +425,21 @@ def apply_plan(plan: list, execute: bool):
         elif action == ADVISORY:
             post_comment(n, advisory_comment(pr, n, reason), execute)
             advised += 1
+        elif action == CAPSKIP:
+            if execute:
+                create_capskip_issue(pr, issue["refs"])
+            else:
+                print(f"  [dry-run] would open cap-skip issue for PR #{pr['number']}")
+            capskips += 1
     mode = "EXECUTED" if execute else "DRY-RUN (nothing mutated)"
-    print(f"{mode}: {closed} close(s), {advised} advisory comment(s), "
-          f"{sum(1 for p in plan if p[2] == SKIP)} skip(s)")
+    skips = sum(1 for p in plan if p[2] == SKIP)
+    excluded = sum(1 for p in plan if p[2] == EXCLUDED)
+    print(f"{mode}: {closed} close(s), {advised} advisory comment(s), {capskips} cap-skip(s), "
+          f"{skips} skip(s), {excluded} excluded (security, backfill)")
 
+
+# ---------------------------------------------------------------------------
+# Modes
 
 def mode_push(before: str, after: str, execute: bool) -> int:
     dnc = load_do_not_close()
@@ -376,7 +448,8 @@ def mode_push(before: str, after: str, execute: bool) -> int:
         print(f"no merged {TARGET_BRANCH}-base PRs in {before[:10]}..{after[:10]}")
         return 0
     print(f"{len(prs)} merged PR(s) in range: {', '.join('#' + str(p['number']) for p in prs)}")
-    plan = process_prs(prs, dnc, execute)
+    plan = build_plan(prs, dnc)
+    assert_plan_safe(plan, backfill=False)
     print_plan(plan)
     apply_plan(plan, execute)
     return 0
@@ -390,16 +463,18 @@ def mode_backfill(execute: bool, reviewed: bool) -> int:
         return 2
     prs = all_merged_dev_prs()
     print(f"scanning {len(prs)} merged {TARGET_BRANCH}-base PRs...")
-    plan = process_prs(prs, dnc, execute)
+    plan = build_plan(prs, dnc, backfill=True)
+    assert_plan_safe(plan, backfill=True)
     live = [p for p in plan if p[2] != SKIP]
-    print(f"\nbackfill plan ({len(live)} action(s)), most dangerous first:")
+    print(f"\nbackfill plan ({len(live)} item(s)), most dangerous first "
+          f"(EXCLUDED = security-labelled, reviewed here, never mutated):")
     print_plan(live)
     apply_plan(plan, execute)
     return 0
 
 
 def mode_undo_push(before: str, after: str, execute: bool) -> int:
-    dnc = load_do_not_close()  # fail-closed applies to undo too
+    load_do_not_close()  # fail-closed applies to undo too
     prs = merged_prs_for_range(before, after)
     undone = 0
     for pr in prs:
@@ -409,7 +484,7 @@ def mode_undo_push(before: str, after: str, execute: bool) -> int:
                 continue
             marker = CLOSE_MARKER.format(pr=pr["number"], issue=n)
             if marker not in blob:
-                print(f"  #{n}: no close marker for PR #{pr['number']} -- not ours, skipping")
+                print(f"  #{n}: no trusted close marker for PR #{pr['number']} -- not ours, skipping")
                 continue
             if issue.get("state") == "open":
                 print(f"  #{n}: already open -- skipping")
@@ -431,26 +506,19 @@ def mode_undo_push(before: str, after: str, execute: bool) -> int:
 
 
 def mode_leak_scan(window: int) -> int:
-    """Exit 1 if any merged PR's claimed issue is still open with no marker and
-    no never-close protection -- the completeness backstop (A1 par.11)."""
+    """Exit 1 if the ladder would CLOSE anything right now over the recent
+    window -- i.e. an earlier run failed. Uses build_plan, the same path as
+    the close job, so a protected/advisory item can never be a false leak."""
     dnc = load_do_not_close()
     prs = all_merged_dev_prs()[:window]
-    leaks = []
-    for pr in prs:
-        refs = closing_refs.closing_numbers(pr.get("body") or "")
-        if not refs or len(refs) > PER_PR_CAP:  # identical cap rule as the close path
-            continue
-        for n in refs:
-            issue, blob = issue_with_comments(n)
-            action, reason = classify(issue, pr["number"], dnc, blob)
-            if action == CLOSE:
-                leaks.append((pr["number"], n))
+    plan = build_plan(prs, dnc)
+    leaks = [(pr["number"], n) for pr, n, action, _r, _i in plan if action == CLOSE]
     if leaks:
-        print(f"LEAK: {len(leaks)} claimed-but-open issue(s) with no marker/protection:")
+        print(f"LEAK: {len(leaks)} claimed-but-open issue(s) the ladder would close now:")
         for pr_n, n in leaks:
             print(f"  #{n} (claimed by merged PR #{pr_n})")
         return 1
-    print(f"leak scan clean over the last {len(prs)} merged PRs")
+    print(f"leak scan clean over the {len(prs)} most recently merged PRs")
     return 0
 
 

@@ -108,6 +108,10 @@ jobs:
             echo "::error::$f gained a PR-context trigger — forbidden for the close automation (ADR-3001 A1 §3)"
             exit 1
           fi
+          if grep -nE '^[[:space:]]*(workflow_dispatch|schedule):' "$f"; then
+            echo "::error::$f gained a dispatch/cron trigger — dev-only workflows accept neither until promoted to main, and the close automation must stay push:-only (ADR-3001 Costs; A1 §3)"
+            exit 1
+          fi
           echo "close-linked-issues control-plane check: clean"
 
       - name: Run zizmor
