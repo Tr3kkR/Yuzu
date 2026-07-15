@@ -286,7 +286,10 @@ Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
   # writes) — a smaller, secondary win. Disposable test data on a CI runner.
   $major = $PostgresVersion.Split('.')[0]
   $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
-  Add-MpPreference -ExclusionProcess 'postgres.exe' -EA SilentlyContinue   # per-connection backend spawn (the big one)
+  # Path-scoped, not a bare filename: 'postgres.exe' alone excludes any
+  # process with that name machine-wide. $pgbin is the one bin dir every
+  # agent's service (agent-0 + agents 1..N-1) launches postgres.exe from.
+  if($pgbin){ Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue }   # per-connection backend spawn (the big one)
   $paths = @()
   if($pgbin){
     $paths += $pgbin                                          # bin dir: postgres.exe not scanned on launch
@@ -294,7 +297,8 @@ Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
   }
   $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
   foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
-  "Defender exclusions added: process=postgres.exe; paths=" + ($paths -join ', ')
+  $procExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(skipped - pgbin not found)' }
+  "Defender exclusions added: process=$procExcl; paths=" + ($paths -join ', ')
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
