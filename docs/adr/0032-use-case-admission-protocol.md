@@ -262,7 +262,9 @@ Core authorises each such call by looking the run up **server-side** and requiri
 
 0. **the calling engine principal, and the `module_id@version` it presents, are exactly the ones
    bound into the run row at admission** — the run is *the caller's own* run;
-1. the run is **live** (Decision 5's state machine);
+1. the run is **live and unexpired** - core evaluates `now < expires_at` inline on every core call,
+   against core's own clock, so authority expiry never depends on the reaper (Decision 5's state
+   machine flips the terminal state; the clock check, not that flip, is the authority boundary);
 2. the request falls inside the run's **frozen scope ceiling**;
 3. the engine principal's **own grants** permit the capability;
 4. the **admitting operator's CURRENT authority** still permits it — re-evaluated per call, not
@@ -342,9 +344,10 @@ an unconditional grid overwrite). The run store is a core-owned store, **born on
 (ADR-0012: fail-closed construction — and **authoritative**, not durability-on-top; see Decision 11).
 
 Each use case declares a TTL in its manifest; core reads that TTL from **its ratified copy**
-(Decision 13), version-locked at admission. Core expires overdue runs, writes the terminal audit row
-(`use_case.run.expired`), and **revokes the run's read authority at that instant** — an expired run's
-next core call fails filter (1) of Decision 4.
+(Decision 13), version-locked at admission. A run's **read authority ends at `expires_at`**: filter (1)
+of Decision 4 checks the clock inline on every call, so an overdue run is denied whether or not the
+reaper has run. The reaper then terminalises overdue runs and writes the terminal audit row
+(`use_case.run.expired`); it records the end, it is not what causes it.
 
 The invariant this buys: **every admitted run reaches a terminal audit state.** No run merely stops
 being mentioned. Reaping a run revokes its **read** authority instantly — it does **not** void an
@@ -359,11 +362,15 @@ requirements, and it is worth exactly as much as they are:
 - **A ceiling on the module-declared TTL** in core's ratified copy. A module must not be able to
   declare a run that outlives the evidence for it.
 - **A liveness metric on the reaper, and an alert on stranded runs** (`admitted` past its TTL). If
-  the reaper dies, every run stays open and read-authoritative — the failure mode is silent, and it
-  fails *open*.
+  the reaper dies, overdue runs are not *terminalised or audited* - but they are **not
+  read-authoritative**, because the inline `now < expires_at` check (filter (1) of Decision 4) denies
+  every call on an expired run regardless of the reaper. The reaper is a janitor (terminalise +
+  terminal audit + cleanup); a dead reaper is missing terminal evidence, stale state and retention
+  pressure, alerted on - not an authority leak.
 - **A retry on a failed terminal audit write.** D6's mutation rule means a failed audit write fails
   the transition closed — which for a reaper leaves the run non-terminal. Retry, or the run is
-  stranded by the very rule meant to protect it.
+  stranded by the very rule meant to protect it. The inline expiry check still denies that stranded
+  run's reads, so a failed audit write never preserves read authority; never gate expiry-denial on it.
 - **An orphan sweep at boot.** A core that crashes mid-run leaves runs in `executing` with nobody
   driving them. On start, core sweeps them to a terminal state (`aborted`, reason `core_restart`)
   before serving. Core restart mid-run is otherwise an unhandled path — the run simply never ends.
@@ -372,8 +379,9 @@ Named, so the alert exists before the incident does (`docs/observability-convent
 `yuzu_use_case_reaper_last_success_timestamp` (gauge — alert on absence, or on age > 180 s for 5 m,
 **critical**; the follow-the-rollup-pattern precedent, not `PolicyEvaluator`'s outcome-only
 counters), `yuzu_use_case_reaper_tick_errors_total`, `yuzu_use_case_runs_stranded` (gauge — runs
-`admitted`/`executing` past TTL; > 0 for 10 m is critical, because every one of them is still
-**read-authoritative**), `yuzu_use_case_run_terminal_audit_failures_total{reason}`,
+`admitted`/`executing` past TTL; > 0 for 10 m is critical, because every one of them is an
+un-terminalised run with no terminal audit row - its reads are already denied by the inline expiry
+check, but its evidence and cleanup are stuck), `yuzu_use_case_run_terminal_audit_failures_total{reason}`,
 `yuzu_use_case_runs_reaped_total{terminal_state}` and `yuzu_use_case_runs_orphaned_total`.
 
 ### 6. Revocation symmetry: a pulled module or capability aborts the run (P10)
@@ -833,7 +841,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(i)** | **Execution semantics: outcome correlation + the coverage envelope** | Gates **every distributed fact read and every effect**. ADR-0033 §10 requires `intended/contacted/responded/failed/timed_out`, and D11's Execution Plan requires a real outcome. The workflow engine marks a step **successful on dispatch** (`workflow_engine.cpp`) and does not correlate an `execution_id`. A finalisation receipt over that attests effects nobody confirmed, and "no vulnerable devices found" becomes indistinguishable from "62 devices never answered" — the exact sentence ADR-0033 §10 exists to forbid. | Coverage fields: zero occurrences in the tree. Dispatch-vs-outcome correlation: unwired. This is the memorandum's "repair execution semantics" step, now a gate. |
 | **(j)** | **Capability projection** — generated OpenAPI + generated `tools/list` from core's registry | Gates **the agentic surface**, i.e. the thing voiding F-10 was for. `tools/list` iterates a **compile-time array** (`mcp_server.cpp`) and the OpenAPI document is a hand-typed literal (`rest_api_v1.cpp`). Activate a module today and its capabilities appear on **neither**. Without (j), an engine is reachable by nobody, and INV-31-4's contract test cannot exist either — you cannot diff registered routes against a hand-written document. | Unbuilt. |
 | **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
-| **(k)** | **Operational readiness** — the new stores in the readiness conjunction, and the reaper's liveness alert | Gates **admitting a run in anger**. Six new stores (run, release log, grants/receipts, approvals, plans, declarations) and none is in `/readyz`'s `stores_ok` conjunction; the reaper fails **open** (every un-reaped run stays read-authoritative) and has no liveness signal. Every row in that conjunction was added because a store died and the server reported healthy. | Unbuilt. Metric names in Decision 5. |
+| **(k)** | **Operational readiness** — the new stores in the readiness conjunction, and the reaper's liveness alert | Gates **admitting a run in anger**. Six new stores (run, release log, grants/receipts, approvals, plans, declarations) and none is in `/readyz`'s `stores_ok` conjunction; the reaper has no liveness signal, and its death strands terminal evidence and cleanup (read authority itself is denied inline by the `now < expires_at` check of Decision 4/5, not by the reaper). Every row in that conjunction was added because a store died and the server reported healthy. | Unbuilt. Metric names in Decision 5. |
 
 **Rule:** no ballot-A5 code path ships until **(a)–(d)** and **(h)** have landed — (h) joins the
 unconditional set because admission *cannot be built* without core's ratified mapping; it is not a
