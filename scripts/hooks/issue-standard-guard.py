@@ -87,12 +87,12 @@ ADVISORY_URL = "https://github.com/Tr3kkR/Yuzu/security/advisories/new"
 # stalling the hook (which blocks the tool call synchronously).
 MAX_COMMAND_LEN = 20_000
 
-# Cheap pre-filter run on EVERY shell command. Regex, not a fixed-space
-# substring, so `gh   issue   create` (a shell collapses the whitespace) is not
-# a silent bypass; case-insensitive and `.exe`/`.cmd`-aware so `gh.exe issue
-# create` on Windows is not a bypass either. Permissive on purpose -- the real
-# parser decides; a false hit only costs one wasted tokenise.
-_CREATE_GATE = re.compile(r"gh(?:\.exe|\.cmd)?\s+issue\s+create\b", re.IGNORECASE)
+# Cheap pre-filter run on EVERY shell command. Gates on the distinctive
+# `issue create` phrase (case-insensitive), NOT `gh...issue create`, so a global
+# flag between them (`gh --repo X issue create`) is not a silent bypass. `gh   issue
+# create` (collapsed whitespace) also matches. Permissive on purpose -- the real
+# parser confirms the `gh` command word; a false hit only costs one tokenise.
+_CREATE_GATE = re.compile(r"\bissue\s+create\b", re.IGNORECASE)
 
 # Line continuations -- a shell removes them entirely, so we normalise them away
 # before the gate/parser (else they split the `gh issue create` phrase). Bash
@@ -110,17 +110,17 @@ ACK_ENV = "YUZU_ISSUE_STANDARD_ACK"
 # redirections, and these wrappers (matched by BASENAME so `/usr/bin/env`
 # counts); `gh` must be the command word itself, so `echo gh issue create ...`
 # (echo is not a wrapper) is NOT treated as a filing.
-_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")           # Bash `VAR=val`
+_PS_VAR_RE = re.compile(r"^\$[A-Za-z_]\w*$")                   # PowerShell `$var`
 # A redirection operator, optionally with a leading fd and/or a glued target:
-# `>`, `>>`, `2>`, `&>`, `>out.txt`, `2>err`.
-_REDIR_RE = re.compile(r"^(?:\d*(?:>>|<<|<|>)|&>)")
+# `>`, `>>`, `2>`, `&>`, `>&`, `<&`, `<>`, `>out.txt`, `2>&1`.
+_REDIR_RE = re.compile(r"^(?:\d*(?:>>|>&|<&|<>|<<<|<<|<|>)|&>>|&>)")
 WRAPPERS = frozenset({
     "command", "builtin", "exec", "env", "sudo", "doas",
     "nice", "time", "xargs", "winpty", "stdbuf", "timeout", "nohup", "ionice",
 })
-# Wrappers that consume a leading option/value token (best-effort): `timeout 5`,
-# `nice -n 10`, `stdbuf -oL`.
-ARG_WRAPPERS = frozenset({"timeout", "nice", "stdbuf", "ionice"})
+# gh global flags (before the subcommand) that consume a value.
+_GH_VALUE_FLAGS = frozenset({"--repo", "-R", "--hostname"})
 # Shell keywords / grouping tokens that precede a command in the same segment.
 CONTROL = frozenset({
     "if", "then", "elif", "else", "fi", "do", "done", "while", "until",
@@ -220,9 +220,18 @@ def _split_shell_segments(command):
             i += 1
             continue
         if c == "&":
-            segments.append("".join(buf))
+            if i + 1 < n and command[i + 1] == "&":
+                segments.append("".join(buf))  # `&&`
+                buf = []
+                i += 2
+                continue
+            if (buf and buf[-1] in "<>") or (i + 1 < n and command[i + 1] == ">"):
+                buf.append(c)  # `>&`, `<&`, `&>`, `2>&1` -- part of a redirect
+                i += 1
+                continue
+            segments.append("".join(buf))  # background `&`
             buf = []
-            i += 2 if (i + 1 < n and command[i + 1] == "&") else 1
+            i += 1
             continue
         if c == "|":
             segments.append("".join(buf))
@@ -254,33 +263,58 @@ def _command_word_index(tokens):
     i, n = 0, len(tokens)
     while i < n:
         t = tokens[i]
+        # PowerShell native assignment `$var = ...` (two tokens) -> skip both.
+        if i + 1 < n and tokens[i + 1] == "=" and _PS_VAR_RE.match(t):
+            i += 2
+            continue
         if _ASSIGN_RE.match(t) or t in CONTROL:
             i += 1
             continue
         if _REDIR_RE.match(t):
-            # a bare operator (`>`, `2>`) also swallows its target token
-            i += 2 if (t in (">", ">>", "<", "<<") or _REDIR_RE.fullmatch(t)) else 1
+            # a bare operator (`>`, `2>`) also swallows its target token; a
+            # glued one (`>out`, `2>&1`) does not.
+            i += 2 if _REDIR_RE.fullmatch(t) else 1
             continue
         base = t.replace("\\", "/").rsplit("/", 1)[-1]
         if base in WRAPPERS:
             i += 1
-            if base in ARG_WRAPPERS:
-                while i < n and (tokens[i].startswith("-") or tokens[i].isdigit()):
-                    i += 1
+            # any wrapper's own options/values: `sudo -E`, `command -p`,
+            # `env -i`, `timeout 5`, `nice -n 10`.
+            while i < n and (tokens[i].startswith("-") or tokens[i].isdigit()):
+                i += 1
             continue
         return i
     return -1
 
 
+def _issue_create_args(tokens, ci):
+    """If gh at index `ci` invokes `issue create`, return its arg tokens, else None.
+
+    Skips gh's own global flags before the subcommand (`gh --repo X issue create`,
+    `gh -R X issue create`) -- mirroring the position-independence the dedupe
+    probe detector already has.
+    """
+    j = ci + 1
+    n = len(tokens)
+    while j < n and tokens[j].startswith("-"):
+        flag = tokens[j]
+        j += 1
+        if flag in _GH_VALUE_FLAGS and j < n and not tokens[j].startswith("-"):
+            j += 1  # consume the value of `--repo X` / `-R X`
+    if j + 1 < n and tokens[j] == "issue" and tokens[j + 1] == "create":
+        return tokens[j + 2:]
+    return None
+
+
 def _find_create_arg_lists(command):
     """Return the flag-token list for every real `gh issue create` invocation.
 
-    Segments the command first (so operators/newlines/comments are handled),
-    then requires `gh` (or `/path/to/gh`, `gh.exe`, `gh.cmd`) to be the segment's
-    COMMAND WORD followed by `issue create`. Requiring command position (not a
-    scan of every token) means `echo gh issue create ...` is not a filing, and a
-    create only inside a quoted string is not one either (it is a single token).
-    A segment shlex cannot parse is skipped -> fail-open.
+    Segments the command first (so operators/newlines/comments/substitution are
+    handled), then requires `gh` (or `/path/to/gh`, `gh.exe`, `gh.cmd`) to be the
+    segment's COMMAND WORD, optionally followed by gh global flags, then `issue
+    create`. Requiring command position (not a scan of every token) means `echo
+    gh issue create ...` is not a filing, and a create only inside a quoted
+    string is not one either. A segment shlex cannot parse is skipped -> fail-open.
     """
     out = []
     for segment in _split_shell_segments(command):
@@ -289,15 +323,11 @@ def _find_create_arg_lists(command):
         except ValueError:
             continue  # unbalanced quotes etc. -> skip this segment
         ci = _command_word_index(tokens)
-        if ci < 0:
+        if ci < 0 or not _is_gh_token(tokens[ci]):
             continue
-        if (
-            _is_gh_token(tokens[ci])
-            and ci + 2 < len(tokens)
-            and tokens[ci + 1] == "issue"
-            and tokens[ci + 2] == "create"
-        ):
-            out.append(tokens[ci + 3:])
+        args = _issue_create_args(tokens, ci)
+        if args is not None:
+            out.append(args)
     return out
 
 

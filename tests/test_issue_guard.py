@@ -425,6 +425,63 @@ def build_cases(with_probe: str, no_probe: str):
             'gh issue create --title T --label bug,P1,needs-triage --body=just-a-one-liner',
             with_probe, "ask", ["missing required section"],
         ),
+
+        # --- two-reviewer adversarial (Kimi+Codex): global flags & wrappers ---
+        (
+            "IG-1: gh --repo before subcommand is enforced",
+            'gh --repo Tr3kkR/Yuzu issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-1: gh -R before subcommand is enforced (do-not-close)",
+            'gh -R Tr3kkR/Yuzu issue create --title T --label bug,P1,needs-triage,do-not-close',
+            with_probe, "deny", ["automation-owned"],
+        ),
+        (
+            "IG-1: gh --repo=X glued global flag is enforced",
+            'gh --repo=Tr3kkR/Yuzu issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-1-neg: a VALID gh --repo create is allowed",
+            f'gh --repo Tr3kkR/Yuzu issue create --title T --body "{GOOD_BODY}" --label bug,P1,needs-triage',
+            with_probe, "allow", [],
+        ),
+        (
+            "IG-2: `sudo -E gh` (option-wrapper) is enforced",
+            'sudo -E gh issue create --title T --label bug,P1,needs-triage,do-not-close',
+            with_probe, "deny", ["automation-owned"],
+        ),
+        (
+            "IG-2: `command -p gh` is enforced",
+            'command -p gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-2: `env -i gh` is enforced",
+            'env -i gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-2: `time -p gh` is enforced",
+            'time -p gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-3: `2>&1 gh` fd-redirect prefix is enforced (& not a boundary)",
+            '2>&1 gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "IG-3: `>&2 gh` redirect prefix is enforced",
+            '>&2 gh issue create --title T --label P1,needs-triage',
+            with_probe, "deny", ["no TYPE label"],
+        ),
+        (
+            "background `&` after a create is still a create",
+            'gh issue create --title T --label P1,needs-triage &',
+            with_probe, "deny", ["no TYPE label"],
+        ),
     ]
 
 
@@ -516,6 +573,10 @@ def main() -> int:
              "gh issue `\ncreate --title T --label P1,needs-triage", "deny"),
             ("C2b: PS backtick-cont between flags",
              "gh issue create --title T `\n--label P1,needs-triage", "deny"),
+            ("IG-C-P1-2: PS `$url = gh issue create` native assignment is enforced",
+             "$url = gh issue create --title T --label P1,needs-triage", "deny"),
+            ("IG-C-P1-2b: PS `$u = $(gh ...)` subexpression is enforced",
+             "$u = $(gh issue create --title T --label P1,needs-triage)", "deny"),
         ]:
             try:
                 decision, _ = run_hook(cmd, transcript_path=with_probe, tool_name="PowerShell")

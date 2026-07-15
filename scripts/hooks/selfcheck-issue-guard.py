@@ -50,7 +50,7 @@ def find_wired_command() -> str:
     )
 
 
-def run_via_bash(command: str, payload: dict) -> tuple[int, str, str]:
+def run_via_bash(command: str, payload: dict, extra_env: dict | None = None) -> tuple[int, str, str]:
     """Run `command` through Git Bash with CLAUDE_PROJECT_DIR set, feeding payload."""
     bash = shutil.which("bash")
     if not bash:
@@ -60,6 +60,8 @@ def run_via_bash(command: str, payload: dict) -> tuple[int, str, str]:
         )
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(ROOT)
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         [bash, "-c", command],
         input=json.dumps(payload).encode("utf-8"),
@@ -116,6 +118,23 @@ def main() -> int:
         failures.append(f"hook exited {rc} on allowed call; stderr={err!r}")
     if dec != "allow":
         failures.append(f"a non-create call did not allow: decision={dec!r} out={out!r}")
+
+    # 3. The PowerShell matcher must fire too (second matcher in settings.json):
+    #    a backtick-newline continuation must not hide the create.
+    ps = {"tool_name": "PowerShell",
+          "tool_input": {"command": "gh issue `\ncreate --title T --label P1,needs-triage"}}
+    rc, out, err = run_via_bash(command, ps)
+    dec = decision_of(out)
+    print(f"  powershell bad  -> exit={rc} decision={dec}")
+    if dec != "deny":
+        failures.append(f"a bad PowerShell create did not deny: decision={dec!r} stderr={err!r}")
+
+    # 4. The ADR-mandated operator escape hatch must short-circuit to allow.
+    rc, out, err = run_via_bash(command, bad, extra_env={"YUZU_ISSUE_STANDARD_ACK": "1"})
+    dec = decision_of(out)
+    print(f"  ACK=1 bypass    -> exit={rc} decision={dec}")
+    if dec != "allow":
+        failures.append(f"YUZU_ISSUE_STANDARD_ACK=1 did not bypass: decision={dec!r}")
 
     if failures:
         print("\nSELF-CHECK FAILED:")
