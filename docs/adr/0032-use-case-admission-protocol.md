@@ -221,10 +221,11 @@ Two properties are load-bearing:
 
 - **It is the same artifact family as 2b delegation** (RFC 8693 token exchange, audience-bound,
   short-TTL, server-issued). A5 deliberately pulls a bounded slice of Phase-5 delegation forward;
-  it does not invent a second credential type. The **invocation** grant's format (opaque vs signed)
-  may stay deferred, because its one-use property comes from the run state machine
-  (`admitted → executing`), not from the token: either format works. The **result-scoped** grant's
-  format is *not* deferred — see below.
+  it does not invent a second credential type. The **invocation** grant's format follows 2b §5 -
+  **opaque, server-side, keyed by `jti`, not a self-contained JWT** - the same as every artifact in
+  the family; this ADR does not re-open it. What this ADR adds is only that its *one-use* property
+  comes from the run state machine (`admitted → executing`), not from the token, so no signing scheme
+  is needed to enforce single use. The **result-scoped** grant's format is *not* deferred — see below.
 - **The invocation grant gates starting the run, nothing else.** Its TTL is not the run's authority.
   Every subsequent core call is authorised by Decision 4's server-side lookup, so a long-lived run
   does not need a long-lived credential, and a **stolen invocation grant expires without carrying
@@ -248,8 +249,8 @@ not a token that authorises. No grant, of either kind, entitles anyone to bytes 
 *signed* grant cannot be one-use, because nothing consumes it. The result-scoped grant is therefore
 **opaque and server-side**, with core holding the record it CASes. Leaving *that* format deferred
 would let an implementer pick signed, silently downgrading one-use to advisory and re-opening S3.
-(The invocation grant is unaffected: its one-use comes from the state transition, so its format
-remains an implementation choice.)
+(The invocation grant is unaffected: its one-use comes from the state transition, and its format is
+already fixed opaque/server-side by 2b §5 - see Decision 3 above.)
 
 The UCE rejects a grant that is missing, expired, wrong-audience, or mismatched against the request
 it accompanies — and, for a result-scoped grant, one that core refuses to redeem.
@@ -426,6 +427,16 @@ namespace (Decision 1) keys on that credential, so a scheduled run is never a ho
 either. Every filter in Decision 4 therefore evaluates against the
 armer's **current** authority: a schedule whose armer is demoted or deleted stops producing runs.
 There is no system principal that admits runs on nobody's behalf.
+
+**This governs operator-facing runs** - runs that read confined fleet facts or drive fleet effects.
+It does **not** re-home 2b §3.4's *autonomous-sync identity*, which acts under the engine principal's
+own grants for autonomous work (external feed ingestion and the engine's own derived state) and is
+**forbidden from reading operator-confined fleet facts or driving fleet effects**. Autonomous
+ingestion has no admitting operator because it discloses nothing operator-attributable; the moment its
+output is rendered to an individual operator, that read is a distinct, admitted, operator-confined run
+(2b §3.4: "any read rendered to an individual operator is authorized as that operator"). Ingestion and
+operator disclosure are different authority questions, and - a deliberate decision of this protocol,
+not merely a restatement of 2b - only the second is a run under this protocol.
 
 **Admitting operator and four-eyes requester root are two different questions, and a scheduled run is
 where they come apart.** The *admitting operator* is the armer — that is whose live authority confines
