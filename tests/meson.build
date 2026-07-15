@@ -539,3 +539,18 @@ test('flake-retry selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
+# entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
+# the cancelled-path "which entry never finished" inference. It reuses
+# flake-retry.py's junit-name -> introspected-entry mapping rather than keeping a
+# second copy, so the shard-naming contract documented above now has two
+# consumers — and this selftest is what makes a break in it loud. Wired here for
+# the same reason flake-retry's is: the alternative to failing in `meson test` is
+# failing silently at 06:00 UTC, in the one nightly that needed a stack trace.
+test('tsan-gdb-capture selftest',
+  _python3_test,
+  args: [files('../scripts/ci/tsan-gdb-capture.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
