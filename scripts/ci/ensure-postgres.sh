@@ -124,8 +124,8 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
 # never see a caller-supplied DSN - so this runs unconditionally, before
 # path selection, not only inside the pre-set-DSN branch (path 1 below).
 if [[ -n "${PGOPTIONS:-}" ]]; then
-  echo "::error::ensure-postgres: PGOPTIONS must not be set in the job environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
-  exit 1
+  echo "::error::ensure-postgres: PGOPTIONS must not be set in the job or runner machine environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+  exit "$SOFT_EXIT"
 fi
 
 # ── 1. Pre-set DSN wins ──────────────────────────────────────────────────
@@ -145,8 +145,8 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # matches keywords via a case-sensitive strcmp, so an "OPTIONS=" variant
   # isn't honored as the `options` keyword by libpq either.
   if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options= ]]; then
-    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
-    exit 1
+    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+    exit "$SOFT_EXIT"
   fi
   # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
   # (machine env on Wee Tam) names the agent-0 cluster; agent <n> shifts
@@ -203,7 +203,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "ensure-postgres: ${CONTAINER} drift (image ${EXISTING_IMAGE} vs ${PG_IMAGE}, tune ${EXISTING_TUNE:-none} vs ${PG_TUNE_LABEL}) — recreating" >&2
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     if docker inspect "$CONTAINER" >/dev/null 2>&1; then
-      echo "::error::ensure-postgres: failed to remove stale ${CONTAINER} - old tuning still active" >&2
+      echo "::error::ensure-postgres: failed to remove stale ${CONTAINER} - old tuning still active. See docs/ci-architecture.md 'Postgres for server tests'." >&2
       exit "$SOFT_EXIT"
     fi
   fi
