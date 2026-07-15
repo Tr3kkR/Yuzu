@@ -249,33 +249,43 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
       } while((Get-Date) -lt $deadline)
       if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s (svc $svc, data $data)" }
       $env:PGPASSWORD='postgres'
-      $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$port")
-      if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
-        & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+      # $env:PGPASSWORD is process-scoped, not scriptblock-scoped, so every
+      # exit out of this span - including a throw from the LASTEXITCODE
+      # checks below - must go through Remove-Item, or the password stays
+      # set (and inheritable by child processes) for every later Step in
+      # this same PowerShell process. try/finally, not a bare Remove-Item
+      # at the bottom, so a throw still cleans up.
+      try {
+        $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$port")
+        if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
+          & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+        }
+        if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
+          & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
+        }
+        # Durability off - applied UNCONDITIONALLY (not only inside the initdb
+        # guard above) so re-provisioning an EXISTING per-agent cluster also
+        # picks up the tuning; a cluster provisioned before this PR landed
+        # would otherwise keep fsync=on forever and keep hitting the
+        # [pg]-shard timeout on its port. Mirrors the agent-0 tune block
+        # above. All three are sighup/user context -> reload suffices, no
+        # restart needed. $LASTEXITCODE is checked explicitly:
+        # $ErrorActionPreference='Continue' does not intercept a native
+        # exe's nonzero exit on this PS 5.1 host, so an unchecked psql.exe
+        # failure here would silently leave durability ON while the loop
+        # still reports the agent "ready" - exactly the kind of swallowed
+        # failure this PR's other fixes are closing elsewhere.
+        & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+        if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed on agent $n (:$port)" }
+        & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+        if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed on agent $n (:$port)" }
+        & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+        if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed on agent $n (:$port)" }
+        & $psql @H -c 'SELECT pg_reload_conf()' | Out-Null
+        if($LASTEXITCODE -ne 0){ throw "pg_reload_conf() failed on agent $n (:$port)" }
+      } finally {
+        Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
       }
-      if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
-        & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
-      }
-      # Durability off - applied UNCONDITIONALLY (not only inside the initdb
-      # guard above) so re-provisioning an EXISTING per-agent cluster also
-      # picks up the tuning; a cluster provisioned before this PR landed would
-      # otherwise keep fsync=on forever and keep hitting the [pg]-shard
-      # timeout on its port. Mirrors the agent-0 tune block above. All three
-      # are sighup/user context -> reload suffices, no restart needed.
-      # $LASTEXITCODE is checked explicitly: $ErrorActionPreference='Continue'
-      # does not intercept a native exe's nonzero exit on this PS 5.1 host, so
-      # an unchecked psql.exe failure here would silently leave durability ON
-      # while the loop still reports the agent "ready" - exactly the kind of
-      # swallowed failure this PR's other fixes are closing elsewhere.
-      & $psql @H -c 'ALTER SYSTEM SET fsync = off'
-      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed on agent $n (:$port)" }
-      & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
-      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed on agent $n (:$port)" }
-      & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
-      if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed on agent $n (:$port)" }
-      & $psql @H -c 'SELECT pg_reload_conf()' | Out-Null
-      if($LASTEXITCODE -ne 0){ throw "pg_reload_conf() failed on agent $n (:$port)" }
-      Remove-Item Env:\PGPASSWORD
       Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
     }
     "per-agent clusters 1..$($RunnerCount-1) ready on :$($PostgresPort+1)..:$($PostgresPort+$RunnerCount-1)"
