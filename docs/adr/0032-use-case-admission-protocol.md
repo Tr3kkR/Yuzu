@@ -450,8 +450,15 @@ There is no system principal that admits runs on nobody's behalf.
 **This governs operator-facing runs** - runs that read confined fleet facts or drive fleet effects.
 It does **not** re-home 2b §3.4's *autonomous-sync identity*, which acts under the engine principal's
 own grants for autonomous work (external feed ingestion and the engine's own derived state) and is
-**forbidden from reading operator-confined fleet facts or driving fleet effects**. Autonomous
-ingestion has no admitting operator because it discloses nothing operator-attributable; the moment its
+**forbidden from reading operator-confined fleet facts or driving fleet effects**. That prohibition is
+**enforced, not merely asserted**, and it is enforced by the filter that DOES apply: with no operator,
+the represented-operator (confinement) filter is not-applicable, so the **authenticated-actor filter**
+(the engine principal's own grants, which always applies - ADR-0033 §1) is the whole bound. The
+autonomous-sync principal is therefore **granted no operator-confined fleet data class at all**; a
+capability declaration that would let it read one is refused at manifest vetting (ADR-0033 §2). The
+confinement is not dropped with the operator - it is that the actor was never granted the confined
+classes, so there is nothing for a represented-operator filter to confine. Autonomous ingestion has no
+admitting operator because it discloses nothing operator-attributable; the moment its
 output is rendered to an individual operator, that read is a distinct, admitted, operator-confined run
 (2b §3.4: "any read rendered to an individual operator is authorized as that operator"). Ingestion and
 operator disclosure are different authority questions, and - a deliberate decision of this protocol,
