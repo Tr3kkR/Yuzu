@@ -108,8 +108,17 @@ public:
         std::size_t outbox_capacity{4096};
     };
 
-    GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend);
-    GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend, Config cfg,
+    /// The runtime OWNS the reader and backend (shared_ptr): a queued handler that
+    /// is detached at shutdown may run past GuardianEngine, so keeping the captured
+    /// runtime alive must transitively keep everything the handler touches alive -
+    /// a borrowed reader reference would UAF the moment the agent destroyed it under
+    /// a detached mid-read. The clock callable must likewise be self-contained (the
+    /// default captures nothing); a clock that borrows agent state reintroduces the
+    /// same hazard.
+    GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
+                         std::shared_ptr<ISparkBackend> backend);
+    GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
+                         std::shared_ptr<ISparkBackend> backend, Config cfg,
                          RuntimeClock clock = RuntimeClock{});
     ~GuardianSparkRuntime();
     GuardianSparkRuntime(const GuardianSparkRuntime&) = delete;
@@ -219,8 +228,8 @@ private:
                          std::chrono::steady_clock::time_point now, bool& accepted);
     std::string next_event_id(const std::string& rule_id);
 
-    IStateReader& reader_;
-    ISparkBackend& backend_;
+    std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
+    std::shared_ptr<ISparkBackend> backend_; ///< OWNED
     RuntimeClock clock_;
     std::uint64_t gen_counter_{0};   ///< registry_mu_-guarded monotonic generation source
     std::uint64_t event_seq_{0};     ///< registry_mu_-guarded event_id source

@@ -1,9 +1,10 @@
 // test_guardian_spark_runtime.cpp - the GuardianSparkRuntime core (ADR-0021 rung
-// 3). Drives the runtime against fake IStateReader / ISparkBackend seams: arm/
-// disarm edges, shared-watcher fan-out, evaluate_key verdict -> outbox -> drain,
-// pending-initial, tri-state Unknown -> health, generation purge, cap/backpressure
-// leaving an eval pending, detach-safety of a late handler, and a multi-threaded
-// stress case that is the TSan checkpoint.
+// 3, hardened rung 4.5). Drives the runtime against fake IStateReader /
+// ISparkBackend seams (owned via shared_ptr): arm/disarm edges, shared-watcher
+// fan-out, evaluate_key verdict -> outbox -> drain, pending-initial, tri-state
+// Unknown -> health, generation purge, cap/backpressure leaving an eval pending,
+// detach-safety of a late handler EVEN when the reader ref is dropped, and a
+// multi-threaded stress case that is the TSan checkpoint.
 
 #include "guardian_spark_runtime.hpp"
 
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <latch>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,26 +79,30 @@ std::vector<OutboxEntry> drain_all(GuardianSparkRuntime& rt) {
     });
     return got;
 }
-auto make_rt(FakeReader& r, FakeBackend& b, GuardianSparkRuntime::Config cfg = {}) {
-    // Deterministic clock so debounce is controllable.
+std::shared_ptr<GuardianSparkRuntime> make_rt(std::shared_ptr<FakeReader> r,
+                                              std::shared_ptr<FakeBackend> b,
+                                              GuardianSparkRuntime::Config cfg = {}) {
+    // Deterministic clock so debounce is controllable. The lambda captures nothing
+    // borrowed (the static satisfies the self-contained-clock contract).
     static std::atomic<std::int64_t> tick{0};
     return std::make_shared<GuardianSparkRuntime>(
-        r, b, cfg, [] { return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000)); });
+        std::move(r), std::move(b), cfg,
+        [] { return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000)); });
 }
 } // namespace
 
 TEST_CASE("attach arms the watcher on the 0->1 edge; a sibling rule shares it", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
 
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    REQUIRE(b.arms.load() == 1);
+    REQUIRE(b->arms.load() == 1);
     REQUIRE(rt->armed_key_count() == 1);
 
     REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
-    REQUIRE(b.arms.load() == 1); // shared watcher, no second arm
+    REQUIRE(b->arms.load() == 1); // shared watcher, no second arm
     REQUIRE(rt->rule_count() == 2);
     REQUIRE(rt->armed_key_count() == 1);
 
@@ -107,37 +113,37 @@ TEST_CASE("attach arms the watcher on the 0->1 edge; a sibling rule shares it", 
 }
 
 TEST_CASE("detach disarms on the ->0 edge; a sibling detach keeps the watcher", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
 
     rt->detach_rule("r1"); // sibling remains -> no disarm
-    REQUIRE(b.disarms.load() == 0);
+    REQUIRE(b->disarms.load() == 0);
     REQUIRE(rt->armed_key_count() == 1);
     REQUIRE(rt->rule_count() == 1);
 
     rt->detach_rule("r2"); // ->0 -> disarm
-    REQUIRE(b.disarms.load() == 1);
+    REQUIRE(b->disarms.load() == 1);
     REQUIRE(rt->armed_key_count() == 0);
 }
 
 TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
-    r.file = read_known(FileSnapshot{.exists = true}); // compliant
+    r->file = read_known(FileSnapshot{.exists = true}); // compliant
     rt->evaluate_key(key, EvalReason::Initial);
     auto got = drain_all(*rt);
     REQUIRE(got.size() == 1);
     REQUIRE(got[0].drift.compliant);
 
-    r.file = read_known(FileSnapshot{.exists = false}); // now absent
-    rt->evaluate_key(key, EvalReason::Event);           // re-reads -> drift
+    r->file = read_known(FileSnapshot{.exists = false}); // now absent
+    rt->evaluate_key(key, EvalReason::Event);            // re-reads -> drift
     got = drain_all(*rt);
     REQUIRE(got.size() == 1);
     REQUIRE_FALSE(got[0].drift.compliant);
@@ -145,15 +151,15 @@ TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spar
 }
 
 TEST_CASE("pending-initial holds until a Known verdict, kept on Unknown", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     REQUIRE(rt->pending_initial(key) == std::vector<std::string>{"r1"});
 
     // Unknown read -> health event, pending-initial RETAINED.
-    r.file = read_unknown<FileSnapshot>("io");
+    r->file = read_unknown<FileSnapshot>("io");
     rt->evaluate_key(key, EvalReason::Initial);
     REQUIRE(rt->pending_initial(key) == std::vector<std::string>{"r1"});
     auto got = drain_all(*rt);
@@ -162,16 +168,16 @@ TEST_CASE("pending-initial holds until a Known verdict, kept on Unknown", "[spar
     REQUIRE_FALSE(got[0].healthy);
 
     // Known read -> compliance verdict, pending-initial cleared.
-    r.file = read_known(FileSnapshot{.exists = true});
+    r->file = read_known(FileSnapshot{.exists = true});
     rt->evaluate_key(key, EvalReason::Convergence);
     REQUIRE(rt->pending_initial(key).empty());
 }
 
 TEST_CASE("a backend arm failure errors the rule, never a silent legacy fallback",
           "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
-    b.fail_arm = true;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->fail_arm = true;
     auto rt = make_rt(r, b);
     const auto res = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     REQUIRE_FALSE(res.has_value()); // errored
@@ -180,8 +186,8 @@ TEST_CASE("a backend arm failure errors the rule, never a silent legacy fallback
 }
 
 TEST_CASE("detach purges a rule's buffered (undrained) outbox entries", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
@@ -193,8 +199,8 @@ TEST_CASE("detach purges a rule's buffered (undrained) outbox entries", "[spark]
 }
 
 TEST_CASE("re-attach supersedes the old generation and purges its stale entry", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     const auto gen1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
@@ -213,8 +219,8 @@ TEST_CASE("re-attach supersedes the old generation and purges its stale entry", 
 }
 
 TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     GuardianSparkRuntime::Config cfg;
     cfg.outbox_capacity = 1;
     auto rt = make_rt(r, b, cfg);
@@ -222,7 +228,7 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
     const auto k2 = spark_key(file_spec("/b"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true); // drifts
     rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true); // drifts
-    r.file = read_known(FileSnapshot{.exists = true}); // present -> both rules drift (expect absent)
+    r->file = read_known(FileSnapshot{.exists = true}); // present -> both rules drift (expect absent)
 
     rt->evaluate_key(k1, EvalReason::Initial); // fills the single slot
     REQUIRE(rt->outbox_size() == 1);
@@ -231,7 +237,7 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
     REQUIRE(rt->outbox_backpressure_drops() == 1);
     REQUIRE(rt->pending_initial(k2) == std::vector<std::string>{"r2"}); // still owes a verdict
 
-    drain_all(*rt);                            // frees the slot
+    drain_all(*rt);                                // frees the slot
     rt->evaluate_key(k2, EvalReason::Convergence); // now r2's drift lands
     const auto got = drain_all(*rt);
     REQUIRE(got.size() == 1);
@@ -240,8 +246,8 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
@@ -251,37 +257,40 @@ TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
     REQUIRE(rt->outbox_size() == 0); // stopping -> no commit
 }
 
-TEST_CASE("a detached in-flight handler is memory-safe after the last owning ref drops",
+TEST_CASE("a detached in-flight handler is memory-safe even after the reader ref is dropped",
           "[spark][runtime]") {
-    // The runtime is kept alive SOLELY by the handler's captured shared_ptr on a
-    // detached thread while an eval is mid-read. ASan proves no use-after-free.
-    auto reader = std::make_unique<FakeReader>();
-    FakeBackend backend;
+    // The runtime OWNS the reader, so keeping the runtime alive (via the handler's
+    // captured shared_ptr) keeps the reader alive too. We drop BOTH the test's reader
+    // ref and the runtime ref while a handler is mid-read; the detached thread must
+    // still finish safely. Under the old borrowed-reference design this destroyed the
+    // reader out from under the in-flight read (ASan use-after-free).
+    auto reader = std::make_shared<FakeReader>();
+    auto backend = std::make_shared<FakeBackend>();
     std::latch reading{1};
     std::latch release{1};
     reader->on_read = [&] {
         reading.count_down();
         release.wait();
     };
-    auto rt = std::make_shared<GuardianSparkRuntime>(*reader, backend);
+    auto rt = std::make_shared<GuardianSparkRuntime>(reader, backend);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
     auto handler = GuardianSparkRuntime::make_handler(rt);
     std::thread t([handler, key] { handler(SparkEvent{.key = key, .type = SparkType::File}); });
 
-    reading.wait(); // the pass is inside read(), holding the only-soon runtime ref via `handler`
-    rt.reset();     // drop our owning reference; the detached thread's capture is now the last
+    reading.wait();  // the pass is inside read(); the runtime (owning the reader) is alive via `handler`
+    reader.reset();  // drop the test's reader ref: only the runtime co-owns it now
+    rt.reset();      // drop the test's runtime ref: only the detached handler owns it
     release.count_down();
-    t.join();       // the pass finished, touched runtime state after our ref was gone: no UAF
-    // reader outlives the thread (declared before rt); nothing to assert beyond a clean ASan run.
+    t.join(); // read finished, verdict committed, reader still alive: no UAF
     SUCCEED();
 }
 
 TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)",
           "[spark][runtime][tsan]") {
-    FakeReader r; // stateless-enough: `file` is not rewritten during this test
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>(); // `file` is not rewritten during this test
+    auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const std::vector<std::string> paths{"/a", "/b", "/c", "/d"};
     std::vector<std::string> keys;

@@ -8,12 +8,14 @@
 
 namespace yuzu::agent {
 
-GuardianSparkRuntime::GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend)
-    : GuardianSparkRuntime(reader, backend, Config{}, RuntimeClock{}) {}
+GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
+                                           std::shared_ptr<ISparkBackend> backend)
+    : GuardianSparkRuntime(std::move(reader), std::move(backend), Config{}, RuntimeClock{}) {}
 
-GuardianSparkRuntime::GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend, Config cfg,
+GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
+                                           std::shared_ptr<ISparkBackend> backend, Config cfg,
                                            RuntimeClock clock)
-    : reader_(reader), backend_(backend),
+    : reader_(std::move(reader)), backend_(std::move(backend)),
       clock_(clock ? std::move(clock)
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       index_(std::make_unique<SparkKeyRuleIndex>()), outbox_(cfg.outbox_capacity) {}
@@ -58,7 +60,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         const bool arm_edge = index_->add(key, rule_id);
         std::shared_ptr<PerKey> pk;
         if (arm_edge) {
-            auto armed = backend_.arm(spec);
+            auto armed = backend_->arm(spec);
             if (!armed) {
                 index_->remove_rule(rule_id); // undo: an un-armed key must not linger
                 return std::unexpected(armed.error());
@@ -105,7 +107,7 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
-            backend_.disarm(kit->second->subscription);
+            backend_->disarm(kit->second->subscription);
             keys_.erase(kit); // the in-flight pass (if any) holds its own shared_ptr; safe
         }
     } else if (key_opt) {
@@ -148,11 +150,11 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
     const bool is_reg = spec.type == SparkType::Registry;
     const bool is_svc = spec.type == SparkType::Service;
     if (is_file)
-        file_read = reader_.read_file(std::get<FileSparkParams>(spec.params));
+        file_read = reader_->read_file(std::get<FileSparkParams>(spec.params));
     else if (is_reg)
-        reg_read = reader_.read_registry(std::get<RegistrySparkParams>(spec.params));
+        reg_read = reader_->read_registry(std::get<RegistrySparkParams>(spec.params));
     else if (is_svc)
-        svc_read = reader_.read_service(std::get<ServiceSparkParams>(spec.params));
+        svc_read = reader_->read_service(std::get<ServiceSparkParams>(spec.params));
     else
         return; // non-event-driven type is never armed here
 

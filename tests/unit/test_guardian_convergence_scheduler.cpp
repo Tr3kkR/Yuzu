@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -72,26 +73,26 @@ bool wait_until(Pred pred, std::chrono::milliseconds budget = std::chrono::milli
 } // namespace
 
 TEST_CASE("sweep_lane drives only its own type's armed keys", "[spark][convergence]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
     ConvergenceScheduler sched{*rt};
     rt->attach_rule("f1", file_spec("/a"), file_rule("f1"), true);
     rt->attach_rule("s1", svc_spec("nginx"), svc_rule("s1"), true);
 
     sched.sweep_lane(SparkType::File);
-    REQUIRE(r.file_reads.load() == 1);
-    REQUIRE(r.svc_reads.load() == 0); // the file lane never touches a service key
+    REQUIRE(r->file_reads.load() == 1);
+    REQUIRE(r->svc_reads.load() == 0); // the file lane never touches a service key
 
     sched.sweep_lane(SparkType::Service);
-    REQUIRE(r.svc_reads.load() == 1);
-    REQUIRE(r.file_reads.load() == 1);
+    REQUIRE(r->svc_reads.load() == 1);
+    REQUIRE(r->file_reads.load() == 1);
 }
 
 TEST_CASE("sweep_pending_initial services every key that still owes a first eval",
           "[spark][convergence]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
     ConvergenceScheduler sched{*rt};
     rt->attach_rule("f1", file_spec("/a"), file_rule("f1"), true);
@@ -104,8 +105,8 @@ TEST_CASE("sweep_pending_initial services every key that still owes a first eval
 }
 
 TEST_CASE("running scheduler converges armed keys and stops cleanly", "[spark][convergence][tsan]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
     ConvergenceScheduler::Config cfg;
     cfg.service_cadence_ms = 5;
@@ -118,17 +119,17 @@ TEST_CASE("running scheduler converges armed keys and stops cleanly", "[spark][c
 
     sched.start();
     // The file lane re-evaluates /a on its cadence, independent of any event.
-    REQUIRE(wait_until([&] { return r.file_reads.load() >= 3; }));
+    REQUIRE(wait_until([&] { return r->file_reads.load() >= 3; }));
     sched.stop();
-    const int after_stop = r.file_reads.load();
+    const int after_stop = r->file_reads.load();
     std::this_thread::sleep_for(std::chrono::milliseconds{30});
-    REQUIRE(r.file_reads.load() == after_stop); // stop actually stops the lanes
+    REQUIRE(r->file_reads.load() == after_stop); // stop actually stops the lanes
 }
 
 TEST_CASE("attaching a rule while running wakes the priority lane promptly",
           "[spark][convergence][tsan]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
     ConvergenceScheduler::Config cfg;
     // Long cadences so ONLY the CV wake (not a cadence tick) can service the new rule quickly.
@@ -148,8 +149,8 @@ TEST_CASE("attaching a rule while running wakes the priority lane promptly",
 }
 
 TEST_CASE("stop is idempotent and safe before start", "[spark][convergence]") {
-    FakeReader r;
-    FakeBackend b;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
     auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
     ConvergenceScheduler sched{*rt};
     sched.stop(); // never started
