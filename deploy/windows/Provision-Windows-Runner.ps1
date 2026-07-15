@@ -168,34 +168,48 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
   $env:PGPASSWORD='postgres'
-  $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$PostgresPort")
-  if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
-    & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+  # try/finally so Remove-Item runs on every exit path, including a throw from
+  # the LASTEXITCODE checks below - same PGPASSWORD-leak class of bug the
+  # per-agent block below was fixed for; agent-0 gets the identical guard for
+  # sibling parity (Gate 4 consistency-auditor review of PR #2167).
+  try {
+    $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$PostgresPort")
+    if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
+      & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+    }
+    if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
+      & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
+    }
+    # Tune for the shared 4-runner instance: server-test suites across concurrent
+    # CCD-pinned runners exhaust the default max_connections=100, so PgPool.acquire()
+    # returns an empty lease (the CH-9 [pg][chaos] flake). logging_collector=on so a
+    # future exhaustion is diagnosable (off by default leaves no log files). Both are
+    # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
+    # $LASTEXITCODE is checked explicitly - see the per-agent block below for why
+    # $ErrorActionPreference='Continue' alone doesn't catch a failed psql.exe here.
+    & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET max_connections failed" }
+    & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET logging_collector failed" }
+    # Disposable CI cluster -> durability OFF. Every [pg] test does CREATE DATABASE
+    # ... TEMPLATE + DROP DATABASE WITH (FORCE), both fsync-heavy, and Windows fsync
+    # is ~20x costlier than Linux (the 2026-07-14 Wee Tam 600s [pg]-shard TIMEOUTs).
+    # A crash just re-runs the job. Removing these re-arms the timeout. All three
+    # are sighup/user context, so applying them to a LIVE cluster needs only a
+    # reload (`SELECT pg_reload_conf()`), no restart — the restart below is for
+    # max_connections (postmaster) and applies these in passing.
+    & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed" }
+    & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed" }
+    & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed" }
+  } finally {
+    Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
   }
-  if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
-    & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
-  }
-  # Tune for the shared 4-runner instance: server-test suites across concurrent
-  # CCD-pinned runners exhaust the default max_connections=100, so PgPool.acquire()
-  # returns an empty lease (the CH-9 [pg][chaos] flake). logging_collector=on so a
-  # future exhaustion is diagnosable (off by default leaves no log files). Both are
-  # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
-  & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
-  & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
-  # Disposable CI cluster -> durability OFF. Every [pg] test does CREATE DATABASE
-  # ... TEMPLATE + DROP DATABASE WITH (FORCE), both fsync-heavy, and Windows fsync
-  # is ~20x costlier than Linux (the 2026-07-14 Wee Tam 600s [pg]-shard TIMEOUTs).
-  # A crash just re-runs the job. Removing these re-arms the timeout. All three
-  # are sighup/user context, so applying them to a LIVE cluster needs only a
-  # reload (`SELECT pg_reload_conf()`), no restart — the restart below is for
-  # max_connections (postmaster) and applies these in passing.
-  & $psql @H -c 'ALTER SYSTEM SET fsync = off'
-  & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
-  & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
   Restart-Service $svc -Force
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
-  Remove-Item Env:\PGPASSWORD
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
