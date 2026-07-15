@@ -11,6 +11,9 @@
   in bulk. Liveness is three mechanisms: an `if: failure()` alert job (opens/updates an
   `automation-broken` issue, self-healing on green), a per-push leak scan, and a frozen parser
   fixture corpus in CI. The bundled driver also carries the one-time #2139 backfill
-  (maintainer-reviewed dry-run diff, hard-stop on any security-labelled candidate) and
-  `--undo-push` for exact-batch reversal. A deterministic zizmor guard fails any PR that deletes
-  the workflow, adds a `paths:` filter, or moves it off the `push:` trigger.
+  (maintainer-reviewed dry-run diff pinned by a plan snapshot — execution aborts if any PR body
+  changed since review; security-labelled candidates are excluded from all mutation and presented
+  for review, with a zero-mutation hard-stop if one ever reaches a mutating action; `--execute`
+  requires a verified approval-comment URL on #2139) and `--undo-push` for exact-batch reversal.
+  A deterministic zizmor guard fails any PR that deletes the workflow, adds a `paths:` filter,
+  moves it off the `push:` trigger, or adds any PR-context/dispatch/cron trigger.

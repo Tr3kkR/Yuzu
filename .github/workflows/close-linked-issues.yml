@@ -18,9 +18,12 @@ name: Close Linked Issues
 # that adds one (a filtered close workflow silently stops closing).
 #
 # Never-close rules (issue-standard.md §5.1) are enforced in the driver, which
-# FAILS CLOSED if scripts/tracker/do-not-close.txt is missing: this workflow
-# is safe to merge before or after the PR that introduces that file -- it
-# closes nothing until the never-close list exists.
+# FAILS CLOSED if scripts/tracker/do-not-close.txt is missing. MERGE ORDER IS
+# A HARD REQUIREMENT: land #2168 (which introduces that file) FIRST. Merging
+# this workflow early is safe but LOUD, not silent -- the workflow runs on the
+# very push that merges it, exits 3 on the missing list, and opens an
+# automation-broken issue on every subsequent push until the list lands; the
+# skipped ranges are then recovered by re-running the failed runs.
 #
 # Liveness is three mechanisms (A1 §11), not this file's alert job alone:
 # the `if: failure()` alert (execution failures, below), the per-push leak
@@ -46,6 +49,8 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      # issues:write -- this job's entire purpose: close/comment/label the
+      # issues that merged PRs claim.
       issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -57,6 +62,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.event.after }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
           python3 scripts/tracker/close_linked_issues.py --push "$BEFORE" "$AFTER" --execute
@@ -68,6 +74,7 @@ jobs:
       - name: Leak scan (last 50 merged PRs)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
           python3 scripts/tracker/close_linked_issues.py --leak-scan
@@ -81,10 +88,14 @@ jobs:
   alert:
     name: "Open automation-broken on failure"
     needs: [close]
-    if: failure()
+    # cancelled() too: with cancel-in-progress:false GitHub still evicts a
+    # QUEUED run when a third push arrives -- an evicted range must alert
+    # (the nightly TSan implicit-success() trap, #1038, same class).
+    if: failure() || cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      # issues:write -- opens/updates the automation-broken alert issue.
       issues: write
     steps:
       - name: Open or update automation-broken issue
@@ -93,10 +104,14 @@ jobs:
           script: |
             const label = 'automation-broken';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            // before/after are platform-controlled SHAs (same safety class as
+            // run_id) -- they identify the affected range, which is exactly
+            // what a re-run or --undo-push needs.
             const body = [
               `The close-linked-issues automation failed on a push to \`dev\`.`,
               ``,
               `**Run:** ${runUrl}`,
+              `**Range:** \`${{ github.event.before }}\`..\`${{ github.event.after }}\``,
               ``,
               `Until this is fixed, merged PRs' \`Closes #N\` declarations are NOT`,
               `being applied -- close the affected issues by hand or re-run the`,
@@ -151,6 +166,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      # issues:write -- closes the automation-broken issue after a green run.
       issues: write
     steps:
       - name: Close any open automation-broken issue

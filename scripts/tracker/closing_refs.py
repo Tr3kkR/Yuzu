@@ -12,9 +12,11 @@ Grammar: a documented SUPERSET of GitHub's closing-keyword grammar
   - keywords: close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved
     (case-insensitive, word-bounded, optional trailing colon)
   - references: #N | GH-N | owner/repo#N | https://github.com/owner/repo/issues/N
-  - the superset: comma/'and' CHAINS bound to one keyword ("Closes #1, #2 and #3")
-    -- a form this repo genuinely uses (9 of 105 refs in the dev corpus are
-    chain-only) that GitHub itself does NOT honour per-reference.
+  - the superset: CHAINS bound to one keyword ("Closes #1, #2 and #3") -- a
+    form this repo genuinely uses (9 of 105 refs in the dev corpus are
+    chain-only) that GitHub itself does NOT honour per-reference. Chain
+    separators are comma, 'and', '&', and bare whitespace: "Closes #10 #11"
+    closes BOTH here (GitHub would close only #10).
 
 Suppression (never produce a ref from):
   - fenced code blocks (``` / ~~~), inline code spans, blockquote lines,
@@ -77,7 +79,10 @@ NEGATION_WINDOW = 80  # chars back from the keyword, bounded by sentence start
 # close is caught by the leak scan; a wrong close mislabels a live issue.)
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?;\n]|\b(?:but|however|yet|although|though)\b", re.IGNORECASE)
 
-_FENCE_RE = re.compile(r"^(?:```|~~~).*?(?:^(?:```|~~~)[ \t]*$|\Z)", re.MULTILINE | re.DOTALL)
+# Backreference: a fence must be closed by ITS OWN character (CommonMark) --
+# a ``` line inside a ~~~ block is content, and letting it close the fence
+# would UN-suppress text GitHub keeps fenced (the unsafe direction).
+_FENCE_RE = re.compile(r"^(?P<fence>```|~~~).*?(?:^(?P=fence)[ \t]*$|\Z)", re.MULTILINE | re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 _BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.MULTILINE)
@@ -223,6 +228,8 @@ _SELFTEST = [
     ("closes the gap in #policy handling", []),  # keyword w/o ref
     ("Fixed #0 and #012", []),  # invalid numbers
     ("Won't fix #31; closes #32", [32]),  # negation stops at sentence boundary
+    ("~~~\ntext\n```\ncloses #2\n~~~", []),  # mismatched fence chars cannot close a fence
+    ("Closes #1 #2 & #3", [1, 2, 3]),  # whitespace/& chain separators (documented superset)
     ("Closes\n#61", []),  # GitHub requires same-line-ish adjacency; newline separates keyword from ref? -- NO: see note below
 ]
 

@@ -10,11 +10,17 @@ Modes (default is ALWAYS --dry-run; nothing mutates without --execute):
   --push BEFORE AFTER     workflow mode: close what the PRs merged by this
                           push range claim. Used by close-linked-issues.yml.
   --backfill              one-time #2139 backfill: sweep ALL merged dev PRs,
-                          list still-open claimed issues. --execute
-                          additionally requires --yes-i-reviewed (the dry-run
-                          diff is reviewed per-issue by the maintainer on
-                          #2139 first -- never a count target). In backfill
-                          mode, `security`-labelled candidates are EXCLUDED
+                          list still-open claimed issues. The dry run writes a
+                          plan snapshot (--plan FILE); --execute additionally
+                          requires --yes-i-reviewed, the SAME --plan FILE (the
+                          run aborts, exit 4, if the live plan drifted from the
+                          reviewed snapshot -- PR bodies are editable
+                          post-merge, so the diff the maintainer approved is
+                          the diff that executes), and --approval-url (the
+                          #2139 comment recording per-issue approval; verified
+                          to exist with a trusted author, and embedded in
+                          every backfill evidence comment). In backfill mode,
+                          `security`-labelled candidates are EXCLUDED
                           (printed, never mutated -- not even an advisory):
                           the maintainer reviews them in the diff instead.
   --undo-push BEFORE AFTER  recompute the closure set for an exact prior push
@@ -28,12 +34,14 @@ Modes (default is ALWAYS --dry-run; nothing mutates without --execute):
 
 Decision ladder, order load-bearing (issue-standard.md 5.1; A1 par.4-5):
   cap (>6 refs on one PR => close NOTHING for that PR, plan a cap-skip issue)
-  -> self-ref -> not-an-issue/404 -> not-open -> already-marked (idempotent,
-  TRUSTED comments only) -> `security` label => ADVISORY (push) / EXCLUDED
-  (backfill) -> `do-not-close` label or scripts/tracker/do-not-close.txt =>
-  ADVISORY -> assigned => ADVISORY -> open linked PR (full timeline, no
-  truncation) => ADVISORY -> CLOSE as completed + evidence comment +
-  `fixed-on-dev` (label tolerated missing).
+  -> 404 -> self-ref -> not-an-issue(PR) -> not-open -> already-marked
+  (idempotent, TRUSTED comments only) -> `security` label => ADVISORY (push) /
+  EXCLUDED (backfill) -> `do-not-close` label or scripts/tracker/
+  do-not-close.txt => ADVISORY -> assigned => ADVISORY -> open linked PR (full
+  timeline, no truncation) => ADVISORY -> CLOSE as completed (the state change
+  lands FIRST, then the evidence comment, then `fixed-on-dev`, label tolerated
+  missing -- comment-first would plant the idempotency marker on a still-open
+  issue if the close PATCH failed, blinding every liveness mechanism at once).
 
 Marker idempotency trusts only comments whose author is github-actions[bot]
 or whose author_association is OWNER/MEMBER/COLLABORATOR -- a drive-by
@@ -88,6 +96,9 @@ ADVISORY_MARKER = "yuzu-close-linked-advisory: pr={pr} issue={issue}"
 CAPSKIP_MARKER = "yuzu-close-linked-capskip: pr={pr}"
 UNDO_MARKER = "yuzu-close-linked-undo: pr={pr} issue={issue}"
 
+# CONTRIBUTOR is deliberately excluded (any merged-commit author gets it).
+# Note: on a user-owned repo COLLABORATOR implies explicit write access; if
+# the repo ever moves to an org with read/triage collaborator roles, revisit.
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 TRUSTED_BOT = "github-actions[bot]"
 
@@ -231,7 +242,8 @@ def merged_prs_for_range(before: str, after: str) -> list:
         raise GhError(
             f"push range {before[:10]}..{after[:10]} returned {len(commits)} commits -- at the "
             f"compare API's {COMPARE_COMMIT_CAP}-commit cap, so merged PRs may be missing. "
-            f"Refusing to run a possibly-partial close pass; run the backfill for this range."
+            f"Refusing to run a possibly-partial close pass; split the range at intermediate "
+            f"SHAs and re-run --push per sub-range."
         )
     shas = [c["sha"] for c in commits]
     prs, seen = [], set()
@@ -252,15 +264,29 @@ def merged_prs_for_range(before: str, after: str) -> list:
     return prs
 
 
-def all_merged_dev_prs() -> list:
+def all_merged_dev_prs(max_pages: int = 0) -> list:
     """Every merged dev-base PR, most recently MERGED first (the pulls API
     sorts by creation; a long-lived PR merged yesterday must not escape a
-    recency window)."""
-    prs = gh_api(
-        f"repos/{REPO}/pulls",
-        "-f", "state=closed", "-f", f"base={TARGET_BRANCH}", "-f", "per_page=100",
-        paginate=True,
-    ) or []
+    recency window). max_pages > 0 bounds the fetch for windowed callers
+    (the per-push leak scan must not paginate the repo's whole PR history);
+    0 = unbounded (the backfill needs everything)."""
+    if max_pages > 0:
+        prs = []
+        for page in range(1, max_pages + 1):
+            batch = gh_api(
+                f"repos/{REPO}/pulls",
+                "-f", "state=closed", "-f", f"base={TARGET_BRANCH}",
+                "-f", "per_page=100", "-f", f"page={page}",
+            ) or []
+            prs.extend(batch)
+            if len(batch) < 100:
+                break
+    else:
+        prs = gh_api(
+            f"repos/{REPO}/pulls",
+            "-f", "state=closed", "-f", f"base={TARGET_BRANCH}", "-f", "per_page=100",
+            paginate=True,
+        ) or []
     merged = [p for p in prs if p.get("merged_at")]
     merged.sort(key=lambda p: p["merged_at"], reverse=True)
     return merged
@@ -300,14 +326,34 @@ def add_label(n: int, label: str, execute: bool):
         print(f"  note: could not add label {label!r} to #{n} ({e}); continuing", file=sys.stderr)
 
 
-def evidence_comment(pr: dict, issue_n: int) -> str:
-    merger = (pr.get("merged_by") or {}).get("login") or "unknown"
+_full_pr_cache: dict = {}
+
+
+def merged_by_login(pr: dict) -> str:
+    """The list endpoints (compare-associated PRs, pulls?state=closed) return
+    pull-request-simple objects that OMIT merged_by entirely -- naming the
+    authorizing human requires one lazy GET of the full PR per CLOSE-carrying
+    PR (verified live: both list sources lack the field)."""
+    if pr.get("merged_by"):
+        return pr["merged_by"].get("login") or "unknown"
+    num = pr["number"]
+    if num not in _full_pr_cache:
+        _full_pr_cache[num] = gh_api(f"repos/{REPO}/pulls/{num}") or {}
+    return ((_full_pr_cache[num].get("merged_by") or {}).get("login")) or "unknown"
+
+
+def evidence_comment(pr: dict, issue_n: int, approval_url: str = "") -> str:
+    merger = merged_by_login(pr)
     sha = (pr.get("merge_commit_sha") or "")[:10]
+    approval = (
+        f"Backfill authorized per-issue by the maintainer: {approval_url}\n\n" if approval_url else ""
+    )
     return (
         f"Closed automatically by `close-linked-issues` ({run_context()}): "
         f"PR #{pr['number']} (merge `{sha}`, merged into `{TARGET_BRANCH}` by @{merger}) "
         f"declares it closes this issue.\n\n"
         f"Performed by automation; the authorizing human is the PR's merger. "
+        f"{approval}"
         f"Wrong close? Reopen and add the `do-not-close` label -- automation "
         f"never touches it again (docs/agents/issue-standard.md 5.1).\n\n"
         f"<!-- {CLOSE_MARKER.format(pr=pr['number'], issue=issue_n)} -->"
@@ -324,11 +370,18 @@ def advisory_comment(pr: dict, issue_n: int, reason: str) -> str:
     )
 
 
+CAPSKIP_TITLE_KEY = "cap-skip on PR #{pr}"  # search phrase MUST be a substring of the title
+
+
+def capskip_title(pr_number: int, ref_count: int) -> str:
+    return f"close-linked-issues: {CAPSKIP_TITLE_KEY.format(pr=pr_number)} ({ref_count} closing refs)"
+
+
 def create_capskip_issue(pr: dict, refs: list):
-    title = f"close-linked-issues: cap-skip on PR #{pr['number']} ({len(refs)} closing refs)"
+    key = CAPSKIP_TITLE_KEY.format(pr=pr["number"])
     existing = gh_api(
         "search/issues",
-        "-f", f"q=repo:{REPO} is:issue is:open in:title \"cap-skip on PR #{pr['number']}\"",
+        "-f", f"q=repo:{REPO} is:issue is:open in:title \"{key}\"",
     ) or {}
     if existing.get("total_count", 0) > 0:
         print(f"  cap-skip issue already open for PR #{pr['number']}")
@@ -339,16 +392,18 @@ def create_capskip_issue(pr: dict, refs: list):
         f"NOTHING for this PR; a human should review and close the genuine ones by hand.\n\n"
         f"Run: {run_context()}\n\n<!-- {CAPSKIP_MARKER.format(pr=pr['number'])} -->"
     )
-    gh_api(f"repos/{REPO}/issues", "-f", f"title={title}", "-f", f"body={body}", method="POST")
-    time.sleep(MUTATION_SLEEP_S)
+    # The POST returns the created issue -- label it directly rather than
+    # re-searching (the search index lags by seconds-to-minutes, which
+    # silently dropped the labels).
     created = gh_api(
-        "search/issues", "-f",
-        f"q=repo:{REPO} is:issue is:open in:title \"cap-skip on PR #{pr['number']}\"",
+        f"repos/{REPO}/issues",
+        "-f", f"title={capskip_title(pr['number'], len(refs))}", "-f", f"body={body}",
+        method="POST",
     ) or {}
-    items = created.get("items") or []
-    if items:
+    time.sleep(MUTATION_SLEEP_S)
+    if created.get("number"):
         for lbl in ("needs-triage", "P2"):
-            add_label(items[0]["number"], lbl, True)
+            add_label(created["number"], lbl, True)
 
 
 # ---------------------------------------------------------------------------
@@ -413,21 +468,37 @@ def print_plan(plan: list):
         print(f"  {action:8} #{n:<5} (PR #{pr['number']}) [{labels}] {title!r} -- {reason}")
 
 
-def apply_plan(plan: list, execute: bool):
-    """The ONLY mutating phase. Callers must have run assert_plan_safe first."""
+def apply_plan(plan: list, execute: bool, approval_url: str = ""):
+    """The ONLY mutating phase. Callers must have run assert_plan_safe first.
+
+    Order within a CLOSE is load-bearing: the STATE CHANGE lands first, the
+    evidence comment (which carries the idempotency marker) second. The
+    reverse would plant the marker on a still-open issue whenever the close
+    PATCH failed mid-batch -- and a marked-but-open issue is invisible to the
+    re-run, the leak scan, AND the alert's green follow-up simultaneously.
+    A closed-but-uncommented issue (comment failed after close) is the benign
+    orphan: the per-mutation progress lines below tell the operator exactly
+    which comment to post by hand."""
     closed = advised = capskips = 0
     for pr, n, action, reason, issue in plan:
         if action == CLOSE:
-            post_comment(n, evidence_comment(pr, n), execute)
             close_issue(n, execute)
+            if execute:
+                print(f"  closed #{n} (PR #{pr['number']})", flush=True)
+            post_comment(n, evidence_comment(pr, n, approval_url), execute)
+            if execute:
+                print(f"  evidence comment posted on #{n}", flush=True)
             add_label(n, "fixed-on-dev", execute)
             closed += 1
         elif action == ADVISORY:
             post_comment(n, advisory_comment(pr, n, reason), execute)
+            if execute:
+                print(f"  advisory posted on #{n} (PR #{pr['number']})", flush=True)
             advised += 1
         elif action == CAPSKIP:
             if execute:
                 create_capskip_issue(pr, issue["refs"])
+                print(f"  cap-skip issue filed for PR #{pr['number']}", flush=True)
             else:
                 print(f"  [dry-run] would open cap-skip issue for PR #{pr['number']}")
             capskips += 1
@@ -436,6 +507,35 @@ def apply_plan(plan: list, execute: bool):
     excluded = sum(1 for p in plan if p[2] == EXCLUDED)
     print(f"{mode}: {closed} close(s), {advised} advisory comment(s), {capskips} cap-skip(s), "
           f"{skips} skip(s), {excluded} excluded (security, backfill)")
+
+
+def plan_snapshot(plan: list) -> list:
+    """The reviewable identity of a plan: sorted (pr, issue, action) triples.
+    PR bodies are editable post-merge, so --backfill --execute refuses to run
+    against anything but the exact snapshot the maintainer reviewed."""
+    return sorted(
+        [pr["number"], n if n is not None else 0, action]
+        for pr, n, action, _r, _i in plan
+        if action != SKIP
+    )
+
+
+def verify_approval_url(url: str) -> bool:
+    """The --approval-url must be a comment on the tracking issue (#2139) by a
+    trusted author -- converting --yes-i-reviewed from attestation into a
+    reference to a durable record (A1 par.4)."""
+    if "#issuecomment-" not in url:
+        return False
+    comment_id = url.rsplit("#issuecomment-", 1)[1].strip("/")
+    if not comment_id.isdigit():
+        return False
+    c = gh_api(f"repos/{REPO}/issues/comments/{comment_id}")
+    if not c:
+        return False
+    login = ((c.get("user") or {}).get("login")) or ""
+    assoc = c.get("author_association") or ""
+    on_2139 = (c.get("issue_url") or "").endswith("/issues/2139")
+    return on_2139 and (login == TRUSTED_BOT or assoc in TRUSTED_ASSOCIATIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +555,23 @@ def mode_push(before: str, after: str, execute: bool) -> int:
     return 0
 
 
-def mode_backfill(execute: bool, reviewed: bool) -> int:
+def mode_backfill(execute: bool, reviewed: bool, plan_file: str, approval_url: str) -> int:
     dnc = load_do_not_close()
-    if execute and not reviewed:
-        print("--backfill --execute requires --yes-i-reviewed: the dry-run diff is "
-              "reviewed per-issue by the maintainer on #2139 first (A1 par.4).")
-        return 2
+    if execute:
+        if not reviewed:
+            print("--backfill --execute requires --yes-i-reviewed: the dry-run diff is "
+                  "reviewed per-issue by the maintainer on #2139 first (A1 par.4).")
+            return 2
+        if not plan_file or not pathlib.Path(plan_file).exists():
+            print("--backfill --execute requires --plan FILE (the snapshot the dry run wrote "
+                  "and the maintainer reviewed) -- PR bodies are editable post-merge, so "
+                  "execution is pinned to the reviewed diff, not to a live re-parse.")
+            return 2
+        if not approval_url or not verify_approval_url(approval_url):
+            print("--backfill --execute requires --approval-url pointing at the maintainer's "
+                  "per-issue approval comment on #2139 (a trusted-author comment; verified "
+                  "via the API). This converts the flag into a reference to a durable record.")
+            return 2
     prs = all_merged_dev_prs()
     print(f"scanning {len(prs)} merged {TARGET_BRANCH}-base PRs...")
     plan = build_plan(prs, dnc, backfill=True)
@@ -469,7 +580,19 @@ def mode_backfill(execute: bool, reviewed: bool) -> int:
     print(f"\nbackfill plan ({len(live)} item(s)), most dangerous first "
           f"(EXCLUDED = security-labelled, reviewed here, never mutated):")
     print_plan(live)
-    apply_plan(plan, execute)
+    snapshot = plan_snapshot(plan)
+    if execute:
+        reviewed_snapshot = json.loads(pathlib.Path(plan_file).read_text(encoding="utf-8"))
+        if reviewed_snapshot != snapshot:
+            print("FATAL: the live plan DIFFERS from the reviewed snapshot -- a PR body or "
+                  "issue state changed since the dry run (post-merge body edits are the "
+                  "known attack shape). Zero mutations. Re-run the dry run, re-review, "
+                  "re-execute.", file=sys.stderr)
+            sys.exit(4)
+    elif plan_file:
+        pathlib.Path(plan_file).write_text(json.dumps(snapshot, indent=1), encoding="utf-8")
+        print(f"plan snapshot written to {plan_file} (pass the same file to --execute)")
+    apply_plan(plan, execute, approval_url=approval_url or "")
     return 0
 
 
@@ -492,8 +615,9 @@ def mode_undo_push(before: str, after: str, execute: bool) -> int:
             if execute:
                 gh_api(f"repos/{REPO}/issues/{n}", "-f", "state=open", method="PATCH")
                 time.sleep(MUTATION_SLEEP_S)
-                post_comment(n, f"Reopened by `close-linked-issues --undo-push` for PR #{pr['number']}."
-                                f"\n\n<!-- {UNDO_MARKER.format(pr=pr['number'], issue=n)} -->", execute)
+                post_comment(n, f"Reopened by `close-linked-issues --undo-push` for PR #{pr['number']} "
+                                f"({run_context()}).\n\n"
+                                f"<!-- {UNDO_MARKER.format(pr=pr['number'], issue=n)} -->", execute)
                 add_label(n, "needs-triage", execute)
                 try:
                     gh_api(f"repos/{REPO}/issues/{n}/labels/fixed-on-dev", method="DELETE")
@@ -510,13 +634,19 @@ def mode_leak_scan(window: int) -> int:
     window -- i.e. an earlier run failed. Uses build_plan, the same path as
     the close job, so a protected/advisory item can never be a false leak."""
     dnc = load_do_not_close()
-    prs = all_merged_dev_prs()[:window]
+    # 3 pages of 100 comfortably covers any 50-PR merge window without
+    # paginating the repo's entire PR history on every push.
+    prs = all_merged_dev_prs(max_pages=max(3, (window * 2) // 100 + 1))[:window]
     plan = build_plan(prs, dnc)
-    leaks = [(pr["number"], n) for pr, n, action, _r, _i in plan if action == CLOSE]
+    leaks = [(pr, n) for pr, n, action, _r, _i in plan if action == CLOSE]
     if leaks:
         print(f"LEAK: {len(leaks)} claimed-but-open issue(s) the ladder would close now:")
-        for pr_n, n in leaks:
-            print(f"  #{n} (claimed by merged PR #{pr_n})")
+        for pr, n in leaks:
+            edited = ""
+            if (pr.get("updated_at") or "") > (pr.get("merged_at") or ""):
+                edited = (" [PR updated after merge -- bodies are editable post-merge; "
+                          "check the edit history before closing #%d by hand]" % n)
+            print(f"  #{n} (claimed by merged PR #{pr['number']}){edited}")
         return 1
     print(f"leak scan clean over the {len(prs)} most recently merged PRs")
     return 0
@@ -532,6 +662,11 @@ def main(argv=None) -> int:
     ap.add_argument("--execute", action="store_true", help="mutate (default: dry-run)")
     ap.add_argument("--yes-i-reviewed", action="store_true",
                     help="backfill only: confirm the dry-run diff was reviewed per-issue")
+    ap.add_argument("--plan", default="",
+                    help="backfill: dry-run writes the plan snapshot here; --execute requires "
+                         "the same file and aborts on drift")
+    ap.add_argument("--approval-url", default="",
+                    help="backfill --execute: URL of the maintainer's approval comment on #2139")
     ap.add_argument("--window", type=int, default=LEAK_SCAN_WINDOW)
     args = ap.parse_args(argv)
 
@@ -539,7 +674,7 @@ def main(argv=None) -> int:
         if args.push:
             return mode_push(args.push[0], args.push[1], args.execute)
         if args.backfill:
-            return mode_backfill(args.execute, args.yes_i_reviewed)
+            return mode_backfill(args.execute, args.yes_i_reviewed, args.plan, args.approval_url)
         if args.undo_push:
             return mode_undo_push(args.undo_push[0], args.undo_push[1], args.execute)
         if args.leak_scan:

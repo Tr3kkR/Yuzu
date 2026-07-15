@@ -71,6 +71,8 @@ PARSER_CORPUS = [
     ("relates-to never fires", "Relates to #99. Part of #98.", []),
     ("no leading zeros / no #0", "Fixed #0 and #012", []),
     ("dedupe preserves order", "Closes #5, #4, #5", [5, 4]),
+    ("mismatched fence chars stay fenced", "~~~\ntext\n```\ncloses #2\n~~~", []),
+    ("whitespace/& chain separators", "Closes #1 #2 & #3", [1, 2, 3]),
 ]
 
 
@@ -289,6 +291,119 @@ def run_plan_tests(failures):
         failures.append(f"cap: 7-ref PR must plan exactly one CAPSKIP, got {plan}")
 
 
+def run_range_tests(failures):
+    """merged_prs_for_range: truncation abort, zero-SHA short-circuit,
+    base-branch filter, earlier-push merge-sha dedupe (quality S1)."""
+    def fake_gh(path, *args, **kw):
+        if path.startswith(f"repos/{cli.REPO}/compare/"):
+            return fake_gh.compare
+        if "/commits/" in path and path.endswith("/pulls"):
+            sha = path.split("/commits/")[1].rsplit("/", 1)[0]
+            return fake_gh.assoc.get(sha, [])
+        raise AssertionError(f"unexpected gh path {path}")
+
+    saved = cli.gh_api
+    cli.gh_api = fake_gh
+    try:
+        # zero-SHA before (branch-creation push) -> no PRs, no API calls
+        if cli.merged_prs_for_range("0" * 40, "b" * 40) != []:
+            failures.append("range: all-zero BEFORE must return []")
+        # truncation: >= 250 commits aborts
+        fake_gh.compare = {"commits": [{"sha": f"{i:040x}"} for i in range(250)]}
+        fake_gh.assoc = {}
+        try:
+            cli.merged_prs_for_range("a" * 40, "b" * 40)
+            failures.append("range: 250-commit compare must raise GhError")
+        except cli.GhError:
+            pass
+        # filtering: wrong base / unmerged / merge-sha outside range all drop
+        s1, s2 = "1" * 40, "2" * 40
+        fake_gh.compare = {"commits": [{"sha": s1}, {"sha": s2}]}
+        fake_gh.assoc = {
+            s1: [
+                {"number": 1, "merged_at": "x", "base": {"ref": "dev"}, "merge_commit_sha": s1},
+                {"number": 2, "merged_at": "x", "base": {"ref": "main"}, "merge_commit_sha": s1},
+                {"number": 3, "merged_at": None, "base": {"ref": "dev"}, "merge_commit_sha": s1},
+            ],
+            s2: [
+                {"number": 4, "merged_at": "x", "base": {"ref": "dev"}, "merge_commit_sha": "9" * 40},
+            ],
+        }
+        got = [p["number"] for p in cli.merged_prs_for_range("a" * 40, "b" * 40)]
+        if got != [1]:
+            failures.append(f"range: filters must keep only PR 1, got {got}")
+    finally:
+        cli.gh_api = saved
+
+
+def run_undo_tests(failures):
+    """mode_undo_push reopens ONLY automation-closed (trusted-marker) issues
+    (quality S2). Dry-run path, no mutations."""
+    import contextlib
+    import io
+
+    marker = "<!-- yuzu-close-linked: pr=600 issue=70 -->"
+    trusted = [{"user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+                "body": marker}]
+    spoofed = [{"user": {"login": "driveby"}, "author_association": "NONE",
+                "body": "<!-- yuzu-close-linked: pr=600 issue=71 -->"}]
+    world = _FakeWorld(
+        issues={70: _issue(70, state="closed"), 71: _issue(71, state="closed"),
+                72: _issue(72, state="open")},
+        comments={70: trusted, 71: spoofed,
+                  72: [{"user": {"login": "github-actions[bot]"}, "author_association": "NONE",
+                        "body": "<!-- yuzu-close-linked: pr=600 issue=72 -->"}]},
+    )
+    saved = cli.merged_prs_for_range
+    cli.merged_prs_for_range = lambda b, a: [_pr(600, "Closes #70, #71, #72")]
+    try:
+        with world:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                # bypass load_do_not_close (network-free): point at a temp file
+                real_dnc = cli.DNC_PATH
+                with tempfile.TemporaryDirectory() as td:
+                    cli.DNC_PATH = pathlib.Path(td) / "do-not-close.txt"
+                    cli.DNC_PATH.write_text("1\n", encoding="utf-8")
+                    try:
+                        cli.mode_undo_push("a" * 40, "b" * 40, execute=False)
+                    finally:
+                        cli.DNC_PATH = real_dnc
+            text = out.getvalue()
+        if "would reopen #70" not in text:
+            failures.append(f"undo: trusted-marker closed issue must reopen; got: {text!r}")
+        if "would reopen #71" in text:
+            failures.append("undo: spoofed marker must NOT reopen")
+        if "would reopen #72" in text:
+            failures.append("undo: open issue must not reopen")
+    finally:
+        cli.merged_prs_for_range = saved
+
+
+def run_snapshot_and_misc_tests(failures):
+    """Backfill plan-snapshot identity (UP-6a), capskip title/search coupling,
+    approval-url shape rejection (no network for bad shapes)."""
+    plan_a = [(_pr(1, ""), 5, cli.CLOSE, "r", _issue(5)),
+              (_pr(1, ""), 6, cli.SKIP, "r", _issue(6))]
+    plan_b = [(_pr(1, ""), 5, cli.ADVISORY, "r", _issue(5))]
+    snap_a, snap_b = cli.plan_snapshot(plan_a), cli.plan_snapshot(plan_b)
+    if snap_a == snap_b:
+        failures.append("snapshot: differing plans must differ")
+    if snap_a != cli.plan_snapshot(list(plan_a)):
+        failures.append("snapshot: identical plans must match")
+    if any(row[2] == cli.SKIP for row in snap_a):
+        failures.append("snapshot: SKIP rows must not be part of the reviewed identity")
+
+    key = cli.CAPSKIP_TITLE_KEY.format(pr=123)
+    if key not in cli.capskip_title(123, 7):
+        failures.append("capskip: search key must be a substring of the generated title")
+
+    for bad in ("", "https://github.com/Tr3kkR/Yuzu/issues/2139",
+                "https://github.com/Tr3kkR/Yuzu/issues/2139#issuecomment-notanumber"):
+        if cli.verify_approval_url(bad):
+            failures.append(f"approval-url: {bad!r} must be rejected")
+
+
 def main() -> int:
     failures = []
     run_parser_corpus(failures)
@@ -296,6 +411,9 @@ def main() -> int:
     run_dnc_failclosed_tests(failures)
     run_cap_tests(failures)
     run_plan_tests(failures)
+    run_range_tests(failures)
+    run_undo_tests(failures)
+    run_snapshot_and_misc_tests(failures)
     if failures:
         print(f"close-automation checks FAILED ({len(failures)}):")
         for f in failures:
