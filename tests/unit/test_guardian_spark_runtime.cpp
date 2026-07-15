@@ -253,27 +253,51 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = 1;
+    cfg.outbox_capacity = 2; // the floor; three drifting keys exceed it
     auto rt = make_rt(r, b, cfg);
-    const auto k1 = spark_key(file_spec("/a"));
-    const auto k2 = spark_key(file_spec("/b"));
+    const auto k3 = spark_key(file_spec("/c"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true); // drifts
     rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true); // drifts
-    r->file = read_known(FileSnapshot{.exists = true}); // present -> both rules drift (expect absent)
+    rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3", /*present=*/false), true); // drifts
+    r->file = read_known(FileSnapshot{.exists = true}); // present -> all rules drift (expect absent)
 
-    rt->evaluate_key(k1, EvalReason::Initial); // fills the single slot
-    REQUIRE(rt->outbox_size() == 1);
-    rt->evaluate_key(k2, EvalReason::Initial); // rejected at cap -> r2 left pending
-    REQUIRE(rt->outbox_size() == 1);
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // slot 1
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial); // slot 2 (full)
+    REQUIRE(rt->outbox_size() == 2);
+    rt->evaluate_key(k3, EvalReason::Initial); // rejected at cap -> r3 left pending
+    REQUIRE(rt->outbox_size() == 2);
     REQUIRE(rt->outbox_backpressure_drops() == 1);
-    REQUIRE(rt->pending_initial(k2) == std::vector<std::string>{"r2"}); // still owes a verdict
+    REQUIRE(rt->pending_initial(k3) == std::vector<std::string>{"r3"}); // still owes a verdict
 
-    drain_all(*rt);                                // frees the slot
-    rt->evaluate_key(k2, EvalReason::Convergence); // now r2's drift lands
+    drain_all(*rt);                                // frees the slots
+    rt->evaluate_key(k3, EvalReason::Convergence); // now r3's drift lands
     const auto got = drain_all(*rt);
     REQUIRE(got.size() == 1);
-    REQUIRE(got[0].rule_id == "r2");
-    REQUIRE(rt->pending_initial(k2).empty());
+    REQUIRE(got[0].rule_id == "r3");
+    REQUIRE(rt->pending_initial(k3).empty());
+}
+
+TEST_CASE("a configured capacity below two is floored so a recovery pair can never be lost",
+          "[spark][runtime]") {
+    // A recovery emits TWO entries (guard.healthy + verdict). A cap of 1 would reject
+    // the pair on every retry forever. The runtime floors the capacity at 2.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1; // deliberately below the floor
+    auto rt = make_rt(r, b, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io"); // errored -> health(false)
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery to a DRIFT -> health(true)+drift
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto g = drain_all(*rt);
+    REQUIRE(g.size() == 2); // the pair landed - not permanently rejected
+    REQUIRE(rt->pending_initial(key).empty());
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {

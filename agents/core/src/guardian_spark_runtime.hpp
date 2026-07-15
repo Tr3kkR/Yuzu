@@ -131,6 +131,12 @@ using RuntimeClock = std::function<std::chrono::steady_clock::time_point()>;
 
 class YUZU_EXPORT GuardianSparkRuntime : public std::enable_shared_from_this<GuardianSparkRuntime> {
 public:
+    /// A recovery emits a PAIR of entries (guard.healthy + the verdict) that
+    /// enqueue_all lands atomically, so the outbox must always hold at least two -
+    /// a smaller cap would reject every recovery forever (permanent health-recovery
+    /// loss). The constructor floors the configured capacity at this.
+    static constexpr std::size_t kMinOutboxCapacity = 2;
+
     struct Config {
         std::size_t outbox_capacity{4096};
     };

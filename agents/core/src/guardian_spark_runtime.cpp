@@ -19,7 +19,8 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
     : reader_(std::move(reader)), backend_(std::move(backend)),
       clock_(clock ? std::move(clock)
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
-      index_(std::make_unique<SparkKeyRuleIndex>()), outbox_(cfg.outbox_capacity) {}
+      index_(std::make_unique<SparkKeyRuleIndex>()),
+      outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
 
 GuardianSparkRuntime::~GuardianSparkRuntime() {
     // No in-flight pass can be running: a pass keeps the runtime alive through the
