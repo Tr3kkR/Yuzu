@@ -57,10 +57,22 @@ $ProgressPreference    = 'SilentlyContinue'
 New-Item -ItemType Directory -Force 'C:\ProvisionLogs' | Out-Null
 Start-Transcript -Path "C:\ProvisionLogs\provision-$(Get-Date -Format yyyyMMdd-HHmmss).log" | Out-Null
 
+$script:failedSteps = @()
 function Step([string]$name,[scriptblock]$body){
+  # Every Step still runs regardless of an earlier one's failure (unchanged
+  # semantics) - only the PROCESS exit code changes. Before this, a failed
+  # Step printed red [FAIL] but the script always exited 0, so nothing
+  # calling this non-interactively (a wrapper, a scheduled reconciliation
+  # job) could tell success from failure - adversarial review v2 F3',
+  # PR #2167. $script: is required: Step is a function, so a bare
+  # $failedSteps assignment in the catch below would be local to that one
+  # call and never accumulate across Step() invocations.
   Write-Host "`n===== $name =====" -ForegroundColor Cyan
   try   { & $body; Write-Host "[OK]  $name" -ForegroundColor Green }
-  catch { Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red }
+  catch {
+    Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red
+    $script:failedSteps += $name
+  }
 }
 function WG([string]$id,[string]$ver='',[string]$override='',[string]$scope='machine'){
   $a=@('install','--id',$id,'-e','--source','winget','--accept-source-agreements','--accept-package-agreements','--disable-interactivity')
@@ -429,6 +441,11 @@ Step "emit toolchain manifest -> $ManifestPath" {
 }
 
 Stop-Transcript | Out-Null
+if($script:failedSteps.Count -gt 0){
+  Write-Host "`n$($script:failedSteps.Count) step(s) FAILED: $($script:failedSteps -join ', ')" -ForegroundColor Red
+  Write-Host "See the transcript in C:\ProvisionLogs\ for details. Steps are idempotent - re-run this script to retry." -ForegroundColor Red
+  exit 1
+}
 Write-Host "`nDone. Transcript in C:\ProvisionLogs\. Open a NEW shell so machine PATH/env take effect." -ForegroundColor Yellow
 Write-Host "Verify: pwsh -File deploy\windows\Assert-Toolchain.ps1 -ManifestPath $ManifestPath" -ForegroundColor Yellow
 Write-Host "Next: register the 4 CCD-pinned runners — see deploy\windows\README.md + Start-PinnedRunner.ps1." -ForegroundColor Yellow
