@@ -84,7 +84,7 @@ Every other layer — a credential, a Module, an approval — may only *reduce* 
 ```
 effective authority =
     authenticated-actor grants
-  ∩ represented-operator grants      (when the action represents an operator)
+  ∩ represented-operator grants      (when an operator is represented)
   ∩ attenuated-credential grants     (when a credential is presented)
   ∩ Module envelope                  (when a Module capability is invoked)
   ∩ execution authorisation          (when the operation is a protected effect)
@@ -366,7 +366,7 @@ only seam that touches endpoints:
   successor** - a credential the auth store records as succeeding the approved one under a
   **credential-level predecessor/successor relation with a terminal-reason classification**
   (`rotation_superseded` vs `compromise`). That relation is a **new required mechanism** (interlock
-  item (n)), **not** the existing 2b §7 `superseded_by`, which links *engine-principal* successors
+  item (n)), **not** the existing 2b §3.1 `superseded_by` (defined on `EnginePrincipalStore`), which links *engine-principal* successors
   after *terminal* revocation (compromise recovery included) and would wrongly treat a post-compromise
   replacement as the approval-preserving successor. Rebind additionally requires **equal-or-narrower
   attenuation**, an **unchanged plan hash**, and a **fresh MFA step-up** - then it is an audited

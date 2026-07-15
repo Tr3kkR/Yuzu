@@ -250,7 +250,7 @@ Two properties are load-bearing:
   does not need a long-lived credential, and a **stolen invocation grant expires without carrying
   the run with it**.
 
-**The invocation grant is one-use too, via the state machine you already have.** The engine's first
+**The invocation grant is one-use too, via the guarded-transition pattern you already have.** The engine's first
 core call on a run performs the guarded `admitted → executing` transition (Decision 5); a call
 presenting a grant for a run **not** in `admitted` is refused. Without that, presentation could
 replay one grant inside its TTL and open N concurrent executions on one run id — N sets of fact
@@ -437,7 +437,7 @@ attenuated read-only worker token that arms a schedule would **launder every run
 its own attenuation** — the token cannot do the thing, but the schedule it armed can. **Revocation, deletion and expiry all
 read the same way - the credential no longer authorises, so the schedule STOPS.** Rotation splits from
 them: a **routine rotation** with a recorded successor (the new credential-level successor +
-terminal-reason relation, interlock item (n) - not 2b §7's engine-principal `superseded_by`) re-binds
+terminal-reason relation, interlock item (n) - not 2b §3.1's engine-principal `superseded_by`) re-binds
 the schedule to the successor as an atomic audited authority change and it keeps running; a **compromise revocation** has no
 successor for this purpose and stops the schedule like any other revocation. Core keys this on the
 recorded `rotation_superseded`-vs-`compromise` classification, never on "same owner" (the twin of
@@ -679,8 +679,8 @@ of behavioural reads, and it must not inherit that pattern. **No release without
   **not the field-level payload**. That is the honest scope, and it is what a DSAR actually needs;
   promising field-level recall the log does not hold would be worse than a precise answer.
 
-**Every confined fact read returns a confinement basis marker, and core — not the engine — computes
-it.** This is the quietest and most dangerous hole in the protocol, so it is closed here explicitly.
+**Every confined fact read returns a `scope_basis` confinement marker, and core — not the engine —
+computes it.** This is the quietest and most dangerous hole in the protocol, so it is closed here explicitly.
 Confinement *removes rows*. If core hands back only the rows the operator may see with no marker, then
 an `authority_scoped` "no vulnerable devices" is **the same bytes** as a global "no vulnerable
 devices" - and an answer that covers only the caller's cohort gets read as a clean bill of health for
@@ -944,8 +944,8 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | **(h)** | **The runtime capability-declaration registry** (core's ratified-mapping table), **and the credential columns** (the run row's admitting-credential id + frozen grant snapshot, and the Execution Plan's requesting-credential id — Decision 0's credential filter has nowhere to live without them, at seams 2 and 5) | Gates **admission itself**. Decisions 1, 5 and 13 read the risk tier, the TTL and the mutability class from *core's ratified copy*. There is no such copy: securable types are a hard-coded C++ array (`rbac_store.cpp:217-244`, 21 entries) with **no runtime create path**. Without (h) the first implementation reads the manifest — which is the S4 failure this ADR rejects by name. | Unbuilt. ADR-0033 §2 calls it "the precondition for every rule in this section" and it appeared in no gate until now. |
 | **(i)** | **Execution semantics: outcome correlation + the coverage envelope** | Gates **every distributed fact read and every effect**. ADR-0033 §10 requires `intended/contacted/responded/failed/timed_out`, and D11's Execution Plan requires a real outcome. The workflow engine marks a step **successful on dispatch** (`workflow_engine.cpp`) and does not correlate an `execution_id`. A finalisation receipt over that attests effects nobody confirmed, and "no vulnerable devices found" becomes indistinguishable from "62 devices never answered" — the exact sentence ADR-0033 §10 exists to forbid. | Coverage fields: zero occurrences in the tree. Dispatch-vs-outcome correlation: unwired. This is the memorandum's "repair execution semantics" step, now a gate. |
 | **(j)** | **Capability projection** — generated OpenAPI + generated `tools/list` from core's registry | Gates **the agentic surface**, i.e. the thing voiding F-10 was for. `tools/list` iterates a **compile-time array** (`mcp_server.cpp`) and the OpenAPI document is a hand-typed literal (`rest_api_v1.cpp`). Activate a module today and its capabilities appear on **neither**. Without (j), an engine is reachable by nobody, and INV-31-4's contract test cannot exist either — you cannot diff registered routes against a hand-written document. | Unbuilt. |
-| **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
 | **(k)** | **Operational readiness** — the new stores in the readiness conjunction, and the reaper's liveness alert | Gates **admitting a run in anger**. Six new stores (run, release log, grants/receipts, approvals, plans, declarations) and none is in `/readyz`'s `stores_ok` conjunction; the reaper has no liveness signal, and its death strands terminal evidence and cleanup (read authority itself is denied inline by the `now < expires_at` check of Decision 4/5, not by the reaper). Every row in that conjunction was added because a store died and the server reported healthy. | Unbuilt. Metric names in Decision 5. |
+| **(l)** | **Intra-module cross-run isolation** — per-tenant or per-run process isolation | Gates **any module whose concurrent scope ceilings span operators who must not be blended.** Filter (0) stops a cross-*module* pivot and explicitly does **not** stop an intra-module one (Decision 4): a compromised module can present the id of any run it is concurrently executing. The containment is isolation, not another filter — and the first module (vulnerability management) will serve many operators from one deployment, so this is not hypothetical. A module that cannot isolate must **declare single-tenant-per-deployment** and be deployed that way. Recorded as a gate because ADR-0031 named the same class of gap in prose once already, and prose is what this interlock exists to replace. | Nothing exists; no engine code is written, so it is free now. |
 | **(m)** | **Per-principal quota caps** (2b PR 4.4, #1973): the **minimum per-principal concurrency/quota cap** #1973 names as a production prerequisite, plus the 2b §5 invocation-grant outstanding-count and issuance-rate caps and dual-side debit under delegation | Gates **admitting a run in production**. "Many small runs" (Decision 1) makes the admit path the throughput ceiling, and idempotency does not bound a caller minting distinct keys; ADR-1005 makes the per-principal cap a production prerequisite, and this interlock omitted it. **Scope note:** broader admission-rate / active-run / concurrent-fact-read / core-and-engine fan-out capacity policy - split by credential, engine principal, module and deployment - is a **separate** capacity decision, not settled here. | 2b/#1973 name these caps; none is enforced for engine principals today. |
 | **(n)** | **A credential-level predecessor/successor relation + terminal-reason classification** (`rotation_superseded` vs `compromise`) on the credential classes that arm schedules and request Execution Plans, **with an authorized+audited classification-setting action (never self-set by the holder) and a retroactive reclassify-to-`compromise` path that voids rebound plans** | Gates **any approval-preserving rebind of a schedule or plan across a credential change** (ADR-0033 §8; Decision 7). Without it, core cannot tell a routine rotation from a compromise revocation, and "same owner" would let a compromise-revoked credential's replacement resurrect an approved effect. 2b's existing `superseded_by` is an engine-principal terminal successor, not this. | Unbuilt; 2b must be amended to add it. |
 
@@ -962,8 +962,8 @@ only if it does not walk them:
 | **(g)** | any module that **persists derived state across runs**. |
 | **(i)** | any **distributed** fact read, and any **effect**. |
 | **(j)** | the **agentic surface** — REST/MCP projection of engine capabilities. |
-| **(l)** | any module serving **more than one operator's runs concurrently from one deployment**. |
 | **(k)** | admitting a run **in production**. |
+| **(l)** | any module serving **more than one operator's runs concurrently from one deployment**. |
 | **(m)** | admitting a run **in production** (joins (k)) - the per-principal invocation-grant caps. |
 | **(n)** | approval-preserving rebind of a schedule or plan across a credential rotation (else every credential change forces fresh four-eyes). |
 
