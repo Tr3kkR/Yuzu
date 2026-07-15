@@ -11,6 +11,8 @@ one-shot `create_issues.sh` backfill.
 | `close_linked_issues.py` | PR 2 | The driver behind `.github/workflows/close-linked-issues.yml`: `--push` (workflow), `--backfill` (one-time #2139 sweep; the dry run writes a `--plan` snapshot, and `--execute` needs `--yes-i-reviewed` + the same `--plan` (aborts on drift — PR bodies are editable post-merge) + a verified `--approval-url` on #2139; security-labelled candidates are EXCLUDED — reviewed in the diff, never mutated), `--undo-push` (reopen an exact prior batch), `--leak-scan` (completeness backstop). Always dry-run unless `--execute`. **Fails closed** if `do-not-close.txt` is missing or unparseable. |
 | `do-not-close.txt` | PR 1 (#2168) | The committed never-close list — issue numbers no automation may ever close (issue-standard.md §5.1). Number-keyed because labels have been wrong before. Only a reviewed PR changes it; the `do-not-close` *label* is the maintainer's instant, no-PR marker (union semantics). |
 | `bootstrap-labels.sh` | PR 1 (#2168) | Idempotent creation of the six automation labels. Run at PR-1 merge, before the first agent filing. |
+| `tracker_report.py` | PR 4 | The weekly dashboard generator behind `.github/workflows/tracker-report.yml`: **read-only, no-LLM**. Telemetry (all gauges on the active set, `is:open -label:roadmap`), leak scan (reuses `build_plan`, so it can never disagree with the close path), issue-standard §4 label-hygiene invariants, duplicate candidates (shared file citation), and a closure-integrity sample. Emits markdown + a candidate-set `report_hash`; mutates nothing. |
+| `apply_decisions.py` | PR 4 | The **only** mutating tracker layer — operator-run, **fail-closed**. Applies a reviewed `decisions.json` from `/issue-triage`: dry-run by default, `--execute` needs a matching `--snapshot`, `--revert <run-id>` reverses an exact batch. Refuses the whole run (zero mutations) on any of R1–R7 (cap, never-close member, unverified security/P0/P1, roadmap-in-judgment, assigned/linked-PR, stale/breach, stale report). Posts a per-run ledger to the `triage-sweep` issue **before** any close. |
 
 Never-close ladder, order load-bearing (see `close_linked_issues.py`):
 cap → 404 → self-ref → not-an-issue(PR) → not-open → marker-idempotent →
@@ -43,6 +45,44 @@ until the list lands; recover skipped ranges by re-running those runs.
 `github-actions[bot]` comment — bot comments are marker-trusted for
 idempotency, so a workflow that echoes user text would become a
 marker-forgery oracle.
+
+## Weekly report → operator decisions (PR 4)
+
+The sweep is a **workflow for the reporting, a human for the judgment** (A1 §10);
+there is **no autonomous closure tier** and none is coming — once close-on-merge
+is live, an issue a claiming-PR probe finds still-open is one the *primary*
+automation failed on, so closing it autonomously would destroy the evidence.
+
+1. **`tracker-report.yml`** (weekly cron; dormant until it reaches `main`, run
+   locally meanwhile) runs `tracker_report.py` and posts the dashboard as one
+   comment to the `triage-sweep` tracking issue. Read-only: it closes nothing.
+   The comment footer carries `<!-- yuzu-tracker-report: hash=<h> run=<id> -->`;
+   the hash covers only the flagged candidate set, so a re-run over an unchanged
+   set is byte-stable.
+2. **`/issue-triage`** (on-demand skill, run when the report flags judgment work)
+   presents the candidates most-dangerous-first and writes a `decisions.json`
+   carrying that `report_hash`. Held-open issues are printed, never proposed;
+   security/P0/P1 closes are capped at 3 and each needs a typed
+   `verified_gone_at` line. It mutates nothing.
+3. **`apply_decisions.py`** applies the reviewed list. Dry-run → review the diff
+   → `--execute`. It re-validates every fail-closed rule against **live** state
+   and refuses the whole batch (exit 4, zero mutations) on any violation; it
+   fails closed (exit 3) if `do-not-close.txt` is unreadable, exactly like the
+   close driver. `--revert <run-id>` reopens exactly the batch a ledger records,
+   each reopen gated on this run's own trusted close marker.
+
+Local run:
+
+```bash
+python scripts/tracker/tracker_report.py --out dashboard.md          # generate the dashboard
+python scripts/tracker/apply_decisions.py --decisions d.json --snapshot s.json           # dry-run
+python scripts/tracker/apply_decisions.py --decisions d.json --snapshot s.json --execute # apply
+python scripts/tracker/apply_decisions.py --revert <run-id>          # reverse a batch
+```
+
+**Marker namespaces** (distinct from the close driver's `yuzu-close-linked*`):
+`yuzu-tracker-report` (dashboard hash), `yuzu-tracker-ledger` (per-run batch),
+`yuzu-tracker-decision` (per-close idempotency, verified on `--revert`).
 
 ## Re-validating the grammar against GitHub's oracle
 

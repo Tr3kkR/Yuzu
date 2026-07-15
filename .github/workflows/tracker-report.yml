@@ -1,0 +1,153 @@
+name: Issue tracker report
+
+# ADR-3001 pillar 5 (as amended by A1 §10): the weekly issue-tracker dashboard.
+# READ-ONLY and NO-LLM. It runs scripts/tracker/tracker_report.py (telemetry +
+# leak scan + label hygiene + duplicate candidates + closure-integrity sample)
+# and posts the result as ONE comment to the `triage-sweep` tracking issue. It
+# closes, reopens, and relabels NOTHING -- every issue-lifecycle mutation is
+# operator-approved out-of-band through scripts/tracker/apply_decisions.py.
+#
+# There is deliberately NO Actions-hosted LLM: the report's core operation is
+# counting labels and grepping the checkout, and an API-key secret would need
+# admin provisioning (ADR-3001 "Alternatives considered"). It is gh + grep.
+#
+# TWO DORMANCY TRAPS (both A1 §10):
+#   (a) A scheduled workflow only fires from the DEFAULT branch (main). This
+#       file lives on dev until a release promotes it, so the cron is DORMANT
+#       until then -- run it locally meanwhile:
+#           python scripts/tracker/tracker_report.py --out dashboard.md
+#       (`python`, not `python3`, on the Windows dev box.)
+#   (b) A scheduled run checks out the DEFAULT branch by default, so telemetry
+#       would be computed against `main`, not `dev`. The checkout below pins
+#       `ref: dev` explicitly. nightly.yml is the live demonstration of this
+#       trap (it claims to run against dev but checks out main).
+#
+# Threshold breaches (`leak > 0`, `needs-triage(active) > 100`, report staleness
+# > 10 days) render as RED rows IN THE COMMENT -- this read-only workflow opens
+# no lifecycle issue for them (A1 §10 recharacterized this as a report, not a
+# ritual). A hard generation failure (exit 3) fails the run and the alert job
+# below opens a self-scoped operational issue (NOT the shared automation-broken
+# label, which close-linked-issues.yml's close-on-green would clobber).
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC (clear of zizmor 06:00 / scorecard 05:00)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracker-report
+  # Never cancel a report mid-post -- a half-posted dashboard helps no one.
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Generate and post the tracker dashboard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write   # posts the dashboard comment to the triage-sweep tracking issue
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # DORMANCY TRAP (b): pin dev, or a scheduled run reports on main.
+          ref: dev
+          persist-credentials: false
+
+      - name: Generate the dashboard (read-only, no LLM)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        # Exit 3 (fail-closed: never-close list unreadable, gh error) fails the
+        # run so the alert job fires. A RED leak/threshold row is exit 0 -- the
+        # per-push leak scan in close-linked-issues.yml owns failing on leaks.
+        run: python3 scripts/tracker/tracker_report.py --out dashboard.md
+
+      - name: Post the dashboard to the triage-sweep tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The dashboard is generated content: post it via --body-file so no
+        # computed text is ever interpolated into the shell (injection-safe,
+        # and it keeps a bot comment from relaying user text -- the
+        # marker-forgery constraint in scripts/tracker/README.md).
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --label triage-sweep --state open \
+                       --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file dashboard.md
+          else
+            gh issue create \
+              --title "Issue-tracker report (triage-sweep)" \
+              --label triage-sweep \
+              --body-file dashboard.md
+          fi
+
+  # ── Alert on a generation failure ───────────────────────────────────────
+  # A read-only dashboard that dies silently defeats its own dead-man's-switch.
+  # This opens/updates a SELF-SCOPED issue (found by title, labelled
+  # `operational`) -- deliberately NOT the shared `automation-broken` label,
+  # which close-linked-issues.yml's close-on-green closes wholesale and would
+  # silently clear this notice on the next dev push.
+  alert:
+    name: "Open tracker-report-failed on failure"
+    needs: [report]
+    # cancelled() too: a QUEUED cron run evicted by a later trigger must alert
+    # (the #1038 implicit-success() trap class).
+    if: failure() || cancelled()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write   # opens/updates the self-scoped failure issue
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Tracker report workflow failed"
+          runUrl="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list --state open --search "$title in:title" \
+                       --json number,title \
+                       --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          body="The \`tracker-report\` workflow failed or was evicted ([run]($runUrl)).
+
+          The weekly issue-tracker dashboard did not post. This does not affect the
+          per-push leak scan (that lives in close-linked-issues.yml). Re-run the
+          workflow, or run it locally: \`python scripts/tracker/tracker_report.py --out dashboard.md\`.
+
+          Auto-posted by .github/workflows/tracker-report.yml -- close after a green run."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label operational --body "$body"
+          fi
+
+  # Symmetric self-heal: a green report closes its OWN failure issue (matched by
+  # title, never by the shared automation-broken label).
+  close-on-green:
+    name: "Close tracker-report-failed on green"
+    needs: [report]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close the failure issue if open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Tracker report workflow failed"
+          runUrl="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          nums=$(gh issue list --state open --search "$title in:title" \
+                   --json number,title \
+                   --jq ".[] | select(.title == \"$title\") | .number")
+          for n in $nums; do
+            gh issue comment "$n" --body "tracker-report ran green: $runUrl -- closing. (auto-posted)"
+            gh issue close "$n" --reason completed
+          done

@@ -114,6 +114,33 @@ jobs:
           fi
           echo "close-linked-issues control-plane check: clean"
 
+      # Control-plane guard for the tracker report (ADR-3001 pillar 5 / A1 §10).
+      # The report is the inverse of the close workflow: it MUST be a cron (a
+      # push/PR trigger would make it fire on unrelated events) and it MUST pin
+      # `ref: dev`, or a scheduled run silently reports on `main` (nightly.yml's
+      # live demonstration of that trap). Deterministic, needs no admin.
+      - name: Guard — tracker-report control plane
+        run: |
+          set -eu
+          f=.github/workflows/tracker-report.yml
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing — the weekly tracker dashboard must not be deleted (ADR-3001 A1 §10)"
+            exit 1
+          fi
+          if ! grep -qE '^[[:space:]]*schedule:' "$f"; then
+            echo "::error::$f is not schedule:-triggered — the dashboard is a weekly cron (ADR-3001 A1 §10)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*(pull_request|pull_request_target):' "$f"; then
+            echo "::error::$f gained a PR-context trigger — the read-only report must stay cron/dispatch-only (ADR-3001 A1 §10)"
+            exit 1
+          fi
+          if ! grep -qE '^[[:space:]]*ref:[[:space:]]*dev([[:space:]]|$)' "$f"; then
+            echo "::error::$f does not pin 'ref: dev' — a scheduled run defaults to the main branch and would report on the wrong tree (ADR-3001 A1 §10)"
+            exit 1
+          fi
+          echo "tracker-report control-plane check: clean"
+
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
         with:

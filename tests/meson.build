@@ -538,6 +538,18 @@ test('close automation logic',
   timeout: 30,
 )
 
+# Tracker report + decision-apply layer (ADR-3001 pillar 5 / A1 §10): telemetry
+# and label-hygiene invariants, the candidate-set hash's stability, and every
+# fail-closed refusal (R1-R7) in apply_decisions.py -- the ONLY mutating tracker
+# layer, so its guardrails must be green on every platform, not by hand. No
+# network (live state is injected). scripts/ changes run the heavy jobs anyway.
+test('tracker report and apply-decisions logic',
+  _python3_test,
+  args: [files('test_tracker.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
 # parsing, budget rows). Wired here (#2092) so the shard-retry contract the
 # server entries above rely on is enforced on every platform, not just when
