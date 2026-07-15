@@ -527,6 +527,17 @@ test('changelog order',
   timeout: 10,
 )
 
+# Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
+# parser fixtures (incl. PR #1711, the canonical negated close) + the decision
+# ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
+# always run the heavy platform jobs, so meson coverage alone is sufficient.
+test('close automation logic',
+  _python3_test,
+  args: [files('test_close_automation.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
 # parsing, budget rows). Wired here (#2092) so the shard-retry contract the
 # server entries above rely on is enforced on every platform, not just when

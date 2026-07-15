@@ -81,6 +81,35 @@ jobs:
           fi
           echo "save-always check: clean"
 
+      # Control-plane guard for the tracker close automation (ADR-3001 A1 §9:
+      # the deliberate replacement for the descoped CODEOWNERS gate). The
+      # tampering that matters is exactly three shapes: deleting the workflow,
+      # putting a `paths:` filter on it (a filtered close workflow silently
+      # stops closing), or moving it off the trusted `push:` trigger (a
+      # pull_request run for a fork/Dependabot PR gets a read-only token and
+      # the close job 403s -- see A1 §3). Deterministic, needs no admin.
+      - name: Guard — close-linked-issues control plane
+        run: |
+          set -eu
+          f=.github/workflows/close-linked-issues.yml
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing — the tracker close automation must not be deleted (ADR-3001 A1 §9)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*paths(-ignore)?:' "$f"; then
+            echo "::error::$f carries a paths filter — a filtered close workflow silently stops closing (ADR-3001 A1 §9)"
+            exit 1
+          fi
+          if ! grep -qE '^[[:space:]]*push:' "$f"; then
+            echo "::error::$f is not push:-triggered — pull_request runs for fork/Dependabot PRs get a read-only token (ADR-3001 A1 §3)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*(pull_request|pull_request_target|workflow_call):' "$f"; then
+            echo "::error::$f gained a PR-context trigger — forbidden for the close automation (ADR-3001 A1 §3)"
+            exit 1
+          fi
+          echo "close-linked-issues control-plane check: clean"
+
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
         with:
