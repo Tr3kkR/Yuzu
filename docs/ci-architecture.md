@@ -173,7 +173,13 @@ Resolution order inside the script:
    Wee Tam server-suite timeouts). Until a box is provisioned with the
    extra clusters the script falls back to the shared pre-set DSN with a
    `::warning` — no flag day. Runners without a `-<n>` suffix use the DSN
-   as-is.
+   as-is. **The DSN must not set `options=`, and `PGOPTIONS` must be unset
+   in the job environment** (checked unconditionally, before path
+   selection) — either silently disables PgPool's `statement_timeout`/
+   `lock_timeout` safety-bound GUCs (`pg_pool.cpp`'s `conninfo_has_options_`
+   gate), caught by the `[pg][hardening]` test "PgPool injects
+   statement_timeout and lock_timeout GUCs". Put durability tuning in
+   `postgresql.conf` via `ALTER SYSTEM` instead (#2167).
 2. **Docker** (self-hosted Linux) — idempotent persistent container
    (`docker start` || `docker run --restart unless-stopped`, image pinned
    to the same digest as `deploy/docker/Dockerfile.postgres`'s base;
