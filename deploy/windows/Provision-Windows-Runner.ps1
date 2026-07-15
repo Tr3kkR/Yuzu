@@ -389,6 +389,14 @@ Step "emit toolchain manifest -> $ManifestPath" {
   $vsw="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   $msvc = if(Test-Path $vsw){ (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1) } else { $null }
   $major = $PostgresVersion.Split('.')[0]
+  # Same resolution as the PostgreSQL/per-agent-cluster/Defender-exclusion
+  # steps above - each Step scriptblock gets its own scope, so $pgbin from
+  # those earlier steps doesn't carry over here and must be re-resolved.
+  # A hardcoded Program Files path (Wee Tam is a C:\pgsql zip install)
+  # made Assert-Toolchain.ps1's self-test report [MISS] postgres after a
+  # successful provision - adversarial review v2 F2'.
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   $tools = @(
     @{ name='python';     path=(Get-Command python -EA SilentlyContinue).Source; version=(Ver { python --version }); required=$true }
     @{ name='meson';      path=(Get-Command meson  -EA SilentlyContinue).Source; version=(Ver { meson --version });  required=$true }
@@ -401,7 +409,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
     @{ name='msvc';       path=$msvc; version=$null; required=$true }
     @{ name='msys2_bash'; path="$Msys2Root\usr\bin\bash.exe"; version=(Ver { & "$Msys2Root\usr\bin\bash.exe" --version }); required=$true }
     @{ name='vcpkg';      path="$VcpkgRoot\vcpkg.exe"; version=(Ver { & "$VcpkgRoot\vcpkg.exe" version }); required=$true }
-    @{ name='postgres';   path="C:\Program Files\PostgreSQL\$major\bin\psql.exe"; version=$PostgresVersion; required=$true }
+    @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
   $manifest = [ordered]@{
     generated = (Get-Date).ToUniversalTime().ToString('o')
