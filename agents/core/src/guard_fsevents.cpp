@@ -37,7 +37,12 @@ struct FsEventsWatchCore::Impl {
     std::map<std::string, std::unique_ptr<Entry>> entries;
     dispatch_queue_t queue{nullptr};
     // Set once in start(), cleared only after the final drain in stop() —
-    // callbacks read them without m (they run strictly between those points).
+    // callbacks read them without m. Happens-before proof: start() writes them
+    // under m; watch() (which must follow start()) re-acquires m before
+    // FSEventStreamStart hands the stream to the queue, and libdispatch's
+    // enqueue/dequeue ordering carries that edge into every callback. On the
+    // teardown side no callback survives the dispatch_sync_f drain, after
+    // which stop() is the only toucher.
     FsWatchEmitFn emit;
     FsWatchFaultFn fault;
     bool started{false};

@@ -513,8 +513,11 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // support today: file-change arms on Windows + macOS (FSEvents); registry is
     // Windows-only by nature; service arms on Windows (enforce) + Linux
     // (observe-only) — everything else is a no-op whose start() returns false.
-    // Returns true iff a guard was actually armed (so callers can count
-    // accurately).
+    // Returns true iff a guard was created and its watch thread started (so
+    // callers can count accurately). NB: a STARTED guard's watch-arm failures
+    // degrade to a bounded re-arm/poll and self-heal (guard_file/guard_registry
+    // kArmFailRetry) — they do not unarm the rule; per-rule arm-state truth is
+    // Spark Stage-2 (rung 4) territory.
 
     // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
     if (rule.spark().type() == "file-change") {

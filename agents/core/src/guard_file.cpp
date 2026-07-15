@@ -498,6 +498,7 @@ void FileGuard::run() try {
 
 #include <algorithm>
 #include <condition_variable>
+#include <expected>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -527,7 +528,8 @@ struct DarwinWake {
 // case-SENSITIVE volume this can only produce a false positive, which merely
 // costs one reconcile (state is re-read from disk); a false negative would
 // miss drift. Ordinal, ASCII-only — a filename match is a byte identity check,
-// not a linguistic one (same rationale as the Windows iequals_w).
+// not a linguistic one (same rationale as the Windows iequals_w). Names that
+// leave ASCII bypass this filter entirely (see has_non_ascii below).
 bool iequals_ascii(std::string_view a, std::string_view b) {
     if (a.size() != b.size())
         return false;
@@ -542,6 +544,18 @@ bool iequals_ascii(std::string_view a, std::string_view b) {
             return false;
     }
     return true;
+}
+
+// APFS case-insensitivity uses Unicode folding tables (with oddities like
+// U+017F ſ → s and U+212A K → k) that an ASCII fold cannot reproduce, so two
+// byte-different names can still be THE SAME file. Never risk a missed wake on
+// that: when either name leaves ASCII, the filename prefilter is bypassed and
+// the event treated as ours — a false positive only costs one reconcile.
+bool has_non_ascii(std::string_view s) {
+    for (unsigned char c : s)
+        if (c >= 0x80)
+            return true;
+    return false;
 }
 
 } // namespace
@@ -591,12 +605,13 @@ void FileGuard::run() try {
     // Watch the PARENT directory: FileEvents-granularity FSEvents deliver the
     // full path of every changed item under it, filtered to our filename below.
     const std::string dir_path = (parent.empty() ? target : parent).string();
+    const bool fname_ascii_only = !has_non_ascii(fname);
 
     FsEventsWatchCore core;
     core.start(
         // Emit callback — runs on the core's delivery queue: filter, flip the
         // wake flags, notify. Never blocks, never calls back into the core.
-        [&dir_path, &fname, wake](const FsWatchEvent& e) {
+        [&dir_path, &fname, fname_ascii_only, wake](const FsWatchEvent& e) {
             bool ours = e.must_reconcile || e.key == "anc";
             if (!ours && !e.path.empty()) {
                 std::string p = e.path;
@@ -604,8 +619,10 @@ void FileGuard::run() try {
                     p.pop_back(); // FSEvents may report directories with a trailing slash
                 const std::string base = fs::path(p).filename().string();
                 // Ours: the changed item is our target (by name), or the parent
-                // dir itself (dir-level event → can't attribute → reconcile).
-                ours = p == dir_path || iequals_ascii(base, fname);
+                // dir itself (dir-level event → can't attribute → reconcile), or
+                // either name leaves ASCII (Unicode folding — see has_non_ascii).
+                ours = p == dir_path || iequals_ascii(base, fname) || !fname_ascii_only ||
+                       has_non_ascii(base);
             } else if (!ours && e.path.empty()) {
                 ours = true; // no path — can't attribute, reconcile
             }
@@ -643,18 +660,23 @@ void FileGuard::run() try {
         core.unwatch("dir");
         core.unwatch("anc");
         arm_retry = false;
-        const bool dir_armed = static_cast<bool>(core.watch("dir", dir_path));
+        const auto dir_res = core.watch("dir", dir_path);
         std::error_code ec;
-        if (dir_armed && fs::is_directory(dir_path, ec))
+        if (dir_res && fs::is_directory(dir_path, ec))
             return;
         fs::path anc = parent.empty() ? fs::path{} : parent.parent_path();
         while (!anc.empty() && !fs::is_directory(anc, ec))
             anc = anc.parent_path();
-        const bool anc_armed = !anc.empty() && static_cast<bool>(core.watch("anc", anc.string()));
-        if (!dir_armed && !anc_armed) {
+        auto anc_res = anc.empty()
+                           ? std::expected<void, std::string>(
+                                 std::unexpected("no existing ancestor directory"))
+                           : core.watch("anc", anc.string());
+        if (!dir_res && !anc_res) {
             arm_retry = true; // both arms failed → bounded degraded re-arm (no deaf-forever)
-            spdlog::warn("Guardian FileGuard[{}]: no watch armed for {} — degraded re-arm in {}ms",
-                         cfg_.rule_id, cfg_.path, kArmFailRetry.count());
+            spdlog::warn("Guardian FileGuard[{}]: no watch armed for {} (dir: {}; ancestor: {}) — "
+                         "degraded re-arm in {}ms",
+                         cfg_.rule_id, cfg_.path, dir_res.error(), anc_res.error(),
+                         kArmFailRetry.count());
         }
     };
 

@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-15._
 
 ## Matrix
 
@@ -23,7 +23,7 @@ _Last hand-updated: 2026-07-13._
 |---|:---:|:---:|:---:|---|
 | **Agent core** (enroll, heartbeat, plugin host, triggers, KV, mTLS) | ✅ | ✅ | ✅ | `agents/core/` builds + enrolls on all three |
 | **Guardian — registry guard** | ✅ | ⛔ | ⛔ | `guard_registry.cpp` (no-op off-Windows); `registry_support::kHives` |
-| **Guardian — file guard** | ✅ | ⛔ | ⛔ | `guard_file.cpp` (no-op off-Windows) |
+| **Guardian — file guard** | ✅ (ReadDirectoryChangesW) | ⛔ | ✅ (FSEvents, detection-only like all platforms) | `guard_file.cpp` (Linux no-op); macOS watch core: `guard_fsevents.cpp` |
 | **Guardian — service run-state guard** | ✅ enforce | 🟡 observe-only | ⛔ | `make_service_guard()` in `guard_systemd.hpp`; Win `ServiceGuard` (SCM), Linux `SystemdServiceGuard` (sd-bus, enforce deferred) |
 | **DEX — reliability signals** (crashes, hangs, service/boot, storage, kernel faults, perf/thermal, …) | ✅ | 🟡 growing (17 signals: perf cpu/mem/disk + storage/uptime + journald unit-crash/hung + coredump-crash + OOM + time-unsynced + kernel panic/disk/fs/dirty-shutdown/MCE/hung-task + thermal-throttle) | 🟡 | Win: `dex_observer.cpp`/`dex_win_poll.cpp`; Linux: `dex_linux_collector.cpp`/`dex_linux_proc.cpp`/`dex_linux_storage.cpp`/`dex_linux_journal.cpp`/`dex_linux_kmsg.cpp`/`dex_linux_sysfs.cpp`; macOS: `dex_macos_collector.cpp` (DiagnosticReports/OSLog/IOKit). Catalogue: `docs/dex-signal-catalog.md` |
 | **DEX — performance telemetry** (CPU/mem/disk levels) | ✅ | ✅ | ⛔ | Two paths, both live on Win+Linux: DEX breach sampling (`dex_win_poll.cpp` / `dex_linux_proc.cpp`) and the TAR `$Perf_*` sampler (`tar_perf.cpp` — Win kernel counters; Linux `/proc` via `parse_linux_perf_counters`). macOS absent from the rollup |
