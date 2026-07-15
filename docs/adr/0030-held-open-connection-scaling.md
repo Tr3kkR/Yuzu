@@ -169,7 +169,9 @@ than a box inserted in front of the server.
 
 ## Consequences
 
-- Track 2f PR 2 implements (1), (2) and (3). The MCP stream cap stops being a capacity limit
+- Track 2f PR 2 implements Decision 1's **shared-budget guardrail** plus (2) and (3). The
+  per-principal lease cap and the pre-auth `/events` limit named in Decision 1 are **prerequisites
+  still to land**, not part of PR 2. The MCP stream cap stops being a capacity limit
   (12) and becomes an anti-abuse backstop against a pool sized for the declared workload.
 - The dashboard and `/api/v1/events` are bounded for the first time — closing a starvation
   path that exists on `dev` today, before MCP streaming ships at all.

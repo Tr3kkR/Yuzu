@@ -444,13 +444,15 @@ references and a **plan hash**. Prepared by a Module or by core; **authorised an
 is not enough for the object that touches endpoints, so the concurrency contract is normative:
 execution acquires a **guarded claim (CAS)** on the plan's execution record - the same
 one-way-transition pattern as ADR-0032's run state machine and the shipped `/auto` deploy
-`claim_for_exec` - so two ticks, two replicas or a retry produce **exactly one** dispatch per
-plan-execution identity. The authority re-check (requester + requesting credential, above), the claim,
+`claim_for_exec` - so two ticks, two replicas or a retry commit **exactly one** execution record per
+plan-execution identity, and agent-side idempotency (ADR-0031 B7) makes that at most one endpoint
+effect. The authority re-check (requester + requesting credential, above), the claim,
 and the audit write **commit together**; only a committed claim may publish the command to the gateway
 (a durable outbox / at-least-once hand-off, deduplicated by the agent, ADR-0031 B7). There is **no
 check-then-dispatch window**: a revocation landing between the check and the dispatch loses to the
 claim's transaction boundary - it either voids the plan before the claim commits, or the command was
-already published and is idempotency-suppressed downstream. The detailed schema is deferred; this
+already durably enqueued at the linearisation point and any repeat delivery is idempotency-suppressed
+downstream. The detailed schema is deferred; this
 linearisation point is not.
 
 **Coverage envelope — part of every distributed answer.** A distributed query cannot honestly return

@@ -134,7 +134,9 @@ every effect. It is **not** a claim of containment over plaintext an engine alre
 has released into the `uce` database persists there under the engine's own retention, so the engine
 stays inside the confidentiality TCB for what it retains (INV-31-2's receive-vs-retain split;
 ADR-0032 Decisions 7 and 15). "Sole authority" means nobody else may *create* authority, not that a
-compromised engine can disclose nothing.
+compromised engine can disclose nothing - and the offline RBAC-recovery / first-admin tool (6a) is
+**core's own** authority-mutating mode under filesystem-owner authorisation, reusing core's validation
+and evidence, not a second authority-creator.
 
 **3. Presentation is a transport-and-render adapter.** It terminates HTTP, SSE and MCP, frames
 protocol, renders the HTMX dashboard, and holds live connection state — and it reaches the domain
