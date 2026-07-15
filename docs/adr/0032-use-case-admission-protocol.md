@@ -676,13 +676,19 @@ envelope to *distributed* answers, so a confined **core-store** read, which is n
 it.
 
 So every B4 fact read returns, alongside the rows, a **`scope_basis` marker that core computes from the
-caller's confinement STATUS, not from the data**: `global` when the caller's resolved authority is the
-whole fleet, `authority_scoped` when it is a subset. This is **independent of query coverage**: **completeness**
-(ADR-0033 §10) is relative to the **requested/intended scope** - did everything you asked for answer -
-while `scope_basis` says whether that requested scope was itself capped by your authority. A result may
-be **presented as fleet-`complete` only when it is `complete` AND `scope_basis = global`**; an
-`authority_scoped` result describes only the caller's authorised cohort and is never a clean bill of
-health for the fleet, regardless of whether any out-of-scope row happened to match. This is deliberately **not** a matched/withheld count:
+caller's confinement STATUS, not from the data**: `authority_scoped` if **any** fact read in the run was truncated by confinement, and `global` only if
+**every** read ran under fleet-wide authority. It is computed **conservatively across the whole run** -
+not from the operator's authority at finalisation - so a mid-run promotion cannot stamp `global` over
+reads that were confined while the operator was narrow. This is **independent of query coverage**:
+**completeness** (ADR-0033 §10) is relative to the **requested/intended scope** (did everything you
+asked for answer), while `scope_basis` says whether that requested scope was itself capped by your
+authority. A **fleet-wide statement** (e.g. "the fleet has no vulnerable devices") is licensed **only**
+when the run's **intended scope was the whole fleet**, its **completeness is `complete`**, AND
+**`scope_basis = global`** (authority did not truncate below the intended scope). `scope_basis = global`
+alone **never** licenses a fleet claim: a fleet-authorised caller who intentionally scoped the query to
+one group has `complete` over that group, not over the fleet. An `authority_scoped` result describes
+only the caller's authorised cohort and is never a clean bill of health for the fleet, regardless of
+whether any out-of-scope row happened to match. This is deliberately **not** a matched/withheld count:
 a per-query figure for rows the caller may not see - even a single truncated-or-not bit - is itself a
 one-bit existence oracle over forbidden data, the very disclosure confinement exists to prevent
 (ADR-0017 INV-3: a confined caller never receives a count computed over rows outside their visible
