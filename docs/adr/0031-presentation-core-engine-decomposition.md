@@ -308,7 +308,8 @@ Two honest qualifications, because this invariant is the one most likely to be o
 
 - **Its mechanism does not exist yet.** Core's release gate *is* the ADR-0017 admit-then-filter
   chokepoint evaluated as the admitting operator — and `authorize_list_read` has **zero occurrences
-  in the server tree** (#1716 unlanded). Until that gate and its evaluate-as-operator seam land
+  in the server tree** (ADR-0017 PR-A unbuilt; its open prerequisite is #1715, the global/group
+  deny-precedence decision - #1716 is the closed doc-honesty companion, not this gate). Until that gate and its evaluate-as-operator seam land
   (ADR-0032's interlock, prerequisite (b)), this invariant is a specification, not a property.
 - **It bounds what the engine *receives*, not what it *retains*.** Everything core has ever released
   to a module persists in the `uce` database — results, journal, and **derived state**. ADR-0032
@@ -403,7 +404,7 @@ INV-31-2, and the M3(d) equivalence test loses the thing it was testing (an inde
 re-derivation). It does not lose its *purpose*: **M3 remains the parity gate**, and its confinement
 leg **retargets** to core's release gate — that what core released to the engine for a given
 operator equals what that operator could have read directly (the evaluate-as-operator seam,
-ADR-0017 / #1716). The test moves; the interlock survives. `docs/uce-host-requirements.md` F-5 and
+ADR-0017 PR-A, #1715 prerequisite). The test moves; the interlock survives. `docs/uce-host-requirements.md` F-5 and
 `docs/adr-1005-execution-plan.md` Decision 14 / M3(d) need amendment notices to say so.
 
 ### 2c D3's cross-origin problem disappears

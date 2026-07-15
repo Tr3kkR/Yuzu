@@ -24,7 +24,7 @@ related: >-
   0033-access-control-spine (registry-declared RBAC and manifest vetting, token attenuation, the
   approval primitive, Execution Plans, the coverage envelope, four-eyes and P11 — this ADR
   cross-references them and never restates them). 0017-management-group-confinement-list-reads (the
-  admit-then-filter chokepoint this protocol confines against, #1716). 0012-server-postgres-store-contract
+  admit-then-filter chokepoint this protocol confines against, ADR-0017 PR-A; #1715 prerequisite). 0012-server-postgres-store-contract
   (every new core store named here is born on Postgres). docs/auth-engine-principals-design.md (2b —
   the delegation artifact the invocation grant IS). docs/adr-1005-execution-plan.md (Phase 4 engine
   principals; the M3 gate whose style the sequencing interlock below copies).
@@ -327,7 +327,7 @@ does, the on-behalf-of ban has been re-implemented as a feature.
 
 Revoking the admitting operator, or shrinking their scope, therefore **kills the run mid-flight** —
 D10's re-check-at-execution rule extended to the whole run lifetime. Filter (4) is the
-`authorize_list_read` admit-then-filter chokepoint (ADR-0017, #1716) evaluated **as the admitting
+`authorize_list_read` admit-then-filter chokepoint (ADR-0017 PR-A; #1715 prerequisite) evaluated **as the admitting
 operator while the engine is the authenticated caller** — the server-internal *evaluate-as-operator*
 seam that gate must grow, and a named prerequisite in the interlock below.
 
@@ -823,7 +823,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | # | Prerequisite | Why A5 cannot ship without it | Status today |
 |---|---|---|---|
 | **(a)** | **Phase-4 engine principals** (ADR-1005 exec plan) | Decision 4's mid-run caller is the engine principal. Without it there is no authenticated identity for the UCE to hold. | `engine` is a **reserved** `principal_class` label; the class is not live. |
-| **(b)** | **The ADR-0017 admit-then-filter gate (#1716) + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. | **Zero occurrences** of `authorize_list_read` in the server tree; the comments that reference the gate name #1716, never the symbol. |
+| **(b)** | **The ADR-0017 admit-then-filter gate (PR-A; decision #1714) + its open deny-precedence prerequisite #1715 + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. | **Zero occurrences** of `authorize_list_read` in the server tree; #1715 (global/group deny precedence, PR-A prerequisite) is **OPEN**. #1716 is the closed doc-honesty companion, not this gate - do not read its closure as (b) satisfied. |
 | **(c)** | **The D12 audit schema** (acting principal · authority ref · **indexed** `use_case_run_id`) | Decision 12. Without it, "no unjoined evidence" is not merely untested — it is **unqueryable**. Rides the audit-store Postgres migration. | `AuditEvent` has a single `principal` field. |
 | **(d)** | **The P7 release-log schema** | Decision 11 *is* the disclosure evidence, and Decision 10's subset check **reads it**. Ship A5 without it and admitted runs exist whose disclosure cannot be proven from core-owned evidence. | Does not exist. Born-on-PG store, ADR-0012. |
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |
