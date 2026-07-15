@@ -67,6 +67,18 @@ struct Config {
                                    // co-determination-relevant — this is the control for
                                    // jurisdictions/agreements that require it off.
 
+    // SparkEngine (ADR-0021 Stage-2, rung 1) — next-gen event-driven detection engine,
+    // instantiated observe-only alongside the enforcing legacy IGuard path.
+    bool spark_disable{false}; // --spark-disable / YUZU_AGENT_SPARK_DISABLE: boot-time
+                               // deploy opt-out. SparkEngine is never instantiated, watches
+                               // nothing, and reports no capability or health counters — but
+                               // the heartbeat DOES still carry the posture itself
+                               // (spark_running=0 + spark_disabled=1), so the fleet can tell
+                               // a deliberate opt-out apart from an engine that FAILED to
+                               // start. Emitting nothing at all is what made a fleet-wide
+                               // boot failure invisible. The enforcing legacy Guardian path
+                               // is unaffected.
+
     // Software Licensing & Entitlements (SLE, ADR-0024) — the per-user `user_ref`
     // knob for the `software_licensing` daily-sync source (Decision 11). One of
     // "collect" | "hash" | "omit"; default "hash" (a per-agent keyed pseudonym).
