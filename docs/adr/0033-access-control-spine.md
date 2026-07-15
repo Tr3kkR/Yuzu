@@ -353,13 +353,18 @@ only seam that touches endpoints:
   90-day token rotation would void every approved plan and demand **fresh four-eyes on an unchanged
   effect**, which §5 calls worse than no gate at all. So the rebind rule is **narrow, and keyed on an
   explicit classification, never on "same owner"**: re-binding a plan to a **routine-rotation
-  successor** - a credential the auth store records as succeeding the approved one (the 2b §7
-  `superseded_by` overlap-pair, or the equivalent successor marker on whatever credential class
-  requested the plan), with **equal-or-narrower attenuation**, an **unchanged plan hash**, and a
-  **fresh MFA step-up** - is an audited authority change, not a new approval. Everything else is not a
+  successor** - a credential the auth store records as succeeding the approved one under a
+  **credential-level predecessor/successor relation with a terminal-reason classification**
+  (`rotation_superseded` vs `compromise`). That relation is a **new required mechanism** (interlock
+  item (n)), **not** the existing 2b §7 `superseded_by`, which links *engine-principal* successors
+  after *terminal* revocation (compromise recovery included) and would wrongly treat a post-compromise
+  replacement as the approval-preserving successor. Rebind additionally requires **equal-or-narrower
+  attenuation**, an **unchanged plan hash**, and a **fresh MFA step-up** - then it is an audited
+  authority change, not a new approval. Everything else is not a
   rebind: a credential recorded as **`compromise`-revoked** (not `rotation_superseded`) has no valid
   successor for this purpose and **cannot preserve an approval** - a compromise discovered during an
-  overlap window disqualifies the pair, so the plan is voided and is **re-authorisable through fresh
+  overlap window disqualifies the pair **and revokes both credentials** (2b's terminal
+  revoke-both behavior), so the plan is voided and is **re-authorisable through fresh
   four-eyes** (it is not permanently dead), never rebound silently; and a **different requester**, a
   **broader** attenuation, or **any change to the plan hash** is a new plan needing new four-eyes. The
   classification is core's - the auth store distinguishes `rotation_superseded` from `compromise` at
