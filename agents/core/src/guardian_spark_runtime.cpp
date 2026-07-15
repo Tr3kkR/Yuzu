@@ -174,6 +174,7 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
     std::vector<std::shared_ptr<RuleGeneration>> planned;
     FileReadPlan fplan;
     RegistryReadPlan rplan;
+    std::string agent_id;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
@@ -194,9 +195,15 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                 reg_values.insert(rg->assertion.value_name);
         }
         rplan.value_names.assign(reg_values.begin(), reg_values.end());
+        agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{}; // snapshot here, not post-read
     }
     if (planned.empty())
         return;
+
+    // Snapshot the debounce clock BEFORE the blocking read too, so neither the clock
+    // nor the agent-id provider is invoked on the detached-post-read path (a provider
+    // that borrowed agent state would UAF if shutdown destroyed it during the read).
+    const auto now = clock_();
 
     // The one blocking I/O, OUTSIDE registry_mu_, driven by the plan. Every event is
     // a hint: re-read live state rather than trust a queued payload.
@@ -211,8 +218,6 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
         svc_read = reader_->read_service(std::get<ServiceSparkParams>(spec.params));
     else
         return; // non-event-driven type is never armed here
-
-    const auto now = clock_();
 
     // Commit section: IO-free, under registry_mu_ so a concurrent detach cannot
     // interleave between the eval and the enqueue (which would re-add a purged
@@ -239,7 +244,7 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                       is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                       is_svc ? &svc_read : nullptr);
 
-        std::vector<OutboxEntry> entries = build_entries(*rg, out);
+        std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id);
         bool accepted = true;
         if (!entries.empty()) {
             std::lock_guard<std::mutex> ob{outbox_mu_};
@@ -278,32 +283,36 @@ EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const Rul
 }
 
 std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneration& gen,
-                                                            const EvalOutcome& out) {
+                                                            const EvalOutcome& out,
+                                                            const std::string& agent_id) {
     // Wall clock for the wire timestamp + id (the steady clock used for debounce has
-    // an arbitrary epoch and is not a valid observation time). registry_mu_ is held.
+    // an arbitrary epoch and is not a valid observation time; system_clock::now
+    // captures nothing, so it is detach-safe). registry_mu_ is held. agent_id was
+    // snapshotted at pass start.
     const auto wall = std::chrono::system_clock::now().time_since_epoch();
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
     const std::string& rid = gen.assertion.rule_id;
     std::vector<OutboxEntry> v;
     if (out.recovered) // Unknown -> Known: clear the health stream's errored state first
-        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms), ns,
+        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
                                         /*healthy=*/true, {}));
     if (out.status == EvalStatus::Emit)
-        v.push_back(
-            OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms), ns, out.drift));
+        v.push_back(OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms, agent_id),
+                                            ns, out.drift));
     else if (out.status == EvalStatus::Unhealthy)
-        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms), ns,
+        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
                                         /*healthy=*/false, out.health_detail));
     // Silent + !recovered -> empty (nothing to publish).
     return v;
 }
 
-std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std::int64_t wall_ms) {
-    // registry_mu_ is held by the caller; event_seq_ + agent_id_fn_ are guarded by it.
-    // boot_nonce_ makes the id restart-unique (wall_ms + seq alone are not).
-    const std::string agent = agent_id_fn_ ? agent_id_fn_() : std::string{};
-    return agent + "-" + boot_nonce_ + "-" + rule_id + "-" + std::to_string(wall_ms) + "-" +
+std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std::int64_t wall_ms,
+                                                const std::string& agent_id) {
+    // registry_mu_ is held by the caller; event_seq_ is guarded by it. boot_nonce_
+    // makes the id restart-unique (wall_ms + seq alone are not); agent_id was
+    // snapshotted at pass start (not called on the detached-post-read path).
+    return agent_id + "-" + boot_nonce_ + "-" + rule_id + "-" + std::to_string(wall_ms) + "-" +
            std::to_string(++event_seq_);
 }
 

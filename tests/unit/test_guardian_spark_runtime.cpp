@@ -522,6 +522,36 @@ TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spa
     REQUIRE(eB[0].event_id != e1[0].event_id); // cross-agent distinct
 }
 
+TEST_CASE("the agent-id provider is invoked before the read, not on the detached path",
+          "[spark][runtime]") {
+    // F3b: clock + agent-id provider are snapshotted at pass start, so neither is
+    // called after the (possibly blocking) read - a provider borrowing agent state
+    // would UAF if shutdown destroyed it mid-read. Gate the read and assert the
+    // provider has already run by the time the read is in flight.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    std::atomic<int> provider_calls{0};
+    rt->set_agent_id_provider([&] {
+        provider_calls.fetch_add(1);
+        return std::string{"a"};
+    });
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    std::latch reading{1};
+    std::latch release{1};
+    r->on_read = [&] {
+        reading.count_down();
+        release.wait();
+    };
+    std::thread t([&] { rt->evaluate_key(key, EvalReason::Initial); });
+    reading.wait();
+    REQUIRE(provider_calls.load() == 1); // snapshotted BEFORE the read
+    release.count_down();
+    t.join();
+}
+
 TEST_CASE("a per-boot nonce disambiguates event ids across runtime instances", "[spark][runtime]") {
     // Two runtimes with the SAME agent id (i.e. a restart) still mint different ids
     // for the same rule + observation, because each has its own random boot nonce -

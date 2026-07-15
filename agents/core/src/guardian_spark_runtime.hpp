@@ -233,6 +233,11 @@ public:
     /// after a restart - as duplicate events. A provider (not a fixed string)
     /// because the agent_id is empty pre-Register and populated later; default is
     /// empty (rung 7 wires the real provider after Register).
+    ///
+    /// The provider MUST be self-contained (process-lifetime-safe captures), like
+    /// the clock: the runtime snapshots it at pass start so it is not called on the
+    /// detached-post-read path, but a provider that borrows agent state and is
+    /// invoked before a shutdown completes is still a hazard.
     void set_agent_id_provider(std::function<std::string()> provider);
 
 private:
@@ -270,12 +275,14 @@ private:
     /// The outbox entries an outcome requires (0, 1, or 2): a recovery emits
     /// guard.healthy AND the verdict, which enqueue_all lands atomically. Called
     /// under registry_mu_ (make_event_id needs it).
-    std::vector<OutboxEntry> build_entries(const RuleGeneration& gen, const EvalOutcome& out);
-    /// Mint a wire event_id: `<agent_id>-<rule_id>-<wall_ms>-<seq>` (registry_mu_
-    /// held). agent_id distinguishes agents, wall_ms distinguishes restarts, seq
-    /// distinguishes same-ms events - closing the collision the server's event_id
-    /// PK would otherwise drop on.
-    std::string make_event_id(const std::string& rule_id, std::int64_t wall_ms);
+    std::vector<OutboxEntry> build_entries(const RuleGeneration& gen, const EvalOutcome& out,
+                                           const std::string& agent_id);
+    /// Mint a wire event_id: `<agent_id>-<nonce>-<rule_id>-<wall_ms>-<seq>`
+    /// (registry_mu_ held). agent_id (snapshotted at pass start) distinguishes
+    /// agents, the boot nonce distinguishes restarts, wall_ms + seq distinguish
+    /// observations - closing the collision the server's event_id PK would drop on.
+    std::string make_event_id(const std::string& rule_id, std::int64_t wall_ms,
+                              const std::string& agent_id);
 
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED
