@@ -164,9 +164,23 @@ public:
     [[nodiscard]] std::size_t outbox_size() const;
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
     /// rule_ids still awaiting a first Known eval on `key` (the pending-initial
-    /// dirty-set the convergence priority lane will service at rung 4).
+    /// dirty-set the convergence priority lane services).
     [[nodiscard]] std::vector<std::string> pending_initial(const std::string& key) const;
     [[nodiscard]] bool stopping() const;
+
+    // --- Convergence-scheduler seam (rung 4) ---
+    /// Armed spark_keys whose spec is `type` - the lane a convergence thread
+    /// sweeps on its own cadence (so a slow file hash never blocks a service
+    /// reconcile).
+    [[nodiscard]] std::vector<std::string> keys_for_type(SparkType type) const;
+    /// Armed keys that still carry a pending-initial rule (the priority lane's
+    /// work-list).
+    [[nodiscard]] std::vector<std::string> keys_with_pending_initial() const;
+    /// Install a waker the runtime invokes (OUTSIDE its lock) whenever a rule is
+    /// newly attached with a pending initial eval, so the scheduler can service
+    /// it immediately rather than waiting a full cadence. Pass {} to clear (the
+    /// scheduler clears it before it tears down).
+    void set_pending_initial_waker(std::function<void()> waker);
 
 private:
     /// Per-rule generation: an immutable assertion/spec-edge + monotonic
@@ -213,6 +227,7 @@ private:
 
     mutable std::mutex registry_mu_;
     bool stopping_{false};
+    std::function<void()> pending_initial_waker_; ///< registry_mu_-guarded; called outside the lock
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

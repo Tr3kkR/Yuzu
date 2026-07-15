@@ -36,42 +36,52 @@ std::expected<std::uint64_t, std::string>
 GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAssertion assertion,
                                   bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    if (stopping_)
-        return std::unexpected(std::string{"stopping"});
+    std::function<void()> waker;
+    std::uint64_t new_gen = 0;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return std::unexpected(std::string{"stopping"});
 
-    // Fresh generation: drop any prior mapping for this rule first (rung 7's
-    // reconcile is what preserves eval state across an identical re-push).
-    detach_rule_locked(rule_id);
+        // Fresh generation: drop any prior mapping for this rule first (rung 7's
+        // reconcile is what preserves eval state across an identical re-push).
+        detach_rule_locked(rule_id);
 
-    const std::uint64_t gen = ++gen_counter_;
-    auto rg = std::make_shared<RuleGeneration>();
-    rg->generation = gen;
-    rg->active = true;
-    rg->emit_compliant_edge = emit_compliant_edge;
-    rg->assertion = std::move(assertion);
-    rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
+        const std::uint64_t gen = ++gen_counter_;
+        auto rg = std::make_shared<RuleGeneration>();
+        rg->generation = gen;
+        rg->active = true;
+        rg->emit_compliant_edge = emit_compliant_edge;
+        rg->assertion = std::move(assertion);
+        rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
-    const bool arm_edge = index_->add(key, rule_id);
-    std::shared_ptr<PerKey> pk;
-    if (arm_edge) {
-        auto armed = backend_.arm(spec);
-        if (!armed) {
-            index_->remove_rule(rule_id); // undo: an un-armed key must not linger
-            return std::unexpected(armed.error());
+        const bool arm_edge = index_->add(key, rule_id);
+        std::shared_ptr<PerKey> pk;
+        if (arm_edge) {
+            auto armed = backend_.arm(spec);
+            if (!armed) {
+                index_->remove_rule(rule_id); // undo: an un-armed key must not linger
+                return std::unexpected(armed.error());
+            }
+            pk = std::make_shared<PerKey>();
+            pk->spec = spec;
+            pk->subscription = *armed;
+            keys_.emplace(key, pk);
+        } else {
+            pk = keys_.at(key); // an existing shared watcher for this key
         }
-        pk = std::make_shared<PerKey>();
-        pk->spec = spec;
-        pk->subscription = *armed;
-        keys_.emplace(key, pk);
-    } else {
-        pk = keys_.at(key); // an existing shared watcher for this key
-    }
 
-    rules_.insert_or_assign(rule_id, std::move(rg));
-    pk->pending_initial.insert(rule_id);
-    ++pk->pending_epoch;
-    return gen;
+        rules_.insert_or_assign(rule_id, std::move(rg));
+        pk->pending_initial.insert(rule_id);
+        ++pk->pending_epoch;
+        waker = pending_initial_waker_; // copy; call after releasing registry_mu_
+        new_gen = gen;
+    }
+    // Outside the lock (avoids a registry_mu_ -> scheduler_mu_ inversion): let the
+    // convergence scheduler service the new rule's initial eval promptly.
+    if (waker)
+        waker();
+    return new_gen;
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
@@ -261,6 +271,29 @@ std::vector<std::string> GuardianSparkRuntime::pending_initial(const std::string
 bool GuardianSparkRuntime::stopping() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     return stopping_;
+}
+
+std::vector<std::string> GuardianSparkRuntime::keys_for_type(SparkType type) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    std::vector<std::string> out;
+    for (const auto& [key, pk] : keys_)
+        if (pk->spec.type == type)
+            out.push_back(key);
+    return out;
+}
+
+std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    std::vector<std::string> out;
+    for (const auto& [key, pk] : keys_)
+        if (!pk->pending_initial.empty())
+            out.push_back(key);
+    return out;
+}
+
+void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    pending_initial_waker_ = std::move(waker);
 }
 
 } // namespace yuzu::agent
