@@ -718,22 +718,32 @@ It proves **no authority**: nothing may be released *because* a receipt exists. 
 verification is exposed on the public API**, so any client — human, agentic, auditor — can verify a
 result independently.
 
-**Finalisation is authority seam 4b (Decision 0), not only an integrity checkpoint.** A freshly
-composed result is released to presentation exactly once, and that release is *authorised*, because the
-window between the last confined fact read and the render is a window in which the operator can be
-demoted, the requesting credential revoked, or the module pulled. So at finalisation core runs the
-**applicable live conjunction of Decision 0** - authenticated actor, the represented operator's CURRENT
-authority, the requesting credential, and module liveness (the execution-authorisation filter is
-not-applicable to a read) - and on success mints a **release authorization** bound to
-`(result_hash, use_case_run_id, requesting credential, engine principal, recipient)`. This is a
-*different* object from the integrity receipt: the receipt attests *what* was finalised; the release
-authorization attests that *this recipient* may receive it *now*. Presentation renders only when both
-agree. The release authorization is **one logical serve** with idempotent replay - a crash after
-authorization but before the bytes reach the client re-runs the conjunction against authority *as it is
-now* (unchanged authority re-authorises with no second release-log row; shrunk authority DENIES), the
-same replay rule as Decision 10's cached redemption. Core authorises the serve; it does not observe
-delivery. A demotion, credential revocation or module pull between the last fact read and this seam
-therefore denies the fresh result exactly as it denies a cached one.
+**Finalisation is authority seam 4b (Decision 0), and the first serve redeems at core exactly like a
+cached one.** A freshly composed result is released to presentation exactly once, and that release is
+*authorised*, because the window between the last confined fact read and the render is one in which the
+operator can be demoted, the requesting credential revoked, the module pulled, or the run expired. So
+the fresh result is **not** handed straight to presentation. Finalisation mints a **release
+authorization** - the same **result-scoped grant** object as Decision 10 (opaque, server-side,
+one-use, short-TTL, durable state core holds), bound to
+`(result_hash, use_case_run_id, requesting credential, engine principal, recipient)`, where `recipient`
+is the admitting operator's presentation session that requested the run - and the engine **redeems it
+at core before the first byte moves**, exactly as it redeems a cached serve (Decision 10 step 5):
+
+- a **guarded CAS** on the grant (`unredeemed → redeemed`), which makes the one-use property true;
+- the **applicable live conjunction re-evaluated AT REDEMPTION** - authenticated engine principal, the
+  represented operator's CURRENT authority, the requesting credential, module liveness, **and the run
+  itself live and unexpired (`now < expires_at`, Decision 5)**; the execution-authorisation filter is
+  not-applicable to a read;
+- the disclosure's **release-log row written in the same transaction**.
+
+This makes the first serve and every later re-fetch (Decision 10) **one mechanism**. The receipt still
+attests only *integrity* (that the bytes are the bytes finalised under this run); the redeemed release
+authorization is what says *this recipient may receive it now*, and presentation renders only when the
+redemption succeeds. Redemption is **replay-safe**: a crash after the CAS re-runs the conjunction
+against authority as it is now - unchanged re-authorises with no second release-log row; shrunk,
+revoked or expired **DENIES** - the same rule as Decision 10. Core authorises the serve; it does not
+observe delivery. A demotion, credential revocation, module pull or run expiry between the last fact
+read and redemption therefore denies the fresh result exactly as it denies a cached one.
 
 **Two journals, linked — not merged.** They answer different questions and live in different
 databases under different roles:
@@ -957,9 +967,9 @@ Two of these have a specific shape under this ADR worth naming:
   expired grant, a wrong-audience grant, a grant whose `input_hash` does not match the inputs
   (Decision 2), or a cached-result request with no **result-scoped** grant (Decision 10) — each is
   refused by the UCE, and each refusal is a test. A **fresh result whose represented operator was
-  demoted, whose requesting credential was revoked, or whose module was pulled between the last fact
-  read and finalisation** is denied release at seam 4b (Decision 12): core refuses the release
-  authorization and presentation renders nothing. That denial is a test too.
+  demoted, whose requesting credential was revoked, whose module was pulled, or whose run expired
+  between the last fact read and redemption** is denied release at seam 4b (Decision 12): core refuses
+  the release-authorization redemption and presentation renders nothing. That denial is a test too.
 - **"No unjoined evidence"** is a *query*, run against a live database: for a sampled
   `use_case_run_id`, the admission row, every release-log entry, every plan, every approval, every
   execution and the finalisation receipt must all return. That query is the D12 index's reason to
