@@ -143,8 +143,12 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # itself sets `options=` is out of scope for this string check. Case-
   # sensitive is intentional: libpq's conninfo_storeval (fe-connect.c)
   # matches keywords via a case-sensitive strcmp, so an "OPTIONS=" variant
-  # isn't honored as the `options` keyword by libpq either.
-  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options= ]]; then
+  # isn't honored as the `options` keyword by libpq either. Keyword-form
+  # conninfo allows whitespace around `=` (`options = -c ...` is valid
+  # per libpq's conninfo_parse), so the `=` is matched with `[[:space:]]*`
+  # in front, not a bare `=` - adversarial review v2 F1', reproduced
+  # empirically against `options = '-c statement_timeout=0'`.
+  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options[[:space:]]*= ]]; then
     echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
     exit "$SOFT_EXIT"
   fi
