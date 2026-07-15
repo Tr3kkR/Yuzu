@@ -361,3 +361,108 @@ TEST_CASE("EnginePrincipalStore::get_for_auth — Active vs MissingOrRevoked vs 
         CHECK_FALSE(lookup.row.has_value());
     }
 }
+
+// ── list_all ────────────────────────────────────────────────────────────────
+
+TEST_CASE("EnginePrincipalStore::list_all returns created principals, ordered, with the "
+          "include_revoked filter",
+          "[pg][engine_principal][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:list-active")
+               .has_value());
+    REQUIRE(store.create("Vendor Sync", "bob", "j", "external", "admin", "engine:list-revoked")
+               .has_value());
+    REQUIRE(store.revoke("engine:list-revoked"));
+
+    SECTION("include_revoked=true (default) returns both") {
+        auto rows = store.list_all();
+        CHECK(rows.size() == 2);
+        bool saw_active = false, saw_revoked = false;
+        for (const auto& r : rows) {
+            if (r.principal_id == "engine:list-active") {
+                saw_active = true;
+                CHECK(r.lifecycle_state == "active");
+            }
+            if (r.principal_id == "engine:list-revoked") {
+                saw_revoked = true;
+                CHECK(r.lifecycle_state == "revoked");
+            }
+        }
+        CHECK(saw_active);
+        CHECK(saw_revoked);
+        // ordered by created_at — the first created principal sorts first.
+        CHECK(rows.front().principal_id == "engine:list-active");
+    }
+
+    SECTION("include_revoked=false filters to active only") {
+        auto rows = store.list_all(/*include_revoked=*/false);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows.front().principal_id == "engine:list-active");
+        CHECK(rows.front().lifecycle_state == "active");
+    }
+}
+
+TEST_CASE("EnginePrincipalStore::list_all returns empty on an unreachable store",
+          "[pg][engine_principal][store]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    CHECK(store.list_all().empty());
+    CHECK(store.list_all(false).empty());
+}
+
+// ── count_active_owned_by ──────────────────────────────────────────────────
+
+TEST_CASE("EnginePrincipalStore::count_active_owned_by counts only active principals for the "
+          "given owner",
+          "[pg][engine_principal][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+
+    // owner X: 2 active + 1 revoked.
+    REQUIRE(store.create("A1", "userx", "j", "internal", "admin", "engine:x-active-1")
+               .has_value());
+    REQUIRE(store.create("A2", "userx", "j", "internal", "admin", "engine:x-active-2")
+               .has_value());
+    REQUIRE(store.create("A3", "userx", "j", "internal", "admin", "engine:x-revoked")
+               .has_value());
+    REQUIRE(store.revoke("engine:x-revoked"));
+
+    // owner Y: 1 active.
+    REQUIRE(store.create("B1", "usery", "j", "internal", "admin", "engine:y-active")
+               .has_value());
+
+    auto x_count = store.count_active_owned_by("userx");
+    REQUIRE(x_count.has_value());
+    CHECK(*x_count == 2);
+
+    auto y_count = store.count_active_owned_by("usery");
+    REQUIRE(y_count.has_value());
+    CHECK(*y_count == 1);
+
+    // owner Z: no principals at all.
+    auto z_count = store.count_active_owned_by("userz");
+    REQUIRE(z_count.has_value());
+    CHECK(*z_count == 0);
+}
+
+TEST_CASE("EnginePrincipalStore::count_active_owned_by returns nullopt on an unreachable store "
+          "(fail-closed for the owner-delete guard)",
+          "[pg][engine_principal][store]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    CHECK_FALSE(store.count_active_owned_by("alice").has_value());
+}

@@ -6,6 +6,7 @@
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
@@ -235,6 +236,16 @@ std::string utc_now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
+}
+
+// Epoch seconds, caller-supplied (not read internally by the stores) so
+// engine-credential mint/rotate windows evaluate against one consistent
+// instant — mirrors ApiTokenStore::rotate_engine_credential's own
+// caller-supplied-`now` contract.
+int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 std::string lower_copy(std::string v) {
@@ -587,6 +598,157 @@ static const ToolDef kTools[] = {
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j"},
 
+    // ── Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3;
+    // MCP twins of the REST /api/v1/engine-principals/* surface, design doc
+    // docs/auth-engine-principals-design.md). An engine principal is the
+    // durable identity behind an autonomous use-case-engine module —
+    // hard-locked to MCP tier readonly (§8), never grantable the admin/
+    // wildcard role (§4.2 "no admin, ever"), and structurally barred from
+    // acting as caller of its OWN lifecycle surface (§9). Mutating tools
+    // require Security:Write — supervised MCP tier, approval-gated,
+    // same posture as every other destructive MCP op.
+    //
+    // G8 (architect-endorsed): §9's MFA step-up requirement applies to the
+    // REST/session surface only. The MCP twins below satisfy the equivalent
+    // privileged-access control via the supervised-tier + maker-checker
+    // approval flow already gated on every Security:Write tool
+    // (the platform-wide MCP step-up exemption) — no separate step-up gate
+    // is required (or possible — MCP tokens are non-interactive) here.
+    {"create_engine_principal",
+     "Create a new engine principal — the durable identity behind an autonomous use-case-engine "
+     "module. Engine credentials minted against it are hard-locked to MCP tier readonly and can "
+     "never be granted the admin/wildcard role (no admin, ever). owner_username is the named "
+     "responsible human and is FK-validated against the user store before the row is written. "
+     "Mirrors POST /api/v1/engine-principals. Destructive — requires Security:Write (supervised "
+     "MCP tier; approval-gated like every other destructive MCP op).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
+     R"j("display_name":{"type":"string","description":"UI/audit label"},)j"
+     R"j("owner_username":{"type":"string","description":"Named responsible human; must reference an existing user"},)j"
+     R"j("justification":{"type":"string","description":"Grant justification captured at creation (feeds access reviews)"},)j"
+     R"j("classification":{"type":"string","enum":["internal","external"],"description":"Required at creation, no default"})j"
+     R"j(},"required":["principal_id","display_name","owner_username","justification","classification"]})j",
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Create engine principal"})j"},
+
+    {"list_engine_principals",
+     "List engine principals with each principal's active-credential count (admin/auditor "
+     "surface). Mirrors GET /api/v1/engine-principals. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"principals":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["count","principals"]})j",
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List engine principals"})j"},
+
+    {"get_engine_principal",
+     "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
+     "/api/v1/engine-principals/{id}. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
+     R"j(},"required":["principal_id"]})j",
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j",
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Get engine principal"})j"},
+
+    {"revoke_engine_principal",
+     "Terminally revoke an engine principal: revokes every active credential first, THEN flips "
+     "lifecycle_state to revoked (credentials-then-identity — a caller can never observe a "
+     "revoked identity with a still-valid credential). TERMINAL and irreversible — never "
+     "un-revocable; a false-positive response mints a successor principal instead (pass "
+     "superseded_by on the successor's own creation, then reference this principal here). "
+     "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
+     "(supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"},)j"
+     R"j("superseded_by":{"type":"string","description":"Optional successor engine principal id, recorded on this row for audit trail continuity"})j"
+     R"j(},"required":["principal_id"]})j",
+     R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"principal_id":{"type":"string"},"credentials_revoked":{"type":"integer"}},"required":["revoked","principal_id"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Revoke engine principal"})j"},
+
+    {"mint_engine_credential",
+     "Mint the FIRST credential for an engine principal (MCP tier hard-locked to readonly, "
+     "ceiling 90 days — design doc §7/§8). Returns the raw credential value exactly once in "
+     "this response; it cannot be retrieved again, only rotated or revoked. Use "
+     "rotate_engine_credential once a credential already exists — this tool is for the initial "
+     "mint only (a second call errors: at most two active credentials, and only "
+     "rotate_engine_credential drives that state machine). Mirrors POST "
+     "/api/v1/engine-principals/{id}/credentials. Destructive — requires Security:Write (live "
+     "credential issuance; supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("name":{"type":"string","description":"Human-readable credential label"},)j"
+     R"j("ttl_days":{"type":"integer","default":90,"minimum":1,"maximum":90,"description":"Credential lifetime in days (90-day ceiling, design doc §7)"})j"
+     R"j(},"required":["principal_id"]})j",
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time reveal — capture now"},"principal_id":{"type":"string"},"expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id","expires_at"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Mint engine credential"})j"},
+
+    {"rotate_engine_credential",
+     "Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): "
+     "mints a successor (both credentials valid during the overlap window, default+minimum 7 "
+     "days, floor 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
+     "generally idempotent: a re-call within a short grace window after the original mint "
+     "re-serves the SAME successor secret (each reveal — original or replay — is independently "
+     "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
+     "errors and the caller must fall back to an explicit re-mint or the principal-level revoke "
+     "compromise runbook — never an indefinite retry. Mirrors POST "
+     "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
+     "(supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
+     R"j(},"required":["principal_id"]})j",
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Rotate engine credential"})j"},
+
+    {"confirm_engine_rotation",
+     "Explicit maker-checker confirmation that a rotation's successor secret has been received/"
+     "installed by its consumer (design doc §7 follow-on). Distinct from rotate_engine_credential "
+     "itself — rotate is the 'here is the secret' reveal step; confirm is a SEPARATE attestation "
+     "that closes the loop, gated behind its own Security:Write check rather than being inferred "
+     "from a successful rotate call. Mirrors POST "
+     "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
+     "(supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
+     R"j(},"required":["principal_id"]})j",
+     R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Confirm engine credential rotation"})j"},
+
+    {"transfer_engine_principal_owner",
+     "Reassign an engine principal's named responsible owner. Admin-forced — independent of the "
+     "outgoing owner's cooperation (a user under termination-for-cause cannot use engine-"
+     "principal ownership as a lever to stall their own deprovisioning). new_owner is FK-"
+     "validated against the user store. Mirrors POST "
+     "/api/v1/engine-principals/{id}/transfer-owner. Destructive — requires Security:Write "
+     "(supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("new_owner":{"type":"string","description":"Username of the new responsible human; must reference an existing user"})j"
+     R"j(},"required":["principal_id","new_owner"]})j",
+     R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j",
+     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Transfer engine principal owner"})j"},
+
+    {"audit_engine_no_admin",
+     "Auditor-runnable proof (design doc §4.2) that 'no admin, ever' and 'no all-permissions "
+     "toggle' hold for every engine principal — not just a write-path claim. Joins "
+     "principal_type=engine against each principal's resolved role assignments AND effective "
+     "permissions and reports any row that would violate those constraints: the literal admin/"
+     "Administrator role name, any role flagged is_system, or a granted securable x operation "
+     "set whose size reaches the full cross-product (functionally admin-equivalent even under a "
+     "custom non-system role name). ok:true with an empty violations[] is the positive "
+     "evidence; a non-empty violations[] (ok:false) indicates the write-path guard was bypassed "
+     "(data corruption, direct DB write, or a code regression) and should be treated as a "
+     "security incident. A 503/internal-error result (rather than ok:true) means the RBAC "
+     "reference data needed to compute the wildcard bound could not be resolved — treat as "
+     "'unable to verify', never as 'clean'. Mirrors GET "
+     "/api/v1/engine-principals/audit/no-admin exactly, including its {ok, violations} response "
+     "shape. Requires AuditLog:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts the audit to lifecycle_state=active principals only"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j",
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Audit engine principals for admin-grant violations"})j"},
+
     // ── Phase 2 write tools (#289 / Issue 13.5) — dispatched below ──────────
     // The optional `approval_id` argument on the approval-gated tools
     // (delete_tag, quarantine_device) carries a ticket from a prior
@@ -735,6 +897,10 @@ static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle",
+    // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
+    "create_engine_principal", "revoke_engine_principal",
+    "mint_engine_credential",  "rotate_engine_credential",
+    "transfer_engine_principal_owner", "confirm_engine_rotation",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -814,6 +980,16 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
+    // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
+    {"create_engine_principal", {"Security", "Write"}},
+    {"revoke_engine_principal", {"Security", "Write"}},
+    {"transfer_engine_principal_owner", {"Security", "Write"}},
+    {"mint_engine_credential", {"Security", "Write"}},
+    {"rotate_engine_credential", {"Security", "Write"}},
+    {"confirm_engine_rotation", {"Security", "Write"}},
+    {"list_engine_principals", {"Security", "Read"}},
+    {"get_engine_principal", {"Security", "Read"}},
+    {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -908,6 +1084,40 @@ static const PromptDef kPrompts[] = {
 };
 
 static constexpr int kPromptCount = sizeof(kPrompts) / sizeof(kPrompts[0]);
+
+// ── A4 retry-honesty classifier for engine-principal store errors ─────────
+// Mirrors rest_api_v1.cpp's engine_store_error_status() substring
+// classification (CSPRNG/"unavailable"/"rotation lock" → transient/retryable;
+// "grace window"/"different operator" → conflict), translated into the JSON-
+// RPC error-code vocabulary rather than HTTP status codes: no JSON-RPC
+// conflict code exists in mcp_jsonrpc.hpp today, so a real conflict still
+// maps to kInvalidParams (client/validation class — correct in that it is
+// NOT blindly retryable) while a genuinely transient failure maps to
+// kInternalError (retryable class) instead of the flat kInvalidParams every
+// site used before. Keep this list in sync with engine_store_error_status()
+// if either grows a new message class.
+int mcp_error_for_store_msg(const std::string& msg) {
+    if (msg.find("CSPRNG") != std::string::npos)
+        return kInternalError;
+    // "rotation confirmation unavailable" is a client-state CONFLICT (the RAM
+    // grace binding is gone — e.g. after a restart mid-rotation), NOT a
+    // transient store outage. REST maps it to 409 (don't-blindly-retry); mirror
+    // that here as kInvalidParams. This carve-out MUST precede the broad
+    // "unavailable"->kInternalError check below, which would otherwise
+    // mis-class it as retryable (consistency Gate 8 #5).
+    if (msg.find("rotation confirmation unavailable") != std::string::npos)
+        return kInvalidParams;
+    if (msg.find("not open") != std::string::npos || msg.find("unavailable") != std::string::npos)
+        return kInternalError;
+    if (msg.find("rotation lock") != std::string::npos)
+        return kInternalError;
+    // "grace window elapsed" / "different operator" are conflicts, not
+    // transient failures — no dedicated JSON-RPC conflict code exists, so
+    // this stays kInvalidParams (client/validation class): correct in that
+    // it signals "don't blindly retry", even though the message is a
+    // conflict rather than a malformed request.
+    return kInvalidParams;
+}
 
 } // anonymous namespace
 
@@ -1450,7 +1660,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     "Safe operating rules: classify the question first; read existing facts "
                     "before dispatch; narrow scope before action; use dry-run/read-only probes "
                     "where possible; request explicit approval before remediation; label "
-                    "connector gaps honestly.";
+                    "connector gaps honestly.\n\n"
+                    "Engine-principal management (create/list/get/revoke/mint/rotate/transfer-"
+                    "owner engine principals, plus a no-admin audit) is a supervised-tier, "
+                    "human-admin-only surface for provisioning the durable identities behind "
+                    "autonomous use-case-engine modules — engine-classed sessions are structurally "
+                    "barred from calling it, and every mutation is approval-gated.";
                 JArr contents;
                 contents.add(
                     JObj().add("uri", uri).add("mimeType", "text/markdown").add("text", content));
@@ -5168,6 +5383,712 @@ McpServer::HandlerFn McpServer::build_handler(
                 // MCP usage correlates with the ca.* domain events in the audit store.
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3) ──
+            // MCP twins of the REST /api/v1/engine-principals/* surface (a sibling
+            // task, built independently — ADR-1005 requires REST and MCP to reach
+            // the SAME store primitives directly, neither wrapping the other).
+            // Design doc: docs/auth-engine-principals-design.md.
+            //
+            // §9 defense-in-depth belt (Phase 4 structural posture): the C8
+            // tier-before-RBAC gate above already blocks every engine-classed
+            // session from reaching a Security:Write/Execute tool (engine
+            // credentials are hard-locked to MCP tier readonly, §8), so the check
+            // on the mutating tools below can never fire in production today — it
+            // exists for audit symmetry with the REST lifecycle routes' identical
+            // belt-and-braces guard, keyed on the session's PERSISTED principal
+            // kind/auth source (never a string-keyed inference) so a future second
+            // engine authentication path cannot silently bypass it. The readonly
+            // MCP tier still PERMITS Security:Read/AuditLog:Read, so list/get/audit
+            // are not exempt — the belt is required there too, else an
+            // engine-classed session could introspect its own lifecycle surface
+            // (list itself, read its own row, run the no-admin auditor) even
+            // though it cannot mutate it. Declared once here, used by every
+            // handler below.
+            auto deny_if_engine_session = [&]() -> bool {
+                if (session->principal_kind != "engine" && session->auth_source != "engine_token")
+                    return false;
+                mcp_audit("denied", "engine-classed session on lifecycle surface");
+                res.set_content(
+                    a4_error(kTierDenied,
+                             "engine-classed sessions may not call engine-principal lifecycle tools",
+                             "use a human admin credential"),
+                    "application/json");
+                return true;
+            };
+
+            if (tool_name == "create_engine_principal") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+                    mcp_audit("failure", "engine principal store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine principal store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                const auto display_name = param_str(args, "display_name");
+                const auto owner_username = param_str(args, "owner_username");
+                const auto justification = param_str(args, "justification");
+                const auto classification = param_str(args, "classification");
+                if (principal_id.empty() || display_name.empty() || owner_username.empty() ||
+                    justification.empty() || classification.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "principal_id, display_name, owner_username, justification, and "
+                                 "classification are all required"),
+                        "application/json");
+                    return;
+                }
+                // Owner-FK validation (design doc §3.1) — EnginePrincipalStore::create
+                // itself only checks non-empty, deliberately store-agnostic re: users
+                // (no ADR-0010 coupling); this is the caller-side check the design
+                // doc assigns to the route. Fail-closed when unwired: never silently
+                // admit an unverifiable owner reference.
+                if (!owner_exists_fn_) {
+                    mcp_audit("failure", "owner existence check unavailable");
+                    res.set_content(a4_error(kInternalError, "owner existence check unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                if (!owner_exists_fn_(owner_username)) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "owner_username does not reference an existing user"),
+                        "application/json");
+                    return;
+                }
+                auto created =
+                    engine_principal_store_->create(display_name, owner_username, justification,
+                                                    classification, session->username, principal_id);
+                if (!created) {
+                    const bool denied_audit_ok = audit_fn(req, "engine_principal.create", "failure",
+                                                          "EnginePrincipal", principal_id,
+                                                          created.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(created.error()), created.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
+                            principal_id, "owner=" + owner_username);
+                JObj payload;
+                payload.add("principal_id", created->principal_id)
+                    .add("display_name", created->display_name)
+                    .add("owner_username", created->owner_username)
+                    .add("classification", created->classification)
+                    .add("lifecycle_state", created->lifecycle_state)
+                    .add("created_at", created->created_at);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_engine_principals") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+                    mcp_audit("failure", "engine principal store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine principal store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const bool include_revoked = args.value("include_revoked", true);
+                auto principals = engine_principal_store_->list_all(include_revoked);
+                JArr arr;
+                for (const auto& p : principals) {
+                    JObj row;
+                    row.add("principal_id", p.principal_id)
+                        .add("display_name", p.display_name)
+                        .add("owner_username", p.owner_username)
+                        .add("classification", p.classification)
+                        .add("lifecycle_state", p.lifecycle_state)
+                        .add("superseded_by", p.superseded_by)
+                        .add("created_at", p.created_at)
+                        .add("revoked_at", p.revoked_at);
+                    if (engine_credential_store_)
+                        row.add("active_credentials",
+                                static_cast<int64_t>(
+                                    engine_credential_store_->list_active_for_principal(p.principal_id)
+                                        .size()));
+                    arr.add(row);
+                }
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(principals.size()))
+                    .raw("principals", arr.str());
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_engine_principal") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+                    mcp_audit("failure", "engine principal store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine principal store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                if (principal_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto p = engine_principal_store_->get(principal_id);
+                if (!p) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "engine principal not found: " + principal_id),
+                        "application/json");
+                    return;
+                }
+                JObj payload;
+                payload.add("principal_id", p->principal_id)
+                    .add("display_name", p->display_name)
+                    .add("owner_username", p->owner_username)
+                    .add("justification", p->justification)
+                    .add("classification", p->classification)
+                    .add("lifecycle_state", p->lifecycle_state)
+                    .add("superseded_by", p->superseded_by)
+                    .add("created_at", p->created_at)
+                    .add("revoked_at", p->revoked_at)
+                    .add("created_by", p->created_by);
+                if (engine_credential_store_)
+                    payload.add("active_credentials",
+                               static_cast<int64_t>(
+                                   engine_credential_store_->list_active_for_principal(principal_id)
+                                       .size()));
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "revoke_engine_principal") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open() ||
+                    !engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    // Fail closed: credentials-then-identity (below) requires BOTH
+                    // stores, and revoking the identity without also being able to
+                    // revoke its live credentials would leave a "revoked" principal
+                    // with a still-valid credential — never partially execute this.
+                    mcp_audit("failure", "engine principal/credential store unavailable");
+                    res.set_content(a4_error(kInternalError,
+                                             "engine principal/credential store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                if (principal_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                const std::string reason = param_str(args, "reason");
+                const std::string superseded_by = param_str(args, "superseded_by");
+                // G4: fetch first so a genuine store failure below can be
+                // told apart from "not found" / "already revoked"
+                // (idempotent) — mirrors the REST DELETE route's
+                // `existing`/`already_revoked` pattern exactly, rather than
+                // collapsing all three into one misleading kInvalidParams
+                // "not found or already revoked".
+                auto existing = engine_principal_store_->get(principal_id);
+                if (!existing) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                principal_id, "not found");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "engine principal not found: " + principal_id,
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool already_revoked = existing->lifecycle_state != "active";
+                // Credentials-then-identity (design doc §7 compromise runbook): revoke
+                // every live credential BEFORE flipping lifecycle_state, so a caller
+                // can never observe a revoked identity row with a still-valid
+                // credential.
+                const std::size_t credentials_revoked =
+                    engine_credential_store_->revoke_for_principal(principal_id);
+                const bool revoked = engine_principal_store_->revoke(principal_id, superseded_by);
+                if (!revoked && already_revoked) {
+                    // Idempotent no-op: the principal was already terminal before
+                    // this call, so `revoke()` returning false here is expected,
+                    // not an error — proceed to the success response below (same
+                    // as the REST route falling through this case).
+                } else if (!revoked) {
+                    // Genuine store failure (authoritative posture, EnginePrincipalStore
+                    // doc comment): a lease/query failure returns false, never a
+                    // silent success. Distinct from "already revoked" above — this is
+                    // retryable/partial-revoke state, not a permanent client-input
+                    // error, so map it to a 503-class retryable error rather than
+                    // kInvalidParams (which would misleadingly read as "bad request,
+                    // don't retry").
+                    mcp_audit("failure", "engine principal store failed to revoke");
+                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                   principal_id, "store_unavailable");
+                    res.set_content(a4_error(kInternalError,
+                                             "failed to revoke engine principal — try again",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "engine_principal.revoke", "success",
+                                               "EnginePrincipal", principal_id, reason);
+                JObj payload;
+                payload.add("revoked", true)
+                    .add("principal_id", principal_id)
+                    .add("credentials_revoked", static_cast<int64_t>(credentials_revoked));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "mint_engine_credential") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "engine credential store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine credential store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                if (principal_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                const std::string cred_name = param_str(args, "name", "engine credential");
+                int64_t ttl_days = param_int(args, "ttl_days", 90);
+                ttl_days = std::clamp<int64_t>(ttl_days, 1, 90);
+                const int64_t expires_at = now_epoch() + ttl_days * 86400;
+                // §7/§8: mcp_tier="readonly" hard-lock + 90-day ceiling + engine
+                // referential check are ALL enforced inside create_token itself —
+                // this handler does not duplicate that validation.
+                auto minted = engine_credential_store_->create_token(
+                    cred_name, principal_id, expires_at, /*scope_service=*/{},
+                    /*mcp_tier=*/"readonly", /*principal_kind=*/"engine");
+                if (!minted) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "engine_principal.credential.mint", "failure", "EnginePrincipal",
+                                principal_id, minted.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(minted.error()), minted.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                // create_token returns only the raw secret; look up the freshly
+                // minted row (the newest active credential) for its token_id.
+                ApiToken newest;
+                bool found_newest = false;
+                for (const auto& t :
+                    engine_credential_store_->list_active_for_principal(principal_id)) {
+                    if (!found_newest || t.created_at > newest.created_at) {
+                        newest = t;
+                        found_newest = true;
+                    }
+                }
+                const bool audit_ok = audit_fn(req, "engine_principal.credential.mint", "success",
+                                               "EnginePrincipal",
+                                               found_newest ? newest.token_id : principal_id,
+                                               "principal=" + principal_id);
+                JObj payload;
+                payload.add("token_id", found_newest ? newest.token_id : "")
+                    .add("raw_token", *minted)
+                    .add("principal_id", principal_id)
+                    .add("expires_at", expires_at);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "rotate_engine_credential") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "engine credential store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine credential store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                if (principal_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                int64_t overlap_days = param_int(args, "overlap_days", 7);
+                // Clamp both bounds before the multiply — an unbounded caller-supplied
+                // overlap_days would otherwise let `overlap_days * 86400` overflow
+                // int64_t (UB), mirroring the ttl_days clamp on the mint path above.
+                overlap_days = std::clamp<int64_t>(overlap_days, 1, 3650);
+                const int64_t overlap_secs = overlap_days * 86400;
+                // G7: requesting_user threads through so the overlap-pair state
+                // machine (and confirm_engine_rotation below) can attribute this
+                // rotation to the calling human/session, same as the REST route.
+                auto rotated = engine_credential_store_->rotate_engine_credential(
+                    principal_id, overlap_secs, now_epoch(), session->username);
+                if (!rotated) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "engine_principal.credential.rotate", "failure",
+                                "EnginePrincipal", principal_id, rotated.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(rotated.error()), rotated.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                // rotate_engine_credential returns only the raw secret; look up the
+                // successor (the newest active credential) for its token_id +
+                // overlap_expires_at.
+                ApiToken successor;
+                bool found_successor = false;
+                for (const auto& t :
+                    engine_credential_store_->list_active_for_principal(principal_id)) {
+                    if (!found_successor || t.created_at > successor.created_at) {
+                        successor = t;
+                        found_successor = true;
+                    }
+                }
+                // §7: every reveal — the original successor mint OR a within-grace-
+                // window replay — is its own independently audited disclosure event
+                // (never folded into one "rotation succeeded" row), so a replay is
+                // never invisible in the audit trail. This handler runs fresh on
+                // every JSON-RPC call, so a replay naturally produces its own row.
+                const bool reveal_audit_ok = audit_fn(
+                    req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
+                    found_successor ? successor.token_id : principal_id,
+                    "principal=" + principal_id + " action=rotate");
+                JObj payload;
+                payload.add("token_id", found_successor ? successor.token_id : "")
+                    .add("raw_token", *rotated)
+                    .add("principal_id", principal_id)
+                    .add("overlap_expires_at", found_successor ? successor.overlap_expires_at : 0);
+                if (!reveal_audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // G7: separate maker-checker confirmation tool — the MCP twin of
+            // POST /api/v1/engine-principals/{id}/credentials/confirm. Own
+            // Security:Write gate (not inferred from rotate having succeeded).
+            if (tool_name == "confirm_engine_rotation") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "engine credential store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine credential store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                if (principal_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto confirmed = engine_credential_store_->confirm_rotation(principal_id,
+                                                                            session->username);
+                if (!confirmed) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "engine_principal.credential.confirm", "failure",
+                                "EnginePrincipal", principal_id, confirmed.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
+                                       confirmed.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
+                                               "EnginePrincipal", principal_id, "");
+                JObj payload;
+                payload.add("confirmed", true).add("principal_id", principal_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "transfer_engine_principal_owner") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+                    mcp_audit("failure", "engine principal store unavailable");
+                    res.set_content(a4_error(kInternalError, "engine principal store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto principal_id = param_str(args, "principal_id");
+                const auto new_owner = param_str(args, "new_owner");
+                if (principal_id.empty() || new_owner.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "principal_id and new_owner are required"),
+                        "application/json");
+                    return;
+                }
+                // Owner-FK validation (design doc §3.1), same fail-closed contract
+                // as create_engine_principal above.
+                if (!owner_exists_fn_) {
+                    mcp_audit("failure", "owner existence check unavailable");
+                    res.set_content(a4_error(kInternalError, "owner existence check unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                if (!owner_exists_fn_(new_owner)) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "new_owner does not reference an existing user"),
+                        "application/json");
+                    return;
+                }
+                // Admin-forced (design doc §3.1): no check of the OUTGOING owner's
+                // cooperation by design — a user under termination-for-cause must
+                // never be able to use engine-principal ownership as a stall lever.
+                const bool transferred = engine_principal_store_->transfer_owner(principal_id, new_owner);
+                if (!transferred) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "engine_principal.transfer_owner", "failure", "EnginePrincipal",
+                                principal_id, "not found or not active");
+                    // No dynamic store error() message on this path — transfer_owner()
+                    // is bool-returning — so this is always a validation-shaped "not
+                    // found or not active" (never CSPRNG/unavailable/etc); still routed
+                    // through the shared classifier for symmetry with its siblings and
+                    // to stay correct if transfer_owner() ever gains richer error text.
+                    res.set_content(
+                        error_response(id,
+                                       mcp_error_for_store_msg("engine principal not found or not active"),
+                                       "engine principal not found or not active",
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "engine_principal.transfer_owner", "success",
+                                               "EnginePrincipal", principal_id,
+                                               "new_owner=" + new_owner);
+                JObj payload;
+                payload.add("transferred", true)
+                    .add("principal_id", principal_id)
+                    .add("new_owner", new_owner);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "audit_engine_no_admin") {
+                if (!tier_allows(tier, "AuditLog", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AuditLog", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_principal_store_ || !engine_principal_store_->is_open() || !rbac_store ||
+                    !rbac_store->is_open()) {
+                    mcp_audit("failure", "engine principal or rbac store unavailable");
+                    res.set_content(a4_error(kInternalError,
+                                             "engine principal or rbac store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                // Default true (audit ALL principals, incl. revoked) to match the
+                // REST twin (GET /api/v1/engine-principals/audit/no-admin, which
+                // calls list_all() with its own all-inclusive default) — a revoked
+                // principal that still holds an admin grant must still be flagged.
+                const bool include_revoked = args.value("include_revoked", true);
+                auto principals = engine_principal_store_->list_all(include_revoked);
+                // Design doc §4.2 named PR-4.3/4.4 deliverable: "no admin, ever" and
+                // "no all-permissions toggle" are enforced at the write path
+                // (RbacStore::validate_assignment) — a claim about code behavior an
+                // auditor cannot verify by reading a policy doc. This independently
+                // joins principal_type='engine' against resolved role/permission
+                // state and asserts zero violations, the same way an auditor-runnable
+                // proof should never just ask to trust the write-path guard.
+                //
+                // G2: mirrors the REST auditor (GET
+                // /api/v1/engine-principals/audit/no-admin, rest_api_v1.cpp) EXACTLY
+                // — same three checks (literal admin/Administrator role name, any
+                // is_system role via list_roles(), and the full securable x
+                // operation cross-product wildcard-grant bound) — rather than the
+                // narrower "Security/UserManagement securable" subset this tool
+                // previously checked. The two auditors must never diverge on what
+                // counts as a violation.
+                auto all_roles = rbac_store->list_roles();
+                auto all_securables = rbac_store->list_securable_types();
+                auto all_operations = rbac_store->list_operations();
+                // G3: same fail-closed posture as the REST twin — these are seeded
+                // RBAC reference tables that a live deployment never legitimately
+                // has zero rows in, so empty means resolution failed, not "no
+                // securables exist". A silently-zero full_grant_size would make
+                // the wildcard-grant check vacuously pass every principal, so
+                // report this run as unable to verify rather than certifying
+                // "clean":true over data we could not actually read.
+                if (all_securables.empty() || all_operations.empty()) {
+                    mcp_audit("failure", "rbac reference data unavailable — cannot verify");
+                    (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                                   "no-admin", "rbac_resolution_failed");
+                    res.set_content(a4_error(kInternalError,
+                                             "rbac reference data unavailable — cannot verify",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const std::size_t full_grant_size = all_securables.size() * all_operations.size();
+                JArr violations;
+                for (const auto& p : principals) {
+                    for (const auto& pr : rbac_store->get_principal_roles("engine", p.principal_id)) {
+                        if (pr.role_name == "admin" || pr.role_name == "Administrator") {
+                            violations.add(JObj()
+                                              .add("principal_id", p.principal_id)
+                                              .add("role", pr.role_name)
+                                              .add("reason", "admin_role"));
+                            continue;
+                        }
+                        auto it = std::find_if(
+                            all_roles.begin(), all_roles.end(),
+                            [&](const RbacRole& r) { return r.name == pr.role_name; });
+                        if (it != all_roles.end() && it->is_system) {
+                            violations.add(JObj()
+                                              .add("principal_id", p.principal_id)
+                                              .add("role", pr.role_name)
+                                              .add("reason", "system_role"));
+                        }
+                    }
+                    // "No all-permissions toggle" residual — same as the REST twin.
+                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
+                    std::unordered_set<std::string> granted;
+                    for (const auto& perm : effective) {
+                        if (perm.effect == "allow")
+                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
+                    }
+                    if (granted.size() >= full_grant_size) {
+                        violations.add(JObj()
+                                          .add("principal_id", p.principal_id)
+                                          .add("role", "")
+                                          .add("reason", "wildcard_grant"));
+                    }
+                }
+                // {ok, violations} — exact parity with the REST twin's response
+                // shape (GET /api/v1/engine-principals/audit/no-admin) so a
+                // machine caller can treat the two transports identically.
+                JObj payload;
+                payload.add("ok", violations.size() == 0).raw("violations", violations.str());
+                (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
+                               "no-admin", "violations=" + std::to_string(violations.size()));
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

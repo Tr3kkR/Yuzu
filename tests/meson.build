@@ -343,6 +343,7 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',

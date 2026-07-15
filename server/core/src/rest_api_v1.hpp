@@ -57,6 +57,11 @@ class BaselineStore;
 // ADR-0016: the typed daily-sync software store backs GET /api/v1/inventory/software.
 // Forward-declared (pointer-only in register_routes); the .cpp includes the header.
 class SoftwareInventoryStore;
+// PR 4.3 — engine-principal lifecycle store backs /api/v1/engine-principals.
+// Forward-declared (threaded post-construction via set_engine_principal_store,
+// not a register_routes parameter — see that method's doc comment); the .cpp
+// includes engine_principal_store.hpp for the definition.
+class EnginePrincipalStore;
 }
 
 #include <httplib.h>
@@ -205,6 +210,17 @@ public:
     /// `POST /api/v1/users/<name>/unlock` returns 503.
     using LockoutClearFn = std::function<bool(const std::string& username)>;
 
+    /// PR 4.3 — wraps `AuthDB::user_exists` so RestApiV1 stays decoupled from
+    /// AuthDB (same injection pattern as `SessionRevokeFn`/`LockoutClearFn`
+    /// immediately above). Used by the engine-principal create/transfer-owner
+    /// routes to validate an owner-FK (`owner_username`/`new_owner`) against
+    /// the real user store BEFORE the mutating store call — an engine
+    /// principal's owner must be a named, existing human
+    /// (`docs/auth-engine-principals-design.md` §3.1). Empty/unset callback
+    /// = those routes cannot verify the FK and fail closed (503), same
+    /// posture as every other unwired-Fn call site in this file.
+    using UserExistsFn = std::function<bool(const std::string& username)>;
+
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
@@ -302,6 +318,27 @@ public:
         // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
         // provider seams; `{}` = the endpoints answer 503 (provider unwired).
         AppPerfProviders app_perf_providers = {});
+
+    /// PR 4.3 — engine-principal lifecycle store backing
+    /// `/api/v1/engine-principals`. Threaded post-construction rather than as
+    /// a `register_routes` parameter: that signature is already large, this
+    /// store is additive to it, and the existing `ApiTokenStore*`/
+    /// `RbacStore*` register_routes params are reused unchanged for the
+    /// credential-mint/rotate and no-admin-audit routes. MUST be called
+    /// BEFORE `register_routes()` — the routes capture the pointer's value at
+    /// registration time, not `this`. Unset (nullptr, the default) = the
+    /// engine-principal routes answer 503, same posture as every other
+    /// unwired-store call site in this file.
+    void set_engine_principal_store(EnginePrincipalStore* store) { engine_principal_store_ = store; }
+
+    /// PR 4.3 — see `UserExistsFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`.
+    void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
+
+private:
+    EnginePrincipalStore* engine_principal_store_{nullptr};
+    UserExistsFn user_exists_fn_;
 };
 
 } // namespace yuzu::server

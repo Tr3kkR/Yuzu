@@ -3,6 +3,7 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
+#include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
@@ -198,6 +199,81 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .raw("pagination", pag)
         .raw("meta", R"({"api_version":"v1"})")
         .str();
+}
+
+// ── PR 4.3 — engine-principal lifecycle route helpers ──────────────────────
+
+// §9 Phase-4 structural denial belt (docs/auth-engine-principals-design.md
+// §9): every engine-principal MUTATING route must reject a caller whose own
+// session belongs to an engine principal — an engine session must never be
+// able to mint/rotate/revoke/transfer engine-principal identities, even if a
+// future RBAC misconfiguration somehow granted it Security:Write. Keyed on
+// the persisted `principal_kind` FIRST (the durable discriminator, design
+// doc §6), with `auth_source=="engine_token"` as a second belt so a future
+// second engine authentication path cannot silently bypass a string-keyed
+// deny. Returns true (and has already written the 403 A4 body) when the
+// caller must stop; false when the session is human and the route may
+// proceed.
+static bool deny_engine_session(const auth::Session& s, const httplib::Request& req,
+                                httplib::Response& res, const RestApiV1::AuditFn& audit,
+                                const char* action, const char* target) {
+    if (s.principal_kind == "engine" || s.auth_source == "engine_token") {
+        if (audit)
+            audit(req, action, "denied", target, "", "engine_session_denied");
+        res.status = 403;
+        res.set_content(detail::a4_error(res, "engine principals cannot access this endpoint"),
+                        "application/json");
+        return true;
+    }
+    return false;
+}
+
+// Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
+// failure message to an HTTP status. The stores are string-typed-error, not
+// exception-typed — this keeps the mapping in one place instead of
+// re-deriving substring checks at every call site (create/mint/rotate).
+// Store-unavailable / entropy-exhaustion conditions are retryable (503);
+// "grace window elapsed" is a genuine state conflict (409, design §7 —
+// the caller must fall back to an explicit re-mint or the compromise
+// runbook, never retry indefinitely); everything else is a validation
+// failure the store already worded for the client (400).
+static int engine_store_error_status(const std::string& err) {
+    if (err.find("CSPRNG") != std::string::npos)
+        return 503;
+    // Specific conflict/validation matches go FIRST, broad retryable
+    // substrings LAST — several of these messages (e.g. "rotation
+    // confirmation unavailable") contain a broad substring too, so ordering
+    // is load-bearing: the narrower, more accurate match must win.
+    if (err.find("grace window elapsed") != std::string::npos)
+        return 409;
+    // Confirm-path client-state conflict: the grace-cache entry needed to
+    // resolve the confirm's caller-binding is gone (process restart, or the
+    // rotation already resolved) — a genuine 409, not a transient store
+    // failure, even though the message contains "unavailable". Checked
+    // BEFORE the broad "unavailable" match below so this specific case wins.
+    if (err.find("rotation confirmation unavailable") != std::string::npos)
+        return 409;
+    // A rotation initiated by a different operator is a conflict, not a bad
+    // request — the caller-binding guard (grace re-serve / confirm) rejects a
+    // second operator touching an in-flight rotation.
+    if (err.find("different operator") != std::string::npos)
+        return 409;
+    // Advisory-lock acquisition failure (concurrent rotate/confirm holding
+    // the same principal-scoped lock, or a momentary connection blip) is
+    // transient — retryable, not a client error.
+    if (err.find("rotation lock") != std::string::npos)
+        return 503;
+    // Covers "database not open", "database unavailable — try again",
+    // "engine principal store unavailable — try again", and "engine referent
+    // check unavailable" (the unwired-resolver case) — none of the store's
+    // remaining validation-shaped messages (checked against every
+    // `unexpected(...)` in engine_principal_store.cpp / api_token_store.cpp's
+    // create_token + rotate_engine_credential + confirm_rotation) contain
+    // "unavailable", so this is a safe broad match, not a narrow substring
+    // per message.
+    if (err.find("not open") != std::string::npos || err.find("unavailable") != std::string::npos)
+        return 503;
+    return 400;
 }
 
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
@@ -1077,6 +1153,14 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers) {
 
     spdlog::info("REST API v1: registering routes");
+
+    // PR 4.3 — engine-principal lifecycle store + owner-FK checker, threaded
+    // post-construction via set_engine_principal_store/set_user_exists_fn
+    // (see those methods' doc comments in the .hpp). Snapshotted into local
+    // values here — same as every other dependency in this function — so the
+    // route lambdas below capture plain values, not `this`.
+    EnginePrincipalStore* engine_principal_store = engine_principal_store_;
+    UserExistsFn user_exists_fn = user_exists_fn_;
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
@@ -2061,6 +2145,686 @@ void RestApiV1::register_routes(
                  "owner=" + existing->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
+
+    // ── Engine Principals (/api/v1/engine-principals) — PR 4.3 ────────────
+    //
+    // Lifecycle surface for engine-principal identities (the durable identity
+    // behind an autonomous use-case engine module,
+    // docs/auth-engine-principals-design.md §3.1). Human-admin + MFA
+    // step-up gated on every mutation (§9 Phase-4 posture); every mutating
+    // route also runs deny_engine_session as a structural denial belt so an
+    // engine session itself can never touch this surface. Credential mint
+    // and rotation delegate to the SAME `ApiTokenStore` the human/service
+    // token routes above use — no parallel credential store.
+
+    // POST /api/v1/engine-principals — mint a new engine-principal identity.
+    sink.Post("/api/v1/engine-principals",
+             [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, user_exists_fn](
+                 const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Write"))
+                     return;
+                 if (!engine_principal_store || !engine_principal_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
+                 if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.create",
+                                         "EnginePrincipal"))
+                     return;
+                 if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/engine-principals"))
+                     return;
+
+                 auto body = nlohmann::json::parse(req.body, nullptr, false);
+                 if (body.is_discarded()) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                     return;
+                 }
+                 auto slug = body.value("slug", "");
+                 auto display_name = body.value("display_name", "");
+                 auto owner_username = body.value("owner_username", "");
+                 auto justification = body.value("justification", "");
+                 auto classification = body.value("classification", "");
+
+                 if (slug.empty()) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "slug is required"), "application/json");
+                     return;
+                 }
+                 if (slug.size() > 128) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "invalid_input_length: slug exceeds 128 chars"),
+                                     "application/json");
+                     return;
+                 }
+
+                 // Owner-FK (design §3.1): owner_username must reference an
+                 // existing user, checked BEFORE the store call. Decoupled
+                 // via UserExistsFn (wraps AuthDB::user_exists) — same
+                 // injection pattern as SessionRevokeFn/LockoutClearFn.
+                 if (!user_exists_fn) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 if (owner_username.empty() || !user_exists_fn(owner_username)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::a4_error(res, "owner_username must reference an existing user"),
+                         "application/json");
+                     return;
+                 }
+
+                 std::string principal_id = "engine:" + slug;
+                 auto result = engine_principal_store->create(display_name, owner_username,
+                                                              justification, classification,
+                                                              session->username, principal_id);
+                 if (!result) {
+                     res.status = engine_store_error_status(result.error());
+                     res.set_content(detail::a4_error(res, result.error()), "application/json");
+                     (void)audit_fn(req, "engine_principal.create", "failure", "EnginePrincipal",
+                                    principal_id, result.error());
+                     return;
+                 }
+                 (void)audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
+                                principal_id,
+                                "owner=" + owner_username + "; classification=" + classification);
+                 res.status = 201;
+                 res.set_content(ok_json(JObj().add("principal_id", principal_id).str()),
+                                 "application/json");
+             });
+
+    // GET /api/v1/engine-principals — list every engine principal.
+    sink.Get("/api/v1/engine-principals",
+             [perm_fn, auth_fn, audit_fn, engine_principal_store, token_store](
+                 const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Read"))
+                     return;
+                 if (!engine_principal_store || !engine_principal_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 // G1 (§9 deny belt): a read route on the engine-principal
+                 // lifecycle surface is still "introspect the lifecycle
+                 // surface" — an engine-classed session must not enumerate
+                 // every engine principal any more than it may mutate one.
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
+                 if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.list",
+                                         "EnginePrincipal"))
+                     return;
+                 auto principals = engine_principal_store->list_all();
+                 JArr arr;
+                 for (const auto& p : principals) {
+                     std::int64_t active_creds =
+                         token_store
+                             ? static_cast<std::int64_t>(
+                                   token_store->list_active_for_principal(p.principal_id).size())
+                             : 0;
+                     arr.add(JObj()
+                                 .add("principal_id", p.principal_id)
+                                 .add("display_name", p.display_name)
+                                 .add("owner_username", p.owner_username)
+                                 .add("classification", p.classification)
+                                 .add("lifecycle_state", p.lifecycle_state)
+                                 .add("created_at", p.created_at)
+                                 .add("active_credential_count", active_creds));
+                 }
+                 (void)audit_fn(req, "engine_principal.list", "success", "EnginePrincipal", "",
+                                "count=" + std::to_string(principals.size()));
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(principals.size())),
+                                 "application/json");
+             });
+
+    // GET /api/v1/engine-principals/{id} — one principal + its active credentials.
+    sink.Get(R"(/api/v1/engine-principals/([^/]+))",
+             [perm_fn, auth_fn, audit_fn, engine_principal_store, token_store](
+                 const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Read"))
+                     return;
+                 if (!engine_principal_store || !engine_principal_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 // G1 (§9 deny belt) — same posture as the list route above.
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
+                 if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.get",
+                                         "EnginePrincipal"))
+                     return;
+                 auto principal_id = req.matches[1].str();
+                 auto row = engine_principal_store->get(principal_id);
+                 if (!row) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "engine principal not found"),
+                                     "application/json");
+                     return;
+                 }
+
+                 JArr creds;
+                 if (token_store) {
+                     for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                         // token_hash is masked ('') by list_active_for_principal already —
+                         // never echo the raw secret on a plain GET.
+                         creds.add(JObj()
+                                       .add("token_id", t.token_id)
+                                       .add("name", t.name)
+                                       .add("created_at", t.created_at)
+                                       .add("expires_at", t.expires_at)
+                                       .add("last_used_at", t.last_used_at)
+                                       .add("rotation_group", t.rotation_group)
+                                       .add("overlap_expires_at", t.overlap_expires_at));
+                     }
+                 }
+                 JObj data;
+                 data.add("principal_id", row->principal_id)
+                     .add("display_name", row->display_name)
+                     .add("owner_username", row->owner_username)
+                     .add("justification", row->justification)
+                     .add("classification", row->classification)
+                     .add("lifecycle_state", row->lifecycle_state)
+                     .add("superseded_by", row->superseded_by)
+                     .add("created_at", row->created_at)
+                     .add("revoked_at", row->revoked_at)
+                     .add("created_by", row->created_by)
+                     .raw("active_credentials", creds.str());
+                 (void)audit_fn(req, "engine_principal.get", "success", "EnginePrincipal",
+                                principal_id, "");
+                 res.set_content(ok_json(data.str()), "application/json");
+             });
+
+    // DELETE /api/v1/engine-principals/{id} — principal-level terminal revoke.
+    // Order (cross-store invariant): kill credentials FIRST
+    // (ApiTokenStore::revoke_for_principal), THEN mark the identity terminal
+    // (EnginePrincipalStore::revoke) — never the reverse, which would leave a
+    // window where the identity reads revoked but its credentials still
+    // validate.
+    sink.Delete(
+        R"(/api/v1/engine-principals/([^/]+))",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, token_store](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.revoke",
+                                    "EnginePrincipal"))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session, "DELETE /api/v1/engine-principals/{id}"))
+                return;
+
+            auto principal_id = req.matches[1].str();
+            auto existing = engine_principal_store->get(principal_id);
+            if (!existing) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "engine principal not found"),
+                                "application/json");
+                return;
+            }
+            bool already_revoked = existing->lifecycle_state != "active";
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            std::string superseded_by =
+                (!body.is_discarded() && body.is_object()) ? body.value("superseded_by", "") : "";
+
+            std::size_t creds_revoked =
+                token_store ? token_store->revoke_for_principal(principal_id) : 0;
+            bool revoked = engine_principal_store->revoke(principal_id, superseded_by);
+            if (!revoked && !already_revoked) {
+                // Authoritative posture (EnginePrincipalStore doc comment): a
+                // lease/query failure returns false, never a silent success —
+                // this is a real store failure, not idempotent no-op.
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "failed to revoke engine principal — try again"),
+                                "application/json");
+                (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                               principal_id, "store_unavailable");
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.revoke", "success", "EnginePrincipal",
+                           principal_id,
+                           "credentials_revoked=" + std::to_string(creds_revoked) +
+                               (superseded_by.empty() ? "" : "; superseded_by=" + superseded_by));
+            res.set_content(
+                ok_json(JObj().add("revoked", true).add("credentials_revoked",
+                                                        static_cast<int64_t>(creds_revoked)).str()),
+                "application/json");
+        });
+
+    // POST /api/v1/engine-principals/{id}/credentials — initial credential mint.
+    sink.Post(
+        R"(/api/v1/engine-principals/([^/]+)/credentials)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, token_store,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open() || !token_store ||
+                !token_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.credential.mint",
+                                    "EnginePrincipal"))
+                return;
+            if (step_up_fn && !step_up_fn(req, res, *session,
+                                          "POST /api/v1/engine-principals/{id}/credentials"))
+                return;
+
+            auto principal_id = req.matches[1].str();
+            auto row = engine_principal_store->get(principal_id);
+            if (!row) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "engine principal not found"),
+                                "application/json");
+                return;
+            }
+            if (row->lifecycle_state != "active") {
+                res.status = 409;
+                res.set_content(detail::a4_error(res, "engine principal is not active"),
+                                "application/json");
+                return;
+            }
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            int64_t ttl_days = 90;
+            if (!body.is_discarded() && body.is_object() && body.contains("ttl_days"))
+                ttl_days = body.value("ttl_days", int64_t{90});
+            if (ttl_days < 1 || ttl_days > 90) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "ttl_days must be between 1 and 90"),
+                                "application/json");
+                return;
+            }
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            const int64_t expires_at = now + ttl_days * 24 * 3600;
+
+            auto result = token_store->create_token(principal_id, principal_id, expires_at,
+                                                    /*scope_service=*/"", /*mcp_tier=*/"readonly",
+                                                    /*principal_kind=*/"engine");
+            if (!result) {
+                int status = engine_store_error_status(result.error());
+                if (status == 503 && metrics_registry &&
+                    result.error().find("CSPRNG") != std::string::npos) {
+                    metrics_registry
+                        ->counter("yuzu_secure_random_failure_total",
+                                  {{"reason", "prng_failure"}, {"site", "engine_principal"}})
+                        .increment();
+                    res.set_header("Retry-After", "5");
+                }
+                res.status = status;
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                (void)audit_fn(req, "engine_principal.credential.mint", "failure", "EnginePrincipal",
+                               principal_id, result.error());
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.credential.mint", "success", "EnginePrincipal",
+                           principal_id, "ttl_days=" + std::to_string(ttl_days));
+            res.status = 201;
+            // create_token returns only the raw secret; look up the freshly
+            // minted row (the newest active credential) for its token_id so a
+            // pure-REST caller can correlate the credential it just minted
+            // without a follow-up GET — mirrors the MCP mint_engine_credential
+            // twin's correlation logic (mcp_server.cpp).
+            std::string minted_token_id;
+            int64_t minted_created_at = -1;
+            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                if (t.created_at > minted_created_at) {
+                    minted_created_at = t.created_at;
+                    minted_token_id = t.token_id;
+                }
+            }
+            // G5 (secret hygiene): the response body carries a raw one-time
+            // credential — never let a browser cache, a shared/corporate
+            // proxy, or a back-button history entry retain it.
+            res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.set_header("Pragma", "no-cache");
+            res.set_content(ok_json(JObj()
+                                        .add("token", *result)
+                                        .add("token_id", minted_token_id)
+                                        .add("expires_at", expires_at)
+                                        .str()),
+                            "application/json");
+        });
+
+    // POST /api/v1/engine-principals/{id}/credentials/rotate — overlap-pair
+    // rotation (design §7). step_up_fn runs on EVERY call, including a
+    // re-serve within the grace window — a rotate call is never exempt just
+    // because it returns the same secret as a moment ago. Each successful
+    // return (mint OR re-serve) gets its OWN `engine_principal.credential.reveal`
+    // audit row — deliberately never folded into a single "rotation
+    // succeeded" event, so every time the raw secret left the server is
+    // independently on the audit chain.
+    sink.Post(
+        R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, token_store](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open() || !token_store ||
+                !token_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn,
+                                    "engine_principal.credential.rotate", "EnginePrincipal"))
+                return;
+            // CRITICAL (design §7 / task spec): gated on every call, including
+            // an idempotent re-serve within the grace window — never skipped.
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session,
+                            "POST /api/v1/engine-principals/{id}/credentials/rotate"))
+                return;
+
+            auto principal_id = req.matches[1].str();
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
+            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs"))
+                overlap_secs = body.value("overlap_secs", overlap_secs);
+
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            // G7: requesting_user threads through to ApiTokenStore so the
+            // overlap-pair state machine can attribute (and, via
+            // confirm_engine_rotation below, gate) this specific rotation
+            // to the human who triggered it — not just the engine principal
+            // being rotated.
+            auto result = token_store->rotate_engine_credential(principal_id, overlap_secs, now,
+                                                                 session->username);
+            if (!result) {
+                res.status = engine_store_error_status(result.error());
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                (void)audit_fn(req, "engine_principal.credential.rotate", "failure",
+                               "EnginePrincipal", principal_id, result.error());
+                return;
+            }
+            // The reveal IS the success audit for this route — see the
+            // comment above the route registration.
+            (void)audit_fn(req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
+                           principal_id, "rotate");
+            // rotate_engine_credential returns only the raw secret; look up
+            // the successor (the newest active credential) for its token_id +
+            // expires_at/overlap_expires_at — mirrors the MCP
+            // rotate_engine_credential twin's correlation logic
+            // (mcp_server.cpp) so a pure-REST caller can correlate the
+            // credential it just minted without a follow-up GET.
+            std::string successor_token_id;
+            int64_t successor_created_at = -1;
+            int64_t successor_expires_at = 0;
+            int64_t successor_overlap_expires_at = 0;
+            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                if (t.created_at > successor_created_at) {
+                    successor_created_at = t.created_at;
+                    successor_token_id = t.token_id;
+                    successor_expires_at = t.expires_at;
+                    successor_overlap_expires_at = t.overlap_expires_at;
+                }
+            }
+            // G5 (secret hygiene) — same no-store contract as the mint route.
+            res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.set_header("Pragma", "no-cache");
+            res.set_content(ok_json(JObj()
+                                        .add("token", *result)
+                                        .add("token_id", successor_token_id)
+                                        .add("expires_at", successor_expires_at)
+                                        .add("overlap_expires_at", successor_overlap_expires_at)
+                                        .str()),
+                            "application/json");
+        });
+
+    // POST /api/v1/engine-principals/{id}/credentials/confirm — explicit
+    // maker-checker confirmation that a rotation's successor secret has been
+    // received/installed by its consumer (design §7 follow-on, G7). Distinct
+    // from the reveal itself: `rotate` above is the "here is the secret"
+    // step; `confirm` is the caller's separate attestation that closes the
+    // loop, gated behind its OWN Security:Write + step-up + deny-belt check
+    // — never inferred from the rotate call succeeding.
+    sink.Post(
+        R"(/api/v1/engine-principals/([^/]+)/credentials/confirm)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, token_store](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open() || !token_store ||
+                !token_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn,
+                                    "engine_principal.credential.confirm", "EnginePrincipal"))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session,
+                            "POST /api/v1/engine-principals/{id}/credentials/confirm"))
+                return;
+
+            auto principal_id = req.matches[1].str();
+            auto confirmed = token_store->confirm_rotation(principal_id, session->username);
+            if (!confirmed) {
+                res.status = engine_store_error_status(confirmed.error());
+                res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
+                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
+                               "EnginePrincipal", principal_id, confirmed.error());
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.credential.confirm", "success", "EnginePrincipal",
+                           principal_id, "");
+            res.set_content(ok_json(JObj().add("confirmed", true).str()), "application/json");
+        });
+
+    // POST /api/v1/engine-principals/{id}/transfer-owner — admin-forced
+    // ownership reassignment (design §3.1: never depends on the outgoing
+    // owner's cooperation).
+    sink.Post(
+        R"(/api/v1/engine-principals/([^/]+)/transfer-owner)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, engine_principal_store, user_exists_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn,
+                                    "engine_principal.transfer_owner", "EnginePrincipal"))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session,
+                            "POST /api/v1/engine-principals/{id}/transfer-owner"))
+                return;
+
+            auto principal_id = req.matches[1].str();
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            auto new_owner = body.value("new_owner", "");
+
+            if (!user_exists_fn) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            if (new_owner.empty() || !user_exists_fn(new_owner)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "new_owner must reference an existing user"),
+                                "application/json");
+                return;
+            }
+
+            auto existing = engine_principal_store->get(principal_id);
+            if (!existing) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "engine principal not found"),
+                                "application/json");
+                return;
+            }
+            if (existing->lifecycle_state != "active") {
+                res.status = 409;
+                res.set_content(detail::a4_error(res, "engine principal is not active"),
+                                "application/json");
+                return;
+            }
+
+            bool transferred = engine_principal_store->transfer_owner(principal_id, new_owner);
+            if (!transferred) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "failed to transfer ownership — try again"),
+                    "application/json");
+                (void)audit_fn(req, "engine_principal.transfer_owner", "failure",
+                               "EnginePrincipal", principal_id, "store_unavailable");
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.transfer_owner", "success", "EnginePrincipal",
+                           principal_id,
+                           "old_owner=" + existing->owner_username + "; new_owner=" + new_owner);
+            res.set_content(ok_json(JObj().add("transferred", true).str()), "application/json");
+        });
+
+    // GET /api/v1/engine-principals/audit/no-admin — auditor-runnable
+    // independent proof of design §4.2's "no admin, ever" / "no
+    // all-permissions toggle" invariants (decision log #13). Gated on
+    // AuditLog:Read, NOT Security — this is a read-only evidentiary query,
+    // not part of the write-path bar it verifies, so a read-only auditor
+    // role can run it without holding engine-principal write access.
+    //
+    // No route-ordering hazard against the `/{id}` GET above: httplib matches
+    // each registered pattern with a FULL regex match, and `[^/]+` cannot
+    // match a value containing '/' — "audit/no-admin" can never be captured
+    // as a single `{id}` segment, regardless of registration order.
+    sink.Get(
+        "/api/v1/engine-principals/audit/no-admin",
+        [perm_fn, auth_fn, audit_fn, engine_principal_store, rbac_store](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AuditLog", "Read"))
+                return;
+            if (!engine_principal_store || !engine_principal_store->is_open() || !rbac_store) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            // G1 (§9 deny belt): the no-admin auditor is still part of the
+            // engine-principal lifecycle surface — an engine-classed
+            // session must not be able to run it either.
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "engine_principal.audit.no_admin",
+                                    "EnginePrincipal"))
+                return;
+
+            auto all_roles = rbac_store->list_roles();
+            auto all_securables = rbac_store->list_securable_types();
+            auto all_operations = rbac_store->list_operations();
+            // G3: list_securable_types()/list_operations() read the
+            // `securable_types`/`operations` reference tables, which RBAC
+            // bootstrap seeds unconditionally at DB creation — a live
+            // deployment NEVER legitimately has zero rows in either. Coming
+            // back empty therefore means resolution failed (closed
+            // connection, corrupt table, etc.), not "there happen to be no
+            // securables" — and a silently-zero `full_grant_size` would make
+            // the wildcard-grant check below vacuously pass every principal.
+            // Fail CLOSED: report this run as unable to verify rather than
+            // certifying `"ok":true` over data we could not actually read.
+            // (list_roles()/get_principal_roles()/get_effective_permissions()
+            // returning empty is not distinguishable from "legitimately no
+            // rows" with the store's current API — same residual noted on
+            // the MCP twin, audit_engine_no_admin, in mcp_server.cpp.)
+            if (all_securables.empty() || all_operations.empty()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "rbac reference data unavailable — cannot verify"),
+                    "application/json");
+                (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                               "no-admin", "rbac_resolution_failed");
+                return;
+            }
+            const std::size_t full_grant_size = all_securables.size() * all_operations.size();
+
+            auto principals = engine_principal_store->list_all();
+            JArr violations;
+            for (const auto& p : principals) {
+                auto roles = rbac_store->get_principal_roles("engine", p.principal_id);
+                for (const auto& pr : roles) {
+                    if (pr.role_name == "admin" || pr.role_name == "Administrator") {
+                        violations.add(JObj()
+                                          .add("principal_id", p.principal_id)
+                                          .add("role", pr.role_name)
+                                          .add("reason", "admin_role"));
+                        continue;
+                    }
+                    auto it = std::find_if(all_roles.begin(), all_roles.end(),
+                                           [&](const RbacRole& r) { return r.name == pr.role_name; });
+                    if (it != all_roles.end() && it->is_system) {
+                        violations.add(JObj()
+                                          .add("principal_id", p.principal_id)
+                                          .add("role", pr.role_name)
+                                          .add("reason", "system_role"));
+                    }
+                }
+                // "No all-permissions toggle" residual (rbac_store.cpp's
+                // assign_role comment): a custom, non-system role that
+                // happens to be granted a FULL cross-product of every known
+                // securable x operation is functionally admin-equivalent
+                // even though neither the literal-name nor is_system checks
+                // above would catch it.
+                if (full_grant_size > 0) {
+                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
+                    std::unordered_set<std::string> granted;
+                    for (const auto& perm : effective) {
+                        if (perm.effect == "allow")
+                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
+                    }
+                    if (granted.size() >= full_grant_size) {
+                        violations.add(JObj()
+                                          .add("principal_id", p.principal_id)
+                                          .add("role", "")
+                                          .add("reason", "wildcard_grant"));
+                    }
+                }
+            }
+
+            const bool ok = violations.size() == 0;
+            std::string data = JObj().add("ok", ok).raw("violations", violations.str()).str();
+            (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
+                           "no-admin", "violations=" + std::to_string(violations.size()));
+            res.set_content(ok_json(data), "application/json");
+        });
 
     // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
     //
@@ -3118,11 +3882,15 @@ void RestApiV1::register_routes(
 
     // GET /api/v1/audit/auth-sample — pseudo-random sample of authentication-
     // surface audit events over an optional [from,to] window, for SOC 2 CC7.2
-    // sampled-evidence export. Scoped to the auth./mfa./session. action prefixes.
-    // Gated on AuditLog:Read (consistent with /api/v1/audit, and lets a read-only
-    // auditor role pull evidence without full admin — separation of duties). The
-    // export itself is audited (audit.auth_sample.exported) so evidence access is
-    // on the chain.
+    // sampled-evidence export. Scoped to the auth./mfa./session./engine_principal.
+    // action prefixes — the last added by PR 4.3 so engine-principal lifecycle
+    // events (create/revoke/credential mint+rotate+reveal/transfer-owner) are
+    // in the sampled-evidence export, per design doc §10's periodic-access-review
+    // hand-off (a principal-class-blind export would silently exclude engine
+    // principals). Gated on AuditLog:Read (consistent with /api/v1/audit, and
+    // lets a read-only auditor role pull evidence without full admin —
+    // separation of duties). The export itself is audited
+    // (audit.auth_sample.exported) so evidence access is on the chain.
     sink.Get(
         "/api/v1/audit/auth-sample",
         [perm_fn, audit_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
@@ -3151,7 +3919,7 @@ void RestApiV1::register_routes(
             }
 
             AuditQuery q;
-            q.action_prefixes = {"auth.", "mfa.", "session."};
+            q.action_prefixes = {"auth.", "mfa.", "session.", "engine_principal."};
             q.random_sample = true;
             // std::stoll throws std::out_of_range on overflow (unlike strtoll) — the
             // catch turns that into a 400, so no separate errno/ceiling check is
