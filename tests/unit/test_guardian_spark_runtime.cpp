@@ -36,6 +36,7 @@ struct FakeReader : IStateReader {
     std::function<void()> on_read; // optional gate
     std::atomic<int> reads{0};
     std::atomic<std::uint64_t> last_hash_cap{0};
+    std::atomic<std::size_t> last_reg_plan_size{0};
     ReadResult<FileSnapshot> read_file(const FileSparkParams&, const FileReadPlan& plan) override {
         reads.fetch_add(1);
         last_hash_cap.store(plan.hash_cap);
@@ -44,6 +45,7 @@ struct FakeReader : IStateReader {
     }
     RegistryRead read_registry(const RegistrySparkParams&, const RegistryReadPlan& plan) override {
         reads.fetch_add(1);
+        last_reg_plan_size.store(plan.value_names.size());
         RegistryRead out;
         out.latency_us = 7;
         for (const auto& vn : plan.value_names) {
@@ -367,6 +369,21 @@ TEST_CASE("two registry rules under one key each read their OWN value_name", "[s
     REQUIRE(g[1].rule_id == "r2");
     REQUIRE_FALSE(g[1].drift.compliant); // B == "9" != "2"
     REQUIRE(g[1].drift.detected_value == "9");
+}
+
+TEST_CASE("two rules watching the SAME registry value dedup the read plan", "[spark][runtime]") {
+    // The read plan promises DISTINCT value_names; a rung-5 reader relies on that to
+    // avoid redundant OS reads. Two rules on the same value must produce one entry.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    r->reg_values["A"] = read_known(RegistrySnapshot{.present = true, .value = "1"});
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(reg_spec("HKLM", "Software\\X"));
+    rt->attach_rule("r1", reg_spec("HKLM", "Software\\X"), registry_rule("r1", "A", "1"), true);
+    rt->attach_rule("r2", reg_spec("HKLM", "Software\\X"), registry_rule("r2", "A", "1"), true);
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(r->last_reg_plan_size.load() == 1); // deduped: value A read once, not twice
+    REQUIRE(drain_all(*rt).size() == 2);        // both rules still evaluated
 }
 
 TEST_CASE("the file read plan uses the largest hash cap among the key's rules", "[spark][runtime]") {

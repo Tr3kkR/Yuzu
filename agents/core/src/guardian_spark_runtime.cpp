@@ -3,6 +3,7 @@
 #include "spark_key_rule_index.hpp"
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -161,6 +162,7 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
         const auto kit = keys_.find(key);
         if (kit == keys_.end() || kit->second.get() != pk.get())
             return;
+        std::set<std::string> reg_values; // distinct value_names (the plan's contract)
         for (const std::string& rid : index_->rules_for(key)) {
             const auto rrit = rules_.find(rid);
             if (rrit == rules_.end() || !rrit->second->active)
@@ -170,8 +172,9 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
             if (is_file && rg->assertion.kind == AssertionKind::FileHashEquals)
                 fplan.hash_cap = std::max(fplan.hash_cap, rg->assertion.max_bytes);
             if (is_reg)
-                rplan.value_names.push_back(rg->assertion.value_name);
+                reg_values.insert(rg->assertion.value_name);
         }
+        rplan.value_names.assign(reg_values.begin(), reg_values.end());
     }
     if (planned.empty())
         return;
