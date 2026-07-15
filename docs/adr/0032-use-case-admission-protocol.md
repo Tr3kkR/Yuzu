@@ -385,7 +385,7 @@ requirements, and it is worth exactly as much as they are:
   *whole* lifecycle - admission, reads, compose, finalise, **and the seam-4b redemption** - not just
   the reads, or a tight TTL would systematically deny an operator their own just-composed result at the
   last step (a fail-closed sharp edge, Decision 12).
-- **A liveness metric on the reaper, and an alert on stranded runs** (`admitted` past its TTL). If
+- **A liveness metric on the reaper, and an alert on stranded runs** (`admitted` or `executing` past its TTL - the wider set matters: a run that finalises but never redeems its release authorization sits in `executing` past TTL, and this alert is what surfaces it). If
   the reaper dies, overdue runs are not *terminalised or audited* - but they are **not
   read-authoritative**, because the inline `now < expires_at` check (filter (1) of Decision 4) denies
   every call on an expired run regardless of the reaper. The reaper is a janitor (terminalise +
@@ -701,7 +701,7 @@ envelope to *distributed* answers, so a confined **core-store** read, which is n
 it.
 
 So every B4 fact read returns, alongside the rows, a **`scope_basis` marker that core computes from the
-caller's confinement STATUS, not from the data**: `authority_scoped` if **any** fact read in the run was truncated by confinement, and `global` only if
+caller's confinement STATUS, not from the data**: `authority_scoped` if the operator's confinement **ceiling** was below the run's intended scope on **any** read - a matter of the operator's authority, **not** of whether rows were actually removed (a confined read that happens to remove zero rows is still `authority_scoped`) - and `global` only if
 **every** read ran under fleet-wide authority. It is computed **conservatively across the whole run** -
 not from the operator's authority at finalisation - so a mid-run promotion cannot stamp `global` over
 reads that were confined while the operator was narrow. This is **independent of query coverage**:

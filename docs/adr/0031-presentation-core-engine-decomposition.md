@@ -339,7 +339,10 @@ Decision 4/5), a stalled reaper strands terminal evidence and cleanup, **not** r
 `/readyz` drives load-balancer / rolling-upgrade routing, so pulling an authority-safe core instance
 out of rotation for a janitor stall trades capacity for zero correctness benefit. The reaper's death is
 covered by its named critical alert (`yuzu_use_case_reaper_last_success_timestamp`, Decision 5), which
-is the right instrument. **presentation** `/readyz` = "core reachable at a compatible API version" (it
+is the right instrument. So a green core `/readyz` **no longer implies cleanup liveness**: accumulating
+non-terminalised runs and unpruned release-log/grant rows are the reaper alert's concern, not the
+probe's - a deliberate split of "can serve requests correctly" (the probe) from "is the janitor
+running" (the alert). **presentation** `/readyz` = "core reachable at a compatible API version" (it
 must never be green while core is down, or a load balancer will route traffic to a surface that can
 only 502); **engine** `/readyz` = its own database + core reachable + module manifests ratified.
 `/livez` stays process-liveness on all three. ADR-0032 and ADR-0033 introduce six new stores; none is

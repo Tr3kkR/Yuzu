@@ -383,7 +383,8 @@ only seam that touches endpoints:
   vs `compromise` is recorded by core under an **authorized, audited** action - **never self-set by the
   credential's holder** (who, if the credential is compromised, is exactly whom the classification
   defends against). And reclassifying a credential to `compromise` *after* a rebind - a rotation later
-  discovered to have been a compromise - **voids every plan and schedule rebound to its successor**,
+  discovered to have been a compromise - **voids every plan and schedule rebound to its successor, and
+  to any transitive successor in the rotation chain**,
   retroactively, exactly as a first-instance compromise would. A classification an attacker could set,
   or that could not be corrected once wrong, would be no control at all.
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
@@ -487,7 +488,7 @@ only rows; it must state how much of the intended fleet answered:
 | `responded` | endpoints returning a valid result before the deadline |
 | `failed` | endpoints returning a terminal error |
 | `timed_out` / `offline` | known non-responses, kept **distinct** from an empty or negative result |
-| `scope_basis` | `global` or `authority_scoped`, computed by core from the caller's confinement **status**, never from the data (ADR-0032 Decision 11), **conservatively across the run** (`authority_scoped` if ANY read was confinement-truncated) - **independent of `completeness`**. A **fleet-wide claim** requires the intended scope to be the whole fleet, `completeness = complete`, AND `scope_basis = global`; `scope_basis = global` alone never licenses a fleet claim (a fleet-authorised caller may intentionally scope narrow). This is **not** a count of withheld rows: a per-query withheld figure is a one-bit existence oracle over forbidden data (ADR-0017 INV-3), so the numeric matched/withheld figures stay core-internal and reach only a caller whose full applicable effective authority resolves to global read. |
+| `scope_basis` | `global` or `authority_scoped`, computed by core from the caller's confinement **status**, never from the data (ADR-0032 Decision 11), **conservatively across the run** (`authority_scoped` if any read's confinement ceiling was below the intended scope - a status, not a row count) - **independent of `completeness`**. A **fleet-wide claim** requires the intended scope to be the whole fleet, `completeness = complete`, AND `scope_basis = global`; `scope_basis = global` alone never licenses a fleet claim (a fleet-authorised caller may intentionally scope narrow). This is **not** a count of withheld rows: a per-query withheld figure is a one-bit existence oracle over forbidden data (ADR-0017 INV-3), so the numeric matched/withheld figures stay core-internal and reach only a caller whose full applicable effective authority resolves to global read. |
 | `completeness` | `complete` · `partial` · `insufficient` · `unknown`, **relative to the requested/intended scope** (did everything asked-for answer). A fleet-wide claim requires intended-scope = fleet AND `complete` AND `scope_basis = global`; a `complete` result over a narrower intended scope (by choice, or by `authority_scoped` confinement) is complete only within that scope |
 | `policy` | the declared threshold, and whether incomplete evidence blocks the next step — **subject to a core-owned ceiling** (below) |
 
