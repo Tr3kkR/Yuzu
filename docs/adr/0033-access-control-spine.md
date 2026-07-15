@@ -379,6 +379,13 @@ only seam that touches endpoints:
   **broader** attenuation, or **any change to the plan hash** is a new plan needing new four-eyes. The
   classification is core's - the auth store distinguishes `rotation_superseded` from `compromise` at
   revocation time - and only the former is an input to this rule.
+- **Setting the classification is itself an authority act, and it is not frozen.** `rotation_superseded`
+  vs `compromise` is recorded by core under an **authorized, audited** action - **never self-set by the
+  credential's holder** (who, if the credential is compromised, is exactly whom the classification
+  defends against). And reclassifying a credential to `compromise` *after* a rebind - a rotation later
+  discovered to have been a compromise - **voids every plan and schedule rebound to its successor**,
+  retroactively, exactly as a first-instance compromise would. A classification an attacker could set,
+  or that could not be corrected once wrong, would be no control at all.
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
 - Approvers need `Approve` on the securable and **never the underlying permission** — low-privilege
   reviewers stay possible, which is what makes four-eyes deployable at all.
