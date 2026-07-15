@@ -335,10 +335,19 @@ only seam that touches endpoints:
   re-arming a schedule after a credential rotation is an audited authority change and *not* an
   effect-bearing edit. §8 needs the twin rule or the asymmetry becomes approval fatigue: a routine
   90-day token rotation would void every approved plan and demand **fresh four-eyes on an unchanged
-  effect**, which §5 calls worse than no gate at all. So — **re-binding a plan to a rotated credential
-  of the same owner, with the plan hash unchanged, is an audited authority change, not a new
-  approval.** A *different* requester, or any change to the plan hash, is a new plan and needs new
-  four-eyes.
+  effect**, which §5 calls worse than no gate at all. So the rebind rule is **narrow, and keyed on an
+  explicit classification, never on "same owner"**: re-binding a plan to a **routine-rotation
+  successor** - a credential the auth store records as succeeding the approved one (the 2b §7
+  `superseded_by` overlap-pair, or the equivalent successor marker on whatever credential class
+  requested the plan), with **equal-or-narrower attenuation**, an **unchanged plan hash**, and a
+  **fresh MFA step-up** - is an audited authority change, not a new approval. Everything else is not a
+  rebind: a credential recorded as **`compromise`-revoked** (not `rotation_superseded`) has no valid
+  successor for this purpose and **cannot preserve an approval** - a compromise discovered during an
+  overlap window disqualifies the pair, so the plan is voided and is **re-authorisable through fresh
+  four-eyes** (it is not permanently dead), never rebound silently; and a **different requester**, a
+  **broader** attenuation, or **any change to the plan hash** is a new plan needing new four-eyes. The
+  classification is core's - the auth store distinguishes `rotation_superseded` from `compromise` at
+  revocation time - and only the former is an input to this rule.
 - Requester's scope shrank → the run gets **smaller**, never grandfathered.
 - Approvers need `Approve` on the securable and **never the underlying permission** — low-privilege
   reviewers stay possible, which is what makes four-eyes deployable at all.
@@ -396,14 +405,37 @@ references and a **plan hash**. Prepared by a Module or by core; **authorised an
   run only ever gets smaller. This is exactly what the shipped `/auto` deploy path already does
   (freeze the cohort, re-authorise every tick), and it is the reason "approve at 17:00, execute at
   09:00" has one answer instead of two.
+- **Authority-monotone is not the same as operationally safe.** Narrowing the cohort can never make a
+  plan over-authorised, but it can make it *invalid*: a phased rollout, a quorum change, or a
+  coordinated client/service update can be more dangerous done to half a cohort than not at all. So a
+  plan **declares its cohort-integrity condition** (all-or-nothing, minimum quorum, ordered waves, or
+  none), and at execution core checks the narrowed set against it. A narrowed cohort that fails the
+  condition **parks or denies** - it is never executed as an unsafe subset merely because the subset
+  is authority-monotone. §10's coverage envelope reports a partial execution *after* the fact; the
+  integrity condition is what prevents an unsafe partial execution *before* dispatch.
 - Execution authorisation is **time-limited** and one-use where appropriate.
 - The approving human may **approve, veto, narrow or escalate**. A supervising model may *recommend*
-  those actions; it can never widen or authorise.
+  those actions; it can never widen or authorise. (**Narrow** mints a *derived* plan with its own hash
+  and its own approval - the immutable plan is never edited in place; **escalate** routes to a
+  different approver, and never widens authority.)
 - An enterprise messaging service may notify a supervisor and carry a deep link. **Approval occurs
   only on the trusted Yuzu presentation surface** — never in the notification channel.
 - **Reuse before invention:** a Use Case composes existing **Instructions and Workflows** wherever it
   can. Specialist Module code is reserved for domain interpretation, derived state and external data
   — a Module does not get to build a second execution engine.
+
+**Execution is claim-once, and the claim linearises against revocation.** "One-use where appropriate"
+is not enough for the object that touches endpoints, so the concurrency contract is normative:
+execution acquires a **guarded claim (CAS)** on the plan's execution record - the same
+one-way-transition pattern as ADR-0032's run state machine and the shipped `/auto` deploy
+`claim_for_exec` - so two ticks, two replicas or a retry produce **exactly one** dispatch per
+plan-execution identity. The authority re-check (requester + requesting credential, above), the claim,
+and the audit write **commit together**; only a committed claim may publish the command to the gateway
+(a durable outbox / at-least-once hand-off, deduplicated by the agent, ADR-0031 B7). There is **no
+check-then-dispatch window**: a revocation landing between the check and the dispatch loses to the
+claim's transaction boundary - it either voids the plan before the claim commits, or the command was
+already published and is idempotency-suppressed downstream. The detailed schema is deferred; this
+linearisation point is not.
 
 **Coverage envelope — part of every distributed answer.** A distributed query cannot honestly return
 only rows; it must state how much of the intended fleet answered:

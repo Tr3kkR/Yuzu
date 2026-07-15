@@ -83,7 +83,9 @@ them.
   admission. It **is** the 2b delegation artifact (RFC 8693 token-exchange family), not a parallel
   mechanism.
 - **Result-scoped grant** — the grant minted by a cached-result re-admission (Decision 10). It
-  authorises the release of *one* stored result and nothing else.
+  authorises the release of *one* stored result and nothing else. It is **one logical serve
+  authorization**, idempotent on replay by the same caller and serve-run (Decision 10 step 5), not a
+  count of network deliveries - core authorizes the serve and cannot observe delivery.
 - **Release log** — core's own record of which device data it released to which run. The primary
   disclosure evidence (Decision 11).
 - **Finalisation receipt** — core's record that a run completed, with the canonical result hash,
@@ -414,8 +416,13 @@ OPERATOR of every run it produces, while the credential they armed it with is th
 CREDENTIAL of every one of them.** The schedule records both. This is not bookkeeping: without a
 recorded arming credential, Decision 0's credential filter has no input on a scheduled run, and an
 attenuated read-only worker token that arms a schedule would **launder every run it produces out of
-its own attenuation** — the token cannot do the thing, but the schedule it armed can. **Revocation, deletion, expiry and rotation all read the
-same way — the credential no longer authorises, so the schedule STOPS.** Naming expiry explicitly
+its own attenuation** — the token cannot do the thing, but the schedule it armed can. **Revocation, deletion and expiry all
+read the same way - the credential no longer authorises, so the schedule STOPS.** Rotation splits from
+them: a **routine rotation** with a recorded successor (2b §7) re-binds the schedule to the successor
+as an atomic audited authority change and it keeps running; a **compromise revocation** has no
+successor for this purpose and stops the schedule like any other revocation. Core keys this on the
+recorded `rotation_superseded`-vs-`compromise` classification, never on "same owner" (the twin of
+ADR-0033 §8's plan-rebind rule). Naming expiry explicitly
 matters twice: a nightly compliance scan armed with a 90-day token would otherwise fail *silently* on
 day 91 (a security control that stops without saying so), or tempt an implementer into ruling
 "expiry ≠ revocation" and keeping it running, which re-opens the laundering hole above. A stopped
