@@ -4,10 +4,12 @@
  * guardian_engine.hpp — Agent-side engine for the Yuzu Guardian (Guaranteed
  * State) policy loop. See docs/yuzu-guardian-design-v1.1.md.
  *
- * This is the PR 2 skeleton: the engine accepts push_rules / get_status
- * commands over the `__guard__` dispatch hook and persists rule state into
- * the agent's KvStore under the reserved namespace "__guardian__". No
- * guard processes are spawned yet — that lands in PR 3.
+ * The engine accepts push_rules / get_status commands over the `__guard__`
+ * dispatch hook, persists rule state into the agent's KvStore under the
+ * reserved namespace "__guardian__", and arms one on-box IGuard per enabled
+ * rule (File / Registry / Windows-Service / systemd). ADR-0021 rung 2 replaces
+ * that per-rule IGuard construction with a single SparkEngine consumer
+ * (guardian_spark_consumer.hpp); that migration is staged and not yet wired.
  *
  * Two-phase startup (design §4 — pre-login activation):
  *   start_local()        — open persistent state, load cached rules;
@@ -136,13 +138,13 @@ private:
     void refresh_count_locked();
     void persist_generation_locked();
 
-    /// Step 4: start (or restart) the on-box guard for a rule. Reads the rule's
-    /// spark/assertion to decide the guard. MVP supports only the Windows Registry
-    /// Spark (`spark.type=="registry-change"` + `assertion.type=="registry-value-equals"`);
-    /// no-op otherwise / off-Windows. Called under mtx_.
-    /// Arm (or re-arm) the on-box guard for a rule. Returns true iff a guard was
-    /// actually started (false for non-registry sparks, off-Windows, or a failed
-    /// start) so callers can count armed guards accurately.
+    /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
+    /// spark type to pick the guard: file-change to FileGuard,
+    /// service-status-change to ServiceGuard (Windows) or SystemdServiceGuard
+    /// (Linux), registry-change to RegistryGuard (Windows). An unknown or
+    /// off-platform type is a no-op. Called under mtx_. Returns true iff a guard
+    /// was actually started (false for an unsupported type, an off-platform
+    /// mechanism, or a failed start) so callers count armed guards accurately.
     bool start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void stop_all_guards_locked();
 
