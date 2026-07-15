@@ -205,6 +205,12 @@ def validate(data: dict, dnc: set, live: dict, linked_pr: dict,
         if issue is None:
             refusals.append(f"R6: #{n} not found (404) -- a stale batch; re-run the report and re-triage.")
             continue
+        # R2b -- a PR is not an issue. The REST issues endpoint returns PRs too,
+        # so a PR number in the decisions would otherwise reach the close PATCH.
+        # Mirror close_linked_issues.classify()'s "reference is a PR" skip.
+        if "pull_request" in issue:
+            refusals.append(f"R2: #{n} is a pull request, not an issue -- the sweep never closes PRs.")
+            continue
         if issue.get("state") != "open":
             refusals.append(f"R6: #{n} is already {issue.get('state')} -- a stale batch; re-triage.")
 
@@ -271,6 +277,13 @@ def _close(n: int, state_reason: str, execute: bool):
     time.sleep(cli.MUTATION_SLEEP_S)
 
 
+def _no_comment_delims(text: str) -> str:
+    """Neutralize HTML-comment delimiters in operator-authored text so it cannot
+    disturb the idempotency marker's own <!-- --> below. Defense-in-depth: the
+    marker is matched by substring so this is hygiene, not a security boundary."""
+    return (text or "").replace("<!--", "<! --").replace("-->", "-- >")
+
+
 def decision_comment(d: dict, run_id: str) -> str:
     cat = d["category"]
     state = CATEGORY_STATE[cat]
@@ -279,10 +292,10 @@ def decision_comment(d: dict, run_id: str) -> str:
         extra = f" Duplicate of #{d['duplicate_of']}."
     ver = d.get("verified_gone_at")
     if ver:
-        extra += f" Verified gone at `{ver.strip()}`."
+        extra += f" Verified gone at `{_no_comment_delims(ver.strip())}`."
     return (
         f"Closed as `{state}` by the tracker sweep ({cli.run_context()}): "
-        f"operator decision — **{cat}**. {d['reason'].strip()}{extra}\n\n"
+        f"operator decision — **{cat}**. {_no_comment_delims(d['reason'].strip())}{extra}\n\n"
         f"Performed under the operator's credentials from a reviewed decision list. "
         f"Wrong close? Reopen and add the `do-not-close` label "
         f"(docs/agents/issue-standard.md §5.1), or run "
@@ -321,17 +334,53 @@ def post_ledger(data: dict, run_id: str, execute: bool):
     return issue["number"]
 
 
-def apply_decisions(data: dict, run_id: str, execute: bool):
-    """The one mutating loop. Ledger first, then per-issue: state change, then
-    the evidence comment (marker). Mirrors close_linked_issues.apply_plan --
-    comment-first would plant the marker on a still-open issue if the close
-    failed, blinding --revert and the leak scan at once."""
+def _live_close_block(d: dict, dnc: set) -> "str | None":
+    """Re-fetch the issue immediately before closing it and return a refusal
+    reason if a never-close signal is now present, else None. The last line of
+    defense against a validate-to-PATCH race (a label/assignment/linked-PR added
+    after the pre-mutation revalidation). Preserves the security exception: a
+    now-`security` issue is still closeable iff it is a verified fixed-elsewhere."""
+    n = d["number"]
+    issue = cli.gh_api(f"repos/{REPO}/issues/{n}")
+    if issue is None:
+        return "not found (404)"
+    if "pull_request" in issue:
+        return "is a pull request"
+    if issue.get("state") != "open":
+        return f"already {issue.get('state')}"
+    labels = report._labels(issue)
+    if n in dnc:
+        return "in do-not-close.txt"
+    if report.DO_NOT_CLOSE_LABEL in labels:
+        return "carries the do-not-close label"
+    if issue.get("assignees"):
+        return "is assigned"
+    if cli.has_open_linked_pr(n):
+        return "has an open linked PR"
+    if (labels & HIGHRISK_LABELS) and not (
+            d["category"] == "fixed-elsewhere" and valid_verification(d.get("verified_gone_at", ""))):
+        return f"is now {sorted(labels & HIGHRISK_LABELS)} without a verified fixed-elsewhere decision"
+    return None
+
+
+def apply_decisions(data: dict, run_id: str, execute: bool, dnc: set):
+    """The one mutating loop. Ledger first, then per-issue: a final live re-check
+    (validate-to-PATCH TOCTOU), state change, then the evidence comment (marker).
+    Mirrors close_linked_issues.apply_plan -- comment-first would plant the
+    marker on a still-open issue if the close failed, blinding --revert and the
+    leak scan at once."""
     ledger_issue = post_ledger(data, run_id, execute)
     print(f"{'posted' if execute else '[dry-run] would post'} ledger for run {run_id} "
           f"to tracking issue #{ledger_issue}")
     closed = 0
     for d in sorted(data["decisions"], key=lambda x: x["number"]):
         n, state = d["number"], CATEGORY_STATE[d["category"]]
+        if execute:
+            block = _live_close_block(d, dnc)
+            if block:
+                print(f"ABORT before closing #{n}: it {block} since the reviewed dry-run. "
+                      f"Zero further closes; re-run the dry-run and re-triage.", file=sys.stderr)
+                sys.exit(4)
         _close(n, state, execute)
         if execute:
             print(f"  closed #{n} as {state} ({d['category']})", flush=True)
@@ -362,10 +411,11 @@ def print_plan(data: dict, live: dict):
 # ---------------------------------------------------------------------------
 # Modes
 
-def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
-    data = load_decisions(decisions_file)          # exit 3 on schema/read failure
-    dnc = cli.load_do_not_close()                  # exit 3 if the list is missing
-
+def fetch_and_validate(data: dict, dnc: set) -> tuple:
+    """Fetch LIVE issue state for every target (+ the do-not-close set) and run
+    the full fail-closed validation against it. Returns (refusals, live).
+    Called once for the dry-run plan AND again on fresh state immediately before
+    any mutation (the validate-to-close TOCTOU guard)."""
     numbers = {d["number"] for d in data["decisions"]} | set(dnc)
     live = fetch_live(numbers)
     linked_pr = {}
@@ -375,12 +425,22 @@ def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
         # only the network-cheap path when the issue is present and open
         linked_pr[n] = has_open_linked_pr(n) if issue is not None and issue.get("state") == "open" else False
     report_hash_live = report.latest_report_hash()
+    return validate(data, dnc, live, linked_pr, report_hash_live), live
 
-    refusals = validate(data, dnc, live, linked_pr, report_hash_live)
+
+def _print_refusals(refusals: list, header: str):
+    print(f"{header} ({len(refusals)} fail-closed violation(s), zero mutations):", file=sys.stderr)
+    for r in refusals:
+        print(f"  ::error::{r}", file=sys.stderr)
+
+
+def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
+    data = load_decisions(decisions_file)          # exit 3 on schema/read failure
+    dnc = cli.load_do_not_close()                  # exit 3 if the list is missing
+
+    refusals, live = fetch_and_validate(data, dnc)
     if refusals:
-        print(f"REFUSED ({len(refusals)} fail-closed violation(s), zero mutations):", file=sys.stderr)
-        for r in refusals:
-            print(f"  ::error::{r}", file=sys.stderr)
+        _print_refusals(refusals, "REFUSED")
         return 4
 
     run_id = decisions_hash(data)[:12]
@@ -392,11 +452,23 @@ def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
             print("--execute requires --snapshot FILE from a prior dry-run "
                   "(no execute without a reviewed dry-run).", file=sys.stderr)
             return 2
-        snap = json.loads(pathlib.Path(snapshot_file).read_text(encoding="utf-8"))
-        if snap.get("decisions_hash") != decisions_hash(data):
+        try:
+            snap = json.loads(pathlib.Path(snapshot_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"FATAL: --snapshot {snapshot_file} is unreadable / not JSON ({e}) -- cannot "
+                  f"confirm it matches the reviewed dry-run. Zero mutations.", file=sys.stderr)
+            return 4
+        if not isinstance(snap, dict) or snap.get("decisions_hash") != decisions_hash(data):
             print("FATAL: the decisions file changed since the reviewed dry-run "
                   "(decisions_hash drift). Zero mutations. Re-run the dry-run, re-review, "
                   "re-execute.", file=sys.stderr)
+            return 4
+        # TOCTOU guard: re-fetch LIVE state and re-validate immediately before any
+        # mutation. A never-close signal (do-not-close/security/assign/linked-PR)
+        # added AFTER the reviewed dry-run must abort the batch, zero mutations.
+        refusals2, live = fetch_and_validate(data, dnc)
+        if refusals2:
+            _print_refusals(refusals2, "REFUSED (issue state changed since the reviewed dry-run)")
             return 4
     elif snapshot_file:
         pathlib.Path(snapshot_file).write_text(
@@ -405,7 +477,7 @@ def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
             encoding="utf-8")
         print(f"snapshot written to {snapshot_file} (pass the same file to --execute)")
 
-    apply_decisions(data, run_id, execute)
+    apply_decisions(data, run_id, execute, dnc)
     return 0
 
 

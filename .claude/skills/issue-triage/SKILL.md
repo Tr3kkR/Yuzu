@@ -88,17 +88,22 @@ gh issue view <N> --repo "$REPO" --json number,title,labels,assignees,body,state
 
 Walk the buckets **in this order**; stop at the 10-decision budget.
 
-1. **Held-open (do-not-close.txt / `security` / `do-not-close` label).**
-   **PRINT these, never propose a closure.** `apply_decisions.py` hard-refuses
-   the whole run if one appears (R2), and a closed held-open issue trips its
-   guardrail-breach sentinel (R6). They are on the report only so you can see
-   they are still open on purpose.
-2. **Security / P0 / P1.** Cap **3 per run**. Each may be closed **only** as
-   `fixed-elsewhere`, and **only** with a typed verification line you write
-   after grepping current `origin/dev`:
+1. **Held-open (in `do-not-close.txt`, OR carrying the `do-not-close` label).**
+   **PRINT these, never propose a closure.** These are the *deliberately*
+   held-open set — `apply_decisions.py` hard-refuses the whole run if one appears
+   (R2), and a closed held-open issue trips its guardrail-breach sentinel (R6).
+   They are on the report only so you can see they are still open on purpose.
+   (This bucket is the committed list + the label — **not** "any security
+   issue"; a `security`-labelled issue that is NOT on the held-open list is
+   handled in bucket 2.)
+2. **Security / P0 / P1 (not on the held-open list above).** Cap **3 per run**.
+   Each may be closed **only** as `fixed-elsewhere`, and **only** with a typed
+   verification line you write after grepping current `origin/dev`:
    `"verified_gone_at": "<7–40 hex sha> — <what you grepped and found gone>"`.
    **A checkbox does not satisfy this** — `apply_decisions.py` R3 requires a
    real sha + a non-empty note. If you cannot type it truthfully, do not decide.
+   (A `security` issue that is also in `do-not-close.txt`/`do-not-close`-labelled
+   stays in bucket 1 — never proposed.)
 3. **Leak scan (`leak > 0`).** These are **automation failures**, not triage
    candidates: an issue a merged PR claims but that is still open means an
    earlier close run failed. **Do not close them here** — re-run

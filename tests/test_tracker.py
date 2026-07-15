@@ -365,6 +365,10 @@ def run_validate_tests(failures):
     if not _has(_run([_d(7)], linked={7: True}), "R5"):
         failures.append("validate R5: open linked PR must refuse")
 
+    # R2b a PR target must be refused (the REST issues endpoint returns PRs too)
+    if not any("pull request" in r for r in _run([_d(7)], live_over={7: _issue(7, is_pr=True)})):
+        failures.append("validate: a pull-request target must refuse")
+
     # R6 not found / already closed
     if not _has(_run([_d(7)], live_over={7: None}), "R6"):
         failures.append("validate R6: 404 target must refuse")
@@ -401,11 +405,16 @@ class _FakeGh:
     mode_apply makes. Records POST/PATCH so the test can assert mutations
     happened only under --execute."""
 
-    def __init__(self, issues, tracking=9000, report_hash=HEX64, linked=None):
+    def __init__(self, issues, tracking=9000, report_hash=HEX64, linked=None, protect_after=None):
         self.issues = issues
         self.tracking = tracking
         self.report_hash = report_hash
         self.linked = linked or {}
+        # protect_after[n] = k: from the (k+1)-th GET of issue n onward, return it
+        # carrying a do-not-close label -- simulates a never-close signal added
+        # mid-run (the validate-to-close TOCTOU).
+        self.protect_after = protect_after or {}
+        self.get_count = {}
         self.posts, self.patches = [], []
         self._saved = {}
 
@@ -431,7 +440,12 @@ class _FakeGh:
                      "body": f"report <!-- yuzu-tracker-report: hash={self.report_hash} run=r -->"}]
         m = re.fullmatch(rf"repos/{rid}/issues/(\d+)", path)
         if m and method == "GET":
-            return self.issues.get(int(m.group(1)))
+            n = int(m.group(1))
+            self.get_count[n] = self.get_count.get(n, 0) + 1
+            base = self.issues.get(n)
+            if base and n in self.protect_after and self.get_count[n] > self.protect_after[n]:
+                return {**base, "labels": base.get("labels", []) + [{"name": "do-not-close"}]}
+            return base
         if m and method == "PATCH":
             self.patches.append((int(m.group(1)), args))
             return {}
@@ -513,13 +527,56 @@ def run_apply_flow_tests(failures):
             bfile = pathlib.Path(td) / "bad.json"
             bfile.write_text(json.dumps(bad), encoding="utf-8")
             with _FakeGh({11: _issue(11, labels=["bug", "security"])}) as fg:
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                     rc = ad.mode_apply(str(bfile), str(snap), execute=True)
                 if rc != 4 or fg.patches:
                     failures.append(f"apply refusal: rc={rc} want 4, patches={fg.patches}")
+
+            # malformed snapshot on --execute -> exit 4 (fail-closed), not a crash/exit 1
+            snap.write_text("{not valid json", encoding="utf-8")
+            with _FakeGh(issues) as fg:
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    rc = ad.mode_apply(str(dfile), str(snap), execute=True)
+                if rc != 4 or fg.patches:
+                    failures.append(f"apply malformed snapshot: rc={rc} want 4, patches={fg.patches}")
+
+            # TOCTOU: a never-close signal added AFTER the reviewed dry-run (the
+            # pre-mutation re-validation must abort with zero mutations). Snapshot
+            # matches the decision list; #11 gains do-not-close on its 2nd GET
+            # (initial validate passes on GET #1, re-validate refuses on GET #2).
+            snap.write_text(json.dumps({"decisions_hash": ad.decisions_hash(decisions)}), encoding="utf-8")
+            with _FakeGh(issues, protect_after={11: 1}) as fg:
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    rc = ad.mode_apply(str(dfile), str(snap), execute=True)
+                if rc != 4 or fg.patches:
+                    failures.append(f"apply TOCTOU (batch revalidation): rc={rc} want 4, patches={fg.patches}")
+
+            # TOCTOU in the residual window: #11 stays clean through BOTH batch
+            # validations (GET 1 and 2) and only gains do-not-close on GET 3 --
+            # the per-issue re-check right before the close PATCH must abort
+            # (sys.exit(4)) with no PATCH sent.
+            with _FakeGh(issues, protect_after={11: 2}) as fg:
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                        ad.mode_apply(str(dfile), str(snap), execute=True)
+                    failures.append("apply TOCTOU (per-issue): expected SystemExit(4)")
+                except SystemExit as e:
+                    if e.code != 4 or fg.patches:
+                        failures.append(f"apply TOCTOU (per-issue): code={e.code} want 4, patches={fg.patches}")
     finally:
         cli.DNC_PATH = real
+
+
+def run_marker_hygiene_tests(failures):
+    # An operator reason containing HTML-comment delimiters must not disturb the
+    # decision marker: the rendered comment must carry exactly one <!-- and -->,
+    # and the marker substring must survive intact.
+    d = _d(5, "fixed-elsewhere", "fixed <!-- sneaky --> here", verified_gone_at="abc1234 --> x")
+    c = ad.decision_comment(d, "run123abc")
+    if c.count("<!--") != 1 or c.count("-->") != 1:
+        failures.append(f"marker hygiene: want one <!-- and one -->, got {c.count('<!--')}/{c.count('-->')}")
+    if ad.DECISION_MARKER.format(run="run123abc", issue=5) not in c:
+        failures.append("marker hygiene: decision marker substring must survive sanitization")
 
 
 def run_revert_tests(failures):
@@ -600,6 +657,7 @@ def main() -> int:
     run_hash_tests(failures)
     run_validate_tests(failures)
     run_apply_flow_tests(failures)
+    run_marker_hygiene_tests(failures)
     run_revert_tests(failures)
     if failures:
         print(f"tracker checks FAILED ({len(failures)}):")
@@ -607,7 +665,8 @@ def main() -> int:
             print(f"  - {f}")
         return 1
     print("tracker checks OK (telemetry, hygiene, duplicates, report-hash, leak-scan, "
-          "schema, decisions-hash, validate R1-R7, apply dry-run/execute/drift, revert)")
+          "schema, decisions-hash, validate R1-R7 + PR-refusal, apply dry-run/execute/drift/"
+          "malformed-snapshot/TOCTOU, marker-hygiene, revert)")
     return 0
 
 
