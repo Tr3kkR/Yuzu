@@ -8,20 +8,27 @@ ConvergenceScheduler::ConvergenceScheduler(GuardianSparkRuntime& rt)
     : ConvergenceScheduler(rt, Config{}) {}
 
 ConvergenceScheduler::ConvergenceScheduler(GuardianSparkRuntime& rt, Config cfg)
-    : rt_(rt), cfg_(cfg) {}
+    : rt_(rt), cfg_(cfg), sig_(std::make_shared<Signal>()) {}
 
 ConvergenceScheduler::~ConvergenceScheduler() { stop(); }
 
 void ConvergenceScheduler::start() {
     {
-        std::lock_guard<std::mutex> lk{mu_};
-        if (started_ || stopping_)
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        if (started_ || sig_->stopping)
             return;
         started_ = true;
     }
-    // The waker lets a fresh attach jump the priority cadence. Installed before
-    // the threads run so no early wake is lost.
-    rt_.set_pending_initial_waker([this] { wake_priority(); });
+    // The waker lets a fresh attach jump the priority cadence. It captures the shared
+    // Signal (NOT `this`), so a copy that outlives this scheduler stays safe.
+    auto sig = sig_;
+    rt_.set_pending_initial_waker([sig] {
+        {
+            std::lock_guard<std::mutex> lk{sig->mu};
+            ++sig->priority_gen;
+        }
+        sig->cv.notify_all();
+    });
     threads_.emplace_back([this] { lane_loop(SparkType::Service, cfg_.service_cadence_ms, 1); });
     threads_.emplace_back([this] { lane_loop(SparkType::Registry, cfg_.registry_cadence_ms, 2); });
     threads_.emplace_back([this] { lane_loop(SparkType::File, cfg_.file_cadence_ms, 3); });
@@ -30,26 +37,19 @@ void ConvergenceScheduler::start() {
 
 void ConvergenceScheduler::stop() {
     {
-        std::lock_guard<std::mutex> lk{mu_};
-        if (stopping_)
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        if (sig_->stopping)
             return;
-        stopping_ = true;
+        sig_->stopping = true;
     }
-    // Stop new wakes before tearing down, so no attach-driven waker outlives us.
+    // Clear the runtime's slot so no NEW attach installs a wake; a copy already taken
+    // by an in-flight attach stays safe (it holds the still-alive Signal).
     rt_.set_pending_initial_waker({});
-    cv_.notify_all();
+    sig_->cv.notify_all();
     for (auto& t : threads_)
         if (t.joinable())
             t.join();
     threads_.clear();
-}
-
-void ConvergenceScheduler::wake_priority() {
-    {
-        std::lock_guard<std::mutex> lk{mu_};
-        ++priority_gen_;
-    }
-    cv_.notify_all(); // lanes re-check stopping_ (false) and re-block; the priority lane proceeds
 }
 
 std::chrono::milliseconds ConvergenceScheduler::jittered(std::uint64_t base_ms,
@@ -70,11 +70,11 @@ void ConvergenceScheduler::lane_loop(SparkType type, std::uint64_t cadence_ms,
     std::mt19937 rng{static_cast<std::uint32_t>(cfg_.rng_seed + rng_offset)};
     while (true) {
         {
-            std::unique_lock<std::mutex> lk{mu_};
-            // A priority wake (notify without stopping_) leaves the predicate false,
-            // so this lane re-blocks until its own cadence: no head-of-line coupling.
-            cv_.wait_for(lk, jittered(cadence_ms, rng), [this] { return stopping_; });
-            if (stopping_)
+            std::unique_lock<std::mutex> lk{sig_->mu};
+            // A priority wake (notify without stopping) leaves the predicate false, so
+            // this lane re-blocks until its own cadence: no head-of-line coupling.
+            sig_->cv.wait_for(lk, jittered(cadence_ms, rng), [this] { return sig_->stopping; });
+            if (sig_->stopping)
                 return;
         }
         sweep_lane(type);
@@ -86,12 +86,12 @@ void ConvergenceScheduler::priority_loop() {
     std::uint64_t seen = 0;
     while (true) {
         {
-            std::unique_lock<std::mutex> lk{mu_};
-            cv_.wait_for(lk, jittered(cfg_.priority_poll_ms, rng),
-                         [this, seen] { return stopping_ || priority_gen_ != seen; });
-            if (stopping_)
+            std::unique_lock<std::mutex> lk{sig_->mu};
+            sig_->cv.wait_for(lk, jittered(cfg_.priority_poll_ms, rng),
+                              [this, seen] { return sig_->stopping || sig_->priority_gen != seen; });
+            if (sig_->stopping)
                 return;
-            seen = priority_gen_;
+            seen = sig_->priority_gen;
         }
         sweep_pending_initial();
     }

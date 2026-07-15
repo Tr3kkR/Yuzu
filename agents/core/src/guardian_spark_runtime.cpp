@@ -298,4 +298,9 @@ void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker
     pending_initial_waker_ = std::move(waker);
 }
 
+std::function<void()> GuardianSparkRuntime::pending_initial_waker_for_test() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return pending_initial_waker_;
+}
+
 } // namespace yuzu::agent

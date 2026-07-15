@@ -190,6 +190,9 @@ public:
     /// it immediately rather than waiting a full cadence. Pass {} to clear (the
     /// scheduler clears it before it tears down).
     void set_pending_initial_waker(std::function<void()> waker);
+    /// Test seam: a copy of the currently-installed waker, to exercise the
+    /// copied-waker-outlives-scheduler lifetime path.
+    [[nodiscard]] std::function<void()> pending_initial_waker_for_test() const;
 
 private:
     /// Per-rule generation: an immutable assertion/spec-edge + monotonic

@@ -43,6 +43,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -79,18 +80,27 @@ public:
     void sweep_pending_initial();
 
 private:
+    /// Heap sync state shared by the lane threads AND the pending-initial waker. The
+    /// waker (a std::function copied into the runtime) captures shared_ptr<Signal>,
+    /// NOT `this`, so a copy invoked after this scheduler is destroyed - e.g. an
+    /// attach_rule that copied the waker just before stop() then ran it after the
+    /// dtor - touches a still-alive Signal (a harmless no-op: `stopping` is set and no
+    /// thread is waiting), never a destroyed mutex/CV. Clearing a std::function slot
+    /// alone would not revoke that already-taken copy.
+    struct Signal {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool stopping{false};
+        std::uint64_t priority_gen{0}; ///< bumped by the waker; the priority lane waits on a change
+    };
+
     void lane_loop(SparkType type, std::uint64_t cadence_ms, std::uint64_t rng_offset);
     void priority_loop();
-    void wake_priority();
     [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
     GuardianSparkRuntime& rt_;
     Config cfg_;
-
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool stopping_{false};
-    std::uint64_t priority_gen_{0}; ///< bumped by wake_priority; the priority lane waits on a change
+    std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::vector<std::thread> threads_;
 };

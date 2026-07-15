@@ -148,6 +148,27 @@ TEST_CASE("attaching a rule while running wakes the priority lane promptly",
     sched.stop();
 }
 
+TEST_CASE("a waker copied before stop is safe to invoke after the scheduler is destroyed",
+          "[spark][convergence]") {
+    // Models an attach_rule that copied the waker just before stop(), then invoked its
+    // copy after the scheduler was gone. The waker captures the shared Signal, not the
+    // scheduler, so this is a harmless no-op - under the old raw-`this` capture it was a
+    // use-after-free on the destroyed mutex/CV.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::function<void()> copied;
+    {
+        ConvergenceScheduler sched{*rt};
+        sched.start();
+        copied = rt->pending_initial_waker_for_test(); // the installed waker
+        REQUIRE(copied);
+        sched.stop();
+    } // scheduler destroyed; only `copied` (holding the Signal) remains
+    copied(); // must not crash / UAF
+    SUCCEED();
+}
+
 TEST_CASE("stop is idempotent and safe before start", "[spark][convergence]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
