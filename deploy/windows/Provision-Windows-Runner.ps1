@@ -256,6 +256,16 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
       if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
         & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
       }
+      # Durability off - applied UNCONDITIONALLY (not only inside the initdb
+      # guard above) so re-provisioning an EXISTING per-agent cluster also
+      # picks up the tuning; a cluster provisioned before this PR landed would
+      # otherwise keep fsync=on forever and keep hitting the [pg]-shard
+      # timeout on its port. Mirrors the agent-0 tune block above. All three
+      # are sighup/user context -> reload suffices, no restart needed.
+      & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+      & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+      & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+      & $psql @H -c 'SELECT pg_reload_conf()' | Out-Null
       Remove-Item Env:\PGPASSWORD
       Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
     }
