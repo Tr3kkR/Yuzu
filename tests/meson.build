@@ -452,6 +452,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_group_store.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
