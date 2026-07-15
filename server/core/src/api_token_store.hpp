@@ -80,12 +80,14 @@ public:
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
     /// If mcp_tier is non-empty, the token is an MCP token with the given tier.
-    /// `principal_kind` defaults to "human" — existing callers mint human
-    /// tokens unchanged. Write-once: there is no update path for it.
+    /// Every token minted here is `principal_kind = "human"`. PR 4.1 keeps the
+    /// column INERT: there is deliberately no parameter to write "engine" —
+    /// engine-principal token issuance (with its lifecycle/tier/referential
+    /// checks) lands in PR 4.2 (docs/auth-engine-principals-design.md §§6-8/11),
+    /// which re-introduces a caller-supplied kind behind a C++-side allowlist.
     std::expected<std::string, std::string>
     create_token(const std::string& name, const std::string& principal_id, int64_t expires_at = 0,
-                 const std::string& scope_service = {}, const std::string& mcp_tier = {},
-                 std::string principal_kind = "human");
+                 const std::string& scope_service = {}, const std::string& mcp_tier = {});
 
     /// Validate a raw Bearer token. Returns the ApiToken if valid and not expired/revoked.
     std::optional<ApiToken> validate_token(const std::string& raw_token);
@@ -99,16 +101,28 @@ public:
     /// cannot revoke another user's token by guessing its ID.
     std::optional<ApiToken> get_token(const std::string& token_id) const;
 
-    /// Revoke a token by ID.
-    bool revoke_token(const std::string& token_id);
+    /// Revoke a token by ID. Returns a typed result that distinguishes the
+    /// two outcomes a bare `bool` conflated (ADR-0030 §Posture — a revoke
+    /// that did not land must never read as success):
+    ///   * value `true`  — the token existed and is now revoked.
+    ///   * value `false` — the DB write succeeded but no such token existed
+    ///                     (already gone / unknown id) — a genuine 404.
+    ///   * `unexpected(msg)` — the write did NOT persist (lease timeout /
+    ///                     query error). The caller MUST surface this
+    ///                     (503 / "retry"), never audit or toast success.
+    std::expected<bool, std::string> revoke_token(const std::string& token_id);
 
-    /// Revoke every non-revoked token belonging to a principal. Returns
-    /// the number of tokens marked revoked. Used by the session-revocation
-    /// REST surface so "Sign out everywhere" actually revokes everywhere
-    /// (cookie sessions + API tokens), not just browser cookies. Without
-    /// this, a stolen-laptop incident leaves the on-laptop API token
-    /// fully functional and the operator UX silently lies.
-    std::size_t revoke_for_principal(const std::string& principal_id);
+    /// Revoke every non-revoked token belonging to a principal. Used by the
+    /// session-revocation REST surface so "Sign out everywhere" actually
+    /// revokes everywhere (cookie sessions + API tokens), not just browser
+    /// cookies — a stolen-laptop incident otherwise leaves the on-laptop API
+    /// token fully functional while the operator UX silently lies.
+    ///   * value — the number of tokens marked revoked (0 = the principal had
+    ///             none; the DB write still succeeded).
+    ///   * `unexpected(msg)` — the write did NOT persist; the caller MUST
+    ///             record a partial/failed revoke, never a clean success
+    ///             (ADR-0030 §Posture).
+    std::expected<std::size_t, std::string> revoke_for_principal(const std::string& principal_id);
 
     /// Delete a token permanently.
     bool delete_token(const std::string& token_id);

@@ -198,7 +198,7 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 std::expected<std::string, std::string>
 ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
                             int64_t expires_at, const std::string& scope_service,
-                            const std::string& mcp_tier, std::string principal_kind) {
+                            const std::string& mcp_tier) {
     if (!open_)
         return std::unexpected("database not open");
     if (name.empty())
@@ -229,14 +229,18 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
     if (!lease)
         return std::unexpected("database unavailable — try again");
 
+    // principal_kind is bound as the SQL literal 'human' — PR 4.1 has no
+    // engine write path (the caller-supplied kind + its C++-side allowlist
+    // land in PR 4.2, design doc §§6-8/11). The column still exists (the seam
+    // the rest of Phase 4 stacks on) and its CHECK bounds it to the allowlist.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO api_token_store.api_tokens "
         "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, principal_kind, "
         " created_at, expires_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::bigint,$9::bigint) RETURNING token_id",
+        "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint) RETURNING token_id",
         std::vector<std::string>{token_id, hash, name, principal_id, scope_service, mcp_tier,
-                                 principal_kind, std::to_string(now), std::to_string(expires_at)});
+                                 std::to_string(now), std::to_string(expires_at)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::unexpected(std::string("failed to create token: ") +
                                PQerrorMessage(lease.get()));
@@ -379,9 +383,9 @@ std::optional<ApiToken> ApiTokenStore::get_token(const std::string& token_id) co
     return read_token(res.get(), 0);
 }
 
-bool ApiTokenStore::revoke_token(const std::string& token_id) {
+std::expected<bool, std::string> ApiTokenStore::revoke_token(const std::string& token_id) {
     if (!open_)
-        return false;
+        return std::unexpected("database not open");
 
     // Bump the revoke generation BEFORE the UPDATE so any concurrent
     // validate_token whose SELECT outraces this UPDATE will observe the
@@ -390,7 +394,9 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return false; // authoritative: a lease timeout is a failure, never a silent success
+        // authoritative: a lease timeout is a WRITE FAILURE — never a silent
+        // success and never a false "not found". The caller must 503/retry.
+        return std::unexpected("database unavailable — try again");
 
     // RETURNING token_hash — never sqlite3_changes()-style mutate-then-count
     // (#1033). PQntuples > 0 IS the changed check, and the returned hash is
@@ -401,19 +407,23 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
         "RETURNING token_hash",
         std::vector<std::string>{token_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return false;
+        return std::unexpected(std::string("revoke did not persist: ") +
+                               PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
     if (rows == 0)
-        return false;
+        return false; // DB write succeeded; no such token (already gone / unknown id)
 
     invalidate_cache(PQgetvalue(res.get(), 0, 0));
     return true;
 }
 
-std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
-    if (!open_ || principal_id.empty())
-        return 0;
+std::expected<std::size_t, std::string>
+ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty())
+        return std::size_t{0}; // argument guard: nothing to revoke, DB untouched
 
     // Bump revoke generation BEFORE the UPDATE — same contract as
     // `revoke_token`.
@@ -421,7 +431,10 @@ std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id)
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return 0; // authoritative: never claim tokens were revoked when we couldn't reach the DB
+        // authoritative: never report a count (even 0) when we could not reach
+        // the DB — that is indistinguishable from "the principal had no tokens"
+        // and would let "Sign out everywhere" lie during an outage.
+        return std::unexpected("database unavailable — try again");
 
     // ONE statement yields both the count (PQntuples) and every hash to
     // invalidate (RETURNING token_hash) — no separate pre-SELECT snapshot
@@ -433,7 +446,8 @@ std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id)
         "WHERE principal_id = $1 AND revoked = FALSE RETURNING token_hash",
         std::vector<std::string>{principal_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+        return std::unexpected(std::string("revoke_for_principal did not persist: ") +
+                               PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
     for (int i = 0; i < rows; ++i)

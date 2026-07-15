@@ -71,7 +71,9 @@ struct ScheduleRouteHarness {
     yuzu::test::TempDir tmp;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
-    yuzu::test::ApiTokenStorePg api_tokens;
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
     std::unique_ptr<AnalyticsEventStore> analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -89,7 +91,7 @@ struct ScheduleRouteHarness {
         analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
-            cfg, auth_mgr, &rbac, api_tokens.get(),
+            cfg, auth_mgr, &rbac, /*api_token_store=*/nullptr,
             /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr, analytics.get(), oidc_mu, oidc_provider);
     }

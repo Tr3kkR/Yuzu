@@ -10727,8 +10727,21 @@ private:
                    bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
                 const auto revoke = auth_mgr_.invalidate_user_sessions(username);
                 std::size_t tokens = 0;
+                bool api_tokens_db_persisted = true; // vacuously true when not requested
                 if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
-                    tokens = api_token_store_->revoke_for_principal(username);
+                    auto revoked = api_token_store_->revoke_for_principal(username);
+                    if (revoked.has_value()) {
+                        tokens = *revoked;
+                    } else {
+                        // The API-token revoke did NOT persist (lease timeout /
+                        // query error). Do NOT report a count — 0 would read as
+                        // "the principal had no tokens". Flag it so the handler
+                        // audits "partial", never a false "signed out
+                        // everywhere" (ADR-0030 §Posture, the stolen-laptop path).
+                        api_tokens_db_persisted = false;
+                        spdlog::error("revoke_for_principal did not persist for {}: {}", username,
+                                      revoked.error());
+                    }
                 }
                 // CC7.2 anomaly-detection signal: a spike in this counter
                 // is the operator's automated alert for compromised-account
@@ -10736,18 +10749,21 @@ private:
                 // Caller dimension is inferred from the api-tokens flag:
                 // /me passes true (self full-credential revoke), admin
                 // path passes false (cookies only, automation tokens
-                // intact). Result dimension carries db_persisted so SOC 2
+                // intact). Result dimension is "partial" if EITHER the cookie
+                // dual-write OR the API-token revoke failed, so SOC 2
                 // partial-failure rows are filterable.
+                const bool all_persisted = revoke.db_persisted && api_tokens_db_persisted;
                 metrics_
                     .counter("yuzu_auth_sessions_revoked_total",
                              {{"caller", revoke_api_tokens ? "self" : "admin"},
-                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"result", all_persisted ? "success" : "partial"},
                               {"scope", revoke_api_tokens ? "all" : "cookies"}})
                     .increment();
                 return RestApiV1::SessionRevokeResult{
                     revoke.count,
                     tokens,
                     revoke.db_persisted,
+                    api_tokens_db_persisted,
                 };
             },
             // W5.1 — pass the per-execution event bus into the REST

@@ -4048,7 +4048,48 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        api_token_store_->revoke_token(token_id);
+        auto revoked = api_token_store_->revoke_token(token_id);
+        if (!revoked.has_value()) {
+            // The revoke did NOT persist (lease timeout / query error). Do NOT
+            // toast or audit success — that would tell an operator revoking a
+            // stolen laptop's token that it died when it did not (ADR-0030
+            // §Posture; the old code discarded this bool and always claimed
+            // success). Audit the failure and surface a retryable error.
+            spdlog::error("API token '{}' revoke did not persist (requested by {}): {}", token_id,
+                          session->username, revoked.error());
+            if (audit_store_) {
+                (void)audit_store_->log(
+                    {.principal = session->username,
+                     .principal_role = auth::role_to_string(auth::effective_role(*session)),
+                     .action = "api_token.revoke",
+                     .target_type = "ApiToken",
+                     .target_id = token_id,
+                     .detail = "owner=" + existing->principal_id + " db_error=true",
+                     .source_ip = req.remote_addr,
+                     .result = "failure"});
+            }
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Revoke did not persist — please retry","level":"error"}})");
+            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
+                            "Revoke did not persist — please retry.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (!*revoked) {
+            // DB write succeeded but no row matched — the token was already gone
+            // (a concurrent revoke/delete after the ownership check). Mirror the
+            // not-found fragment rather than claim a fresh revoke.
+            res.status = 404;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Token not found","level":"error"}})");
+            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
+                            "Token not found.</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
 
         spdlog::info("API token '{}' revoked by {}", token_id, session->username);
 
