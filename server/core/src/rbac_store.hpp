@@ -88,6 +88,29 @@ public:
     std::vector<PrincipalRole> get_principal_roles(const std::string& principal_type,
                                                    const std::string& principal_id) const;
     std::vector<PrincipalRole> get_role_members(const std::string& role_name) const;
+
+    /// Shared assignment guard called by BOTH `RbacStore::assign_role` AND
+    /// `ManagementGroupStore::assign_role` (which includes this header to
+    /// reach it) — a single chokepoint per design §4.2 "no admin, ever" so a
+    /// future assignment call site can never re-derive its own, possibly
+    /// looser, copy. Deliberately static/DB-independent (name-based, not an
+    /// `is_system` lookup): `ManagementGroupStore` has no RbacStore
+    /// connection to query the `roles` table against.
+    ///
+    /// - Any `principal_type` other than `"engine"` is a no-op pass —
+    ///   existing user/group assignment behavior is completely unchanged.
+    /// - `principal_type == "engine"` REQUIRES `principal_id` to carry the
+    ///   reserved `"engine:<slug>"` namespace (§3.3); anything else is
+    ///   rejected as a malformed engine assignment.
+    /// - `principal_type == "engine"` REJECTS `role_name` naming a built-in
+    ///   full-access role ("Administrator" — RBAC's legacy-admin-equivalent
+    ///   system role — or the literal "admin"). See the `.cpp`
+    ///   `kEngineDisallowedRoles` doc for the full rationale, including why
+    ///   elevation eligibility needs no entry here.
+    static std::expected<void, std::string> validate_assignment(const std::string& principal_type,
+                                                                 const std::string& principal_id,
+                                                                 const std::string& role_name);
+
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
     std::expected<void, std::string> unassign_role(const std::string& principal_type,
                                                    const std::string& principal_id,
@@ -97,14 +120,31 @@ public:
     std::vector<RbacGroup> list_groups() const;
 
     /// Rejects a `source=="local"` create whose `name` collides with a reserved
-    /// IdP namespace prefix (`local:`/`entra:`/`saml:`/`ad:`) — see
-    /// `namespaced_group_name` below. An IdP-sourced create (any other
-    /// `source`) is exempt: `reconcile_idp_memberships` writes IdP groups
-    /// directly (not via this method) and always passes a namespaced name, but
-    /// the exemption also covers any future caller that legitimately creates
-    /// an IdP-sourced group through this API. #1832.
+    /// IdP or engine-principal namespace prefix (`local:`/`entra:`/`saml:`/
+    /// `ad:`/`engine:`) — see `namespaced_group_name` below. An IdP-sourced
+    /// create (any other `source`) is exempt: `reconcile_idp_memberships`
+    /// writes IdP groups directly (not via this method) and always passes a
+    /// namespaced name, but the exemption also covers any future caller that
+    /// legitimately creates an IdP-sourced group through this API. #1832;
+    /// `engine:` reservation is design §3.3 / PR 4.2.
     std::expected<void, std::string> create_group(const RbacGroup& group);
     std::expected<void, std::string> delete_group(const std::string& name);
+
+    /// Read-only prefix scan over LOCALLY-sourced group names — backs the T8
+    /// startup collision-scan preflight (decision log #3: "The PR 4.2
+    /// migration itself scans for pre-existing colliding names rather than
+    /// allowing silent coexistence"). `prefix` must be a code-controlled
+    /// literal (e.g. `"engine:"`) — see the `.cpp` for the LIKE-metacharacter
+    /// fail-closed guard.
+    ///
+    /// G3 (governance hardening, UP-2): returns `std::nullopt` on a scan
+    /// error (statement prepare failure, or `sqlite3_step` terminating on
+    /// anything other than `SQLITE_DONE`) so a mid-scan SQLite error can
+    /// never be misread as "no collisions found" by the boot preflight — an
+    /// empty-but-`has_value()` result means the scan genuinely completed and
+    /// found nothing. Callers MUST treat `nullopt` as fail-closed.
+    std::optional<std::vector<std::string>>
+    find_local_groups_with_prefix(const std::string& prefix) const;
     std::vector<std::string> get_group_members(const std::string& group_name) const;
     std::expected<void, std::string> add_group_member(const std::string& group_name,
                                                       const std::string& username);
@@ -188,8 +228,11 @@ private:
     void seed_defaults();
     void load_enabled_flag();
 
-    /// Collect all role names for a user (direct + via group membership).
-    /// Caller must hold at least a shared lock on mtx_.
+    /// Collect all role names for a principal (direct user grant + via group
+    /// membership + PR 4.2 direct engine-principal grant, §4.1). `username`
+    /// is also the identity key for an `engine:`-prefixed caller — the
+    /// namespace reservation (§3.3) is what keeps the three UNION arms from
+    /// ever colliding. Caller must hold at least a shared lock on mtx_.
     std::vector<std::string> collect_roles_locked(const std::string& username) const;
 
     // Permission cache (G3-PERF-004): avoids 2+ SQL queries per REST request.

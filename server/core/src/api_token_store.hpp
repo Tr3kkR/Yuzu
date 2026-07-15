@@ -52,6 +52,20 @@ class PgPool;
 
 namespace yuzu::server {
 
+// Forward-declared rather than pulling in engine_principal_store.hpp here —
+// a scoped enum's underlying type defaults to `int`, so an opaque
+// enum-class-declaration is a valid, self-consistent forward reference. The
+// full definition (and the `.cpp`'s actual use of the enum values) lives in
+// engine_principal_store.hpp, included only by api_token_store.cpp.
+//
+// G8 (governance hardening, cpp-expert N1): the underlying type is pinned
+// `: int` explicitly (rather than relying on the implicit default) on BOTH
+// this forward-declaration and the definition in engine_principal_store.hpp
+// — self-documenting, and removes any ambiguity for either translation unit
+// (a mismatched underlying type between a forward-declaration and its
+// definition is ill-formed, no diagnostic required).
+enum class EngineLookupStatus : int;
+
 struct ApiToken {
     std::string token_id;      // Short display ID (prefix of hash)
     std::string token_hash;    // SHA-256 hash of raw token (stored, never the raw token)
@@ -81,14 +95,17 @@ public:
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
     /// If mcp_tier is non-empty, the token is an MCP token with the given tier.
-    /// Every token minted here is `principal_kind = "human"`. PR 4.1 keeps the
-    /// column INERT: there is deliberately no parameter to write "engine" —
-    /// engine-principal token issuance (with its lifecycle/tier/referential
-    /// checks) lands in PR 4.2 (docs/auth-engine-principals-design.md §§6-8/11),
-    /// which re-introduces a caller-supplied kind behind a C++-side allowlist.
+    /// `principal_kind` defaults to `"human"`; passing `"engine"` mints an
+    /// engine-principal credential and triggers the engine block (design doc
+    /// §§6-8): the mcp_tier must be `"readonly"`, the token must expire within
+    /// the 90-day ceiling, and the injected referent check
+    /// (`set_engine_referent_check`) must report the principal Active — else the
+    /// mint fails closed. A C++-side allowlist rejects any other kind ahead of
+    /// the DB `CHECK (principal_kind IN ('human','engine'))`.
     std::expected<std::string, std::string>
     create_token(const std::string& name, const std::string& principal_id, int64_t expires_at = 0,
-                 const std::string& scope_service = {}, const std::string& mcp_tier = {});
+                 const std::string& scope_service = {}, const std::string& mcp_tier = {},
+                 std::string principal_kind = "human");
 
     /// Validate a raw Bearer token. Returns the ApiToken if valid and not expired/revoked.
     std::optional<ApiToken> validate_token(const std::string& raw_token);
@@ -154,6 +171,16 @@ public:
     std::function<void()> test_hook_after_first_revoke_bump_;   // fired in revoke_token, right after the FIRST generation bump, before the lease/UPDATE
     std::function<void()> test_hook_after_validate_select_;     // fired in validate_token, right after the SELECT (+last_used update), before the generation re-check block
 
+    /// Injects the engine-principal referential-integrity check used by
+    /// `create_token`'s engine block (design doc §6). Unset by default —
+    /// `create_token` fails closed (rejects every `principal_kind=="engine"`
+    /// mint) until this is wired. server.cpp wires the real resolver
+    /// (`EnginePrincipalStore::get_for_auth`) after both stores open; this
+    /// setter exists so `ApiTokenStore` never constructs an
+    /// `EnginePrincipalStore` itself (would couple two independently-owned
+    /// stores at construction time).
+    void set_engine_referent_check(std::function<EngineLookupStatus(const std::string&)> fn);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
@@ -211,6 +238,12 @@ private:
     // revoke txn, or a per-token version column) is tracked in #2173.
     // Keep every fetch_add (both per call) and every snapshot/re-check.
     std::atomic<uint64_t> revoke_generation_{0};
+
+    // Engine-principal referential-integrity resolver (design doc §6),
+    // injected via `set_engine_referent_check`. Null until server.cpp wires
+    // it post-construction — `create_token` treats null as fail-closed
+    // (never mints an engine token without this check available).
+    std::function<EngineLookupStatus(const std::string&)> engine_referent_check_;
 
     /// Generate a fresh `yuzu_` Bearer token from the platform CSPRNG.
     /// Returns the raw token on success; std::unexpected when the system

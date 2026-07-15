@@ -11,6 +11,7 @@
 #include <shared_mutex>
 #include <string_view>
 
+#include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
@@ -224,26 +225,91 @@ std::string AuthRoutes::extract_form_value(const std::string& body, const std::s
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
+std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
+    // F4 (Hermes pass-2 HIGH H3): explicit three-way branch on the PERSISTED
+    // `principal_kind` field — never on the shape of `principal_id` (design
+    // doc §6/decision 7; the "engine:" prefix is defense-in-depth/
+    // readability, not the discriminator). The DB CHECK constraint normally
+    // limits this column to {"human","engine"}, but this is a
+    // defense-in-depth chokepoint: an out-of-allowlist value (e.g. "" from a
+    // NULL cell, or anything else a corrupted row / a bypassed CHECK could
+    // produce) must never silently fall through to the human branch — that
+    // would attribute an unknown/corrupted principal_kind as a fully
+    // privileged human session. Fail closed instead.
+    if (api_token.principal_kind != "human" && api_token.principal_kind != "engine") {
+        spdlog::error(
+            "synthesize_token_session: token principal_id='{}' has out-of-allowlist "
+            "principal_kind='{}' — refusing to synthesize a session (DB corruption or a "
+            "bypassed CHECK constraint)",
+            api_token.principal_id, api_token.principal_kind);
+        return std::nullopt;
+    }
+
+    if (api_token.principal_kind == "human") {
+        // ---- human branch — byte-identical to pre-#2021 behavior ----------
+        auth::Session synth;
+        synth.username = api_token.principal_id;
+        // #1837: no separate display label is stored for a token; fall back to
+        // the principal id itself (matches the pre-#1837 behavior for local
+        // principals, and is the best available label for a stable SSO id with
+        // no live session to render a human name from — there is no persistent
+        // principal→display-name directory; see #1852).
+        synth.display_name = api_token.principal_id;
+        synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
+        synth.token_scope_service = api_token.scope_service;
+        synth.mcp_tier = api_token.mcp_tier;
+        synth.principal_kind = "human";
+
+        // Resolve the creator's actual legacy role fresh (not unconditional admin).
+        // get_user_role() queries the current role on every call, so a creator who's
+        // been demoted since the token was issued will produce a user-role session.
+        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+        synth.role = legacy_role.value_or(auth::Role::user);
+
+        return synth;
+    }
+
+    // ---- engine branch (design doc §6) -------------------------------------
+    // The session IS the engine principal: no creating-user re-attribution,
+    // no get_user_role (there is no user row to consult — that would either
+    // 401 spuriously or, worse, silently borrow a namesake human's role).
     auth::Session synth;
-    synth.username = api_token.principal_id;
-    // #1837: no separate display label is stored for a token; fall back to
-    // the principal id itself (matches the pre-#1837 behavior for local
-    // principals, and is the best available label for a stable SSO id with
-    // no live session to render a human name from — there is no persistent
-    // principal→display-name directory; see #1852).
+    synth.username = api_token.principal_id; // "engine:<slug>"
     synth.display_name = api_token.principal_id;
-    synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
+    synth.auth_source = "engine_token"; // sixth auth_source value, see auth.hpp
     synth.token_scope_service = api_token.scope_service;
     synth.mcp_tier = api_token.mcp_tier;
+    synth.principal_kind = "engine";
+    // Legacy Role enum is pinned to the floor — real authority comes from
+    // RBAC assignments resolved elsewhere (§4), never from this field for an
+    // engine session.
+    synth.role = auth::Role::user;
 
-    // Resolve the creator's actual legacy role fresh (not unconditional admin).
-    // get_user_role() queries the current role on every call, so a creator who's
-    // been demoted since the token was issued will produce a user-role session.
-    auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
-    synth.role = legacy_role.value_or(auth::Role::user);
+    // engine_principal_store_ not yet wired (server.cpp/T8) → fail closed:
+    // an engine-kind token synthesizes NO session rather than an
+    // unauthenticated one silently passing through with floor privileges.
+    if (!engine_principal_store_) {
+        return std::nullopt;
+    }
 
-    return synth;
+    auto lookup = engine_principal_store_->get_for_auth(api_token.principal_id);
+    switch (lookup.status) {
+        case EngineLookupStatus::Active:
+            return synth;
+        case EngineLookupStatus::MissingOrRevoked:
+            // Terminal, 401-class (store doc §3.1): the credential's backing
+            // principal is dead (or never existed) — no session, no retry.
+            return std::nullopt;
+        case EngineLookupStatus::StoreUnreachable:
+            // Retryable, 503-class (store doc §3.1) — distinct from the
+            // terminal MissingOrRevoked case above in RETRY semantics only,
+            // never in the authorization outcome: both deny here. Surfacing
+            // the 503 end-to-end through require_auth (rather than the
+            // generic 401 an empty optional produces) is a noted follow-on,
+            // not required by this slice.
+            return std::nullopt;
+    }
+    return std::nullopt; // unreachable — silences -Wreturn-type on an enum add
 }
 
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
@@ -1686,6 +1752,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         //     writes a users row); MFA attestation for SAML is deferred to
         //     a future release. Return a clear denial rather than the
         //     misleading API-token message (governance R12).
+        //
+        // A fourth kind, `engine_token` (design doc §6), also reaches this
+        // code: `is_oidc`/`is_saml` are both false for it, so it falls into
+        // the same "bearer credential cannot step up" branch as api_token/
+        // mcp_token below — a 400, never a session mutation. Correct posture:
+        // an engine session has no local secret and no MFA-enrolled user to
+        // step up (§9), so denial here is intended, not an accidental
+        // fallthrough.
         if (session->auth_source != "local") {
             const bool is_oidc = session->auth_source == "oidc";
             const bool is_saml = session->auth_source == "saml";
@@ -2701,6 +2775,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // `oidc`) row can no longer satisfy it. This keeps the guard correct
         // when SAML provisioning + SAML-MFA land, without a rework (Hermes
         // cyber-review finding, #1852 hardening).
+        //
+        // An `engine_token` session (design doc §6/§9) never reaches this
+        // comparison at all: `POST /api/v1/elevate` is COOKIE-session only
+        // (see the `extract_session_cookie`/`validate_session` gate above —
+        // an engine session is synthesized fresh per bearer request and is
+        // never placed in the cookie `sessions_` map). If that structural
+        // gate were ever bypassed, `db->get_user(session->username)` for an
+        // `engine:<slug>` username would still fail (`!row`, no `users` row)
+        // and deny at the branch above. Belt-and-braces default-deny, both
+        // intended.
         const std::string& expected_identity_source = session->auth_source;
         if (row->identity_source != expected_identity_source) {
             audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
@@ -2732,6 +2816,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // from elevating — require_mfa_step_up's own no-proof-OIDC branch can
         // PASS a request through when --mfa-enforcement doesn't protect the
         // role (e.g. "optional"), so the decision must not be deferred there.
+        //
+        // As with the identity-source comparison above, an `engine_token`
+        // session cannot reach this code (cookie-session-only route,
+        // enforced structurally, plus the `!row` deny two branches up). Were
+        // it ever to arrive here, `session->auth_source == "oidc"` is false
+        // for "engine_token", so it takes the local-session `else` branch
+        // below (line ~2840), which requires local TOTP enrollment the
+        // engine principal's non-existent `users` row can never satisfy —
+        // denied either way.
         const bool oidc_amr_proof = session->auth_source == "oidc" &&
                                     session->mfa_verified_at.time_since_epoch().count() != 0;
         const bool oidc_amr_elevation = cfg_.jit_oidc_amr_elevation && oidc_amr_proof;

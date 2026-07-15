@@ -646,6 +646,28 @@ TEST_CASE("RbacStore: reconcile_idp_memberships rejects an empty source", "[rbac
     REQUIRE_FALSE(result.has_value());
 }
 
+// F3 (Hermes pass-2 HIGH H2): reject any `source` outside the recognized IdP
+// allowlist, not just "local"/empty. Without this, a caller passing
+// source="engine" (or any other unrecognized string) could mint
+// `engine:`-prefixed "IdP" groups via this path — it never checks
+// has_reserved_idp_prefix or the create_group collision scan, since it's a
+// raw upsert into `groups`, not a call through create_group.
+TEST_CASE("RbacStore: reconcile_idp_memberships rejects an unrecognized source (e.g. 'engine')",
+          "[rbac_store]") {
+    RbacStore store(":memory:");
+    auto result =
+        store.reconcile_idp_memberships("ivan", "engine", {{"vuln", "engine:vuln"}});
+    REQUIRE_FALSE(result.has_value());
+    // No mutation on rejection — the rejected 'source' never gets a chance to
+    // mint any group row (reserved 'engine:' namespace or otherwise).
+    CHECK(store.list_groups().empty());
+
+    // Also reject an arbitrary unrecognized string, not just the specific
+    // "engine" probe above.
+    auto result2 = store.reconcile_idp_memberships("ivan", "totally-made-up", {{"g", "g"}});
+    REQUIRE_FALSE(result2.has_value());
+}
+
 // sec-L1: a group row that pre-exists with a DIFFERENT source than this
 // reconcile call (e.g. a local group literally named `entra:x`, created
 // before the create_group reserved-prefix guard existed, or by direct DB
