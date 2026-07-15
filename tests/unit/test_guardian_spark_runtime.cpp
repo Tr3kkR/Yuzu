@@ -26,21 +26,31 @@ namespace {
 using clk = std::chrono::steady_clock;
 
 // A reader whose single-key responses tests set directly. Thread-safe for the
-// blocking detach test (only one in-flight read; `file` is not rewritten during it).
+// blocking gate tests (one in-flight read; the response fields aren't rewritten
+// during it).
 struct FakeReader : IStateReader {
     ReadResult<FileSnapshot> file{read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h"})};
-    RegistryRead reg{read_known(RegistrySnapshot{.present = true, .value = "v"}), 7};
+    ReadResult<RegistrySnapshot> reg_snap{read_known(RegistrySnapshot{.present = true, .value = "v"})};
+    std::unordered_map<std::string, ReadResult<RegistrySnapshot>> reg_values; ///< per value_name override
     ReadResult<ServiceRunState> svc{read_known(ServiceRunState::Running)};
     std::function<void()> on_read; // optional gate
     std::atomic<int> reads{0};
-    ReadResult<FileSnapshot> read_file(const FileSparkParams&) override {
+    std::atomic<std::uint64_t> last_hash_cap{0};
+    ReadResult<FileSnapshot> read_file(const FileSparkParams&, const FileReadPlan& plan) override {
         reads.fetch_add(1);
+        last_hash_cap.store(plan.hash_cap);
         if (on_read) on_read();
         return file;
     }
-    RegistryRead read_registry(const RegistrySparkParams&) override {
+    RegistryRead read_registry(const RegistrySparkParams&, const RegistryReadPlan& plan) override {
         reads.fetch_add(1);
-        return reg;
+        RegistryRead out;
+        out.latency_us = 7;
+        for (const auto& vn : plan.value_names) {
+            const auto it = reg_values.find(vn);
+            out.values.emplace(vn, it != reg_values.end() ? it->second : reg_snap);
+        }
+        return out;
     }
     ReadResult<ServiceRunState> read_service(const ServiceSparkParams&) override {
         reads.fetch_add(1);
@@ -78,6 +88,18 @@ RuleAssertion svc_running_rule(const std::string& rule_id) {
     RuleAssertion a;
     a.kind = AssertionKind::ServiceRunning;
     a.rule_id = rule_id;
+    return a;
+}
+SparkSpec reg_spec(const std::string& hive, const std::string& key) {
+    return SparkSpec{SparkType::Registry, RegistrySparkParams{hive, key}};
+}
+RuleAssertion registry_rule(const std::string& rule_id, const std::string& value_name,
+                            const std::string& expected) {
+    RuleAssertion a;
+    a.kind = AssertionKind::RegistryEquals;
+    a.rule_id = rule_id;
+    a.value_name = value_name;
+    a.expected_value = expected;
     return a;
 }
 std::vector<OutboxEntry> drain_all(GuardianSparkRuntime& rt) {
@@ -294,6 +316,83 @@ TEST_CASE("a detached in-flight handler is memory-safe even after the reader ref
     release.count_down();
     t.join(); // read finished, verdict committed, reader still alive: no UAF
     SUCCEED();
+}
+
+TEST_CASE("two registry rules under one key each read their OWN value_name", "[spark][runtime]") {
+    // Rules watching different values under one (hive,key) share ONE spark_key/watcher.
+    // The read plan requests both value_names; each rule evaluates against ITS value -
+    // reading one snapshot and fanning it to both would give a wrong verdict.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    r->reg_values["A"] = read_known(RegistrySnapshot{.present = true, .value = "1"}); // r1 compliant
+    r->reg_values["B"] = read_known(RegistrySnapshot{.present = true, .value = "9"}); // r2 drifts vs "2"
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(reg_spec("HKLM", "Software\\X"));
+    rt->attach_rule("r1", reg_spec("HKLM", "Software\\X"), registry_rule("r1", "A", "1"), true);
+    rt->attach_rule("r2", reg_spec("HKLM", "Software\\X"), registry_rule("r2", "B", "2"), true);
+    REQUIRE(rt->armed_key_count() == 1); // one shared watcher
+    REQUIRE(b->arms.load() == 1);
+
+    rt->evaluate_key(key, EvalReason::Initial);
+    auto g = drain_all(*rt);
+    REQUIRE(g.size() == 2);
+    std::sort(g.begin(), g.end(),
+              [](const OutboxEntry& a, const OutboxEntry& c) { return a.rule_id < c.rule_id; });
+    REQUIRE(g[0].rule_id == "r1");
+    REQUIRE(g[0].drift.compliant); // A == "1"
+    REQUIRE(g[1].rule_id == "r2");
+    REQUIRE_FALSE(g[1].drift.compliant); // B == "9" != "2"
+    REQUIRE(g[1].drift.detected_value == "9");
+}
+
+TEST_CASE("the file read plan uses the largest hash cap among the key's rules", "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    RuleAssertion small = file_exists_rule("r1"); // file-exists: no hash
+    small.kind = AssertionKind::FileHashEquals;
+    small.expected_hash = "h";
+    small.max_bytes = 100;
+    RuleAssertion big = small;
+    big.rule_id = "r2";
+    big.max_bytes = 5000;
+    rt->attach_rule("r1", file_spec("/a"), small, true);
+    rt->attach_rule("r2", file_spec("/a"), big, true);
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(r->last_hash_cap.load() == 5000); // hashed once at the largest admitting cap
+}
+
+TEST_CASE("a rule that joins mid-read is NOT committed against the stale snapshot",
+          "[spark][runtime]") {
+    // F2+F4: the pass snapshots its plan+gens before I/O and commits only those. A
+    // sibling rule that attaches while the read is in flight is not in the plan, so it
+    // is not evaluated against a snapshot that predates it - it stays dirty and the
+    // priority lane will run it next. (The old post-read fan-out evaluated it here.)
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    std::latch reading{1};
+    std::latch release{1};
+    r->on_read = [&] {
+        reading.count_down();
+        release.wait();
+    };
+    std::thread t([&] { rt->evaluate_key(key, EvalReason::Initial); });
+    reading.wait(); // r1's read is in flight; the plan was snapshotted with only r1
+
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); // joins mid-read
+    release.count_down();
+    t.join();
+
+    // r1 was in the plan -> committed + cleared; r2 joined after -> still pending.
+    REQUIRE(rt->pending_initial(key) == std::vector<std::string>{"r2"});
+    const auto g = drain_all(*rt);
+    REQUIRE(g.size() == 1); // only r1's verdict, not r2's
+    REQUIRE(g[0].rule_id == "r1");
 }
 
 TEST_CASE("Unknown->Known recovery emits guard.healthy even when the verdict is Silent",

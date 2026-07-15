@@ -2,6 +2,7 @@
 
 #include "spark_key_rule_index.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <variant>
@@ -75,7 +76,6 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         rules_.insert_or_assign(rule_id, std::move(rg));
         pk->pending_initial.insert(rule_id);
-        ++pk->pending_epoch;
         waker = pending_initial_waker_; // copy; call after releasing registry_mu_
         new_gen = gen;
     }
@@ -136,23 +136,54 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
         spec = pk->spec;
     }
 
-    // Serialise the whole pass (read + fan-out + commit) for THIS key, so read
-    // order == commit order and the freshest read commits last (no backward
+    // Serialise the whole pass (plan + read + fan-out + commit) for THIS key, so
+    // read order == commit order and the freshest read commits last (no backward
     // compliance). Per-key, so sibling keys run concurrently.
     std::lock_guard<std::mutex> eval_lk{pk->eval_mu};
 
-    // The one blocking I/O, OUTSIDE registry_mu_. Every event is a hint: re-read
-    // live state rather than trust a queued payload.
-    ReadResult<FileSnapshot> file_read;
-    RegistryRead reg_read;
-    ReadResult<ServiceRunState> svc_read;
     const bool is_file = spec.type == SparkType::File;
     const bool is_reg = spec.type == SparkType::Registry;
     const bool is_svc = spec.type == SparkType::Service;
+
+    // Snapshot the active generations + derive the read plan BEFORE any I/O (under
+    // registry_mu_). We evaluate ONLY these generations: a rule that joins during the
+    // read is not in the plan, so its value_name / hash cap was not read - evaluating
+    // it against a snapshot that lacks its data would be wrong. It stays dirty in
+    // pending_initial and the priority lane re-runs the key for it.
+    std::vector<std::shared_ptr<RuleGeneration>> planned;
+    FileReadPlan fplan;
+    RegistryReadPlan rplan;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end() || kit->second.get() != pk.get())
+            return;
+        for (const std::string& rid : index_->rules_for(key)) {
+            const auto rrit = rules_.find(rid);
+            if (rrit == rules_.end() || !rrit->second->active)
+                continue;
+            const auto& rg = rrit->second;
+            planned.push_back(rg);
+            if (is_file && rg->assertion.kind == AssertionKind::FileHashEquals)
+                fplan.hash_cap = std::max(fplan.hash_cap, rg->assertion.max_bytes);
+            if (is_reg)
+                rplan.value_names.push_back(rg->assertion.value_name);
+        }
+    }
+    if (planned.empty())
+        return;
+
+    // The one blocking I/O, OUTSIDE registry_mu_, driven by the plan. Every event is
+    // a hint: re-read live state rather than trust a queued payload.
+    ReadResult<FileSnapshot> file_read;
+    RegistryRead reg_read;
+    ReadResult<ServiceRunState> svc_read;
     if (is_file)
-        file_read = reader_->read_file(std::get<FileSparkParams>(spec.params));
+        file_read = reader_->read_file(std::get<FileSparkParams>(spec.params), fplan);
     else if (is_reg)
-        reg_read = reader_->read_registry(std::get<RegistrySparkParams>(spec.params));
+        reg_read = reader_->read_registry(std::get<RegistrySparkParams>(spec.params), rplan);
     else if (is_svc)
         svc_read = reader_->read_service(std::get<ServiceSparkParams>(spec.params));
     else
@@ -162,8 +193,9 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
 
     // Commit section: IO-free, under registry_mu_ so a concurrent detach cannot
     // interleave between the eval and the enqueue (which would re-add a purged
-    // entry). Re-snapshot active generations post-I/O (a rule may have joined,
-    // left, or been superseded during the read).
+    // entry). Commit ONLY the planned generations, and re-check each is STILL the
+    // active current generation for its rule - one withdrawn or re-attached during
+    // the read must drop here (its new generation gets its own pass).
     std::lock_guard<std::mutex> lk{registry_mu_};
     if (stopping_)
         return;
@@ -171,23 +203,20 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
     if (kit == keys_.end() || kit->second.get() != pk.get())
         return; // key withdrawn or re-armed under a new PerKey during the read
 
-    for (const std::string& rid : index_->rules_for(key)) {
-        const auto rrit = rules_.find(rid);
-        if (rrit == rules_.end())
-            continue;
-        RuleGeneration& gen = *rrit->second;
-        if (!gen.active)
-            continue;
+    for (const std::shared_ptr<RuleGeneration>& rg : planned) {
+        const auto rrit = rules_.find(rg->assertion.rule_id);
+        if (rrit == rules_.end() || rrit->second.get() != rg.get() || !rg->active)
+            continue; // withdrawn or superseded during the read
 
         // copy-eval-enqueue-commit: eval mutates a COPY; commit only if what we
         // needed to buffer was accepted, else leave the eval pending for retry.
-        RuleEvalState scratch = gen.eval;
+        RuleEvalState scratch = rg->eval;
         const EvalOutcome out =
-            eval_rule(spec, gen.assertion, scratch, now, gen.emit_compliant_edge,
+            eval_rule(spec, rg->assertion, scratch, now, rg->emit_compliant_edge,
                       is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                       is_svc ? &svc_read : nullptr);
 
-        std::vector<OutboxEntry> entries = build_entries(gen, out);
+        std::vector<OutboxEntry> entries = build_entries(*rg, out);
         bool accepted = true;
         if (!entries.empty()) {
             std::lock_guard<std::mutex> ob{outbox_mu_};
@@ -196,11 +225,11 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
         if (!accepted)
             continue; // outbox full: eval stays pending (nothing committed), convergence retries
 
-        gen.eval = std::move(scratch); // COMMIT
+        rg->eval = std::move(scratch); // COMMIT
         // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
         // Unknown does not (it still owes a real verdict).
         if (out.status != EvalStatus::Unhealthy)
-            pk->pending_initial.erase(rid);
+            pk->pending_initial.erase(rg->assertion.rule_id);
     }
 }
 
@@ -212,8 +241,14 @@ EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const Rul
                                             const ReadResult<ServiceRunState>* svc) {
     if (file)
         return eval_file(a, *file, state, now, edge);
-    if (reg)
-        return eval_registry(a, reg->result, state, reg->latency_us, now, edge);
+    if (reg) {
+        // Pick THIS rule's value from the per-value_name map (the plan requested it).
+        const auto it = reg->values.find(a.value_name);
+        if (it == reg->values.end())
+            return eval_registry(a, read_unknown<RegistrySnapshot>("value not in read plan"), state,
+                                 reg->latency_us, now, edge);
+        return eval_registry(a, it->second, state, reg->latency_us, now, edge);
+    }
     if (svc)
         return eval_service(a, *svc, state, now, edge);
     return EvalOutcome{}; // Silent (unreachable for an armed event-driven key)

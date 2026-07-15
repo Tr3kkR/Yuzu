@@ -23,13 +23,16 @@ struct FakeReader : IStateReader {
     std::atomic<int> file_reads{0};
     std::atomic<int> reg_reads{0};
     std::atomic<int> svc_reads{0};
-    ReadResult<FileSnapshot> read_file(const FileSparkParams&) override {
+    ReadResult<FileSnapshot> read_file(const FileSparkParams&, const FileReadPlan&) override {
         file_reads.fetch_add(1);
         return read_known(FileSnapshot{.exists = true});
     }
-    RegistryRead read_registry(const RegistrySparkParams&) override {
+    RegistryRead read_registry(const RegistrySparkParams&, const RegistryReadPlan& plan) override {
         reg_reads.fetch_add(1);
-        return RegistryRead{read_known(RegistrySnapshot{.present = true, .value = "v"}), 0};
+        RegistryRead out;
+        for (const auto& vn : plan.value_names)
+            out.values.emplace(vn, read_known(RegistrySnapshot{.present = true, .value = "v"}));
+        return out;
     }
     ReadResult<ServiceRunState> read_service(const ServiceSparkParams&) override {
         svc_reads.fetch_add(1);

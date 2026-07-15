@@ -67,22 +67,49 @@ class SparkKeyRuleIndex; // spark_key_rule_index.hpp (fwd - kept out of this hea
 /// (always a live re-read); the reason only tunes pending-initial bookkeeping.
 enum class EvalReason { Initial, Event, Convergence };
 
-/// A registry read plus its measured latency (registry is the one type that
-/// records detection_latency_us for parity).
+/// What the file reader must resolve for a key. One watcher serves rules with
+/// different caps, so the reader hashes ONCE at the largest admitting cap and the
+/// evaluator projects oversize per-rule. hash_cap == 0 means no rule on the key
+/// hashes (file-exists only) - skip hashing.
+struct FileReadPlan {
+    std::uint64_t hash_cap{0}; ///< max max_bytes over the key's file-hash rules; 0 = no hash needed
+};
+
+/// What the registry reader must resolve for a key. Rules under ONE (hive,key)
+/// spark_key may watch DIFFERENT values, so the reader reads each requested value
+/// (memoised per value_name) and returns a per-value map; the evaluator selects
+/// its rule's value_name. Reading one snapshot and fanning it to all rules would
+/// be wrong for a multi-value key.
+struct RegistryReadPlan {
+    std::vector<std::string> value_names; ///< distinct values to read under the key
+};
+
+/// The registry reader's result: a per-value_name read plus the measured latency
+/// (registry is the one type that records detection_latency_us for parity). A key
+/// that could not be opened fills every requested value_name with Unknown.
 struct RegistryRead {
-    ReadResult<RegistrySnapshot> result;
+    std::unordered_map<std::string, ReadResult<RegistrySnapshot>> values;
     std::uint64_t latency_us{0};
 };
 
 /// The runtime's view of live endpoint state. Rung 5 supplies the platform
 /// readers (file handle-scoped #807, registry RegOpenKeyExW, service SCM/sd-bus);
-/// tests supply fakes. A method returns Unknown (ReadResult.known == false) when
-/// it cannot determine the value - never a fabricated absent/stopped.
+/// tests supply fakes.
+///
+/// CONTRACT for implementers (rung 5):
+///   - A method returns Unknown (ReadResult.known == false) when it cannot
+///     determine the value - never a fabricated absent/stopped.
+///   - MUST be thread-safe: the convergence lanes and the consumer handler call it
+///     concurrently for different keys (each call gets its own params/plan).
+///   - MUST be bounded / cancellable: a read participates in shutdown (a lane join
+///     and the consumer detach both wait on an in-flight read), so a platform call
+///     that can block indefinitely (SCM, sd-bus, a filesystem stall) must carry a
+///     timeout and degrade to Unknown rather than hang agent shutdown.
 class IStateReader {
 public:
     virtual ~IStateReader() = default;
-    virtual ReadResult<FileSnapshot> read_file(const FileSparkParams& p) = 0;
-    virtual RegistryRead read_registry(const RegistrySparkParams& p) = 0;
+    virtual ReadResult<FileSnapshot> read_file(const FileSparkParams& p, const FileReadPlan& plan) = 0;
+    virtual RegistryRead read_registry(const RegistrySparkParams& p, const RegistryReadPlan& plan) = 0;
     virtual ReadResult<ServiceRunState> read_service(const ServiceSparkParams& p) = 0;
 };
 
@@ -224,7 +251,6 @@ private:
         SparkSpec spec;
         std::uint64_t subscription{0};
         std::mutex eval_mu;
-        std::uint64_t pending_epoch{0};       ///< bumped when a rule joins; lets a pass detect a mid-flight join
         std::set<std::string> pending_initial; ///< rule_ids awaiting a first Known eval (registry_mu_-guarded)
     };
 
