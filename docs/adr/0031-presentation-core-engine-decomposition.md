@@ -333,8 +333,13 @@ rule it replaces.
 **INV-31-6 — Every store that a component depends on appears in that component's readiness probe.**
 Stated as an invariant rather than a habit, because the existing `stores_ok` conjunction in `/readyz`
 grew one row at a time, and every row was added after a store died while the server reported healthy.
-The split multiplies the problem: **core** `/readyz` = its stores + the Postgres pool + **the run
-reaper's liveness**; **presentation** `/readyz` = "core reachable at a compatible API version" (it
+The split multiplies the problem: **core** `/readyz` = its stores + the Postgres pool. Note the run
+reaper is **not** in the conjunction: once run expiry is enforced inline (`now < expires_at`, ADR-0032
+Decision 4/5), a stalled reaper strands terminal evidence and cleanup, **not** read authority - and
+`/readyz` drives load-balancer / rolling-upgrade routing, so pulling an authority-safe core instance
+out of rotation for a janitor stall trades capacity for zero correctness benefit. The reaper's death is
+covered by its named critical alert (`yuzu_use_case_reaper_last_success_timestamp`, Decision 5), which
+is the right instrument. **presentation** `/readyz` = "core reachable at a compatible API version" (it
 must never be green while core is down, or a load balancer will route traffic to a surface that can
 only 502); **engine** `/readyz` = its own database + core reachable + module manifests ratified.
 `/livez` stays process-liveness on all three. ADR-0032 and ADR-0033 introduce six new stores; none is

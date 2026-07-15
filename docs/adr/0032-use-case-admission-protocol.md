@@ -774,7 +774,10 @@ redemption succeeds. Redemption is **replay-safe**: a crash after the CAS re-run
 against authority as it is now - unchanged re-authorises with no second release-log row; shrunk,
 revoked or expired **DENIES** - the same rule as Decision 10. Core authorises the serve; it does not
 observe delivery. A demotion, credential revocation, module pull or run expiry between the last fact
-read and redemption therefore denies the fresh result exactly as it denies a cached one.
+read and redemption therefore denies the fresh result exactly as it denies a cached one. Every such
+denial - fresh or cached - emits `yuzu_use_case_release_denied_total{reason}` (`reason` = `demoted` |
+`credential_revoked` | `module_pulled` | `expired` | `scope_shrunk`), a real-time signal rather than
+audit-only, matching the `schedules_stalled` / `execution_plan_voided` convention.
 
 **Two journals, linked — not merged.** They answer different questions and live in different
 databases under different roles:
