@@ -287,6 +287,40 @@ TEST_CASE("a detached in-flight handler is memory-safe even after the reader ref
     SUCCEED();
 }
 
+TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {
+    // Within one runtime, two observations of the same rule get distinct ids (seq);
+    // two agents get distinct id prefixes - so the server's event_id PK never drops a
+    // legitimate observation as a duplicate.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->set_agent_id_provider([] { return std::string{"agentA"}; });
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Initial); // compliant edge
+    const auto e1 = drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = false});
+    rt->evaluate_key(key, EvalReason::Event); // drift
+    const auto e2 = drain_all(*rt);
+    REQUIRE(e1.size() == 1);
+    REQUIRE(e2.size() == 1);
+    REQUIRE(e1[0].event_id != e2[0].event_id);        // distinct observations
+    REQUIRE(e1[0].event_id.rfind("agentA-", 0) == 0); // agent-id folded in
+    REQUIRE(e1[0].enqueued_ns > 0);                   // wall-clock timestamp, not steady epoch
+
+    // A second agent with a different id yields a different prefix for the same rule.
+    auto rt2 = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    rt2->set_agent_id_provider([] { return std::string{"agentB"}; });
+    rt2->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt2->evaluate_key(key, EvalReason::Initial);
+    const auto eB = drain_all(*rt2);
+    REQUIRE(eB.size() == 1);
+    REQUIRE(eB[0].event_id.rfind("agentB-", 0) == 0);
+    REQUIRE(eB[0].event_id != e1[0].event_id); // cross-agent distinct
+}
+
 TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)",
           "[spark][runtime][tsan]") {
     auto r = std::make_shared<FakeReader>(); // `file` is not rewritten during this test

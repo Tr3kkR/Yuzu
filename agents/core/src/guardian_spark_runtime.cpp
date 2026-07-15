@@ -189,7 +189,7 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
 
         bool accepted = true;
         if (out.status != EvalStatus::Silent)
-            enqueue_outcome(gen, out, now, accepted);
+            enqueue_outcome(gen, out, accepted);
         if (!accepted)
             continue; // outbox full: eval stays pending, convergence retries
 
@@ -217,10 +217,13 @@ EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const Rul
 }
 
 void GuardianSparkRuntime::enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out,
-                                           std::chrono::steady_clock::time_point now,
                                            bool& accepted) {
-    const std::int64_t ns = now.time_since_epoch().count();
-    const std::string eid = next_event_id(gen.assertion.rule_id);
+    // Wall clock for the wire timestamp + id (the steady clock used for debounce has
+    // an arbitrary epoch and is not a valid observation time). registry_mu_ is held.
+    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
+    const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
+    const std::string eid = make_event_id(gen.assertion.rule_id, ms);
     OutboxEntry e = (out.status == EvalStatus::Emit)
                         ? OutboxEntry::compliance(gen.assertion.rule_id, gen.generation, eid, ns,
                                                   out.drift)
@@ -230,9 +233,11 @@ void GuardianSparkRuntime::enqueue_outcome(const RuleGeneration& gen, const Eval
     accepted = outbox_.enqueue(std::move(e));
 }
 
-std::string GuardianSparkRuntime::next_event_id(const std::string& rule_id) {
-    // registry_mu_ is held by the caller; event_seq_ is guarded by it.
-    return rule_id + ":" + std::to_string(++event_seq_);
+std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std::int64_t wall_ms) {
+    // registry_mu_ is held by the caller; event_seq_ + agent_id_fn_ are guarded by it.
+    const std::string agent = agent_id_fn_ ? agent_id_fn_() : std::string{};
+    return agent + "-" + rule_id + "-" + std::to_string(wall_ms) + "-" +
+           std::to_string(++event_seq_);
 }
 
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
@@ -301,6 +306,11 @@ void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker
 std::function<void()> GuardianSparkRuntime::pending_initial_waker_for_test() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     return pending_initial_waker_;
+}
+
+void GuardianSparkRuntime::set_agent_id_provider(std::function<std::string()> provider) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    agent_id_fn_ = std::move(provider);
 }
 
 } // namespace yuzu::agent

@@ -194,6 +194,14 @@ public:
     /// copied-waker-outlives-scheduler lifetime path.
     [[nodiscard]] std::function<void()> pending_initial_waker_for_test() const;
 
+    /// Install the source of THIS agent's id, folded into every event_id so the
+    /// server's global `event_id` PRIMARY KEY (drops on UNIQUE conflict, #1307)
+    /// does not treat two agents drifting on the same rule - or the same agent
+    /// after a restart - as duplicate events. A provider (not a fixed string)
+    /// because the agent_id is empty pre-Register and populated later; default is
+    /// empty (rung 7 wires the real provider after Register).
+    void set_agent_id_provider(std::function<std::string()> provider);
+
 private:
     /// Per-rule generation: an immutable assertion/spec-edge + monotonic
     /// generation + the mutable eval state. Held by shared_ptr so an in-flight
@@ -227,9 +235,12 @@ private:
                           const ReadResult<FileSnapshot>* file,
                           const RegistryRead* reg,
                           const ReadResult<ServiceRunState>* svc);
-    void enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out,
-                         std::chrono::steady_clock::time_point now, bool& accepted);
-    std::string next_event_id(const std::string& rule_id);
+    void enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out, bool& accepted);
+    /// Mint a wire event_id: `<agent_id>-<rule_id>-<wall_ms>-<seq>` (registry_mu_
+    /// held). agent_id distinguishes agents, wall_ms distinguishes restarts, seq
+    /// distinguishes same-ms events - closing the collision the server's event_id
+    /// PK would otherwise drop on.
+    std::string make_event_id(const std::string& rule_id, std::int64_t wall_ms);
 
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED
@@ -240,6 +251,7 @@ private:
     mutable std::mutex registry_mu_;
     bool stopping_{false};
     std::function<void()> pending_initial_waker_; ///< registry_mu_-guarded; called outside the lock
+    std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; empty until rung 7 wires it
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key
