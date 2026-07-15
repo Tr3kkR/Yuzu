@@ -22,6 +22,8 @@
 
 #include <yuzu/agent/guard_systemd.hpp>
 
+#include <yuzu/agent/guard_launchd.hpp> // LaunchdServiceGuard (make_service_guard's macOS arm)
+
 #include <spdlog/spdlog.h>
 
 #include <cctype>
@@ -157,6 +159,8 @@ EmitDecision systemd_decide_emit(ServiceGuard::Desired want, SystemdState got, E
 std::unique_ptr<IGuard> make_service_guard(ServiceGuard::Config cfg, GuardSink sink) {
 #if defined(__linux__)
     return std::make_unique<SystemdServiceGuard>(std::move(cfg), std::move(sink));
+#elif defined(__APPLE__)
+    return std::make_unique<LaunchdServiceGuard>(std::move(cfg), std::move(sink));
 #else
     return std::make_unique<ServiceGuard>(std::move(cfg), std::move(sink));
 #endif

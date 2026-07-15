@@ -193,9 +193,9 @@ private:
 };
 
 /// Platform factory for the `service-status-change` Spark: a SystemdServiceGuard on
-/// Linux, the Windows/other ServiceGuard otherwise. Returns a unique_ptr<IGuard> so
-/// the GuardianEngine dispatch stays platform-clean (mirrors make_dex_observer()).
-/// Never null.
+/// Linux, a LaunchdServiceGuard (guard_launchd.hpp) on macOS, the Windows/other
+/// ServiceGuard otherwise. Returns a unique_ptr<IGuard> so the GuardianEngine
+/// dispatch stays platform-clean (mirrors make_dex_observer()). Never null.
 YUZU_EXPORT std::unique_ptr<IGuard> make_service_guard(ServiceGuard::Config cfg, GuardSink sink);
 
 } // namespace yuzu::agent

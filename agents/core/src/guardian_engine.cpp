@@ -633,18 +633,23 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 it->second->stop();
             guards_.erase(it);
         }
-        // Platform factory: Windows SCM ServiceGuard or Linux systemd
-        // SystemdServiceGuard, both IGuard. Keeps this dispatch platform-clean.
+        // Platform factory: Windows SCM ServiceGuard, Linux systemd
+        // SystemdServiceGuard, or macOS launchd LaunchdServiceGuard — all IGuard.
+        // Keeps this dispatch platform-clean.
         auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
         if (sguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(sguard));
-            // Honest mode label: the Linux systemd guard is observe-only in v1, so an
-            // enforce-authored rule observes (it logs its own downgrade too) — don't
-            // claim "enforce" on a platform that won't remediate (happy-path Q4).
+            // Honest mode label: the Linux systemd and macOS launchd guards are
+            // observe-only in v1, so an enforce-authored rule observes (each logs its
+            // own downgrade too) — don't claim "enforce" on a platform that won't
+            // remediate (happy-path Q4).
             const char* mode = enforce ? "enforce" : "audit";
 #if defined(__linux__)
             if (enforce)
                 mode = "enforce (observe-only on Linux)";
+#elif defined(__APPLE__)
+            if (enforce)
+                mode = "enforce (observe-only on macOS)";
 #endif
             spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
                          rule.rule_id(), log_service,
