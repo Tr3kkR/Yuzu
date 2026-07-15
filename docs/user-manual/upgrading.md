@@ -205,6 +205,42 @@ the caller holds `InstructionDefinition:Read`) plus a top-level `actions_enriche
 count. The change is purely additive; any client that pinned `version == 1` should relax the
 check to a minimum (`>= 1`).
 
+## ⚠️ Breaking: API and MCP bearer tokens are invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030)
+
+`ApiTokenStore` — the store backing every `Authorization: Bearer` API token and
+every MCP token — moves from SQLite (`api-tokens.db`) to the server's PostgreSQL
+substrate in this release (engine-principals PR 4.1; ADR-0006/ADR-0030). This is
+a **fresh-start cutover with no data migration**: the new server creates an empty
+Postgres `api_token_store.api_tokens` table and **never reads the old
+`api-tokens.db`**, so every API/MCP token minted before the upgrade stops working
+the instant the new server starts. Interactive cookie-session login (dashboard,
+OIDC/SAML SSO) is **not** affected — only bearer tokens.
+
+The rationale for no backfill (convention with every prior server-store migration,
+plus the token store holds only verify-only hashes) is in ADR-0030.
+
+**Who this affects:** every external automation consumer that authenticates with an
+API or MCP bearer token — CI/CD scripts, SIEM/webhook pollers, cron jobs, MCP
+clients. Because it is a fresh-start cutover, **all of them break at once** at the
+moment of upgrade; there is no rolling/staged token continuity.
+
+**Remediate:** after upgrading, **re-mint every API/MCP bearer token** (`POST
+/api/v1/tokens`) and update the credential wherever it is stored (CI secrets, cron
+configs, MCP client configs). Plan the upgrade in a **maintenance window** and
+**notify automation/integration owners in advance** so a batch of `401`s across
+every integration is expected, not a surprise incident.
+
+**Diagnostic:** if the legacy `api-tokens.db` is still on disk, the server logs
+`[auth] Legacy SQLite api-tokens.db found at … — API/MCP tokens now live in
+PostgreSQL and any prior tokens were INVALIDATED by the migration (ADR-0030)` at
+boot. The old file is inert (never read again) and can be removed once you have
+re-minted; it contains only token hashes + metadata, no plaintext secret.
+
+**Multi-instance note:** the Postgres substrate now permits running multiple server
+replicas against one database. Token *validation* uses a per-process 60-second
+cache, so a token revoked on one replica may remain accepted on another replica for
+up to that window — see ADR-0030 for the tracked hardening.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and

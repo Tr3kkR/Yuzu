@@ -186,6 +186,17 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
+
+The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
+a **fresh-start cutover with no data migration** — every pre-upgrade API token and MCP token stops
+working the instant the new server starts (interactive cookie-session/SSO login is unaffected).
+**Re-mint every API/MCP bearer token** after upgrading (`POST /api/v1/tokens`) and update the
+credential wherever it is stored; plan a maintenance window and notify automation owners, since all
+bearer-token integrations break at once. A boot-time warning names the legacy file (inert,
+removable). Full detail + multi-instance caveat: the `## ⚠️ Breaking` section in
+`docs/user-manual/upgrading.md` and ADR-0030.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track

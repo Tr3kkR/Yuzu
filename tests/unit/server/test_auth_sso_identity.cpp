@@ -20,6 +20,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "migration_runner.hpp"
 #include "test_route_sink.hpp"
@@ -339,7 +340,9 @@ struct SsoJitHarness {
     Config cfg{};
     auth::AuthManager auth_mgr{};
     AuthDB auth_db;
-    std::unique_ptr<ApiTokenStore> api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    yuzu::test::ApiTokenStorePg api_tokens;
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -355,10 +358,8 @@ struct SsoJitHarness {
         auth_mgr.load_config(cfg.auth_config_path);
         auth_mgr.set_auth_db(&auth_db);
 
-        api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
                                                    api_tokens.get(), audit_store.get(), nullptr,
                                                    nullptr, analytics_store.get(), oidc_mu,

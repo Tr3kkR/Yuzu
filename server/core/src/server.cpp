@@ -1406,6 +1406,36 @@ public:
             }
         }
 
+        // ApiTokenStore — born-on-PG Bearer-token store (plan PR 4.1). Same
+        // fail-CLOSED construction posture as the other born-on-PG stores
+        // (ADR-0012 §1): a reachable database whose schema can't migrate/open
+        // is a deploy error, not a serve-degraded state. FRESH START — no
+        // SQLite backfill; the legacy api-tokens.db is no longer opened.
+        if (pg_pool_ && !startup_failed_) {
+            api_token_store_ = std::make_unique<ApiTokenStore>(*pg_pool_);
+            if (!api_token_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: api-token store migration/open failed "
+                              "(database reachable but the api_token_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // FRESH-START migration (ADR-0030): the legacy SQLite
+                // api-tokens.db is never opened; existing API/MCP tokens are
+                // invalidated on upgrade. Warn if the stale file is still on
+                // disk so an in-place upgrade's mass 401s are diagnosable (the
+                // file is inert + hash-only and can be deleted).
+                std::error_code ec;
+                const auto legacy_db = cfg_.db_dir() / "api-tokens.db";
+                if (std::filesystem::exists(legacy_db, ec)) {
+                    spdlog::warn("[auth] Legacy SQLite api-tokens.db found at {} — API/MCP "
+                                 "tokens now live in PostgreSQL and any prior tokens were "
+                                 "INVALIDATED by the migration (ADR-0030); re-mint them. The "
+                                 "old file is inert and can be removed.",
+                                 legacy_db.string());
+                }
+            }
+        }
+
         // Initialize response store
         {
             auto resp_db = cfg_.db_dir() / "responses.db";
@@ -2172,10 +2202,6 @@ public:
             agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
-        }
-        {
-            auto token_db = cfg_.db_dir() / "api-tokens.db";
-            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
         }
         {
             auto quar_db = cfg_.db_dir() / "quarantine.db";
@@ -3565,6 +3591,12 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
+        // hold a raw pointer, and every HTTP handler thread is already
+        // quiesced by the drain above); keep the ADR-0012 teardown discipline
+        // so a future consumer can't UAF.
+        api_token_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -11384,6 +11416,10 @@ private:
     // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    // Born-on-PG (plan PR 4.1). Borrows pg_pool_ — declared after it (line
+    // ~11270) so normal reverse-declaration-order destruction is already
+    // correct; stop() also explicitly resets it before pg_pool_.reset() (ADR-0012
+    // destruct-before-pool discipline, matching the other born-on-PG stores).
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<ResultSetStore> result_set_store_;

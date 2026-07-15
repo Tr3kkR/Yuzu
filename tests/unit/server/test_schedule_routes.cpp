@@ -24,6 +24,7 @@
 #include "auth_routes.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
 #include "schedule_engine.hpp"
@@ -68,7 +69,9 @@ struct ScheduleRouteHarness {
     TestDb sdb;
     ScheduleEngine schedule_engine{sdb.db};
     yuzu::test::TempDir tmp;
-    std::unique_ptr<ApiTokenStore> api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    yuzu::test::ApiTokenStorePg api_tokens;
     std::unique_ptr<AnalyticsEventStore> analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -83,9 +86,7 @@ struct ScheduleRouteHarness {
         // tries to open a file underneath it.
         std::filesystem::create_directories(tmp.path);
 
-        api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr, &rbac, api_tokens.get(),
