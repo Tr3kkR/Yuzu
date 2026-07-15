@@ -169,6 +169,8 @@ docs/             Architecture docs, conventions, roadmap, capability map
 
 Three-tier split: Tier 1 PR fast-path (`ci.yml`, one Linux + Windows + macOS + `proto-compat`, <10 min), Tier 2 push to dev/main (full matrix, no sanitizers/coverage, #410), Tier 3 nightly (`nightly.yml`, sanitizers + coverage — failure auto-opens `nightly-broken`; **no merge to main while it is open**). `workflow_dispatch`/cron fire only once the workflow file is on `main` — new workflows on `dev` are dormant until merged. Full reference: `docs/ci-architecture.md`; `build-ci` owns the matrix, `cross-platform` the Windows/macOS specifics.
 
+**Standing invariant — failure-path `if:` guards need an explicit status function.** A GitHub Actions `if:` containing **no** status-check function (`success()`/`failure()`/`always()`/`cancelled()`) has an implicit `success()` ANDed onto it. So `if: steps.X.outcome == 'failure'` is **unsatisfiable** — `success()` is already false the moment X fails, so the step can never run. Every failure-path step (diagnostics, stack captures, artifact uploads on red) must lead with `failure() && …` or `failure() || cancelled()` explicitly. This silently skipped the nightly TSan gdb capture on every red nightly for two months (#1038); `grep -n "outcome ==" .github/workflows/` before trusting any failure-path guard.
+
 ## Release workflow gates
 
 The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose-versions.sh` **first** — it rejects any tracked-compose `ghcr.io/<owner>/yuzu-{server,gateway,agent}(-chisel)?:X.Y.Z` that is a bare numeric tag or a `${YUZU_VERSION:-...}` default ≠ the tag being released (floating tags ignored). **Before tagging**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify: `bash scripts/check-compose-versions.sh 0.12.0` — else the job fails only after the full build matrix. New compose file ⇒ add it to the script's `FILES` array (auto-discovery is deliberately off).
@@ -232,6 +234,8 @@ For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUI
 ## Agent skills
 
 The Matt Pocock engineering skills are **user-global**, not committed — they follow the operator. Re-run `/setup-matt-pocock-skills` to change.
+
+**`/dev-team`** is committed **project-level** (`.claude/skills/dev-team/`), *unlike* the Matt Pocock set above — so every collaborator gets it via git. It runs an Opus "senior" session that plans and delegates to Sonnet `junior-developer` subagents (scoped edits, targeted tests, then `/test --quick`), consulting a Fable `enterprise-architect` (both in `.claude/agents/`) for material or disputed calls, then integrates the result behind `/test` + `/governance`. Invoke `/dev-team <task>`. If Fable is unavailable in an environment, override `enterprise-architect`'s frontmatter to `model: opus` **as a local-only edit — do not commit it** (it is environment-specific; committing would force `model: opus` on every collaborator whose environment *does* have Fable). Keep the change out of any PR, or carry it via user-global config that shadows the committed agent file.
 
 ### Plugin scope — `frontend-design` is marketing-only
 

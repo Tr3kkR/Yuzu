@@ -151,6 +151,7 @@ agent_test_exe = executable(
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
+    'unit/test_shutdown_pipe.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_mechanism.cpp',
@@ -451,6 +452,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_group_store.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
@@ -543,6 +545,21 @@ test('changelog order',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
+# entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
+# the cancelled-path "which entry never finished" inference. It reuses
+# flake-retry.py's junit-name -> introspected-entry mapping rather than keeping a
+# second copy, so the shard-naming contract documented above now has two
+# consumers — and this selftest is what makes a break in it loud. Wired here for
+# the same reason flake-retry's is: the alternative to failing in `meson test` is
+# failing silently at 06:00 UTC, in the one nightly that needed a stack trace.
+test('tsan-gdb-capture selftest',
+  _python3_test,
+  args: [files('../scripts/ci/tsan-gdb-capture.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
 )

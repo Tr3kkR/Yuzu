@@ -62,7 +62,7 @@ skill claims anything is "done."
 | Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
 | Account lockout after N failed local-password logins | Shipped (SOC 2 CC6.3) | `auth.db` v3 columns + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins` (`auth_db.cpp`); `POST /login` pre-check + record/clear (`auth_routes.cpp`); admin unlock `POST /api/v1/users/<name>/unlock` (`rest_api_v1.cpp`); `--auth-lockout-threshold`/`--auth-lockout-window-secs` (`main.cpp`). Generic-401 (no enum/oracle), auto-expiring window, audit `auth.lockout.applied`/`.cleared`. Ref: `docs/auth-architecture.md` "Account lockout". |
 | MFA / TOTP — full ladder (enrollment + login challenge + recovery codes; step-up on 11 high-risk surfaces; enforcement modes + OIDC `amr` short-circuit + login-time enrollment bootstrap) | Shipped (v0.12–v0.13, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors; `POST /login` 202-branches + `POST /login/mfa`, `/login/mfa/stepup`, `/login/mfa/enroll` at `auth_routes.cpp`; `require_mfa_step_up` + `amr_asserts_mfa` at `mfa_step_up.{hpp,cpp}`; `--mfa-enforcement` at `main.cpp`; Settings panel + self-target disable guard at `settings_routes.cpp`. Remaining: at-rest TOTP-secret encryption — **mechanism decided by ADR-0010** (SecretCodec envelope encryption at the `auth` store's Postgres migration; the `auth_kv` scaffolding will NOT be used). Full reference: `docs/auth-mfa-design.md`. |
-| SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP (`/scim/v2/*`, Users-only) | Shipped (SOC 2 CC6.2/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (storage: `scim_resources`/`scim_tokens` inside `auth.db`, own `"scim"` migration component) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`users.provisioning_source`, auth.db migration v7), now also re-checking `role == "user"`. See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+| SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP, plus Groups→role mapping (`/scim/v2/*`, Users and Groups) | Shipped (SOC 2 CC6.2/CC6.7/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (storage: `scim_resources`/`scim_tokens` inside `auth.db`, own `"scim"` migration component) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`users.provisioning_source`, auth.db migration v7), now also re-checking `role == "user"`. `--scim-admin-group` grants `role=admin` to a SCIM-provisioned user currently in that group (Model A: IdP membership is authoritative, a manual role change is reverted on the next membership recompute). See `docs/auth-architecture.md` "SCIM v2 provisioning". |
 
 ---
 
@@ -82,7 +82,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only. Admins are now reachable via SAML without a local account. Deferred: AuthnRequest signing, AttributeStatement parsing beyond the group attribute, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
-| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **SHIPPED (Users slice)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push, and SCIM users are always `role=user` at creation so a compromised IdP can't create an admin. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`; metrics `yuzu_scim_requests_total{op,status}` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** Groups→role mapping, native email-`userName` support, `userName` rename, per-route rate-limiting, API-token revocation on user delete/deactivate (pre-existing gap shared with the dashboard's manual disable path), SCIM-token-at-rest encryption. See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.7/6.8 | **SHIPPED (Users + Groups→role mapping)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push. **Groups→role mapping (#2021):** `/scim/v2/Groups` (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`, `displayName`-keyed exact-case match, whitespace-trimmed `--scim-admin-group`, bounded `members[]`, `409` on a `displayName` collision or rename-onto-existing) reuses `resolve_role_from_groups` — a SCIM-provisioned user is `role=admin` **iff** currently a member of `--scim-admin-group`; there is no other field or code path to `role=admin`, so a compromised IdP can elevate only as far as that one configured group. **Model A: IdP membership is authoritative** — a manual dashboard role change on a SCIM account is reverted on the next membership-recomputing event (Group mutation or User reprovision), not on a plain deactivate/restart/flag change; `deprovision_role_ok` is a demote-before-delete ordering gate (blocks deprovisioning a non-`user` account), not a permanent-elevation guarantee. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`/`scim.group.*`/`scim.user.role_changed`; metrics `yuzu_scim_requests_total{op,status}` + `yuzu_scim_role_changes_total` + `yuzu_scim_role_change_failures_total` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** native email-`userName` support, `userName` rename, per-route rate-limiting, API-token revocation on user delete/deactivate (pre-existing gap shared with the dashboard's manual disable path), SCIM-token-at-rest encryption. See `docs/auth-architecture.md` "SCIM v2 provisioning". |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
@@ -206,37 +206,57 @@ matches the customer ask.
    AuthnRequest signing, AttributeStatement parsing beyond the group
    attribute, Windows support, IdP-metadata auto-fetch, Settings-UI
    reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP".
-7. ~~**SCIM v2 provisioning**~~ **DONE (Users slice)** — auto-create/deactivate/
-   reactivate users from the IdP over `/scim/v2/*` (`--scim-enable`/
-   `--scim-token`, fail-closed without a token or without HTTPS). Reuses
-   `auth.db`'s user table (a new `provisioning_source` column, migration v7)
-   plus two new SCIM-owned tables (`scim_resources`/`scim_tokens`) under
-   their own migration component on the same db file — not a new store.
-   Bearer-token auth (constant-time, separate from operator API tokens),
-   fixed `role=user` provisioning (no SCIM path to admin), soft-delete +
-   session-revoke on deactivate, lockout-clear (not MFA-restore) on
-   reactivate. The **provenance guard** — every mutating call re-verifies
-   `provisioning_source == "scim"` immediately before touching the account,
-   refusing `404` (never `403`, no existence oracle) on mismatch — is the
-   invariant that makes it safe to point a third-party IdP connector at this
-   surface: a local admin or the break-glass account can never be
-   deactivated by SCIM — a check now extended to also re-verify `role ==
-   "user"`, so an operator-elevated former-SCIM account is likewise beyond
-   SCIM's reach. `PUT` triggers the same deactivate/reactivate semantics as
-   `PATCH` when `active` flips; a `POST` against a deactivated SCIM account's
-   `userName` revives it (returning-employee reprovision) rather than
-   `409`ing. Audit result values are `success`/`failure`/`denied`; metrics
-   `yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
-   `yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
-   **Remaining (next slice):** Groups→role mapping (every SCIM user is
-   `role=user` regardless of IdP group membership), native email-shaped
-   `userName` support (Yuzu usernames are slug-only — a stock Okta/Entra
-   `userName=email` mapping 400s until the operator remaps it), `userName`
-   rename via `PUT`, per-route rate-limiting, API-token revocation on
-   user delete/deactivate (currently only auth sessions are revoked — a
-   pre-existing gap shared with the dashboard's manual disable path, not
-   SCIM-specific), and SCIM-token-at-rest encryption. See
-   `docs/auth-architecture.md` "SCIM v2 provisioning".
+7. ~~**SCIM v2 provisioning**~~ **DONE (Users + Groups→role mapping,
+   #2021)** — auto-create/deactivate/reactivate users from the IdP over
+   `/scim/v2/*` (`--scim-enable`/`--scim-token`, fail-closed without a
+   token or without HTTPS). Reuses `auth.db`'s user table (a new
+   `provisioning_source` column, migration v7) plus SCIM-owned tables
+   (`scim_resources`/`scim_tokens`, plus Group resources/membership rows)
+   under their own migration component on the same db file — not a new
+   store. Bearer-token auth (constant-time, separate from operator API
+   tokens), soft-delete + session-revoke on deactivate, lockout-clear (not
+   MFA-restore) on reactivate. The **provenance guard** — every mutating
+   call re-verifies `provisioning_source == "scim"` immediately before
+   touching the account, refusing `404` (never `403`, no existence oracle)
+   on mismatch — is the invariant that makes it safe to point a
+   third-party IdP connector at this surface: a local admin or the
+   break-glass account can never be deactivated by SCIM — a check also
+   re-verifies `role == "user"`, so an operator-elevated former-SCIM
+   account is likewise beyond SCIM's reach (this is a **demote-before-delete
+   ordering gate**, not a claim the elevation is permanent — see Groups→role
+   mapping below). `PUT` triggers the same deactivate/reactivate semantics
+   as `PATCH` when `active` flips; a `POST` against a deactivated SCIM
+   account's `userName` revives it (returning-employee reprovision) rather
+   than `409`ing.
+   **`/scim/v2/Groups`** (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`,
+   `displayName`-keyed, whitespace-trimmed + exact-case
+   `--scim-admin-group` match, bounded `members[]`, `409` on a `displayName`
+   collision or rename-onto-existing) grants a SCIM-provisioned user
+   `role=admin` **iff** currently a member of the configured admin group,
+   via the same `resolve_role_from_groups` SAML/OIDC already use — the
+   **only** code path from a SCIM request to `role=admin`. **Model A: IdP
+   group membership is authoritative** for a SCIM account's role — a manual
+   dashboard role change is reverted on the next event that recomputes that
+   user's membership (a Group mutation or User reprovision), not on a plain
+   deactivate/restart/`--scim-admin-group` change; a manually-promoted
+   admin in no SCIM group is the one residual case Model A does not reach
+   (neither reverted nor SCIM-deprovisionable until demoted by hand).
+   Audit result values are `success`/`failure`/`denied` (incl. new
+   `scim.group.created`/`.updated`/`.deleted` and `scim.user.role_changed`);
+   metrics `yuzu_scim_requests_total{op,status}`,
+   `yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
+   `yuzu_scim_provenance_denied_total`, `yuzu_scim_role_changes_total`,
+   `yuzu_scim_role_change_failures_total` (the last a hardening-round fix —
+   a role-apply failure now gets its own audit `failure` row + metric,
+   distinct from the pre-existing audit-write-failure counter).
+   **Remaining:** native email-shaped `userName` support (Yuzu usernames
+   are slug-only — a stock Okta/Entra `userName=email` mapping 400s until
+   the operator remaps it), `userName` rename via `PUT`, per-route
+   rate-limiting, API-token revocation on user delete/deactivate (currently
+   only auth sessions are revoked — a pre-existing gap shared with the
+   dashboard's manual disable path, not SCIM-specific), and
+   SCIM-token-at-rest encryption. See `docs/auth-architecture.md` "SCIM v2
+   provisioning".
 8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
    (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
    0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
