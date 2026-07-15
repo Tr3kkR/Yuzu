@@ -676,23 +676,26 @@ it.
 
 So every B4 fact read returns, alongside the rows, a **`scope_basis` marker that core computes from the
 caller's confinement STATUS, not from the data**: `global` when the caller's resolved authority is the
-whole fleet, `authority_scoped` when it is a subset. Coverage and completeness are **relative to that
-basis** (ADR-0033 §10): a result built from an `authority_scoped` read describes the caller's
-authorised cohort and **may never be presented as `complete` over the global fleet**, regardless of
-whether any out-of-scope row happened to match. This is deliberately **not** a matched/withheld count:
+whole fleet, `authority_scoped` when it is a subset. This is **independent of query coverage**: **completeness**
+(ADR-0033 §10) is relative to the **requested/intended scope** - did everything you asked for answer -
+while `scope_basis` says whether that requested scope was itself capped by your authority. A result may
+be **presented as fleet-`complete` only when it is `complete` AND `scope_basis = global`**; an
+`authority_scoped` result describes only the caller's authorised cohort and is never a clean bill of
+health for the fleet, regardless of whether any out-of-scope row happened to match. This is deliberately **not** a matched/withheld count:
 a per-query figure for rows the caller may not see - even a single truncated-or-not bit - is itself a
 one-bit existence oracle over forbidden data, the very disclosure confinement exists to prevent
 (ADR-0017 INV-3: a confined caller never receives a count computed over rows outside their visible
 set; cf. the Inventory catalogue-rollup exception, global-gated for exactly this reason). The numeric
-matched/withheld figures are **core-internal**; they are released to a caller **only when that caller's
-requesting credential itself currently holds global read**.
+matched/withheld figures are **core-internal**; they reach a caller **only when the recipient's full
+applicable effective authority (Decision 0) resolves to global read** - not merely the requesting
+credential, since the engine principal, represented operator or module envelope may each be narrower.
 
 **Coverage is core-verified, never merely engine-asserted.** Decision 12 has the engine submit a
 disclosure summary and a coverage envelope at finalisation — but core performed every fact read and
 every dispatch, so **core holds the ground truth and MUST validate the engine's claim against it**.
 Core rejects a finalisation whose declared coverage contradicts what core actually served (an engine
-declaring `complete` over an `authority_scoped` read, or over a fleet dispatch core recorded as
-partially timed out). Decision 11 records the release "never trusted from the engine"; coverage gets the same
+presenting a result as **fleet-`complete`** when `scope_basis` is `authority_scoped`, or declaring
+`complete` over a fleet dispatch core recorded as partially timed out). Decision 11 records the release "never trusted from the engine"; coverage gets the same
 posture, for the same reason. An engine that could self-attest completeness could launder a partial
 answer into a clean bill of health, and the evidence chain would agree with it.
 
