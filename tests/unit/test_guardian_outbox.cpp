@@ -145,6 +145,34 @@ TEST_CASE("at capacity a new key is rejected + counted, coalescing still succeed
     REQUIRE(ob.enqueue(comp("c", 1, "e5", 300, "z")));
 }
 
+TEST_CASE("enqueue_all is atomic: at cap NEITHER of a pair is buffered", "[spark][outbox]") {
+    GuardianOutbox ob{1};
+    REQUIRE(ob.enqueue(comp("a", 1, "e1", 100, "x"))); // fills the single slot
+    // A health+verdict pair for rule b is two NEW keys, needs 2 slots -> reject both.
+    std::vector<OutboxEntry> pair;
+    pair.push_back(OutboxEntry::health("b", 1, "h", 101, true, ""));
+    pair.push_back(comp("b", 2, "c", 102, "y"));
+    REQUIRE_FALSE(ob.enqueue_all(std::move(pair)));
+    REQUIRE(ob.size() == 1); // neither buffered - no partial commit
+    REQUIRE(ob.backpressure_drops() == 1);
+}
+
+TEST_CASE("enqueue_all buffers a pair that fits; coalescing entries are not growth",
+          "[spark][outbox]") {
+    GuardianOutbox ob{2};
+    std::vector<OutboxEntry> pair;
+    pair.push_back(OutboxEntry::health("a", 1, "h", 100, true, ""));
+    pair.push_back(comp("a", 1, "c", 101, "x"));
+    REQUIRE(ob.enqueue_all(std::move(pair))); // 2 new keys (health + compliance), cap 2 -> fits
+    REQUIRE(ob.size() == 2);
+    // Re-enqueue a pair for the same rule/domains: both coalesce -> no growth, still fits at cap.
+    std::vector<OutboxEntry> pair2;
+    pair2.push_back(OutboxEntry::health("a", 1, "h2", 200, true, ""));
+    pair2.push_back(comp("a", 2, "c2", 201, "y"));
+    REQUIRE(ob.enqueue_all(std::move(pair2)));
+    REQUIRE(ob.size() == 2);
+}
+
 TEST_CASE("purge_stale drops entries below the active generation, keeps the rest", "[spark][outbox]") {
     GuardianOutbox ob{16};
     ob.enqueue(comp("a", 1, "e1", 100, "x"));                        // gen 1 - stale

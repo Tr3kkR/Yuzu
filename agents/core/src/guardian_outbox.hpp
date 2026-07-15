@@ -45,7 +45,9 @@
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace yuzu::agent {
 
@@ -142,6 +144,29 @@ public:
         }
         pending_.push_back(std::move(e));
         index_.emplace(k, std::prev(pending_.end()));
+        return true;
+    }
+
+    /// Atomically buffer a SET of entries: both-or-neither. Returns false iff the
+    /// NEW keys among them would exceed capacity, in which case NONE are buffered
+    /// (and the backpressure counter bumps once) so the caller leaves the whole eval
+    /// pending. Used for the health-recovery pair (guard.healthy + the verdict) which
+    /// must land together or not at all - a partial commit would advance decider state
+    /// for an event the server never receives. Coalescing entries never count as growth.
+    bool enqueue_all(std::vector<OutboxEntry> entries) {
+        std::size_t new_keys = 0;
+        std::unordered_set<Key, KeyHash> adding;
+        for (const auto& e : entries) {
+            const Key k{e.domain, e.rule_id};
+            if (index_.find(k) == index_.end() && adding.insert(k).second)
+                ++new_keys;
+        }
+        if (pending_.size() + new_keys > capacity_) {
+            ++backpressure_drops_;
+            return false;
+        }
+        for (auto& e : entries)
+            enqueue(std::move(e)); // each fits now (a coalesce, or within the reserved room)
         return true;
     }
 

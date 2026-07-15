@@ -187,11 +187,14 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                       is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                       is_svc ? &svc_read : nullptr);
 
+        std::vector<OutboxEntry> entries = build_entries(gen, out);
         bool accepted = true;
-        if (out.status != EvalStatus::Silent)
-            enqueue_outcome(gen, out, accepted);
+        if (!entries.empty()) {
+            std::lock_guard<std::mutex> ob{outbox_mu_};
+            accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
+        }
         if (!accepted)
-            continue; // outbox full: eval stays pending, convergence retries
+            continue; // outbox full: eval stays pending (nothing committed), convergence retries
 
         gen.eval = std::move(scratch); // COMMIT
         // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
@@ -216,21 +219,26 @@ EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const Rul
     return EvalOutcome{}; // Silent (unreachable for an armed event-driven key)
 }
 
-void GuardianSparkRuntime::enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out,
-                                           bool& accepted) {
+std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneration& gen,
+                                                            const EvalOutcome& out) {
     // Wall clock for the wire timestamp + id (the steady clock used for debounce has
     // an arbitrary epoch and is not a valid observation time). registry_mu_ is held.
     const auto wall = std::chrono::system_clock::now().time_since_epoch();
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
-    const std::string eid = make_event_id(gen.assertion.rule_id, ms);
-    OutboxEntry e = (out.status == EvalStatus::Emit)
-                        ? OutboxEntry::compliance(gen.assertion.rule_id, gen.generation, eid, ns,
-                                                  out.drift)
-                        : OutboxEntry::health(gen.assertion.rule_id, gen.generation, eid, ns,
-                                              /*healthy=*/false, out.health_detail);
-    std::lock_guard<std::mutex> ob{outbox_mu_};
-    accepted = outbox_.enqueue(std::move(e));
+    const std::string& rid = gen.assertion.rule_id;
+    std::vector<OutboxEntry> v;
+    if (out.recovered) // Unknown -> Known: clear the health stream's errored state first
+        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms), ns,
+                                        /*healthy=*/true, {}));
+    if (out.status == EvalStatus::Emit)
+        v.push_back(
+            OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms), ns, out.drift));
+    else if (out.status == EvalStatus::Unhealthy)
+        v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms), ns,
+                                        /*healthy=*/false, out.health_detail));
+    // Silent + !recovered -> empty (nothing to publish).
+    return v;
 }
 
 std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std::int64_t wall_ms) {

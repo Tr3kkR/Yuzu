@@ -71,6 +71,15 @@ RuleAssertion file_exists_rule(const std::string& rule_id, bool present = true) 
     a.expect_present = present;
     return a;
 }
+SparkSpec svc_spec(const std::string& name) {
+    return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
+}
+RuleAssertion svc_running_rule(const std::string& rule_id) {
+    RuleAssertion a;
+    a.kind = AssertionKind::ServiceRunning;
+    a.rule_id = rule_id;
+    return a;
+}
 std::vector<OutboxEntry> drain_all(GuardianSparkRuntime& rt) {
     std::vector<OutboxEntry> got;
     rt.drain([&](const OutboxEntry& e) {
@@ -285,6 +294,58 @@ TEST_CASE("a detached in-flight handler is memory-safe even after the reader ref
     release.count_down();
     t.join(); // read finished, verdict committed, reader still alive: no UAF
     SUCCEED();
+}
+
+TEST_CASE("Unknown->Known recovery emits guard.healthy even when the verdict is Silent",
+          "[spark][runtime]") {
+    // The systemd worst case: emit_compliant_edge=false, so a recovery to steady
+    // compliant is a Silent verdict. Without a health-recovery emit the health stream
+    // would stay unhealthy forever. Assert guard.healthy IS emitted on recovery.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(svc_spec("nginx"));
+    rt->attach_rule("s1", svc_spec("nginx"), svc_running_rule("s1"), /*emit_compliant_edge=*/false);
+
+    r->svc = read_known(ServiceRunState::Running);
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 0); // systemd compliant edge is Silent
+
+    r->svc = read_unknown<ServiceRunState>("scm timeout");
+    rt->evaluate_key(key, EvalReason::Event);
+    auto g = drain_all(*rt);
+    REQUIRE(g.size() == 1);
+    REQUIRE(g[0].domain == OutboxDomain::Health);
+    REQUIRE_FALSE(g[0].healthy);
+
+    r->svc = read_known(ServiceRunState::Running); // recovery to steady compliant
+    rt->evaluate_key(key, EvalReason::Convergence);
+    g = drain_all(*rt);
+    REQUIRE(g.size() == 1);
+    REQUIRE(g[0].domain == OutboxDomain::Health);
+    REQUIRE(g[0].healthy); // the recovery signal that was previously never sent
+}
+
+TEST_CASE("recovery to a drifted state emits BOTH guard.healthy and the drift verdict",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io"); // errored
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1); // health(false)
+
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto g = drain_all(*rt);
+    REQUIRE(g.size() == 2); // health(true) + the drift, landed atomically
+    REQUIRE(g[0].domain == OutboxDomain::Health);
+    REQUIRE(g[0].healthy);
+    REQUIRE(g[1].domain == OutboxDomain::Compliance);
+    REQUIRE_FALSE(g[1].drift.compliant);
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {

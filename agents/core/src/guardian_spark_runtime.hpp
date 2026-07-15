@@ -235,7 +235,10 @@ private:
                           const ReadResult<FileSnapshot>* file,
                           const RegistryRead* reg,
                           const ReadResult<ServiceRunState>* svc);
-    void enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out, bool& accepted);
+    /// The outbox entries an outcome requires (0, 1, or 2): a recovery emits
+    /// guard.healthy AND the verdict, which enqueue_all lands atomically. Called
+    /// under registry_mu_ (make_event_id needs it).
+    std::vector<OutboxEntry> build_entries(const RuleGeneration& gen, const EvalOutcome& out);
     /// Mint a wire event_id: `<agent_id>-<rule_id>-<wall_ms>-<seq>` (registry_mu_
     /// held). agent_id distinguishes agents, wall_ms distinguishes restarts, seq
     /// distinguishes same-ms events - closing the collision the server's event_id

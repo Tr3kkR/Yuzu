@@ -148,6 +148,9 @@ struct EvalOutcome {
     EvalStatus status{EvalStatus::Silent};
     GuardDrift drift{};         ///< meaningful iff status == Emit
     std::string health_detail;  ///< read-error detail iff status == Unhealthy
+    bool recovered{false};      ///< this Known outcome is the FIRST after an Unknown gap; the runtime
+                                ///< also emits guard.healthy so the health stream leaves the errored
+                                ///< state even when the verdict itself is Silent (systemd steady-compliant)
 };
 
 /// Evaluate a file rule against a tri-state read. Returns Emit / Silent / Unhealthy.

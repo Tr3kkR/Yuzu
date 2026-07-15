@@ -26,20 +26,23 @@ EvalOutcome pack(const RuleAssertion& a, const char* guard_type, bool compliant,
                  std::string detected, std::string expected, RuleEvalState& state,
                  std::chrono::steady_clock::time_point now, bool emit_compliant_edge,
                  std::uint64_t detection_latency_us) {
+    bool recovered = false;
     if (state.in_unknown) {
         // Recovery: force a fresh verdict. Clearing last_compliant makes a compliant
         // read an edge again; clearing last_emit/suppressed lets a drift re-emit
-        // rather than debounce-fold against a pre-error drift. (A systemd rule that
-        // recovers to compliant with emit_compliant_edge=false still stays Silent on
-        // the compliance channel - its "recovered" signal rides the health channel.)
+        // rather than debounce-fold against a pre-error drift. `recovered` tells the
+        // runtime to ALSO emit guard.healthy - so a systemd rule recovering to steady
+        // compliant (a Silent verdict with emit_compliant_edge=false) still leaves the
+        // health stream's errored state instead of staying unhealthy forever.
         state.emit.last_compliant.reset();
         state.emit.last_emit.reset();
         state.emit.suppressed = 0;
         state.in_unknown = false;
+        recovered = true;
     }
     const EmitResult r = decide_emit(compliant, state.emit, a.debounce_ms, now, emit_compliant_edge);
     if (r.kind == EmitKind::Silent)
-        return EvalOutcome{EvalStatus::Silent, GuardDrift{}, {}};
+        return EvalOutcome{EvalStatus::Silent, GuardDrift{}, {}, recovered};
     GuardDrift d;
     d.guard_type = guard_type;
     d.rule_id = a.rule_id;
@@ -49,7 +52,7 @@ EvalOutcome pack(const RuleAssertion& a, const char* guard_type, bool compliant,
     d.detection_latency_us = detection_latency_us;
     d.collapsed_count = r.collapsed_count;
     d.compliant = (r.kind == EmitKind::CompliantEdge);
-    return EvalOutcome{EvalStatus::Emit, std::move(d), {}};
+    return EvalOutcome{EvalStatus::Emit, std::move(d), {}, recovered};
 }
 
 } // namespace
