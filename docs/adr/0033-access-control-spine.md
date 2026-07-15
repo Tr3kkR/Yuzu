@@ -447,8 +447,8 @@ only rows; it must state how much of the intended fleet answered:
 | `responded` | endpoints returning a valid result before the deadline |
 | `failed` | endpoints returning a terminal error |
 | `timed_out` / `offline` | known non-responses, kept **distinct** from an empty or negative result |
-| `withheld_by_confinement` | records the operator's authority **removed** from the answer before the engine ever saw them (ADR-0032 Decision 11 returns matched/released/withheld on every confined fact read). Without this row, a confined read and a clean fleet are the same bytes — the envelope would report honestly on the devices that *answered* while silently omitting the ones the operator was not allowed to *ask about*. |
-| `completeness` | `complete` · `partial` · `insufficient` · `unknown` — and a result whose inputs were **confinement-truncated may never be `complete`** |
+| `scope_basis` | `global` or `authority_scoped`, computed by core from the caller's confinement **status**, never from the data (ADR-0032 Decision 11). An `authority_scoped` answer covers only the caller's authorised cohort and can never be `complete` over the fleet. This is **not** a count of withheld rows: a per-query withheld figure is a one-bit existence oracle over forbidden data (ADR-0017 INV-3), so the numeric matched/withheld figures stay core-internal and reach only a caller whose credential currently holds global read. |
+| `completeness` | `complete` · `partial` · `insufficient` · `unknown`, **relative to `scope_basis`** — a result built from an `authority_scoped` read may never be `complete` over the global fleet |
 | `policy` | the declared threshold, and whether incomplete evidence blocks the next step — **subject to a core-owned ceiling** (below) |
 
 **Missing evidence is never a negative finding.** "No vulnerable devices found" and "62 devices never

@@ -650,27 +650,35 @@ of behavioural reads, and it must not inherit that pattern. **No release without
   **not the field-level payload**. That is the honest scope, and it is what a DSAR actually needs;
   promising field-level recall the log does not hold would be worse than a precise answer.
 
-**Every confined fact read returns a confinement envelope, and core — not the engine — computes it.**
-This is the quietest and most dangerous hole in the protocol, so it is closed here explicitly.
-Confinement *removes rows*. If core hands back only the rows the operator may see, then "the engine
-found no vulnerable devices" and "the engine was shown none of the 12 vulnerable devices it was not
-allowed to see" are **the same bytes**. The engine cannot tell them apart, and neither can the
-operator reading the result. That is precisely the sentence ADR-0033 §10's coverage envelope exists
-to make impossible — and §10 scopes the envelope to *distributed* answers, so a confined **core-store**
-read, which is not one, would slip past it.
+**Every confined fact read returns a confinement basis marker, and core — not the engine — computes
+it.** This is the quietest and most dangerous hole in the protocol, so it is closed here explicitly.
+Confinement *removes rows*. If core hands back only the rows the operator may see with no marker, then
+an `authority_scoped` "no vulnerable devices" is **the same bytes** as a global "no vulnerable
+devices" - and an answer that covers only the caller's cohort gets read as a clean bill of health for
+the whole fleet. The engine cannot tell them apart, and neither can the operator reading the result.
+That is precisely what ADR-0033 §10's coverage envelope exists to make impossible - and §10 scopes the
+envelope to *distributed* answers, so a confined **core-store** read, which is not one, would slip past
+it.
 
-So every B4 fact read returns, alongside the rows: the count of records **matched** before
-confinement, the count **released**, and therefore the count **withheld by confinement**. The engine
-must propagate this into its result's coverage (ADR-0033 §10), and a result whose inputs were
-confinement-truncated **may not be presented as complete**. Core knows these numbers because core did
-the filtering; nobody else can know them at all.
+So every B4 fact read returns, alongside the rows, a **`scope_basis` marker that core computes from the
+caller's confinement STATUS, not from the data**: `global` when the caller's resolved authority is the
+whole fleet, `authority_scoped` when it is a subset. Coverage and completeness are **relative to that
+basis** (ADR-0033 §10): a result built from an `authority_scoped` read describes the caller's
+authorised cohort and **may never be presented as `complete` over the global fleet**, regardless of
+whether any out-of-scope row happened to match. This is deliberately **not** a matched/withheld count:
+a per-query figure for rows the caller may not see - even a single truncated-or-not bit - is itself a
+one-bit existence oracle over forbidden data, the very disclosure confinement exists to prevent
+(ADR-0017 INV-3: a confined caller never receives a count computed over rows outside their visible
+set; cf. the Inventory catalogue-rollup exception, global-gated for exactly this reason). The numeric
+matched/withheld figures are **core-internal**; they are released to a caller **only when that caller's
+requesting credential itself currently holds global read**.
 
 **Coverage is core-verified, never merely engine-asserted.** Decision 12 has the engine submit a
 disclosure summary and a coverage envelope at finalisation — but core performed every fact read and
 every dispatch, so **core holds the ground truth and MUST validate the engine's claim against it**.
 Core rejects a finalisation whose declared coverage contradicts what core actually served (an engine
-declaring `complete` over a read core truncated, or over a fleet dispatch core recorded as partially
-timed out). Decision 11 records the release "never trusted from the engine"; coverage gets the same
+declaring `complete` over an `authority_scoped` read, or over a fleet dispatch core recorded as
+partially timed out). Decision 11 records the release "never trusted from the engine"; coverage gets the same
 posture, for the same reason. An engine that could self-attest completeness could launder a partial
 answer into a clean bill of health, and the evidence chain would agree with it.
 
