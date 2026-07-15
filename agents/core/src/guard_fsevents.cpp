@@ -115,9 +115,12 @@ std::expected<void, std::string> FsEventsWatchCore::watch(const std::string& key
     std::lock_guard lk(impl_->m);
     if (!impl_->started || !impl_->queue)
         return std::unexpected("FSEvents watch core is not started");
-    // Reserve the map slot BEFORE creating the stream: the only throwing
-    // operation (node allocation) happens while nothing needs cleanup, so a
-    // started stream can never leak with a dangling context (sec-M1).
+    // Reserve the map slot BEFORE creating the stream (sec-M1): the map-node
+    // allocation happens while nothing needs cleanup, and no operation after
+    // FSEventStreamStart can throw (plain moves + return), so a STARTED stream
+    // can never leak with a dangling context. Pre-Start allocations that throw
+    // (Entry, error strings) leave at worst a null map slot, which every
+    // consumer null-guards and unwatch() erases — self-healing, not a leak.
     auto [it, inserted] = impl_->entries.try_emplace(key);
     if (!inserted)
         return std::unexpected("duplicate watch key '" + key + "'");

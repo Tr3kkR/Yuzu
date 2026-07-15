@@ -25,6 +25,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -110,6 +111,37 @@ struct FileDriftCollector {
                     return true;
             return false;
         });
+    }
+    // Index-anchored variants: wait for a compliant / non-compliant event at
+    // index >= from. Raw-count syncs race late in-flight events (a deletion
+    // storm can emit two drifts across wake cycles), which lets survival
+    // assertions pass vacuously — anchoring on the event KIND at a known index
+    // closes that (Gate-8 F4/G8R-1). Returns the matching index, or nullopt.
+    std::optional<std::size_t> wait_compliant_from(std::size_t from, std::chrono::milliseconds to) {
+        std::unique_lock lk(m);
+        std::optional<std::size_t> hit;
+        cv.wait_for(lk, to, [&] {
+            for (std::size_t i = from; i < events.size(); ++i)
+                if (events[i].compliant) {
+                    hit = i;
+                    return true;
+                }
+            return false;
+        });
+        return hit;
+    }
+    std::optional<std::size_t> wait_drift_from(std::size_t from, std::chrono::milliseconds to) {
+        std::unique_lock lk(m);
+        std::optional<std::size_t> hit;
+        cv.wait_for(lk, to, [&] {
+            for (std::size_t i = from; i < events.size(); ++i)
+                if (!events[i].compliant) {
+                    hit = i;
+                    return true;
+                }
+            return false;
+        });
+        return hit;
     }
 };
 
@@ -434,21 +466,25 @@ TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
     REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
 
     // 1) delete the whole parent directory → file is absent → drift. (Count drifts,
-    //    not raw events — arming present emitted a compliant edge first, Slice B.)
+    //    not raw events — arming present emitted a compliant edge first, Slice B.
+    //    A deletion storm may emit MORE than one drift across wake cycles, so
+    //    step 2 anchors on the compliant EDGE, never on raw counts.)
     fs::remove_all(parent);
     REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
     const auto after_drift = col->size();
 
-    // 2) recreate the parent + file — the guard must go compliant again (a fresh
-    //    edge event, which doubles as the re-arm/re-baseline sync), then delete
-    //    once more and it must detect again (Windows: re-armed via the
-    //    nearest-ancestor watch; macOS: the path-based FSEvents stream survives
-    //    the recreation outright).
+    // 2) recreate the parent + file — the guard must go compliant again (the
+    //    edge event doubles as the re-arm/re-baseline sync), then delete once
+    //    more and a drift must land AFTER that edge, proving live survival
+    //    (Windows: re-armed via the nearest-ancestor watch; macOS: the
+    //    path-based FSEvents stream survives the recreation outright).
     fs::create_directories(parent);
     write_file(target);
-    REQUIRE(col->wait_count(after_drift + 1, std::chrono::seconds(5))); // the clear edge
+    const auto clear_edge = col->wait_compliant_from(after_drift, std::chrono::seconds(5));
+    REQUIRE(clear_edge.has_value());
     fs::remove(target);
-    CHECK(col->wait_drift_count(2, std::chrono::seconds(5))); // second <absent> drift proves survival
+    // A drift strictly after the clear edge cannot be a late step-1 straggler.
+    CHECK(col->wait_drift_from(*clear_edge + 1, std::chrono::seconds(5)).has_value());
     g.stop();
     fs::remove_all(base);
 }

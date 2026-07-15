@@ -83,6 +83,21 @@ public:
             eval_exists();
     }
 
+    /// Poll-originated evaluation (idle liveness recheck / degraded re-arm):
+    /// identical repeat verdicts are suppressed so a steady drifted rule does
+    /// not re-emit drift.detected on every poll tick forever (Gate-8 F1 — the
+    /// event-originated paths keep their re-report semantics, which is the
+    /// pre-existing cross-platform contract). Returns true when the eval
+    /// TRANSITIONED compliance state — the caller can treat that as proof the
+    /// event stream missed something and re-arm (Gate-8 F3).
+    bool eval_poll() {
+        poll_eval_ = true;
+        transitioned_ = false;
+        eval_now();
+        poll_eval_ = false;
+        return transitioned_;
+    }
+
     // file-exists: drift when presence != expected.
     void eval_exists() {
         namespace fs = std::filesystem;
@@ -155,7 +170,18 @@ public:
 
 private:
     void report(const std::string& detected, const std::string& expected) {
+        if (last_compliant_ != false)
+            transitioned_ = true; // compliant/unknown → drifted
+        // Poll-originated identical repeat: same verdict as the last emission
+        // with no intervening compliant edge — suppress (Gate-8 F1). A CHANGED
+        // detected/expected value (e.g. a different bad hash) still reports.
+        if (poll_eval_ && last_compliant_ == false && detected == last_detected_ &&
+            expected == last_expected_) {
+            return;
+        }
         last_compliant_ = false; // drifted / can't-verify (reported, possibly collapsed)
+        last_detected_ = detected;
+        last_expected_ = expected;
         const auto now = std::chrono::steady_clock::now();
         if (last_emit_ && (now - *last_emit_) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
             ++suppressed_; // fold into the next post-window emission
@@ -180,7 +206,11 @@ private:
     void report_compliant() {
         if (last_compliant_ == true)
             return;
+        if (last_compliant_ == false)
+            transitioned_ = true; // drifted → compliant (a cleared drift)
         last_compliant_ = true;
+        last_detected_.clear(); // a fresh drift after this edge must re-report
+        last_expected_.clear();
         GuardDrift d;
         d.guard_type = "file";
         d.rule_id = cfg_.rule_id;
@@ -202,6 +232,13 @@ private:
     std::uint64_t suppressed_ = 0;
     // Compliance-edge state: nullopt until the first eval.
     std::optional<bool> last_compliant_;
+    // Poll-eval bookkeeping (Gate-8 F1/F3): the last EMITTED drift verdict (for
+    // identical-repeat suppression during polls) and whether the current eval
+    // flipped compliance state.
+    std::string last_detected_;
+    std::string last_expected_;
+    bool poll_eval_ = false;
+    bool transitioned_ = false;
     // file-hash-equals state.
     std::string baseline_; // captured-on-arm hash when expected_hash is empty
     bool baseline_set_ = false;
@@ -529,7 +566,8 @@ constexpr std::chrono::milliseconds kIdleRecheck{15 * 60 * 1000};
 struct DarwinWake {
     std::mutex m;
     std::condition_variable cv;
-    bool event{false};     // a change touched our target (or was unattributable)
+    bool event{false};     // any wake source below fired (the cv predicate)
+    bool dir_event{false}; // an attributable dir-stream change touched our target
     bool rearm{false};     // unattributable on the dir stream → re-resolve the watch
     bool anc_event{false}; // the ancestor backstop fired (the parent may now exist)
 };
@@ -657,6 +695,9 @@ void FileGuard::run() try {
                 wake->event = true;
                 if (e.must_reconcile)
                     wake->rearm = true;
+                else
+                    wake->dir_event = true; // attributable → must evaluate even if
+                                            // coalesced with an anc hint (G8R-2)
             }
             wake->cv.notify_all();
         },
@@ -715,6 +756,7 @@ void FileGuard::run() try {
     };
 
     bool hash_pending = false; // a change is settling before we (re)hash
+    bool settle_from_poll = false; // the pending settle was poll-initiated (idle recheck)
     std::chrono::steady_clock::time_point settle_first{}; // when the settle window began
 
     spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [resilient, FSEvents]", cfg_.rule_id,
@@ -758,19 +800,36 @@ void FileGuard::run() try {
             if (hash_mode && hash_pending) {
                 hash_pending = false;
                 lk.unlock();
-                ev.eval_hash(); // settle quiesced (or the max-defer cap fired)
+                if (settle_from_poll) {
+                    settle_from_poll = false;
+                    // Poll-initiated settle: identical repeats suppressed; a
+                    // state TRANSITION with no stream event means the stream
+                    // missed it — re-arm (Gate-8 F3 self-heal).
+                    if (ev.eval_poll())
+                        arm_watch();
+                } else {
+                    ev.eval_hash(); // settle quiesced (or the max-defer cap fired)
+                }
                 lk.lock();
             } else if (arm_retry) {
                 lk.unlock();
                 arm_watch(); // degraded re-arm
-                ev.eval_now();
+                ev.eval_poll();
                 lk.lock();
             } else if (idle_recheck) {
                 // Liveness backstop: nothing arrived for kIdleRecheck. Re-read
-                // real state (no stream churn — the stream is presumed alive;
-                // if it silently died, drift is still caught at this cadence).
+                // real state. Identical repeat verdicts are suppressed (F1); in
+                // hash mode the read goes through the settle window first so a
+                // mid-write tick can neither report a torn hash nor baseline
+                // one (F2); a transition with no stream event re-arms (F3).
                 lk.unlock();
-                ev.eval_now();
+                if (hash_mode) {
+                    hash_pending = true;
+                    settle_from_poll = true;
+                    settle_first = std::chrono::steady_clock::now();
+                } else if (ev.eval_poll()) {
+                    arm_watch();
+                }
                 lk.lock();
             }
             continue;
@@ -778,42 +837,42 @@ void FileGuard::run() try {
 
         const bool rearm = wake->rearm;
         const bool anc = wake->anc_event;
+        const bool dir_evt = wake->dir_event;
         wake->event = false;
         wake->rearm = false;
         wake->anc_event = false;
+        wake->dir_event = false;
         lk.unlock();
-        if (anc && !rearm) {
+        bool armed_now = false;
+        if (rearm) {
+            arm_watch(); // unattributable / fault → re-resolve from scratch
+            armed_now = true;
+        } else if (anc) {
             // Ancestor-backstop hint: only meaningful if the parent now exists —
-            // re-arm the dir stream and evaluate. While the parent is still
-            // absent this is volume churn under the ancestor: one stat, no
-            // stream teardown, no eval (nothing under an absent parent can have
-            // changed for our target) — the CH-2 storm damper.
+            // then re-arm the dir stream. While the parent is still absent this
+            // is volume churn under the ancestor: one stat, no stream teardown
+            // (the CH-2 storm damper). A genuine coalesced dir event still
+            // evaluates below via dir_evt (G8R-2).
             std::error_code ec;
             if (fs::is_directory(dir_path, ec)) {
                 arm_watch();
-                if (hash_mode) {
-                    if (!hash_pending) {
-                        hash_pending = true;
-                        settle_first = std::chrono::steady_clock::now();
-                    }
-                } else {
-                    ev.eval_exists();
-                }
+                armed_now = true;
             }
-            lk.lock();
-            continue;
         }
-        if (rearm)
-            arm_watch(); // unattributable / fault → re-resolve from scratch
-        if (hash_mode) {
-            // Defer the (expensive, mid-write-prone) hash to the settle timeout;
-            // each further change restarts the (bounded) settle countdown.
-            if (!hash_pending) {
-                hash_pending = true;
-                settle_first = std::chrono::steady_clock::now();
+        if (dir_evt || armed_now) {
+            if (hash_mode) {
+                // Defer the (expensive, mid-write-prone) hash to the settle
+                // timeout; each further change restarts the (bounded) settle
+                // countdown. An event-driven change supersedes any pending
+                // poll-initiated settle's suppression semantics.
+                if (!hash_pending) {
+                    hash_pending = true;
+                    settle_first = std::chrono::steady_clock::now();
+                }
+                settle_from_poll = false;
+            } else {
+                ev.eval_exists();
             }
-        } else {
-            ev.eval_exists();
         }
         lk.lock();
     }
