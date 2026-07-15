@@ -1,0 +1,266 @@
+#include "guardian_spark_runtime.hpp"
+
+#include "spark_key_rule_index.hpp"
+
+#include <string>
+#include <utility>
+#include <variant>
+
+namespace yuzu::agent {
+
+GuardianSparkRuntime::GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend)
+    : GuardianSparkRuntime(reader, backend, Config{}, RuntimeClock{}) {}
+
+GuardianSparkRuntime::GuardianSparkRuntime(IStateReader& reader, ISparkBackend& backend, Config cfg,
+                                           RuntimeClock clock)
+    : reader_(reader), backend_(backend),
+      clock_(clock ? std::move(clock)
+                   : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
+      index_(std::make_unique<SparkKeyRuleIndex>()), outbox_(cfg.outbox_capacity) {}
+
+GuardianSparkRuntime::~GuardianSparkRuntime() {
+    // No in-flight pass can be running: a pass keeps the runtime alive through the
+    // handler's captured shared_ptr, so ~runtime runs only once nothing references
+    // it. begin_stop() is a defensive idempotent no-op here.
+    begin_stop();
+}
+
+std::function<void(const SparkEvent&)>
+GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
+    // Capture ONLY the shared_ptr: detach-safe. A late/detached dispatch touches
+    // solely runtime-owned state, which this keeps alive.
+    return [rt = std::move(rt)](const SparkEvent& ev) { rt->on_event(ev); };
+}
+
+std::expected<std::uint64_t, std::string>
+GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAssertion assertion,
+                                  bool emit_compliant_edge) {
+    const std::string key = spark_key(spec);
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    if (stopping_)
+        return std::unexpected(std::string{"stopping"});
+
+    // Fresh generation: drop any prior mapping for this rule first (rung 7's
+    // reconcile is what preserves eval state across an identical re-push).
+    detach_rule_locked(rule_id);
+
+    const std::uint64_t gen = ++gen_counter_;
+    auto rg = std::make_shared<RuleGeneration>();
+    rg->generation = gen;
+    rg->active = true;
+    rg->emit_compliant_edge = emit_compliant_edge;
+    rg->assertion = std::move(assertion);
+    rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
+
+    const bool arm_edge = index_->add(key, rule_id);
+    std::shared_ptr<PerKey> pk;
+    if (arm_edge) {
+        auto armed = backend_.arm(spec);
+        if (!armed) {
+            index_->remove_rule(rule_id); // undo: an un-armed key must not linger
+            return std::unexpected(armed.error());
+        }
+        pk = std::make_shared<PerKey>();
+        pk->spec = spec;
+        pk->subscription = *armed;
+        keys_.emplace(key, pk);
+    } else {
+        pk = keys_.at(key); // an existing shared watcher for this key
+    }
+
+    rules_.insert_or_assign(rule_id, std::move(rg));
+    pk->pending_initial.insert(rule_id);
+    ++pk->pending_epoch;
+    return gen;
+}
+
+void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    detach_rule_locked(rule_id);
+}
+
+void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
+    const auto rit = rules_.find(rule_id);
+    const bool known = (rit != rules_.end());
+    const auto key_opt = index_->key_for_rule(rule_id); // capture BEFORE removal
+    if (known)
+        rit->second->active = false; // in-flight evals will not commit
+    const auto disarm_key = index_->remove_rule(rule_id);
+    if (known)
+        rules_.erase(rule_id);
+    {
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        outbox_.drop_rule(rule_id);
+    }
+    if (disarm_key) {
+        const auto kit = keys_.find(*disarm_key);
+        if (kit != keys_.end()) {
+            backend_.disarm(kit->second->subscription);
+            keys_.erase(kit); // the in-flight pass (if any) holds its own shared_ptr; safe
+        }
+    } else if (key_opt) {
+        const auto kit = keys_.find(*key_opt);
+        if (kit != keys_.end())
+            kit->second->pending_initial.erase(rule_id);
+    }
+}
+
+void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
+    // The event is an invalidation HINT; evaluate_key re-reads live state.
+    evaluate_key(ev.key, EvalReason::Event);
+}
+
+void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*reason*/) {
+    std::shared_ptr<PerKey> pk;
+    SparkSpec spec;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end())
+            return;
+        pk = kit->second;
+        spec = pk->spec;
+    }
+
+    // Serialise the whole pass (read + fan-out + commit) for THIS key, so read
+    // order == commit order and the freshest read commits last (no backward
+    // compliance). Per-key, so sibling keys run concurrently.
+    std::lock_guard<std::mutex> eval_lk{pk->eval_mu};
+
+    // The one blocking I/O, OUTSIDE registry_mu_. Every event is a hint: re-read
+    // live state rather than trust a queued payload.
+    ReadResult<FileSnapshot> file_read;
+    RegistryRead reg_read;
+    ReadResult<ServiceRunState> svc_read;
+    const bool is_file = spec.type == SparkType::File;
+    const bool is_reg = spec.type == SparkType::Registry;
+    const bool is_svc = spec.type == SparkType::Service;
+    if (is_file)
+        file_read = reader_.read_file(std::get<FileSparkParams>(spec.params));
+    else if (is_reg)
+        reg_read = reader_.read_registry(std::get<RegistrySparkParams>(spec.params));
+    else if (is_svc)
+        svc_read = reader_.read_service(std::get<ServiceSparkParams>(spec.params));
+    else
+        return; // non-event-driven type is never armed here
+
+    const auto now = clock_();
+
+    // Commit section: IO-free, under registry_mu_ so a concurrent detach cannot
+    // interleave between the eval and the enqueue (which would re-add a purged
+    // entry). Re-snapshot active generations post-I/O (a rule may have joined,
+    // left, or been superseded during the read).
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    if (stopping_)
+        return;
+    const auto kit = keys_.find(key);
+    if (kit == keys_.end() || kit->second.get() != pk.get())
+        return; // key withdrawn or re-armed under a new PerKey during the read
+
+    for (const std::string& rid : index_->rules_for(key)) {
+        const auto rrit = rules_.find(rid);
+        if (rrit == rules_.end())
+            continue;
+        RuleGeneration& gen = *rrit->second;
+        if (!gen.active)
+            continue;
+
+        // copy-eval-enqueue-commit: eval mutates a COPY; commit only if what we
+        // needed to buffer was accepted, else leave the eval pending for retry.
+        RuleEvalState scratch = gen.eval;
+        const EvalOutcome out =
+            eval_rule(spec, gen.assertion, scratch, now, gen.emit_compliant_edge,
+                      is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
+                      is_svc ? &svc_read : nullptr);
+
+        bool accepted = true;
+        if (out.status != EvalStatus::Silent)
+            enqueue_outcome(gen, out, now, accepted);
+        if (!accepted)
+            continue; // outbox full: eval stays pending, convergence retries
+
+        gen.eval = std::move(scratch); // COMMIT
+        // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
+        // Unknown does not (it still owes a real verdict).
+        if (out.status != EvalStatus::Unhealthy)
+            pk->pending_initial.erase(rid);
+    }
+}
+
+EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const RuleAssertion& a,
+                                            RuleEvalState& state,
+                                            std::chrono::steady_clock::time_point now, bool edge,
+                                            const ReadResult<FileSnapshot>* file,
+                                            const RegistryRead* reg,
+                                            const ReadResult<ServiceRunState>* svc) {
+    if (file)
+        return eval_file(a, *file, state, now, edge);
+    if (reg)
+        return eval_registry(a, reg->result, state, reg->latency_us, now, edge);
+    if (svc)
+        return eval_service(a, *svc, state, now, edge);
+    return EvalOutcome{}; // Silent (unreachable for an armed event-driven key)
+}
+
+void GuardianSparkRuntime::enqueue_outcome(const RuleGeneration& gen, const EvalOutcome& out,
+                                           std::chrono::steady_clock::time_point now,
+                                           bool& accepted) {
+    const std::int64_t ns = now.time_since_epoch().count();
+    const std::string eid = next_event_id(gen.assertion.rule_id);
+    OutboxEntry e = (out.status == EvalStatus::Emit)
+                        ? OutboxEntry::compliance(gen.assertion.rule_id, gen.generation, eid, ns,
+                                                  out.drift)
+                        : OutboxEntry::health(gen.assertion.rule_id, gen.generation, eid, ns,
+                                              /*healthy=*/false, out.health_detail);
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    accepted = outbox_.enqueue(std::move(e));
+}
+
+std::string GuardianSparkRuntime::next_event_id(const std::string& rule_id) {
+    // registry_mu_ is held by the caller; event_seq_ is guarded by it.
+    return rule_id + ":" + std::to_string(++event_seq_);
+}
+
+std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.drain(send);
+}
+
+void GuardianSparkRuntime::begin_stop() {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    stopping_ = true;
+    for (auto& [rid, rg] : rules_)
+        rg->active = false;
+}
+
+std::size_t GuardianSparkRuntime::armed_key_count() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return keys_.size();
+}
+std::size_t GuardianSparkRuntime::rule_count() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return rules_.size();
+}
+std::size_t GuardianSparkRuntime::outbox_size() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.size();
+}
+std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.backpressure_drops();
+}
+std::vector<std::string> GuardianSparkRuntime::pending_initial(const std::string& key) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto kit = keys_.find(key);
+    if (kit == keys_.end())
+        return {};
+    return {kit->second->pending_initial.begin(), kit->second->pending_initial.end()};
+}
+bool GuardianSparkRuntime::stopping() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return stopping_;
+}
+
+} // namespace yuzu::agent
