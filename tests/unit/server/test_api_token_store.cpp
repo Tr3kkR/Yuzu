@@ -4,6 +4,8 @@
 
 #include "api_token_store.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -15,22 +17,14 @@ using namespace yuzu::server;
 
 namespace {
 
-// Per-instance unique path so tests are safe to run under parallel
-// meson test --num-processes N. The prior hardcoded path collided
-// between concurrent test cases.
-struct TempDb {
-    std::filesystem::path path;
-    TempDb()
-        : path(std::filesystem::temp_directory_path() /
-               ("test_api_tokens-" +
-                std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-                               static_cast<size_t>(std::chrono::steady_clock::now()
-                                                       .time_since_epoch()
-                                                       .count())) +
-                ".db")) {
-        std::filesystem::remove(path);
-    }
-    ~TempDb() { std::filesystem::remove(path); }
+// Per-test SQLite temp file. yuzu::test::TempDbFile carries the collision-safe
+// naming (process salt + atomic counter) and -wal/-shm cleanup. The previous
+// fixture salted with std::hash<std::thread::id> ^ steady_clock — the exact
+// formula behind flake #473 (constant thread-id hash under single-threaded
+// Catch2; coarse MSVC steady_clock under Defender I/O serialisation), and a
+// cross-JOB hazard on the shared-identity CI pools (#1883).
+struct TempDb : yuzu::test::TempDbFile {
+    TempDb() : TempDbFile("yuzu_test_api_tokens-") {}
 };
 
 } // namespace

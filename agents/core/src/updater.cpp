@@ -65,9 +65,20 @@ namespace pb = ::yuzu::agent::v1;
 // the slot before `ctx` is destroyed (declared after `ctx`, so destroyed
 // first). stop() reads the slot and TryCancel()s the context, unblocking a
 // stalled OTA call so a shutdown can't hang the update-thread join (#1434
-// UP-1). The residual store/cancel/destroy window matches the long-standing
-// AgentImpl::heartbeat_ctx_ pattern; gRPC TryCancel on a completed RPC is a
-// documented no-op.
+// UP-1). gRPC TryCancel on a completed RPC is a documented no-op.
+//
+// PUBLISH AND RETRACT UNDER `mu` — the RAII was never the hard part. An earlier version of
+// this comment said the store/cancel/destroy window "matches the long-standing
+// AgentImpl::heartbeat_ctx_ pattern". It did, and that pattern was a USE-AFTER-FREE: `ctx` is
+// a STACK object in the update thread's frame, stop() TryCancel()s it from ANOTHER thread, and
+// with no lock the owner could retract, pop the frame and be joined while stop() sat between
+// its load() and its TryCancel(). Reachable on every TRANSIENT RECONNECT, not just shutdown —
+// AgentImpl's reconnect teardown calls updater_->stop() and then joins update_thread_.
+//
+// The same defect was fixed three times over in AgentImpl (CtxSlot + cancel_ctx, governance
+// Gate-8 rounds 7-8) and this eighth site was MISSED, because the "grep proves no bare sites
+// remain" check was run over agent.cpp alone. Hence the mutex here, and hence stop() takes it
+// too. (governance Gate-8 round 8 cpp-safety.)
 struct ActiveRpcCtxGuard {
     // The slot type-erases a grpc::ClientContext* as void* so the public
     // updater.hpp need not pull in grpc headers. stop() static_casts it back to
@@ -78,11 +89,23 @@ struct ActiveRpcCtxGuard {
     // and trips only on a hypothetical non-flat-pointer ABI.
     static_assert(sizeof(void*) == sizeof(grpc::ClientContext*),
                   "void* slot cannot round-trip a grpc::ClientContext*");
+    std::mutex& mu;
     std::atomic<void*>& slot;
-    ActiveRpcCtxGuard(std::atomic<void*>& s, grpc::ClientContext& ctx) : slot(s) {
+    ActiveRpcCtxGuard(std::mutex& m, std::atomic<void*>& s, grpc::ClientContext& ctx)
+        : mu(m), slot(s) {
+        std::lock_guard lk(mu);
         slot.store(&ctx, std::memory_order_release);
     }
-    ~ActiveRpcCtxGuard() { slot.store(nullptr, std::memory_order_release); }
+    ~ActiveRpcCtxGuard() {
+        // Retract under the lock: an in-flight Updater::stop() holding `mu` across its
+        // load+TryCancel blocks us here until the cancel returns, so `ctx` cannot be destroyed
+        // out from under it.
+        std::lock_guard lk(mu);
+        slot.store(nullptr, std::memory_order_release);
+    }
+    // The lock is held only inside the ctor/dtor BODIES, never for the guard's lifetime —
+    // the blocking RPC runs with it released. (Mirrors AgentImpl::CtxSlot; holding it across
+    // the RPC would deadlock stop() for the whole of a stalled download.)
     ActiveRpcCtxGuard(const ActiveRpcCtxGuard&) = delete;
     ActiveRpcCtxGuard& operator=(const ActiveRpcCtxGuard&) = delete;
 };
@@ -311,6 +334,14 @@ void Updater::stop() noexcept {
     // so a sick-but-not-dead server that withholds a chunk would otherwise park
     // reader->Read() / CheckForUpdate() indefinitely and hang the update-thread
     // join during shutdown (#1434 UP-1). TryCancel aborts the blocking call.
+    //
+    // Load AND cancel under ctx_mu_ — see the member note in updater.hpp. `ctx` is a STACK
+    // object owned by the update thread and this runs on another thread; releasing the lock
+    // between the load and the TryCancel would let the owner retract it, leave scope and be
+    // joined, cancelling freed memory. The lock is released before the caller's
+    // update_thread_.join() (never hold it across a join — the update thread needs it to
+    // retract). (governance Gate-8 round 8 cpp-safety.)
+    std::lock_guard lk(ctx_mu_);
     if (void* p = active_rpc_ctx_.load(std::memory_order_acquire))
         static_cast<grpc::ClientContext*>(p)->TryCancel();
 }
@@ -346,7 +377,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     {
         // Publish check_ctx for the blocking unary call; cleared on block exit
         // (before check_ctx is destroyed) so stop() never cancels a stale ctx.
-        ActiveRpcCtxGuard ctx_guard{active_rpc_ctx_, check_ctx};
+        ActiveRpcCtxGuard ctx_guard{ctx_mu_, active_rpc_ctx_, check_ctx};
         check_status = stub->CheckForUpdate(&check_ctx, check_req, &check_resp);
     }
 
@@ -525,7 +556,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     // so it is destroyed first on ANY exit from here — including every
     // cleanup_and_fail early return inside the loop — clearing the slot before
     // dl_ctx dies. stop() TryCancels this to abort a stalled reader->Read().
-    ActiveRpcCtxGuard dl_guard{active_rpc_ctx_, dl_ctx};
+    ActiveRpcCtxGuard dl_guard{ctx_mu_, active_rpc_ctx_, dl_ctx};
 
     // Cleanup helper: on Windows the path-based fs::remove fails with
     // ERROR_SHARING_VIOLATION while h_guard holds the file with dwShareMode=0,

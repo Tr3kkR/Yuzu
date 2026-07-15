@@ -987,6 +987,26 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
             spdlog::error("AuthDB update_role failed for '{}'", username);
             return false;
         }
+
+        // In-memory cache/session cleanup is a best-effort side effect only —
+        // it must NOT gate the return value. On a cold-booted server users_
+        // may never have been warmed for this username even though the DB row
+        // existed and was just updated; returning the cache-lookup result in
+        // that case falsely reports failure (e.g. an unaudited SCIM role
+        // recompute after restart). The DB write is authoritative — same
+        // pattern as remove_user.
+        std::unique_lock lock(mu_);
+        auto it = users_.find(username);
+        if (it != users_.end()) {
+            it->second.role = new_role;
+        }
+
+        // Invalidate sessions so the user picks up the new role on next login
+        // Prevents stale session role from granting old privileges
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+
+        return true;
     }
 
     std::unique_lock lock(mu_);
@@ -1000,10 +1020,8 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
     // Prevents stale session role from granting old privileges
     std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
 
-    if (!auth_db_) {
-        lock.unlock();
-        save_config();
-    }
+    lock.unlock();
+    save_config();
 
     return true;
 }

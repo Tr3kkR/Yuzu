@@ -46,9 +46,10 @@ namespace {
 
 // Delegates to the shared salt + atomic counter helper (#482). The prior
 // thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to.
+// #473 traced back to. yuzu_test_ prepended so files land inside the Wee Tam
+// Defender exclusion wildcard yuzu_* (K1/CX1 on the #1883 sweep).
 static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
+    return yuzu::test::unique_temp_path("yuzu_test_" + prefix + "-");
 }
 
 struct AuditRecord {
@@ -61,8 +62,15 @@ struct AuditRecord {
 struct RestTokensHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path db_path;
-    fs::path device_db_path;
+    // TempDbFile members sit ABOVE the store unique_ptrs (reverse-order
+    // destruction closes each store before its file + -wal/-shm are removed)
+    // and replace the old manual dtor, which never removed the WAL/SHM
+    // companions (both stores run journal_mode=WAL) and never ran at all if
+    // a ctor REQUIRE threw (#486 / qe-B1). db_file is initialised in the
+    // ctor: the broken_token_db arm adopts a path under a missing parent dir
+    // via the adopt-a-path ctor (removal is then a harmless no-op).
+    yuzu::test::TempDbFile db_file;
+    yuzu::test::TempDbFile device_db_file{"yuzu_test_rest_api_device_tokens-"};
     std::unique_ptr<ApiTokenStore> token_store;
     std::unique_ptr<DeviceTokenStore> device_token_store;
 
@@ -92,14 +100,11 @@ struct RestTokensHarness {
     /// directory does not exist, so sqlite3_open fails and db_ stays null —
     /// the #347 CH-3 injection (storage down, routes still registered).
     explicit RestTokensHarness(bool broken_token_db = false)
-        : db_path(broken_token_db
+        : db_file(broken_token_db
                       ? unique_temp_path("rest-api-tokens") / "missing-dir" / "tokens.db"
-                      : unique_temp_path("rest-api-tokens")),
-          device_db_path(unique_temp_path("rest-api-device-tokens")) {
-        fs::remove(db_path);
-        fs::remove(device_db_path);
-        token_store = std::make_unique<ApiTokenStore>(db_path);
-        device_token_store = std::make_unique<DeviceTokenStore>(device_db_path);
+                      : unique_temp_path("rest-api-tokens")) {
+        token_store = std::make_unique<ApiTokenStore>(db_file.path);
+        device_token_store = std::make_unique<DeviceTokenStore>(device_db_file.path);
         if (broken_token_db)
             REQUIRE_FALSE(token_store->is_open());
         else
@@ -163,13 +168,6 @@ struct RestTokensHarness {
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
                             /*metrics_registry=*/&metrics);
-    }
-
-    ~RestTokensHarness() {
-        token_store.reset();
-        device_token_store.reset();
-        fs::remove(db_path);
-        fs::remove(device_db_path);
     }
 
     std::string create_token_for(const std::string& owner, const std::string& name) {
@@ -414,17 +412,19 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
     // expected fields. Any divergence between this row and the one the
     // handler emits would be caught by the source-level edit pattern in
     // the same commit.
-    auto audit_db = unique_temp_path("rest-api-audit");
-    fs::remove(audit_db);
-    auto token_db = unique_temp_path("rest-api-csprng-store");
-    fs::remove(token_db);
+    // TempDbFile guards declared before the inner scope: the stores close on
+    // scope exit (even via a failing REQUIRE unwinding), then the guards
+    // remove the files — the old trailing fs::remove pair leaked both DBs on
+    // any assertion failure (#486).
+    yuzu::test::TempDbFile audit_db{"yuzu_test_rest_api_audit-"};
+    yuzu::test::TempDbFile token_db{"yuzu_test_rest_api_csprng_store-"};
 
     {
-        AuditStore audit_store(audit_db, /*retention_days=*/365,
+        AuditStore audit_store(audit_db.path, /*retention_days=*/365,
                                /*cleanup_interval_min=*/0);
         REQUIRE(audit_store.is_open());
 
-        ApiTokenStore token_store(token_db);
+        ApiTokenStore token_store(token_db.path);
         REQUIRE(token_store.is_open());
 
         // Force CSPRNG failure on the next fill_random call (the one inside
@@ -460,9 +460,6 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
         // surfaces the security-relevant failure for SRE paging.
         CHECK(audit_store.events_written("failure") == 1);
     }
-
-    fs::remove(audit_db);
-    fs::remove(token_db);
 }
 
 TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard)",

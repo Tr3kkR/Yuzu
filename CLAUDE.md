@@ -221,7 +221,7 @@ Working on Guardian / Guaranteed State? **Read `docs/yuzu-guardian-design-v1.1.m
 
 ## Test conventions — shared helpers
 
-Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp` for any test temp file or SQLite DB. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation (flake #473; #482).
+Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::test::TempDir` from `tests/unit/test_helpers.hpp` for any test temp file, SQLite DB, or scratch dir. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation (flake #473; #482). Pass a **`yuzu_test_` (underscore) prefix** so names land inside the Wee Tam Defender path-exclusion wildcard `yuzu_*` (`scripts/windows-runner-defender-exclusions.ps1`) — the helpers' default `yuzu-test-` (hyphen) prefix does NOT match it; all three helpers take an explicit prefix for exactly this.
 
 **Standing invariant:** both self-hosted CI pools run 4 runner agents as ONE shared OS identity on ONE box — Windows "Wee Tam" (LOCAL SYSTEM, `deploy/windows/README.md`), Linux "Big Tam" (`runner` user sharing `$HOME`, `docs/ci-architecture.md`). A fixed registry key/port/named-object/path is a cross-JOB shared resource — two concurrent CI jobs on one box collide (#1871's `RegistryGuard` family; same bug on Linux gateway eunit `health_port`). Salt every such identifier per-test/per-process like `unique_temp_path()` — see `test_guard_registry.cpp`'s `TempRegKey`/`TempEnforceKey`.
 

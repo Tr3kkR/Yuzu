@@ -57,6 +57,19 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   then PATH/glob — it no longer assumes Shulgi's `C:\Erlang` junction or the
   Chocolatey rebar3 path. A box that sets those env vars builds the gateway with
   no filesystem fakery.
+- **Per-agent PostgreSQL (#2094).** Provisioning creates **one cluster per
+  runner agent**: agent 0's winget-installed service on `:5433`, plus an
+  initdb'd cluster + service `postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`
+  (data under `D:\ci\pg\agent-<n>`, run as NETWORK SERVICE like agent 0) for
+  each further agent. The machine-level `YUZU_TEST_POSTGRES_DSN` stays the
+  **agent-0** DSN; `scripts/ci/ensure-postgres.sh` derives "base port + agent
+  index" from the runner's `-<n>` name suffix at job time and probes before
+  switching, falling back to the shared agent-0 cluster with a `::warning` if
+  a per-agent cluster is missing. Rationale: 4 concurrent jobs sharing one
+  cluster mutually DoS their `[pg]` server suites through the shared
+  WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
+  wrapper change is involved — re-running the provisioning script is the whole
+  cutover.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
