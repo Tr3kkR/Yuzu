@@ -3,12 +3,31 @@
 #include "spark_key_rule_index.hpp"
 
 #include <algorithm>
+#include <random>
 #include <set>
 #include <string>
 #include <utility>
 #include <variant>
 
 namespace yuzu::agent {
+
+namespace {
+/// A random 64-bit hex token fixed once per runtime construction. Folded into
+/// every event_id so a restart (which resets event_seq_ and can revisit a wall_ms)
+/// cannot reproduce a prior id and have the server's event_id PK drop it.
+std::string make_boot_nonce() {
+    std::random_device rd;
+    const std::uint64_t n = (static_cast<std::uint64_t>(rd()) << 32) | rd();
+    static const char* d = "0123456789abcdef";
+    std::string s(16, '0');
+    std::uint64_t v = n;
+    for (int i = 15; i >= 0; --i) {
+        s[static_cast<std::size_t>(i)] = d[v & 0xF];
+        v >>= 4;
+    }
+    return s;
+}
+} // namespace
 
 GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                                            std::shared_ptr<ISparkBackend> backend)
@@ -20,7 +39,7 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
     : reader_(std::move(reader)), backend_(std::move(backend)),
       clock_(clock ? std::move(clock)
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
-      index_(std::make_unique<SparkKeyRuleIndex>()),
+      boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
 
 GuardianSparkRuntime::~GuardianSparkRuntime() {
@@ -282,8 +301,9 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
 
 std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std::int64_t wall_ms) {
     // registry_mu_ is held by the caller; event_seq_ + agent_id_fn_ are guarded by it.
+    // boot_nonce_ makes the id restart-unique (wall_ms + seq alone are not).
     const std::string agent = agent_id_fn_ ? agent_id_fn_() : std::string{};
-    return agent + "-" + rule_id + "-" + std::to_string(wall_ms) + "-" +
+    return agent + "-" + boot_nonce_ + "-" + rule_id + "-" + std::to_string(wall_ms) + "-" +
            std::to_string(++event_seq_);
 }
 

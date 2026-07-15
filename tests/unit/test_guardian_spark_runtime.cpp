@@ -522,6 +522,23 @@ TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spa
     REQUIRE(eB[0].event_id != e1[0].event_id); // cross-agent distinct
 }
 
+TEST_CASE("a per-boot nonce disambiguates event ids across runtime instances", "[spark][runtime]") {
+    // Two runtimes with the SAME agent id (i.e. a restart) still mint different ids
+    // for the same rule + observation, because each has its own random boot nonce -
+    // so a restart cannot reproduce a prior id and have the server's PK drop it.
+    const auto make_id = [] {
+        auto r = std::make_shared<FakeReader>();
+        auto b = std::make_shared<FakeBackend>();
+        auto rt = make_rt(r, b);
+        rt->set_agent_id_provider([] { return std::string{"agentA"}; });
+        const auto key = spark_key(file_spec("/a"));
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        rt->evaluate_key(key, EvalReason::Initial);
+        return drain_all(*rt).at(0).event_id;
+    };
+    REQUIRE(make_id() != make_id());
+}
+
 TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)",
           "[spark][runtime][tsan]") {
     auto r = std::make_shared<FakeReader>(); // `file` is not rewritten during this test

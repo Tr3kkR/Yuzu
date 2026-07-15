@@ -282,6 +282,8 @@ private:
     RuntimeClock clock_;
     std::uint64_t gen_counter_{0};   ///< registry_mu_-guarded monotonic generation source
     std::uint64_t event_seq_{0};     ///< registry_mu_-guarded event_id source
+    std::string boot_nonce_;         ///< random, fixed at construction; disambiguates event_ids across
+                                     ///< process restarts (wall_ms + seq alone are not restart-unique)
 
     mutable std::mutex registry_mu_;
     bool stopping_{false};
