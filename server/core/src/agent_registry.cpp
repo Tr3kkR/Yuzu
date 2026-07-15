@@ -1609,10 +1609,19 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // proving the engine runs at rest. The DEX sibling already reports
             // enabled-but-deaf as `dex_observer_armed=0` rather than going quiet.
             // (governance Gate-4 consistency + UP-10.)
-            if (get_view(kKeySparkDisabled) == "1")
+            // Strict split: a non-conforming spark_disabled value (e.g. "01"/"true" from a
+            // forked build) is Unknown → counted in NEITHER bucket, so it can never fabricate
+            // a FAILED alert. Same forged-value posture as parse_spark_running (Gate-4 UP-3).
+            switch (parse_spark_disabled(get_view(kKeySparkDisabled))) {
+            case SparkDisabledState::Disabled:
                 ++spark_disabled_os[net_os];
-            else
+                break;
+            case SparkDisabledState::NotDisabled:
                 ++spark_failed_os[net_os];
+                break;
+            case SparkDisabledState::Unknown:
+                break; // garbage discriminator — page on neither
+            }
         }
     }
 

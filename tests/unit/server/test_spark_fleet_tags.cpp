@@ -259,3 +259,28 @@ TEST_CASE("parse_spark_running is STRICT — only the exact tokens mean anything
         CHECK(parse_spark_running(garbage) == SparkRunState::NotReported);
     }
 }
+
+TEST_CASE("parse_spark_disabled is STRICT — a garbage discriminator pages on neither bucket",
+          "[spark][fleet]") {
+    // Governance Gate-4 UP-3. Once spark_running parses as NotRunning, the DISABLED vs FAILED
+    // split used to be a bare `spark_disabled == "1" ? disabled : failed`, so a buggy/forked
+    // agent emitting `spark_disabled="01"`/`"true"` while genuinely opted-out landed in
+    // yuzu_fleet_spark_failed{os} — the ONE gauge with an active alert. Same forged-value
+    // class parse_spark_running was hardened against, one level down.
+    using detail::parse_spark_disabled;
+    using detail::SparkDisabledState;
+
+    // The two conforming inputs: DISABLED emits "1"; FAILED omits the key entirely (empty view).
+    CHECK(parse_spark_disabled("1") == SparkDisabledState::Disabled);
+    CHECK(parse_spark_disabled("") == SparkDisabledState::NotDisabled);
+    // "0" is accepted as an explicit not-disabled for symmetry, though the writer never emits it.
+    CHECK(parse_spark_disabled("0") == SparkDisabledState::NotDisabled);
+
+    // Everything else is Unknown — counted in NEITHER bucket, so it can never fabricate a
+    // FAILED alert (nor a phantom DISABLED that would hide a real boot failure).
+    for (const char* garbage : {" ", "01", " 1", "1 ", "2", "true", "TRUE", "yes", "x", "-1",
+                                "1.0", "00", "disabled"}) {
+        INFO("value: '" << garbage << "'");
+        CHECK(parse_spark_disabled(garbage) == SparkDisabledState::Unknown);
+    }
+}

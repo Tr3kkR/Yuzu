@@ -311,11 +311,19 @@ public:
             const sd::SparkRunState state = sd::parse_spark_running(get(sd::kSparkTagRunning));
             if (state == sd::SparkRunState::NotRunning) {
                 // The DISABLED vs FAILED split — a deliberate opt-out must never be
-                // confused with an engine that threw at boot.
-                if (get(sd::kSparkTagDisabled) == "1")
+                // confused with an engine that threw at boot. STRICT (Gate-4 UP-3): a
+                // non-conforming discriminator is Unknown → neither bucket, mirroring the
+                // shipped store so this model does not drift.
+                switch (sd::parse_spark_disabled(get(sd::kSparkTagDisabled))) {
+                case sd::SparkDisabledState::Disabled:
                     ++disabled[os];
-                else
+                    break;
+                case sd::SparkDisabledState::NotDisabled:
                     ++failed[os];
+                    break;
+                case sd::SparkDisabledState::Unknown:
+                    break;
+                }
                 continue;
             }
             if (state != sd::SparkRunState::Running)
@@ -827,4 +835,46 @@ TEST_CASE("REAL AgentHealthStore: the four spark postures reach the shipped gaug
     // never-seen OS must not be seeded at 0 (the absent-not-zero convention).
     CHECK(out.find("yuzu_fleet_spark_reporting{os=\"windows\"}") == std::string::npos);
     CHECK(out.find("yuzu_fleet_spark_failed{os=\"windows\"}") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a garbage spark_disabled value pages on neither bucket",
+          "[spark][rollup][real]") {
+    // Governance Gate-4 UP-3. spark_running parses NotRunning (strict "0"), but the DISABLED
+    // vs FAILED discriminator used to be a bare `spark_disabled == "1" ? disabled : failed`,
+    // so an opted-out agent whose forked build emits `spark_disabled="01"`/`"true"` was bucketed
+    // FAILED — the ONE gauge with an active alert. parse_spark_disabled now treats any non-
+    // conforming discriminator as Unknown → NEITHER bucket. Driven through the SHIPPED store.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "windows";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Five opted-out agents with a NON-conforming disabled value — must count in neither bucket.
+    beat("g1", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", "01"}});
+    beat("g2", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", "true"}});
+    beat("g3", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", " 1"}});
+    beat("g4", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", "2"}});
+    beat("g5", {{"yuzu.spark_running", "0"}, {"yuzu.spark_disabled", "yes"}});
+    // ...and one genuinely failed agent (no disabled key), to prove the gauge still works.
+    beat("real", {{"yuzu.spark_running", "0"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+
+    // Exactly ONE failure — the real one. The five garbage discriminators page on NOTHING.
+    CHECK(val("yuzu_fleet_spark_failed{os=\"windows\"} ") == 1.0);
+    CHECK(out.find("yuzu_fleet_spark_disabled{os=\"windows\"}") == std::string::npos);
 }

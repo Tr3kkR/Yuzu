@@ -190,14 +190,14 @@ public:
                          r < 0 ? err_str(-r) : std::string("no bus"));
             if (bus)
                 sd_bus_unref(bus);
-            inert_ = true;
+            inert_.store(true, std::memory_order_release);
             started_ = true; // "started" so watch() reaches the inert_ rejection, not "not started"
             return;
         }
         int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         if (efd < 0) {
             sd_bus_unref(bus);
-            inert_ = true;
+            inert_.store(true, std::memory_order_release);
             started_ = true;
             return;
         }
@@ -307,7 +307,7 @@ public:
         std::lock_guard lk(mu_);
         emit_ = nullptr;
         fault_ = nullptr;
-        inert_ = false;
+        inert_.store(false, std::memory_order_release);
         pending_.clear();
     }
 
@@ -783,7 +783,7 @@ private:
     /// them. Held across the join; mu_ is NOT (the poll thread needs it).
     /// LOCK ORDER: teardown_mu_ → mu_. Never the reverse.
     std::mutex teardown_mu_;
-    std::mutex mu_;                    ///< guards ONLY pending_ + the start/stop/inert flags
+    std::mutex mu_;                    ///< guards ONLY pending_, emit_/fault_, and started_ (inert_ is atomic)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
     std::deque<Cmd> pending_;
@@ -1430,7 +1430,7 @@ private:
             teardown_watch(*wp);
     }
 
-    std::mutex mu_; ///< guards ONLY pending_ + the start/stop/scm_ok_ flags
+    std::mutex mu_; ///< guards ONLY pending_ + the start/stop flags (scm_ok_ is atomic)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
     std::deque<Cmd> pending_;

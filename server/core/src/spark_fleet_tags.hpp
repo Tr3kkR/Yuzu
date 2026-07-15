@@ -193,6 +193,35 @@ inline SparkRunState parse_spark_running(std::string_view s) {
     return SparkRunState::NotReported;
 }
 
+/// Once `spark_running` parsed as NotRunning, this splits the deliberate opt-out
+/// (DISABLED) from a boot failure (FAILED). It is the SAME forged-value class
+/// parse_spark_running was hardened against, one level down: the discriminator used to be
+/// a bare `spark_disabled == "1" ? disabled : failed`, so a buggy/forked agent that emitted
+/// `spark_disabled="01"`/`"true"`/`"2"` while genuinely opted-out landed in
+/// `yuzu_fleet_spark_failed{os}` — the ONE gauge with an active alert. A single misbehaving
+/// agent could page on-call. (governance Gate-4 UP-3.)
+///
+/// The writer contract (spark_heartbeat.hpp emit_spark_absent_tags): DISABLED emits
+/// `spark_disabled="1"`; FAILED emits the key NOT AT ALL. So "1" is the only Disabled token,
+/// and an ABSENT key (empty view) is the conforming FAILED posture. "0" is accepted as an
+/// explicit not-disabled for symmetry with parse_spark_running's two-token strictness even
+/// though the writer never emits it. Every OTHER value is Unknown → the caller counts it in
+/// NEITHER bucket, so garbage never fabricates a FAILED alert (mirrors parse_spark_running's
+/// "garbage → contribute to nothing").
+enum class SparkDisabledState {
+    Disabled,    ///< exactly "1" — the deliberate --spark-disable opt-out
+    NotDisabled, ///< absent (conforming FAILED) or exactly "0"
+    Unknown,     ///< any other value — count in neither bucket, never page
+};
+
+inline SparkDisabledState parse_spark_disabled(std::string_view s) {
+    if (s == "1")
+        return SparkDisabledState::Disabled;
+    if (s.empty() || s == "0")
+        return SparkDisabledState::NotDisabled;
+    return SparkDisabledState::Unknown;
+}
+
 /// Forged-value-safe parse of an agent-supplied spark COUNT (a non-negative
 /// integer tag). Full-token parse only; empty / garbage / negative / overflow →
 /// nullopt (the caller treats nullopt as "did not report", never 0).
