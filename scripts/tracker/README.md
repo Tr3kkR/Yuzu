@@ -30,11 +30,18 @@ until the list lands; recover skipped ranges by re-running those runs.
 
 - **Find BEFORE/AFTER for a past run:** the close step's `env:` block in that
   run's log, or the alert issue's **Range** line.
-- **Exit codes:** 1 = leaks found (leak scan) · 2 = backfill authorization
-  missing (`--yes-i-reviewed`/`--plan`/`--approval-url`) · 3 = fail-closed
-  (never-close list missing/unparseable, API error, truncated range) ·
-  4 = safety assertion (security-labelled issue in a mutating action, or
+- **Exit codes (`close_linked_issues.py`):** 1 = leaks found (leak scan) ·
+  2 = backfill authorization missing (`--yes-i-reviewed`/`--plan`/`--approval-url`) ·
+  3 = fail-closed (never-close list missing/unparseable, API error, truncated
+  range) · 4 = safety assertion (security-labelled issue in a mutating action, or
   backfill plan drift) — always zero mutations.
+- **Exit codes (`apply_decisions.py`):** same meta-contract — 2 = `--execute`
+  without a matching prior-dry-run `--snapshot` · 3 = fail-closed (bad decisions
+  file, unreadable never-close list) · 4 = an R1–R7 refusal, snapshot drift, a
+  bot-context `--execute`, or a per-issue TOCTOU abort. Zero mutations on 3/4,
+  **except** the one per-issue TOCTOU abort, which can leave earlier closes in
+  the batch — reverse them with `apply_decisions.py --revert <run-id> --execute`
+  (the ledger names the batch).
 - **Wrong close, single issue:** reopen + add `do-not-close` label (automation
   never touches it again). **Wrong batch:** `--undo-push BEFORE AFTER`
   (marker-verified, reopens only what this automation closed). Note undo can
@@ -77,12 +84,14 @@ Local run:
 python scripts/tracker/tracker_report.py --out dashboard.md          # generate the dashboard
 python scripts/tracker/apply_decisions.py --decisions d.json --snapshot s.json           # dry-run
 python scripts/tracker/apply_decisions.py --decisions d.json --snapshot s.json --execute # apply
-python scripts/tracker/apply_decisions.py --revert <run-id>          # reverse a batch
+python scripts/tracker/apply_decisions.py --revert <run-id>              # review the reversal (dry-run)
+python scripts/tracker/apply_decisions.py --revert <run-id> --execute    # reopen the batch
 ```
 
 **Marker namespaces** (distinct from the close driver's `yuzu-close-linked*`):
 `yuzu-tracker-report` (dashboard hash), `yuzu-tracker-ledger` (per-run batch),
-`yuzu-tracker-decision` (per-close idempotency, verified on `--revert`).
+`yuzu-tracker-decision` (per-close idempotency, verified on `--revert`), and
+`yuzu-tracker-revert` (reopen breadcrumb, written by `--revert --execute`).
 
 ## Re-validating the grammar against GitHub's oracle
 

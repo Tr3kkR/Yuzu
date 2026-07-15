@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -298,24 +299,33 @@ def decision_comment(d: dict, run_id: str) -> str:
         f"operator decision — **{cat}**. {_no_comment_delims(d['reason'].strip())}{extra}\n\n"
         f"Performed under the operator's credentials from a reviewed decision list. "
         f"Wrong close? Reopen and add the `do-not-close` label "
-        f"(docs/agents/issue-standard.md §5.1), or run "
-        f"`apply_decisions.py --revert {run_id}` to reverse this whole batch.\n\n"
+        f"(docs/agents/issue-standard.md §5.1), or reverse this whole batch: "
+        f"`apply_decisions.py --revert {run_id}` (review), then add `--execute`.\n\n"
         f"<!-- {DECISION_MARKER.format(run=run_id, issue=d['number'])} -->"
     )
 
 
 def ledger_comment(data: dict, run_id: str) -> str:
+    # Each line keeps the `- #N — ` prefix that mode_revert parses, then records
+    # the decision's reason (and typed verification for high-risk closes) so the
+    # durable "why" survives even if the post-close evidence comment fails to
+    # post (COMP-1). User text is whitespace-collapsed and delimiter-neutralized.
     lines = []
     for d in sorted(data["decisions"], key=lambda x: x["number"]):
-        lines.append(f"- #{d['number']} — {d['category']} → {CATEGORY_STATE[d['category']]}")
+        why = _no_comment_delims(" ".join(d["reason"].split()))[:160]
+        ver = d.get("verified_gone_at")
+        vtag = f" [verified: {_no_comment_delims(' '.join(ver.split()))[:80]}]" if ver else ""
+        lines.append(f"- #{d['number']} — {d['category']} → {CATEGORY_STATE[d['category']]} — {why}{vtag}")
     return (
         f"### Tracker decision ledger — run `{run_id}`\n\n"
         f"{cli.run_context()} · report `{data['report_hash'][:12]}…` · "
         f"{len(data['decisions'])} issue(s).\n\n"
         f"{chr(10).join(lines)}\n\n"
-        f"This ledger is posted BEFORE any close. "
-        f"`apply_decisions.py --revert {run_id}` reverses exactly this batch "
-        f"(each reopen is verified by this run's own close marker).\n\n"
+        f"This ledger is posted BEFORE any close and is the durable record of each "
+        f"decision's reason. To reverse this exact batch: "
+        f"`apply_decisions.py --revert {run_id}` (review), then "
+        f"`apply_decisions.py --revert {run_id} --execute` (reopen). Each reopen is "
+        f"verified by this run's own close marker.\n\n"
         f"<!-- {LEDGER_MARKER.format(run=run_id)} -->"
     )
 
@@ -357,6 +367,8 @@ def _live_close_block(d: dict, dnc: set) -> "str | None":
         return "is assigned"
     if cli.has_open_linked_pr(n):
         return "has an open linked PR"
+    if report.ROADMAP_LABEL in labels and d["category"] in JUDGMENT_CATEGORIES:
+        return f"is now roadmap-labelled (eligible for fixed-elsewhere only, not {d['category']!r})"
     if (labels & HIGHRISK_LABELS) and not (
             d["category"] == "fixed-elsewhere" and valid_verification(d.get("verified_gone_at", ""))):
         return f"is now {sorted(labels & HIGHRISK_LABELS)} without a verified fixed-elsewhere decision"
@@ -378,8 +390,13 @@ def apply_decisions(data: dict, run_id: str, execute: bool, dnc: set):
         if execute:
             block = _live_close_block(d, dnc)
             if block:
+                # NOTE: unlike the batch refusals, this abort happens AFTER the
+                # ledger and any earlier closes -- so this ONE exit-4 path may
+                # carry partial, revert-recoverable mutations (UP-2).
                 print(f"ABORT before closing #{n}: it {block} since the reviewed dry-run. "
-                      f"Zero further closes; re-run the dry-run and re-triage.", file=sys.stderr)
+                      f"Issues closed earlier in this batch are recorded in ledger run {run_id}; "
+                      f"reverse them with `apply_decisions.py --revert {run_id} --execute`, "
+                      f"then re-run the dry-run and re-triage.", file=sys.stderr)
                 sys.exit(4)
         _close(n, state, execute)
         if execute:
@@ -434,8 +451,26 @@ def _print_refusals(refusals: list, header: str):
         print(f"  ::error::{r}", file=sys.stderr)
 
 
+def _bot_context() -> "str | None":
+    """A CI/bot token context, in which apply_decisions must NOT mutate: the
+    'authorizing human is the operator' record depends on running under the
+    operator's own credentials, never a workflow token (COMP-2)."""
+    for var in ("GITHUB_ACTIONS", "CI", "GITHUB_RUN_ID"):
+        if os.environ.get(var):
+            return var
+    return None
+
+
 def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
     data = load_decisions(decisions_file)          # exit 3 on schema/read failure
+    if execute and _bot_context():
+        print(f"REFUSED: --execute detected a CI/bot context ({_bot_context()} is set). "
+              f"apply_decisions.py must run under the OPERATOR's credentials so the closing "
+              f"actor is a human, never a workflow token. Zero mutations.", file=sys.stderr)
+        return 4
+    if not data["decisions"]:
+        print("no decisions in the file; nothing to do.")
+        return 0
     dnc = cli.load_do_not_close()                  # exit 3 if the list is missing
 
     refusals, live = fetch_and_validate(data, dnc)
@@ -476,6 +511,8 @@ def mode_apply(decisions_file: str, snapshot_file: str, execute: bool) -> int:
                         "decisions_hash": decisions_hash(data), "decisions": data["decisions"]}, indent=1),
             encoding="utf-8")
         print(f"snapshot written to {snapshot_file} (pass the same file to --execute)")
+    else:
+        print("dry-run: no --snapshot given; pass one (e.g. --snapshot snap.json) to enable --execute.")
 
     apply_decisions(data, run_id, execute, dnc)
     return 0
@@ -527,7 +564,8 @@ def mode_revert(run_id: str, execute: bool) -> int:
             cli.add_label(n, "needs-triage", execute)
         print(f"  {'reopened' if execute else '[dry-run] would reopen'} #{n}")
         reopened += 1
-    print(f"revert {run_id}: {reopened} issue(s) {'reopened' if execute else 'would reopen'}")
+    banner = "REVERTED" if execute else "DRY-RUN (nothing reopened -- add --execute to reopen)"
+    print(f"{banner}: revert {run_id}: {reopened} issue(s) {'reopened' if execute else 'would reopen'}")
     return 0
 
 

@@ -90,9 +90,18 @@ LEAK_SCAN_WINDOW = cli.LEAK_SCAN_WINDOW
 CLOSURE_SAMPLE_SIZE = 10
 DUP_MIN_CLUSTER = 2
 
-# A file-path citation: a slash-separated path with a real extension, optionally
-# ":line". Conservative on purpose -- a bare word must not cluster issues.
-_PATH_CITE_RE = re.compile(r"\b([A-Za-z0-9_][A-Za-z0-9_./-]*?/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,6})(?::(\d+))?\b")
+# A file-path citation: one or more `segment/` (a segment has no `/` and no `.`)
+# then a final `name.ext`, optionally `:line`. The `(?:seg/)+` prefix is
+# unambiguous (each segment is slash-delimited and dot-free), so the pattern
+# cannot backtrack catastrophically on adversarial issue bodies -- the earlier
+# lazy/greedy `[.../-]*? / [.../-]+ \.` form was ReDoS-cubic (SG-1).
+_PATH_CITE_RE = re.compile(r"\b((?:[A-Za-z0-9_-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,6})(?::(\d+))?\b")
+# Defense-in-depth cap: GitHub issue bodies can be 65,536 chars; bound the regex
+# input so a pathological body can never dominate the weekly run's wall clock.
+# The new pattern is O(n^2), not linear, so the cap (not the shape) is what
+# bounds cost -- 8 KB keeps a worst-case body well under a second. Real file:line
+# citations live in the issue's Evidence section, comfortably within 8 KB.
+MAX_CITE_BODY = 8000
 # Paths so common they cluster unrelated issues -- excluded from the dup index.
 _PATH_CITE_STOPLIST = {"docs/agents/issue-standard.md", "docs/agents/triage-labels.md"}
 
@@ -150,16 +159,18 @@ def search_count(query: str) -> int:
 
 
 def find_tracking_issue() -> "dict | None":
-    """The open issue labelled `triage-sweep` the report comments on. First
-    such issue wins; None if the label has not been applied to one yet."""
+    """The open issue labelled `triage-sweep` the report comments on. Chosen
+    DETERMINISTICALLY as the LOWEST-numbered (oldest) such issue, so the report
+    generator, the workflow's post step, and /issue-triage all agree on the same
+    tracking issue even in the (mis-created) two-open-issues case -- otherwise
+    apply_decisions.py's R7 would read a different issue's hash than the operator
+    triaged and refuse every batch (UP-1). None if the label is on no open issue."""
     raw = cli.gh_api(
         f"repos/{REPO}/issues",
-        "-f", f"labels={TRIAGE_SWEEP_LABEL}", "-f", "state=open", "-f", "per_page=10",
+        "-f", f"labels={TRIAGE_SWEEP_LABEL}", "-f", "state=open", "-f", "per_page=100",
     ) or []
-    for i in raw:
-        if _is_issue(i):
-            return i
-    return None
+    issues = [i for i in raw if _is_issue(i)]
+    return min(issues, key=lambda i: i["number"]) if issues else None
 
 
 def latest_report_hash() -> "str | None":
@@ -247,10 +258,17 @@ def label_hygiene(open_issues: list, dnc_numbers: "set | None") -> list:
     """issue-standard.md §4 invariant violations. Each row: (number, problem).
     Forward-looking: only OPEN issues are audited (closures predating ADR-3001
     are never re-read through this taxonomy)."""
+    # Automation-owned bookkeeping issues the tracker workflows create (the
+    # triage-sweep tracking issue, an automation-broken alert) are not backlog
+    # and legitimately carry no type/triage-state/priority -- exempt them so the
+    # dashboard does not perpetually flag issues its own workflow spawned (CA-1).
+    HYGIENE_EXEMPT = {TRIAGE_SWEEP_LABEL, "automation-broken"}
     rows = []
     for i in open_issues:
         n = i["number"]
         labels = _labels(i)
+        if labels & HYGIENE_EXEMPT:
+            continue
         is_roadmap = ROADMAP_LABEL in labels
         types = labels & TYPE_LABELS
         states = labels & TRIAGE_STATE_LABELS
@@ -280,7 +298,7 @@ def label_hygiene(open_issues: list, dnc_numbers: "set | None") -> list:
 
 def _cited_paths(body: str) -> set:
     out = set()
-    for m in _PATH_CITE_RE.finditer(body or ""):
+    for m in _PATH_CITE_RE.finditer((body or "")[:MAX_CITE_BODY]):
         path = m.group(1)
         if path not in _PATH_CITE_STOPLIST:
             out.add(path)
@@ -336,7 +354,7 @@ def closure_integrity_sample(n: int) -> list:
     ) or {}
     out = []
     for item in (data.get("items") or [])[:n]:
-        m = _PATH_CITE_RE.search(item.get("body") or "")
+        m = _PATH_CITE_RE.search((item.get("body") or "")[:MAX_CITE_BODY])
         cited = None
         if m:
             cited = m.group(1) + (f":{m.group(2)}" if m.group(2) else "")

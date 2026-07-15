@@ -75,16 +75,25 @@ jobs:
         # marker-forgery constraint in scripts/tracker/README.md).
         run: |
           set -euo pipefail
+          # Lowest-numbered open triage-sweep issue -- MUST match
+          # tracker_report.find_tracking_issue()'s deterministic choice, or
+          # apply_decisions R7 would read a different issue's hash (UP-1).
           existing=$(gh issue list --label triage-sweep --state open \
-                       --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body-file dashboard.md
-          else
+                       --json number --jq 'map(.number) | min // empty')
+          if [ -z "$existing" ]; then
+            # First activation: open the tracking issue with a STUB body, then
+            # comment the dashboard -- every consumer (hash-pin, staleness,
+            # /issue-triage) scans COMMENTS, and the REST comments endpoint
+            # excludes the issue body, so the report marker must land in a
+            # comment or the inaugural report is invisible (happy-path).
             gh issue create \
               --title "Issue-tracker report (triage-sweep)" \
               --label triage-sweep \
-              --body-file dashboard.md
+              --body "Rolling tracking issue for the weekly tracker report (ADR-3001 pillar 5). Each weekly dashboard is posted as a comment below; do not close."
+            existing=$(gh issue list --label triage-sweep --state open \
+                         --json number --jq 'map(.number) | min // empty')
           fi
+          gh issue comment "$existing" --body-file dashboard.md
 
   # ── Alert on a generation failure ───────────────────────────────────────
   # A read-only dashboard that dies silently defeats its own dead-man's-switch.

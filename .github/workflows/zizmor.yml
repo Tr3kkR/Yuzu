@@ -135,6 +135,10 @@ jobs:
             echo "::error::$f gained a PR-context trigger — the read-only report must stay cron/dispatch-only (ADR-3001 A1 §10)"
             exit 1
           fi
+          if grep -nE '^[[:space:]]*push:' "$f"; then
+            echo "::error::$f gained a push: trigger — the weekly dashboard must stay cron/dispatch-only, or it sprays a comment on every dev push (ADR-3001 A1 §10)"
+            exit 1
+          fi
           if ! grep -qE '^[[:space:]]*ref:[[:space:]]*dev([[:space:]]|$)' "$f"; then
             echo "::error::$f does not pin 'ref: dev' — a scheduled run defaults to the main branch and would report on the wrong tree (ADR-3001 A1 §10)"
             exit 1

@@ -156,8 +156,9 @@ This skill stops here. Applying is a distinct authorized action:
 python scripts/tracker/apply_decisions.py --decisions decisions.json --snapshot snap.json
 # review the printed diff (most-dangerous-first), then:
 python scripts/tracker/apply_decisions.py --decisions decisions.json --snapshot snap.json --execute
-# reverse an exact batch by its run id (from the ledger comment):
+# reverse an exact batch by its run id (from the ledger comment) — dry-run, then execute:
 python scripts/tracker/apply_decisions.py --revert <run-id>
+python scripts/tracker/apply_decisions.py --revert <run-id> --execute
 ```
 
 (`python`, not `python3`, on the Windows dev box.) `--execute` refuses unless

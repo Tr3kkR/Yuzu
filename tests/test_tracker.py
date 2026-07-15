@@ -27,10 +27,12 @@ jobs -- meson coverage is structurally sufficient. Run locally as
 import contextlib
 import io
 import json
+import os
 import pathlib
 import re
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts" / "tracker"))
@@ -410,12 +412,13 @@ class _FakeGh:
         self.tracking = tracking
         self.report_hash = report_hash
         self.linked = linked or {}
-        # protect_after[n] = k: from the (k+1)-th GET of issue n onward, return it
-        # carrying a do-not-close label -- simulates a never-close signal added
+        # protect_after[n] = (k, label): from the (k+1)-th GET of issue n onward,
+        # return it carrying `label` -- simulates a never-close signal added
         # mid-run (the validate-to-close TOCTOU).
         self.protect_after = protect_after or {}
         self.get_count = {}
         self.posts, self.patches = [], []
+        self.events = []  # ordered ('PATCH'|'POST', n) log, to assert close-before-comment
         self._saved = {}
 
     def __enter__(self):
@@ -443,15 +446,19 @@ class _FakeGh:
             n = int(m.group(1))
             self.get_count[n] = self.get_count.get(n, 0) + 1
             base = self.issues.get(n)
-            if base and n in self.protect_after and self.get_count[n] > self.protect_after[n]:
-                return {**base, "labels": base.get("labels", []) + [{"name": "do-not-close"}]}
+            if base and n in self.protect_after and self.get_count[n] > self.protect_after[n][0]:
+                return {**base, "labels": base.get("labels", []) + [{"name": self.protect_after[n][1]}]}
             return base
         if m and method == "PATCH":
-            self.patches.append((int(m.group(1)), args))
+            n = int(m.group(1))
+            self.patches.append((n, args))
+            self.events.append(("PATCH", n))
             return {}
         m = re.fullmatch(rf"repos/{rid}/issues/(\d+)/comments", path)
         if m and method == "POST":
-            self.posts.append((int(m.group(1)), args))
+            n = int(m.group(1))
+            self.posts.append((n, args))
+            self.events.append(("POST", n))
             return {}
         m = re.fullmatch(rf"repos/{rid}/issues/(\d+)/labels", path)
         if m and method == "POST":
@@ -461,6 +468,10 @@ class _FakeGh:
 
 def run_apply_flow_tests(failures):
     real = cli.DNC_PATH
+    # The meson docs suite runs under GITHUB_ACTIONS on CI runners; clear the
+    # bot-context vars so the execute tests below aren't refused by COMP-2 (a
+    # dedicated case re-sets GITHUB_ACTIONS to test that refusal).
+    _bot_env = {v: os.environ.pop(v, None) for v in ("GITHUB_ACTIONS", "CI", "GITHUB_RUN_ID")}
     try:
         with tempfile.TemporaryDirectory() as td:
             cli.DNC_PATH = pathlib.Path(td) / "do-not-close.txt"
@@ -545,7 +556,7 @@ def run_apply_flow_tests(failures):
             # matches the decision list; #11 gains do-not-close on its 2nd GET
             # (initial validate passes on GET #1, re-validate refuses on GET #2).
             snap.write_text(json.dumps({"decisions_hash": ad.decisions_hash(decisions)}), encoding="utf-8")
-            with _FakeGh(issues, protect_after={11: 1}) as fg:
+            with _FakeGh(issues, protect_after={11: (1, "do-not-close")}) as fg:
                 with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                     rc = ad.mode_apply(str(dfile), str(snap), execute=True)
                 if rc != 4 or fg.patches:
@@ -555,7 +566,7 @@ def run_apply_flow_tests(failures):
             # validations (GET 1 and 2) and only gains do-not-close on GET 3 --
             # the per-issue re-check right before the close PATCH must abort
             # (sys.exit(4)) with no PATCH sent.
-            with _FakeGh(issues, protect_after={11: 2}) as fg:
+            with _FakeGh(issues, protect_after={11: (2, "do-not-close")}) as fg:
                 try:
                     with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                         ad.mode_apply(str(dfile), str(snap), execute=True)
@@ -563,8 +574,79 @@ def run_apply_flow_tests(failures):
                 except SystemExit as e:
                     if e.code != 4 or fg.patches:
                         failures.append(f"apply TOCTOU (per-issue): code={e.code} want 4, patches={fg.patches}")
+
+            # CA-2: a roadmap label added in the residual window blocks a judgment
+            # close (roadmap is fixed-elsewhere-only) via the per-issue guard.
+            with _FakeGh(issues, protect_after={11: (2, "roadmap")}) as fg:
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                        ad.mode_apply(str(dfile), str(snap), execute=True)
+                    failures.append("apply TOCTOU (roadmap): expected SystemExit(4)")
+                except SystemExit as e:
+                    if e.code != 4 or fg.patches:
+                        failures.append(f"apply TOCTOU (roadmap): code={e.code} want 4, patches={fg.patches}")
+
+            # QE-1(a): #11 gains `security` under a judgment category mid-run ->
+            # per-issue guard blocks (sys.exit 4, no PATCH).
+            with _FakeGh(issues, protect_after={11: (2, "security")}) as fg:
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                        ad.mode_apply(str(dfile), str(snap), execute=True)
+                    failures.append("apply TOCTOU (security judgment): expected SystemExit(4)")
+                except SystemExit as e:
+                    if e.code != 4 or fg.patches:
+                        failures.append(f"apply TOCTOU (security judgment): code={e.code} want 4, patches={fg.patches}")
+
+            # QE-1(b): #21 gains `security` mid-run but IS a verified fixed-elsewhere
+            # -> the exception holds, it still closes.
+            fe = {"report_hash": HEX64,
+                  "decisions": [_d(21, "fixed-elsewhere", "landed in #99",
+                                   verified_gone_at="abc1234 — grepped src/x.cpp, gone")]}
+            fefile = pathlib.Path(td) / "fe.json"
+            fefile.write_text(json.dumps(fe), encoding="utf-8")
+            fesnap = pathlib.Path(td) / "fesnap.json"
+            fesnap.write_text(json.dumps({"decisions_hash": ad.decisions_hash(fe)}), encoding="utf-8")
+            with _FakeGh({21: _issue(21, labels=["bug"])}, protect_after={21: (2, "security")}) as fg:
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    rc = ad.mode_apply(str(fefile), str(fesnap), execute=True)
+                if rc != 0 or {n for n, _a in fg.patches} != {21}:
+                    failures.append(f"apply verified-security fixed-elsewhere: rc={rc} patches={fg.patches} want close #21")
+
+            # QE-3: for each closed issue, its close PATCH must precede its own
+            # evidence-comment POST (comment-first would strand the marker).
+            with _FakeGh(issues) as fg:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ad.mode_apply(str(dfile), str(snap), execute=True)
+                for n in (11, 12):
+                    seq = [ev for ev in fg.events if ev[1] == n]
+                    if seq != [("PATCH", n), ("POST", n)]:
+                        failures.append(f"ordering: #{n} events {seq} want [PATCH, POST]")
+
+            # UP-4: an empty decisions list closes nothing and posts no ledger.
+            empty = pathlib.Path(td) / "empty.json"
+            empty.write_text(json.dumps({"report_hash": HEX64, "decisions": []}), encoding="utf-8")
+            with _FakeGh(issues) as fg:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = ad.mode_apply(str(empty), str(snap), execute=True)
+                if rc != 0 or fg.posts or fg.patches:
+                    failures.append(f"empty decisions: rc={rc} posts={fg.posts} patches={fg.patches} want no-op 0")
+
+            # COMP-2: --execute under a CI/bot token refuses (exit 4, zero mutations).
+            _saved_env = os.environ.get("GITHUB_ACTIONS")
+            os.environ["GITHUB_ACTIONS"] = "true"
+            try:
+                with _FakeGh(issues) as fg:
+                    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                        rc = ad.mode_apply(str(dfile), str(snap), execute=True)
+                    if rc != 4 or fg.patches:
+                        failures.append(f"bot-context execute: rc={rc} want 4, patches={fg.patches}")
+            finally:
+                os.environ.pop("GITHUB_ACTIONS", None)
     finally:
         cli.DNC_PATH = real
+        for _v, _val in _bot_env.items():
+            if _val is not None:
+                os.environ[_v] = _val
 
 
 def run_marker_hygiene_tests(failures):
@@ -620,6 +702,16 @@ def run_revert_tests(failures):
             cli.post_comment = lambda n, body, execute: None
             cli.add_label = lambda n, label, execute: None
 
+            # QE-4: revert DRY-RUN reopens nothing but reports the would-reopen.
+            dout = io.StringIO()
+            with contextlib.redirect_stdout(dout):
+                drc = ad.mode_revert(run_id, execute=False)
+            dtext = dout.getvalue()
+            if drc != 0 or patches:
+                failures.append(f"revert dry-run: rc={drc} patches={patches} want 0 / no PATCH")
+            if "would reopen #70" not in dtext or "DRY-RUN" not in dtext:
+                failures.append(f"revert dry-run: must report would-reopen #70 + DRY-RUN banner; got {dtext!r}")
+
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = ad.mode_revert(run_id, execute=True)
@@ -645,6 +737,115 @@ def run_revert_tests(failures):
 
 
 # ==========================================================================
+# 4. Governance-round coverage (SG-1 ReDoS, CA-1 hygiene exempt, QE-2/4/5, SRE render)
+
+def run_redos_test(failures):
+    # SG-1: a pathological no-terminal-extension body must complete fast and
+    # yield no paths (the old lazy/greedy regex backtracked cubically here).
+    body = "a/" * 8000  # 16 KB of slash segments, no `name.ext`
+    t0 = time.time()
+    paths = report._cited_paths(body)
+    dt = time.time() - t0
+    if dt > 2.0:
+        failures.append(f"ReDoS: _cited_paths took {dt:.2f}s on a pathological body (want < 2s)")
+    if paths:
+        failures.append(f"ReDoS: no-extension body must yield no paths, got {sorted(paths)[:3]}")
+    if report._cited_paths("see src/core/auth.cpp:42 here") != {"src/core/auth.cpp"}:
+        failures.append("ReDoS fix regressed real path extraction")
+
+
+def run_hygiene_exempt_test(failures):
+    # CA-1: the workflow's own bookkeeping issues (triage-sweep tracking issue,
+    # automation-broken alert) must be exempt from hygiene, not self-flagged.
+    if any(n == 9000 for n, _p in report.label_hygiene([_issue(9000, labels=["triage-sweep"])], set())):
+        failures.append("hygiene: triage-sweep tracking issue must be exempt")
+    if any(n == 9001 for n, _p in report.label_hygiene([_issue(9001, labels=["automation-broken"])], set())):
+        failures.append("hygiene: automation-broken alert issue must be exempt")
+
+
+def run_report_hash_filter_test(failures):
+    # QE-2: latest_report_hash must trust only github-actions[bot] comments, so a
+    # user-pasted (newer) report marker cannot spoof the hash R7 pins against.
+    saved = cli.gh_api
+    A, B = "a" * 64, "b" * 64
+
+    def fake(path, *args, method="GET", paginate=False):
+        if path == f"repos/{cli.REPO}/issues" and any("labels=triage-sweep" in a for a in args):
+            return [{"number": 9000}]
+        if path == f"repos/{cli.REPO}/issues/9000/comments":
+            return [
+                {"user": {"login": "driveby"}, "author_association": "NONE", "created_at": "2026-07-16T00:00:00Z",
+                 "body": f"<!-- yuzu-tracker-report: hash={B} run=x -->"},   # non-bot, NEWER -> ignored
+                {"user": {"login": cli.TRUSTED_BOT}, "author_association": "MEMBER", "created_at": "2026-07-15T00:00:00Z",
+                 "body": f"<!-- yuzu-tracker-report: hash={A} run=y -->"},   # bot, older -> wins
+            ]
+        raise AssertionError(f"unexpected {path}")
+    cli.gh_api = fake
+    try:
+        got = report.latest_report_hash()
+        if got != A:
+            failures.append(f"latest_report_hash: want bot hash, got {got and got[:8]} (spoof filter broken)")
+    finally:
+        cli.gh_api = saved
+
+
+def run_closure_sample_test(failures):
+    # QE-5: closure_integrity_sample returns (number, path-or-None) ONLY -- never
+    # the user-authored title (the no-user-text-in-bot-comment property, at source).
+    saved = cli.gh_api
+
+    def fake(path, *args, method="GET", paginate=False):
+        if path == "search/issues":
+            return {"items": [
+                {"number": 42, "title": "<!-- yuzu-tracker-report: hash=x --> sneaky", "body": "cause in src/core/auth.cpp:42"},
+                {"number": 43, "title": "plain title", "body": "no path here"},
+            ]}
+        raise AssertionError(path)
+    cli.gh_api = fake
+    try:
+        out = report.closure_integrity_sample(10)
+        if out != [(42, "src/core/auth.cpp:42"), (43, None)]:
+            failures.append(f"closure_integrity_sample: {out} unexpected")
+        if "sneaky" in str(out) or "yuzu-tracker-report" in str(out):
+            failures.append("closure_integrity_sample: leaked user title/marker text")
+    finally:
+        cli.gh_api = saved
+
+
+def run_post_ledger_guard_test(failures):
+    # QE-4: post_ledger fails closed (GhError) when there is no tracking issue.
+    saved = report.find_tracking_issue
+    report.find_tracking_issue = lambda: None
+    try:
+        ad.post_ledger({"report_hash": HEX64, "decisions": [_d(1)]}, "run", execute=True)
+        failures.append("post_ledger: missing tracking issue must raise GhError")
+    except cli.GhError:
+        pass
+    finally:
+        report.find_tracking_issue = saved
+
+
+def run_render_signal_test(failures):
+    # SRE: the operator-critical RED signals actually render.
+    import datetime
+    now = datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc)
+    t = report.compute_telemetry([], 0, 0, 0, now)
+    chash = report.report_hash(report.candidate_set([], [], [], []))
+    md_red = report.render_markdown(t, "unavailable", ["dnc missing"], [], [], [], 30, chash, "r")
+    stale_line = [l for l in md_red.splitlines() if "days since last report" in l]
+    if not stale_line or "🔴" not in stale_line[0]:
+        failures.append("render: staleness > threshold must be a RED row")
+    leak_line = [l for l in md_red.splitlines() if "leak scan (claimed-but-open)" in l]
+    if not leak_line or "🔴" not in leak_line[0]:
+        failures.append("render: unavailable leak scan must be a RED telemetry row")
+    if "UNAVAILABLE" not in md_red:
+        failures.append("render: unavailable leak scan must render UNAVAILABLE")
+    md_first = report.render_markdown(t, "ok", [], [], [], [], None, chash, "r")
+    if "first run" not in md_first:
+        failures.append("render: staleness None must show 'first run'")
+
+
+# ==========================================================================
 
 def main() -> int:
     failures = []
@@ -659,6 +860,12 @@ def main() -> int:
     run_apply_flow_tests(failures)
     run_marker_hygiene_tests(failures)
     run_revert_tests(failures)
+    run_redos_test(failures)
+    run_hygiene_exempt_test(failures)
+    run_report_hash_filter_test(failures)
+    run_closure_sample_test(failures)
+    run_post_ledger_guard_test(failures)
+    run_render_signal_test(failures)
     if failures:
         print(f"tracker checks FAILED ({len(failures)}):")
         for f in failures:
@@ -666,7 +873,8 @@ def main() -> int:
         return 1
     print("tracker checks OK (telemetry, hygiene, duplicates, report-hash, leak-scan, "
           "schema, decisions-hash, validate R1-R7 + PR-refusal, apply dry-run/execute/drift/"
-          "malformed-snapshot/TOCTOU, marker-hygiene, revert)")
+          "malformed-snapshot/TOCTOU x4/bot-context/empty, marker-hygiene, revert dry+exec, "
+          "ReDoS, hygiene-exempt, bot-hash-filter, closure-no-title, ledger-guard, render-signals)")
     return 0
 
 
