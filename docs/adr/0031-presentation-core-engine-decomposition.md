@@ -504,7 +504,7 @@ being structural.
    store access to unwind. **It is not free, and it is not first.** Engine principals are a
    *reserved* `principal_class` that is **never emitted today** (`principal_class.hpp`), the
    engine's GUI must go (superseding 2c D2), and no engine code path may ship before ADR-0032's
-   interlock (a)–(d) has landed.
+   interlock (a)–(d) and (h) have landed.
 
 ### The acceptance tests live in ADR-0032
 

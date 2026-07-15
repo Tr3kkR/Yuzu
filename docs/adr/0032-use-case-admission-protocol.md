@@ -136,11 +136,11 @@ authenticated-actor grants
 omit; the create-authority seams (approving a manifest mints the Module envelope; granting an approval
 mints the execution authorisation) run every filter that applies to *them* and do not
 self-referentially require the authority they are about to create. Successive drafts dropped the
-**credential** term at three of the four seams; each omission independently let a deliberately
+**credential** term at three of the four seams it then enumerated; each omission independently let a deliberately
 attenuated token act with its owner's full authority, which is worse than having no attenuation at
 all, because the operator believes the worker is confined.
 
-Two corollaries, both normative:
+Corollaries, all normative:
 
 - **Every filter reads LIVE, except the ceiling.** A frozen snapshot may only ever *narrow*: it is the
   ceiling the run may not exceed. Anything that can be *revoked* — the operator's authority, the
@@ -364,13 +364,13 @@ reaper has run. The reaper then terminalises overdue runs and writes the termina
 (`use_case.run.expired`); it records the end, it is not what causes it.
 
 The invariant this buys: **every admitted run reaches a terminal audit state.** No run merely stops
-being mentioned. Reaping a run revokes its **read** authority instantly — it does **not** void an
+being mentioned. Expiry at `expires_at` revokes a run's **read** authority (checked inline, Decision 4 filter 1); reaping only terminalises, audits and cleans up. Neither voids an
 Execution Plan the run already produced and a human already approved: an approved plan is authorised
 in its own right and is re-checked against the *requester's* current authority at execution
 (ADR-0033 §8). A reaper must never be able to silently un-approve a human's decision.
 
 **It is bought by a reaper, not by construction** — and a reaper is a background thread, which is a
-thing that can die quietly (the `PolicyEvaluator` precedent). So the invariant carries three
+thing that can die quietly (the `PolicyEvaluator` precedent). So the invariant carries four
 requirements, and it is worth exactly as much as they are:
 
 - **A ceiling on the module-declared TTL** in core's ratified copy. A module must not be able to
