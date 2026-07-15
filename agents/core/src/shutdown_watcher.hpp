@@ -68,8 +68,6 @@
 
 #ifndef _WIN32
 
-#include <spdlog/spdlog.h>
-
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -79,6 +77,8 @@
 #include <memory>
 #include <thread>
 #include <unistd.h>
+
+#include <spdlog/spdlog.h>
 
 namespace yuzu::agent {
 
@@ -263,7 +263,8 @@ public:
             // one exit that cannot complete: the watcher is parked in a BLOCKING read() we can
             // no longer wake, so join() would hang process exit forever — the exact failure
             // this class exists to prevent, at the last line. Exhaustion is unreachable today
-            // (64 KiB pipe; the second-signal _exit() caps the queue at one byte) but its
+            // (the pipe buffer is ≥4 KiB on every target — Darwin defaults to 16 KiB,
+            // Linux 64 KiB — and the second-signal _exit() caps the queue at one byte) but its
             // safety depended on an invariant in ANOTHER FILE, which is not a safety argument.
             // (governance Gate-8 round 8: cpp-safety + unhappy-path UP8-3, found independently.)
             //

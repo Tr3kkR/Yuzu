@@ -419,6 +419,60 @@ cleared on every sweep and re-emitted per reporting OS** — a `(metric, os)`
 nobody reported is absent, never stale or a fabricated 0 (`_degraded{os}` only
 appears if an agent of that OS still emits the retired tag).
 
+## SparkEngine fleet gauges
+
+Published on every fleet-health sweep (~15 s), fed from the `yuzu.spark_*`
+heartbeat tags. SparkEngine (ADR-0021 Stage-2) is the next-generation event-driven
+detection engine; at **rung 1 it runs observe-only** (no consumer arms rules), so
+every mechanism- and consumer-health counter below is **0** in production today —
+`_reporting`, `_disabled`, `_failed` and `_mechanisms` are the four that carry live
+signal, and none of them depends on a consumer being armed; the rest go live when
+rung 2 arms real rules. A `(metric, os[, mechanism])` nobody reported is **absent**,
+never a fabricated 0 (all eleven families are cleared and re-emitted every sweep, the
+same idiom as `yuzu_fleet_net_*`). An agent started with `--spark-disable` reports
+`spark_running=0` + `spark_disabled=1`: it is absent from `_reporting` and counted in
+`_disabled`. An agent whose engine was enabled but **threw at boot** reports
+`spark_running=0` with no `spark_disabled` key, and is counted in `_failed` — that
+split is what makes a fleet-wide spark boot failure visible at all.
+
+**All series carry an `os` label** — `file` and `registry` mechanisms are
+Windows-only, `service` is Windows + Linux, macOS has none — so **query and alert
+per OS, never `sum without(os)`** (a cross-OS aggregate is meaningless for a
+single-platform mechanism). The four mechanism counters additionally carry a
+`mechanism` label (`file` / `registry` / `service`). The mechanism counters are
+fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
+until the reporting agent restarts — the shipped **counter** alert templates
+(disabled until rung 2) use `increase(...[15m]) > 0` instead. One rule ships
+**active** today: `YuzuSparkBootFailed` on `_failed` (a per-sweep state gauge,
+latch-free) — warning severity, 30m hold (see `docs/prometheus/yuzu-alerts.yml`,
+group `yuzu-fleet-spark-rung1`).
+
+**Staged-rollout example:** these series only exist for agents that have been
+upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
+2,000-endpoint Linux fleet with 500 agents upgraded,
+`yuzu_fleet_spark_reporting{os="linux"}` reads **500, not 2,000** — the other
+1,500 agents are ABSENT (pre-rung-1), which is expected and is not a failure.
+`_reporting` approaches the enrolled count as the rollout completes; only
+`_failed` indicates something wrong.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_spark_reporting{os}` | gauge | Agents **of that OS** whose latest heartbeat reported the engine running (`spark_running=1`) — the denominator for the engine-level counters |
+| `yuzu_fleet_spark_disabled{os}` | gauge | Agents **of that OS** running with the engine deliberately off (`--spark-disable`). An operator decision — expected to be non-zero in some fleets. **Do not alert on it** |
+| `yuzu_fleet_spark_failed{os}` | gauge | Agents **of that OS** where the engine was ENABLED but boot-time instantiation **threw**, so the agent degraded to no-spark. Distinct from `_disabled` on purpose: this is a fault, not a choice — **alert on it** (the shipped `YuzuSparkBootFailed` rule does, warning severity). Without this series a fleet-wide spark boot failure would be invisible (a failed agent would look exactly like one that was never asked to run it) |
+| `yuzu_fleet_spark_mechanisms{os,mechanism}` | gauge | Agents **of that OS** whose spark capability includes that mechanism (from the `spark_mechs` CSV). Counts only mechanisms that are registered **and functional**: one that started but could not bind its OS facility — most commonly a **containerised Linux host, which has no systemd system bus** — is reported inert and **excluded**, because every watch on it would be refused. An OS with agents in `_reporting` but no `{mechanism}` series either does not support it (e.g. no `file` on `linux`) or cannot use it there |
+| `yuzu_fleet_spark_armed_faulted{os}` | gauge | Fleet sum of armed watches a mechanism reported deaf. A **live** gauge (recovers when the watch recovers), not cumulative — `> 0` means detection is silently down for that many watches. 0 at rung 1 (nothing armed) |
+| `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
+| `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of cumulative mechanism quarantines — a structural leak that should stay 0. 0 at rung 1 |
+| `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative slow watch/unwatch ops (a stalled/contended watcher). 0 at rung 1 |
+| `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
+| `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
+| `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |
+
+See [Guaranteed State → SparkEngine](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)
+for the observe-only migration, the `--spark-disable` flag, and the per-rung
+enforcement-posture table.
+
 ## Guardian metrics
 
 | Metric | Type | Description |
