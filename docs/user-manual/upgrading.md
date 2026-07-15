@@ -241,6 +241,43 @@ replicas against one database. Token *validation* uses a per-process 60-second
 cache, so a token revoked on one replica may remain accepted on another replica for
 up to that window — see ADR-0030 for the tracked hardening.
 
+## ⚠️ Breaking: `engine:` namespace reservation — server refuses to start on a pre-existing collision (engine principals PR 4.2)
+
+This release introduces the **engine principal** class — a distinct identity
+class for autonomous/agentic callers, stored in the new `EnginePrincipalStore`
+and resolved through RBAC/`ApiTokenStore` (design doc §3.1/§3.3). To make that
+resolution unambiguous, the `engine:` prefix is now a **reserved namespace**
+for both local usernames (`users.username`) and local RBAC group names
+(`groups.name`).
+
+**Pre-upgrade collision check** (mirrors the plugin-trust-bundle filename
+collision check above). At boot, the server now scans for any pre-existing
+`engine:`-prefixed local user or local RBAC group and **refuses to start** if
+it finds one — silently coexisting with (or being shadowed by) a real engine
+principal is not an acceptable outcome, so this fails closed rather than
+booting into an ambiguous state (decision log #3). Before upgrading, run
+against your `auth.db` and `rbac.db`:
+
+```sql
+-- auth.db
+SELECT username FROM users WHERE username LIKE 'engine:%';
+
+-- rbac.db
+SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';
+```
+
+If either query returns rows, rename or remove those users/groups **before**
+upgrading — the new server will not boot until the collision is cleared (or,
+if the boot-time collision scan itself fails, e.g. a mid-scan database error,
+the server also fails closed rather than guessing). See
+[`docs/ops-runbooks/engine-principal-store-recovery.md`](../ops-runbooks/engine-principal-store-recovery.md)
+for the full recovery procedure if you hit this at boot.
+
+**Scope of this release:** PR 4.2 ships the engine-principal store, RBAC
+resolution, and attribution plumbing only — there is **no operator-facing
+surface yet** (no dashboard/REST CRUD for minting or managing engine
+principals). That ships in PR 4.3.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and

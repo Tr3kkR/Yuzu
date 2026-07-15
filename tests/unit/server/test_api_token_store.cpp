@@ -11,6 +11,7 @@
  */
 
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -371,6 +372,12 @@ TEST_CASE("ApiTokenStore: principal_kind round-trips through create -> validate/
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
+    // Engine block prerequisites (design doc §6/§7/§8): mcp_tier must be
+    // "readonly", expires_at must be non-zero and within the 90-day ceiling,
+    // and the referent resolver must be wired — a stub reporting Active,
+    // matching how server.cpp wires the real EnginePrincipalStore.
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
 
     auto human_raw = store.create_token("human-token", "alice");
     REQUIRE(human_raw.has_value());
@@ -378,7 +385,7 @@ TEST_CASE("ApiTokenStore: principal_kind round-trips through create -> validate/
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
     auto engine_raw =
-        store.create_token("engine-token", "svc-ci", now + 3600, "", "", "engine");
+        store.create_token("engine-token", "svc-ci", now + 3600, "", "readonly", "engine");
     REQUIRE(engine_raw.has_value());
 
     auto human_v = store.validate_token(*human_raw);

@@ -33,12 +33,27 @@ constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "sam
 /// pre-emptively, and doing so costs nothing.
 constexpr std::string_view kLocalPrefix = "local:";
 
+/// The reserved engine-principal namespace (auth-engine-principals design
+/// §3.3 / decision log #3). Deliberately NOT folded into
+/// `kRecognizedIdpSources` above: "engine" is not an identity-provider
+/// source — no engine-principal role assignment is ever asserted via
+/// `reconcile_idp_memberships`, and adding it to that array would wrongly
+/// imply otherwise. Kept as its own guard instead, same shape as
+/// `kLocalPrefix`. Also reused by `RbacStore::validate_assignment` below —
+/// single literal, not re-derived per call site.
+constexpr std::string_view kEnginePrefix = "engine:";
+
 /// A `source=='local'` group create is rejected if `name` starts with one of
-/// `kRecognizedIdpSources` + ':' (or `kLocalPrefix`) — it would otherwise be
-/// indistinguishable from (and could be used to pre-seed roles for) a
-/// same-named IdP group. #1832.
+/// `kRecognizedIdpSources` + ':' (or `kLocalPrefix`/`kEnginePrefix`) — it
+/// would otherwise be indistinguishable from (and could be used to pre-seed
+/// roles for) a same-named IdP group, or collide with the reserved engine
+/// namespace (§3.3: "the same rejection applies to locally created RBAC
+/// group names"). #1832; engine reservation is PR 4.2.
 bool has_reserved_idp_prefix(std::string_view name) {
     if (name.size() >= kLocalPrefix.size() && name.compare(0, kLocalPrefix.size(), kLocalPrefix) == 0)
+        return true;
+    if (name.size() >= kEnginePrefix.size() &&
+        name.compare(0, kEnginePrefix.size(), kEnginePrefix) == 0)
         return true;
     for (auto source : kRecognizedIdpSources) {
         if (name.size() > source.size() && name[source.size()] == ':' &&
@@ -64,6 +79,34 @@ bool is_blank(std::string_view s) {
 /// is defense-in-depth against a malformed/hostile assertion, not a format
 /// constraint. #1832 hardening UP-9.
 constexpr size_t kMaxExternalIdLength = 512;
+
+/// Built-in role names an engine-principal assignment must never receive —
+/// `RbacStore::validate_assignment`'s "no admin, ever" bar (design §4.2).
+/// "Administrator" is RBAC's own full-access system role, seeded below with
+/// description "Full access to all operations" and granted CRUD across
+/// every securable type in `seed_defaults()`; it is also the RBAC-role name
+/// legacy `auth::Role::admin` is displayed/mapped as at every existing
+/// legacy-role↔RBAC-role site (e.g. `session->role == auth::Role::admin ?
+/// "Administrator" : "Viewer"` in rest_api_v1.cpp/server.cpp), so barring
+/// this one name closes both "the admin legacy role" and "any built-in
+/// wildcard role" from §4.2 — today there is exactly one built-in
+/// (`is_system`) role that is provably unrestricted. The literal "admin" is
+/// barred too, as defense-in-depth against a caller ever threading the raw
+/// legacy role string through this path instead of an RBAC role name.
+/// EXTEND this set — never fork a second bar elsewhere (matches the
+/// `dangerous_enforce_in_spec` single-chokepoint pattern used for Guardian's
+/// analogous enforce-promotion bar) — if a future built-in role is ever
+/// seeded with comparably unrestricted access. Decision log #13 additionally
+/// names an independent auditor-runnable verification query (PR 4.3/4.4) so
+/// this write-path bar is never the sole evidence of the invariant.
+///
+/// "Elevation-eligibility role" (§4.2's third bar) has no entry here: JIT
+/// elevation eligibility is the per-user `users.elevation_eligible` column
+/// (auth_db.cpp) — it has no RBAC-role representation to reject, and an
+/// engine principal is never a `users` table row in the first place
+/// (`EnginePrincipalStore` is a separate substrate), so the bar is
+/// structurally satisfied without a check here.
+constexpr std::array<std::string_view, 2> kEngineDisallowedRoles = {"admin", "Administrator"};
 
 } // namespace
 
@@ -897,10 +940,93 @@ std::vector<PrincipalRole> RbacStore::get_role_members(const std::string& role_n
     return result;
 }
 
+std::expected<void, std::string> RbacStore::validate_assignment(const std::string& principal_type,
+                                                                 const std::string& principal_id,
+                                                                 const std::string& role_name) {
+    // F2 (Hermes pass-2 MEDIUM, worst finding): an `engine:`-prefixed
+    // principal_id must ONLY ever be assigned under principal_type=="engine".
+    // Without this, a caller could mint a shadow row
+    // `('user', 'engine:x', role)` that `collect_roles_locked`'s user arm
+    // would happily match at role-resolution time — silently attributing an
+    // engine identity's permissions to whatever attacker-controlled "user"
+    // lookup produces that principal_id, entirely bypassing the engine-only
+    // checks below. Reject regardless of principal_type.
+    if (principal_type != "engine" && principal_id.starts_with(kEnginePrefix))
+        return std::unexpected(
+            "principal_id in the reserved 'engine:' namespace may only be assigned under "
+            "principal_type=\"engine\"");
+
+    // Also reject any principal_type outside the recognized set — this
+    // function is the single validation chokepoint for assign_role, so an
+    // unrecognized principal_type (typo, or an attacker probing for an
+    // unvalidated arm) must fail closed here rather than silently falling
+    // through to the `{}` return below.
+    if (principal_type != "user" && principal_type != "group" && principal_type != "engine")
+        return std::unexpected("unrecognized principal_type '" + principal_type + "'");
+
+    // user/group assignment behavior is completely unchanged — a hard
+    // invariant, exercised by every pre-existing caller of assign_role.
+    if (principal_type != "engine")
+        return {};
+
+    // Matches engine_principal_store.cpp::create's own prefix check exactly
+    // (`starts_with` + non-empty-slug), so the two guards can never drift.
+    if (!principal_id.starts_with(kEnginePrefix) || principal_id.size() == kEnginePrefix.size())
+        return std::unexpected(
+            "engine principal_id must be in the reserved 'engine:<slug>' namespace with a "
+            "non-empty slug");
+
+    for (auto disallowed : kEngineDisallowedRoles) {
+        if (role_name == disallowed)
+            return std::unexpected("engine principals cannot be granted the admin/full-access "
+                                   "role '" +
+                                   role_name + "' — no admin, ever (design §4.2)");
+    }
+    return {};
+}
+
 std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr) {
     std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
+    if (auto v = validate_assignment(pr.principal_type, pr.principal_id, pr.role_name); !v)
+        return std::unexpected(v.error());
+
+    // F1 (Hermes pass-1 H1, downgraded MEDIUM by architect): generalize the
+    // "no admin, ever" bar to "no built-in role, ever" for engine
+    // principals. `validate_assignment` is `static` and has no DB handle, so
+    // it can only bar the two hardcoded literal role names
+    // (`kEngineDisallowedRoles`) — that's a manual-extend footgun for any
+    // future `is_system` role (see the comment on that array). This
+    // fleet-wide path DOES have DB access, so query the role's own
+    // `is_system` flag (same idiom as `delete_role`'s system-role-protection
+    // check above) and reject any built-in role outright. The literal check
+    // in `validate_assignment` stays as defense-in-depth (the legacy "admin"
+    // string isn't itself a `roles` row, so it wouldn't be caught here).
+    // Residual: a custom (`is_system=0`) role that happens to be granted
+    // fleet-wide/unrestricted permissions is NOT caught by this bar — that
+    // is closed by the independent auditor-runnable verification query
+    // (decision log #13, PR 4.3/4.4), never by trying to enumerate
+    // "dangerous" permission combinations here (trivially bypassable and
+    // falsely advertises completeness).
+    if (pr.principal_type == "engine") {
+        sqlite3_stmt* chk = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT is_system FROM roles WHERE name = ?;", -1, &chk,
+                               nullptr) != SQLITE_OK)
+            return std::unexpected(sqlite3_errmsg(db_));
+        sqlite3_bind_text(chk, 1, pr.role_name.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(chk) == SQLITE_ROW) {
+            bool is_sys = sqlite3_column_int(chk, 0) != 0;
+            sqlite3_finalize(chk);
+            if (is_sys)
+                return std::unexpected(
+                    "engine principals cannot be granted a built-in system role '" +
+                    pr.role_name + "' — no built-in role, ever (design §4.2)");
+        } else {
+            sqlite3_finalize(chk);
+        }
+    }
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,
@@ -967,6 +1093,61 @@ std::vector<RbacGroup> RbacStore::list_groups() const {
     return result;
 }
 
+std::optional<std::vector<std::string>>
+RbacStore::find_local_groups_with_prefix(const std::string& prefix) const {
+    std::shared_lock lock(mtx_);
+    std::vector<std::string> result;
+    // `prefix` is code-controlled (e.g. `kEnginePrefix`), never user input —
+    // fail closed (empty result) rather than trust the caller if it ever
+    // carries a LIKE metacharacter, matching audit_store.cpp's action-prefix
+    // guard (`%`/`_`/`\` would otherwise widen the match).
+    if (!db_ || prefix.empty() || prefix.find_first_of("%_\\") != std::string::npos)
+        return result;
+    // Scoped to `source = 'local'` — an IdP-sourced group asserting a
+    // same-prefixed name is disambiguated by `principal_type` at the
+    // resolution site (§3.3) and is not the namespace collision a LOCAL
+    // group of that name would be; this backs the T8 startup collision
+    // preflight (decision log #3), which only needs to find LOCAL create
+    // paths that predate the `has_reserved_idp_prefix` guard above.
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT name FROM groups WHERE source = 'local' AND name LIKE ?;",
+                           -1, &s, nullptr) != SQLITE_OK) {
+        // G3: a prepare failure is a scan error, not "no rows" — signal it
+        // distinctly so the T8 preflight fails closed instead of booting.
+        spdlog::error("find_local_groups_with_prefix: failed to prepare scan statement: {}",
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    std::string pattern = prefix + "%";
+    sqlite3_bind_text(s, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+    int rc;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+        // Explicit length, not implicit strlen() via the NUL-terminated
+        // char* — matches scim_store.cpp's row_to_resource text_col idiom
+        // (a group name could in principle carry an embedded NUL from a
+        // pre-hardening write path; a collision scan must not silently
+        // truncate what it reports).
+        const unsigned char* t = sqlite3_column_text(s, 0);
+        if (t) {
+            result.emplace_back(reinterpret_cast<const char*>(t),
+                                static_cast<std::size_t>(sqlite3_column_bytes(s, 0)));
+        }
+    }
+    sqlite3_finalize(s);
+    // G3 (UP-2, cpp-safety): a mid-scan SQLite error (rc != SQLITE_DONE)
+    // previously fell through silently, returning whatever rows had been
+    // collected so far as if the scan had completed cleanly — the T8 boot
+    // preflight would then read a partial (possibly empty) result as
+    // "no collision" and boot with a live namespace collision undetected.
+    // Signal the error distinctly via nullopt so the caller can fail closed.
+    if (rc != SQLITE_DONE) {
+        spdlog::error("find_local_groups_with_prefix: scan of prefix '{}' failed: {}", prefix,
+                     sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    return result;
+}
+
 std::expected<void, std::string> RbacStore::create_group(const RbacGroup& group) {
     std::unique_lock lock(mtx_);
     if (!db_)
@@ -979,8 +1160,8 @@ std::expected<void, std::string> RbacStore::create_group(const RbacGroup& group)
     // present source=='local'.
     if (group.source == "local" && has_reserved_idp_prefix(group.name))
         return std::unexpected(
-            "group name uses a reserved identity-provider namespace prefix "
-            "(local:/entra:/saml:/ad:)");
+            "group name uses a reserved identity-provider or engine-principal namespace prefix "
+            "(local:/entra:/saml:/ad:/engine:)");
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
@@ -1038,6 +1219,15 @@ std::expected<void, std::string> RbacStore::add_group_member(const std::string& 
     std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
+    // G5 (governance hardening, UP-5): this method has zero route callers
+    // today, but the group-resolution arm of role lookup would hand an
+    // `engine:`-named member any role the group holds — the same shadow-
+    // attribution hazard `validate_assignment`'s F2 guard closes for direct
+    // role assignment (see that comment). Defense-in-depth per UP-11:
+    // reject an `engine:`-prefixed username at this write surface too.
+    if (username.starts_with(kEnginePrefix))
+        return std::unexpected(
+            "principal_id in the reserved 'engine:' namespace cannot be added as a group member");
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_, "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?);", -1,
@@ -1080,7 +1270,23 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
     // an empty source) would mass-DELETE every local group membership
     // fleet-wide on the very next reconcile. Reject outright, before the
     // lock/transaction — no mutation on this rejection either.
-    if (source.empty() || source == "local")
+    //
+    // F3 (Hermes pass-2 H2): reject any source that isn't a recognized IdP
+    // source outright, not just "local"/empty. Without this, a caller
+    // passing source="engine" (or any other unrecognized string) could mint
+    // `engine:`-prefixed "IdP" groups that bypass `has_reserved_idp_prefix`
+    // (which only rejects `source == "local"` writes into the reserved
+    // namespace) and the collision scan below — this path never checks the
+    // reserved-prefix at all. Fail closed on anything outside the
+    // allowlist.
+    bool recognized_source = false;
+    for (auto s : kRecognizedIdpSources) {
+        if (source == s) {
+            recognized_source = true;
+            break;
+        }
+    }
+    if (!recognized_source)
         return std::unexpected("invalid_source");
 
     // UP-9: drop asserted entries whose external_id can't produce a sane
@@ -1263,6 +1469,14 @@ std::vector<std::string> RbacStore::collect_roles_locked(const std::string& user
         return roles;
 
     sqlite3_stmt* s = nullptr;
+    // Three-way UNION: direct user grant, group-membership grant, and (PR
+    // 4.2, design §4.1) direct engine-principal grant. The first two
+    // branches are BYTE-IDENTICAL to their pre-PR-4.2 form — a hard
+    // invariant — because the third branch is purely additive and safe:
+    // an `engine:` principal_id can never match a human username (§3.3
+    // reserves the namespace at every creation surface) and a human/group
+    // name never carries the `engine:` prefix, so this UNION arm can only
+    // ever contribute rows for an actual `principal_type='engine'` caller.
     if (sqlite3_prepare_v2(db_,
                            "SELECT role_name FROM principal_roles "
                            "WHERE principal_type = 'user' AND principal_id = ? "
@@ -1270,11 +1484,15 @@ std::vector<std::string> RbacStore::collect_roles_locked(const std::string& user
                            "SELECT pr.role_name FROM principal_roles pr "
                            "JOIN group_members gm ON pr.principal_type = 'group' AND "
                            "pr.principal_id = gm.group_name "
-                           "WHERE gm.username = ?;",
+                           "WHERE gm.username = ? "
+                           "UNION "
+                           "SELECT role_name FROM principal_roles "
+                           "WHERE principal_type = 'engine' AND principal_id = ?;",
                            -1, &s, nullptr) != SQLITE_OK)
         return roles;
     sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, username.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW)
         roles.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
     sqlite3_finalize(s);
@@ -1484,6 +1702,7 @@ bool RbacStore::check_scoped_permission(const std::string& username,
         auto assignments = mgmt_store->get_group_roles(gid);
         for (const auto& assignment : assignments) {
             // Check if this assignment is for our user
+            // TODO(engine-scope, ADR-0017): engine principal_type scoped resolution is Phase 5
             bool matches = false;
             if (assignment.principal_type == "user" && assignment.principal_id == username)
                 matches = true;

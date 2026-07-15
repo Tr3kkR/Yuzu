@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -50,6 +51,20 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+// Forward-declared rather than pulling in engine_principal_store.hpp here —
+// a scoped enum's underlying type defaults to `int`, so an opaque
+// enum-class-declaration is a valid, self-consistent forward reference. The
+// full definition (and the `.cpp`'s actual use of the enum values) lives in
+// engine_principal_store.hpp, included only by api_token_store.cpp.
+//
+// G8 (governance hardening, cpp-expert N1): the underlying type is pinned
+// `: int` explicitly (rather than relying on the implicit default) on BOTH
+// this forward-declaration and the definition in engine_principal_store.hpp
+// — self-documenting, and removes any ambiguity for either translation unit
+// (a mismatched underlying type between a forward-declaration and its
+// definition is ill-formed, no diagnostic required).
+enum class EngineLookupStatus : int;
 
 struct ApiToken {
     std::string token_id;      // Short display ID (prefix of hash)
@@ -123,6 +138,16 @@ public:
     /// Current number of distinct tokens cached in memory.
     std::size_t cache_size() const;
 
+    /// Injects the engine-principal referential-integrity check used by
+    /// `create_token`'s engine block (design doc §6). Unset by default —
+    /// `create_token` fails closed (rejects every `principal_kind=="engine"`
+    /// mint) until this is wired. server.cpp wires the real resolver
+    /// (`EnginePrincipalStore::get_for_auth`) after both stores open; this
+    /// setter exists so `ApiTokenStore` never constructs an
+    /// `EnginePrincipalStore` itself (would couple two independently-owned
+    /// stores at construction time).
+    void set_engine_referent_check(std::function<EngineLookupStatus(const std::string&)> fn);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
@@ -165,6 +190,12 @@ private:
     // in the revoke txn, or a per-token version column) is tracked in #2173.
     // Keep every fetch_add and every snapshot/re-check.
     std::atomic<uint64_t> revoke_generation_{0};
+
+    // Engine-principal referential-integrity resolver (design doc §6),
+    // injected via `set_engine_referent_check`. Null until server.cpp wires
+    // it post-construction — `create_token` treats null as fail-closed
+    // (never mints an engine token without this check available).
+    std::function<EngineLookupStatus(const std::string&)> engine_referent_check_;
 
     /// Generate a fresh `yuzu_` Bearer token from the platform CSPRNG.
     /// Returns the raw token on success; std::unexpected when the system
