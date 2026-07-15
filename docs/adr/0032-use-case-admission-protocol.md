@@ -292,10 +292,11 @@ Core authorises each such call by looking the run up **server-side** and requiri
    conjunction that revocation cannot reach: kill a leaked worker token and its in-flight runs would
    keep acquiring facts and driving effects for the whole TTL.
 
-**Filter (6) exists because the narrowing law has four filters and this conjunction was quietly
-dropping one.** ADR-0033 §1: `effective authority = operator grants ∩ attenuated credential grants ∩
-Module envelope ∩ execution authorisation`. Filters (2)–(5) covered the operator, the engine and the
-module; nothing covered the **credential**. So a run admitted by a read-only, canary-ring-only token would, for its
+**Filter (6) exists because the narrowing law's applicable factors (ADR-0033 §1) include the
+credential, and this conjunction was quietly dropping it.** §1: `authenticated-actor ∩
+represented-operator ∩ attenuated-credential ∩ Module envelope ∩ execution authorisation`. Filters
+(3)–(5) covered the authenticated engine principal, the represented operator and the module; nothing
+covered the **credential**. So a run admitted by a read-only, canary-ring-only token would, for its
 entire mid-run life, be authorised against its *owner's* full authority — the attenuation would apply
 at admission and evaporate immediately afterwards, which is worse than not having it, because the
 operator believes the worker is confined. The credential's grant set is bound into the run row at
@@ -548,9 +549,10 @@ never partially re-served.**
 Where that rule is enforced, normatively:
 
 1. A cached-result read **is a fast-lane re-admission**. Presentation calls core, not the UCE.
-2. **Core runs the subset check** — and it is the **full four-filter conjunction of Decision 0**,
-   credential term included, against the source run's released-input set as read from core's own
-   release log. Not "the operator's authority": *the requesting credential's* authority. This is the
+2. **Core runs the subset check** — and it is the **applicable conjunction of Decision 0**
+   (the requesting operator's current authority, the requesting credential, and module liveness; the
+   execution-authorisation filter is not-applicable to a read), credential term included, against the
+   source run's released-input set as read from core's own release log. Not "the operator's authority": *the requesting credential's* authority. This is the
    path that actually hands bytes to a caller, so it is the last place that can afford to drop a
    filter — a read-only, canary-ring-only token whose **owner** happens to be allowed the production
    blend must not be able to request the cached result of a run that spans production.
@@ -564,8 +566,10 @@ Where that rule is enforced, normatively:
      one-way-transition pattern as Decision 5's state machine, in Postgres). The CAS is what makes
      "one-use" **true**: two concurrent redemptions, or two engine replicas, produce exactly one
      winner, and core — not the engine — is the one holding the fact.
-   - Core **re-evaluates the subset check — the same full conjunction, credential term included —
-     against authority as it is AT REDEMPTION**, not as it was at mint. This closes the window between
+   - Core **re-evaluates the subset check — the same applicable conjunction (Decision 0): the
+     requesting operator's current authority, the requesting credential, module liveness, and the
+     redeeming engine principal, credential term included — against authority as it is AT
+     REDEMPTION**, not as it was at mint. This closes the window between
      the two: an operator whose scope shrinks, or a credential that is revoked, after the grant is
      minted is denied at redemption. Without this step the check is only as fresh as the TTL, which is
      exactly the S3 hole re-opened at a smaller size.

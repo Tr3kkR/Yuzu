@@ -15,7 +15,7 @@ depends-on: >-
   1005-headless-platform-use-case-engines (every capability is reachable by an external principal;
   this ADR is what "RBAC + audit enforced at the API" concretely means once capabilities can be
   declared by a Module rather than compiled into core).
-  0017-management-group-confinement-list-reads (scope confinement is one of the four narrowing
+  0017-management-group-confinement-list-reads (scope confinement is one of the narrowing
   filters below; this ADR does not restate it).
 related: >-
   0031-presentation-core-engine-decomposition (the process boundary that makes "enforced once, in
@@ -148,7 +148,7 @@ capability is not exempt from the platform's own rules: the **versioned REST twi
 the **A4 error envelope**, its **agentic-context annotations** (track 2g), and its **`data_class` +
 `audit_verb`** so a device-attributable read is countable by construction (ADR-0032 Decision 11 emits
 it with the release-log write). Without these, a module could declare a capability that passes all
-four §1 filters and still ships MCP-only, undiscoverable, or silently uncounted — a second-class
+the applicable §1 filters and still ships MCP-only, undiscoverable, or silently uncounted — a second-class
 capability surface built by the same door we closed on ourselves.
 
 Role administration therefore stays at securable granularity — the role UX does not become a wall of
