@@ -169,8 +169,8 @@ Invocation works like this, and only like this:
   request carries the run identifier and is independently confined by core, against the admitting
   operator's **current** authority — the grant's TTL gates run *start*, not the run's life.
 - **The engine composes, and finalises.** It assembles results from the confined inputs core
-  released to it, and finalises the run with core (canonical result hash + disclosure summary)
-  before release.
+  released to it, finalises the run with core (canonical result hash + disclosure summary), and
+  **redeems the release authorization at core before the first byte moves** (ADR-0032 Decision 12).
 
 One exception to "only like this", named here so the two ADRs cannot be read as contradicting each
 other: serving a **cached** result skips the engine's composition step, but not core. It is a
@@ -478,7 +478,8 @@ being structural.
   request. A view that today does K in-process store reads becomes **K authenticated localhost
   calls** (Decision 6 admits no in-process shortcut), and an engine run adds admission, the
   presentation→engine call, one core call per confined fact read, **a release-log write on the
-  fail-closed critical path of every one of them** (ADR-0032 Decision 11), and finalisation. A
+  fail-closed critical path of every one of them** (ADR-0032 Decision 11), finalisation, and **a
+  seam-4b release-redemption round trip before the first byte renders** (ADR-0032 Decision 12). A
   single localhost round trip is genuinely small against a 250 ms p95 view budget. **K is not
   measured.** Measuring it on the busiest existing dashboard fragment is a **gate on migration step
   4**, not a footnote — sizing a fleet-scale resource off an unmeasured constant is precisely what

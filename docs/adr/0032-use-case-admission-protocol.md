@@ -381,7 +381,10 @@ thing that can die quietly (the `PolicyEvaluator` precedent). So the invariant c
 requirements, and it is worth exactly as much as they are:
 
 - **A ceiling on the module-declared TTL** in core's ratified copy. A module must not be able to
-  declare a run that outlives the evidence for it.
+  declare a run that outlives the evidence for it. It also carries a **floor**: the TTL must cover the
+  *whole* lifecycle - admission, reads, compose, finalise, **and the seam-4b redemption** - not just
+  the reads, or a tight TTL would systematically deny an operator their own just-composed result at the
+  last step (a fail-closed sharp edge, Decision 12).
 - **A liveness metric on the reaper, and an alert on stranded runs** (`admitted` past its TTL). If
   the reaper dies, overdue runs are not *terminalised or audited* - but they are **not
   read-authoritative**, because the inline `now < expires_at` check (filter (1) of Decision 4) denies
@@ -438,7 +441,10 @@ its own attenuation** — the token cannot do the thing, but the schedule it arm
 read the same way - the credential no longer authorises, so the schedule STOPS.** Rotation splits from
 them: a **routine rotation** with a recorded successor (the new credential-level successor +
 terminal-reason relation, interlock item (n) - not 2b §3.1's engine-principal `superseded_by`) re-binds
-the schedule to the successor as an atomic audited authority change and it keeps running; a **compromise revocation** has no
+the schedule to the successor as an atomic audited authority change and it keeps running (no
+equal-or-narrower-attenuation clause is needed here, unlike the plan rebind in ADR-0033 §8: a schedule
+re-evaluates live confinement on **every** run it produces, so it protects no frozen prior approval -
+the successor's own attenuation bounds the next run); a **compromise revocation** has no
 successor for this purpose and stops the schedule like any other revocation. Core keys this on the
 recorded `rotation_superseded`-vs-`compromise` classification, never on "same owner" (the twin of
 ADR-0033 §8's plan-rebind rule). Naming expiry explicitly
@@ -605,7 +611,12 @@ Where that rule is enforced, normatively:
 6. The re-admission **mints its own `use_case_run_id`**, recording `served_from_run_id`, and its
    release-log entry (written at step 5) inherits the source run's released-input set. Without this,
    a second disclosure — to a different principal, at a different time — would leave no evidence
-   anywhere core can read.
+   anywhere core can read. The release-log **dedup key is `(release grant id, serve-run id)`, never the
+   source run alone**: a replay of the *same* grant and serve-run writes no second row (idempotent
+   retry), while a *genuine* re-serve is a new serve-run with a new id and therefore a new row. Core
+   cannot observe delivery, so the key must separate an idempotent retry from a real new disclosure, or
+   the DSAR-critical log over- or under-counts. Since fresh (Decision 12) and cached serves now share
+   this one redemption path, the key governs both.
 7. A **serve-run is short and terminal**: it transits `admitted → finalised` **on redemption** (core
    cannot observe delivery, so it must not pretend to — the receipt attests what core authorised, and
    it carries the *source* run's canonical result hash because the bytes are the same bytes), or
@@ -770,7 +781,8 @@ that finalises but never redeems is an `executing` run past its TTL - caught by
 `yuzu_use_case_runs_stranded` and denied inline (Decision 5), never a silently stuck result. The receipt still
 attests only *integrity* (that the bytes are the bytes finalised under this run); the redeemed release
 authorization is what says *this recipient may receive it now*, and presentation renders only when the
-redemption succeeds. Redemption is **replay-safe**: a crash after the CAS re-runs the conjunction
+redemption succeeds (the check is core's, enforced upstream of presentation by the B2 contract,
+ADR-0031 - presentation never re-implements it, and cannot skip it). Redemption is **replay-safe**: a crash after the CAS re-runs the conjunction
 against authority as it is now - unchanged re-authorises with no second release-log row; shrunk,
 revoked or expired **DENIES** - the same rule as Decision 10. Core authorises the serve; it does not
 observe delivery. A demotion, credential revocation, module pull or run expiry between the last fact
