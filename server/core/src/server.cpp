@@ -776,8 +776,10 @@ public:
         // alert rules can be authored up front; the series simply never
         // increments on a disabled surface.
         metrics_.describe("yuzu_scim_requests_total",
-                          "Total /scim/v2/Users requests, by op "
-                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "Total /scim/v2/Users and /scim/v2/Groups (#2021) requests, by op "
+                          "(create|get|list|replace|patch|delete for Users; "
+                          "group_create|group_get|group_list|group_replace|group_patch|"
+                          "group_delete for Groups) and status (2xx|4xx|5xx)",
                           "counter");
         metrics_.describe("yuzu_scim_auth_failures_total",
                           "Total /scim/v2/* requests rejected by the bearer gate — a "
@@ -798,6 +800,29 @@ public:
                           "provisioning_source is not 'scim' (or its role was elevated outside "
                           "SCIM's ownership) — SCIM attempting to touch an account it does not "
                           "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
+        // SCIM v2 Groups->role application core (#2021). Bumped only when
+        // recompute_scim_user_role ACTUALLY changes a role (promotion or
+        // demotion via group membership) — never on a no-op recompute, and
+        // never for a value that fails the provenance guard (see
+        // yuzu_scim_provenance_denied_total for that refusal class, though
+        // this particular guard doesn't bump it — recompute_scim_user_role
+        // just silently declines).
+        metrics_.describe("yuzu_scim_role_changes_total",
+                          "Total SCIM-provisioned user role changes applied via SCIM Group "
+                          "membership (--scim-admin-group), by the group-membership-driven "
+                          "role-recompute core - a sustained rate is a normal signal of IdP "
+                          "group-membership churn, not itself an anomaly",
+                          "counter");
+        // CC6.7 evidence-gap fix (governance hardening round): bumped when
+        // recompute_scim_user_role's AuthManager::update_role call reports a
+        // genuine AuthDB write failure (row missing/inactive/write error) —
+        // a durable role change that could not be applied, distinct from
+        // yuzu_scim_role_changes_total's success path.
+        metrics_.describe("yuzu_scim_role_change_failures_total",
+                          "Total SCIM-driven role changes that failed to write to AuthDB during "
+                          "group-membership recompute - a sustained non-zero rate means role "
+                          "changes are silently not taking effect",
                           "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
@@ -10540,6 +10565,15 @@ private:
         // entries at all. main.cpp already refuses to start if --scim-enable is
         // set without --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
+            // sec-L3/UP-9 (governance hardening round): trim leading/trailing
+            // ASCII whitespace from the admin-group config value — same
+            // trailing-space silent-lockout bug fixed for
+            // --oidc-admin-group/--saml-admin-group above. Mutate cfg_
+            // itself so every reader of cfg_.scim_admin_group (the routes
+            // registration below, recompute_scim_user_role) sees the
+            // trimmed value.
+            cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
+
             scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
             if (!scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,
@@ -10572,7 +10606,7 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get());
+                                          audit_store_.get(), cfg_.scim_admin_group);
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set

@@ -52,6 +52,7 @@ struct Config {
     bool auto_update{true};                               // --no-auto-update disables
     std::chrono::seconds update_check_interval{6 * 3600}; // --update-check-interval
 
+
     // Guardian DEX (Digital Experience) — fleet-wide crash recorder (slice 1)
     bool dex_disable{false}; // --dex-disable / YUZU_AGENT_DEX_DISABLE: deploy-time opt-out;
                              // when set, the crash recorder never arms and no crash
@@ -103,10 +104,20 @@ public:
     [[nodiscard]] virtual std::vector<std::string> loaded_plugins() const = 0;
 
     /**
-     * True if run() returned because of a fatal STARTUP failure (e.g. the #1303
-     * fail-closed TLS posture refused to connect with no pinnable CA), as opposed
-     * to a normal stop(). main() maps it to a non-zero exit so systemd Restart= /
-     * Docker / Windows SCM observe the failure instead of a silent EXIT_SUCCESS.
+     * True if run() returned because of a FATAL FAILURE rather than a normal stop() — so main()
+     * maps it to a non-zero exit and systemd Restart= / Docker / the Windows SCM observe the
+     * failure instead of a silent EXIT_SUCCESS.
+     *
+     * NOT ONLY A STARTUP FAILURE, DESPITE THE NAME. It covers:
+     *   * a fatal startup failure (e.g. the #1303 fail-closed TLS posture refused to connect with
+     *     no pinnable CA), AND
+     *   * a fatal MID-LIFE failure: a dispatch-thread-pool re-creation that fails on the reconnect
+     *     path (host out of threads). That used to return EXIT_SUCCESS, so the agent simply
+     *     vanished from the fleet — a clean exit fires no Restart=on-failure / k8s OnFailure
+     *     policy, and on Windows it denies FAILURE_ACTIONS the failure exit those actions key on.
+     * The name is a historical narrowing; `Agent` is an exported interface, so it is not renamed
+     * here. If you widen it further, widen this contract and the Windows SCM mapping with it
+     * (service_win.cpp reports specific-error 1 for BOTH). (governance: consistency-auditor.)
      */
     [[nodiscard]] virtual bool startup_failed() const noexcept = 0;
 };
