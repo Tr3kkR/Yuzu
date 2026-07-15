@@ -160,6 +160,13 @@ Corollaries, all normative:
   §8 therefore re-checks the **requesting credential's current grants** alongside the requester's
   authority, and a revoked, deleted or expired requesting credential **voids the plan**.
 
+**The inventory is enforced by a contract test, not a promise.** Decision 0's "finding a new one
+extends this list" is only safe if a drift is caught: **every authorization decision point in the code
+- every place core answers "may this actor do this" - must resolve to a registered seam that runs the
+applicable conjunction, and a build/contract test must fail on an authorization site outside this
+inventory.** Seam 4b's own late discovery is why this is a test rather than a habit - the inventory
+drifts, so the build must catch it (the same posture as INV-31-4's route-enumeration test, ADR-0031).
+
 ### 1. A run is one declared episode (P1)
 
 One admission, one input hash, one scope ceiling, one finalisation. Multi-step work happens
@@ -925,7 +932,7 @@ M3 parity gate — a named gate with a checklist, not a sentence in an ADR.
 | # | Prerequisite | Why A5 cannot ship without it | Status today |
 |---|---|---|---|
 | **(a)** | **Phase-4 engine principals** (ADR-1005 exec plan) | Decision 4's mid-run caller is the engine principal. Without it there is no authenticated identity for the UCE to hold. | `engine` is a **reserved** `principal_class` label; the class is not live. |
-| **(b)** | **The ADR-0017 admit-then-filter gate (PR-A; decision #1714) + its open deny-precedence prerequisite #1715 + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. | **Zero occurrences** of `authorize_list_read` in the server tree; #1715 (global/group deny precedence, PR-A prerequisite) is **OPEN**. #1716 is the closed doc-honesty companion, not this gate - do not read its closure as (b) satisfied. |
+| **(b)** | **The ADR-0017 admit-then-filter gate (PR-A; decision #1714) + its open deny-precedence prerequisite #1715 + a server-internal evaluate-as-operator seam** | Decision 4 confines against the **admitting operator's** current authority while the **engine** is the authenticated caller. Both halves are needed. **And #1715 must resolve with DENY-precedence** (a global deny, or a confinement boundary, must never be overridden by a group allow): resolved the other way, filter (4), seam 4b and Decision 10 redemption all over-authorise a confined operator - the whole confinement edifice rests on this semantics, so the gate cannot ship until #1715 lands deny-precedence. | **Zero occurrences** of `authorize_list_read` in the server tree; #1715 (global/group deny precedence, PR-A prerequisite) is **OPEN**. #1716 is the closed doc-honesty companion, not this gate - do not read its closure as (b) satisfied. |
 | **(c)** | **The D12 audit schema** (acting principal · authority ref · **indexed** `use_case_run_id`) | Decision 12. Without it, "no unjoined evidence" is not merely untested — it is **unqueryable**. Rides the audit-store Postgres migration. | `AuditEvent` has a single `principal` field. |
 | **(d)** | **The P7 release-log schema** | Decision 11 *is* the disclosure evidence, and Decision 10's subset check **reads it**. Ship A5 without it and admitted runs exist whose disclosure cannot be proven from core-owned evidence. | Does not exist. Born-on-PG store, ADR-0012. |
 | **(e)** | **G1 — the cross-process event transport** | Gates **Decision 9 only** (progress/events), not the whole of A5. The buses are process-local. | Open question; must be designed before P4 lands. |

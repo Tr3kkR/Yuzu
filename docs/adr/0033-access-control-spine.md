@@ -129,6 +129,13 @@ a missing input for an *applicable* filter denies. This is what lets the create-
 without paradox: approving a manifest, or granting an approval, runs every filter that applies to
 *that* seam and does not self-referentially require the authority it is about to create.
 
+**The one typing that must not be self-certified is read-vs-effect**, because it decides whether the
+execution-authorisation filter applies at all. It is **not** a free manifest field: it is core's
+ratified mutability class (ADR-0032 Decision 8 / Decision 13), and on the dispatch path it is enforced
+where the module cannot reach - the agent-side read-only envelope refuses a non-read-only action and
+core quarantines on mismatch (ADR-0032 interlock (f)). A manifest that mis-declares an effect as a read
+is caught there and at four-eyes manifest vetting (§2), never trusted because it typed itself.
+
 ### 2. The capability declaration is the RBAC unit (D1-C · G3 · G9)
 
 Each registered tool or capability declares, at registration, a triple plus a tier:
