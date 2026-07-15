@@ -11,11 +11,14 @@
 // narrower race. The caller OWNS the fd/HANDLE lifetime; these functions seek
 // to BEGIN and read, and never close it.
 //
-// Reads at most `max_bytes`; if the content exceeds the cap (a growing / hostile
-// file), the hash is REFUSED (empty return) rather than read unbounded - the
-// same bounded-read guard `sha256_file` carries, so the primitive is safe on the
-// untrusted watched files the Guardian state reader hashes. Plugin-loader callers
-// pass the default (SIZE_MAX), keeping their behaviour byte-identical.
+// Bounded by `max_bytes`: content that exceeds the cap (a growing / hostile
+// file) is REFUSED (empty return) rather than hashed unbounded - the same
+// bounded-read guard `sha256_file` carries, so the primitive is safe on the
+// untrusted watched files the Guardian state reader hashes. (The refusal is
+// checked per 64 KiB block, so up to one block may be read past the cap before
+// it trips; the operation is byte-bounded, not literally "at most max_bytes".)
+// Plugin-loader callers pass the default (SIZE_MAX), keeping their behaviour
+// byte-identical.
 //
 // Returns lowercase hex SHA-256, or an empty string on any error (bad handle,
 // seek/read failure, over-cap, crypto failure). errno / GetLastError is preserved

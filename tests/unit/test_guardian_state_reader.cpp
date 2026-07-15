@@ -114,6 +114,41 @@ TEST_CASE("read_file: a changed file changes the identity/hash across reads", "[
 }
 
 #ifndef _WIN32
+TEST_CASE("read_file: a permission-denied existing file is Known unreadable, not absent/Unknown",
+          "[spark][statereader]") {
+    yuzu::test::TempDir dir;
+    const auto fp = write_file(dir.path, "locked.txt", "secret");
+    std::error_code ec;
+    std::filesystem::permissions(fp, std::filesystem::perms::none, ec);
+    if (ec)
+        SKIP("could not remove file permissions");
+    GuardianStateReader reader;
+    const auto r =
+        reader.read_file(FileSparkParams{.path = fp.string()}, FileReadPlan{.hash_cap = 64});
+    std::filesystem::permissions(fp, std::filesystem::perms::owner_all, ec); // restore for cleanup
+    if (r.known && r.snapshot.readable)
+        SKIP("running as root: permission bits bypassed"); // open() succeeded, file is readable
+    REQUIRE(r.known);                 // the target demonstrably EXISTS (stat succeeded)...
+    REQUIRE(r.snapshot.exists);       // ...so this is a Known "<unreadable>" drift...
+    REQUIRE_FALSE(r.snapshot.readable); // ...never a fabricated present-and-compliant, never Unknown
+}
+
+TEST_CASE("read_file: an unresolvable symlink loop is Unknown, never fabricated present",
+          "[spark][statereader]") {
+    yuzu::test::TempDir dir;
+    std::filesystem::create_directories(dir.path);
+    std::error_code ec;
+    const auto a = dir.path / "a";
+    const auto b = dir.path / "b";
+    std::filesystem::create_symlink("b", a, ec); // a -> b
+    std::filesystem::create_symlink("a", b, ec); // b -> a  (loop)
+    if (ec)
+        SKIP("could not create symlinks");
+    GuardianStateReader reader;
+    const auto r = reader.read_file(FileSparkParams{.path = a.string()}, FileReadPlan{.hash_cap = 64});
+    REQUIRE_FALSE(r.known); // open + stat both ELOOP: cannot determine, so NOT a Known present
+}
+
 TEST_CASE("read_registry off Windows yields Unknown per requested value", "[spark][statereader]") {
     GuardianStateReader reader;
     const auto r = reader.read_registry(

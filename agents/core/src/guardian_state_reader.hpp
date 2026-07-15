@@ -14,10 +14,18 @@
 // STATELESS -> thread-safe by construction: every call resolves from its own
 // params/plan using only locals plus OS handles it opens and closes within the
 // call, so the convergence lanes and the consumer handler may call it
-// concurrently for different keys with no shared mutable state. Reads are
-// bounded (each OS handle is opened and closed inside the call; sd_bus / SCM
-// calls carry their own finite timeouts) and degrade to Unknown rather than
-// fabricate an absent/stopped, per the IStateReader contract.
+// concurrently for different keys with no shared mutable state.
+//
+// BOUNDED/CANCELLABLE (partial): the sd_bus point-read carries an explicit 5s
+// method-call timeout (not the ~25s libsystemd default). The file open/read and
+// the Windows SCM calls are synchronous with no per-read deadline; they are
+// bounded in practice on a local filesystem / a responsive SCM, but a network /
+// FUSE mount stall or a wedged SCM can still block a lane join or the consumer
+// detach until the agent's hard-exit shutdown backstop (PR-A) fires. Full
+// per-read cancellation (a stop token + platform cancellable I/O, or a
+// lifetime-safe bounded I/O executor) is a recorded follow-up, NOT yet done. The
+// reader still never fabricates an absent/stopped from a failure - it degrades to
+// Unknown.
 //
 // Unknown vs Known is the load-bearing distinction: a DEFINITIVE negative (file
 // ENOENT, registry key/value not found, systemd NoSuchUnit, SCM

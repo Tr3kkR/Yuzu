@@ -22,6 +22,7 @@
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
 #include <cstdlib> // free
 #include <optional>
+#include <string_view>
 
 #include <systemd/sd-bus.h>
 
@@ -34,7 +35,8 @@
 
 #include <vector>
 
-#include <win_str.hpp> // yuzu::win::to_wide / from_wide
+#include <win_sc_handle.hpp> // yuzu::win::ScHandle (RAII SC_HANDLE)
+#include <win_str.hpp>       // yuzu::win::to_wide / from_wide
 #endif
 
 namespace yuzu::agent {
@@ -67,6 +69,18 @@ std::int64_t stat_mtime_ns(const struct stat& st) {
 #endif
 }
 
+// Inode change time: unlike mtime it also moves on a content write and cannot be
+// restored by an unprivileged writer (there is no utimes for ctime), so adding it
+// to the mutation-stability check closes a same-size + mtime-preserving in-place
+// write that would otherwise pass revalidation with a stale/mixed digest.
+std::int64_t stat_ctime_ns(const struct stat& st) {
+#ifdef __APPLE__
+    return static_cast<std::int64_t>(st.st_ctimespec.tv_sec) * 1'000'000'000 + st.st_ctimespec.tv_nsec;
+#else
+    return static_cast<std::int64_t>(st.st_ctim.tv_sec) * 1'000'000'000 + st.st_ctim.tv_nsec;
+#endif
+}
+
 // Opaque change-detection token (device + inode); convergence uses it to spot a
 // replace-in-place. NOT part of any verdict.
 std::string file_identity(const struct stat& st) {
@@ -76,6 +90,18 @@ std::string file_identity(const struct stat& st) {
 #endif // !_WIN32
 
 #ifdef _WIN32
+// Close-on-scope guard for an owned HKEY so an exception from the value loop
+// (emplace / to_wide / vector alloc) cannot leak the key.
+struct RegKeyGuard {
+    HKEY h = nullptr;
+    ~RegKeyGuard() {
+        if (h)
+            RegCloseKey(h);
+    }
+    RegKeyGuard(const RegKeyGuard&) = delete;
+    RegKeyGuard& operator=(const RegKeyGuard&) = delete;
+};
+
 // Mirrors guard_registry.cpp's parse_hive (anonymous there, reimplemented here).
 HKEY parse_hive_local(const std::string& hive) {
     if (hive == "HKLM")
@@ -117,26 +143,43 @@ ReadResult<RegistrySnapshot> read_one_value(HKEY h, const std::string& value_nam
     snap.present = true;
     switch (type) {
     case REG_DWORD: {
+        // A malformed (short) payload must NOT decode as a fabricated 0 - that
+        // would falsely comply with an expected value of "0". Require exactly the
+        // declared width, else mark unsupported (fail-loud "<unsupported-type>").
+        if (data_size != sizeof(DWORD)) {
+            snap.supported = false;
+            break;
+        }
         DWORD dw = 0;
-        if (data_size >= sizeof(DWORD))
-            std::memcpy(&dw, data.data(), sizeof(DWORD));
+        std::memcpy(&dw, data.data(), sizeof(DWORD));
         snap.value = std::to_string(dw);
         break;
     }
     case REG_QWORD: {
+        if (data_size != sizeof(std::uint64_t)) {
+            snap.supported = false;
+            break;
+        }
         std::uint64_t qw = 0;
-        if (data_size >= sizeof(std::uint64_t))
-            std::memcpy(&qw, data.data(), sizeof(std::uint64_t));
+        std::memcpy(&qw, data.data(), sizeof(std::uint64_t));
         snap.value = std::to_string(qw);
         break;
     }
     case REG_SZ:
     case REG_EXPAND_SZ: {
-        const auto* wp = reinterpret_cast<const wchar_t*>(data.data());
-        int wlen = static_cast<int>(data_size / sizeof(wchar_t));
-        while (wlen > 0 && wp[wlen - 1] == L'\0')
-            --wlen; // strip trailing NUL terminator(s)
-        snap.value = yuzu::win::from_wide(wp, wlen);
+        if (data_size % sizeof(wchar_t) != 0) { // not a whole number of UTF-16 units
+            snap.supported = false;
+            break;
+        }
+        // Copy into a wchar_t-aligned buffer (a vector<BYTE> is only byte-aligned,
+        // so a typed reinterpret would be misaligned access), then strip trailing
+        // NUL terminator(s).
+        std::wstring w(data_size / sizeof(wchar_t), L'\0');
+        if (!w.empty())
+            std::memcpy(w.data(), data.data(), data_size);
+        while (!w.empty() && w.back() == L'\0')
+            w.pop_back();
+        snap.value = yuzu::win::from_wide(w.c_str(), static_cast<int>(w.size()));
         break;
     }
     default:
@@ -164,22 +207,26 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
         if (e == ENOENT || e == ENOTDIR)
             return read_known(FileSnapshot{}) /* default: exists=false -> "<absent>" */;
         if (e == EACCES || e == EPERM || e == ELOOP) {
-            // The path may exist but we could not open it for read (permission,
-            // or a symlink loop). lstat distinguishes "exists but unverifiable"
-            // (Known drift) from "cannot even determine existence" (Unknown).
-            struct stat ls{};
-            if (::lstat(p.path.c_str(), &ls) == 0) {
+            // We could not open the target for read (permission, or an unresolvable
+            // symlink). Since we FOLLOW symlinks, establish the TARGET's state with
+            // stat (which also follows) - lstat would only prove the LINK exists and
+            // could report a dangling/looping link as present. stat succeeds ->
+            // exists but unreadable (Known drift); stat ENOENT -> target absent
+            // (Known); any other stat failure (a parent-dir search denial, a loop)
+            // -> cannot determine (Unknown), never a fabricated present.
+            struct stat ts{};
+            if (::stat(p.path.c_str(), &ts) == 0) {
                 FileSnapshot snap;
                 snap.exists = true;
-                snap.readable = false; // persistent: permission / symlink loop
-                snap.size = static_cast<std::uint64_t>(ls.st_size);
-                snap.identity = file_identity(ls);
-                snap.mtime_ns = stat_mtime_ns(ls);
+                snap.readable = false; // persistent: permission on an existing target
+                snap.size = static_cast<std::uint64_t>(ts.st_size);
+                snap.identity = file_identity(ts);
+                snap.mtime_ns = stat_mtime_ns(ts);
                 return read_known(std::move(snap));
             }
             if (errno == ENOENT || errno == ENOTDIR)
                 return read_known(FileSnapshot{}) /* default: exists=false -> "<absent>" */;
-            return read_unknown<FileSnapshot>(std::string{"open/lstat: "} + std::strerror(e));
+            return read_unknown<FileSnapshot>(std::string{"open/stat: "} + std::strerror(e));
         }
         return read_unknown<FileSnapshot>(std::string{"open: "} + std::strerror(e));
     }
@@ -214,6 +261,7 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
     if (plan.hash_cap == 0 || snap.size > plan.hash_cap)
         return read_known(std::move(snap));
 
+    std::int64_t ctime_ns = stat_ctime_ns(st); // stability input only; not in the snapshot
     for (int attempt = 0; attempt < kHashAttempts; ++attempt) {
         const std::string h = sha256_from_fd(fd, static_cast<std::size_t>(plan.hash_cap));
         struct stat st2{};
@@ -222,7 +270,7 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
 
         const bool stable = file_identity(st2) == snap.identity &&
                             static_cast<std::uint64_t>(st2.st_size) == snap.size &&
-                            stat_mtime_ns(st2) == snap.mtime_ns;
+                            stat_mtime_ns(st2) == snap.mtime_ns && stat_ctime_ns(st2) == ctime_ns;
         if (stable) {
             // Metadata unchanged across the hash: an empty digest here means a
             // genuine read failure (size is <= cap, so it is not over-cap) ->
@@ -238,6 +286,7 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
         snap.size = static_cast<std::uint64_t>(st2.st_size);
         snap.identity = file_identity(st2);
         snap.mtime_ns = stat_mtime_ns(st2);
+        ctime_ns = stat_ctime_ns(st2);
         if (snap.size > plan.hash_cap)
             return read_known(std::move(snap));
     }
@@ -258,12 +307,34 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
         const DWORD e = GetLastError();
         if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
             return read_known(FileSnapshot{}) /* default: exists=false -> "<absent>" */;
-        if (e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION) {
-            // Exists but locked / no read access -> persistent unreadable drift.
+        if (e == ERROR_SHARING_VIOLATION) {
+            // Held open by someone with a restrictive share mode: the target
+            // demonstrably exists but we cannot read it -> unreadable drift.
             FileSnapshot snap;
             snap.exists = true;
             snap.readable = false;
             return read_known(std::move(snap));
+        }
+        if (e == ERROR_ACCESS_DENIED) {
+            // A bare access denial does not by itself prove the target exists
+            // (it could be a denial on a directory component). Confirm existence
+            // (and grab metadata) before reporting present.
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+                FileSnapshot snap;
+                snap.exists = true;
+                snap.readable = false;
+                snap.size = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+                snap.mtime_ns = static_cast<std::int64_t>(
+                    (static_cast<std::uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                    fad.ftLastWriteTime.dwLowDateTime);
+                return read_known(std::move(snap));
+            }
+            const DWORD ae = GetLastError();
+            if (ae == ERROR_FILE_NOT_FOUND || ae == ERROR_PATH_NOT_FOUND)
+                return read_known(FileSnapshot{}) /* target absent */;
+            return read_unknown<FileSnapshot>(
+                "CreateFileW ACCESS_DENIED + GetFileAttributesExW error " + std::to_string(ae));
         }
         return read_unknown<FileSnapshot>("CreateFileW error " + std::to_string(e));
     }
@@ -291,6 +362,15 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
                                           << 32) |
                                          bi.ftLastWriteTime.dwLowDateTime);
     };
+    // ChangeTime (metadata/content change time) is not in BY_HANDLE_FILE_INFORMATION;
+    // it is the Windows analogue of POSIX ctime for the mutation-stability check
+    // (a same-size + same-write-time in-place write still moves ChangeTime).
+    auto changetime_of = [](HANDLE h) -> std::int64_t {
+        FILE_BASIC_INFO fbi{};
+        if (GetFileInformationByHandleEx(h, FileBasicInfo, &fbi, sizeof(fbi)))
+            return static_cast<std::int64_t>(fbi.ChangeTime.QuadPart);
+        return 0; // unavailable -> contributes a constant; size+mtime+identity still gate
+    };
 
     BY_HANDLE_FILE_INFORMATION bi{};
     if (!info_of(fh, bi))
@@ -317,14 +397,16 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
     if (plan.hash_cap == 0 || snap.size > plan.hash_cap)
         return read_known(std::move(snap));
 
+    std::int64_t change_time = changetime_of(fh); // stability input only; not in the snapshot
     for (int attempt = 0; attempt < kHashAttempts; ++attempt) {
         const std::string h = sha256_from_handle(fh, static_cast<std::size_t>(plan.hash_cap));
         BY_HANDLE_FILE_INFORMATION bi2{};
         if (!info_of(fh, bi2))
             return read_unknown<FileSnapshot>("re-GetFileInformationByHandle error " +
                                               std::to_string(GetLastError()));
+        const std::int64_t ct2 = changetime_of(fh);
         const bool stable = identity_of(bi2) == snap.identity && size_of(bi2) == snap.size &&
-                            mtime_of(bi2) == snap.mtime_ns;
+                            mtime_of(bi2) == snap.mtime_ns && ct2 == change_time;
         if (stable) {
             if (h.empty())
                 return read_unknown<FileSnapshot>("hash read failed");
@@ -334,6 +416,7 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
         snap.size = size_of(bi2);
         snap.identity = identity_of(bi2);
         snap.mtime_ns = mtime_of(bi2);
+        change_time = ct2;
         if (snap.size > plan.hash_cap)
             return read_known(std::move(snap));
     }
@@ -352,8 +435,8 @@ RegistryRead GuardianStateReader::read_registry(const RegistrySparkParams& p,
             out.values.emplace(v, read_unknown<RegistrySnapshot>("unknown hive: " + p.hive));
         return out;
     }
-    HKEY h = nullptr;
-    const LONG rc = RegOpenKeyExW(root, yuzu::win::to_wide(p.key).c_str(), 0, KEY_READ, &h);
+    RegKeyGuard kg;
+    const LONG rc = RegOpenKeyExW(root, yuzu::win::to_wide(p.key).c_str(), 0, KEY_READ, &kg.h);
     if (rc != ERROR_SUCCESS) {
         // Key absent -> every requested value is a KNOWN absent snapshot; any
         // other open error is transient -> Unknown per value.
@@ -367,11 +450,10 @@ RegistryRead GuardianStateReader::read_registry(const RegistrySparkParams& p,
     }
     const auto t0 = std::chrono::steady_clock::now();
     for (const auto& v : plan.value_names)
-        out.values.emplace(v, read_one_value(h, v));
+        out.values.emplace(v, read_one_value(kg.h, v)); // kg closes the key (exception-safe)
     out.latency_us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
             .count());
-    RegCloseKey(h);
 #else
     // The registry type never arms off Windows; a rule that somehow reaches here
     // cannot be evaluated -> Unknown (never a fabricated absent).
@@ -388,6 +470,25 @@ constexpr const char* kDest      = "org.freedesktop.systemd1";
 constexpr const char* kMgrPath   = "/org/freedesktop/systemd1";
 constexpr const char* kMgrIface  = "org.freedesktop.systemd1.Manager";
 constexpr const char* kUnitIface = "org.freedesktop.systemd1.Unit";
+
+// Bound the method calls below so a hung broker cannot exceed this on the read
+// path (the libsystemd default is ~25s). Set once on the connection.
+constexpr std::uint64_t kSdBusTimeoutUs = 5'000'000; // 5s
+
+// Reader-local absence classification. The shared systemd_error_name_is_absence
+// folds org.freedesktop.DBus.Error.ServiceUnknown into "absent", but for calls
+// addressed to the org.freedesktop.systemd1 destination ServiceUnknown means that
+// DESTINATION is unavailable / not activatable (no systemd), NOT that the unit is
+// gone. Treating it as absence would let a reachable bus with no systemd fabricate
+// Known Stopped and falsely satisfy a service-stopped rule. Exclude it here (the
+// genuine unit-gone names NoSuchUnit / UnknownObject / FileNotFound still count).
+bool unit_error_is_absence(const char* name) {
+    if (name == nullptr)
+        return false;
+    if (std::string_view{name} == "org.freedesktop.DBus.Error.ServiceUnknown")
+        return false;
+    return systemd_error_name_is_absence(name);
+}
 } // namespace
 
 ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams& p) {
@@ -407,6 +508,7 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
                 sd_bus_flush_close_unref(b);
         }
     } bus_guard{bus};
+    sd_bus_set_method_call_timeout(bus, kSdBusTimeoutUs); // bound LoadUnit + ActiveState
 
     // Resolve the unit object path (LoadUnit resolves even an inactive unit).
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -419,7 +521,7 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
         if (sd_bus_message_read(reply, "o", &pth) >= 0 && pth && *pth)
             obj_path = pth;
     }
-    const bool load_absence = (r < 0) && systemd_error_name_is_absence(err.name ? err.name : "");
+    const bool load_absence = (r < 0) && unit_error_is_absence(err.name);
     if (reply)
         sd_bus_message_unref(reply);
     sd_bus_error_free(&err);
@@ -437,7 +539,7 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
     std::optional<SystemdState> st;
     if (r >= 0 && s)
         st = parse_active_state(s);
-    else if (systemd_error_name_is_absence(perr.name ? perr.name : ""))
+    else if (unit_error_is_absence(perr.name))
         st = SystemdState::Absent;
     if (s)
         free(s);
@@ -456,28 +558,27 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
 }
 #elif defined(_WIN32)
 ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams& p) {
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    yuzu::win::ScHandle scm;
+    scm.reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
     if (!scm)
         return read_unknown<ServiceRunState>("OpenSCManager error " +
                                              std::to_string(GetLastError()));
-    SC_HANDLE svc = OpenServiceW(scm, yuzu::win::to_wide(p.service_name).c_str(),
-                                 SERVICE_QUERY_STATUS);
+    yuzu::win::ScHandle svc;
+    svc.reset(OpenServiceW(scm.get(), yuzu::win::to_wide(p.service_name).c_str(),
+                           SERVICE_QUERY_STATUS));
     if (!svc) {
         const DWORD e = GetLastError();
-        CloseServiceHandle(scm);
         if (e == ERROR_SERVICE_DOES_NOT_EXIST)
             return read_known(ServiceRunState::Stopped); // R5: absent service -> Stopped
         return read_unknown<ServiceRunState>("OpenService error " + std::to_string(e));
     }
     SERVICE_STATUS_PROCESS ssp{};
     DWORD needed = 0;
-    const BOOL ok = QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+    const BOOL ok = QueryServiceStatusEx(svc.get(), SC_STATUS_PROCESS_INFO,
                                          reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed);
-    const DWORD qerr = ok ? 0u : GetLastError();
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
     if (!ok)
-        return read_unknown<ServiceRunState>("QueryServiceStatusEx error " + std::to_string(qerr));
+        return read_unknown<ServiceRunState>("QueryServiceStatusEx error " +
+                                             std::to_string(GetLastError()));
     switch (ssp.dwCurrentState) {
     case SERVICE_RUNNING:
         return read_known(ServiceRunState::Running);

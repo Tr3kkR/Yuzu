@@ -76,7 +76,7 @@ std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
         if (bytes_read == 0)
             break;
         hashed_total += static_cast<std::uintmax_t>(bytes_read);
-        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+        if (hashed_total > max_bytes) { // exceeds the read cap - refuse (oversize)
             BCryptDestroyHash(hash);
             BCryptCloseAlgorithmProvider(alg, 0);
             return {};
@@ -139,7 +139,7 @@ std::string sha256_from_fd(int fd, std::size_t max_bytes) {
         if (n == 0)
             break;
         hashed_total += static_cast<std::uintmax_t>(n);
-        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+        if (hashed_total > max_bytes) { // exceeds the read cap - refuse (oversize)
             EVP_MD_CTX_free(ctx);
             return {};
         }
