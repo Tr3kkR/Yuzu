@@ -118,6 +118,18 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
 
 # ── 1. Pre-set DSN wins ──────────────────────────────────────────────────
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+  # PgPool (pg_pool.cpp) only injects its statement_timeout/lock_timeout
+  # safety-bound GUCs when PQconninfoParse finds no `options` keyword and
+  # PGOPTIONS is unset - an `options=` in a pre-set DSN (URI query form OR
+  # keyword form) silently disables those bounds (the [pg][hardening] test
+  # "PgPool injects statement_timeout and lock_timeout GUCs"). This is the
+  # one path that takes a caller-supplied DSN (paths 2-4 build DSNs from
+  # constants), so gate it before the per-agent derivation below, which
+  # would otherwise carry an unsafe `options=` straight into PA_DSN.
+  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?\&[:space:]])options= ]] || [[ -n "${PGOPTIONS:-}" ]]; then
+    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options=/PGOPTIONS (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead" >&2
+    exit 1
+  fi
   # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
   # (machine env on Wee Tam) names the agent-0 cluster; agent <n> shifts
   # the port by <n> (Wee Tam: 5433 -> 5434..5436, provisioned by
