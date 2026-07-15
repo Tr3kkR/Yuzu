@@ -115,7 +115,11 @@ std::expected<void, std::string> FsEventsWatchCore::watch(const std::string& key
     std::lock_guard lk(impl_->m);
     if (!impl_->started || !impl_->queue)
         return std::unexpected("FSEvents watch core is not started");
-    if (impl_->entries.contains(key))
+    // Reserve the map slot BEFORE creating the stream: the only throwing
+    // operation (node allocation) happens while nothing needs cleanup, so a
+    // started stream can never leak with a dangling context (sec-M1).
+    auto [it, inserted] = impl_->entries.try_emplace(key);
+    if (!inserted)
         return std::unexpected("duplicate watch key '" + key + "'");
 
     auto entry = std::make_unique<Impl::Entry>();
@@ -124,12 +128,15 @@ std::expected<void, std::string> FsEventsWatchCore::watch(const std::string& key
 
     CFStringRef cf_path =
         CFStringCreateWithFileSystemRepresentation(kCFAllocatorDefault, path.c_str());
-    if (!cf_path)
+    if (!cf_path) {
+        impl_->entries.erase(it);
         return std::unexpected("CFString conversion failed for '" + path + "'");
+    }
     const void* values[1] = {cf_path};
     CFArrayRef cf_paths = CFArrayCreate(kCFAllocatorDefault, values, 1, &kCFTypeArrayCallBacks);
     if (!cf_paths) {
         CFRelease(cf_path);
+        impl_->entries.erase(it);
         return std::unexpected("CFArray creation failed for '" + path + "'");
     }
 
@@ -143,56 +150,57 @@ std::expected<void, std::string> FsEventsWatchCore::watch(const std::string& key
             kFSEventStreamCreateFlagWatchRoot);
     CFRelease(cf_paths);
     CFRelease(cf_path);
-    if (!stream)
+    if (!stream) {
+        impl_->entries.erase(it);
         return std::unexpected("FSEventStreamCreate failed for '" + path + "'");
+    }
 
     entry->stream = stream;
     FSEventStreamSetDispatchQueue(stream, impl_->queue);
     if (!FSEventStreamStart(stream)) {
         FSEventStreamInvalidate(stream);
         FSEventStreamRelease(stream);
+        impl_->entries.erase(it);
         return std::unexpected("FSEventStreamStart failed for '" + path + "'");
     }
-    impl_->entries.emplace(key, std::move(entry));
+    it->second = std::move(entry);
     return {};
 }
 
 void FsEventsWatchCore::unwatch(const std::string& key) {
-    std::unique_ptr<Impl::Entry> entry;
-    dispatch_queue_t queue = nullptr;
-    {
-        std::lock_guard lk(impl_->m);
-        auto it = impl_->entries.find(key);
-        if (it == impl_->entries.end())
-            return; // unknown key — idempotent no-op
-        entry = std::move(it->second);
-        impl_->entries.erase(it);
-        queue = impl_->queue;
-    }
-    teardown_stream(entry->stream);
-    if (queue)
-        dispatch_sync_f(queue, nullptr, &drain_noop); // drain in-flight callbacks
+    // The whole teardown (extract + stop/invalidate + drain) runs under m so
+    // concurrent unwatch()/stop() serialize — the header promises thread-safe
+    // teardown, and an unlocked drain raced stop()'s queue release (C-1).
+    // Holding m across dispatch_sync_f cannot deadlock: callbacks never take m.
+    std::lock_guard lk(impl_->m);
+    auto it = impl_->entries.find(key);
+    if (it == impl_->entries.end())
+        return; // unknown key — idempotent no-op
+    std::unique_ptr<Impl::Entry> entry = std::move(it->second);
+    impl_->entries.erase(it);
+    if (entry && entry->stream)
+        teardown_stream(entry->stream);
+    if (impl_->queue)
+        dispatch_sync_f(impl_->queue, nullptr, &drain_noop); // drain in-flight callbacks
     // entry (the stream's context target) is freed only now, post-drain.
 }
 
 void FsEventsWatchCore::stop() {
-    std::map<std::string, std::unique_ptr<Impl::Entry>> entries;
-    dispatch_queue_t queue = nullptr;
-    {
-        std::lock_guard lk(impl_->m);
-        if (!impl_->started)
-            return;
-        impl_->started = false;
-        entries = std::move(impl_->entries);
-        impl_->entries.clear();
-        queue = impl_->queue;
-        impl_->queue = nullptr;
-    }
+    // Fully serialized with watch()/unwatch() under m, same deadlock argument
+    // as unwatch() — callbacks never take m.
+    std::lock_guard lk(impl_->m);
+    if (!impl_->started)
+        return;
+    impl_->started = false;
+    auto entries = std::move(impl_->entries);
+    impl_->entries.clear();
     for (auto& [key, entry] : entries)
-        teardown_stream(entry->stream);
-    if (queue) {
-        dispatch_sync_f(queue, nullptr, &drain_noop); // no emit runs past this point
-        dispatch_release(queue);
+        if (entry && entry->stream)
+            teardown_stream(entry->stream);
+    if (impl_->queue) {
+        dispatch_sync_f(impl_->queue, nullptr, &drain_noop); // no emit runs past this point
+        dispatch_release(impl_->queue);
+        impl_->queue = nullptr;
     }
     // Callbacks are fully drained — safe to drop them (and the entries) now.
     impl_->emit = nullptr;

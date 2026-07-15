@@ -135,7 +135,9 @@ TEST_CASE("FileGuard file-exists: detects deletion in realtime", "[guardian][gua
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // let the watch arm
+    // Arm-edge sync (not a sleep): present == expected emits one compliant edge
+    // once the watch is live — mutating before it races stream setup on loaded CI.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
     fs::remove(target);
     CHECK(col->wait_for_detected("<absent>", std::chrono::seconds(5)));
     g.stop();
@@ -186,7 +188,8 @@ TEST_CASE("FileGuard file-exists: expect-absent detects creation", "[guardian][g
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // arm (compliant: absent==expected)
+    // Arm-edge sync: absent == expected emits the compliant edge once live.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
     write_file(target);
     CHECK(col->wait_for_detected("<present>", std::chrono::seconds(5)));
     g.stop();
@@ -269,7 +272,8 @@ TEST_CASE("FileGuard file-hash-equals: detects a content change", "[guardian][gu
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // arm + baseline (compliant edge)
+    // Arm-edge sync: baseline-on-arm emits the compliant edge once live.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
     CHECK(col->drift_count() == 0); // baseline-on-arm is compliant, not drift
     write_file(target, "version-two-different"); // content changes
     REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
@@ -299,7 +303,8 @@ TEST_CASE("FileGuard file-hash-equals: identical-content rewrite stays quiet",
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // baseline (compliant edge)
+    // Arm-edge sync: baseline-on-arm emits the compliant edge once live.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
     write_file(target, "unchanging"); // rewrite SAME bytes → notification, but hash unchanged
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // settle + eval window
     g.stop();
@@ -418,28 +423,88 @@ TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
     cfg.rule_id = "fg-resil";
     cfg.path = target.string();
     cfg.expect_present = true;
-    cfg.event_debounce_ms = 50;
+    // This case asserts TWO distinct drifts and (edge-synced) can produce them
+    // within one debounce window, where the collapse-with-count design folds the
+    // second into a never-sent follow-up. Debounce isn't under test here: 0 =
+    // emit every drift.
+    cfg.event_debounce_ms = 0;
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Arm-edge sync: present == expected emits the compliant edge once live.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
 
     // 1) delete the whole parent directory → file is absent → drift. (Count drifts,
     //    not raw events — arming present emitted a compliant edge first, Slice B.)
     fs::remove_all(parent);
     REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
+    const auto after_drift = col->size();
 
-    // 2) recreate the parent + file (compliant again), then delete once more — the
-    //    guard must still be live and detect again (Windows: re-armed via the
+    // 2) recreate the parent + file — the guard must go compliant again (a fresh
+    //    edge event, which doubles as the re-arm/re-baseline sync), then delete
+    //    once more and it must detect again (Windows: re-armed via the
     //    nearest-ancestor watch; macOS: the path-based FSEvents stream survives
     //    the recreation outright).
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     fs::create_directories(parent);
     write_file(target);
-    std::this_thread::sleep_for(std::chrono::milliseconds(400)); // let it re-arm + re-baseline present
+    REQUIRE(col->wait_count(after_drift + 1, std::chrono::seconds(5))); // the clear edge
     fs::remove(target);
     CHECK(col->wait_drift_count(2, std::chrono::seconds(5))); // second <absent> drift proves survival
     g.stop();
     fs::remove_all(base);
+}
+
+TEST_CASE("FileGuard file-exists: arms with a never-existed parent and detects its creation",
+          "[guardian][guard][file][resilience]") {
+    // Parent directory does not exist at arm time: the guard reports the initial
+    // <absent> drift, holds the watch via its backstop (Windows: nearest-ancestor
+    // notification; macOS: ancestor FSEvents stream / degraded re-arm), and goes
+    // compliant once the parent chain + file appear.
+    const auto base = yuzu::test::unique_temp_path("yuzu_test_fileguard-noparent");
+    fs::create_directories(base);
+    const auto parent = base / "missing";
+    const auto target = parent / "watched.txt";
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-noparent";
+    cfg.path = target.string();
+    cfg.expect_present = true;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(g.start());
+    REQUIRE(col->wait_for_detected("<absent>", std::chrono::seconds(5))); // initial drift
+
+    fs::create_directories(parent);
+    write_file(target);
+    // Compliant edge proves the backstop re-armed onto the newly-created parent.
+    CHECK(col->wait_compliant(std::chrono::seconds(10)));
+    g.stop();
+    fs::remove_all(base);
+}
+
+TEST_CASE("FileGuard file-exists: non-ASCII filename deletion is detected",
+          "[guardian][guard][file][unicode]") {
+    // café.txt exercises the non-ASCII paths: Windows matches via wide ordinal
+    // compare; macOS bypasses the ASCII prefilter (APFS Unicode folding — a
+    // missed wake would be a missed drift).
+    const auto dir = yuzu::test::unique_temp_path("yuzu_test_fileguard-uni");
+    fs::create_directories(dir);
+    const auto target = dir / "caf\xC3\xA9.txt"; // UTF-8 é
+    write_file(target);
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-uni";
+    cfg.path = target.string();
+    cfg.expect_present = true;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(g.start());
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
+    fs::remove(target);
+    CHECK(col->wait_for_detected("<absent>", std::chrono::seconds(5)));
+    g.stop();
+    fs::remove_all(dir);
 }
 
 TEST_CASE("FileGuard file-hash-equals: continuous sub-settle writes still get hashed (defer cap)",
@@ -461,14 +526,17 @@ TEST_CASE("FileGuard file-hash-equals: continuous sub-settle writes still get ha
     cfg.event_debounce_ms = 50;
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(250)); // arm + baseline v0
+    // Arm-edge sync: baseline-on-arm emits the compliant edge once live.
+    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
 
     for (int i = 1; i <= 14; ++i) { // ~1.4s of continuous changing writes < settle_ms apart
         write_file(target, "v" + std::to_string(i));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    // Without the defer cap this would never fire (settle never quiesces).
-    CHECK(col->wait_count(1, std::chrono::seconds(3)));
+    // Without the defer cap this would never fire (settle never quiesces). Count
+    // DRIFTS — the arm-time compliant edge already satisfies a raw event count,
+    // which made the old wait_count(1) assertion vacuous (QE-M1).
+    CHECK(col->wait_drift_count(1, std::chrono::seconds(3)));
     g.stop();
     fs::remove_all(dir);
 }

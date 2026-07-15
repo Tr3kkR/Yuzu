@@ -512,6 +512,16 @@ namespace {
 // deaf-forever; the healthy path stays fully event-driven (no poll).
 constexpr std::chrono::milliseconds kArmFailRetry{30000};
 
+// Healthy-mode liveness backstop (UP-1/UP-2): an FSEvents stream has no death
+// signal — if fseventsd restarts (or the target lives on a network volume whose
+// remote-origin changes FSEvents never reports), an untimed wait would be deaf
+// forever while the rule reads armed. Re-evaluate on this cadence so the worst
+// case degrades to a slow poll, never silence — the same philosophy as the TAR
+// ES stream's idle self-heal (docs/darwin-compat.md). Deliberately long: the
+// healthy path stays event-driven; this is one cheap stat (exists mode) or one
+// bounded hash per 15 minutes.
+constexpr std::chrono::milliseconds kIdleRecheck{15 * 60 * 1000};
+
 // Wake state shared between the FSEvents emit callback (core delivery queue),
 // stop() (engine thread) and run() (watch thread). Allocated in start() and
 // owned through the opaque stop_event_ member; deleted in stop() AFTER the
@@ -519,8 +529,9 @@ constexpr std::chrono::milliseconds kArmFailRetry{30000};
 struct DarwinWake {
     std::mutex m;
     std::condition_variable cv;
-    bool event{false}; // a change touched our target (or was unattributable)
-    bool rearm{false}; // ancestor fired / unattributable → re-resolve the watch
+    bool event{false};     // a change touched our target (or was unattributable)
+    bool rearm{false};     // unattributable on the dir stream → re-resolve the watch
+    bool anc_event{false}; // the ancestor backstop fired (the parent may now exist)
 };
 
 // ASCII case-insensitive equality. APFS is case-insensitive (case-preserving)
@@ -612,17 +623,30 @@ void FileGuard::run() try {
         // Emit callback — runs on the core's delivery queue: filter, flip the
         // wake flags, notify. Never blocks, never calls back into the core.
         [&dir_path, &fname, fname_ascii_only, wake](const FsWatchEvent& e) {
-            bool ours = e.must_reconcile || e.key == "anc";
+            // Ancestor-backstop events are only a "parent may exist now" hint —
+            // never a reconcile trigger by themselves (the run loop stat-gates
+            // them; an absent parent means volume churn is noise, CH-2).
+            if (e.key == "anc") {
+                {
+                    std::lock_guard lk(wake->m);
+                    wake->event = true;
+                    wake->anc_event = true;
+                }
+                wake->cv.notify_all();
+                return;
+            }
+            bool ours = e.must_reconcile;
             if (!ours && !e.path.empty()) {
                 std::string p = e.path;
                 while (p.size() > 1 && p.back() == '/')
                     p.pop_back(); // FSEvents may report directories with a trailing slash
                 const std::string base = fs::path(p).filename().string();
                 // Ours: the changed item is our target (by name), or the parent
-                // dir itself (dir-level event → can't attribute → reconcile), or
+                // dir itself (dir-level event → can't attribute → reconcile; the
+                // compare is case-insensitive like the filename one — APFS), or
                 // either name leaves ASCII (Unicode folding — see has_non_ascii).
-                ours = p == dir_path || iequals_ascii(base, fname) || !fname_ascii_only ||
-                       has_non_ascii(base);
+                ours = iequals_ascii(p, dir_path) || iequals_ascii(base, fname) ||
+                       !fname_ascii_only || has_non_ascii(base);
             } else if (!ours && e.path.empty()) {
                 ours = true; // no path — can't attribute, reconcile
             }
@@ -631,7 +655,7 @@ void FileGuard::run() try {
             {
                 std::lock_guard lk(wake->m);
                 wake->event = true;
-                if (e.must_reconcile || e.key == "anc")
+                if (e.must_reconcile)
                     wake->rearm = true;
             }
             wake->cv.notify_all();
@@ -665,25 +689,36 @@ void FileGuard::run() try {
         if (dir_res && fs::is_directory(dir_path, ec))
             return;
         fs::path anc = parent.empty() ? fs::path{} : parent.parent_path();
-        while (!anc.empty() && !fs::is_directory(anc, ec))
+        while (!anc.empty() && anc != anc.root_path() && !fs::is_directory(anc, ec))
             anc = anc.parent_path();
-        auto anc_res = anc.empty()
-                           ? std::expected<void, std::string>(
-                                 std::unexpected("no existing ancestor directory"))
+        // NEVER pin the backstop to the volume root: a FileEvents stream on "/"
+        // receives every event on the volume, and each would cost at least a
+        // stat here (CH-2 storm). If the nearest existing ancestor IS the root,
+        // fall back to the bounded 30s re-arm poll instead.
+        const bool anc_usable = !anc.empty() && anc != anc.root_path();
+        auto anc_res = !anc_usable
+                           ? std::expected<void, std::string>(std::unexpected(
+                                 "no usable ancestor (root refused — degraded poll)"))
                            : core.watch("anc", anc.string());
-        if (!dir_res && !anc_res) {
-            arm_retry = true; // both arms failed → bounded degraded re-arm (no deaf-forever)
-            spdlog::warn("Guardian FileGuard[{}]: no watch armed for {} (dir: {}; ancestor: {}) — "
-                         "degraded re-arm in {}ms",
-                         cfg_.rule_id, cfg_.path, dir_res.error(), anc_res.error(),
-                         kArmFailRetry.count());
+        if (!anc_res) {
+            // We only reach here when the parent is absent or the dir stream
+            // failed. Without a usable backstop, delivery is not guaranteed
+            // even if the dir stream nominally armed (never-existed roots) —
+            // degrade to the bounded re-arm poll (no deaf-forever).
+            arm_retry = true;
+            spdlog::warn("Guardian FileGuard[{}]: degraded watch for {} (dir: {}; ancestor: {}) — "
+                         "re-arm in {}ms",
+                         cfg_.rule_id, cfg_.path,
+                         dir_res ? std::string("armed, parent absent") : dir_res.error(),
+                         anc_res.error(), kArmFailRetry.count());
         }
     };
 
     bool hash_pending = false; // a change is settling before we (re)hash
     std::chrono::steady_clock::time_point settle_first{}; // when the settle window began
 
-    spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [FSEvents]", cfg_.rule_id, cfg_.path,
+    spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [resilient, FSEvents]", cfg_.rule_id,
+                 cfg_.path,
                  hash_mode ? "hash-equals"
                            : (cfg_.expect_present ? "expect present" : "expect absent"));
     arm_watch();
@@ -695,8 +730,10 @@ void FileGuard::run() try {
         // Timeout selection (no busy-poll): a settling hash change uses the settle
         // window, but bounded by max_settle_defer so a continuous write storm cannot
         // starve the hash forever (UP-1); a failed-to-arm watch uses a degraded retry;
-        // otherwise block on the FSEvents wake.
+        // otherwise block on the FSEvents wake, bounded by the idle liveness
+        // recheck (kIdleRecheck — silent stream death / network volumes).
         bool woke = true;
+        bool idle_recheck = false;
         if (hash_mode && hash_pending) {
             const auto deferred = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::steady_clock::now() - settle_first)
@@ -711,7 +748,8 @@ void FileGuard::run() try {
         } else if (arm_retry) {
             woke = wake->cv.wait_for(lk, kArmFailRetry, woken);
         } else {
-            wake->cv.wait(lk, woken);
+            woke = wake->cv.wait_for(lk, kIdleRecheck, woken);
+            idle_recheck = !woke;
         }
         if (stop_.load(std::memory_order_acquire))
             break;
@@ -727,16 +765,46 @@ void FileGuard::run() try {
                 arm_watch(); // degraded re-arm
                 ev.eval_now();
                 lk.lock();
+            } else if (idle_recheck) {
+                // Liveness backstop: nothing arrived for kIdleRecheck. Re-read
+                // real state (no stream churn — the stream is presumed alive;
+                // if it silently died, drift is still caught at this cadence).
+                lk.unlock();
+                ev.eval_now();
+                lk.lock();
             }
             continue;
         }
 
         const bool rearm = wake->rearm;
+        const bool anc = wake->anc_event;
         wake->event = false;
         wake->rearm = false;
+        wake->anc_event = false;
         lk.unlock();
+        if (anc && !rearm) {
+            // Ancestor-backstop hint: only meaningful if the parent now exists —
+            // re-arm the dir stream and evaluate. While the parent is still
+            // absent this is volume churn under the ancestor: one stat, no
+            // stream teardown, no eval (nothing under an absent parent can have
+            // changed for our target) — the CH-2 storm damper.
+            std::error_code ec;
+            if (fs::is_directory(dir_path, ec)) {
+                arm_watch();
+                if (hash_mode) {
+                    if (!hash_pending) {
+                        hash_pending = true;
+                        settle_first = std::chrono::steady_clock::now();
+                    }
+                } else {
+                    ev.eval_exists();
+                }
+            }
+            lk.lock();
+            continue;
+        }
         if (rearm)
-            arm_watch(); // unattributable / ancestor / fault → re-resolve from scratch
+            arm_watch(); // unattributable / fault → re-resolve from scratch
         if (hash_mode) {
             // Defer the (expensive, mid-write-prone) hash to the settle timeout;
             // each further change restarts the (bounded) settle countdown.
