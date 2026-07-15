@@ -306,12 +306,15 @@ Alice's worker can never approve Alice's other worker.
 
 **A scheduled run has no interactive operator, and that is exactly where a root goes missing.**
 P11 says the requester root is the admitting operator — but a 03:00 cron-style run admits itself.
-Its root is therefore **bound at arming time**, and it is the schedule's **admitting operator** for
-every run it produces (ADR-0032 Decision 7 — the same human, named twice, never two people). Their
-authority is **re-checked at every execution** (§8), so a departed or demoted scheduler does not keep
-dispatching effects from beyond the grave. A schedule whose armer can no longer perform the action
-**stops**; it does not fall back to the engine's owner, and it does not run as a system principal.
-**There is no unrooted effect.**
+Two distinct roles are **bound at arming time** (ADR-0032 Decision 7, which keeps them apart): the
+schedule's **admitting operator** - the *armer*, whose CURRENT authority confines every run it
+produces - and the **four-eyes requester root**, which is the set of humans who authored the effect
+(below) and includes the armer only if they authored it. The armer's authority is **re-checked at
+every execution** (§8), so a departed or demoted scheduler does not keep dispatching effects from
+beyond the grave: a schedule whose armer can no longer perform the action **stops**, does not fall back
+to the engine's owner, and does not run as a system principal. **There is no unrooted effect** - and,
+because the four-eyes root is the author-set and not the armer, neither the armer nor an author can
+approve the schedule's effect.
 
 **"Last modified" must never launder the root.** The naive rule — *the human who created or last
 modified the schedule* — is a four-eyes bypass with a one-character edit: Alice authors an
