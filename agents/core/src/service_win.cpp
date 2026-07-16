@@ -203,13 +203,28 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
 
         spdlog::default_logger()->flush();
 
-        if (agent->startup_failed())
+        // AN EXPLICIT OPERATOR STOP ALWAYS WINS, AND IT IS TESTED FIRST.
+        //
+        // A `sc stop` can RACE a fatal failure (a dispatch-pool re-creation that fails on the
+        // reconnect path at the same moment). With the failure tested first, we would report a
+        // service-specific error -- and because --install-service sets
+        // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, the SCM would then run its recovery actions and
+        // RESTART THE SERVICE THE OPERATOR JUST STOPPED. An explicit stop is the one signal that is
+        // unambiguously intentional; it must never be overridden by a failure that arrived with it.
+        // (governance: unhappy-path B-7.)
+        if (g_stop_requested.load(std::memory_order_relaxed)) {
+            report_status(SERVICE_STOPPED);
+        } else if (agent->startup_failed()) {
+            // specific=1 now covers TWO causes: a fatal STARTUP failure (agent construction, or the
+            // fail-closed TLS posture with no pinnable CA) AND a fatal MID-LIFE failure (the
+            // dispatch pool could not be re-created -- host out of threads). Both mean "could not
+            // continue", both should run the SCM's recovery actions, and the log file carries the
+            // actual reason. Documented in server-admin.md. (governance: consistency-auditor.)
             report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/1);
-        else if (!g_stop_requested.load(std::memory_order_relaxed))
+        } else {
             // run() returned on its own, without a STOP/SHUTDOWN control -- unexpected.
             report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/2);
-        else
-            report_status(SERVICE_STOPPED);
+        }
     } catch (const std::exception& e) {
         // service_main is a raw WINAPI callback invoked directly by the SCM
         // dispatcher thread -- an exception must never cross that C ABI boundary
