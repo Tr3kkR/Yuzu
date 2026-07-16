@@ -129,6 +129,14 @@ The per-vulnerability ranking score a remediation queue is actually ordered by: 
 
 CAVM's assurance measure underneath its other scoring outputs (ADR-4003): the confidence distribution across reachability edges, and the proportion of nodes carrying a confirmed asset identity across data sources. A rising **AMAPC** drawn from falling graph coverage is not evidence of anything — coverage qualifies every other CAVM metric and is reported alongside them, not beneath them. Measures the reachability *graph's* completeness, not CVE-assessment completeness — a deliberately distinct name from any per-endpoint finding-assessment coverage metric, so the two never sit ambiguously side by side on a dashboard.
 
+## Gate state
+
+A field on a `triaged` or `mitigated` finding (ADR-4004) marking whether it's under active remediation scheduling and, if so, how protected it is from being silently re-prioritized by routine rescoring: `none` (unscheduled), `scheduled` (a change record raised), `in_progress` (change window open, no rescore interrupts), or `deferred` (an explicit, TTL-bound pause). Null for every other disposition — it answers a narrower question than the disposition lifecycle itself.
+
+## Assessment coverage
+
+The vulnerability-management module's own coverage metric, named by ADR-4004: the UNKNOWN-fraction and LOW-provenance-fraction of a device's assessed packages, stamped as-of-inventory — the honest measure of "how much did we actually assess," not inferable from the vulnerability count (the underlying assessment axis is ADR-0019's). Measures per-endpoint CVE-assessment completeness specifically — a deliberately distinct name from any reachability-graph coverage metric, so the two never sit ambiguously side by side on a dashboard.
+
 ## Component inventory
 
 The per-endpoint census of individual software *components* — including ones no package manager
