@@ -44,7 +44,7 @@ enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
     constexpr std::string_view kBtn = "##BTN##";
     constexpr std::string_view kErr = "##ERR##";
 
-    if (out.rfind(kBtn, 0) == 0) {
+    if (out.starts_with(kBtn)) {
         const std::string_view button = out.substr(kBtn.size());
         // `display dialog` echoes the literal button label we specified.
         if (button == "OK") return DialogOutcome::ok;
@@ -55,7 +55,7 @@ enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
         return DialogOutcome::not_reachable;
     }
 
-    if (out.rfind(kErr, 0) == 0) {
+    if (out.starts_with(kErr)) {
         const std::string_view err_num = out.substr(kErr.size());
         // -128 is AppleScript's "user canceled"; everything else (no window
         // server, not authorised, app not running, …) is a delivery failure.
