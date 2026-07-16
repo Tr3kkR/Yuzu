@@ -21,6 +21,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
 #include "test_route_sink.hpp"
@@ -52,7 +53,11 @@ struct OidcRoutesFixture {
     Config                                cfg{};
     yuzu::MetricsRegistry                 metrics; // wired so yuzu_auth_oidc_login_total fires
     auth::AuthManager                     auth_mgr{};
-    std::unique_ptr<ApiTokenStore>        api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
     std::unique_ptr<AuditStore>           audit_store;
     std::unique_ptr<AnalyticsEventStore>  analytics;
     std::shared_mutex                     oidc_mu;
@@ -63,17 +68,15 @@ struct OidcRoutesFixture {
     OidcRoutesFixture() {
         fs::create_directories(tmp.path);
         auth_mgr.set_metrics_registry(&metrics);
-        api_tokens  = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
         REQUIRE(audit_store->is_open());
         REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
             /*rbac_store=*/nullptr,
-            api_tokens.get(),
+            /*api_token_store=*/nullptr,
             audit_store.get(),
             /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr,
