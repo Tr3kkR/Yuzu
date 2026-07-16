@@ -26,27 +26,105 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
-  The TSan leg preloads `/tmp/libgai_sync_shim.so` (built inline from a
-  ~30-line C file at job start) to replace glibc's `getaddrinfo_a()` async
-  DNS path with synchronous `getaddrinfo()` on the calling thread. Required
-  because cpp-httplib enables `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON`
-  by default (vcpkg port), which makes glibc spawn an async-DNS helper
-  thread via `clone3` directly — bypassing TSan's `pthread_create`
-  interceptor — so the helper's per-thread allocator state is never
-  initialised and the first `malloc()` from it segfaults inside
-  `__tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8)` (#438).
-  Scoped to the TSan job via step-level `env: LD_PRELOAD`; production
-  keeps the non-blocking-DNS behaviour. The same shim is mirrored into
-  `sanitizer-tests.yml` so `/test --full` benefits identically.
+  The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
+  `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
+  calling thread. Required because cpp-httplib enables
+  `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON` by default (vcpkg port), which
+  makes glibc spawn an async-DNS helper thread via `clone3` directly —
+  bypassing TSan's `pthread_create` interceptor — so the helper's per-thread
+  allocator state is never initialised and the first `malloc()` from it
+  segfaults inside `__tsan::SizeClassAllocator64LocalCache::Allocate
+  (this=0x8)` (#438). Scoped to the TSan job via step-level `env: LD_PRELOAD`;
+  production keeps the non-blocking-DNS behaviour. The shim is built by
+  `scripts/ci/build-gai-sync-shim.sh` — a **single** script shared by both this
+  workflow and `sanitizer-tests.yml` so the two can't drift (#1038 CS-03); it
+  compiles with `gcc-15 -Werror` and `_Static_assert`s glibc's private
+  `struct gaicb` layout (`ar_result`=24, `__return`=32, `sizeof`=56), so an ABI
+  reshuffle fails the build loudly instead of silently corrupting adjacent
+  memory. Built into `$RUNNER_TEMP`, not a fixed `/tmp` path, because Big Tam
+  runs 4 runner agents under one OS identity and a fixed path is a cross-job
+  collision class (#1038 R-15).
 
-  On Test failure, the TSan job's `Capture stack trace under gdb`
-  diagnostic re-runs `yuzu_server_tests` under `gdb -batch` with the
-  Catch2 seed replayed, dumps `thread apply all bt full` + `info
-  registers`, and rides the existing `meson-testlog-tsan` artifact.
+  On Test **failure or job cancellation**, the TSan job's `Capture stack trace
+  under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
+  failing test binary from the meson junit, maps each to its binary+args via
+  `meson introspect`, and replays each under `gdb -batch` with its own Catch2
+  seed and shard filter, dumping `thread apply all bt full` + `info registers`
+  into `build-linux-tsan/stack-capture.log`, which rides the `meson-testlog-tsan`
+  artifact (uploaded on `failure() || cancelled()`). The cancelled path is the
+  60-min-timeout **hang** case: it infers the unfinished entries and
+  SIGINT-interrupts gdb for a live backtrace. Best-effort — it always exits 0
+  and never changes pass/fail. **Guard note (#1038):** the step's `if:` must keep
+  an explicit `failure() || cancelled()`; a bare `steps.test.outcome ==
+  'failure'` gets an implicit `success()` ANDed on and is unreachable — that
+  defect silently skipped this step on every red nightly from 2026-05-15 to
+  2026-07-14.
 
 `workflow_dispatch` only works once a workflow file exists on the **default
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
+
+## Gates outside the tier ladder
+
+### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
+
+The five Yuzu **application** images' compose healthchecks depend on a tool baked
+into the image, not on the application: **bash + `/dev/tcp` + `grep`** for
+`yuzu-server`, **busybox `wget --spider`** for `yuzu-gateway`, and
+**`/bin/busybox`** (by absolute path) for the three FROM-scratch chisel images.
+Nothing else exercises those tools. A base-image swap, a dropped apt package, or a
+chisel slice change that stops shipping the busybox symlink breaks nothing at
+build time and nothing at boot — it breaks only the healthcheck, so Compose parks
+every container `unhealthy` forever and anything with `depends_on: condition:
+service_healthy` never starts, with no application failure to point at.
+
+`yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
+is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
+role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`
+is gated **pre-emptively**: no compose healthchecks an agent image today.
+
+The probes are a hard-coded copy of the healthcheck commands, so both the script
+and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
+defines one — including the two easy-to-miss ones,
+`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
+`pre-release.yml`.
+
+`scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
+real healthcheck probe **against a live HTTP listener** in a shared network
+namespace, so exit 0 is the only passing outcome. Probing a *closed* port cannot
+distinguish a working bash from a bash built without net redirections — both
+return 1 — which is why the naive "accept 0 or 1" check that #751 originally
+proposed passes a broken image (verified against a bash compiled
+`--disable-net-redirections`).
+
+**Placement — it runs in two places, sharing one script:**
+
+| Where | When | Why |
+|---|---|---|
+| `docker-healthcheck-invariants.yml` | PRs + pushes to `dev`/`main` | Catches a base-image swap in the PR that introduces it, not weeks later at release. |
+| `release.yml` (`docker-publish`, `docker-publish-chisel`) | Between image build and registry push | A broken image is never published. Verifying after the push would leave a broken tag in GHCR. |
+
+It is deliberately **not** in `ci.yml`: the Tier-1 fast path must stay under 10
+min and these builds are far too heavy. It is equally deliberately **not**
+`paths:`-filtered — per #1978, a path-filtered workflow that later becomes a
+*required* check never reports on PRs it filters out, so the check sits at
+"Expected — waiting for status" forever and a non-admin can never merge. Instead
+the workflow always runs and a cheap `changes` job skips the build matrix.
+
+That is necessary but **not sufficient for a matrix job**. Per `actions/runner#952`
+a matrix job skipped at the job level is skipped *before* the matrix expands, so it
+emits none of its inner check-run names — "skipped" never appears and the required
+context hangs anyway. A `required-check-stubs` job (mirroring `ci.yml`'s
+`docs-required-checks`) emits the five `Verify <role> healthcheck invariant` names
+when the matrix is skipped, and fails red rather than hanging if the classifier
+itself dies. **Only with that stub are the five contexts safe to add to branch
+protection.**
+
+The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
+with no `cache-to`), so it never evicts release layers and adds no cache directory
+`cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
+likewise has no `cache-to`: it shares one buildkitd instance with the push build,
+so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 ## Self-hosted runner topology
 
@@ -157,7 +235,13 @@ Resolution order inside the script:
    Wee Tam server-suite timeouts). Until a box is provisioned with the
    extra clusters the script falls back to the shared pre-set DSN with a
    `::warning` — no flag day. Runners without a `-<n>` suffix use the DSN
-   as-is.
+   as-is. **The DSN must not set `options=`, and `PGOPTIONS` must be unset
+   in the job environment** (checked unconditionally, before path
+   selection) — either silently disables PgPool's `statement_timeout`/
+   `lock_timeout` safety-bound GUCs (`pg_pool.cpp`'s `conninfo_has_options_`
+   gate), caught by the `[pg][hardening]` test "PgPool injects
+   statement_timeout and lock_timeout GUCs". Put durability tuning in
+   `postgresql.conf` via `ALTER SYSTEM` instead (#2167).
 2. **Docker** (self-hosted Linux) — idempotent persistent container
    (`docker start` || `docker run --restart unless-stopped`, image pinned
    to the same digest as `deploy/docker/Dockerfile.postgres`'s base;

@@ -186,6 +186,17 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
+
+The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
+a **fresh-start cutover with no data migration** — every pre-upgrade API token and MCP token stops
+working the instant the new server starts (interactive cookie-session/SSO login is unaffected).
+**Re-mint every API/MCP bearer token** after upgrading (`POST /api/v1/tokens`) and update the
+credential wherever it is stored; plan a maintenance window and notify automation owners, since all
+bearer-token integrations break at once. A boot-time warning names the legacy file (inert,
+removable). Full detail + multi-instance caveat: the `## ⚠️ Breaking` section in
+`docs/user-manual/upgrading.md` and ADR-0030.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track
@@ -1297,6 +1308,23 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 | `deploy/systemd/yuzu-agent.service` | Yuzu agent unit |
 | `deploy/systemd/yuzu-gateway.service` | Erlang gateway unit |
 
+**Stopping a wedged agent (Linux/macOS).** `SIGTERM`/`SIGINT` (`systemctl stop`,
+Ctrl-C) triggers a graceful agent stop — plugin shutdown, thread joins, store
+close. If that teardown hangs (e.g. the server is unreachable and a drain is
+stuck), **send the signal a second time** (`kill -TERM <pid>` again, or a second
+Ctrl-C): the agent immediately hard-exits with code 1. This escalation is
+deliberate and has **no grace window** — the second signal always force-exits,
+even if the first stop was progressing normally — so double-signalling stop
+tooling will force-kill healthy agents; send one signal and wait. You no longer
+need `SIGKILL` to recover a stuck agent. SQLite state is WAL crash-safe across
+the hard exit. On Windows, a second Ctrl-C also terminates promptly (via the
+escalation or the CRT's default disposition); the service path (`sc stop`) is
+unchanged. If the agent logs `shutdown watcher unavailable` at boot (thread/fd
+exhaustion), a hard-exit handler is installed instead: the agent exits promptly
+on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
+(A default signal disposition would be discarded by PID 1 in a container, so
+the handler is the posture that stays killable.)
+
 **Installation:**
 
 ```bash
@@ -1349,18 +1377,18 @@ REM Register the service (binPath is written for you, including the internal
 REM --service marker the agent needs to run under the SCM control protocol)
 yuzu-agent.exe --install-service
 
-REM Point it at your server / data dir / log file via sc config -- this is the
-REM EXACT quoting convention the shipped installer's own [Run] sc.exe config
-REM line uses (empirically verified working per #1822): quote ONLY the
-REM executable path, leave --service and the flag tokens bare/individually
-REM quoted after it. sc.exe reassembles all of this back into one binPath
-REM value regardless of how many separate quoted segments the command line
-REM contains, so this still works unmodified under a spaced path like
-REM "Program Files" (Gate 4 consistency-auditor finding, governance re-run --
-REM a prior revision of this example wrapped the entire value in one outer
-REM quote pair with escaped inner quotes, a different, less copy-paste-
-REM friendly convention from what the installer itself actually ships).
-sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe" --service --server yuzu.example.com:50051 --data-dir "C:\ProgramData\Yuzu" --plugin-dir "C:\Yuzu\plugins" --log-file "C:\Yuzu\logs\yuzu-agent.log"
+REM Point it at your server / data dir / log file via sc config. binPath= takes a
+REM SINGLE value, so the whole "exe + arguments" string must be ONE quoted token,
+REM with the quotes around a spaced exe path escaped as \" -- sc.exe does NOT
+REM reassemble several quoted segments back into one binPath. Written the other way
+REM round (quoting only the exe and leaving the flags bare after it) sc.exe parses
+REM --service/--server/... as unknown OPTIONS to sc itself, prints its usage block,
+REM and exits 1639 ERROR_INVALID_COMMAND_LINE without touching the service. That is
+REM #1468: the shipped installer had exactly that defect, and because Inno ignores
+REM [Run] exit codes it failed silently -- the service kept the argument-less binPath
+REM --install-service had written, so the agent ran with no --server and fail-closed
+REM on TLS. Check your work with `sc qc YuzuAgent`: every flag below must appear.
+sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir \"C:\ProgramData\Yuzu\" --plugin-dir \"C:\Yuzu\plugins\" --log-file \"C:\Yuzu\logs\yuzu-agent.log\""
 
 sc.exe start YuzuAgent
 sc.exe stop YuzuAgent
@@ -1377,7 +1405,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers two distinct causes that land on the same code — either the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
 
 ### Server: sc.exe (native wrapper not yet available)
 

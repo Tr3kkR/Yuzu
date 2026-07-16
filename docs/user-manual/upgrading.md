@@ -205,6 +205,42 @@ the caller holds `InstructionDefinition:Read`) plus a top-level `actions_enriche
 count. The change is purely additive; any client that pinned `version == 1` should relax the
 check to a minimum (`>= 1`).
 
+## ⚠️ Breaking: API and MCP bearer tokens are invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030)
+
+`ApiTokenStore` — the store backing every `Authorization: Bearer` API token and
+every MCP token — moves from SQLite (`api-tokens.db`) to the server's PostgreSQL
+substrate in this release (engine-principals PR 4.1; ADR-0006/ADR-0030). This is
+a **fresh-start cutover with no data migration**: the new server creates an empty
+Postgres `api_token_store.api_tokens` table and **never reads the old
+`api-tokens.db`**, so every API/MCP token minted before the upgrade stops working
+the instant the new server starts. Interactive cookie-session login (dashboard,
+OIDC/SAML SSO) is **not** affected — only bearer tokens.
+
+The rationale for no backfill (convention with every prior server-store migration,
+plus the token store holds only verify-only hashes) is in ADR-0030.
+
+**Who this affects:** every external automation consumer that authenticates with an
+API or MCP bearer token — CI/CD scripts, SIEM/webhook pollers, cron jobs, MCP
+clients. Because it is a fresh-start cutover, **all of them break at once** at the
+moment of upgrade; there is no rolling/staged token continuity.
+
+**Remediate:** after upgrading, **re-mint every API/MCP bearer token** (`POST
+/api/v1/tokens`) and update the credential wherever it is stored (CI secrets, cron
+configs, MCP client configs). Plan the upgrade in a **maintenance window** and
+**notify automation/integration owners in advance** so a batch of `401`s across
+every integration is expected, not a surprise incident.
+
+**Diagnostic:** if the legacy `api-tokens.db` is still on disk, the server logs
+`[auth] Legacy SQLite api-tokens.db found at … — API/MCP tokens now live in
+PostgreSQL and any prior tokens were INVALIDATED by the migration (ADR-0030)` at
+boot. The old file is inert (never read again) and can be removed once you have
+re-minted; it contains only token hashes + metadata, no plaintext secret.
+
+**Multi-instance note:** the Postgres substrate now permits running multiple server
+replicas against one database. Token *validation* uses a per-process 60-second
+cache, so a token revoked on one replica may remain accepted on another replica for
+up to that window — see ADR-0030 for the tracked hardening.
+
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 
 Releases before this one accepted `--mfa-enforcement=admin-only` and
@@ -390,6 +426,26 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- [ ] **New SparkEngine health telemetry (auto-on, engine-health only):** on agent
+  upgrade, agents begin shipping SparkEngine posture tags on the existing
+  heartbeat (2 keys when quiescent), and the server exposes 11 new
+  `yuzu_fleet_spark_*` gauges. The engine is **observe-only at this rung** —
+  nothing about Guard detection or enforcement changes — and the tags are pure
+  engine-health counts (no user, process, or path identity; no works-council
+  trigger). During a staged rollout, not-yet-upgraded agents are simply absent
+  from the new gauges — expected, see the staged-rollout example in
+  [Metrics](metrics.md#sparkengine-fleet-gauges). Deploy-time opt-out:
+  `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (the opt-out itself stays
+  visible as `yuzu_fleet_spark_disabled`). See
+  [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only).
+- [ ] **Changed agent signal handling (Linux/macOS):** graceful shutdown now runs
+  on a dedicated watcher thread (fixes an abort/hang class on `SIGTERM`), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the agent (exit 1) —
+  by design, with **no grace window**: the second signal is read as "the stop is
+  wedged". Stop scripts that deliberately double-signal agents will now
+  force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
+  also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app
   DisplayName/Publisher/Version in vulnerability findings), `os_info` (OS
