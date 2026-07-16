@@ -59,6 +59,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Current User](#current-user)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
+  - [Engine Principals](#engine-principals)
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
@@ -710,6 +711,250 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Engine Principals
+
+Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
+
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`Security:Read` / `AuditLog:Read`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+
+**Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
+
+#### `POST /api/v1/engine-principals`
+
+Create a new engine-principal identity. `principal_id` is derived server-side as `"engine:" + slug` — the reserved `engine:` namespace.
+
+**Permission:** `Security:Write`
+
+**Request body:**
+
+```json
+{
+  "slug": "vuln-uce",
+  "display_name": "Vuln UCE",
+  "owner_username": "alice",
+  "classification": "internal",
+  "justification": "First-party vulnerability-management use-case engine module"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `slug` | string | Yes | 1-128 chars; becomes `principal_id = "engine:" + slug`. |
+| `display_name` | string | No | UI/audit label. |
+| `owner_username` | string | Yes | Must reference an existing user (FK-validated before the row is written). |
+| `classification` | string | Yes | Exactly `"internal"` or `"external"` — required at creation, no default and no silent fallback. |
+| `justification` | string | No | Grant justification, feeds periodic access review. |
+
+**Validation errors (`400`):**
+
+| Condition | Response |
+|---|---|
+| `slug` empty | `400` — `slug is required` |
+| `slug` longer than 128 chars | `400` — `invalid_input_length: slug exceeds 128 chars` |
+| `owner_username` empty or does not reference an existing user | `400` — `owner_username must reference an existing user` |
+| `classification` missing or not `internal`/`external` | `400` — store validation error |
+
+**Response (201):**
+
+```json
+{
+  "data": { "principal_id": "engine:vuln-uce" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/engine-principals`
+
+List every engine principal (all lifecycle states), with each principal's active-credential count.
+
+**Permission:** `Security:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "principal_id": "engine:vuln-uce",
+      "display_name": "Vuln UCE",
+      "owner_username": "alice",
+      "classification": "internal",
+      "lifecycle_state": "active",
+      "created_at": 1710849600,
+      "active_credential_count": 1
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 1 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/engine-principals/{id}`
+
+Get one engine principal's full identity row plus its active credentials (token id, name, timestamps, rotation group, overlap-expiry — never the raw secret; `token_hash` stays masked).
+
+**Permission:** `Security:Read`
+
+**Error (404):** `engine principal not found`
+
+---
+
+#### `DELETE /api/v1/engine-principals/{id}`
+
+Terminal, irreversible revoke. Every active credential is revoked **first**, then the identity's `lifecycle_state` flips to `revoked` — a caller can never observe a revoked identity with a still-valid credential. Idempotent: calling this on an already-revoked principal returns success without re-auditing a revoke.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "superseded_by": "engine:vuln-uce-2" }
+```
+
+`superseded_by` is an optional successor-principal id recorded on this row for audit-trail continuity — recovery from a compromised or retired principal mints a fresh successor principal rather than un-revoking this one.
+
+**Response:**
+
+```json
+{
+  "data": { "revoked": true, "credentials_revoked": 1 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `404` — engine principal not found. `503` — the revoke call itself failed (a genuine store failure, not idempotent no-op).
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials`
+
+Mint the **first** credential for an engine principal. The raw secret is returned exactly once in this response — capture it immediately; it cannot be retrieved again, only rotated (below) or revoked. A second call against a principal that already has an active credential errors — use the rotate route once a credential exists.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "ttl_days": 90 }
+```
+
+`ttl_days` defaults to `90` and must be between `1` and `90` (`400` otherwise — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
+
+**Response (201):** headers carry `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` so a shared proxy or browser history never retains the secret.
+
+```json
+{
+  "data": { "token": "yzt_...", "token_id": "...", "expires_at": 1760000000 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
+
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked). `400` — `ttl_days` out of range. `503` — CSPRNG or store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`).
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials/rotate`
+
+Overlap-pair rotation (design doc §7): mints a successor credential while the existing (predecessor) credential stays valid for an overlap window — at most **two** active credentials per principal during the overlap. The raw successor secret is returned exactly once per **reveal** (see below for the grace-window exception). MFA step-up runs on **every** call to this route, including an idempotent re-serve — a rotate call is never exempt from step-up just because it returns a secret the caller already saw.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "overlap_secs": 604800 }
+```
+
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor.
+
+**Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
+
+**Response:** same no-store headers as the mint route; the `data` object adds `overlap_expires_at` (the epoch at which the predecessor is auto-revoked) alongside `token`, `token_id`, and `expires_at`.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Overlap window below the 24h floor (or above the 10-year ceiling) | `400` — window out of range |
+| A rotation already in flight, initiated by a **different** operator | `409` — a second operator cannot touch an in-flight rotation they didn't start |
+| Grace window elapsed with no confirm | `409` — `grace window elapsed` |
+| Engine principal not found / not active / store unavailable | `404` / `409` / `503` as above |
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials/confirm`
+
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed by its consumer. This is a **separate attestation** from the `rotate` reveal above — it is never inferred from a successful rotate call. On success, the predecessor credential is revoked and the successor becomes the principal's sole active credential (closing the overlap window early, ahead of the auto-revoke sweep).
+
+**Permission:** `Security:Write`
+
+**Response:**
+
+```json
+{
+  "data": { "confirmed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `409` — no rotation in flight for this principal, or confirm attempted by a different operator than the one who initiated the rotation. `404` / `503` as above.
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/transfer-owner`
+
+Reassign the named responsible owner of an active engine principal. Admin-forced — deliberately does **not** depend on the outgoing owner's cooperation (an account under termination-for-cause cannot use engine-principal ownership as a lever to stall its own deprovisioning).
+
+**Permission:** `Security:Write`
+
+**Request body:**
+
+```json
+{ "new_owner": "bob" }
+```
+
+`new_owner` must reference an existing user (FK-validated).
+
+**Response:**
+
+```json
+{
+  "data": { "transferred": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed.
+
+---
+
+#### `GET /api/v1/engine-principals/audit/no-admin`
+
+Auditor-runnable, independent proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — not merely a claim about the write-path guard. Resolves each engine principal's actual role assignments and effective permissions against the live RBAC reference tables and reports any violation: a literal `admin`/`Administrator` role grant, any role flagged `is_system`, or a granted securable × operation set whose size reaches the full cross-product (functionally admin-equivalent even under a custom, non-system role name).
+
+**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access.
+
+**Response:**
+
+```json
+{
+  "data": { "ok": true, "violations": [] },
+  "meta": { "api_version": "v1" }
+}
+```
+
+An empty `violations` array with `ok:true` is the positive evidence. A non-empty `violations` array (each entry carrying `principal_id`, `role`, and `reason` — `admin_role` / `system_role` / `wildcard_grant`) indicates the write-path guard was bypassed (data corruption, direct DB write, or a code regression) and should be treated as a security incident.
+
+**Error (503):** `rbac reference data unavailable — cannot verify` — the RBAC reference tables (`securable_types`/`operations`) could not be resolved, so the wildcard-grant bound cannot be computed. This is a fail-**closed** result: treat it as "unable to verify," never as "clean."
 
 ---
 
