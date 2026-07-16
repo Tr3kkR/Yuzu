@@ -19,7 +19,8 @@ metadata:
     signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
     network type or channel, and BSSID or connection status.
     On Windows uses WlanGetAvailableNetworkList, on Linux uses
-    nmcli device wifi list, on macOS uses the airport utility.
+    nmcli device wifi list, on macOS uses `airport -s` (legacy) or
+    system_profiler.
   tags: [wifi, network, wireless, inventory, security]
 
 spec:

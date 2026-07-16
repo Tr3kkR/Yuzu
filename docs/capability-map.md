@@ -260,7 +260,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.6 WiFi Network Enumeration :white_check_mark: `T2`
 
-`wifi` plugin (cross-platform). `list_networks` scans for visible WiFi networks with SSID, signal strength, security type, channel, and BSSID. `connected` reports the currently connected network. Windows: WlanAPI, Linux: nmcli, macOS: airport.
+`wifi` plugin (cross-platform). `list_networks` scans for visible WiFi networks with SSID, signal strength, security type, channel, and BSSID. `connected` reports the currently connected network. Windows: WlanAPI, Linux: nmcli. macOS: `connected` uses CoreWLAN (`wifi_corewlan.mm`); `list_networks` uses legacy `airport -s`/`system_profiler`. On macOS 14+, Location Services withholds SSID/BSSID from a background daemon, reported as `<ssid-withheld>` on an otherwise-live connection.
 
 ### 4.7 Wake-on-LAN :white_check_mark: `T2`
 

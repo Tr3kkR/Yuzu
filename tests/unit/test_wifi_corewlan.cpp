@@ -48,6 +48,20 @@ TEST_CASE("wifi connected: associated with SSID/BSSID visible", "[wifi]") {
     CHECK(format_connected_record(c) == "connected|MyNet|-50|WPA3-Personal|aa:bb:cc:dd:ee:ff|11");
 }
 
+TEST_CASE("wifi connected: rssi 0 while associated is a real connection, not Not-connected",
+          "[wifi]") {
+    // A driver can momentarily report 0 dBm on a genuinely-associated link; that
+    // must render as a connection (rssi 0), distinct from the not-connected line.
+    WifiConnection c;
+    c.associated = true;
+    c.ssid_available = true;
+    c.ssid = "MyNet";
+    c.rssi = 0;
+    c.channel = 6;
+    c.security = "WPA2-Personal";
+    CHECK(format_connected_record(c) == "connected|MyNet|0|WPA2-Personal|-|6");
+}
+
 TEST_CASE("wifi connected: unknown security falls back to Unknown", "[wifi]") {
     WifiConnection c;
     c.associated = true;

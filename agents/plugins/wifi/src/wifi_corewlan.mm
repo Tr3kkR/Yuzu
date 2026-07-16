@@ -68,6 +68,11 @@ std::string to_std(NSString* s) {
 
 bool corewlan_current_connection(WifiConnection& out) {
     @autoreleasepool {
+        // CoreWLAN getters are read-only and don't throw in practice, but an
+        // ObjC exception unwinding through these ARC/C++ frames would be
+        // implementation-defined (risking std::terminate of the agent). Contain
+        // it: on any exception, report no interface (→ honest "Not connected").
+        @try {
         CWWiFiClient* client = [CWWiFiClient sharedWiFiClient];
         if (client == nil)
             return false;
@@ -77,7 +82,7 @@ bool corewlan_current_connection(WifiConnection& out) {
             return false; // no Wi-Fi hardware
 
         out.interface = to_std(iface.interfaceName);
-        out.power_on = iface.powerOn ? true : false;
+        out.power_on = iface.powerOn;
 
         // A non-nil channel is the authorisation-free signal that the interface
         // has actually joined a network; ssid/bssid can be withheld, the channel
@@ -91,15 +96,21 @@ bool corewlan_current_connection(WifiConnection& out) {
             out.rssi = static_cast<int>(iface.rssiValue);
             out.security = security_to_string(iface.security);
 
-            NSString* ssid = iface.ssid;
-            if (ssid != nil) {
-                out.ssid = to_std(ssid);
-                out.ssid_available = true;
-            }
+            // Treat the SSID as available only if we actually decoded a
+            // non-empty name: iface.ssid is nil when withheld/unassociated, and
+            // UTF8String yields nil (→ empty) for a non-UTF8 SSID. Either way an
+            // empty result must fall back to the "<ssid-withheld>" marker rather
+            // than emit a blank SSID field.
+            out.ssid = to_std(iface.ssid);
+            out.ssid_available = !out.ssid.empty();
             out.bssid = to_std(iface.bssid); // nil → empty when withheld
         }
 
         return true;
+        } @catch (NSException* e) {
+            out = WifiConnection{}; // discard any partial state
+            return false;
+        }
     }
 }
 
