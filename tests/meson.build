@@ -423,6 +423,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
