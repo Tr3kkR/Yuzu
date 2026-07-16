@@ -1863,8 +1863,17 @@ void RestApiV1::register_routes(
                      return;
 
                  auto tokens = token_store->list_tokens(session->username);
+                 if (!tokens.has_value()) {
+                     // Authoritative store (ADR-0012 §1): surface a read failure
+                     // as retryable, never an empty "you have no tokens" list.
+                     res.status = 503;
+                     res.set_header("Retry-After", "2");
+                     res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& t : tokens) {
+                 for (const auto& t : *tokens) {
                      JObj item;
                      item.add("token_id", t.token_id)
                          .add("name", t.name)
@@ -1882,7 +1891,7 @@ void RestApiV1::register_routes(
                          item.add("mcp_tier", t.mcp_tier);
                      arr.add(item);
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
                                  "application/json");
              });
 
@@ -2121,28 +2130,53 @@ void RestApiV1::register_routes(
         // vs. no event) and the `owner=` detail so forensics can see who
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
-        bool denied = existing && existing->principal_id != session->username &&
+        if (!existing.has_value()) {
+            // DB error on the ownership pre-check — 503, not a misleading 404
+            // that reads "already gone" while the token may still be live
+            // (ADR-0012 §1; the store no longer returns nullopt on a DB error).
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                            "application/json");
+            return;
+        }
+        auto& tok = *existing; // std::optional<ApiToken>
+        bool denied = tok && tok->principal_id != session->username &&
                       auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
-        if (!existing || denied) {
+        if (!tok || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
-                         "owner=" + existing->principal_id);
+                         "owner=" + tok->principal_id);
             }
             res.status = 404;
             res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
 
-        bool revoked = token_store->revoke_token(token_id);
-        if (!revoked) {
-            // Either the token vanished between get and revoke, or the
-            // revoke call itself failed. Treat as not-found for the client.
+        auto revoked = token_store->revoke_token(token_id);
+        if (!revoked.has_value()) {
+            // The revoke did NOT persist (lease timeout / query error). This is
+            // NOT "not found" — the old code conflated the two and returned 404,
+            // telling automation the token was already gone when it may still be
+            // live. Surface a retryable failure and audit it (ADR-0030 §Posture).
+            audit_fn(req, "api_token.revoke", "failure", "ApiToken", token_id,
+                     "owner=" + tok->principal_id + " db_error=true");
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "token revoke did not persist — retry"),
+                            "application/json");
+            return;
+        }
+        if (!*revoked) {
+            // DB write succeeded but no row matched — the token vanished between
+            // the ownership check and the revoke (a concurrent revoke/delete).
+            // A genuine 404.
             res.status = 404;
             res.set_content(detail::a4_error(res, "token not found"), "application/json");
             return;
         }
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
-                 "owner=" + existing->principal_id);
+                 "owner=" + tok->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
 
@@ -2915,11 +2949,19 @@ void RestApiV1::register_routes(
             return;
         }
         const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
-        const std::string audit_result = result.db_persisted ? "success" : "partial";
+        // "partial" if EITHER the cookie dual-write OR the API-token revoke
+        // failed to persist. A "success" row that hides a failed API-token
+        // revoke tells the operator the stolen laptop's credential died when it
+        // did not (ADR-0030 §Posture; the API-token leg used to be dropped from
+        // this outcome entirely — it rode `db_persisted`, which only reflects
+        // the cookie-session write).
+        const bool all_persisted = result.db_persisted && result.api_tokens_db_persisted;
+        const std::string audit_result = all_persisted ? "success" : "partial";
         const std::string detail =
             "count=" + std::to_string(result.cookie_sessions_revoked) +
             " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked) +
-            (result.db_persisted ? "" : " db_error=true");
+            (result.db_persisted ? "" : " db_error=true") +
+            (result.api_tokens_db_persisted ? "" : " api_tokens_db_error=true");
         const auto audit =
             try_audit("session.revoke_all.self", audit_result, "User", session->username, detail);
         // CC6.7 disposition: clear the caller's cookie on the response so
@@ -2936,6 +2978,7 @@ void RestApiV1::register_routes(
                         .add("revoked", static_cast<int64_t>(result.cookie_sessions_revoked))
                         .add("api_tokens_revoked", static_cast<int64_t>(result.api_tokens_revoked))
                         .add("db_persisted", result.db_persisted)
+                        .add("api_tokens_db_persisted", result.api_tokens_db_persisted)
                         .add("audit_emitted", audit.emitted)
                         .str()),
             "application/json");

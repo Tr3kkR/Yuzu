@@ -240,7 +240,7 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 std::expected<std::string, std::string>
 ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
                             int64_t expires_at, const std::string& scope_service,
-                            const std::string& mcp_tier, std::string principal_kind) {
+                            const std::string& mcp_tier) {
     if (!open_)
         return std::unexpected("database not open");
     if (name.empty())
@@ -299,14 +299,18 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
     if (!lease)
         return std::unexpected("database unavailable — try again");
 
+    // principal_kind is bound as the SQL literal 'human' — PR 4.1 has no
+    // engine write path (the caller-supplied kind + its C++-side allowlist
+    // land in PR 4.2, design doc §§6-8/11). The column still exists (the seam
+    // the rest of Phase 4 stacks on) and its CHECK bounds it to the allowlist.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO api_token_store.api_tokens "
         "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, principal_kind, "
         " created_at, expires_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::bigint,$9::bigint) RETURNING token_id",
+        "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint) RETURNING token_id",
         std::vector<std::string>{token_id, hash, name, principal_id, scope_service, mcp_tier,
-                                 principal_kind, std::to_string(now), std::to_string(expires_at)});
+                                 std::to_string(now), std::to_string(expires_at)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::unexpected(std::string("failed to create token: ") +
                                PQerrorMessage(lease.get()));
@@ -383,9 +387,25 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     // prevents a stale revoked=false entry surviving the cache TTL. It does
     // NOT retract the value already being returned below; that bounded
     // single-request window is documented on revoke_generation_ in the hpp.
-    if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+    //
+    // The generation re-check MUST be taken UNDER cache_mtx_, not before it.
+    // invalidate_cache() acquires the same mutex, and revoke_token bumps the
+    // generation BEFORE it locks, so a check-then-lock ordering left a real
+    // window: a revoke's erase could run between our check and our insert
+    // (erasing nothing, since we hadn't inserted yet), after which we inserted a
+    // revoked=false entry that re-authenticated the token for up to
+    // kTokenCacheTtl. Holding the lock across the re-check AND the insert makes
+    // the two operations serialize against the erase: either we observe the
+    // bumped generation and skip, or the revoke's erase runs strictly after our
+    // insert and removes it. Neither leaves a stale entry.
+    if (test_hook_after_validate_select_)
+        test_hook_after_validate_select_();
+
+    {
         std::lock_guard cache_lock(cache_mtx_);
-        token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
+        }
     }
 
     return t;
@@ -408,12 +428,18 @@ void ApiTokenStore::set_engine_referent_check(
 
 std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {
     std::vector<ApiToken> result;
+std::expected<std::vector<ApiToken>, std::string>
+ApiTokenStore::list_tokens(const std::string& principal_id) const {
+    // Authoritative store (ADR-0012 §1): a runtime read error is SURFACED, never
+    // papered over as an empty result — a silent empty read here would show an
+    // operator "no tokens" during a Postgres outage and could hide a live
+    // credential. Only a genuine zero-row read returns an empty vector.
     if (!open_)
-        return result;
+        return std::unexpected("database not open");
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return result;
+        return std::unexpected("database unavailable — try again");
 
     std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
                       " FROM api_token_store.api_tokens";
@@ -426,8 +452,10 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
-        return result;
+        return std::unexpected(std::string("list_tokens read failed: ") +
+                               PQerrorMessage(lease.get()));
 
+    std::vector<ApiToken> result;
     const int rows = PQntuples(res.get());
     result.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i) {
@@ -436,22 +464,31 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
     return result;
 }
 
-std::optional<ApiToken> ApiTokenStore::get_token(const std::string& token_id) const {
-    if (!open_ || token_id.empty())
-        return std::nullopt;
+std::expected<std::optional<ApiToken>, std::string>
+ApiTokenStore::get_token(const std::string& token_id) const {
+    // Authoritative store (ADR-0012 §1): distinguish a runtime read error
+    // (surfaced → caller 503s) from a genuine no-such-row (value == nullopt →
+    // caller 404s). The old nullopt-on-DB-error made an ownership pre-check 404
+    // during an outage while the token stayed live (#2188 review).
+    if (!open_)
+        return std::unexpected("database not open");
+    if (token_id.empty())
+        return std::optional<ApiToken>{std::nullopt}; // argument guard, not a DB error
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return std::unexpected("database unavailable — try again");
 
     const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
                             " FROM api_token_store.api_tokens WHERE token_id = $1";
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{token_id});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("get_token read failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ApiToken>{std::nullopt}; // genuine not-found
 
-    return read_token(res.get(), 0);
+    return std::optional<ApiToken>{read_token(res.get(), 0)};
 }
 
 std::vector<ApiToken>
@@ -1080,17 +1117,23 @@ ApiTokenStore::list_rotations_nearing_expiry_unused(int64_t now, int64_t warn_wi
 }
 
 bool ApiTokenStore::revoke_token(const std::string& token_id) {
+std::expected<bool, std::string> ApiTokenStore::revoke_token(const std::string& token_id) {
     if (!open_)
-        return false;
+        return std::unexpected("database not open");
 
     // Bump the revoke generation BEFORE the UPDATE so any concurrent
     // validate_token whose SELECT outraces this UPDATE will observe the
     // generation move at its cache-write step and skip the stale write.
     revoke_generation_.fetch_add(1, std::memory_order_release);
 
+    if (test_hook_after_first_revoke_bump_)
+        test_hook_after_first_revoke_bump_();
+
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return false; // authoritative: a lease timeout is a failure, never a silent success
+        // authoritative: a lease timeout is a WRITE FAILURE — never a silent
+        // success and never a false "not found". The caller must 503/retry.
+        return std::unexpected("database unavailable — try again");
 
     // RETURNING token_hash — never sqlite3_changes()-style mutate-then-count
     // (#1033). PQntuples > 0 IS the changed check, and the returned hash is
@@ -1101,19 +1144,34 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
         "RETURNING token_hash",
         std::vector<std::string>{token_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return false;
+        return std::unexpected(std::string("revoke did not persist: ") +
+                               PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
     if (rows == 0)
-        return false;
+        return false; // DB write succeeded; no such token (already gone / unknown id)
 
+    // Second generation bump — AFTER the UPDATE has committed, BEFORE we
+    // invalidate. The pre-UPDATE bump alone only catches a validate_token that
+    // snapshotted revoke_generation_ *before* it. A validate that started AFTER
+    // that first bump captured the already-incremented value as its baseline,
+    // and under Postgres READ COMMITTED its SELECT can still read this row's
+    // pre-commit revoked=false; its post-SELECT re-check would then match its
+    // own snapshot and cache the stale row for the full TTL (PR #2188 round-3
+    // review). This second transition moves the generation past that snapshot,
+    // so the racing validate skips its cache write; invalidate_cache below then
+    // clears any entry that still beat us (both serialize on cache_mtx_).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     invalidate_cache(PQgetvalue(res.get(), 0, 0));
     return true;
 }
 
-std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
-    if (!open_ || principal_id.empty())
-        return 0;
+std::expected<std::size_t, std::string>
+ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty())
+        return std::size_t{0}; // argument guard: nothing to revoke, DB untouched
 
     // Bump revoke generation BEFORE the UPDATE — same contract as
     // `revoke_token`.
@@ -1121,7 +1179,10 @@ std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id)
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return 0; // authoritative: never claim tokens were revoked when we couldn't reach the DB
+        // authoritative: never report a count (even 0) when we could not reach
+        // the DB — that is indistinguishable from "the principal had no tokens"
+        // and would let "Sign out everywhere" lie during an outage.
+        return std::unexpected("database unavailable — try again");
 
     // ONE statement yields both the count (PQntuples) and every hash to
     // invalidate (RETURNING token_hash) — no separate pre-SELECT snapshot
@@ -1133,17 +1194,23 @@ std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id)
         "WHERE principal_id = $1 AND revoked = FALSE RETURNING token_hash",
         std::vector<std::string>{principal_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+        return std::unexpected(std::string("revoke_for_principal did not persist: ") +
+                               PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
+    // Second generation bump after the UPDATE commits, before invalidating —
+    // see revoke_token for the full rationale (closes the post-first-bump /
+    // pre-commit READ COMMITTED cache-poisoning window).
+    if (rows > 0)
+        revoke_generation_.fetch_add(1, std::memory_order_release);
     for (int i = 0; i < rows; ++i)
         invalidate_cache(PQgetvalue(res.get(), i, 0));
     return static_cast<std::size_t>(rows);
 }
 
-bool ApiTokenStore::delete_token(const std::string& token_id) {
+std::expected<bool, std::string> ApiTokenStore::delete_token(const std::string& token_id) {
     if (!open_)
-        return false;
+        return std::unexpected("database not open");
 
     // Bump revoke generation BEFORE the DELETE — a delete is a stronger
     // form of revoke from the cache's perspective, so the same TOCTOU
@@ -1152,7 +1219,10 @@ bool ApiTokenStore::delete_token(const std::string& token_id) {
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return false; // authoritative: never claim a delete succeeded on a lease timeout
+        // authoritative (ADR-0030 §Posture names delete_token alongside
+        // revoke_*): a lease timeout is a WRITE FAILURE, never a silent success
+        // and never a false "not found".
+        return std::unexpected("database unavailable — try again");
 
     // RETURNING token_hash — same #1033 idiom as revoke_token: PQntuples is
     // the changed-check, the returned hash is the cache-invalidation key.
@@ -1160,12 +1230,15 @@ bool ApiTokenStore::delete_token(const std::string& token_id) {
         lease.get(), "DELETE FROM api_token_store.api_tokens WHERE token_id = $1 RETURNING token_hash",
         std::vector<std::string>{token_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return false;
+        return std::unexpected(std::string("delete did not persist: ") + PQerrorMessage(lease.get()));
 
     const int rows = PQntuples(res.get());
     if (rows == 0)
-        return false;
+        return false; // DB write succeeded; no such token (already gone / unknown id)
 
+    // Second generation bump after the DELETE commits, before invalidating —
+    // see revoke_token for the full rationale.
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     invalidate_cache(PQgetvalue(res.get(), 0, 0));
     return true;
 }

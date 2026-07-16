@@ -171,13 +171,21 @@ public:
     /// only when the caller asked for full-principal revocation
     /// (`/me`'s "Sign out everywhere"; admin force-logout deliberately
     /// leaves automation tokens intact). `db_persisted` reports whether
-    /// the AuthDB DELETE for cookie sessions succeeded; when false, the
-    /// caller MUST surface this in the audit row (a "success" audit row
-    /// hiding a DB write failure produces fictional CC6.3/CC6.6 evidence).
+    /// the AuthDB DELETE for cookie sessions succeeded; `api_tokens_db_persisted`
+    /// reports the SAME for the API-token revoke leg — kept as its OWN field
+    /// rather than folded into `db_persisted`, because the two writes hit
+    /// independent stores (AuthDB vs `api_token_store`) and either can fail
+    /// alone. When EITHER is false the caller MUST surface it in the audit row
+    /// (a "success" row hiding a failed API-token revoke tells an operator who
+    /// revoked a stolen laptop that every credential died when it did not —
+    /// fictional CC6.3/CC6.6 evidence, and the exact failure ADR-0030 §Posture
+    /// forbids). `api_tokens_db_persisted` is vacuously true when API-token
+    /// revocation was not requested (the admin force-logout path).
     struct SessionRevokeResult {
         std::size_t cookie_sessions_revoked{0};
         std::size_t api_tokens_revoked{0};
         bool db_persisted{true};
+        bool api_tokens_db_persisted{true};
     };
 
     /// Carrier for the audit-emission outcome on a session-revocation

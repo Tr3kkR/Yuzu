@@ -188,7 +188,7 @@ struct RestTokensHarness {
         // list_tokens orders by `created_at DESC`, so the newest token is
         // front(). Using back() would return the oldest and break if a test
         // ever creates multiple tokens per owner on the same harness.
-        auto listing = token_store()->list_tokens(owner);
+        auto listing = token_store()->list_tokens(owner).value();
         REQUIRE(!listing.empty());
         return listing.front().token_id;
     }
@@ -215,7 +215,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][toke
     CHECK(res->status == 200);
 
     // Store state: token is now revoked.
-    auto looked_up = h.token_store()->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -243,7 +243,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)"
     CHECK(res->status == 404);
 
     // Store state: token is NOT revoked.
-    auto looked_up = h.token_store()->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK_FALSE(looked_up->revoked);
 
@@ -290,7 +290,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
     REQUIRE(res);
     CHECK(res->status == 200);
 
-    auto looked_up = h.token_store()->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -365,7 +365,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
 
     // Store contains no token for alice — the failure path must not leak
     // a half-created row.
-    auto listing = h.token_store()->list_tokens("alice");
+    auto listing = h.token_store()->list_tokens("alice").value();
     CHECK(listing.empty());
 }
 

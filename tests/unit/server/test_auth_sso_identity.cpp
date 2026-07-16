@@ -342,7 +342,9 @@ struct SsoJitHarness {
     AuthDB auth_db;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
-    yuzu::test::ApiTokenStorePg api_tokens;
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -361,7 +363,7 @@ struct SsoJitHarness {
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
-                                                   api_tokens.get(), audit_store.get(), nullptr,
+                                                   /*api_token_store=*/nullptr, audit_store.get(), nullptr,
                                                    nullptr, analytics_store.get(), oidc_mu,
                                                    oidc_provider);
         auth_routes->register_routes(sink);

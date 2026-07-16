@@ -55,7 +55,9 @@ struct OidcRoutesFixture {
     auth::AuthManager                     auth_mgr{};
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
-    yuzu::test::ApiTokenStorePg           api_tokens;
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
     std::unique_ptr<AuditStore>           audit_store;
     std::unique_ptr<AnalyticsEventStore>  analytics;
     std::shared_mutex                     oidc_mu;
@@ -74,7 +76,7 @@ struct OidcRoutesFixture {
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
             /*rbac_store=*/nullptr,
-            api_tokens.get(),
+            /*api_token_store=*/nullptr,
             audit_store.get(),
             /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr,
