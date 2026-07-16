@@ -328,8 +328,17 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     // claiming the user clicked OK on a dialog that was never shown. The
     // try/on-error idiom mirrors platform_input; capturing the error NUMBER
     // keeps a genuine user-cancel (-128) distinct from an undeliverable
-    // session. safe_msg/safe_title are already sanitize()d (no shell/AppleScript
-    // injection); the sentinels are fixed literals.
+    // session.
+    //
+    // Documented shell exception (docs/cpp-conventions.md, shell/process
+    // boundaries): this osascript invocation is built via the plugin's
+    // existing popen-based run_command helper rather than argv-style
+    // execution because AppleScript has no non-shell invocation form and
+    // Yuzu has no cross-platform subprocess helper today. safe_msg/
+    // safe_title are already sanitize()d (unsafe chars replaced with '_',
+    // so no shell/AppleScript metacharacter reaches the string); btn_spec
+    // and every sentinel/-e fragment are fixed compile-time literals — no
+    // operator-supplied text controls the command's shape.
     std::string cmd = std::format(
         "osascript -e 'try' "
         "-e 'display dialog \"{}\" with title \"{}\" {}' "
