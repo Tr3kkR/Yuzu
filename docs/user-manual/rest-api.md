@@ -62,6 +62,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
+  - [Engine Principals](#engine-principals)
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
@@ -1158,6 +1159,113 @@ persistence failed), `503` (CA unavailable). A rejected import is audited
 > `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
 > the internal CA for that surface entirely — unchanged behaviour, supported and
 > independent of subordinate mode.
+
+---
+
+### Engine Principals
+
+Fleet-wide RBAC role-assignment **authoring** surface for the `engine` principal
+class — the durable identity behind an autonomous use-case-engine (UCE) module
+(design doc `docs/auth-engine-principals-design.md`, ADR-1005 item 2b). This is
+PR 4.2's "assignment authoring" deliverable (design §4.1): without it,
+`RbacStore::assign_role` had no production caller for `principal_type="engine"`,
+so a would-be grant could never take effect. There is **no CRUD for minting or
+revoking engine principals themselves yet** — that lands in PR 4.3; these three
+endpoints only manage the roles held by an *existing* engine principal.
+
+`{id}` in every route below is the **bare slug**, without the `engine:` prefix
+(mirrors `/management-groups/{id}` taking a bare group id) — the server
+reconstructs the full `engine:<slug>` principal id internally. Grants are
+**always fleet-wide** in this release; scoped (management-group) engine role
+assignment is rejected pending the Phase-5 `authorize_list_read` extension
+(design §4.3).
+
+**Structural constraint (design §4.2, "no admin, ever"):** an engine principal
+can never hold the `admin`/`Administrator` role, any other built-in system
+role, or a wildcard role. `POST .../roles` **rejects** such a request outright
+(`400`) — it is never silently narrowed to something safer.
+
+#### `GET /api/v1/engine-principals/{id}/roles`
+
+List the fleet-wide roles currently assigned to an engine principal.
+
+**Permission:** `Security:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "principal_id": "engine:vuln-viewer", "role_name": "Viewer" }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+An unknown or revoked `{id}` is not distinguished here — it simply returns an
+empty `data` array (no RBAC row can exist for a principal that was never
+granted one). Errors: `403` (missing `Security:Read`), `503` (RBAC store
+unavailable).
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/roles`
+
+Assign a fleet-wide role to an engine principal.
+
+**Permission:** `Security:Write`, plus **admin + MFA step-up** (same gate class
+as `POST /api/v1/ca/import-chain` — this route grants further RBAC authority to
+a principal).
+
+**Request body:**
+
+```json
+{ "role": "Viewer" }
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `role` | string | Yes | An existing RBAC role name. `admin`/`Administrator`/any built-in system role is rejected. |
+
+**Response (201):**
+
+```json
+{
+  "data": { "assigned": true, "principal_id": "engine:vuln-viewer", "role": "Viewer" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
+role is admin/built-in/otherwise rejected by `validate_assignment` (design
+§4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
+`Security:Write`, or MFA step-up required/failed; `404` — no active (live,
+non-revoked) engine principal exists at `{id}`; `503` — the RBAC or
+engine-principal store is unavailable. A rejected assignment is audited
+`engine_principal.role.assigned` with `result=denied`; success with
+`result=success`.
+
+---
+
+#### `DELETE /api/v1/engine-principals/{id}/roles/{role}`
+
+Unassign a fleet-wide role from an engine principal.
+
+**Permission:** `Security:Write`, plus **admin + MFA step-up**.
+
+**Response:**
+
+```json
+{
+  "data": { "unassigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `400` — the role was not assigned to this principal (store-returned
+error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
+step-up required/failed; `503` — the RBAC store is unavailable. Audited
+`engine_principal.role.unassigned` on success.
 
 ---
 
