@@ -396,17 +396,9 @@ paths**; **depth-bounded** (`d ≈ 5`) because real breaches are 2–4 hops and 
 is both a tractability and a precision lever. Output: a **per-finding attack-path score
 that replaces raw CVSS as the default ranking.**
 
-### 5.2 Chokepoints — value-weighted chain centrality, not Brandes betweenness (ADR-4003)
+### 5.2 Chokepoints — unweighted chain centrality, not Brandes betweenness (ADR-4003)
 
-Generic betweenness is O(V·E) *and* wrong (weights all-pairs equally). A chokepoint is a
-node/edge appearing in many of the already-computed top-k entry→jewel paths — still bounded
-to the declared entry-point/crown-jewel surface, still reusing this section's already-computed
-paths, still not Brandes betweenness. **Superseded formula (ADR-4003 Decision 5):** credit
-accrues per `(entry point, crown jewel)` pair, scaled by that crown jewel's declared value and
-divided fairly across every crown jewel a node reaches — `crown-jewel value × path probability`
-summed flatly per path (the original defender-ROI number) undercounted a node touching several
-valuable targets relative to one touching a single very-valuable target. Still "nearly free":
-same bounded computation, same reused path set, no new graph traversal.
+Generic betweenness is O(V·E) *and* wrong (weights all-pairs equally) — still rejected, unchanged. **Superseded formula (ADR-4003 Decision 5):** a chokepoint is a node appearing on the single least-complexity path for one or more `(entry point, crown jewel)` pairs, credit split evenly across the pairs it serves — bounded to the declared entry-point/crown-jewel surface, same complexity shape as §5.1's own Dijkstra search, still not Brandes betweenness. This is *not* a literal reuse of §5.1's output: chain centrality runs its own shortest-path search over the graph as extended by ADR-4003's host-privilege-state nodes, which §5.1's plain service-level search doesn't include. It replaces the original `crown-jewel value × path probability` defender-ROI sum (which undercounted a node touching several crown jewels relative to one touching a single valuable target) with equal credit per pair reached — value-weighting the credit was considered and reverted (crown-jewel membership is binary, so there's no gradient to weight by; see ADR-4003's Considered-and-rejected). Only the single lowest-complexity path per pair counts — a real, viable secondary route with strictly higher complexity earns zero credit, CAVM's own accepted design, not an approximation introduced here.
 
 ### 5.3 Segmentation — cost-weighted min-cut
 
