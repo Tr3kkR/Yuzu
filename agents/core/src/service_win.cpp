@@ -204,6 +204,20 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
 
         agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
+        // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2): the
+        // logger flush and report_status() calls below could in principle throw
+        // and unwind past the explicit orphan check further down, which would
+        // let normal C++ teardown run while a Guardian I/O worker might still be
+        // active - exactly what F3 exists to prevent. Constructed AFTER `agent`
+        // (declared above), so reverse-declaration-order destruction runs this
+        // guard BEFORE the Agent's own destructor on every exit path, including
+        // an unwind into the catch block below - the same pattern
+        // `AgentUnpublisher` already relies on. Disarmed once the explicit check
+        // has run to completion on the normal path; its destructor is a
+        // deliberately non-throwing, unlogged fallback for every other path.
+        yuzu::agent::OrphanExitGuard orphan_guard{
+            [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+
         spdlog::default_logger()->flush();
 
         // AN EXPLICIT OPERATOR STOP ALWAYS WINS, AND IT IS TESTED FIRST.
@@ -269,6 +283,7 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
                 yuzu::agent::hard_exit(3); // the SCM status above already reported the real outcome
             }
         }
+        orphan_guard.disarm(); // the explicit check above has run to completion
     } catch (const std::exception& e) {
         // service_main is a raw WINAPI callback invoked directly by the SCM
         // dispatcher thread -- an exception must never cross that C ABI boundary

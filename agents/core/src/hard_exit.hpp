@@ -76,4 +76,57 @@ bool wait_for_workers_to_drain(ActiveWorkersFn&& active_workers,
     return true;
 }
 
+/// A fail-closed backstop for the F3 orphan-exit check. Construct this
+/// immediately after run() returns - before any operation that could throw
+/// and unwind past the caller's own explicit check (report_status, a logger
+/// flush, a mutex acquisition under resource exhaustion) - and call disarm()
+/// once that explicit check has run to completion on the normal path. If
+/// something throws before disarm() is reached, this guard's destructor
+/// performs the SAME check during unwinding, before the caller's own `Agent`
+/// is destroyed - otherwise an unrelated exception on that path could skip
+/// F3 entirely and let normal C++ teardown run while a Guardian I/O worker
+/// is still active, which is precisely what F3 exists to prevent (Sol
+/// rung-7.6 review round 3, finding 2: this is NOT the same class of concern
+/// as the OOM-cascade findings scoped out of the rung 7.5 series - F3 is a
+/// NEW safety guarantee, and a pre-existing exception path silently
+/// defeating it is a regression this mechanism introduces, not one it
+/// inherits).
+///
+/// Deliberately does not log: the destructor path exists precisely because
+/// logging (among other things) can itself throw, so it must not depend on
+/// it succeeding. The caller's own explicit, logged check is what provides
+/// diagnostics on the (overwhelmingly common) non-exceptional path.
+///
+/// Declare this AFTER the caller's `Agent` local so reverse-declaration-order
+/// destruction runs it BEFORE the Agent's own destructor on every exit path,
+/// exactly like main.cpp's pre-existing `shutdown_watcher`/`AgentUnpublisher`
+/// pattern.
+template <typename ActiveWorkersFn>
+class OrphanExitGuard {
+public:
+    OrphanExitGuard(ActiveWorkersFn active_workers, std::chrono::milliseconds grace,
+                    int hard_exit_code) noexcept
+        : active_workers_(std::move(active_workers)), grace_(grace), code_(hard_exit_code) {}
+
+    OrphanExitGuard(const OrphanExitGuard&) = delete;
+    OrphanExitGuard& operator=(const OrphanExitGuard&) = delete;
+
+    /// Call once the caller's own explicit orphan check has completed - makes
+    /// the destructor below a no-op on the normal path.
+    void disarm() noexcept { armed_ = false; }
+
+    ~OrphanExitGuard() noexcept {
+        if (!armed_)
+            return;
+        if (active_workers_() > 0 && !wait_for_workers_to_drain(active_workers_, grace_))
+            hard_exit(code_);
+    }
+
+private:
+    ActiveWorkersFn active_workers_;
+    std::chrono::milliseconds grace_;
+    int code_;
+    bool armed_{true};
+};
+
 } // namespace yuzu::agent

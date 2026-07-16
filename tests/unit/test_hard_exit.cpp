@@ -52,3 +52,28 @@ TEST_CASE("a zero grace with a nonzero count returns false without hanging",
           "[hard_exit]") {
     CHECK_FALSE(yuzu::agent::wait_for_workers_to_drain([] { return std::size_t{1}; }, 0ms, 1ms));
 }
+
+// OrphanExitGuard's destructor calls hard_exit() (terminates the process) when
+// still armed with a nonzero, never-draining count - not in-process testable,
+// same reason hard_exit() itself isn't. Only the two SAFE paths are covered:
+// disarm() suppresses the check entirely, and a count that is already zero
+// never triggers it.
+
+TEST_CASE("a disarmed OrphanExitGuard's destructor is a no-op even with a "
+          "nonzero, never-draining count",
+          "[hard_exit]") {
+    {
+        yuzu::agent::OrphanExitGuard guard{[] { return std::size_t{1}; }, 1ms, 99};
+        guard.disarm();
+    } // if disarm() didn't work, this line would never be reached (hard_exit(99))
+    SUCCEED("destructor did not call hard_exit after disarm()");
+}
+
+TEST_CASE("an armed OrphanExitGuard is a no-op when the count is already zero",
+          "[hard_exit]") {
+    {
+        yuzu::agent::OrphanExitGuard guard{[] { return std::size_t{0}; }, 1ms, 99};
+        // left armed - the destructor must see count==0 and do nothing.
+    }
+    SUCCEED("destructor did not call hard_exit when already drained");
+}

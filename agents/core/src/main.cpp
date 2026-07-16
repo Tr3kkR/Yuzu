@@ -786,6 +786,21 @@ int main(int argc, char* argv[]) {
 
     agent->run();
 
+    // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2): several
+    // operations between here and the explicit orphan check below
+    // (g_agent_mu acquisition on Windows, report_status-equivalent logging)
+    // could in principle throw and unwind past that check entirely, which
+    // would let normal C++ teardown run below while a Guardian I/O worker
+    // might still be active - exactly what F3 exists to prevent. Constructed
+    // AFTER `agent`, so reverse-declaration-order destruction runs this guard
+    // BEFORE the Agent's own destructor on every exit path, including an
+    // unwind - the same pattern `shutdown_watcher`/`agent_unpublisher` below
+    // already rely on. Disarmed once the explicit check has run to
+    // completion on the normal path (see below); its destructor is a
+    // deliberately non-throwing, unlogged fallback for every other path.
+    yuzu::agent::OrphanExitGuard orphan_guard{
+        [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+
     // ── THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM ──────────────────────────────
     // From here on nothing can act on a signal: the watcher is about to be joined and
     // `g_shutdown_wfd` cleared, so on_signal would find wfd == -1 and simply RETURN —
@@ -870,6 +885,7 @@ int main(int argc, char* argv[]) {
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
         }
     }
+    orphan_guard.disarm(); // the explicit check above has run to completion
 
     // #1303: a fatal STARTUP failure (e.g. the fail-closed TLS posture refused to
     // connect with no pinnable CA) must surface as a non-zero exit so systemd
