@@ -116,6 +116,12 @@ public:
     /// Number of rules currently persisted. Informational only.
     std::size_t rule_count() const;
 
+    /// Number of guards CURRENTLY ARMED (may be < rule_count(): a disabled rule,
+    /// an unsupported/off-platform spark type, or a failed start all persist the
+    /// rule without arming a guard). Informational + the test seam for the
+    /// enabled()/disable/re-enable/same-id-replace contract (rung 6).
+    std::size_t armed_guard_count() const;
+
     /// Current policy generation — monotonically increasing; bumped on
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;

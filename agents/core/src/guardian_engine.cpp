@@ -269,7 +269,18 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (!put_rule_locked(rule)) {
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
-        start_guard_for_rule_locked(rule); // step 4: arm the on-box guard
+        if (rule.enabled()) {
+            start_guard_for_rule_locked(rule); // step 4: arm the on-box guard
+        } else if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
+            // A disabled rule must not leave a stale guard armed from an earlier
+            // push: start_local already skips disabled cached rules on restart
+            // (line ~212), but this loop previously called start_guard_for_rule_
+            // locked for every pushed rule regardless of enabled() — so pushing
+            // an already-armed rule as disabled never stopped its guard.
+            if (it->second)
+                it->second->stop();
+            guards_.erase(it);
+        }
         ++applied;
     }
 
@@ -393,6 +404,11 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
 std::size_t GuardianEngine::rule_count() const {
     std::lock_guard lock(mtx_);
     return rule_count_;
+}
+
+std::size_t GuardianEngine::armed_guard_count() const {
+    std::lock_guard lock(mtx_);
+    return guards_.size();
 }
 
 std::uint64_t GuardianEngine::policy_generation() const {

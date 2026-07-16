@@ -326,6 +326,103 @@ TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-c
     CHECK(status.errored_rules() == 1);
 }
 
+// ── rung 6: apply_rules must honor enabled() the same way start_local does ──
+// Previously apply_rules called start_guard_for_rule_locked for EVERY pushed
+// rule regardless of enabled() (unlike start_local, which already skipped
+// disabled cached rules on restart), so a disabled rule still armed a guard,
+// and pushing an already-armed rule as disabled never stopped it. These use
+// make_service_rule because it is the one fixture that arms a REAL guard
+// cross-platform (SystemdServiceGuard on Linux+systemd, ServiceGuard on
+// Windows) without depending on the target unit/service existing (R5) — a
+// SKIP mirrors the existing [statereader] "no reachable system bus" precedent
+// for environments where arming genuinely cannot happen.
+
+TEST_CASE("GuardianEngine: apply_rules never arms a guard for a disabled rule",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-disabled", "audit");
+    p.mutable_rules(0)->set_enabled(false);
+    REQUIRE(f.engine->apply_rules(p).has_value());
+
+    CHECK(f.engine->rule_count() == 1);       // still persisted...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but never armed
+}
+
+TEST_CASE("GuardianEngine: full_sync does not arm a disabled rule alongside an enabled one",
+          "[guardian][engine][enabled][full_sync]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-on", "audit");
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-off", "audit");
+    p.mutable_rules(1)->set_enabled(false);
+    REQUIRE(f.engine->apply_rules(p).has_value());
+
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->rule_count() == 2);
+    CHECK(f.engine->armed_guard_count() == 1); // only svc-on
+}
+
+TEST_CASE("GuardianEngine: disabling a previously-armed rule stops it; re-enabling re-arms it",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, now disabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        p.mutable_rules(0)->set_enabled(false);
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->rule_count() == 1);       // the rule is still tracked (disabled, not deleted)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but its guard was stopped
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, re-enabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->armed_guard_count() == 1); // re-armed
+}
+
+TEST_CASE("GuardianEngine: re-pushing an enabled rule with the same id replaces its guard, "
+          "never double-arms",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-replace", "audit");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, changed content, still enabled
+        p.set_full_sync(false);
+        auto rule = GuardianFixture::make_service_rule("svc-replace", "enforce");
+        *p.add_rules() = rule;
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->armed_guard_count() == 1); // swapped, not accumulated to 2
+}
+
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;
