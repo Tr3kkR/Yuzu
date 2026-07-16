@@ -826,6 +826,19 @@ int main(int argc, char* argv[]) {
     }
 #else
     g_agent.store(nullptr, std::memory_order_release);
+    // F3's orphan check below needs guardian_->stop() to have DEFINITELY
+    // completed before sampling guardian_active_io_workers() - a count of
+    // zero is meaningless otherwise: it could mean "fully quiesced" just as
+    // easily as "the watcher thread's a->stop() call has not even started
+    // yet". ~ShutdownWatcher's destructor JOINS the watcher thread (whose
+    // callback IS a->stop()) - waiting for main()'s natural scope exit to get
+    // that join is too late, since the orphan check below runs first in
+    // program order. Reset it explicitly here instead. g_agent is already
+    // null (above), so this is safe even on the rare detach fallback path
+    // (Sol rung-7.6 review finding 1). On Windows, g_agent_mu already
+    // provides this ordering: the console handler holds it across a->stop(),
+    // and the store above blocks until any in-flight call has returned.
+    shutdown_watcher.reset();
 #endif
 
     // F3 orphan-exit obligation (ADR-0021 rung 7.6; guardian_io_executor.hpp's
@@ -844,10 +857,16 @@ int main(int argc, char* argv[]) {
         constexpr auto kOrphanDrainGrace = std::chrono::seconds(3);
         if (!yuzu::agent::wait_for_workers_to_drain(
                 [&] { return agent->guardian_active_io_workers(); }, kOrphanDrainGrace)) {
-            spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
-                             "forcing process exit rather than race static/DSO teardown "
-                             "against them",
-                             n, kOrphanDrainGrace.count());
+            // Firewalled: a logging exception here must never skip hard_exit()
+            // below - same rationale as log_quietly() elsewhere in this file
+            // (Sol rung-7.6 review finding 2).
+            try {
+                spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
+                                 "forcing process exit rather than race static/DSO teardown "
+                                 "against them",
+                                 n, kOrphanDrainGrace.count());
+            } catch (...) {
+            }
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
         }
     }

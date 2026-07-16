@@ -21,8 +21,8 @@
 /// detached Guardian I/O worker that may still be executing library code
 /// through it).
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
-#include <functional>
 #include <thread>
 
 #ifdef _WIN32
@@ -56,10 +56,17 @@ inline void hard_exit(int code) noexcept {
 /// nonzero after grace" means; main()/service_win.cpp call hard_exit() with a
 /// nonzero code rather than let normal process exit run C++ teardown
 /// concurrently with a still-running detached I/O worker.
-inline bool wait_for_workers_to_drain(const std::function<std::size_t()>& active_workers,
-                                      std::chrono::milliseconds grace,
-                                      std::chrono::milliseconds poll_interval =
-                                          std::chrono::milliseconds(20)) {
+///
+/// Templated rather than `std::function<std::size_t()>`: a call site is one
+/// or two lines away from hard_exit() on the "not drained" path, and a
+/// std::function CONVERSION can itself allocate and throw, which would skip
+/// hard_exit() entirely and fall through to the normal teardown this whole
+/// mechanism exists to avoid racing (Sol rung-7.6 review finding 2).
+template <typename ActiveWorkersFn>
+bool wait_for_workers_to_drain(ActiveWorkersFn&& active_workers,
+                               std::chrono::milliseconds grace,
+                               std::chrono::milliseconds poll_interval =
+                                   std::chrono::milliseconds(20)) {
     const auto deadline = std::chrono::steady_clock::now() + grace;
     while (active_workers() > 0) {
         if (std::chrono::steady_clock::now() >= deadline)
