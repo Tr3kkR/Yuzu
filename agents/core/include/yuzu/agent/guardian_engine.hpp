@@ -194,8 +194,9 @@ public:
     /// partial construction back and reports SparkFailed; see the .cpp for
     /// the exact rollback sequence). `engine` is a BORROWED pointer, safe
     /// only because of the agent.cpp member-declaration-order guarantee that
-    /// spark_engine_ outlives this GuardianEngine's teardown (guardian_ is
-    /// declared before spark_engine_ in agent.cpp, so it is destroyed first).
+    /// spark_engine_ outlives this GuardianEngine's teardown (spark_engine_ is
+    /// declared BEFORE guardian_ in agent.cpp; members destroy in reverse
+    /// declaration order, so guardian_ - declared later - is destroyed first).
     /// `spark_disabled_by_config` disambiguates a null `engine` meaning
     /// --spark-disable from one meaning spark_engine_ failed to boot -
     /// agent.cpp already knows which case it is; this method must not guess.

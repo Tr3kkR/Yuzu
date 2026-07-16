@@ -3017,25 +3017,6 @@ private:
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
-    // Declared AFTER stream_write_mu_/guardian_sink_stream_ (destroyed before both,
-    // same reasoning as always: ~GuardianEngine joins the guard worker threads,
-    // which must happen while the mutex + sink-stream holder those workers write
-    // through are still alive, H4/#1209) AND, as of ADR-0021 rung 7, AFTER
-    // thread_pool_ and BEFORE spark_engine_ below - moved here from its earlier
-    // position (right after guardian_sink_stream_) specifically so guardian_ is
-    // destroyed BEFORE spark_engine_, not after. GuardianSparkEngineBackend
-    // (rung 7.3) holds a BORROWED, non-owning SparkEngine* threaded through
-    // guardian_'s spark_runtime_/spark_backend_ once a future rung wires
-    // wire_spark_engine() into this constructor - that borrowed pointer is only
-    // ever safe to hold if spark_engine_ outlives ~GuardianEngine, which requires
-    // spark_engine_ to be destroyed AFTER guardian_, i.e. declared AFTER it here.
-    // The OLD declaration order (guardian_ before spark_engine_, so spark_engine_
-    // was destroyed FIRST) made every comment elsewhere claiming "spark_engine_
-    // always outlives this adapter" FALSE - inert only because no production call
-    // site invokes wire_spark_engine() yet (governance Gate 2/3 finding, this PR).
-    // Body-initialized in the ctor (after kv_store_), so this declaration-order
-    // move does not itself require reordering any constructor-body statement.
-    std::unique_ptr<GuardianEngine> guardian_;
     // SparkEngine (ADR-0021 Stage-2, rung 1) — instantiated OBSERVE-ONLY with no
     // consumer, so (unlike guardian_/dex_observer_) it does NOT emit through
     // guardian_sink_stream_; ~SparkEngine only joins its own internal wheel/mechanism
@@ -3043,16 +3024,40 @@ private:
     // in quiesce_run_workers() before member teardown. nullptr under --spark-disable,
     // and also nullptr if boot-time instantiation threw (degrade-to-no-spark).
     //
-    // DECLARATION ORDER IS LOAD-BEARING — spark_engine_ MUST stay AFTER thread_pool_.
-    // Members destroy in reverse declaration order, so this makes ~SparkEngine run
-    // BEFORE ~ThreadPool. Rung 1 does not borrow the pool, but rung 2's queued Guardian
-    // consumer is expected to dispatch through it (the agent's bounded-dispatch pattern,
-    // #2037). Declared the other way round, ~ThreadPool would run first and
-    // ~SparkEngine's join could then invoke a callback against a destroyed pool — and
-    // stop() sequencing masks that only on the graceful path, since a throw between
-    // construction and stop() destroys members directly. Free to fix now; a
-    // use-after-free class to find later (governance Gate-3 architect).
+    // DECLARATION ORDER IS LOAD-BEARING — spark_engine_ MUST stay AFTER thread_pool_
+    // AND BEFORE guardian_ below. Members destroy in REVERSE declaration order (the
+    // LAST-declared member is destroyed FIRST): this position makes ~SparkEngine run
+    // BEFORE ~ThreadPool (rung 1 does not borrow the pool, but rung 2's queued
+    // Guardian consumer is expected to dispatch through it, #2037 - declared the
+    // other way round, ~ThreadPool would run first and ~SparkEngine's join could
+    // invoke a callback against a destroyed pool), AND makes ~SparkEngine run AFTER
+    // ~GuardianEngine (ADR-0021 rung 7): GuardianSparkEngineBackend (rung 7.3) holds
+    // a BORROWED, non-owning SparkEngine* threaded through guardian_'s
+    // spark_runtime_/spark_backend_ once a future rung wires wire_spark_engine()
+    // into this constructor - that pointer is only safe to hold if spark_engine_
+    // outlives ~GuardianEngine, which requires spark_engine_ destroyed AFTER
+    // guardian_, i.e. declared BEFORE it (verified with a standalone destructor-
+    // order reproducer, not by re-reading this comment - an EARLIER version of this
+    // fix, in this same PR, had guardian_ declared before spark_engine_, which is
+    // BACKWARDS: that destroys spark_engine_ FIRST, still leaving the dangling-
+    // pointer bug this comment describes fixing. Caught by governance Gate 8
+    // independently re-reviewing this PR's own fix commit - cpp-safety and
+    // security-guardian both re-derived the destruction order from source and
+    // caught the inversion; empirically confirmed with g++ before landing this
+    // correction). Free to fix now; a use-after-free class to find later otherwise
+    // (governance Gate-3 architect, original finding).
     std::unique_ptr<SparkEngine> spark_engine_;
+    // Declared AFTER stream_write_mu_/guardian_sink_stream_ (destroyed before both,
+    // same reasoning as always: ~GuardianEngine joins the guard worker threads,
+    // which must happen while the mutex + sink-stream holder those workers write
+    // through are still alive, H4/#1209) AND, as of ADR-0021 rung 7, AFTER
+    // spark_engine_ above - this is what makes guardian_ (the LAST-declared of the
+    // two) destroy FIRST, while spark_engine_ is still alive, satisfying
+    // GuardianSparkEngineBackend's borrowed-pointer requirement documented on
+    // spark_engine_ above. Body-initialized in the ctor (after kv_store_), so this
+    // declaration-order position does not itself require reordering any
+    // constructor-body statement.
+    std::unique_ptr<GuardianEngine> guardian_;
     /// TRUE once run()'s spark boot block has finished mutating spark_engine_ (set on
     /// every path: instantiated, --spark-disable, or degrade-to-no-spark). Agent::stop()
     /// — which runs on the watcher/SCM/console thread and is reachable from the moment

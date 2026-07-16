@@ -20,15 +20,19 @@
  * that reads as a mystery bug rather than a caller-sequencing one).
  *
  * LIFETIME: engine_ is BORROWED, never owned. This is safe ONLY because of
- * agent.cpp's member declaration order: GuardianEngine (which owns this
- * adapter, transitively via GuardianSparkRuntime's shared_ptr<ISparkBackend>)
- * is declared BEFORE spark_engine_, so it is destroyed FIRST (reverse
- * declaration order) - spark_engine_ always outlives this adapter's lifetime.
- * (Landed as a governance Gate 2/3 fix, this PR - an earlier version of this
- * comment described the intended order while the actual declaration was still
- * reversed; harmless only because no production call site invoked
- * wire_spark_engine() yet. Do not reorder agent.cpp's guardian_/spark_engine_
- * declarations without re-verifying this invariant.)
+ * agent.cpp's member declaration order: spark_engine_ is declared BEFORE
+ * guardian_ (which owns this adapter, transitively via GuardianSparkRuntime's
+ * shared_ptr<ISparkBackend>). Members destroy in REVERSE declaration order -
+ * the LAST-declared member is destroyed FIRST - so guardian_ (declared later)
+ * is destroyed BEFORE spark_engine_ (declared earlier): spark_engine_ always
+ * outlives this adapter's lifetime. (Landed as a governance Gate 2/3 fix, this
+ * PR - a first attempt at this fix got the declaration order BACKWARDS
+ * [guardian_ before spark_engine_, which destroys spark_engine_ first - the
+ * exact bug being fixed], caught by an independent Gate 8 re-review and
+ * verified empirically with a standalone destructor-order reproducer before
+ * landing this corrected version. Do not reorder agent.cpp's guardian_/
+ * spark_engine_ declarations without re-verifying this invariant the same
+ * way - prose review alone was not enough to catch the inversion.)
  */
 
 #include <yuzu/agent/spark.hpp> // SparkSpec
