@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -316,25 +317,40 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
             return read_known(std::move(snap));
         }
         if (e == ERROR_ACCESS_DENIED) {
-            // A bare access denial does not by itself prove the target exists
-            // (it could be a denial on a directory component). Confirm existence
-            // (and grab metadata) before reporting present.
-            WIN32_FILE_ATTRIBUTE_DATA fad{};
-            if (GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+            // A read denial does not itself prove the target exists (it may be a
+            // traversal denial on a directory component, or a dangling reparse
+            // point). Reopen for METADATA ONLY: desired access 0 still FOLLOWS the
+            // reparse point (no OPEN_REPARSE_POINT) but needs no read permission,
+            // so a successful open proves the FOLLOWED target exists;
+            // ERROR_*_NOT_FOUND is absent; any other failure is Unknown (never a
+            // fabricated present). GetFileAttributesExW is NOT used - its reparse
+            // follow semantics are ambiguous and could pass on the link alone.
+            HANDLE mh = CreateFileW(wpath.c_str(), 0,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (mh != INVALID_HANDLE_VALUE) {
                 FileSnapshot snap;
                 snap.exists = true;
                 snap.readable = false;
-                snap.size = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-                snap.mtime_ns = static_cast<std::int64_t>(
-                    (static_cast<std::uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
-                    fad.ftLastWriteTime.dwLowDateTime);
+                BY_HANDLE_FILE_INFORMATION mbi{};
+                if (GetFileInformationByHandle(mh, &mbi)) {
+                    snap.size = (static_cast<std::uint64_t>(mbi.nFileSizeHigh) << 32) | mbi.nFileSizeLow;
+                    snap.identity =
+                        std::to_string(mbi.dwVolumeSerialNumber) + ":" +
+                        std::to_string((static_cast<std::uint64_t>(mbi.nFileIndexHigh) << 32) |
+                                       mbi.nFileIndexLow);
+                    snap.mtime_ns = static_cast<std::int64_t>(
+                        (static_cast<std::uint64_t>(mbi.ftLastWriteTime.dwHighDateTime) << 32) |
+                        mbi.ftLastWriteTime.dwLowDateTime);
+                }
+                CloseHandle(mh);
                 return read_known(std::move(snap));
             }
-            const DWORD ae = GetLastError();
-            if (ae == ERROR_FILE_NOT_FOUND || ae == ERROR_PATH_NOT_FOUND)
+            const DWORD me = GetLastError();
+            if (me == ERROR_FILE_NOT_FOUND || me == ERROR_PATH_NOT_FOUND)
                 return read_known(FileSnapshot{}) /* target absent */;
             return read_unknown<FileSnapshot>(
-                "CreateFileW ACCESS_DENIED + GetFileAttributesExW error " + std::to_string(ae));
+                "CreateFileW ACCESS_DENIED + metadata-open error " + std::to_string(me));
         }
         return read_unknown<FileSnapshot>("CreateFileW error " + std::to_string(e));
     }
@@ -365,11 +381,11 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
     // ChangeTime (metadata/content change time) is not in BY_HANDLE_FILE_INFORMATION;
     // it is the Windows analogue of POSIX ctime for the mutation-stability check
     // (a same-size + same-write-time in-place write still moves ChangeTime).
-    auto changetime_of = [](HANDLE h) -> std::int64_t {
+    auto changetime_of = [](HANDLE h) -> std::optional<std::int64_t> {
         FILE_BASIC_INFO fbi{};
         if (GetFileInformationByHandleEx(h, FileBasicInfo, &fbi, sizeof(fbi)))
             return static_cast<std::int64_t>(fbi.ChangeTime.QuadPart);
-        return 0; // unavailable -> contributes a constant; size+mtime+identity still gate
+        return std::nullopt; // unavailable -> dropped from the stability comparison
     };
 
     BY_HANDLE_FILE_INFORMATION bi{};
@@ -397,16 +413,20 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
     if (plan.hash_cap == 0 || snap.size > plan.hash_cap)
         return read_known(std::move(snap));
 
-    std::int64_t change_time = changetime_of(fh); // stability input only; not in the snapshot
+    std::optional<std::int64_t> change_time = changetime_of(fh); // stability input only
     for (int attempt = 0; attempt < kHashAttempts; ++attempt) {
         const std::string h = sha256_from_handle(fh, static_cast<std::size_t>(plan.hash_cap));
         BY_HANDLE_FILE_INFORMATION bi2{};
         if (!info_of(fh, bi2))
             return read_unknown<FileSnapshot>("re-GetFileInformationByHandle error " +
                                               std::to_string(GetLastError()));
-        const std::int64_t ct2 = changetime_of(fh);
+        const std::optional<std::int64_t> ct2 = changetime_of(fh);
+        // ChangeTime only vetoes stability when BOTH reads produced a value; if
+        // either is unavailable it drops out (identity+size+mtime still gate), so a
+        // transient info failure cannot false-mutate or force a spurious Unknown.
+        const bool ct_stable = (!change_time || !ct2) ? true : (*ct2 == *change_time);
         const bool stable = identity_of(bi2) == snap.identity && size_of(bi2) == snap.size &&
-                            mtime_of(bi2) == snap.mtime_ns && ct2 == change_time;
+                            mtime_of(bi2) == snap.mtime_ns && ct_stable;
         if (stable) {
             if (h.empty())
                 return read_unknown<FileSnapshot>("hash read failed");
