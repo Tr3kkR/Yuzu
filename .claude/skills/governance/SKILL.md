@@ -131,6 +131,55 @@ implements the same semantic (e.g. "revoke token", "update group",
 Explicit "grep for sibling paths and compare" is the invariant — not
 "trust that other paths are fine."
 
+## New authz surface / principal class check (LOAD-BEARING)
+
+Added after PR #2202: a rebase of already-gated engine-principal code
+shipped **4 HIGH** auth findings (fleet-wide-read-when-RBAC-off,
+boots-clean-on-corrupt-rbac.db, engine-audit-mislabelled, resolver
+branch with no production caller) through a 14-agent `/governance` run
+AND two Hermes passes. An external panel caught all four on first
+contact. The gap: reviewers checked the *new routes* and the surface a
+recently-added deny-belt already covered, and never traced the
+capability's authority across the whole authz layer.
+
+When a diff adds or changes a **principal class**, an `auth_source`, an
+authorization **entry point**, or any capability reachable by a new kind
+of actor, do ALL of the following — do not sample:
+
+1. **Chokepoint coverage, not file coverage.** Enumerate *every*
+   authorization chokepoint an actor of that class can reach —
+   `require_permission`, `require_scoped_permission`, `require_admin`,
+   every inline `check_permission`/`check_scoped_permission`, the MCP
+   tier gate, any service-scoped/elevation/legacy fallback — and prove
+   the intended posture (allow/deny/step-up) at EACH. A carve-out that
+   sits only on the new routes, or only where a sibling guard happens to
+   already sit, is the #2202 gap. Grep for the chokepoint functions; do
+   not reason from "the new code looks right."
+
+2. **Test the DEFAULT deployment config, not the hardened one.** Re-run
+   the authorization reasoning with the security-relevant toggle in its
+   **default** state (e.g. RBAC *off* — the default — not RBAC on). The
+   #2202 fleet-wide-read only triggered with RBAC off, which is exactly
+   what nobody exercised. Ask: "what does this grant/deny when the admin
+   has configured nothing?"
+
+3. **Reachability of every new branch.** For each new authorization or
+   resolution branch (a new `principal_type` arm, a new store method, a
+   new grant path), grep for a **production caller**. A branch reachable
+   only from tests is either dead code or a shipped-incomplete
+   deliverable — say which. (#2202 Blocker 4: the engine RBAC resolver
+   had no route that could author the grant it consumed.)
+
+4. **Fail-closed on infra failure.** For any new authoritative read in
+   the authz/identity path, confirm a store/DB failure denies or refuses
+   boot — never reads as an empty/absent result that silently allows.
+   Check the engaged-empty-vs-`nullopt` / `std::expected` distinction.
+
+5. **Comment-vs-code diff.** Read each comment near a new authz branch
+   against the code it describes. #2202 Blocker 2 shipped a comment that
+   asserted the *opposite* of what the function did (`nullopt` on
+   failure) — a lying comment is a strong signal, not decoration.
+
 ## New-error-branch audit
 
 If this PR adds any new 4xx/5xx error-response branch in a handler,

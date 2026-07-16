@@ -72,9 +72,37 @@ Triggers for loading each doc:
 | **MEDIUM** | Missing input validation, weak crypto params, missing audit event | Requires acknowledgment. Should be fixed in same PR or tracked. |
 | **LOW** | Defense-in-depth suggestions, hardening opportunities | Informational. Fix when convenient. |
 
+## New authz surface / principal class (LOAD-BEARING — added after #2202)
+
+A rebase of already-gated engine-principal code shipped **4 HIGH** auth
+findings past a 14-agent `/governance` run + two Hermes passes; an
+external panel caught all four. The lesson: review *chokepoint coverage*,
+not *file coverage*. When a diff adds/changes a principal class,
+`auth_source`, authorization entry point, or a capability reachable by a
+new kind of actor:
+
+- **Every chokepoint, proven.** Enumerate ALL authz entry points the new
+  actor can reach — `require_permission`, `require_scoped_permission`,
+  `require_admin`, every inline `check_permission`, the MCP tier gate,
+  any service-scoped/elevation/legacy fallback — and prove allow/deny/
+  step-up at each. A carve-out on only the new routes (or only where a
+  sibling guard already sits) is the #2202 gap. Grep the chokepoints.
+- **Default config.** Re-run the reasoning with the security toggle in
+  its DEFAULT state (e.g. RBAC *off* — the default). #2202's fleet-wide
+  read only triggered with RBAC off; nobody exercised it.
+- **Branch reachability.** Every new authz/resolution branch must have a
+  production caller — grep for one. Test-only ⇒ dead code or a
+  shipped-incomplete deliverable (#2202 Blocker 4).
+- **Fail-closed reads.** A store/DB failure in the authz/identity path
+  must deny or refuse boot, never read as empty/absent-and-allow
+  (engaged-empty vs `nullopt`/`std::expected`).
+- **Comment-vs-code.** Diff each comment near a new authz branch against
+  the code — #2202 shipped one asserting the opposite of its behavior.
+
 ## Review Checklist
 
 When performing deep-dive review:
+- [ ] New principal class / authz entry point: carve-out proven at EVERY chokepoint, in the DEFAULT config, every new branch has a production caller (see section above)
 - [ ] All SQL queries use parameterized statements (`?` placeholders)
 - [ ] All REST endpoints check RBAC permissions
 - [ ] No credentials, tokens, or keys appear in log messages or error responses
