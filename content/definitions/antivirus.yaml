@@ -158,7 +158,8 @@ metadata:
     Remediator and MRT engine versions. Emits status "unknown" when the
     definition bundle is unreadable — never an assumed-healthy value. No
     real-time-protection row is reported: macOS exposes no queryable
-    equivalent, and agents older than 0.2.0 answer "not_available".
+    equivalent, and antivirus plugin versions older than 0.2.0 answer
+    "not_available".
   tags: [security, antivirus, xprotect, compliance, macos]
 
 spec:

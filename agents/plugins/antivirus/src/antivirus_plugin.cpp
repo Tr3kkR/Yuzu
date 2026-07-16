@@ -175,7 +175,12 @@ constexpr const char* kXProtectVersionCmd =
 void list_av_products_macos(yuzu::CommandContext& ctx) {
     // XProtect: probe the definition bundle instead of asserting it — the old
     // hardcoded "active" reported protection without reading anything.
-    auto xp_ver = yuzu::antivirus::parse_plist_version(run_command(kXProtectVersionCmd));
+    // These macOS system binaries are invoked via the plugin's existing
+    // popen-based run_command helper because argv-style execution would
+    // require a new cross-platform subprocess helper; all commands are
+    // hardcoded literals with no user-supplied arguments.
+    auto xp_out = run_command(kXProtectVersionCmd);
+    auto xp_ver = yuzu::antivirus::parse_plist_version(xp_out);
     if (!xp_ver.empty()) {
         ctx.write_output("av|XProtect|active");
         ctx.write_output(std::format("xprotect_version|{}", xp_ver));
@@ -187,8 +192,8 @@ void list_av_products_macos(yuzu::CommandContext& ctx) {
     // system-extension registry (unprivileged read); modern EDRs must
     // register there. Emits an av row per extension plus a detail row with
     // bundle id and version.
-    auto exts = yuzu::antivirus::parse_sysext_list(
-        run_command("systemextensionsctl list 2>/dev/null"));
+    auto sysext_out = run_command("systemextensionsctl list 2>/dev/null");
+    auto exts = yuzu::antivirus::parse_sysext_list(sysext_out);
     std::string es_names;
     for (const auto& ext : exts) {
         if (!yuzu::antivirus::is_endpoint_security(ext))
@@ -225,7 +230,8 @@ void xprotect_status_macos(yuzu::CommandContext& ctx) {
     // XProtect definition version + bundle freshness, and the Remediator/MRT
     // engine versions. No realtime_protection row — macOS exposes no
     // queryable equivalent, and asserting one would be false confidence.
-    auto ver = yuzu::antivirus::parse_plist_version(run_command(kXProtectVersionCmd));
+    auto ver_out = run_command(kXProtectVersionCmd);
+    auto ver = yuzu::antivirus::parse_plist_version(ver_out);
     if (ver.empty()) {
         ctx.write_output("status|unknown");
         return;
@@ -240,18 +246,20 @@ void xprotect_status_macos(yuzu::CommandContext& ctx) {
         ctx.write_output(std::format("last_update|{}", mtime));
     }
 
-    auto remediator = yuzu::antivirus::parse_plist_version(run_command(
+    auto remediator_out = run_command(
         "/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "
         "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/Info.plist "
-        "2>/dev/null"));
+        "2>/dev/null");
+    auto remediator = yuzu::antivirus::parse_plist_version(remediator_out);
     if (!remediator.empty()) {
         ctx.write_output(std::format("remediator_version|{}", remediator));
     }
 
-    auto mrt = yuzu::antivirus::parse_plist_version(run_command(
+    auto mrt_out = run_command(
         "/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "
         "/Library/Apple/System/Library/CoreServices/MRT.app/Contents/Info.plist "
-        "2>/dev/null"));
+        "2>/dev/null");
+    auto mrt = yuzu::antivirus::parse_plist_version(mrt_out);
     if (!mrt.empty()) {
         ctx.write_output(std::format("mrt_version|{}", mrt));
     }
