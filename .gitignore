@@ -36,8 +36,10 @@ meson-logs/
 meson-private/
 compile_commands.json
 
-# vcpkg
-vcpkg_installed/
+# vcpkg — match the dir AND the worktree cache-share symlink (a bare
+# `vcpkg_installed/` trailing slash matches directories only, so a symlink
+# slipped past `git add -A` and got tracked; `/vcpkg_installed` matches both).
+/vcpkg_installed
 
 # Binaries
 *.exe
