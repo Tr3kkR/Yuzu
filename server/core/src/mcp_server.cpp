@@ -5245,7 +5245,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Security", "Write"))
                     return;
-                if (!rbac_store || !engine_principal_store) {
+                if (!rbac_store || !rbac_store->is_open() || !engine_principal_store) {
                     res.set_content(error_response(id, kInternalError,
                                                    "RBAC or engine-principal store not available"),
                                     "application/json");
@@ -5326,7 +5326,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Security", "Write"))
                     return;
-                if (!rbac_store) {
+                if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "RBAC store not available"),
                                     "application/json");
                     return;
@@ -5340,9 +5340,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
+                // Idempotent DELETE (success even if the role was not held).
+                // With the store confirmed open, a !result is a runtime query
+                // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
-                    res.set_content(error_response(id, kInvalidParams, result.error()),
+                    res.set_content(error_response(id, kInternalError, result.error()),
                                     "application/json");
                     return;
                 }
@@ -5367,7 +5370,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Security", "Read"))
                     return;
-                if (!rbac_store) {
+                if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "RBAC store not available"),
                                     "application/json");
                     return;

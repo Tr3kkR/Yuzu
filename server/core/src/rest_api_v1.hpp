@@ -284,11 +284,14 @@ public:
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
     ///
-    /// `step_up_fn` (PR2, optional) — when present, the 9 high-risk REST
-    /// handlers (token create/revoke, session revoke, Guardian rule
-    /// create/update/push, software package create, software deploy
-    /// start, file retrieval upload) gate behind it after permissions
-    /// pass. Empty functor disables the gate entirely (default — preserves
+    /// `step_up_fn` (PR2, optional) — when present, the high-risk REST /
+    /// Settings handlers (token create/revoke, session revoke, Guardian rule
+    /// create/update/push, software package create, software deploy start,
+    /// file retrieval upload, user delete/role-change, and the two
+    /// engine-principal role assign/unassign routes) gate behind it after
+    /// permissions pass — the canonical enumerated list lives in
+    /// docs/user-manual/rest-api.md "Step-up envelope on high-risk endpoints".
+    /// Empty functor disables the gate entirely (default — preserves
     /// pre-PR2 behaviour for any caller that hasn't wired it).
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,

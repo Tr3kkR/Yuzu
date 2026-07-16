@@ -229,6 +229,12 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assign creates a reso
     REQUIRE(listed);
     CHECK(listed->status == 200);
     CHECK(listed->body.find("EngineReader") != std::string::npos);
+    // Field-name contract (ADR-1005 A1 twin parity): the list item key is
+    // `role`, matching the assign/unassign response bodies and the MCP
+    // list twin — NOT the legacy `role_name`. Lock it so a rename can't
+    // silently reintroduce the REST/MCP drift.
+    CHECK(listed->body.find("\"role\"") != std::string::npos);
+    CHECK(listed->body.find("role_name") == std::string::npos);
 }
 
 TEST_CASE("REST DELETE /api/v1/engine-principals/{id}/roles/{role}: unassign removes the grant",

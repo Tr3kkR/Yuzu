@@ -560,11 +560,11 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     },
     "/engine-principals/{id}/roles": {
-      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}}},
-      "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
+      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "RBAC store unavailable"}}},
+      "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
-      "delete": {"summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "403": {"description": "Requires Security:Write"}}}
+      "delete": {"summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned (idempotent — success even if not held)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "RBAC store unavailable"}}}
     })json"
         // Split here so each raw-string literal stays under MSVC's 16,380-byte
         // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -1787,7 +1787,10 @@ void RestApiV1::register_routes(
              [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
-                 if (!rbac_store) {
+                 // is_open() distinguishes "no roles" from "rbac.db down": a
+                 // closed store must 503, never return [] implying the
+                 // principal holds no grants (a misleading authoritative read).
+                 if (!rbac_store || !rbac_store->is_open()) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
@@ -1796,7 +1799,10 @@ void RestApiV1::register_routes(
                  auto roles = rbac_store->get_principal_roles("engine", principal_id);
                  JArr arr;
                  for (const auto& r : roles) {
-                     arr.add(JObj().add("principal_id", r.principal_id).add("role_name", r.role_name));
+                     // Key is `role` — matches the POST/assign response body and
+                     // the MCP list twin (one field name across every
+                     // engine-role surface; ADR-1005 A1 parity).
+                     arr.add(JObj().add("principal_id", r.principal_id).add("role", r.role_name));
                  }
                  res.set_content(ok_json(arr.str()), "application/json");
              });
@@ -1812,7 +1818,7 @@ void RestApiV1::register_routes(
             // CA subordinate-import route (also Security:Write).
             if (!perm_fn(req, res, "Security", "Write"))
                 return;
-            if (!rbac_store || !engine_principal_store) {
+            if (!rbac_store || !rbac_store->is_open() || !engine_principal_store) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -1905,7 +1911,7 @@ void RestApiV1::register_routes(
                                                              httplib::Response& res) {
             if (!perm_fn(req, res, "Security", "Write"))
                 return;
-            if (!rbac_store) {
+            if (!rbac_store || !rbac_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -1921,9 +1927,13 @@ void RestApiV1::register_routes(
             const std::string principal_id = "engine:" + req.matches[1].str();
             const std::string role_name = req.matches[2].str();
 
+            // unassign_role is an idempotent DELETE — success even when the
+            // role was not held (matches the management-group sibling). With
+            // the store confirmed open above, a !result here is a runtime
+            // query failure, not a client error, so surface it as 503.
             auto result = rbac_store->unassign_role("engine", principal_id, role_name);
             if (!result) {
-                res.status = 400;
+                res.status = 503;
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
