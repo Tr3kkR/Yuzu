@@ -208,7 +208,7 @@ Three things are visible after upgrading agents:
    `security.firewall.state` description (v1.1.0) lands on fresh installs
    only; upgraded fleets get the corrected *behavior* regardless. To refresh
    the text, delete `security.firewall.state` and re-import it via
-   `POST /api/v1/definitions/import` — do not edit it in the dashboard YAML
+   `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
 
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
