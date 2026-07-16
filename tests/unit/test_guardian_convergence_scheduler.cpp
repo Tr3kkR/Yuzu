@@ -38,6 +38,7 @@ struct FakeReader : IStateReader {
         svc_reads.fetch_add(1);
         return read_known(ServiceRunState::Running);
     }
+    void request_stop() noexcept override {}
 };
 struct FakeBackend : ISparkBackend {
     std::atomic<std::uint64_t> next{1};

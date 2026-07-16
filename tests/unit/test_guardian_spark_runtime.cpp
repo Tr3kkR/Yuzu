@@ -59,6 +59,8 @@ struct FakeReader : IStateReader {
         reads.fetch_add(1);
         return svc;
     }
+    std::atomic<int> stops{0};
+    void request_stop() noexcept override { stops.fetch_add(1); }
 };
 
 struct FakeBackend : ISparkBackend {

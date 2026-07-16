@@ -2,6 +2,7 @@
 
 #include "guardian_rule_eval.hpp"   // read_known / read_unknown + snapshot types
 #include <yuzu/agent/file_hash.hpp> // sha256_from_fd / sha256_from_handle (#807)
+#include <yuzu/agent/spark.hpp>     // SparkSpec / SparkType / spark_key (single-flight key)
 
 #include <spdlog/spdlog.h>
 
@@ -192,12 +193,9 @@ ReadResult<RegistrySnapshot> read_one_value(HKEY h, const std::string& value_nam
 }
 #endif // _WIN32
 
-} // namespace
-
-// ── read_file (cross-platform) ───────────────────────────────────────────────
+// ── read_file_blocking (cross-platform; runs on the executor's detached worker) ──
 #ifndef _WIN32
-ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p,
-                                                        const FileReadPlan& plan) {
+ReadResult<FileSnapshot> read_file_blocking(const FileSparkParams& p, const FileReadPlan& plan) {
     // Follow symlinks (legacy sha256_file semantics), but pin the RESOLVED inode
     // for the whole read: we fstat + hash + revalidate on the SAME fd, so there
     // is no second path-open swap window (the #807 hazard applies to hash-then-
@@ -295,8 +293,7 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
     return read_unknown<FileSnapshot>("file mutating during hash, retries exhausted");
 }
 #else  // _WIN32
-ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p,
-                                                        const FileReadPlan& plan) {
+ReadResult<FileSnapshot> read_file_blocking(const FileSparkParams& p, const FileReadPlan& plan) {
     // Follow reparse points (no OPEN_REPARSE_POINT) to match the POSIX
     // symlink-follow semantics; FILE_SHARE_* keeps us from blocking writers, and
     // hashing from the single owned HANDLE keeps the read consistent. BACKUP
@@ -445,9 +442,8 @@ ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p
 }
 #endif // _WIN32
 
-// ── read_registry (Windows only; Unknown elsewhere) ──────────────────────────
-RegistryRead GuardianStateReader::read_registry(const RegistrySparkParams& p,
-                                                const RegistryReadPlan& plan) {
+// ── read_registry_blocking (Windows only; Unknown elsewhere) ─────────────────
+RegistryRead read_registry_blocking(const RegistrySparkParams& p, const RegistryReadPlan& plan) {
     RegistryRead out;
 #ifdef _WIN32
     HKEY root = parse_hive_local(p.hive);
@@ -484,17 +480,19 @@ RegistryRead GuardianStateReader::read_registry(const RegistrySparkParams& p,
     return out;
 }
 
-// ── read_service (Linux sd_bus / Windows SCM; Unknown elsewhere) ──────────────
+// ── read_service_blocking (Linux sd_bus / Windows SCM; Unknown elsewhere) ─────
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
-namespace {
 constexpr const char* kDest      = "org.freedesktop.systemd1";
 constexpr const char* kMgrPath   = "/org/freedesktop/systemd1";
 constexpr const char* kMgrIface  = "org.freedesktop.systemd1.Manager";
 constexpr const char* kUnitIface = "org.freedesktop.systemd1.Unit";
 
-// Bound the method calls below so a hung broker cannot exceed this on the read
-// path (the libsystemd default is ~25s). Set once on the connection.
-constexpr std::uint64_t kSdBusTimeoutUs = 5'000'000; // 5s
+// Total sd-bus budget for the whole read (LoadUnit + ActiveState). The executor
+// already bounds the SUBMITTER at the service deadline; this bounds the WORKER's
+// own wall time by splitting the budget across the two sequential method calls, so
+// a wedged broker cannot leave the worker (and thus the service slot + key) held
+// for ~2x the per-method timeout. The libsystemd default is ~25s.
+constexpr std::uint64_t kSdBusTotalBudgetUs = 5'000'000; // 5s
 
 // Reader-local absence classification. The shared systemd_error_name_is_absence
 // folds org.freedesktop.DBus.Error.ServiceUnknown into "absent", but for calls
@@ -510,9 +508,8 @@ bool unit_error_is_absence(const char* name) {
         return false;
     return systemd_error_name_is_absence(name);
 }
-} // namespace
 
-ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams& p) {
+ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
     const std::string unit = normalize_unit_name(p.service_name);
     if (!valid_unit_name(unit))
         return read_unknown<ServiceRunState>("invalid unit name: " + p.service_name);
@@ -529,7 +526,11 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
                 sd_bus_flush_close_unref(b);
         }
     } bus_guard{bus};
-    sd_bus_set_method_call_timeout(bus, kSdBusTimeoutUs); // bound LoadUnit + ActiveState
+
+    // Split the total budget across the two sequential calls: LoadUnit gets the
+    // whole budget, ActiveState gets whatever remains.
+    const auto t_start = std::chrono::steady_clock::now();
+    sd_bus_set_method_call_timeout(bus, kSdBusTotalBudgetUs);
 
     // Resolve the unit object path (LoadUnit resolves even an inactive unit).
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -551,6 +552,17 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
             return read_known(ServiceRunState::Stopped); // R5: absent unit -> Stopped
         return read_unknown<ServiceRunState>("LoadUnit transient failure for " + unit);
     }
+
+    // Bound the second call by the remaining budget; if none remains the whole read
+    // has already used its wall-time allowance -> transient Unknown.
+    const std::uint64_t elapsed_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              t_start)
+            .count());
+    if (elapsed_us >= kSdBusTotalBudgetUs)
+        return read_unknown<ServiceRunState>("service read budget exhausted after LoadUnit for " +
+                                             unit);
+    sd_bus_set_method_call_timeout(bus, kSdBusTotalBudgetUs - elapsed_us);
 
     // Point-read the ActiveState property.
     sd_bus_error perr = SD_BUS_ERROR_NULL;
@@ -578,7 +590,7 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
                                                   : ServiceRunState::Stopped);
 }
 #elif defined(_WIN32)
-ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams& p) {
+ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
     yuzu::win::ScHandle scm;
     scm.reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
     if (!scm)
@@ -618,11 +630,73 @@ ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSpark
     }
 }
 #else
-ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams&) {
+ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams&) {
     // No service backend on this platform (e.g. macOS in this rung); a service
     // rule never arms here, so this is only reached defensively -> Unknown.
     return read_unknown<ServiceRunState>("service reader unsupported on this platform");
 }
 #endif
+
+// ── executor routing ──────────────────────────────────────────────────────────
+// Per-class deadlines: file-hash is generous because the 64 MiB (default) cap, an
+// unbounded authored max_bytes, and up to kHashAttempts re-hashes on a mutating
+// file can exceed 5s on a healthy-but-slow disk (a permanent-Unknown trap);
+// metadata-only / registry / service are 5s.
+constexpr auto kFileHashDeadline = std::chrono::seconds(15);
+constexpr auto kFileMetaDeadline = std::chrono::seconds(5);
+constexpr auto kRegistryDeadline = std::chrono::seconds(5);
+constexpr auto kServiceDeadline  = std::chrono::seconds(5);
+
+// Map a bounded-I/O failure to a precise, bounded guard.unhealthy detail string.
+std::string io_failure_detail(const char* kind, IoFailure f) {
+    switch (f) {
+    case IoFailure::Timeout:           return std::string{kind} + " read timed out (bounded I/O deadline)";
+    case IoFailure::Stopped:           return std::string{kind} + " read cancelled (reader stopping)";
+    case IoFailure::CapacityExhausted: return std::string{kind} + " read rejected (I/O executor at capacity)";
+    case IoFailure::AlreadyRunning:    return std::string{kind} + " read already in flight (single-flight)";
+    case IoFailure::LaunchFailed:      return std::string{kind} + " read worker launch failed";
+    case IoFailure::WorkerThrew:       return std::string{kind} + " read worker failed";
+    }
+    return std::string{kind} + " read failed";
+}
+
+} // namespace
+
+// Public overrides: route each read through the bounded executor (single-flight on
+// the canonical spark_key, bulkheaded per type, deadline captured at entry) and map
+// any IoFailure to a precise Unknown. The closures capture params/plan BY VALUE, so
+// a detached worker never touches `this` or a caller-stack reference.
+ReadResult<FileSnapshot> GuardianStateReader::read_file(const FileSparkParams& p,
+                                                        const FileReadPlan& plan) {
+    const auto deadline = plan.hash_cap > 0 ? kFileHashDeadline : kFileMetaDeadline;
+    auto r = executor_.run(IoClass::File, spark_key(SparkSpec{.type = SparkType::File, .params = p}),
+                           deadline, [p, plan] { return read_file_blocking(p, plan); });
+    if (r)
+        return std::move(*r);
+    return read_unknown<FileSnapshot>(io_failure_detail("file", r.error()));
+}
+
+RegistryRead GuardianStateReader::read_registry(const RegistrySparkParams& p,
+                                                const RegistryReadPlan& plan) {
+    auto r =
+        executor_.run(IoClass::Registry, spark_key(SparkSpec{.type = SparkType::Registry, .params = p}),
+                      kRegistryDeadline, [p, plan] { return read_registry_blocking(p, plan); });
+    if (r)
+        return std::move(*r);
+    RegistryRead out;
+    const std::string why = io_failure_detail("registry", r.error());
+    for (const auto& v : plan.value_names)
+        out.values.emplace(v, read_unknown<RegistrySnapshot>(why));
+    return out;
+}
+
+ReadResult<ServiceRunState> GuardianStateReader::read_service(const ServiceSparkParams& p) {
+    auto r =
+        executor_.run(IoClass::Service, spark_key(SparkSpec{.type = SparkType::Service, .params = p}),
+                      kServiceDeadline, [p] { return read_service_blocking(p); });
+    if (r)
+        return std::move(*r);
+    return read_unknown<ServiceRunState>(io_failure_detail("service", r.error()));
+}
 
 } // namespace yuzu::agent

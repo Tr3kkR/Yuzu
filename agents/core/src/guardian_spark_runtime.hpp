@@ -105,12 +105,21 @@ struct RegistryRead {
 ///     and the consumer detach both wait on an in-flight read), so a platform call
 ///     that can block indefinitely (SCM, sd-bus, a filesystem stall) must carry a
 ///     timeout and degrade to Unknown rather than hang agent shutdown.
+///   - MUST implement request_stop(): begin_stop() calls it (outside the runtime's
+///     lock) so an in-flight / future read wakes and degrades to Unknown instead of
+///     blocking a lane join or the consumer detach.
 class IStateReader {
 public:
     virtual ~IStateReader() = default;
     virtual ReadResult<FileSnapshot> read_file(const FileSparkParams& p, const FileReadPlan& plan) = 0;
     virtual RegistryRead read_registry(const RegistrySparkParams& p, const RegistryReadPlan& plan) = 0;
     virtual ReadResult<ServiceRunState> read_service(const ServiceSparkParams& p) = 0;
+    /// Wake any waiting read and reject new ones so shutdown does not hang. Does NOT
+    /// cancel a detached OS call already in a kernel syscall (that cannot be
+    /// cancelled or joined); it decouples the waiter, which degrades to Unknown.
+    /// MUST be idempotent and NONBLOCKING, and MUST NOT throw - begin_stop() runs
+    /// from ~GuardianSparkRuntime(), so an escaping exception would std::terminate.
+    virtual void request_stop() noexcept = 0;
 };
 
 /// The runtime's view of the spark backend: arm a watcher for a spec (returns the

@@ -322,10 +322,20 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
 }
 
 void GuardianSparkRuntime::begin_stop() {
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    stopping_ = true;
-    for (auto& [rid, rg] : rules_)
-        rg->active = false;
+    std::shared_ptr<IStateReader> reader;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        stopping_ = true;
+        for (auto& [rid, rg] : rules_)
+            rg->active = false;
+        reader = reader_; // copy under the lock; call request_stop() outside it
+    }
+    // request_stop() is an extensible virtual - never invoke it under registry_mu_
+    // (the runtime already avoids calling copied wakers under its central lock). It
+    // is contractually noexcept + nonblocking, so it is safe here even though
+    // begin_stop() also runs from ~GuardianSparkRuntime().
+    if (reader)
+        reader->request_stop();
 }
 
 std::size_t GuardianSparkRuntime::armed_key_count() const {

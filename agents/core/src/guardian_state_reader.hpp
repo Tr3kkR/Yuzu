@@ -11,33 +11,45 @@
 //                a truly absent unit/service folds to Stopped (R5); other
 //                platforms report Unknown.
 //
-// STATELESS -> thread-safe by construction: every call resolves from its own
-// params/plan using only locals plus OS handles it opens and closes within the
-// call, so the convergence lanes and the consumer handler may call it
-// concurrently for different keys with no shared mutable state.
+// THREAD-SAFE VIA THE EXECUTOR: each read body is a self-contained free function
+// that resolves from its own params/plan using only locals plus OS handles it
+// opens and closes within the call. The convergence lanes and the consumer
+// handler may call the reader concurrently for different keys; the shared
+// GuardianIoExecutor member is the only mutable state and is internally
+// synchronised.
 //
-// BOUNDED/CANCELLABLE (partial): the sd_bus point-read carries an explicit 5s
-// method-call timeout (not the ~25s libsystemd default). The file open/read and
-// the Windows SCM calls are synchronous with no per-read deadline; they are
-// bounded in practice on a local filesystem / a responsive SCM, but a network /
-// FUSE mount stall or a wedged SCM can still block a lane join or the consumer
-// detach until the agent's hard-exit shutdown backstop (PR-A) fires. Full
-// per-read cancellation (a stop token + platform cancellable I/O, or a
-// lifetime-safe bounded I/O executor) is a recorded follow-up, NOT yet done. The
-// reader still never fabricates an absent/stopped from a failure - it degrades to
-// Unknown.
+// BOUNDED / CANCELLABLE (F3): every read runs on a detached worker via the
+// GuardianIoExecutor with a per-class deadline (file-hash ~15s, file-metadata-only
+// / registry / service 5s), single-flighted per canonical spark_key and
+// bulkheaded per type. A read that exceeds its deadline (a network/FUSE mount
+// stall, a wedged SCM, a hung sd-bus broker) degrades to Unknown instead of
+// hanging a lane join or the consumer detach; the wedged worker is decoupled, not
+// force-cancelled (a D-state syscall cannot be cancelled or joined). request_stop()
+// (from begin_stop(), including ~GuardianSparkRuntime) wakes any waiter and rejects
+// new reads. The reader never fabricates an absent/stopped from a failure - it
+// degrades to Unknown.
+//
+// ORPHAN-EXIT OBLIGATION: a decoupled worker may still be running a kernel/library
+// call after the reader is destroyed. active_io_workers() surfaces the executor's
+// live worker count (total + per class); the process MUST NOT perform normal C++
+// static/DSO teardown while it is > 0 (a detached worker in libc/OpenSSL/sd-bus
+// through teardown is UB). The enforcement (main taking _exit after a bounded
+// grace) is a tracked rung-7 / separate-PR dependency; see guardian_io_executor.hpp.
 //
 // Unknown vs Known is the load-bearing distinction: a DEFINITIVE negative (file
 // ENOENT, registry key/value not found, systemd NoSuchUnit, SCM
 // ERROR_SERVICE_DOES_NOT_EXIST) is a KNOWN snapshot (absent / stopped) that the
 // evaluator turns into a real verdict; a TRANSIENT fault (EMFILE, ACCESS_DENIED,
-// a bus transport blip, a mid-transition *_PENDING / activating state) is
-// UNKNOWN, so the evaluator leaves the compliance verdict untouched and raises
-// guard.unhealthy instead of a false drift.
+// a bus transport blip, a mid-transition *_PENDING / activating state, or a bounded
+// I/O failure from the executor) is UNKNOWN, so the evaluator leaves the compliance
+// verdict untouched and raises guard.unhealthy instead of a false drift.
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include "guardian_io_executor.hpp"   // GuardianIoExecutor + IoClass
 #include "guardian_spark_runtime.hpp" // IStateReader + seam types (plan/snapshot/params)
+
+#include <cstddef>
 
 namespace yuzu::agent {
 
@@ -46,6 +58,16 @@ public:
     ReadResult<FileSnapshot> read_file(const FileSparkParams& p, const FileReadPlan& plan) override;
     RegistryRead read_registry(const RegistrySparkParams& p, const RegistryReadPlan& plan) override;
     ReadResult<ServiceRunState> read_service(const ServiceSparkParams& p) override;
+    void request_stop() noexcept override { executor_.stop(); }
+
+    /// Live bounded-I/O worker count (orphan-exit obligation, see the header note).
+    [[nodiscard]] std::size_t active_io_workers() const { return executor_.active_worker_count(); }
+    [[nodiscard]] std::size_t active_io_workers(IoClass c) const {
+        return executor_.active_worker_count(c);
+    }
+
+private:
+    GuardianIoExecutor executor_;
 };
 
 } // namespace yuzu::agent
