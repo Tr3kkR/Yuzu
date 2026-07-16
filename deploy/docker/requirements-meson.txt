@@ -6,6 +6,5 @@
 # normal dependency PRs (it regenerates the hashes).
 # meson is pure Python with zero install_requires — the wheel + sdist
 # hashes below are the complete closure.
-meson==1.9.2 \
-    --hash=sha256:1a284dc1912929098a6462401af58dc49ae3f324e94814a38a8f1020cee07cba \
-    --hash=sha256:3499b59bb23982496e01e57b4103ac2f826f9c3a3f59e507a0a832487fe55e3d
+meson==1.11.1 \
+    --hash=sha256:9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80

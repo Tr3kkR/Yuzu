@@ -78,6 +78,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
@@ -2908,6 +2909,91 @@ On a `503` the store could not be read; do **not** treat it as "not installed an
 
 ---
 
+### Software Licensing (SLE)
+
+The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
+
+#### `GET /api/v1/sle/agents/{agent_id}`
+
+One device's detected licences — the per-agent drill. This is the **only** surface that serves the per-user `user_scope`/`user_ref` fields (ADR-0024 Decision 11 personal data); its MCP twin `query_software_licenses` returns machine-scope facts with those fields omitted. Because it renders personal data, every open is **audited fail-closed**: if the `sle.agent.view` audit row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no licence data is served.
+
+**Permission:** `SoftwareLicensing:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "licenses": [
+      {"product": "Office 365 ProPlus", "vendor": "Microsoft", "version": "16.0.1",
+       "license_type": "subscription", "state": "subscription_active", "expiry_at": 1893456000,
+       "channel": "KMS", "key_hint": "XXXXX-B7GJQ", "detector": "wmi_slp",
+       "confidence": "probable", "exe_hints": "winword.exe;excel.exe",
+       "user_scope": "machine", "user_ref": "",
+       "collected_at": 1751000000, "first_seen": 1751000000, "last_seen": 1751600000}
+    ],
+    "count": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`key_hint` is an OS-provided partial key — full key material is never collected, stored, or served. `expiry_at` is epoch seconds (`0` = none). On a per-user row, `user_scope` is `"user"` and `user_ref` carries the profile identifier as minimised on-device (`hash` mode default — a per-agent keyed-HMAC pseudonym; see the [privacy limits](software-licensing.md#per-user-detection-and-privacy)). `first_seen`/`last_seen` are server receipt times.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `SoftwareLicensing:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` means the store could not be read — do **not** treat it as "nothing licensed".
+
+#### `DELETE /api/v1/sle/agents/{agent_id}`
+
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+
+**Permission:** a **per-device-scoped conjunction over every securable the cascade erases through** — `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and** `GuaranteedState:Delete`. A role missing any one of the three is `403`'d (the seeded Administrator/ITServiceOwner roles hold all three; a custom role must be granted the full set).
+
+Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
+
+**Response (200)** — every store's delete committed:
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "decommissioned": true,
+    "stores": {"inventory": "deleted", "software_inventory": "deleted",
+               "app_perf_daily": "deleted", "device_inventory": "skipped",
+               "software_licensing": "deleted"},
+    "deleted": 4,
+    "skipped": 1,
+    "failed": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not configured on this deployment), `failed` (rolled back or threw — the delete did **not** happen). Each store reports its true commit status, so a rolled-back erasure is never reported as done.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks any one of the three per-device-scoped `Delete` permissions |
+| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures |
+| 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
+| 503 | Scope gate or cascade not configured (A4 envelope) |
+
+A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first.
+
+---
+
 ### Execution Statistics
 
 Fleet-wide and per-entity execution metrics.
@@ -4607,11 +4693,40 @@ A failed signature ALWAYS rejects, even when enforcement is off — `--allow-uns
 
 #### `POST /api/instructions/yaml`
 
-Store raw YAML source for an instruction definition.
+Create or update an instruction definition from raw YAML source (the dashboard
+New Definition panel's Save endpoint). Form-encoded: `yaml_source` carries the
+document verbatim (stored as the definition's source of truth); an optional
+`id` parameter switches to update mode. Responses are HTML fragments (this is
+a dashboard surface), plus an `HX-Trigger` toast header. Requires
+`InstructionDefinition:Write`.
+
+The queryable columns are derived schema-aware from the YAML — both the
+canonical nested schema and the flat form the panel's structured form
+generates are accepted, with this precedence:
+
+| Column | Canonical | Fallback |
+|---|---|---|
+| id | `metadata.id` (create only; honoured, **409** on conflict) | store-generated |
+| name | `metadata.displayName` | `metadata.name`, then `metadata.id` |
+| plugin / action | `spec.execution.plugin` / `.action` | `spec.plugin` / `spec.action` |
+| approval | `spec.approval.mode` | scalar `spec.approval` (default `auto`) |
+| version / type / concurrency | `metadata.version` / `spec.type` / `spec.execution.concurrency` | defaults `1.0.0` / `question` / `per-device` |
+
+On update, a `yaml_source` whose `metadata.id` differs from the `id` parameter
+is rejected. Explicit ids must match `[A-Za-z0-9._-]{1,128}`. Save and
+validate-yaml share one validation contract — YAML that passes validation
+always saves.
+
+**Audit:** emits `instruction.create` / `instruction.update` (`result=success`),
+and `instruction.create` with `result=denied` / `duplicate_id` on conflict.
 
 #### `POST /api/instructions/validate-yaml`
 
 Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
+Requires `InstructionDefinition:Read`. Runs the same validation contract as
+the Save endpoint above (required fields, `type`/`approval` enums, explicit
+`metadata.id` charset/length, size cap, scope-walking gates), so a document
+that validates green is guaranteed to save.
 
 #### `POST /api/instructions/{id}/execute`
 
@@ -5769,11 +5884,13 @@ Discovery — static capability document (patch/filter/bulk support flags).
 
 #### `GET /scim/v2/ResourceTypes`
 
-Discovery — a SCIM `ListResponse` describing the `User` resource type.
+Discovery — a SCIM `ListResponse` describing the User and Group resource
+types.
 
 #### `GET /scim/v2/Schemas`
 
-Discovery — a SCIM `ListResponse` describing the core `User` schema.
+Discovery — a SCIM `ListResponse` describing the core User and Group
+schemas.
 
 #### `POST /scim/v2/Users`
 
@@ -5795,11 +5912,13 @@ are tolerated and ignored).
 | `201` + `Location` + `ETag` | Created | SCIM User representation |
 | `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
 
-Created at the fixed `role=user` with a discarded CSPRNG password — the
-account authenticates via SSO, never a local password. If the `userName`
-instead matches an existing SCIM-provisioned account that is currently
-**deactivated**, `POST` revives that account (a returning-employee
-reprovision) rather than `409`ing.
+Created with a discarded CSPRNG password — the account authenticates via
+SSO, never a local password. Role defaults to `user`, recomputed
+immediately against `--scim-admin-group` membership (see Groups → role
+mapping below) — created `role=admin` iff already a member of that group at
+creation time. If the `userName` instead matches an existing
+SCIM-provisioned account that is currently **deactivated**, `POST` revives
+that account (a returning-employee reprovision) rather than `409`ing.
 
 #### `GET /scim/v2/Users/{id}`
 
@@ -5861,12 +5980,68 @@ account immediately before mutating it, and refuses with **`404` — never
 from "no such SCIM resource") plus a `scim.user.provenance_denied` audit row.
 This is what makes it safe to point an IdP's SCIM connector at this surface
 at all: a locally-created admin, or the `--break-glass-user` account, can
-never be deactivated by a SCIM call; SCIM-provisioned accounts are always
-`role=user` at creation so a compromised IdP cannot create an admin; and the
-`role` check means an operator-elevated former-SCIM account (later promoted
-by a human via the dashboard) also drops out of SCIM's write authority. See
-`docs/auth-architecture.md` "SCIM v2 provisioning" for the full threat
-discussion.
+never be deactivated by a SCIM call; the only path from a SCIM request to
+`role=admin` is Groups → role mapping below, bounded to the single
+configured `--scim-admin-group`, so a compromised IdP cannot create an
+admin outside that mapping; and the `role` check means an operator-elevated
+former-SCIM account (later promoted by a human via the dashboard, or via
+Groups → role mapping) also drops out of SCIM's write authority until it is
+back to `role=user`. See `docs/auth-architecture.md` "SCIM v2 provisioning"
+for the full threat discussion.
+
+#### Groups → role mapping
+
+`Group` is advertised in `/scim/v2/ResourceTypes` and `/scim/v2/Schemas`
+(schema urn `urn:ietf:params:scim:schemas:core:2.0:Group`). Gated by
+`--scim-admin-group` (`YUZU_SCIM_ADMIN_GROUP`, default empty — no SCIM group
+grants admin). Full design detail (role-resolution, provenance guard
+interaction, deprovision-ordering) is in `docs/auth-architecture.md` "SCIM v2
+provisioning" § Groups → role mapping; operator walkthrough is
+[docs/user-manual/scim-provisioning.md](scim-provisioning.md#groups--role-mapping).
+
+#### `POST /scim/v2/Groups`
+
+Create a group. Body: `displayName` (required), optional `members[]`
+(each `{"value": "<scim-user-id>"}`).
+
+| Status | Condition | Body |
+|---|---|---|
+| `201` + `Location` + `ETag` | Created | SCIM Group representation |
+| `409` (`scim_type=uniqueness`) | `displayName` already in use | SCIM error envelope |
+
+#### `GET /scim/v2/Groups/{id}`
+
+Read a single group by its SCIM `id`. `200` + Group representation, or
+`404` if unknown.
+
+#### `GET /scim/v2/Groups?filter=displayName eq "x"&startIndex=&count=`
+
+List groups. Same pagination contract as `GET /scim/v2/Users`
+(`startIndex`/`count`, SCIM `ListResponse` envelope, `startIndex` 1-based per
+RFC 7644 §3.4.2). Optional `filter=displayName eq "..."` (case-insensitive
+attribute/operator, double-quoted value); any other filter expression is
+rejected `400` (`scim_type=invalidFilter`).
+
+#### `PUT /scim/v2/Groups/{id}`
+
+Replace a group (`displayName`, `members[]`). `200` + Group representation;
+`404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
+onto a `displayName` already used by a different group.
+
+#### `PATCH /scim/v2/Groups/{id}`
+
+Add/remove members — RFC 7644 §3.5.2 PatchOp on the `members` path
+(`"op": "add"` / `"op": "remove"`, `"path": "members"`). `200` + Group
+representation, or `404` if unknown.
+
+#### `DELETE /scim/v2/Groups/{id}`
+
+Delete a group. `204` on success; `404` if unknown.
+
+Any Group `POST`/`PUT`/`PATCH`/`DELETE` that changes a user's membership of
+the `--scim-admin-group` group recomputes that user's role immediately
+(`scim.user.role_changed` audit row, see below) — there is no separate
+"apply role changes" step.
 
 #### Audit actions
 
@@ -5881,11 +6056,19 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision / rolls back `500` |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
+| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 
 #### Metrics
 
-`yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
-`yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
+`yuzu_scim_requests_total{op,status}` (now including group ops),
+`yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
+`yuzu_scim_provenance_denied_total`, `yuzu_scim_role_changes_total`,
+`yuzu_scim_role_change_failures_total` (a role change that was decided but
+failed to durably apply — pairs with `scim.user.role_changed` `failure`
+rows).
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics.
 

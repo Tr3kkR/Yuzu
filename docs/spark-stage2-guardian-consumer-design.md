@@ -271,10 +271,36 @@ dashboard fragment. This section ticks every #1939 item.
   exports flat key→value heartbeat tags (`kNetTag*`-style scalars), and every sibling
   `SparkEngineStats` counter is a flat scalar summed across mechanisms — so the
   `{os,mechanism}` breakdown is realized as **separate per-type scalar counters**
-  (file / registry / service), each **pre-seeded to 0** per the bounded-label
-  convention (`docs/observability-conventions.md`), not a single labelled series.
+  (file / registry / service), not a single labelled series. **Corrected as built
+  (rung 1):** these are emitted **SPARSELY — omitted when 0, never pre-seeded** (an
+  earlier draft of this bullet said "pre-seeded to 0", which contradicted this same
+  doc's §Server and the `yuzu_fleet_net_*` precedent). The server clears each gauge
+  family per sweep, so an absent series means "no agent reported it", never a
+  fabricated 0 — the absent-not-zero rule in `docs/observability-conventions.md`.
+  Sparse emit also keeps a quiescent agent's heartbeat at two tags rather than ~15.
   Also emit `yuzu.spark_enforce_active` (rung 2, the detect-only-vs-enforcing signal,
-  §Kill-switch). **Rung-1 task:** introduce `kSparkTag*` tag-key constants
+  §Kill-switch).
+
+  > **RUNG-2 TELEMETRY CONTRACT — read this before touching the counters (#2083).**
+  > The obvious rung-2 move — "counter-type the `yuzu_fleet_spark_*` sums so `increase()`
+  > works" — is **UNIMPLEMENTABLE**, and an earlier draft of this doc and of
+  > `docs/prometheus/yuzu-alerts.yml` both said to do it. A fleet **SUM over a churning
+  > agent population is not a valid counter**: it DECREASES whenever an agent ages out of
+  > the staleness window or restarts (its cumulative counters reset to 0), Prometheus reads
+  > any decrease in a counter as a RESET, and `increase()` then manufactures a false spike
+  > out of an agent merely going away. `clear_gauge_family()` makes it worse — series go
+  > absent and reappear.
+  >
+  > The correct design: the **agent keeps shipping the cumulative absolute value**
+  > (idempotent under a duplicated or lost heartbeat — an agent-side delta is NOT: a
+  > duplicate double-counts and a loss is gone forever), and the **server** holds
+  > last-seen-per-agent and does `counter.inc(max(0, new − old))` with reset detection
+  > (`new < old → inc(new)`). Server state is ~10k × 11 × 8B ≈ 1 MB. That single change
+  > also fixes the **`absent == 0` reader contract**, which today forecloses change-gated
+  > emit and forces every agent to re-ship unchanged counters on every heartbeat
+  > (~68 B → ~556 B at rung 2; ~16 GB/day fleet-wide at 10k agents). Same root, both ends.
+
+  **Rung-1 task:** introduce `kSparkTag*` tag-key constants
   (none exist yet) and pin them with a `static_assert` in a new `test_spark_*`
   test, mirroring the `kNetTag*` pin precedent (`test_network_perf_model.cpp`) —
   this doc does not reuse the net pin's own location. Omit the
@@ -408,6 +434,40 @@ container without a system bus) is today indistinguishable from "no Service spar
 configured." A mechanism-up gauge (or an `inert` reason on the fault channel)
 distinguishes them; **owned by rung 1** (observe-only), not left open. (sre F3.)
 
+> **SHIPPED IN RUNG 1 — the 2026-07-12 deferral below was WRONG and is withdrawn.**
+> The rung-1 governance re-run (2026-07-13) had three agents independently reach the
+> same conclusion — cross-platform, sre (which explicitly *rebutted* the deferral), and
+> Gate-4 consistency. The deferral rested on "inert liveness needs arming to carry
+> signal." It does not: **inertness is known at `start()`**, no arming required, and all
+> three mechanisms already log it there. Worse, deferring it shipped a live
+> misreport — `Dockerfile.agent` installs `libsystemd0` but a container has **no system
+> bus**, so *every containerised Linux agent* advertised a `service` capability whose
+> every `watch()` would be refused: "looks healthy, can detect nothing".
+>
+> Rung 1 therefore ships an `inert` bit on `SparkMechanismStats`, set at `start()` by
+> each mechanism, and **excludes inert mechanisms from the `yuzu.spark_mechs` capability
+> CSV** — so `yuzu_fleet_spark_mechanisms{os,mechanism}` now counts only mechanisms that
+> are registered **and functional**. Inert mechanisms still report their counters;
+> inertness suppresses the capability *claim*, not the telemetry.
+>
+> Still genuinely deferred to rung 2 (#2084): the **armed-but-deaf** liveness signal (a
+> watcher that died after arming) and `mech_unsupported_total` (an arm-rejection counter
+> — nothing arms at rung 1, so it is structurally 0). Those really do need arming.
+
+### Not-running distinguishability (rung 1)
+A spark-capable agent reports exactly one of four postures, and each is distinguishable
+on the wire: **RUNNING** (`spark_running=1` + capability CSV), **FAILED** (`=0`, no
+`spark_disabled` key — enabled, but boot-time instantiation threw), **DISABLED** (`=0`
+plus `spark_disabled=1`), and **ABSENT** (no `yuzu.spark_*` key at all — a pre-rung-1
+agent, or a dead one). Rolled up as `yuzu_fleet_spark_{reporting,failed,disabled}{os}`.
+
+As first built, the FAILED path emitted *nothing*, making it byte-identical to DISABLED
+and to ABSENT — so a fleet where spark failed to boot on 30% of endpoints was
+**unobservable**, which defeats rung 1's entire stated purpose ("prove the engine runs
+and reports at rest"). The DEX sibling already had this right, emitting
+`dex_observer_armed=0` when enabled-but-deaf rather than going quiet. Alert on `failed`;
+never on `disabled`, which is an operator decision. (Gate-4 consistency + UP-10.)
+
 ### Audit-on-arm
 The arming path (Guardian's `apply_rules` / `start_local` calling
 `arm(Service, …)`) emits an audit event at the Guardian layer, matching the
@@ -462,12 +522,16 @@ upgrade note for this enforcement-posture default change (not deferred to rung 5
 
 ## Dependencies & issue dispositions
 
-- **#2011 (HARD gate, rung 0):** downgrade the engine-wide `mech_ops_mu_`
-  (`spark_engine.hpp:370`, introduced by #1994's M2 fix) to per-mechanism-type
-  granularity, so a slow `watch()` on one mechanism can't block arm/disarm on
-  another. Harmless while unconsumed; load-bearing the moment a second live
-  mechanism arms. Its observability counters already exist in `SparkEngineStats`;
-  emission + alerts fold into the health surface above.
+- **#2011 (HARD gate, rung 0) — LANDED (lock half).** The engine-wide
+  `mech_ops_mu_` (introduced by #1994's M2 fix) is downgraded to per-mechanism-type
+  `mech_ops_mu_by_type_` (`std::map<SparkType, std::mutex>`), so a slow `watch()`
+  on one mechanism can no longer block arm/disarm on another. Cross-mechanism
+  coupling is closed; the residual same-type stall (an unbounded `watch()` still
+  blocks its own type's queue) is a distinct, deferred walk-off-`mu_` follow-up,
+  gated as a Stage-2/rung-3 pre-arm dependency (measured Registry/Service
+  `watch()` latency ceiling). The observability half of #2011 (per-type
+  `SparkEngineStats` emission + alerts) is DEFERRED to rung 1, where SparkEngine
+  is first instantiated.
 - **#2014 (BLOCKING-before-Stage-2):** resolved by the no-blocking-inline-consumer
   policy + never-drop enforce lane (§Enforce). Whether to *additionally* decouple
   the Windows file mechanism's emit-delivery from its completion-reap loop
@@ -502,6 +566,25 @@ posting it as a **GitHub PR review (`gh pr review`) on that rung's PR** — a du
 artifact mapping onto Workstream F's "PR review records" category, never a bare git
 commit hash (which can orphan, as this doc's own prior `bbe55cc9` did).
 
+**A PR can orphan too — the rule above is necessary but not sufficient.** Rung 1 proved
+it. PR #2082 carried a complete governance review and GitHub reported it **MERGED** — but
+its base was `fix/2011-spark-mech-ops-per-type`, a sibling branch that had *itself* merged
+to `dev` the day before. GitHub did not retarget it, so the merge (and the code, and the
+review) landed on a dangling ref and **never reached `dev`**. The rule was satisfied and
+the evidence orphaned anyway, because it never checked where the PR's *base* pointed. An
+auditor tracing "what review authorised the code running in production" would have found
+nothing that resolves to `dev`.
+
+Two corrections, both binding from rung 2 on:
+
+1. **Every rung PR bases directly on `dev`.** Never on a sibling feature/fix branch, even
+   one still open — that branch may merge to `dev` first and silently strand the second
+   merge off-trunk. If a rung genuinely must stack, it is rebased onto `dev` and
+   re-targeted *before* merge, not after.
+2. **A PR is valid Workstream-F evidence only once its merge commit is reachable from
+   `dev`** — verified with `git merge-base --is-ancestor <merge-sha> origin/dev`, **not**
+   by trusting the GitHub "Merged" badge, which was true for #2082 the entire time.
+
 Gates, applied at the marked rungs:
 - **Parity:** Guardian §24 invariants verbatim — `Push` seed stays Guardian-only,
   the `__guard__` load-time + dispatch-time dual intercept both remain,
@@ -530,15 +613,38 @@ Gates, applied at the marked rungs:
 Each rung is an independently-governed PR on `dev`, run through the full
 `/governance` pipeline.
 
-0. **#2011 gate** — per-mechanism-type `mech_ops_mu_`. Pure engine-internal
-   refactor; acceptance test: a blocking `watch()` on mechanism A does not delay
-   `unwatch()` on mechanism B.
-1. **Instantiate + observe** — SparkEngine constructed in `agent.cpp` behind
-   `--spark-disable`; `yuzu.spark_*` heartbeat tags (incl. queue-drop/consumer-error
-   + inert-mechanism signal) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
-   denominator + alerts, `mech_unsupported_total{os,mechanism}`, and the boot log
-   naming the active detection path (legacy `IGuard` still enforcing at rung 1). No
-   consumer yet; proves the engine runs and reports at rest.
+0. **#2011 gate — LANDED (lock half).** Per-mechanism-type `mech_ops_mu_by_type_`.
+   Pure engine-internal refactor; acceptance tests: a blocking `watch()` on
+   mechanism A does not delay `unwatch()` on mechanism B (cross-type decoupling),
+   and a blocking `watch()` DOES still serialise a second arm of the same type
+   (per-type control). Observability half (per-type stats + alerts) deferred to
+   rung 1.
+1. **Instantiate + observe — LANDED.** SparkEngine constructed in `agent.cpp` behind
+   `--spark-disable`; `yuzu.spark_*` heartbeat tags (queue-drop/consumer-error +
+   per-type mech counters) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
+   denominator + the capability signal `yuzu_fleet_spark_mechanisms{os,mechanism}` +
+   a reviewed alert group shipped **commented out**, and the boot log naming the active
+   detection path (legacy `IGuard` still enforcing at rung 1). No consumer yet;
+   proves the engine runs and reports at rest. Guards against a boot exception (thread
+   exhaustion) by degrading to no-spark.
+
+   **Shipped beyond the original rung-1 scope**, both added by the rung-1 governance
+   rounds — the ladder must not be read as still deferring them:
+   - **The `inert` bit** (§Inert-mechanism distinguishability). A mechanism that started
+     but could not bind its OS facility is excluded from the capability CSV. The earlier
+     deferral to rung 2 was WITHDRAWN: inertness is known at `start()`, needs no arming,
+     and deferring it shipped a live misreport on every containerised Linux agent
+     (`libsystemd0` is installed, but a container has no system bus).
+   - **The four-posture wire contract** (§Not-running distinguishability): RUNNING /
+     FAILED / DISABLED / ABSENT, rolled up as
+     `yuzu_fleet_spark_{reporting,failed,disabled}{os}`. Without it a fleet-wide spark
+     boot failure was invisible — a failed agent emitted nothing, identical to a
+     deliberate opt-out.
+
+   **Genuinely still deferred to rung 2** (#2084): the ARMED-BUT-DEAF liveness signal (a
+   watcher that dies after arming) and `mech_unsupported_total{os,mechanism}` — both need
+   arming to carry signal. The alert group is enabled at rung 2 (#2083), and NOT by
+   "counter-typing the fleet sums" — see §Fleet metrics for why that does not work.
 2. **Guardian detection consumer** — the queued consumer + arm-per-rule (with the
    `spark_key→rule` index, refcounted shared watchers, and the re-arm/initial-eval
    contract), detection only (observe mode), behind the switch, both paths compiled
