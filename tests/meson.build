@@ -151,6 +151,7 @@ agent_test_exe = executable(
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
+    'unit/test_shutdown_pipe.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_mechanism.cpp',
@@ -372,6 +373,7 @@ if build_server
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
+      'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -451,6 +453,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_group_store.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
@@ -461,6 +464,25 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
+      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
+      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
+      # template — no link to yuzu_agent_core, just the include path.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
+      # the include path of every server test TU. It is safe TODAY only because there is
+      # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
+      # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
+      # and server/core/src/*.hpp,
+      # and because server/core/src is listed FIRST so it would win a future clash. A
+      # same-named header added on both sides later SILENTLY SHADOWS — there is no
+      # diagnostic. Do NOT add a private-agent-src include for any other target, and do
+      # NOT solve a future collision by having server PRODUCTION code include an agent
+      # header: that would be an upward dependency edge (server → agent), which the build
+      # graph does not have and must not gain. The durable fix is to hoist the shared tag
+      # keys into one source of truth at rung 2, when the wire contract changes anyway.
+      include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -492,11 +514,18 @@ if build_server
   # hidden ([.]), so the shards partition the visible case set with nothing
   # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
   # meson runs the entries in parallel, so suite wall time is max(shards),
-  # and each shard gets its own budget. 600s each (was 900s combined): the
-  # quiet-leg worst case for the WHOLE suite was 512s, and per-agent Postgres
-  # (#2094/#2114) removed the cross-job contention that blew the old 600s
-  # cap. A real hang is still bounded by the job-level timeouts (90-120 min
-  # in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
+  # and each shard gets its own budget. ~[pg] keeps 600s (its Windows worst
+  # case is ~231s). [pg] gets 900s: the 600 assumed per-agent Postgres
+  # (#2094) had removed cross-job contention, but it is NOT yet provisioned on
+  # Wee Tam, and at full durability every [pg] case's CREATE DATABASE ...
+  # TEMPLATE + DROP DATABASE WITH (FORCE) is fsync-bound — ~20x costlier on
+  # Windows — so the [pg] shard hit exactly-600s TIMEOUTs on 2026-07-14
+  # (Fail:0, killed at the cap). The durable fix is durability-off on the
+  # disposable CI clusters (fsync/synchronous_commit/full_page_writes;
+  # scripts/ci/ensure-postgres.sh + deploy/windows/Provision-Windows-Runner.ps1)
+  # + finishing the #2094 per-agent provisioning; once both land on Wee Tam
+  # this returns to 600. A real hang is still bounded by the job-level timeouts
+  # (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
   # (test_pg_template_cleanup.cpp) fires in both shards — idempotent,
   # harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear in args (flake-retry.py strips
@@ -504,10 +533,12 @@ if build_server
   #     positional specs);
   #   - neither entry name may be a substring of the other (flake-retry maps
   #     meson-junit names by longest substring match).
-  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning,
-  # split further or rebalance the shards — don't just raise the number.
+  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the
+  # first move is the durability/per-agent fix above (attack the cost), then
+  # split or rebalance — raising the number is only the transitional net it is
+  # here for [pg] until durability-off + per-agent Postgres land on Wee Tam.
   test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
-  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 600)
+  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -546,4 +577,17 @@ test('issue lifecycle docs',
   args: [files('test_issue_docs.py')],
   suite: 'docs',
   timeout: 10,
+# The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
+# entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
+# the cancelled-path "which entry never finished" inference. It reuses
+# flake-retry.py's junit-name -> introspected-entry mapping rather than keeping a
+# second copy, so the shard-naming contract documented above now has two
+# consumers — and this selftest is what makes a break in it loud. Wired here for
+# the same reason flake-retry's is: the alternative to failing in `meson test` is
+# failing silently at 06:00 UTC, in the one nightly that needed a stack trace.
+test('tsan-gdb-capture selftest',
+  _python3_test,
+  args: [files('../scripts/ci/tsan-gdb-capture.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
 )

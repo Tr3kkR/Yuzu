@@ -157,10 +157,19 @@ public:
         if (!pool_) {
             spdlog::error("spark_registry: CreateThreadpool failed (err={}) — registry sparks inert",
                           ::GetLastError());
+            // Publish the inertness: without this the mechanism stays REGISTERED and
+            // reports byte-identically to a healthy idle one on the heartbeat, so the
+            // fleet sees a registry capability that can never watch anything
+            // (governance Gate-3 cross-platform / Gate-6 sre).
+            inert_.store(true, std::memory_order_release);
             return;
         }
         // #1907 condition 2: a pinned PRIVATE pool, bounded min=2/max=4 — the
         // watch count, not the thread count, is what scales.
+        // Symmetric with spark_file.cpp: clear inert on the SUCCESS path too, or a
+        // failed-then-successful start() would report a working mechanism as inert forever
+        // and silently drop it from the capability CSV (governance Gate-3 cpp-expert).
+        inert_.store(false, std::memory_order_release);
         ::SetThreadpoolThreadMinimum(pool_, 2);
         ::SetThreadpoolThreadMaximum(pool_, 4);
         ::InitializeThreadpoolEnvironment(&env_);
@@ -350,7 +359,15 @@ private:
     PTP_POOL pool_{nullptr};
     TP_CALLBACK_ENVIRON env_{};
     bool started_{false};
+    /// Started, but CreateThreadpool failed — every watch() will be refused. Atomic so
+    /// stats() (const, called from the heartbeat thread) reads it without mu_.
+    std::atomic<bool> inert_{false};
     std::unordered_map<std::string, std::unique_ptr<RegWatch>> watches_;
+
+public:
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = inert_.load(std::memory_order_acquire)};
+    }
 };
 
 } // namespace
