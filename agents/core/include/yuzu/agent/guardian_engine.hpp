@@ -7,9 +7,10 @@
  * The engine accepts push_rules / get_status commands over the `__guard__`
  * dispatch hook, persists rule state into the agent's KvStore under the
  * reserved namespace "__guardian__", and arms one on-box IGuard per enabled
- * rule (File / Registry / Windows-Service / systemd). ADR-0021 rung 2 replaces
- * that per-rule IGuard construction with a single SparkEngine consumer
- * (guardian_spark_consumer.hpp); that migration is staged and not yet wired.
+ * rule (File / Registry / Windows-Service / systemd). ADR-0021 rung 7 wires an
+ * alternate SparkEngine-backed detection path (GuardianSparkRuntime,
+ * guardian_spark_runtime.hpp) alongside the legacy IGuard path; a per-rule
+ * reconcile op selects exactly one, never both.
  *
  * Two-phase startup (design §4 — pre-login activation):
  *   start_local()        — open persistent state, load cached rules;
