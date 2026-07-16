@@ -35,12 +35,34 @@
  * constraint doesn't strictly apply to them, but they stay in this header
  * (still inline, still trivial) rather than splitting into a second file for
  * two small pure functions.
+ *
+ * rule_assertion_from_rule() (rung 7) is the RuleAssertion-side counterpart to
+ * spark_spec_from_rule(): together they give the reconcile op everything
+ * attach_rule() needs, having faithfully re-derived the SAME normalization the
+ * legacy start_guard_for_rule_locked() (guardian_engine.cpp) already applies -
+ * hash lowercasing, whole-string max_bytes parsing + zero-normalization, the
+ * file-exists/absent default, and the debounce window sourced from
+ * parse_resilience_params over the remediation block. It does NOT carry the
+ * watch TARGET (that is spark_spec_from_rule's job) or an enforce/remediation
+ * mode - the spark evaluators are detection-only through this rung (rung 3 is
+ * when spark gains enforcement), so RuleAssertion has no field for it yet.
+ * `settle_ms` (file-hash-equals' mid-write notification coalescing window) is a
+ * FileGuard-mechanism-level concern with no RuleAssertion field and no spark
+ * FileSparkParams equivalent - an ACCEPTED behavioral delta from legacy
+ * (spark's convergence scheduler dead-reckons via size+mtime skip + a forced
+ * periodic re-hash instead of debouncing kernel notifications), flagged here
+ * for the rung-9 design-doc rewrite and the rung-10 parity/durability matrix.
  */
 
-#include <yuzu/agent/spark.hpp> // SparkSpec, SparkType, *SparkParams
+#include <yuzu/agent/resilience_strategy.hpp> // parse_resilience_params, ResilienceConfig
+#include <yuzu/agent/spark.hpp>               // SparkSpec, SparkType, *SparkParams
 
+#include "guardian_rule_eval.hpp" // RuleAssertion, AssertionKind
 #include "guaranteed_state.pb.h"
 
+#include <charconv>
+#include <cstdint>
+#include <expected>
 #include <optional>
 #include <set>
 #include <string>
@@ -132,6 +154,94 @@ spark_spec_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     }
     default:
         return std::nullopt; // Interval/Startup/Disk are not Guardian spark types
+    }
+}
+
+/// Build the proto-free RuleAssertion the spark evaluators (guardian_rule_eval.hpp)
+/// compare live state against. Returns an error for: an unrecognized spark type
+/// (see spark_type_from_token); an assertion `type()` that does not match the
+/// rule's spark type (e.g. a file-change rule asserting service-running) - this
+/// is validated BEFORE any platform-capability question, so a malformed rule is
+/// never mistaken for a routine cross-platform gap. Every field is normalized
+/// EXACTLY as start_guard_for_rule_locked() (guardian_engine.cpp) already does,
+/// re-derived here rather than shared because the legacy path fills a
+/// guard-specific Config struct, not RuleAssertion.
+[[nodiscard]] inline std::expected<RuleAssertion, std::string>
+rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
+    const yuzu::guardian::v1::GuardianSpecBlock& assertion = rule.assertion();
+    const std::optional<SparkType> spark_type = spark_type_from_token(rule.spark().type());
+    if (!spark_type)
+        return std::unexpected("unrecognized spark type: " + rule.spark().type());
+
+    RuleAssertion out;
+    out.rule_id = rule.rule_id();
+    out.rule_name = rule.name();
+
+    // debounce_ms: single-sourced via parse_resilience_params over the
+    // remediation block's params - identical to every legacy guard branch. The
+    // returned ResilienceConfig itself (remediation MODE) is intentionally
+    // discarded: spark is detection-only through this rung (enforcement lands
+    // rung 3), so only the debounce window applies here.
+    const auto& rem = rule.remediation();
+    auto get = [&rem](std::string_view k) -> std::string {
+        const auto it = rem.params().find(std::string(k));
+        return it != rem.params().end() ? it->second : std::string{};
+    };
+    (void)parse_resilience_params(get, out.debounce_ms);
+
+    const std::string& atype = assertion.type();
+    switch (*spark_type) {
+    case SparkType::File:
+        if (atype == "file-hash-equals") {
+            out.kind = AssertionKind::FileHashEquals;
+            out.expected_hash = detail::guardian_assertion_param(assertion, "expected_hash");
+            for (auto& c : out.expected_hash) // normalise to the lowercase hex sha256 emits
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c - 'A' + 'a');
+            const std::uint64_t default_max_bytes = out.max_bytes;
+            const std::string mb = detail::guardian_assertion_param(assertion, "max_bytes");
+            if (!mb.empty()) {
+                std::uint64_t parsed = default_max_bytes;
+                const auto [p, ec] = std::from_chars(mb.data(), mb.data() + mb.size(), parsed);
+                // Whole-string only: "123abc" -> default, not 123 (M1 - symmetric with
+                // the server validator and resilience_strategy::to_u64).
+                out.max_bytes = (ec == std::errc{} && p == mb.data() + mb.size())
+                                    ? parsed
+                                    : default_max_bytes;
+            }
+            // A 0 cap would report every covered file as <oversize> (never hashed,
+            // perpetual false compliant/drift) - treat 0 as unset and keep the default.
+            if (out.max_bytes == 0)
+                out.max_bytes = default_max_bytes;
+            return out;
+        }
+        if (atype == "file-exists") {
+            out.kind = AssertionKind::FileExists;
+            // "absent" -> drift when the file EXISTS; anything else (default
+            // "present", including empty/unset) -> drift when the file is missing.
+            out.expect_present = (detail::guardian_assertion_param(assertion, "expected") != "absent");
+            return out;
+        }
+        return std::unexpected("unrecognized file assertion type: " + atype);
+    case SparkType::Service:
+        if (atype == "service-running") {
+            out.kind = AssertionKind::ServiceRunning;
+            return out;
+        }
+        if (atype == "service-stopped") {
+            out.kind = AssertionKind::ServiceStopped;
+            return out;
+        }
+        return std::unexpected("unrecognized service assertion type: " + atype);
+    case SparkType::Registry:
+        if (atype != "registry-value-equals")
+            return std::unexpected("unrecognized registry assertion type: " + atype);
+        out.kind = AssertionKind::RegistryEquals;
+        out.expected_value = detail::guardian_assertion_param(assertion, "expected");
+        out.value_name = detail::guardian_assertion_param(assertion, "value_name");
+        return out;
+    default:
+        return std::unexpected("spark type has no assertion mapping"); // Interval/Startup/Disk
     }
 }
 

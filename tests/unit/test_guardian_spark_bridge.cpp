@@ -17,9 +17,12 @@
 #include <string>
 #include <variant>
 
+using yuzu::agent::AssertionKind;
 using yuzu::agent::classify;
 using yuzu::agent::FileSparkParams;
 using yuzu::agent::RegistrySparkParams;
+using yuzu::agent::RuleAssertion;
+using yuzu::agent::rule_assertion_from_rule;
 using yuzu::agent::RulePlacement;
 using yuzu::agent::ServiceSparkParams;
 using yuzu::agent::spark_key;
@@ -38,6 +41,10 @@ Rule make_rule(const std::string& rule_id, const std::string& spark_type,
     for (const auto& [k, v] : aparams)
         (*r.mutable_assertion()->mutable_params())[k] = v;
     return r;
+}
+
+void set_remediation_param(Rule& r, const char* k, const char* v) {
+    (*r.mutable_remediation()->mutable_params())[k] = v;
 }
 } // namespace
 
@@ -152,4 +159,117 @@ TEST_CASE("classify agrees with spark_spec_from_rule on every recognized token (
         REQUIRE(spark_spec_from_rule(r).has_value());
         REQUIRE(classify(spark_type, all_caps) != RulePlacement::Unrecognized);
     }
+}
+
+// ── rule_assertion_from_rule (rung 7.2) ──────────────────────────────────────
+
+TEST_CASE("rule_assertion_from_rule: file-hash-equals round-trips + lowercases the hash",
+          "[spark][bridge][assertion]") {
+    Rule r = make_rule("r1", "file-change", "file-hash-equals",
+                       {{"expected_hash", "DEADBEEF"}, {"max_bytes", "1048576"}});
+    r.set_name("my-rule");
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->rule_id == "r1");
+    CHECK(a->rule_name == "my-rule");
+    CHECK(a->kind == AssertionKind::FileHashEquals);
+    CHECK(a->expected_hash == "deadbeef");
+    CHECK(a->max_bytes == 1048576);
+}
+
+TEST_CASE("rule_assertion_from_rule: max_bytes=0 normalizes to the default, never <everything-oversize>",
+          "[spark][bridge][assertion]") {
+    const RuleAssertion default_assertion;
+    const Rule r = make_rule("r", "file-change", "file-hash-equals", {{"max_bytes", "0"}});
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->max_bytes == default_assertion.max_bytes);
+}
+
+TEST_CASE("rule_assertion_from_rule: a malformed max_bytes falls back to the default (whole-string only)",
+          "[spark][bridge][assertion]") {
+    const RuleAssertion default_assertion;
+    const Rule r = make_rule("r", "file-change", "file-hash-equals", {{"max_bytes", "123abc"}});
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->max_bytes == default_assertion.max_bytes); // "123abc" -> default, NOT 123
+}
+
+TEST_CASE("rule_assertion_from_rule: file-exists defaults to expect_present, 'absent' flips it",
+          "[spark][bridge][assertion]") {
+    const auto present = rule_assertion_from_rule(make_rule("r", "file-change", "file-exists", {}));
+    REQUIRE(present.has_value());
+    CHECK(present->kind == AssertionKind::FileExists);
+    CHECK(present->expect_present);
+
+    const auto absent = rule_assertion_from_rule(
+        make_rule("r", "file-change", "file-exists", {{"expected", "absent"}}));
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(absent->expect_present);
+
+    const auto other = rule_assertion_from_rule(
+        make_rule("r", "file-change", "file-exists", {{"expected", "whatever"}}));
+    REQUIRE(other.has_value());
+    CHECK(other->expect_present); // only the literal "absent" flips it
+}
+
+TEST_CASE("rule_assertion_from_rule: service-running / service-stopped map to distinct kinds",
+          "[spark][bridge][assertion]") {
+    const auto running = rule_assertion_from_rule(
+        make_rule("r", "service-status-change", "service-running", {}));
+    REQUIRE(running.has_value());
+    CHECK(running->kind == AssertionKind::ServiceRunning);
+
+    const auto stopped = rule_assertion_from_rule(
+        make_rule("r", "service-status-change", "service-stopped", {}));
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->kind == AssertionKind::ServiceStopped);
+}
+
+TEST_CASE("rule_assertion_from_rule: registry-value-equals reads expected + value_name",
+          "[spark][bridge][assertion]") {
+    const Rule r = make_rule("r", "registry-change", "registry-value-equals",
+                             {{"expected", "1"}, {"value_name", "Flag"}});
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->kind == AssertionKind::RegistryEquals);
+    CHECK(a->expected_value == "1");
+    CHECK(a->value_name == "Flag");
+}
+
+TEST_CASE("rule_assertion_from_rule: debounce_ms is sourced from the remediation block",
+          "[spark][bridge][assertion]") {
+    Rule r = make_rule("r", "file-change", "file-exists", {});
+    set_remediation_param(r, "event_debounce_ms", "5000");
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->debounce_ms == 5000);
+}
+
+TEST_CASE("rule_assertion_from_rule: an unrecognized spark type is an error",
+          "[spark][bridge][assertion]") {
+    const auto a = rule_assertion_from_rule(make_rule("r", "banana", "file-exists", {}));
+    REQUIRE_FALSE(a.has_value());
+}
+
+TEST_CASE("rule_assertion_from_rule: a spark-type/assertion-type mismatch is an error, "
+          "never a fabricated FileExists",
+          "[spark][bridge][assertion]") {
+    // A file-change rule asserting a SERVICE predicate: RuleAssertion::kind
+    // defaults to FileExists, so an infallible converter would silently turn
+    // this into a real (wrong) file-exists evaluation. It must be rejected.
+    const auto a = rule_assertion_from_rule(
+        make_rule("r", "file-change", "service-running", {}));
+    REQUIRE_FALSE(a.has_value());
+}
+
+TEST_CASE("rule_assertion_from_rule: an unrecognized assertion type per spark type is an error",
+          "[spark][bridge][assertion]") {
+    REQUIRE_FALSE(rule_assertion_from_rule(make_rule("r", "file-change", "bogus", {})).has_value());
+    REQUIRE_FALSE(
+        rule_assertion_from_rule(make_rule("r", "service-status-change", "bogus", {})).has_value());
+    REQUIRE_FALSE(
+        rule_assertion_from_rule(make_rule("r", "registry-change", "bogus", {})).has_value());
+    REQUIRE_FALSE(
+        rule_assertion_from_rule(make_rule("r", "registry-change", "file-exists", {})).has_value());
 }
