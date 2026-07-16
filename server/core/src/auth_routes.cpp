@@ -2499,6 +2499,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
             saml_name_id  = result.value().name_id;
+            // Namespace hygiene: a malicious/misconfigured IdP could assert a
+            // NameID inside the reserved `engine:` namespace. It would NOT
+            // bypass RBAC (the engine gate keys on principal_kind, not the
+            // prefix — this SAML session is principal_kind="human"), but it
+            // would pollute the reserved namespace and mislead audit logs with
+            // an engine-looking human session. Reject before minting.
+            if (saml_name_id.starts_with("engine:")) {
+                spdlog::warn("SAML login rejected: NameID is in the reserved 'engine:' namespace");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
             session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
                                                            saml_admin_gid);
 

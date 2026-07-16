@@ -1784,7 +1784,7 @@ void RestApiV1::register_routes(
     // Phase 4 ships fleet-wide-only, which design §4.3 states is expressible
     // in the current global model).
     sink.Get(R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, audit_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
                  // is_open() distinguishes "no roles" from "rbac.db down": a
@@ -1804,6 +1804,10 @@ void RestApiV1::register_routes(
                      // engine-role surface; ADR-1005 A1 parity).
                      arr.add(JObj().add("principal_id", r.principal_id).add("role", r.role_name));
                  }
+                 // M2: audit the privilege-enumeration read (CC7.2) — the
+                 // assign/unassign mutations are audited, so must this read.
+                 (void)audit_fn(req, "engine_principal.role.listed", "success", "EnginePrincipal",
+                                principal_id, "");
                  res.set_content(ok_json(arr.str()), "application/json");
              });
 
@@ -1870,10 +1874,18 @@ void RestApiV1::register_routes(
             // unchecked call here would silently create an orphan grant
             // that resolves as a no-op hole (a typo becomes an inert grant,
             // discoverable only by confusion, not by an error).
+            // Uniform rejection (M1 — no role-catalog oracle): an unknown role
+            // and an existing-but-forbidden role return the SAME 400 body, so
+            // a non-admin Security:Write holder can't enumerate the role
+            // catalog one name at a time by diffing "unknown role" vs "admin
+            // rejected". The specific reason is recorded server-side (audit).
+            const std::string kUniformReject =
+                "role '" + role_name + "' cannot be assigned to this engine principal";
             if (!rbac_store->get_role(role_name)) {
+                (void)audit_fn(req, "engine_principal.role.assigned", "denied", "EnginePrincipal",
+                               principal_id, role_name + ": unknown role");
                 res.status = 400;
-                res.set_content(detail::a4_error(res, "unknown role '" + role_name + "'"),
-                                "application/json");
+                res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
             }
 
@@ -1887,11 +1899,12 @@ void RestApiV1::register_routes(
                 // validate_assignment + the is_system-role check reject
                 // admin/built-in/malformed-namespace grants here — surface
                 // as a 4xx denial, never a 500 (design §4.2 "no admin,
-                // ever").
+                // ever"). The specific reason is audited; the client sees the
+                // same uniform message as the unknown-role case (M1).
                 (void)audit_fn(req, "engine_principal.role.assigned", "denied", "EnginePrincipal",
                                principal_id, role_name + ": " + result.error());
                 res.status = 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
             }
             (void)audit_fn(req, "engine_principal.role.assigned", "success", "EnginePrincipal",

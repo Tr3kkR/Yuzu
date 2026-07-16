@@ -5278,13 +5278,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Role must be a real, currently-defined RBAC role (assign_role's
-                // INSERT carries no FK — an unchecked call would silently create
-                // an orphan grant, a typo that resolves as an inert no-op).
+                // Uniform rejection (M1 — no role-catalog oracle): an unknown
+                // role and an existing-but-forbidden role return the SAME error
+                // body so a non-admin Security:Write holder can't enumerate the
+                // role catalog by diffing the messages. Specific reason audited
+                // server-side. (assign_role's INSERT carries no FK, so the
+                // get_role pre-check also prevents a typo becoming an inert
+                // orphan grant.)
+                const std::string kUniformReject =
+                    "role '" + role_name + "' cannot be assigned to this engine principal";
                 if (!rbac_store->get_role(role_name)) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "unknown role '" + role_name + "'"),
-                        "application/json");
+                    (void)audit_fn(req, "engine_principal.role.assigned", "denied",
+                                   "EnginePrincipal", principal_id, role_name + ": unknown role");
+                    res.set_content(error_response(id, kInvalidParams, kUniformReject),
+                                    "application/json");
                     return;
                 }
 
@@ -5297,11 +5304,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // validate_assignment + the is_system-role check reject
                     // admin/built-in/malformed-namespace grants — a 4xx-shaped
                     // JSON-RPC error, never an internal-error 500-equivalent
-                    // (design §4.2 "no admin, ever").
+                    // (design §4.2 "no admin, ever"). Same uniform client
+                    // message as the unknown-role case (M1); reason audited.
                     (void)audit_fn(req, "engine_principal.role.assigned", "denied",
                                    "EnginePrincipal", principal_id,
                                    role_name + ": " + result.error());
-                    res.set_content(error_response(id, kInvalidParams, result.error()),
+                    res.set_content(error_response(id, kInvalidParams, kUniformReject),
                                     "application/json");
                     return;
                 }
@@ -5390,6 +5398,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 nlohmann::json payload = {{"principal_id", principal_id},
                                           {"count", items.size()},
                                           {"roles", std::move(items)}};
+                // M2: audit the privilege-enumeration read (CC7.2), mirroring
+                // the REST GET twin and the assign/unassign mutations.
+                (void)audit_fn(req, "engine_principal.role.listed", "success", "EnginePrincipal",
+                               principal_id, "");
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
