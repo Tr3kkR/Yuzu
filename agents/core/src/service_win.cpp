@@ -2,11 +2,14 @@
 
 #include "service_win.hpp"
 
+#include "hard_exit.hpp" // shared TerminateProcess + F3 orphan-drain poll (rung 7.6)
+
 #include <yuzu/agent/agent.hpp>
 
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -200,6 +203,25 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             report_status(SERVICE_RUNNING);
 
         agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
+
+        // F3 orphan-exit obligation (ADR-0021 rung 7.6; guardian_io_executor.hpp's
+        // "ORPHAN PROCESS-EXIT CONTRACT"), Windows SCM path. Mirrors main.cpp's
+        // console-mode check: a detached Guardian bounded-I/O worker cannot be
+        // joined or force-cancelled, so give it a short grace to actually finish
+        // before this function returns and the process runs normal C++ teardown.
+        // Reported as a service-specific error (never a plain STOPPED) so the SCM
+        // sees a real failure rather than a silently-clean-looking stop.
+        if (const auto n = agent->guardian_active_io_workers(); n > 0) {
+            constexpr auto kOrphanDrainGrace = std::chrono::seconds(3);
+            if (!yuzu::agent::wait_for_workers_to_drain(
+                    [&] { return agent->guardian_active_io_workers(); }, kOrphanDrainGrace)) {
+                spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
+                                 "forcing process exit rather than race static/DSO teardown "
+                                 "against them",
+                                 n, kOrphanDrainGrace.count());
+                yuzu::agent::hard_exit(3); // distinct from the specific-error codes below
+            }
+        }
 
         spdlog::default_logger()->flush();
 

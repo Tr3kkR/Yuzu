@@ -2597,6 +2597,10 @@ public:
 
     [[nodiscard]] bool startup_failed() const noexcept override { return startup_failed_; }
 
+    [[nodiscard]] std::size_t guardian_active_io_workers() const noexcept override {
+        return guardian_ ? guardian_->active_io_workers() : 0;
+    }
+
 private:
     // Serialize a Guardian event into the __guard__/event CommandResponse and write
     // it through the current Subscribe stream. Shared by the GuardianEngine drift

@@ -16,6 +16,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
+#include "hard_exit.hpp" // shared TerminateProcess/_exit + F3 orphan-drain poll (rung 7.6)
 #include "shutdown_watcher.hpp" // POSIX self-pipe + watcher thread (the B2 root fix)
 #include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
 
@@ -150,13 +151,9 @@ static void log_quietly(const char* what) noexcept {
 
 static void on_signal_hard_exit(int sig) {
     (void)sig;
-#ifdef _WIN32
-    // Never ::_exit() here: it routes via ExitProcess -> DLL_PROCESS_DETACH across ~49 plugin DLLs
-    // -> the loader lock a wedged thread may hold. TerminateProcess runs no DllMain.
-    ::TerminateProcess(::GetCurrentProcess(), 1);
-#else
-    ::_exit(1); // exit_group(2): async-signal-safe, no atexit, no dtors, cannot block.
-#endif
+    // See hard_exit.hpp for why TerminateProcess (not ::_exit()) on Windows,
+    // and why ::_exit() (not std::exit()) on POSIX. Async-signal-safe either way.
+    yuzu::agent::hard_exit(1);
 }
 
 static void on_signal(int sig) {
@@ -214,16 +211,9 @@ static void on_signal(int sig) {
         // thread, where logging is safe) is deferred to a separate PR; until it lands, a wedged
         // stop is diagnosed from the supervisor's log and the absence of "Yuzu agent stopped".
         // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
-#ifdef _WIN32
-        // ::_exit() routes through ExitProcess, which terminates every other thread and THEN
-        // runs DLL_PROCESS_DETACH for each of the ~49 loaded plugin DLLs — taking the loader
-        // lock a wedged thread may already hold. The one path whose entire job is unconditional
-        // escape could itself deadlock. TerminateProcess runs no DllMain and takes no loader
-        // lock. (governance: cross-platform SHOULD-1.)
-        ::TerminateProcess(::GetCurrentProcess(), 1);
-#else
-        ::_exit(1); // exit_group(2): no atexit, no dtors, no loader lock. Cannot block.
-#endif
+        // See hard_exit.hpp: TerminateProcess on Windows (no DllMain, no loader
+        // lock), ::_exit() on POSIX (async-signal-safe, cannot block).
+        yuzu::agent::hard_exit(1);
     }
 
 #ifdef _WIN32
@@ -837,6 +827,30 @@ int main(int argc, char* argv[]) {
 #else
     g_agent.store(nullptr, std::memory_order_release);
 #endif
+
+    // F3 orphan-exit obligation (ADR-0021 rung 7.6; guardian_io_executor.hpp's
+    // "ORPHAN PROCESS-EXIT CONTRACT"). guardian_->stop() above has already run as
+    // part of Agent's own teardown, but a Guardian bounded-I/O read is spawned
+    // DETACHED and cannot be joined or force-cancelled - a wedged SCM query, a
+    // stalled sd-bus broker, or a hung FUSE/network mount can leave one still
+    // running past its own per-class deadline (which only makes the SUBMITTER
+    // stop waiting; the worker keeps running). Falling through to normal process
+    // exit here would run C++ static/DSO teardown while that worker may still be
+    // executing libsystemd/OpenSSL/Win32-RPC code through it - not safe. Give it
+    // a short grace to actually finish, and if it hasn't, hard_exit() (skip
+    // teardown entirely) with a code that is NEVER EXIT_SUCCESS, so the
+    // supervisor sees a real failure instead of a silently-clean-looking exit.
+    if (const auto n = agent->guardian_active_io_workers(); n > 0) {
+        constexpr auto kOrphanDrainGrace = std::chrono::seconds(3);
+        if (!yuzu::agent::wait_for_workers_to_drain(
+                [&] { return agent->guardian_active_io_workers(); }, kOrphanDrainGrace)) {
+            spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
+                             "forcing process exit rather than race static/DSO teardown "
+                             "against them",
+                             n, kOrphanDrainGrace.count());
+            yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
+        }
+    }
 
     // #1303: a fatal STARTUP failure (e.g. the fail-closed TLS posture refused to
     // connect with no pinnable CA) must surface as a non-zero exit so systemd
