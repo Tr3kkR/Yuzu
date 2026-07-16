@@ -1,10 +1,13 @@
 /**
- * wifi_corewlan.hpp — macOS current-Wi-Fi-connection query via CoreWLAN.
+ * wifi_corewlan.hpp — macOS current-Wi-Fi-connection query via CoreWLAN, plus
+ * the pure `connected`-record formatter shared by the plugin and its unit test.
  *
- * CoreWLAN is an Objective-C framework, so the implementation lives in the
- * sibling Objective-C++ translation unit `wifi_corewlan.mm` (the first `.mm`
- * TU in the tree). This header is plain C++ so `wifi_plugin.cpp` can call in
- * without itself being compiled as Objective-C++.
+ * CoreWLAN is an Objective-C framework, so `corewlan_current_connection()` is
+ * implemented in the sibling Objective-C++ TU `wifi_corewlan.mm` (the first
+ * `.mm` TU in the tree) and is only declared on Apple. The `WifiConnection`
+ * struct and `format_connected_record()` are plain, platform-neutral C++ so the
+ * output contract can be unit-tested on every CI leg without CoreWLAN or live
+ * Wi-Fi hardware (tests/unit/test_wifi_corewlan.cpp).
  *
  * Replaces the dead `airport -I` shell-out: the private `airport` binary was
  * removed in macOS 14 (Sonoma), so the old path returned nothing and the agent
@@ -20,8 +23,7 @@
  */
 #pragma once
 
-#ifdef __APPLE__
-
+#include <format>
 #include <string>
 
 namespace yuzu::wifi {
@@ -38,11 +40,25 @@ struct WifiConnection {
     std::string interface;        // e.g. "en0"; empty when no Wi-Fi hardware
 };
 
+// Formats the macOS `connected` action output line from a WifiConnection.
+// Single source of truth for the record contract, in the established macOS field
+// order: SSID | RSSI | Security | BSSID | Channel. An associated link whose SSID
+// is withheld by Location Services reports "<ssid-withheld>" (an honest
+// connection), never a false "Not connected". Pure — unit-tested cross-platform.
+inline std::string format_connected_record(const WifiConnection& c) {
+    if (!c.associated)
+        return "connected|none|Not connected|0|none|none";
+    const std::string ssid = c.ssid_available ? c.ssid : "<ssid-withheld>";
+    return std::format("connected|{}|{}|{}|{}|{}", ssid, c.rssi,
+                       c.security.empty() ? "Unknown" : c.security,
+                       c.bssid.empty() ? "-" : c.bssid, c.channel);
+}
+
+#ifdef __APPLE__
 // Populates `out` from the default Wi-Fi interface via CoreWLAN.
 // Returns false only when the host has no Wi-Fi interface at all; a powered-off
 // or unassociated radio still returns true (with associated == false).
 bool corewlan_current_connection(WifiConnection& out);
+#endif // __APPLE__
 
 } // namespace yuzu::wifi
-
-#endif // __APPLE__

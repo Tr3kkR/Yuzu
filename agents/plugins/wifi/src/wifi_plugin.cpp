@@ -476,15 +476,12 @@ int do_connected(yuzu::CommandContext& ctx) {
     // readable — so an authorised-withheld SSID becomes an honest
     // "<ssid-withheld>" marker on a real connection, never a false
     // "Not connected".
+    // A fresh struct each call; corewlan_current_connection leaves it at its
+    // default (associated == false → "Not connected") when there is no Wi-Fi
+    // interface, so format_connected_record is the single output path.
     yuzu::wifi::WifiConnection conn;
-    if (yuzu::wifi::corewlan_current_connection(conn) && conn.associated) {
-        std::string ssid = conn.ssid_available ? conn.ssid : "<ssid-withheld>";
-        ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", ssid, conn.rssi,
-                                     conn.security.empty() ? "Unknown" : conn.security,
-                                     conn.bssid.empty() ? "-" : conn.bssid, conn.channel));
-    } else {
-        ctx.write_output("connected|none|Not connected|0|none|none");
-    }
+    yuzu::wifi::corewlan_current_connection(conn);
+    ctx.write_output(yuzu::wifi::format_connected_record(conn));
 #endif
     return 0;
 }

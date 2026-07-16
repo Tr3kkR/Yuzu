@@ -16,10 +16,15 @@ elif host_machine.system() == 'darwin'
   wifi_sources += files('src/wifi_corewlan.mm')
   wifi_deps += dependency('appleframeworks', modules: ['CoreWLAN', 'Foundation'],
                           include_type: 'system')
-  # objcpp is a separate language from cpp, so the project-level -std=c++23 /
-  # visibility args do not reach the .mm — set them here. ARC keeps the CoreWLAN
-  # object lifetimes correct without manual retain/release.
-  wifi_objcpp_args += ['-std=c++23', '-fvisibility=hidden', '-fobjc-arc']
+  # objcpp is a separate language from cpp, so the project-level -std / visibility
+  # args do not reach the .mm — set them here. Probe for the C++23 flag rather
+  # than hardcoding it: Apple Clang 15 rejects the raw `-std=c++23` spelling and
+  # needs `-std=c++2b` (docs/ci-cpp23-troubleshooting.md), so pick whichever the
+  # objcpp compiler accepts. ARC keeps the CoreWLAN object lifetimes correct
+  # without manual retain/release.
+  objcpp = meson.get_compiler('objcpp')
+  wifi_objcpp_std = objcpp.has_argument('-std=c++23') ? '-std=c++23' : '-std=c++2b'
+  wifi_objcpp_args += [wifi_objcpp_std, '-fvisibility=hidden', '-fobjc-arc']
 endif
 
 shared_library(

@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-16._
 
 ## Matrix
 
@@ -43,6 +43,7 @@ _Last hand-updated: 2026-07-13._
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
+| **Wi-Fi current connection** (`wifi connected`) | ✅ | ✅ | 🟡 | `wifi_plugin.cpp` `do_connected`: Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` (CoreWLAN, first `.mm` TU). macOS is Partial because Location Services withholds SSID/BSSID from a background daemon on 14+ → reported as `<ssid-withheld>` on an otherwise-live connection (RSSI/channel/security still read). `wifi list_networks` stays legacy `airport -s`/`system_profiler` (needs the same authorisation). See `docs/darwin-compat.md` |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate
