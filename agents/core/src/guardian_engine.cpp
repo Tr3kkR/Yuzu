@@ -63,6 +63,21 @@ constexpr std::string_view kKeyGen      = "meta:policy_generation";
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
 
+/// Generic scope-exit guard: runs `fn` in its destructor unless `committed` was
+/// set. wire_spark_engine() uses this so rollback runs on EVERY exit path -
+/// including a catch handler's own logging call throwing - rather than an
+/// explicit rollback_spark_wiring_locked() call inside each catch block, which
+/// could be skipped if that logging call itself throws (Sol rung-7.5 review
+/// finding 2).
+struct ScopeExit {
+    std::function<void()> fn;
+    bool committed{false};
+    ~ScopeExit() {
+        if (!committed && fn)
+            fn();
+    }
+};
+
 std::string hex_encode(const std::string& bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -868,11 +883,22 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     }
 
     // All-or-nothing wiring transaction. `registered` tracks whether
-    // register_consumer() succeeded, so the catch block below knows whether
-    // it must unregister on a LATER step's failure (scheduler/drain-worker
+    // register_consumer() succeeded, so the guard below knows whether it must
+    // unregister on a LATER step's failure (scheduler/drain-worker
     // construction, which can throw - both spawn threads).
     bool registered = false;
     SparkEngine::ConsumerId consumer_id = 0;
+    // Runs rollback_spark_wiring_locked() on ANY exit from this point on -
+    // an early return, an exception unwinding out of the try below, or a
+    // catch handler's own spdlog::warn call itself throwing - unless
+    // `committed` is set at the very end of the success path. Declaring this
+    // OUTSIDE the try/catch, before either branch runs, is what guarantees
+    // the destructor always fires (Sol rung-7.5 review finding 2: the prior
+    // explicit rollback_spark_wiring_locked() call inside each catch block
+    // could be skipped if the logging call ahead of it threw).
+    ScopeExit rollback{[this, engine, &registered, &consumer_id] {
+        rollback_spark_wiring_locked(engine, registered, consumer_id);
+    }};
     try {
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
@@ -884,11 +910,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
             spdlog::warn("Guardian: spark consumer registration failed ({}) - spark path "
                          "unavailable",
                          id.error());
-            spark_runtime_.reset();
-            spark_backend_.reset();
-            spark_reader_.reset();
-            spark_availability_ = SparkAvailability::SparkFailed;
-            return;
+            return; // rollback's destructor cleans up (registered is still false)
         }
         consumer_id = *id;
         registered = true;
@@ -903,17 +925,16 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
 
         spark_engine_ = engine;
         spark_availability_ = SparkAvailability::Available;
+        rollback.committed = true;
         spdlog::info("Guardian: spark path wired and available (consumer_id={})", consumer_id);
     } catch (const std::exception& e) {
         spdlog::warn("Guardian: spark wiring failed ({}) - rolling back, spark path unavailable",
                      e.what());
-        rollback_spark_wiring_locked(engine, registered, consumer_id);
     } catch (...) {
         // Belt-and-braces: nothing may terminate the agent for this
         // best-effort subsystem, even a non-std throw.
         spdlog::warn("Guardian: spark wiring failed (unknown exception) - rolling back, spark "
                      "path unavailable");
-        rollback_spark_wiring_locked(engine, registered, consumer_id);
     }
 }
 

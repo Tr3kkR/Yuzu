@@ -256,6 +256,34 @@ TEST_CASE("a same-id replace while spark-armed swaps generations, never double-a
     CHECK(f.engine->spark_armed_rule_count() == 1); // still 1, not 2
 }
 
+TEST_CASE("a same-id replace from spark-armed to legacy-armed withdraws spark first",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // spark-armed (service mechanism registered)
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(f.engine->armed_guard_count() == 0);
+
+    // Same rule_id, now a type with no mechanism registered - must land ONLY
+    // in legacy, with the prior spark attachment fully withdrawn, never both.
+    f.apply(make_file_rule("r1"), /*full_sync=*/false);
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(f.mechanism->watching_count() == 0);
+}
+
+TEST_CASE("a same-id replace from legacy-armed to spark-armed withdraws legacy first",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    f.apply(make_file_rule("r1")); // legacy-armed (no mechanism for file-change)
+    REQUIRE(f.engine->spark_armed_rule_count() == 0);
+
+    // Same rule_id, now a spark-supported type - must land ONLY in spark, with
+    // withdraw_legacy_guard_locked having retired the prior legacy guard.
+    f.apply(make_service_rule("r1"), /*full_sync=*/false);
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.engine->armed_guard_count() == 0);
+    CHECK(f.mechanism->watching_count() == 1);
+}
+
 TEST_CASE("full_sync withdraws a spark-armed rule the new push omits",
           "[spark][guardian][reconcile]") {
     SparkReconcileFixture f;
