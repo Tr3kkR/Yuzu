@@ -136,6 +136,15 @@ RUN set -eux; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu; \
     install -d -m 0750 -o 1000 -g 1000 /rootfs/var/log/yuzu; \
+    # RUNTIME INVARIANT (#751): this busybox + its `wget` applet ARE the
+    # healthcheck. docker-compose.demo.yml probes this image with
+    # ["CMD", "/bin/busybox", "wget", "--spider", "-q", ...] — by ABSOLUTE path,
+    # which resolves here only via the usrmerge /bin -> usr/bin symlink. A slice
+    # change that drops busybox, or moves it, breaks nothing at build time and
+    # nothing at boot: it breaks only the healthcheck, so Compose parks the
+    # container `unhealthy` forever. ENFORCED by
+    # scripts/ci/verify-healthcheck-invariants.sh, which runs that exact probe
+    # against a live listener before release.yml pushes the image.
     BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
     test -n "$BB"; \
     for app in sh wget nc; do ln -sf busybox "$(dirname "$BB")/$app"; done
