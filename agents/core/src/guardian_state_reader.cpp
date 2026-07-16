@@ -35,6 +35,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// Self-sufficient link (#1287): this TU calls advapi32 directly (RegOpenKeyExW,
+// RegQueryValueExW, RegCloseKey, OpenSCManagerW, OpenServiceW,
+// QueryServiceStatusEx). Don't rely on a sibling TU's pragma to carry advapi32
+// across the whole yuzu_agent_core link line - mirrors guard_registry.cpp /
+// guard_service.cpp.
+#pragma comment(lib, "advapi32.lib")
+
 #include <vector>
 
 #include <win_sc_handle.hpp> // yuzu::win::ScHandle (RAII SC_HANDLE)
@@ -92,6 +99,20 @@ std::string file_identity(const struct stat& st) {
 #endif // !_WIN32
 
 #ifdef _WIN32
+// Close-on-scope guard for an owned HANDLE so an exception between a
+// successful CreateFileW and the intended CloseHandle (e.g. bad_alloc from a
+// std::to_string/string-concat while building a snapshot) cannot leak it.
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) : h(handle) {}
+    ~HandleGuard() {
+        if (h != INVALID_HANDLE_VALUE)
+            CloseHandle(h);
+    }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+};
+
 // Close-on-scope guard for an owned HKEY so an exception from the value loop
 // (emplace / to_wide / vector alloc) cannot leak the key.
 struct RegKeyGuard {
@@ -327,6 +348,7 @@ ReadResult<FileSnapshot> read_file_blocking(const FileSparkParams& p, const File
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
             if (mh != INVALID_HANDLE_VALUE) {
+                HandleGuard mguard{mh};
                 FileSnapshot snap;
                 snap.exists = true;
                 snap.readable = false;
@@ -341,7 +363,6 @@ ReadResult<FileSnapshot> read_file_blocking(const FileSparkParams& p, const File
                         (static_cast<std::uint64_t>(mbi.ftLastWriteTime.dwHighDateTime) << 32) |
                         mbi.ftLastWriteTime.dwLowDateTime);
                 }
-                CloseHandle(mh);
                 return read_known(std::move(snap));
             }
             const DWORD me = GetLastError();
@@ -352,13 +373,7 @@ ReadResult<FileSnapshot> read_file_blocking(const FileSparkParams& p, const File
         }
         return read_unknown<FileSnapshot>("CreateFileW error " + std::to_string(e));
     }
-    struct HandleGuard {
-        HANDLE h;
-        ~HandleGuard() {
-            if (h != INVALID_HANDLE_VALUE)
-                CloseHandle(h);
-        }
-    } guard{fh};
+    HandleGuard guard{fh};
 
     auto info_of = [](HANDLE h, BY_HANDLE_FILE_INFORMATION& bi) -> bool {
         return GetFileInformationByHandle(h, &bi) != 0;
@@ -527,6 +542,30 @@ ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
         }
     } bus_guard{bus};
 
+    // RAII for sd_bus_error/sd_bus_message/malloc'd C-string ownership so an
+    // exception (e.g. bad_alloc from a std::string assignment) between a
+    // successful sd-bus call and its manual cleanup call cannot leak the
+    // reply/error payload - matches the ownership convention documented for
+    // the other sd-bus resources in this function.
+    struct SdBusErrorGuard {
+        sd_bus_error* e;
+        ~SdBusErrorGuard() { sd_bus_error_free(e); }
+    };
+    struct SdBusMessageGuard {
+        sd_bus_message* m;
+        ~SdBusMessageGuard() {
+            if (m)
+                sd_bus_message_unref(m);
+        }
+    };
+    struct CStrGuard {
+        char* s;
+        ~CStrGuard() {
+            if (s)
+                free(s);
+        }
+    };
+
     // Split the total budget across the two sequential calls: LoadUnit gets the
     // whole budget, ActiveState gets whatever remains.
     const auto t_start = std::chrono::steady_clock::now();
@@ -534,19 +573,18 @@ ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
 
     // Resolve the unit object path (LoadUnit resolves even an inactive unit).
     sd_bus_error err = SD_BUS_ERROR_NULL;
+    SdBusErrorGuard err_guard{&err};
     sd_bus_message* reply = nullptr;
     std::string obj_path;
     r = sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "LoadUnit", &err, &reply, "s",
                            unit.c_str());
+    SdBusMessageGuard reply_guard{reply};
     if (r >= 0 && reply) {
         const char* pth = nullptr;
         if (sd_bus_message_read(reply, "o", &pth) >= 0 && pth && *pth)
             obj_path = pth;
     }
     const bool load_absence = (r < 0) && unit_error_is_absence(err.name);
-    if (reply)
-        sd_bus_message_unref(reply);
-    sd_bus_error_free(&err);
     if (obj_path.empty()) {
         if (load_absence)
             return read_known(ServiceRunState::Stopped); // R5: absent unit -> Stopped
@@ -566,17 +604,16 @@ ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
 
     // Point-read the ActiveState property.
     sd_bus_error perr = SD_BUS_ERROR_NULL;
+    SdBusErrorGuard perr_guard{&perr};
     char* s = nullptr;
     r = sd_bus_get_property_string(bus, kDest, obj_path.c_str(), kUnitIface, "ActiveState", &perr,
                                    &s);
+    CStrGuard s_guard{s};
     std::optional<SystemdState> st;
     if (r >= 0 && s)
         st = parse_active_state(s);
     else if (unit_error_is_absence(perr.name))
         st = SystemdState::Absent;
-    if (s)
-        free(s);
-    sd_bus_error_free(&perr);
 
     if (!st)
         return read_unknown<ServiceRunState>("ActiveState transient failure for " + unit);

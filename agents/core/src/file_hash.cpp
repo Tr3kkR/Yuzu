@@ -26,6 +26,28 @@
 namespace yuzu::agent {
 
 #ifdef _WIN32
+namespace {
+// RAII owners for the BCrypt alg/hash handles so a bad_alloc from a vector
+// allocation or from spdlog's own formatting (both of which can throw between
+// a successful BCrypt* call and its paired manual close) cannot leak the
+// handle - closed unconditionally on every return path, not just the ones
+// that remembered to call BCryptDestroyHash/BCryptCloseAlgorithmProvider.
+struct BCryptAlgGuard {
+    BCRYPT_ALG_HANDLE h = nullptr;
+    ~BCryptAlgGuard() {
+        if (h)
+            BCryptCloseAlgorithmProvider(h, 0);
+    }
+};
+struct BCryptHashGuard {
+    BCRYPT_HASH_HANDLE h = nullptr;
+    ~BCryptHashGuard() {
+        if (h)
+            BCryptDestroyHash(h);
+    }
+};
+} // namespace
+
 std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
     if (h == INVALID_HANDLE_VALUE)
         return {};
@@ -34,9 +56,9 @@ std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
         spdlog::error("sha256_from_handle: SetFilePointerEx failed: {}", GetLastError());
         return {};
     }
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    BCryptAlgGuard alg_guard;
+    NTSTATUS status =
+        BCryptOpenAlgorithmProvider(&alg_guard.h, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::error("sha256_from_handle: BCryptOpenAlgorithmProvider failed: 0x{:08x}",
                       static_cast<unsigned>(status));
@@ -44,21 +66,20 @@ std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
     }
 
     DWORD obj_size = 0, data_len = 0;
-    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size),
-                               sizeof(DWORD), &data_len, 0);
+    status = BCryptGetProperty(alg_guard.h, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&obj_size), sizeof(DWORD), &data_len, 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::error("sha256_from_handle: BCryptGetProperty failed: 0x{:08x}",
                       static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(alg, 0);
         return {};
     }
     std::vector<unsigned char> hash_obj(obj_size);
-    status = BCryptCreateHash(alg, &hash, hash_obj.data(), static_cast<ULONG>(hash_obj.size()),
-                              nullptr, 0, 0);
+    BCryptHashGuard hash_guard;
+    status = BCryptCreateHash(alg_guard.h, &hash_guard.h, hash_obj.data(),
+                              static_cast<ULONG>(hash_obj.size()), nullptr, 0, 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::error("sha256_from_handle: BCryptCreateHash failed: 0x{:08x}",
                       static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(alg, 0);
         return {};
     }
 
@@ -69,32 +90,23 @@ std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
         DWORD bytes_read = 0;
         if (!ReadFile(h, buf.data(), kBufSize, &bytes_read, nullptr)) {
             spdlog::error("sha256_from_handle: ReadFile failed: {}", GetLastError());
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(alg, 0);
             return {};
         }
         if (bytes_read == 0)
             break;
         hashed_total += static_cast<std::uintmax_t>(bytes_read);
-        if (hashed_total > max_bytes) { // exceeds the read cap - refuse (oversize)
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(alg, 0);
+        if (hashed_total > max_bytes) // exceeds the read cap - refuse (oversize)
             return {};
-        }
-        status = BCryptHashData(hash, buf.data(), bytes_read, 0);
+        status = BCryptHashData(hash_guard.h, buf.data(), bytes_read, 0);
         if (!BCRYPT_SUCCESS(status)) {
             spdlog::error("sha256_from_handle: BCryptHashData failed: 0x{:08x}",
                           static_cast<unsigned>(status));
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(alg, 0);
             return {};
         }
     }
 
     unsigned char digest[32]{};
-    status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
+    status = BCryptFinishHash(hash_guard.h, digest, sizeof(digest), 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::error("sha256_from_handle: BCryptFinishHash failed: 0x{:08x}",
                       static_cast<unsigned>(status));
@@ -111,6 +123,20 @@ std::string sha256_from_handle(HANDLE h, std::size_t max_bytes) {
     return hex;
 }
 #else
+namespace {
+// RAII owner for EVP_MD_CTX so a bad_alloc from spdlog's own formatting (which
+// can throw between a successful EVP_MD_CTX_new/Init and its paired manual
+// free, e.g. the read-failure log below) cannot leak the context - mirrors
+// the BCryptAlgGuard/BCryptHashGuard treatment on the Windows side.
+struct EvpMdCtxGuard {
+    EVP_MD_CTX* ctx = nullptr;
+    ~EvpMdCtxGuard() {
+        if (ctx)
+            EVP_MD_CTX_free(ctx);
+    }
+};
+} // namespace
+
 std::string sha256_from_fd(int fd, std::size_t max_bytes) {
     if (fd < 0)
         return {};
@@ -118,10 +144,14 @@ std::string sha256_from_fd(int fd, std::size_t max_bytes) {
         spdlog::error("sha256_from_fd: lseek failed: {}", std::strerror(errno));
         return {};
     }
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
-        if (ctx)
-            EVP_MD_CTX_free(ctx);
+    EvpMdCtxGuard ctx_guard;
+    ctx_guard.ctx = EVP_MD_CTX_new();
+    if (!ctx_guard.ctx) {
+        spdlog::error("sha256_from_fd: EVP_MD_CTX_new failed");
+        return {};
+    }
+    if (EVP_DigestInit_ex(ctx_guard.ctx, EVP_sha256(), nullptr) != 1) {
+        spdlog::error("sha256_from_fd: EVP_DigestInit_ex failed");
         return {};
     }
     constexpr size_t kBufSize = 64 * 1024;
@@ -133,24 +163,25 @@ std::string sha256_from_fd(int fd, std::size_t max_bytes) {
             if (errno == EINTR)
                 continue;
             spdlog::error("sha256_from_fd: read failed: {}", std::strerror(errno));
-            EVP_MD_CTX_free(ctx);
             return {};
         }
         if (n == 0)
             break;
         hashed_total += static_cast<std::uintmax_t>(n);
-        if (hashed_total > max_bytes) { // exceeds the read cap - refuse (oversize)
-            EVP_MD_CTX_free(ctx);
+        if (hashed_total > max_bytes) // exceeds the read cap - refuse (oversize)
+            return {};
+        if (EVP_DigestUpdate(ctx_guard.ctx, buf, static_cast<size_t>(n)) != 1) {
+            spdlog::error("sha256_from_fd: EVP_DigestUpdate failed");
             return {};
         }
-        EVP_DigestUpdate(ctx, buf, static_cast<size_t>(n));
     }
     unsigned char digest[32]{};
     unsigned int out_len = 0;
-    bool ok = EVP_DigestFinal_ex(ctx, digest, &out_len) == 1 && out_len == 32;
-    EVP_MD_CTX_free(ctx);
-    if (!ok)
+    bool ok = EVP_DigestFinal_ex(ctx_guard.ctx, digest, &out_len) == 1 && out_len == 32;
+    if (!ok) {
+        spdlog::error("sha256_from_fd: EVP_DigestFinal_ex failed");
         return {};
+    }
     static constexpr char kHex[] = "0123456789abcdef";
     std::string hex;
     hex.reserve(64);
