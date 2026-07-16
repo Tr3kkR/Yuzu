@@ -9,6 +9,8 @@ depends-on: 0006/0007/0008 (server-side Postgres substrate chain — accepted 20
 
 > **Implementation status (2026-06-18 conformance audit):** Accepted decision; attack-path/chokepoint scoring is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
 
+> **Amendment (2026-07-16, ADR-4003).** The Chokepoints bullet below (`crown-jewel value × path probability`, defender ROI, not Brandes betweenness) is superseded by ADR-4003 Decision 5's value-weighted chain centrality — a reformulation of the *same* bounded, declared-surface-scoped computation described here (reusing this ADR's already-computed entry→jewel paths, still not classical Brandes betweenness, still not O(V·E)), not a reopening of this ADR's rejection of generic all-pairs centrality. Attack-path scoring (§5.1/below) and segmentation (§5.3/below) are unaffected.
+
 ## Context
 
 Raw CVSS ranking is noise at fleet scale. We want findings ranked by their position on a

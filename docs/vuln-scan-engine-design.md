@@ -396,11 +396,17 @@ paths**; **depth-bounded** (`d ≈ 5`) because real breaches are 2–4 hops and 
 is both a tractability and a precision lever. Output: a **per-finding attack-path score
 that replaces raw CVSS as the default ranking.**
 
-### 5.2 Chokepoints — path-set frequency, not Brandes betweenness
+### 5.2 Chokepoints — value-weighted chain centrality, not Brandes betweenness (ADR-4003)
 
 Generic betweenness is O(V·E) *and* wrong (weights all-pairs equally). A chokepoint is a
-node/edge appearing in many of the already-computed top-k entry→jewel paths, weighted by
-`crown-jewel value × path probability` — a direct **defender-ROI** number, nearly free.
+node/edge appearing in many of the already-computed top-k entry→jewel paths — still bounded
+to the declared entry-point/crown-jewel surface, still reusing this section's already-computed
+paths, still not Brandes betweenness. **Superseded formula (ADR-4003 Decision 5):** credit
+accrues per `(entry point, crown jewel)` pair, scaled by that crown jewel's declared value and
+divided fairly across every crown jewel a node reaches — `crown-jewel value × path probability`
+summed flatly per path (the original defender-ROI number) undercounted a node touching several
+valuable targets relative to one touching a single very-valuable target. Still "nearly free":
+same bounded computation, same reused path set, no new graph traversal.
 
 ### 5.3 Segmentation — cost-weighted min-cut
 
