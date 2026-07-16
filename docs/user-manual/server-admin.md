@@ -186,6 +186,30 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — macOS antivirus posture is now probed, not asserted
+
+The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
+without reading anything, and its third-party checks grepped for the wrong
+process name. Visible after upgrading agents:
+
+1. **`av|XProtect|<state>` is now a real probe** of the XProtect definition
+   bundle: `active` comes with a new `xprotect_version|<n>` row; `unknown`
+   means the bundle was unreadable (never assumed active). Third-party EDR/AV
+   detected via endpoint-security system extensions emit an additional
+   `edr|<bundle id>|<version>` row each. Integrations keying on the old
+   always-present `av|XProtect|active` row should treat `unknown` as a signal
+   to investigate, not as product-absent.
+2. **The `status` action on macOS returns real XProtect data** (definition
+   version, freshness, Remediator/MRT versions) instead of
+   `status|not_available`. A new darwin-only definition
+   `security.antivirus.xprotect_status` exposes it; being a new id, it seeds
+   on upgraded installs at next boot (unlike edited descriptions, which reach
+   fresh installs only — the amended `security.antivirus.products` text lands
+   there alone).
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   the hardcoded XProtect row and process-grep results. Not a server bug; the
+   presence of an `xprotect_version` row identifies an upgraded agent.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track

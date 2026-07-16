@@ -419,7 +419,11 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 ### 9.1 Antivirus Status and Product Detection :white_check_mark: `T1`
 
-`antivirus` plugin (cross-platform).
+`antivirus` plugin (cross-platform). macOS `products` probes the XProtect
+definition bundle (version row; `unknown` when unreadable, never assumed
+active) and enumerates endpoint-security system extensions for third-party
+EDR/AV; macOS `status` reports XProtect definition version/freshness plus
+Remediator/MRT engine versions (`security.antivirus.xprotect_status`).
 
 ### 9.2 Firewall Status and Rule Enumeration :white_check_mark: `T1`
 
