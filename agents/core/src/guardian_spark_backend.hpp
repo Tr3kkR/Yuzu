@@ -19,11 +19,16 @@
  * arm() would itself reject an unregistered id with "unknown consumer id", but
  * that reads as a mystery bug rather than a caller-sequencing one).
  *
- * LIFETIME: engine_ is BORROWED, never owned. This is safe ONLY because of the
- * agent.cpp member-declaration-order swap (rung 7.7): GuardianEngine (which
- * owns this adapter, transitively via GuardianSparkRuntime's shared_ptr<
- * ISparkBackend>) is declared AFTER spark_engine_, so it is destroyed FIRST -
- * spark_engine_ always outlives this adapter's lifetime.
+ * LIFETIME: engine_ is BORROWED, never owned. This is safe ONLY because of
+ * agent.cpp's member declaration order: GuardianEngine (which owns this
+ * adapter, transitively via GuardianSparkRuntime's shared_ptr<ISparkBackend>)
+ * is declared BEFORE spark_engine_, so it is destroyed FIRST (reverse
+ * declaration order) - spark_engine_ always outlives this adapter's lifetime.
+ * (Landed as a governance Gate 2/3 fix, this PR - an earlier version of this
+ * comment described the intended order while the actual declaration was still
+ * reversed; harmless only because no production call site invoked
+ * wire_spark_engine() yet. Do not reorder agent.cpp's guardian_/spark_engine_
+ * declarations without re-verifying this invariant.)
  */
 
 #include <yuzu/agent/spark.hpp> // SparkSpec

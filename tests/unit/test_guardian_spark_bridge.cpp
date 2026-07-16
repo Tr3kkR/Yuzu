@@ -83,11 +83,30 @@ TEST_CASE("spark_spec_from_rule: missing required target param is nullopt", "[sp
     REQUIRE_FALSE(
         spark_spec_from_rule(make_rule("r", "service-status-change", "service-running", {}))
             .has_value());
-    // registry with hive but no key
+    // registry with no hive - hive is the one truly required field
     REQUIRE_FALSE(
         spark_spec_from_rule(make_rule("r", "registry-change", "registry-value-equals",
-                                       {{"hive", "HKLM"}}))
+                                       {{"key", "Software\\Yuzu"}}))
             .has_value());
+}
+
+TEST_CASE("spark_spec_from_rule: registry hive with an empty key watches the hive root",
+          "[spark][bridge]") {
+    // `key` is NOT required: an empty key means "watch the hive root", which
+    // legacy's RegistryGuard has always accepted (guard_registry.cpp passes an
+    // empty subkey as NULL to RegOpenKeyExW/RegCreateKeyExW, opening the hive
+    // itself) and the spark mechanism accepts identically (spark_registry.cpp).
+    // Rejecting this here made validation - which runs unconditionally, before
+    // the prefer_spark_ check - stricter than legacy ever was (governance
+    // Gate 4/6 finding).
+    const auto r =
+        make_rule("r", "registry-change", "registry-value-equals", {{"hive", "HKLM"}});
+    const auto spec = spark_spec_from_rule(r);
+    REQUIRE(spec.has_value());
+    REQUIRE(spec->type == SparkType::Registry);
+    const auto& rp = std::get<RegistrySparkParams>(spec->params);
+    REQUIRE(rp.hive == "HKLM");
+    REQUIRE(rp.key.empty());
 }
 
 TEST_CASE("spark_spec_from_rule: an unknown spark type is nullopt", "[spark][bridge]") {

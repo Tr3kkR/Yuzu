@@ -50,19 +50,23 @@
  *  - Absolute deadline captured at run() ENTRY (per-class deadline chosen by the
  *    reader), so allocation + launch time counts against the caller's budget.
  *
- * ORPHAN PROCESS-EXIT CONTRACT (rung-5 scope: expose + document; enforce later):
+ * ORPHAN PROCESS-EXIT CONTRACT (rung-5 scope: expose + document; ENFORCEMENT
+ * LANDED rung 7, see below):
  *  A shared_ptr keeps State and the result cell alive for a wedged detached worker,
  *  so there is no use-after-free. It does NOT make it safe for that worker to run
  *  libc / OpenSSL / libsystemd / Win32-RPC code THROUGH normal C++ static/DSO
- *  teardown. Today main() returns EXIT_SUCCESS normally and the autonomous
- *  hard-exit deadline is deferred to a separate PR, so "process exit reaps it" is
- *  NOT a lifetime proof. The process MUST NOT perform normal C++ teardown while
- *  active_worker_count() > 0. Rung 5 exposes that count (total + per class) here
- *  and re-exposes it through GuardianStateReader; the ENFORCEMENT (main taking
- *  _exit / TerminateProcess after a bounded grace when orphans remain, or folding
- *  outstanding Guardian I/O workers into the deferred autonomous hard-exit
- *  deadline) is a tracked rung-7 / separate-PR dependency. F3 is not fully "safe"
- *  until that lands.
+ *  teardown. The process MUST NOT perform normal C++ teardown while
+ *  active_worker_count() > 0. Rung 5 exposed that count (total + per class) here
+ *  and re-exposed it through GuardianStateReader; rung 7's hard_exit.hpp is the
+ *  enforcement: main.cpp/service_win.cpp construct an OrphanExitGuard before
+ *  Agent::run(), sample guardian_active_io_workers() after it returns, and
+ *  hard_exit() (TerminateProcess/_exit, skipping normal teardown entirely) if
+ *  still nonzero after a bounded grace. Verified on POSIX (full test suite +
+ *  TSan + real boot/SIGTERM smoke tests); the Windows SCM path
+ *  (service_win.cpp) needs a DGRHP build+run before it's considered verified
+ *  the same way. Currently inert in production either way - GuardianEngine's
+ *  spark path (the only source of a nonzero active_worker_count()) has zero
+ *  production wire_spark_engine() call sites yet.
  */
 
 #include <array>

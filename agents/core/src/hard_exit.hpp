@@ -27,12 +27,28 @@
 #include <utility>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <unistd.h>
 #endif
 
 namespace yuzu::agent {
+
+/// The F3 orphan-drain grace, shared by every OrphanExitGuard construction and
+/// explicit orphan check (main.cpp x2, service_win.cpp x2) - previously 4
+/// independent `std::chrono::seconds(3)` literals with nothing tying them
+/// together, so a future edit to one without the others would silently
+/// desync the guard's fallback grace from the explicit check's grace (sre
+/// Gate 3 finding, this PR). Not yet a CLI/config knob - the motivating case
+/// (a slow FUSE/network mount) is exactly the kind of thing an SRE would want
+/// to tune per-fleet without a redeploy; tracked as a rung-7.7 follow-up.
+inline constexpr std::chrono::seconds kOrphanDrainGrace{3};
 
 /// Terminates the process immediately: no unwinding, no atexit handlers, no
 /// static/DSO destructors. `code` should be nonzero for every F3/orphan-
@@ -122,8 +138,20 @@ public:
     ~OrphanExitGuard() noexcept {
         if (!armed_)
             return;
-        if (active_workers_() > 0 && !wait_for_workers_to_drain(active_workers_, grace_))
+        // Firewalled: wait_for_workers_to_drain()'s std::this_thread::sleep_for
+        // is not standard-guaranteed noexcept. Left unguarded, a throw here
+        // would still be fail-closed at the language level (an exception
+        // escaping a noexcept destructor calls std::terminate()) - but
+        // std::terminate() is NOT the same as hard_exit(): on Windows it can
+        // still run CRT abort handling, which is closer to the DLL_PROCESS_
+        // DETACH/loader-lock hazard hard_exit()'s TerminateProcess call exists
+        // specifically to avoid. Catch and route to the intended path instead.
+        try {
+            if (active_workers_() > 0 && !wait_for_workers_to_drain(active_workers_, grace_))
+                hard_exit(code_);
+        } catch (...) {
             hard_exit(code_);
+        }
     }
 
 private:

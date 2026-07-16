@@ -85,9 +85,14 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         if (stopping_)
             return std::unexpected(std::string{"stopping"});
 
-        // Fresh generation: drop any prior mapping for this rule first (rung 7's
-        // reconcile is what preserves eval state across an identical re-push).
-        // If a prior generation existed, this already enqueued its "disarmed"
+        // Fresh generation: drop any prior mapping for this rule first. This
+        // rebuilds eval state from scratch on every push, identical re-push
+        // included - there is no diff-skip that preserves it (a possible future
+        // optimization, not implemented; matches the legacy path's own
+        // tear-down-and-rebuild-every-push behavior, so this is not a
+        // regression - consistency-auditor Gate 4 finding, this PR: an earlier
+        // version of this comment claimed the opposite in present tense). If a
+        // prior generation existed, this already enqueued its "disarmed"
         // lifecycle entry - the "armed" entry below covers the new one, so ONE
         // outbox-waker firing at the end of this call covers both.
         detach_rule_locked(rule_id);

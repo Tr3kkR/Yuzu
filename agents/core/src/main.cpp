@@ -801,7 +801,7 @@ int main(int argc, char* argv[]) {
     // below); its destructor is a deliberately non-throwing, unlogged fallback
     // for every other path.
     yuzu::agent::OrphanExitGuard orphan_guard{
-        [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+        [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
 
     agent->run();
 
@@ -873,9 +873,9 @@ int main(int argc, char* argv[]) {
     // teardown entirely) with a code that is NEVER EXIT_SUCCESS, so the
     // supervisor sees a real failure instead of a silently-clean-looking exit.
     if (const auto n = agent->guardian_active_io_workers(); n > 0) {
-        constexpr auto kOrphanDrainGrace = std::chrono::seconds(3);
         if (!yuzu::agent::wait_for_workers_to_drain(
-                [&] { return agent->guardian_active_io_workers(); }, kOrphanDrainGrace)) {
+                [&] { return agent->guardian_active_io_workers(); },
+                yuzu::agent::kOrphanDrainGrace)) {
             // Firewalled: a logging exception here must never skip hard_exit()
             // below - same rationale as log_quietly() elsewhere in this file
             // (Sol rung-7.6 review finding 2).
@@ -883,7 +883,7 @@ int main(int argc, char* argv[]) {
                 spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
                                  "forcing process exit rather than race static/DSO teardown "
                                  "against them",
-                                 n, kOrphanDrainGrace.count());
+                                 n, yuzu::agent::kOrphanDrainGrace.count());
             } catch (...) {
             }
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)

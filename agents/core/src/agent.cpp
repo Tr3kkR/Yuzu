@@ -754,29 +754,40 @@ public:
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
         ScopeExit cleanup{[this]() {
-            // SparkEngine FIRST — before thread_pool_ is reset below. Rung 1's engine
-            // does not borrow the pool, but rung 2's queued Guardian consumer is expected
-            // to dispatch through it (#2037's bounded-dispatch pattern), and this guard
-            // resets the pool on every run() exit. Stopping spark here means its threads
-            // are quiesced before anything it may borrow goes away — on the exception and
-            // early-return paths too, not just the graceful one. Idempotent: Agent::stop()
-            // may already have called it. (Gate-8 cpp-safety: an earlier comment claimed
-            // this guard already covered spark. It did not — it never touched it.)
-            if (spark_engine_)
-                spark_engine_->stop();
-            // Guardian, on EVERY run() exit - not just the externally-triggered
-            // Agent::stop() path (handler_ex / the shutdown watcher / the console
-            // handler). A run() exit that never went through an explicit stop()
-            // request (e.g. the dispatch-pool re-creation failure below setting
-            // stop_requested_ directly) previously left guardian_->stop() never
-            // called at all, so F3's orphan check in main()/service_win.cpp could
-            // sample guardian_active_io_workers() before Guardian I/O admission
-            // was ever closed - not merely before it finished, but before it had
-            // even started (Sol rung-7.6 review round 3, finding 1). Idempotent:
-            // Agent::stop() may already have called it, exactly like spark_engine_
-            // above.
+            // Guardian BEFORE SparkEngine, on EVERY run() exit - not just the
+            // externally-triggered Agent::stop() path (handler_ex / the shutdown
+            // watcher / the console handler). A run() exit that never went
+            // through an explicit stop() request (e.g. the dispatch-pool
+            // re-creation failure below setting stop_requested_ directly)
+            // previously left guardian_->stop() never called at all, so F3's
+            // orphan check in main()/service_win.cpp could sample
+            // guardian_active_io_workers() before Guardian I/O admission was
+            // ever closed - not merely before it finished, but before it had
+            // even started (Sol rung-7.6 review round 3, finding 1).
+            //
+            // THIS ORDER (guardian_ first) is load-bearing and matches
+            // Agent::stop()'s own pre-existing order: GuardianEngine::stop()'s
+            // own doc comment requires spark teardown to close Guardian's
+            // internal admission (spark_runtime_/scheduler/drain-worker) FIRST,
+            // so the EXTERNAL spark_engine_->stop() below can safely tear down
+            // the SparkEngine consumer afterward without racing a live commit.
+            // An earlier version of this guard had these reversed (governance
+            // Gate 3/4 finding, this PR) - harmless only because no production
+            // call site wires a consumer onto spark_engine_ yet. Idempotent:
+            // Agent::stop() may already have called both.
             if (guardian_)
                 guardian_->stop();
+            // Before thread_pool_ is reset below. Rung 1's engine does not
+            // borrow the pool, but rung 2's queued Guardian consumer is expected
+            // to dispatch through it (#2037's bounded-dispatch pattern), and this
+            // guard resets the pool on every run() exit. Stopping spark here
+            // means its threads are quiesced before anything it may borrow goes
+            // away - on the exception and early-return paths too, not just the
+            // graceful one. Idempotent: Agent::stop() may already have called it.
+            // (Gate-8 cpp-safety: an earlier comment claimed this guard already
+            // covered spark. It did not - it never touched it.)
+            if (spark_engine_)
+                spark_engine_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
             // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
@@ -2990,12 +3001,6 @@ private:
     // stream is torn down, so a guard firing mid-teardown can never write to a
     // cancelled stream.
     std::shared_ptr<SubscribeStream> guardian_sink_stream_;
-    // Declared AFTER stream_write_mu_ + guardian_sink_stream_ so it is DESTROYED
-    // FIRST (reverse declaration order): ~GuardianEngine joins the guard worker
-    // threads, which must happen while the mutex + sink-stream holder those
-    // workers write through are still alive (H4 / #1209). Body-initialized in the
-    // ctor (after kv_store_), so the later declaration does not affect construction.
-    std::unique_ptr<GuardianEngine> guardian_;
     // Fleet-wide DEX signal observer (multi-signal). Declared AFTER stream_write_mu_
     // + guardian_sink_stream_ (same reasoning as guardian_): its OS-callbacks emit
     // through emit_guardian_event(), so its dtor (which stop()s the subscriptions +
@@ -3012,6 +3017,25 @@ private:
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
+    // Declared AFTER stream_write_mu_/guardian_sink_stream_ (destroyed before both,
+    // same reasoning as always: ~GuardianEngine joins the guard worker threads,
+    // which must happen while the mutex + sink-stream holder those workers write
+    // through are still alive, H4/#1209) AND, as of ADR-0021 rung 7, AFTER
+    // thread_pool_ and BEFORE spark_engine_ below - moved here from its earlier
+    // position (right after guardian_sink_stream_) specifically so guardian_ is
+    // destroyed BEFORE spark_engine_, not after. GuardianSparkEngineBackend
+    // (rung 7.3) holds a BORROWED, non-owning SparkEngine* threaded through
+    // guardian_'s spark_runtime_/spark_backend_ once a future rung wires
+    // wire_spark_engine() into this constructor - that borrowed pointer is only
+    // ever safe to hold if spark_engine_ outlives ~GuardianEngine, which requires
+    // spark_engine_ to be destroyed AFTER guardian_, i.e. declared AFTER it here.
+    // The OLD declaration order (guardian_ before spark_engine_, so spark_engine_
+    // was destroyed FIRST) made every comment elsewhere claiming "spark_engine_
+    // always outlives this adapter" FALSE - inert only because no production call
+    // site invokes wire_spark_engine() yet (governance Gate 2/3 finding, this PR).
+    // Body-initialized in the ctor (after kv_store_), so this declaration-order
+    // move does not itself require reordering any constructor-body statement.
+    std::unique_ptr<GuardianEngine> guardian_;
     // SparkEngine (ADR-0021 Stage-2, rung 1) — instantiated OBSERVE-ONLY with no
     // consumer, so (unlike guardian_/dex_observer_) it does NOT emit through
     // guardian_sink_stream_; ~SparkEngine only joins its own internal wheel/mechanism

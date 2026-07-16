@@ -149,7 +149,17 @@ spark_spec_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     case SparkType::Registry: {
         std::string hive = detail::guardian_assertion_param(assertion, "hive");
         std::string key = detail::guardian_assertion_param(assertion, "key");
-        if (hive.empty() || key.empty()) return std::nullopt;
+        // `key` may legitimately be empty - it means "watch the hive root",
+        // which the legacy RegistryGuard has always accepted (guard_registry.cpp's
+        // resolver passes an empty subkey as NULL to RegOpenKeyExW/RegCreateKeyExW,
+        // opening `root` itself) and the spark mechanism accepts identically
+        // (spark_registry.cpp's `p.empty() ? nullptr : wp.c_str()`). Rejecting it
+        // here made this validation - which runs unconditionally, before the
+        // prefer_spark_ check - STRICTER than legacy ever was, silently disarming
+        // an already-working hive-root rule on the very next agent restart even
+        // with spark fully inert (governance Gate 4/6 finding, this PR: confirmed
+        // independently by three reviewers). Only `hive` is actually required.
+        if (hive.empty()) return std::nullopt;
         return SparkSpec{SparkType::Registry, RegistrySparkParams{std::move(hive), std::move(key)}};
     }
     default:

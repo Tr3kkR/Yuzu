@@ -796,6 +796,17 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
     auto assertion = rule_assertion_from_rule(rule);
     auto spec = spark_spec_from_rule(rule);
     if (!assertion || !spec) {
+        // A validation-rejected rule is withdrawn from BOTH backends with no
+        // diagnostic at all otherwise - unlike every legacy arm-failure path,
+        // which always spdlog::warns with the rule_id and a reason. Silent
+        // withdrawal here means an operator sees a rule stop being enforced
+        // (e.g. on the next restart re-arm pass) with nothing in the log to
+        // explain why (sre Gate 6 finding, this PR).
+        spdlog::warn("Guardian: rule '{}' failed spark validation ({}) - withdrawing from "
+                     "both detection paths",
+                     rule.rule_id(),
+                     !assertion ? assertion.error() : "spec derivation failed for spark type '" +
+                                                           rule.spark().type() + "'");
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());

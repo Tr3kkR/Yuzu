@@ -219,7 +219,7 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
         // the normal path; its destructor is a deliberately non-throwing,
         // unlogged fallback for every other path.
         yuzu::agent::OrphanExitGuard orphan_guard{
-            [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+            [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
 
         agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
@@ -273,16 +273,16 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             std::lock_guard<std::mutex> lock(g_agent_mu);
         }
         if (const auto n = agent->guardian_active_io_workers(); n > 0) {
-            constexpr auto kOrphanDrainGrace = std::chrono::seconds(3);
             if (!yuzu::agent::wait_for_workers_to_drain(
-                    [&] { return agent->guardian_active_io_workers(); }, kOrphanDrainGrace)) {
+                    [&] { return agent->guardian_active_io_workers(); },
+                    yuzu::agent::kOrphanDrainGrace)) {
                 // Firewalled: a logging exception here must never skip hard_exit()
                 // below (Sol rung-7.6 review finding 2).
                 try {
                     spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
                                      "forcing process exit rather than race static/DSO teardown "
                                      "against them",
-                                     n, kOrphanDrainGrace.count());
+                                     n, yuzu::agent::kOrphanDrainGrace.count());
                 } catch (...) {
                 }
                 yuzu::agent::hard_exit(3); // the SCM status above already reported the real outcome
