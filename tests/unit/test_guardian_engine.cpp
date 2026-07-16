@@ -333,7 +333,7 @@ TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-c
 // and pushing an already-armed rule as disabled never stopped it. These use
 // make_service_rule because it is the one fixture that arms a REAL guard
 // cross-platform (SystemdServiceGuard on Linux+systemd, ServiceGuard on
-// Windows) without depending on the target unit/service existing (R5) — a
+// Windows) without depending on the target unit/service existing (R5) - a
 // SKIP mirrors the existing [statereader] "no reachable system bus" precedent
 // for environments where arming genuinely cannot happen.
 
@@ -421,6 +421,42 @@ TEST_CASE("GuardianEngine: re-pushing an enabled rule with the same id replaces 
     }
     CHECK(f.engine->rule_count() == 1);
     CHECK(f.engine->armed_guard_count() == 1); // swapped, not accumulated to 2
+}
+
+TEST_CASE("GuardianEngine: a same-id replacement with an invalid new assertion retires the prior "
+          "guard instead of leaving it enforcing stale policy",
+          "[guardian][engine][enabled]") {
+    // Regression for a bug found reviewing the enabled()/replace contract:
+    // start_guard_for_rule_locked's per-branch "stop the existing guard for this
+    // rule_id" step ran only on the happy path, AFTER validating the new rule's
+    // assertion type - so a same-id re-push whose new assertion failed validation
+    // returned false early and left the PRIOR guard armed, silently enforcing a
+    // stale definition even though apply_rules had already persisted (and reported
+    // success for) the new one. The retire-existing-guard step is now hoisted to
+    // the top of start_guard_for_rule_locked so every return path starts clean.
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, still enabled, INVALID assertion type
+        p.set_full_sync(false);
+        auto rule = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        rule.mutable_assertion()->set_type("service-frobnicate"); // not a recognized assertion kind
+        *p.add_rules() = rule;
+        auto applied = f.engine->apply_rules(p); // persistence succeeds regardless of arm outcome
+        REQUIRE(applied.has_value());
+        CHECK(*applied == 1);
+    }
+    CHECK(f.engine->rule_count() == 1);       // still persisted (as the new, invalid definition)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but the OLD guard was retired, not left running
 }
 
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",

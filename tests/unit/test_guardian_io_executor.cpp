@@ -94,20 +94,32 @@ TEST_CASE("run: a second read for the same (class,key) returns AlreadyRunning wi
     GuardianIoExecutor ex;
     auto gate = std::make_shared<Gate>();
     auto spawns = std::make_shared<std::atomic<int>>(0);
+    auto first_started = std::make_shared<std::promise<void>>();
+    auto first_started_fut = first_started->get_future();
     std::thread caller([&] {
-        ex.run(IoClass::File, "dup", 30s, [gate, spawns] {
+        ex.run(IoClass::File, "dup", 30s, [gate, spawns, first_started] {
             spawns->fetch_add(1);
+            first_started->set_value(); // proves the worker body, not just admission, ran
             gate->wait();
             return 1;
         });
     });
-    REQUIRE(spin_until([&] { return ex.active_worker_count() == 1; }));
+    // Wait for the FIRST worker to genuinely start executing, not merely for
+    // admission to succeed - active_worker_count() flips before the OS thread is
+    // ever scheduled, so gating on that alone could race a not-yet-running first
+    // worker and let a would-be-erroneous second spawn slip past unobserved.
+    REQUIRE(first_started_fut.wait_for(5s) == std::future_status::ready);
     auto r2 = ex.run(IoClass::File, "dup", 1s, [spawns] {
         spawns->fetch_add(1);
         return 2;
     });
     CHECK_FALSE(r2.has_value());
     CHECK(r2.error() == IoFailure::AlreadyRunning);
+    // Give a hypothetical erroneously-spawned second worker ample time to run and
+    // increment spawns before asserting it never did - an instant read here would
+    // let a real single-flight regression pass if that second thread simply hadn't
+    // been scheduled yet.
+    std::this_thread::sleep_for(100ms);
     CHECK(spawns->load() == 1); // the second call never spawned a worker
     gate->release();
     caller.join();

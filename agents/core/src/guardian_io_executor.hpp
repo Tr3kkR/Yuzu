@@ -29,11 +29,14 @@
  *    its whole type budget.
  *  - RAII admission ticket: admission is a transaction (the one throwing mutation,
  *    set::insert, runs before the nothrow counter increments; the ticket is armed
- *    last). A shared_ptr<TicketCore> owns the slot + active key and releases both
- *    exactly once, in a nothrow destructor (erase by stored iterator), when the
- *    LAST holder dies. The caller drops its copy after a successful launch, so a
- *    timed-out submitter does NOT release the slot - the worker's copy does, when
- *    it exits.
+ *    last). A shared_ptr<TicketCore> owns the slot + active key. The KEY is freed by
+ *    the worker at publish time (release_key_locked(), so a fast sequential re-read
+ *    of the same key is not spuriously single-flighted); the INFLIGHT COUNTERS
+ *    (what active_worker_count() reports) are freed only in the destructor, when the
+ *    LAST holder dies - the worker's own captured copy, destroyed by the trampoline
+ *    after the worker lambda has fully returned, i.e. at true OS-thread-exit time.
+ *    The caller drops its copy after a successful launch, so a timed-out submitter
+ *    does NOT release either - the worker does, on its own schedule.
  *  - No std::terminate path: the worker is launched DETACHED-at-creation
  *    (pthread_create PTHREAD_CREATE_DETACHED / _beginthreadex + CloseHandle), so
  *    there is no joinable std::thread whose destructor could terminate and no
@@ -226,8 +229,9 @@ public:
     /// `deadline` (absolute, captured at entry). `key` is the canonical spark_key
     /// of the target. Returns the worker's result on success, or a typed IoFailure.
     /// Forwarding callable (no std::function alloc); the worker captures a decayed
-    /// OWNING copy of `fn`. `T` must be nothrow-move-constructible so publication
-    /// into the result cell cannot throw.
+    /// OWNING copy of `fn`. No constraint on `T`'s own move-throwing-ness - the
+    /// worker heap-boxes its result and publishes by a nothrow unique_ptr move
+    /// (see below).
     template <class F>
     auto run(IoClass cls, std::string key, std::chrono::milliseconds deadline, F&& fn) {
         using T = std::decay_t<std::invoke_result_t<F&>>;
@@ -295,10 +299,14 @@ public:
                         ++st->counters[ci].worker_exceptions;
                     cell->result = std::move(boxed); // nothrow: unique_ptr pointer move
                     cell->done = true;
-                    ticket->release_locked();        // free slot+key atomically with the result
+                    ticket->release_key_locked(); // free the single-flight key now;
+                                                   // the inflight counters stay held
+                                                   // until this ticket's destructor
+                                                   // runs (worker's own copy, at true
+                                                   // OS-thread-exit time)
                 }
                 st->cv.notify_all(); // after releasing the lock
-                // `ticket` copy destroyed at worker scope end -> releases slot + key
+                // `ticket` copy destroyed at worker scope end -> releases the counters
             };
 
             bool launched = false;
@@ -399,10 +407,27 @@ private:
         int total_quota{0};                                 // immutable after ctor
     };
 
-    /// RAII admission slot: releases the inflight counters + the active key exactly
-    /// once, in a nothrow destructor (erase by the stored iterator - no allocation,
-    /// no comparator call), when the last shared holder dies. `armed` is false until
-    /// admission succeeds, so a ticket destroyed before/without admission is a no-op.
+    /// RAII admission slot. Two DISTINCT release moments, deliberately not merged:
+    ///   - release_key_locked() frees only the single-flight KEY, called by the
+    ///     worker in its publish critical section, so a fast sequential re-read of
+    ///     the same key is not spuriously single-flighted the instant the result is
+    ///     visible to a waiting submitter.
+    ///   - the COUNTERS (total_inflight / class_inflight - what active_worker_count()
+    ///     reports) are freed ONLY in the destructor, i.e. when the LAST shared
+    ///     holder dies. The worker's own captured copy is that last holder, and it
+    ///     is destroyed by the trampoline AFTER the worker lambda body has fully
+    ///     returned (notify_all included) - i.e. at the latest point observable
+    ///     before the OS thread itself exits. This is load-bearing for the
+    ///     orphan-exit contract: active_worker_count() must not read 0 while any
+    ///     worker code can still execute in the process image, even the trivial
+    ///     capture-destruction tail after a result has published. Splitting the two
+    ///     lets the key-reuse fix and the orphan-count accuracy both hold - merging
+    ///     them (as an earlier revision did) made active_worker_count() reach 0
+    ///     while the worker's OS thread was still unwinding.
+    /// `armed` is false until admission succeeds, so a ticket destroyed before /
+    /// without admission is a no-op. A ticket destroyed WITHOUT release_key_locked()
+    /// having run first (the rollback / never-launched / never-published paths)
+    /// still frees the key here - `key_released` guards against a double-erase.
     struct TicketCore {
         explicit TicketCore(std::shared_ptr<State> s) noexcept : state(std::move(s)) {}
         ~TicketCore() {
@@ -410,7 +435,12 @@ private:
                 return;
             {
                 std::lock_guard<std::mutex> lk{state->mu};
-                release_locked();
+                if (state->total_inflight > 0)
+                    --state->total_inflight;
+                if (state->class_inflight[ci] > 0)
+                    --state->class_inflight[ci];
+                if (!key_released)
+                    state->active_keys.erase(key_it); // nothrow: erase by valid iterator
             }
             state->cv.notify_all(); // after releasing the lock
         }
@@ -419,22 +449,15 @@ private:
             key_it = it;
             armed = true;
         }
-        // Free the slot + active key exactly once; the CALLER must hold State::mu.
-        // The worker calls this in its publish critical section so the key is free
-        // the instant the result is visible to a waiting submitter - a fast
-        // sequential re-read of the same key is not spuriously single-flighted. A
-        // wedged worker never publishes, so it never releases here, preserving the
-        // dead-target guard; the destructor is the fallback for the never-published
-        // and launch-failure paths.
-        void release_locked() noexcept {
-            if (!armed)
+        // Free ONLY the single-flight key; the CALLER must hold State::mu. Does NOT
+        // touch the inflight counters (see the class comment above) - a wedged
+        // worker never reaches this call (it never publishes), preserving the
+        // dead-target single-flight guard.
+        void release_key_locked() noexcept {
+            if (!armed || key_released)
                 return;
-            if (state->total_inflight > 0)
-                --state->total_inflight;
-            if (state->class_inflight[ci] > 0)
-                --state->class_inflight[ci];
-            state->active_keys.erase(key_it); // nothrow: erase by valid iterator
-            armed = false;
+            state->active_keys.erase(key_it);
+            key_released = true;
         }
         TicketCore(const TicketCore&) = delete;
         TicketCore& operator=(const TicketCore&) = delete;
@@ -443,6 +466,7 @@ private:
         std::size_t ci{0};
         std::set<std::pair<int, std::string>>::iterator key_it{};
         bool armed{false};
+        bool key_released{false};
     };
     using Ticket = std::shared_ptr<TicketCore>;
 

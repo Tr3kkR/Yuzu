@@ -117,8 +117,13 @@ public:
     /// Wake any waiting read and reject new ones so shutdown does not hang. Does NOT
     /// cancel a detached OS call already in a kernel syscall (that cannot be
     /// cancelled or joined); it decouples the waiter, which degrades to Unknown.
-    /// MUST be idempotent and NONBLOCKING, and MUST NOT throw - begin_stop() runs
-    /// from ~GuardianSparkRuntime(), so an escaping exception would std::terminate.
+    /// MUST be idempotent and MUST NOT throw - the `noexcept` is load-bearing since
+    /// begin_stop() runs from ~GuardianSparkRuntime(), where an escaping exception
+    /// would std::terminate (the implementer must contain any exception itself, not
+    /// merely avoid causing one). MUST NOT block on I/O or an unbounded wait; a
+    /// short lock-protected critical section over in-memory state (no syscalls) is
+    /// acceptable and is what GuardianStateReader does - this is not a wait-free /
+    /// hard-realtime guarantee.
     virtual void request_stop() noexcept = 0;
 };
 

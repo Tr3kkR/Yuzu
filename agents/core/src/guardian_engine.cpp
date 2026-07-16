@@ -275,7 +275,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             // A disabled rule must not leave a stale guard armed from an earlier
             // push: start_local already skips disabled cached rules on restart
             // (line ~212), but this loop previously called start_guard_for_rule_
-            // locked for every pushed rule regardless of enabled() — so pushing
+            // locked for every pushed rule regardless of enabled() - so pushing
             // an already-armed rule as disabled never stopped its guard.
             if (it->second)
                 it->second->stop();
@@ -529,6 +529,21 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // Windows for the MVP. Returns true iff a guard was actually armed (so callers
     // can count accurately).
 
+    // Retire any guard already armed for this rule_id BEFORE validating/arming the
+    // new definition below. Each branch used to do this find-stop-erase only on its
+    // happy path, AFTER the type/assertion checks - so a same-id re-push whose new
+    // assertion failed validation (an unsupported type, an unrecognized spark type)
+    // returned false early and left the PRIOR guard running, silently enforcing a
+    // stale definition the caller believes was replaced (apply_rules persists the
+    // new rule to KV regardless of whether it arms). Hoisting this here means every
+    // return path - early-invalid, late-failed-start, or success - starts from a
+    // clean slate, so an unarmed/errored outcome is genuinely unarmed.
+    if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
+        if (it->second)
+            it->second->stop();
+        guards_.erase(it);
+    }
+
     // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
     if (rule.spark().type() == "file-change") {
         const auto& fa = rule.assertion();
@@ -594,11 +609,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 : std::string(fcfg.expect_present ? "expect present" : "expect absent");
 
         auto file_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
-        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-            if (it->second)
-                it->second->stop();
-            guards_.erase(it);
-        }
+        // (prior guard for this rule_id already retired at function entry)
         auto fguard = std::make_unique<FileGuard>(std::move(fcfg), std::move(file_sink));
         if (fguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(fguard));
@@ -644,11 +655,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         const std::string log_service = cfg.service_name; // captured before the move below
 
         auto service_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
-        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-            if (it->second)
-                it->second->stop();
-            guards_.erase(it);
-        }
+        // (prior guard for this rule_id already retired at function entry)
         // Platform factory: Windows SCM ServiceGuard or Linux systemd
         // SystemdServiceGuard, both IGuard. Keeps this dispatch platform-clean.
         auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
@@ -713,11 +720,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // delivers once set_event_sink runs. emit_guard_event takes sink_mtx_ only.
     auto guard_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
 
-    if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-        if (it->second)
-            it->second->stop();
-        guards_.erase(it);
-    }
+    // (prior guard for this rule_id already retired at function entry)
     auto guard = std::make_unique<RegistryGuard>(std::move(cfg), std::move(guard_sink));
     if (guard->start()) {
         guards_.emplace(rule.rule_id(), std::move(guard));

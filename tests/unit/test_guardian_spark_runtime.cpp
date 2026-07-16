@@ -311,8 +311,10 @@ TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE(r->stops.load() == 0);
     rt->begin_stop();
     REQUIRE(rt->stopping());
+    CHECK(r->stops.load() == 1); // begin_stop() -> reader_->request_stop(), exactly once
     rt->on_event(SparkEvent{.key = key, .type = SparkType::File});
     REQUIRE(rt->outbox_size() == 0); // stopping -> no commit
 }

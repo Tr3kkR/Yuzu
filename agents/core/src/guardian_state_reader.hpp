@@ -58,7 +58,18 @@ public:
     ReadResult<FileSnapshot> read_file(const FileSparkParams& p, const FileReadPlan& plan) override;
     RegistryRead read_registry(const RegistrySparkParams& p, const RegistryReadPlan& plan) override;
     ReadResult<ServiceRunState> read_service(const ServiceSparkParams& p) override;
-    void request_stop() noexcept override { executor_.stop(); }
+    // executor_.stop() is not itself noexcept (it takes a mutex, and
+    // std::mutex::lock() is permitted to throw std::system_error), so this must
+    // contain any exception itself rather than merely avoid causing one - an
+    // escape here would std::terminate the agent (this runs from begin_stop(),
+    // including ~GuardianSparkRuntime()). The critical section is bounded and
+    // I/O-free (see the stop() contract note), so in practice this never throws.
+    void request_stop() noexcept override {
+        try {
+            executor_.stop();
+        } catch (...) {
+        }
+    }
 
     /// Live bounded-I/O worker count (orphan-exit obligation, see the header note).
     [[nodiscard]] std::size_t active_io_workers() const { return executor_.active_worker_count(); }
