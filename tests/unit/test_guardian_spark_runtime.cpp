@@ -107,10 +107,24 @@ RuleAssertion registry_rule(const std::string& rule_id, const std::string& value
     a.expected_value = expected;
     return a;
 }
+// Drains the compliance/health verdicts these tests were written against.
+// Filters out Lifecycle (rung 7 audit-on-arm: attach_rule/detach_rule now
+// enqueue an armed/disarmed entry on every call) - a SEPARATE helper below
+// (drain_lifecycle) is for the tests that specifically exercise that.
 std::vector<OutboxEntry> drain_all(GuardianSparkRuntime& rt) {
     std::vector<OutboxEntry> got;
     rt.drain([&](const OutboxEntry& e) {
-        got.push_back(e);
+        if (e.domain != OutboxDomain::Lifecycle)
+            got.push_back(e);
+        return SendResult::Sent;
+    });
+    return got;
+}
+std::vector<OutboxEntry> drain_lifecycle(GuardianSparkRuntime& rt) {
+    std::vector<OutboxEntry> got;
+    rt.drain([&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle)
+            got.push_back(e);
         return SendResult::Sent;
     });
     return got;
@@ -543,6 +557,13 @@ TEST_CASE("the agent-id provider is invoked before the read, not on the detached
     });
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    // attach_rule itself calls the provider once too (its Lifecycle "armed"
+    // audit entry, rung 7 - synchronous on the caller's thread, never on the
+    // detached-post-read path, so this call is fine). Check the DELTA from here
+    // rather than an absolute count, so this stays robust to other legitimate
+    // synchronous provider calls: the invariant under test is specifically that
+    // evaluate_key's read-thread calls it once, before the blocking read.
+    const int before_read = provider_calls.load();
 
     std::latch reading{1};
     std::latch release{1};
@@ -552,7 +573,7 @@ TEST_CASE("the agent-id provider is invoked before the read, not on the detached
     };
     std::thread t([&] { rt->evaluate_key(key, EvalReason::Initial); });
     reading.wait();
-    REQUIRE(provider_calls.load() == 1); // snapshotted BEFORE the read
+    REQUIRE(provider_calls.load() == before_read + 1); // snapshotted BEFORE the read
     release.count_down();
     t.join();
 }
@@ -620,4 +641,179 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
     for (auto& th : threads) th.join();
     rt->begin_stop();
     SUCCEED(); // no crash / no TSan report is the assertion
+}
+
+// ── rung 7.4: detach_all, status_for_rule, Lifecycle audit, live-drain waker ─
+
+TEST_CASE("attach_rule enqueues a Lifecycle 'armed' entry; detach_rule enqueues 'disarmed'",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].rule_id == "r1");
+    CHECK(lc[0].lifecycle_kind == "armed");
+
+    rt->detach_rule("r1");
+    lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].rule_id == "r1");
+    CHECK(lc[0].lifecycle_kind == "disarmed");
+}
+
+TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",
+          "[spark][runtime]") {
+    // The bug Sol's review caught: GuardianOutbox coalesces by (domain,rule_id)
+    // - latest wins - and detach_rule's drop_rule(rule_id) purges every domain
+    // for that rule, including (before this fix) Lifecycle. Attach-then-
+    // immediately-disable must not lose the "armed" audit evidence.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->detach_rule("r1"); // same-tick disable, before anything ever drained
+
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 2); // BOTH survive: armed, then disarmed
+    CHECK(lc[0].lifecycle_kind == "armed");
+    CHECK(lc[1].lifecycle_kind == "disarmed");
+}
+
+TEST_CASE("a same-id re-attach enqueues disarmed-then-armed, both surviving",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", false), true); // replace
+
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 3); // armed, disarmed (internal replace), armed (new generation)
+    CHECK(lc[0].lifecycle_kind == "armed");
+    CHECK(lc[1].lifecycle_kind == "disarmed");
+    CHECK(lc[2].lifecycle_kind == "armed");
+}
+
+TEST_CASE("detach_all withdraws every attached rule and disarms every backend subscription",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->attach_rule("r2", svc_spec("sshd"), svc_running_rule("r2"), true);
+    REQUIRE(rt->rule_count() == 2);
+    REQUIRE(rt->armed_key_count() == 2);
+    REQUIRE(b->arms.load() == 2);
+
+    rt->detach_all();
+
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->disarms.load() == 2);
+    const auto lc = drain_lifecycle(*rt);
+    CHECK(lc.size() == 4); // armed x2, disarmed x2
+}
+
+TEST_CASE("detach_all also clears pending-initial bookkeeping (no stale scheduler reference)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE(rt->keys_with_pending_initial().size() == 1);
+
+    rt->detach_all();
+
+    CHECK(rt->keys_with_pending_initial().empty());
+    // A convergence sweep over a now-nonexistent key must be a safe no-op, not
+    // a dangling reference into freed PerKey state.
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+    SUCCEED("sweeping a detached key after detach_all did not crash");
+}
+
+TEST_CASE("status_for_rule reflects the last committed verdict; nullopt for an unattached rule",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    CHECK_FALSE(rt->status_for_rule("ghost").has_value());
+
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+
+    const auto st = rt->status_for_rule("r1");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->in_unknown);
+    REQUIRE(st->last_compliant.has_value());
+    CHECK(*st->last_compliant); // file exists, expect_present=true -> compliant
+
+    r->file = read_unknown<FileSnapshot>("transient");
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+    const auto st2 = rt->status_for_rule("r1");
+    REQUIRE(st2.has_value());
+    CHECK(st2->in_unknown);
+}
+
+TEST_CASE("the outbox-enqueue waker fires on a compliance commit and on attach/detach lifecycle "
+          "entries",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    std::atomic<int> wakes{0};
+    rt->set_outbox_enqueue_waker([&] { wakes.fetch_add(1); });
+
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    CHECK(wakes.load() >= 1); // the "armed" lifecycle enqueue
+
+    const int before_eval = wakes.load();
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    CHECK(wakes.load() > before_eval); // the compliant-edge commit
+
+    const int before_detach = wakes.load();
+    rt->detach_rule("r1");
+    CHECK(wakes.load() > before_detach); // the "disarmed" lifecycle enqueue
+}
+
+TEST_CASE("a copied outbox-enqueue waker outliving its installer is a harmless no-op",
+          "[spark][runtime]") {
+    // Mirrors the already-shipped pending_initial_waker_ lifetime test: a
+    // waker capturing only shared, still-alive state must be safe to invoke
+    // after whatever installed it is gone.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    rt->set_outbox_enqueue_waker([flag] { flag->store(true); });
+    auto copied = rt->outbox_enqueue_waker_for_test();
+    rt->set_outbox_enqueue_waker({}); // clear the installed one
+    REQUIRE(copied);
+    copied(); // the copy still runs fine
+    CHECK(flag->load());
+}
+
+TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking the arm",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    auto rt = make_rt(r, b, cfg);
+
+    // Fill the (shared-capacity) lifecycle log past its floor via same-id
+    // replace churn (armed/disarmed/armed/... never coalesces or gets purged).
+    for (int i = 0; i < 5; ++i)
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    CHECK(rt->lifecycle_backpressure_drops() > 0);
+    // The arm itself still succeeded throughout - the audit trail never blocks
+    // the real detection-capability change.
+    CHECK(rt->rule_count() == 1);
+    CHECK(b->arms.load() >= 1);
 }

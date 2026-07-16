@@ -243,4 +243,64 @@ private:
     std::uint64_t backpressure_drops_{0};
 };
 
+/// APPEND-ONLY audit log for Lifecycle (guard.armed / guard.disarmed / guard.errored)
+/// entries (ADR-0021 Stage 2 rung 7, audit-on-arm). Deliberately NOT the same
+/// structure as GuardianOutbox: that class coalesces per (domain, rule_id) -
+/// latest wins - and its drop_rule()/purge_stale() erase every domain for a
+/// rule, INCLUDING Lifecycle. Both are correct and desired for a live
+/// compliance/health verdict (only the latest matters, and a withdrawn rule's
+/// stale verdict must not send) but WRONG for an audit trail: a rule armed then
+/// quickly disabled must not have its "armed" evidence silently coalesced away
+/// or purged by the disable's own withdrawal - the trail is the point. This
+/// class enqueues FIFO, sends FIFO, coalesces nothing, and is never purged by
+/// rule_id or generation - an entry leaves only when successfully sent.
+/// Capacity-bounded like its sibling (reject-new + count on full; never evict).
+class GuardianLifecycleLog {
+public:
+    explicit GuardianLifecycleLog(std::size_t capacity) : capacity_(capacity) {}
+
+    /// Buffer `e`. Returns false iff at capacity - the caller's arm/disarm still
+    /// succeeds (the audit trail is not allowed to block or unwind a real
+    /// detection-capability change); the caller should count/log this loudly
+    /// rather than swallow it (see the header note on outbox-full-on-arm).
+    bool enqueue(OutboxEntry e) {
+        if (pending_.size() >= capacity_) {
+            ++backpressure_drops_;
+            return false;
+        }
+        pending_.push_back(std::move(e));
+        return true;
+    }
+
+    /// Send in FIFO order; a Sent entry is removed, a Retain (or a throw) stops
+    /// the drain and keeps the head - identical send contract to GuardianOutbox.
+    template <typename SendFn>
+    std::size_t drain(SendFn&& send) {
+        std::size_t sent = 0;
+        while (!pending_.empty()) {
+            const OutboxEntry& front = pending_.front();
+            SendResult r = SendResult::Retain;
+            try {
+                r = send(front);
+            } catch (...) {
+                break;
+            }
+            if (r != SendResult::Sent)
+                break;
+            pending_.pop_front();
+            ++sent;
+        }
+        return sent;
+    }
+
+    [[nodiscard]] std::size_t size() const { return pending_.size(); }
+    [[nodiscard]] bool empty() const { return pending_.empty(); }
+    [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+
+private:
+    std::size_t capacity_;
+    std::list<OutboxEntry> pending_;
+    std::uint64_t backpressure_drops_{0};
+};
+
 } // namespace yuzu::agent

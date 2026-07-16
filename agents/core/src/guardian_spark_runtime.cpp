@@ -40,7 +40,8 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
       clock_(clock ? std::move(clock)
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
-      outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
+      outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
+      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
 
 GuardianSparkRuntime::~GuardianSparkRuntime() {
     // No in-flight pass can be running: a pass keeps the runtime alive through the
@@ -61,6 +62,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                                   bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
     std::function<void()> waker;
+    std::function<void()> outbox_waker;
     std::uint64_t new_gen = 0;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
@@ -69,6 +71,9 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         // Fresh generation: drop any prior mapping for this rule first (rung 7's
         // reconcile is what preserves eval state across an identical re-push).
+        // If a prior generation existed, this already enqueued its "disarmed"
+        // lifecycle entry - the "armed" entry below covers the new one, so ONE
+        // outbox-waker firing at the end of this call covers both.
         detach_rule_locked(rule_id);
 
         const std::uint64_t gen = ++gen_counter_;
@@ -97,24 +102,56 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         rules_.insert_or_assign(rule_id, std::move(rg));
         pk->pending_initial.insert(rule_id);
-        waker = pending_initial_waker_; // copy; call after releasing registry_mu_
+        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy -
+        // must not go unaudited. Failure here is counted, never rolls back the
+        // arm itself (the audit trail must not compromise real detection
+        // capability); see enqueue_lifecycle_locked's doc.
+        enqueue_lifecycle_locked(rule_id, gen, "armed");
+        waker = pending_initial_waker_;   // copy; call after releasing registry_mu_
+        outbox_waker = outbox_enqueue_waker_;
         new_gen = gen;
     }
     // Outside the lock (avoids a registry_mu_ -> scheduler_mu_ inversion): let the
-    // convergence scheduler service the new rule's initial eval promptly.
+    // convergence scheduler service the new rule's initial eval promptly, and let
+    // the drain worker (rung 7.5) send the fresh armed/health/compliance entries.
     if (waker)
         waker();
+    if (outbox_waker)
+        outbox_waker();
     return new_gen;
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    detach_rule_locked(rule_id);
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        detach_rule_locked(rule_id);
+        outbox_waker = outbox_enqueue_waker_;
+    }
+    if (outbox_waker)
+        outbox_waker();
+}
+
+void GuardianSparkRuntime::detach_all() {
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        std::vector<std::string> rule_ids;
+        rule_ids.reserve(rules_.size());
+        for (const auto& [rid, rg] : rules_)
+            rule_ids.push_back(rid);
+        for (const auto& rid : rule_ids)
+            detach_rule_locked(rid);
+        outbox_waker = outbox_enqueue_waker_;
+    }
+    if (outbox_waker)
+        outbox_waker();
 }
 
 void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
     const auto rit = rules_.find(rule_id);
     const bool known = (rit != rules_.end());
+    const std::uint64_t gen = known ? rit->second->generation : 0;
     const auto key_opt = index_->key_for_rule(rule_id); // capture BEFORE removal
     if (known)
         rit->second->active = false; // in-flight evals will not commit
@@ -123,8 +160,10 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         rules_.erase(rule_id);
     {
         std::lock_guard<std::mutex> ob{outbox_mu_};
-        outbox_.drop_rule(rule_id);
+        outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
+    if (known)
+        enqueue_lifecycle_locked(rule_id, gen, "disarmed");
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
@@ -224,41 +263,55 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
     // entry). Commit ONLY the planned generations, and re-check each is STILL the
     // active current generation for its rule - one withdrawn or re-attached during
     // the read must drop here (its new generation gets its own pass).
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    if (stopping_)
-        return;
-    const auto kit = keys_.find(key);
-    if (kit == keys_.end() || kit->second.get() != pk.get())
-        return; // key withdrawn or re-armed under a new PerKey during the read
+    bool enqueued_any = false;
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end() || kit->second.get() != pk.get())
+            return; // key withdrawn or re-armed under a new PerKey during the read
 
-    for (const std::shared_ptr<RuleGeneration>& rg : planned) {
-        const auto rrit = rules_.find(rg->assertion.rule_id);
-        if (rrit == rules_.end() || rrit->second.get() != rg.get() || !rg->active)
-            continue; // withdrawn or superseded during the read
+        for (const std::shared_ptr<RuleGeneration>& rg : planned) {
+            const auto rrit = rules_.find(rg->assertion.rule_id);
+            if (rrit == rules_.end() || rrit->second.get() != rg.get() || !rg->active)
+                continue; // withdrawn or superseded during the read
 
-        // copy-eval-enqueue-commit: eval mutates a COPY; commit only if what we
-        // needed to buffer was accepted, else leave the eval pending for retry.
-        RuleEvalState scratch = rg->eval;
-        const EvalOutcome out =
-            eval_rule(spec, rg->assertion, scratch, now, rg->emit_compliant_edge,
-                      is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
-                      is_svc ? &svc_read : nullptr);
+            // copy-eval-enqueue-commit: eval mutates a COPY; commit only if what we
+            // needed to buffer was accepted, else leave the eval pending for retry.
+            RuleEvalState scratch = rg->eval;
+            const EvalOutcome out =
+                eval_rule(spec, rg->assertion, scratch, now, rg->emit_compliant_edge,
+                          is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
+                          is_svc ? &svc_read : nullptr);
 
-        std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id);
-        bool accepted = true;
-        if (!entries.empty()) {
-            std::lock_guard<std::mutex> ob{outbox_mu_};
-            accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
+            std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id);
+            const bool had_entries = !entries.empty(); // captured BEFORE the move below
+            bool accepted = true;
+            if (had_entries) {
+                std::lock_guard<std::mutex> ob{outbox_mu_};
+                accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
+            }
+            if (!accepted)
+                continue; // outbox full: eval stays pending (nothing committed), convergence retries
+            if (had_entries)
+                enqueued_any = true;
+
+            rg->eval = std::move(scratch); // COMMIT
+            // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
+            // Unknown does not (it still owes a real verdict).
+            if (out.status != EvalStatus::Unhealthy)
+                pk->pending_initial.erase(rg->assertion.rule_id);
         }
-        if (!accepted)
-            continue; // outbox full: eval stays pending (nothing committed), convergence retries
-
-        rg->eval = std::move(scratch); // COMMIT
-        // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
-        // Unknown does not (it still owes a real verdict).
-        if (out.status != EvalStatus::Unhealthy)
-            pk->pending_initial.erase(rg->assertion.rule_id);
+        if (enqueued_any)
+            outbox_waker = outbox_enqueue_waker_; // copy; call after releasing registry_mu_
     }
+    // Fire once for the whole pass (not per-rule/per-key concurrently - this
+    // local is per-call, no cross-thread sharing) - the drain worker (rung 7.5)
+    // drains everything pending regardless of how many entries accumulated.
+    if (outbox_waker)
+        outbox_waker();
 }
 
 EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const RuleAssertion& a,
@@ -316,9 +369,27 @@ std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std:
            std::to_string(++event_seq_);
 }
 
+bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
+                                                    std::uint64_t generation,
+                                                    const std::string& kind) {
+    // Called from attach_rule/detach_rule_locked - never on the detached-post-
+    // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
+    // safe here, unlike evaluate_key's read path.
+    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
+    const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
+    const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+    auto entry = OutboxEntry::lifecycle(rule_id, generation, make_event_id(rule_id, ms, agent_id),
+                                        ns, kind);
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.enqueue(std::move(entry));
+}
+
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    return outbox_.drain(send);
+    std::size_t sent = outbox_.drain(send);
+    sent += lifecycle_log_.drain(send);
+    return sent;
 }
 
 void GuardianSparkRuntime::begin_stop() {
@@ -353,6 +424,21 @@ std::size_t GuardianSparkRuntime::outbox_size() const {
 std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return outbox_.backpressure_drops();
+}
+std::uint64_t GuardianSparkRuntime::lifecycle_backpressure_drops() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.backpressure_drops();
+}
+std::optional<GuardianSparkRuntime::RuleStatusSnapshot>
+GuardianSparkRuntime::status_for_rule(const std::string& rule_id) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto it = rules_.find(rule_id);
+    if (it == rules_.end())
+        return std::nullopt;
+    RuleStatusSnapshot snap;
+    snap.in_unknown = it->second->eval.in_unknown;
+    snap.last_compliant = it->second->eval.emit.last_compliant;
+    return snap;
 }
 std::vector<std::string> GuardianSparkRuntime::pending_initial(const std::string& key) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
@@ -392,6 +478,16 @@ void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker
 std::function<void()> GuardianSparkRuntime::pending_initial_waker_for_test() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     return pending_initial_waker_;
+}
+
+void GuardianSparkRuntime::set_outbox_enqueue_waker(std::function<void()> waker) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    outbox_enqueue_waker_ = std::move(waker);
+}
+
+std::function<void()> GuardianSparkRuntime::outbox_enqueue_waker_for_test() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return outbox_enqueue_waker_;
 }
 
 void GuardianSparkRuntime::set_agent_id_provider(std::function<std::string()> provider) {

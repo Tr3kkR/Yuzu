@@ -53,6 +53,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -192,6 +193,14 @@ public:
     /// Idempotent for an unknown rule.
     void detach_rule(const std::string& rule_id);
 
+    /// Detach EVERY currently-attached rule (mirrors GuardianEngine's legacy
+    /// stop_all_guards_locked()). For the reconcile op's full_sync branch: a
+    /// full sync replaces the active set, so any spark-attached rule the new
+    /// push omits must be withdrawn too, not just the ones the per-rule loop
+    /// revisits. Equivalent to calling detach_rule() for every attached rule_id,
+    /// but atomic under one registry_mu_ acquisition.
+    void detach_all();
+
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown
     /// (it observes the stopping flag and commits nothing).
@@ -203,8 +212,12 @@ public:
     void evaluate_key(const std::string& key, EvalReason reason);
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
-    /// The drain trigger (sink publication + reconnect) is wired at rung 7; this is
-    /// the mechanism. Returns the number sent. Takes only the outbox lock.
+    /// Drains the compliance/health outbox AND the Lifecycle audit log (distinct
+    /// structures internally - see GuardianLifecycleLog - but one send callback
+    /// suffices since `send` can switch on OutboxEntry::domain). The drain
+    /// trigger (sink publication + reconnect + live wake-on-enqueue) is wired at
+    /// rung 7; this is the mechanism. Returns the number sent. Takes only the
+    /// outbox lock.
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
@@ -224,6 +237,20 @@ public:
     [[nodiscard]] std::vector<std::string> pending_initial(const std::string& key) const;
     [[nodiscard]] bool stopping() const;
 
+    /// A live status snapshot for one currently-attached rule, reflecting the
+    /// LAST COMMITTED eval outcome (not a fresh re-read - matching every other
+    /// introspection method here). `in_unknown` true means the last committed
+    /// read was Unknown (the rule is errored, not compliant/drifted).
+    /// `last_compliant` is nullopt until the first Known verdict ever commits.
+    struct RuleStatusSnapshot {
+        bool in_unknown{false};
+        std::optional<bool> last_compliant;
+    };
+    /// nullopt if rule_id is not attached here (unknown to the runtime - e.g.
+    /// legacy-armed, invalid, or never pushed; the reconcile op / GuardianEngine
+    /// owns the wider status picture across both backends, rung 7.5).
+    [[nodiscard]] std::optional<RuleStatusSnapshot> status_for_rule(const std::string& rule_id) const;
+
     // --- Convergence-scheduler seam (rung 4) ---
     /// Armed spark_keys whose spec is `type` - the lane a convergence thread
     /// sweeps on its own cadence (so a slow file hash never blocks a service
@@ -240,6 +267,26 @@ public:
     /// Test seam: a copy of the currently-installed waker, to exercise the
     /// copied-waker-outlives-scheduler lifetime path.
     [[nodiscard]] std::function<void()> pending_initial_waker_for_test() const;
+
+    // --- Live-drain seam (rung 7, F6) ---
+    /// Install a waker the runtime invokes (OUTSIDE its lock, same lifetime-
+    /// safety shape as set_pending_initial_waker) whenever ANY outbox mutation
+    /// happens - a compliance/health commit in evaluate_key's commit section, OR
+    /// a Lifecycle armed/disarmed enqueue in attach_rule/detach_rule. Called
+    /// unconditionally after any such mutation (not gated on "was this truly a
+    /// new key vs a coalesce" - a coalesced-in-place update is still fresh data
+    /// waiting to be sent, and an extra CV wake is harmless, whereas under-
+    /// waking risks steady-state staleness with no bounded recovery). Lets
+    /// GuardianEngine's drain worker (rung 7.5) wake immediately instead of
+    /// waiting for the next reconnect or periodic tick. Pass {} to clear.
+    void set_outbox_enqueue_waker(std::function<void()> waker);
+    /// Test seam: a copy of the currently-installed waker.
+    [[nodiscard]] std::function<void()> outbox_enqueue_waker_for_test() const;
+    /// Count of Lifecycle audit entries rejected for capacity (arm/disarm still
+    /// succeeds regardless - the audit trail never blocks a real detection-
+    /// capability change - but a drop here must be loudly observable, never
+    /// silent). Takes only the outbox lock.
+    [[nodiscard]] std::uint64_t lifecycle_backpressure_drops() const;
 
     /// Install the source of THIS agent's id, folded into every event_id so the
     /// server's global `event_id` PRIMARY KEY (drops on UNIQUE conflict, #1307)
@@ -297,6 +344,15 @@ private:
     /// observations - closing the collision the server's event_id PK would drop on.
     std::string make_event_id(const std::string& rule_id, std::int64_t wall_ms,
                               const std::string& agent_id);
+    /// Build + buffer a Lifecycle("armed"|"disarmed") entry for `rule_id` into
+    /// lifecycle_log_ (registry_mu_ held - make_event_id needs it) and return
+    /// whether it was accepted (false => capacity; caller counts/logs, never
+    /// rolls back the arm/disarm itself). Snapshots agent_id_fn_ itself (no
+    /// separate pass-in needed - this is never called from the detached-read
+    /// path, only from attach_rule/detach_rule_locked which already hold the
+    /// lock and are not blocking-I/O call sites).
+    bool enqueue_lifecycle_locked(const std::string& rule_id, std::uint64_t generation,
+                                  const std::string& kind);
 
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED
@@ -309,6 +365,11 @@ private:
     mutable std::mutex registry_mu_;
     bool stopping_{false};
     std::function<void()> pending_initial_waker_; ///< registry_mu_-guarded; called outside the lock
+    /// registry_mu_-guarded (same pattern as pending_initial_waker_ above, NOT
+    /// outbox_mu_ - every call site that needs to copy+invoke it already holds
+    /// registry_mu_: evaluate_key's commit section, attach_rule, detach_rule[_locked]).
+    /// Called outside BOTH locks after any outbox_/lifecycle_log_ mutation.
+    std::function<void()> outbox_enqueue_waker_;
     std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; empty until rung 7 wires it
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
@@ -316,6 +377,7 @@ private:
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
+    GuardianLifecycleLog lifecycle_log_; ///< capacity set in the ctor init list (see the .cpp)
 };
 
 } // namespace yuzu::agent
