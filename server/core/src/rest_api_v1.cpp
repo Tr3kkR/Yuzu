@@ -2,6 +2,7 @@
 #include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
+#include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -557,6 +558,13 @@ const std::string& openapi_spec() {
       "get": {"summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments"}}},
       "post": {"summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned"}}},
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
+    },
+    "/engine-principals/{id}/roles": {
+      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}}},
+      "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
+    },
+    "/engine-principals/{id}/roles/{role}": {
+      "delete": {"summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "403": {"description": "Requires Security:Write"}}}
     })json"
         // Split here so each raw-string literal stays under MSVC's 16,380-byte
         // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -1043,7 +1051,8 @@ void RestApiV1::register_routes(
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers) {
+    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
+    EnginePrincipalStore* engine_principal_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1056,7 +1065,7 @@ void RestApiV1::register_routes(
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
-                    std::move(app_perf_providers));
+                    std::move(app_perf_providers), engine_principal_store);
 }
 
 void RestApiV1::register_routes(
@@ -1074,7 +1083,8 @@ void RestApiV1::register_routes(
     GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
-    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers) {
+    ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
+    EnginePrincipalStore* engine_principal_store) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1756,6 +1766,169 @@ void RestApiV1::register_routes(
             mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name);
             audit_fn(req, "management_group.unassign_role", "success", "ManagementGroup", group_id,
                      principal_id + ":" + role_name);
+            res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
+        });
+
+    // ── Engine Principal Role Assignments (/api/v1/engine-principals/:id/roles) ──
+    // PR 4.2 (design doc `docs/auth-engine-principals-design.md` §4.1) — the
+    // fleet-wide role-assignment AUTHORING surface for engine principals.
+    // Without this route, `RbacStore::assign_role` has NO production caller
+    // for `principal_type="engine"`: the resolution side (the third UNION
+    // arm in `RbacStore::collect_roles_locked`) exists but is unreachable —
+    // a real grant that never takes effect (design §4.1 "resolution side"
+    // deliverable). `{id}` is the bare slug (no "engine:" prefix in the
+    // URL, mirroring `/management-groups/{id}` taking a bare group id); the
+    // handler reconstructs the full "engine:<slug>" principal_id. Scope is
+    // always fleet-wide — `PrincipalRole` carries no per-assignment scope
+    // field today (that is ADR-0017 PR-A / design §4.3's named follow-on;
+    // Phase 4 ships fleet-wide-only, which design §4.3 states is expressible
+    // in the current global model).
+    sink.Get(R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
+             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Read"))
+                     return;
+                 if (!rbac_store) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 const std::string principal_id = "engine:" + req.matches[1].str();
+                 auto roles = rbac_store->get_principal_roles("engine", principal_id);
+                 JArr arr;
+                 for (const auto& r : roles) {
+                     arr.add(JObj().add("principal_id", r.principal_id).add("role_name", r.role_name));
+                 }
+                 res.set_content(ok_json(arr.str()), "application/json");
+             });
+
+    sink.Post(
+        R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
+        [auth_fn, perm_fn, audit_fn, rbac_store, engine_principal_store, step_up_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            // Gate ordering mirrors POST /api/v1/tokens (permission -> store
+            // availability -> auth [to obtain the Session for step-up] ->
+            // MFA step-up). Security:Write — this route grants further RBAC
+            // authority to a principal, the same class of operation as the
+            // CA subordinate-import route (also Security:Write).
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!rbac_store || !engine_principal_store) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session, "POST /api/v1/engine-principals/{id}/roles"))
+                return;
+
+            const std::string principal_id = "engine:" + req.matches[1].str();
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            auto role_name = body.value("role", "");
+            if (role_name.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "role is required"), "application/json");
+                return;
+            }
+
+            // Target must name a live (non-revoked) engine principal.
+            // MissingOrRevoked is a terminal answer (404); StoreUnreachable
+            // is retryable (503) — the store's three-state contract
+            // (engine_principal_store.hpp) changes retry behavior only,
+            // never the authorization outcome.
+            auto lookup = engine_principal_store->get_for_auth(principal_id);
+            if (lookup.status == EngineLookupStatus::StoreUnreachable) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "engine principal store unavailable"),
+                                "application/json");
+                return;
+            }
+            if (lookup.status == EngineLookupStatus::MissingOrRevoked) {
+                res.status = 404;
+                res.set_content(
+                    detail::a4_error(res, "no active engine principal '" + principal_id + "'"),
+                    "application/json");
+                return;
+            }
+
+            // Role must be a real, currently-defined RBAC role —
+            // `assign_role`'s INSERT carries no FK to `roles`, so an
+            // unchecked call here would silently create an orphan grant
+            // that resolves as a no-op hole (a typo becomes an inert grant,
+            // discoverable only by confusion, not by an error).
+            if (!rbac_store->get_role(role_name)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "unknown role '" + role_name + "'"),
+                                "application/json");
+                return;
+            }
+
+            PrincipalRole assignment;
+            assignment.principal_type = "engine";
+            assignment.principal_id = principal_id;
+            assignment.role_name = role_name;
+
+            auto result = rbac_store->assign_role(assignment);
+            if (!result) {
+                // validate_assignment + the is_system-role check reject
+                // admin/built-in/malformed-namespace grants here — surface
+                // as a 4xx denial, never a 500 (design §4.2 "no admin,
+                // ever").
+                (void)audit_fn(req, "engine_principal.role.assigned", "denied", "EnginePrincipal",
+                               principal_id, role_name + ": " + result.error());
+                res.status = 400;
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.role.assigned", "success", "EnginePrincipal",
+                           principal_id, role_name);
+            res.status = 201;
+            res.set_content(ok_json(JObj()
+                                        .add("assigned", true)
+                                        .add("principal_id", principal_id)
+                                        .add("role", role_name)
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Delete(
+        R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles/([^/]+))",
+        [auth_fn, perm_fn, audit_fn, rbac_store, step_up_fn](const httplib::Request& req,
+                                                             httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!rbac_store) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session,
+                            "DELETE /api/v1/engine-principals/{id}/roles/{role}"))
+                return;
+
+            const std::string principal_id = "engine:" + req.matches[1].str();
+            const std::string role_name = req.matches[2].str();
+
+            auto result = rbac_store->unassign_role("engine", principal_id, role_name);
+            if (!result) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                return;
+            }
+            (void)audit_fn(req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
+                           principal_id, role_name);
             res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
         });
 

@@ -16,9 +16,12 @@
 /// `revoke_token`/`revoke_for_principal`/`delete_token` MUST return
 /// false/0, never a silent success — those calls back "Sign out
 /// everywhere" and the stolen-laptop response path (ADR-0012 §1
-/// authoritative posture; do not soften to fail-open). Reads
-/// (`validate_token`/`get_token`/`list_tokens`) degrade to
-/// empty/not-found on a DB error, same as before the port.
+/// authoritative posture; do not soften to fail-open). Reads split by
+/// role: `validate_token` is the auth hot path and degrades to `nullopt`
+/// on a DB error (the per-request status label already carries the 401);
+/// `get_token`/`list_tokens` are authoritative (ADR-0012 §1) and surface
+/// a runtime DB error as `std::unexpected` rather than an empty/not-found
+/// that would paper over an outage — see their per-method contracts below.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `PgPool&`, runs its
 /// migration at construction on a pinned lease, schema-qualifies every

@@ -443,6 +443,77 @@ TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
     CHECK(members.empty());
 }
 
+// ── find_local_groups_with_prefix (T8 namespace-collision preflight) ───────
+
+TEST_CASE("RbacStore: find_local_groups_with_prefix matches local-source groups by prefix",
+          "[rbac_store]") {
+    // create_group() rejects a new local group named inside the reserved
+    // 'engine:' prefix (see the "local group create inside 'engine:' is
+    // rejected" test in test_engine_principal_integration.cpp), so a
+    // colliding row can only exist as one that predates that guard — seed it
+    // via a raw connection the same way test_engine_principal_integration.cpp
+    // does, then reopen through RbacStore (closed first, required on
+    // Windows).
+    auto rbac_path = yuzu::test::unique_temp_path("yuzu_test_rbac_prefix_match-");
+    {
+        RbacStore seed(rbac_path); // runs migrations + seed_defaults, then closes
+        REQUIRE(seed.is_open());
+    }
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open_v2(rbac_path.string().c_str(), &raw,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) ==
+               SQLITE_OK);
+        char* err = nullptr;
+        REQUIRE(sqlite3_exec(raw,
+                             "INSERT INTO groups (name, description, source, external_id, "
+                             "created_at) VALUES ('engine:foo', '', 'local', '', 0), "
+                             "('engine:bar', '', 'local', '', 0), ('other', '', 'local', '', 0)",
+                             nullptr, nullptr, &err) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    RbacStore store(rbac_path);
+    REQUIRE(store.is_open());
+    // An IdP-sourced group asserting the same prefixed name is disambiguated
+    // by principal_type at the resolution site, not this scan (§3.3) — must
+    // not appear in the result.
+    REQUIRE(store.create_group({"engine:idp-sourced", "IdP group", "entra", "ext-1", 0})
+               .has_value());
+
+    auto result = store.find_local_groups_with_prefix("engine:");
+    REQUIRE(result.has_value());
+    CHECK(result->size() == 2);
+}
+
+TEST_CASE("RbacStore: find_local_groups_with_prefix returns empty engaged optional "
+          "when nothing matches",
+          "[rbac_store]") {
+    RbacStore store(":memory:");
+    store.create_group({"other", "", "local", "", 0});
+
+    auto result = store.find_local_groups_with_prefix("engine:");
+    REQUIRE(result.has_value());
+    CHECK(result->empty());
+}
+
+TEST_CASE("RbacStore: find_local_groups_with_prefix returns nullopt (not an engaged "
+          "empty optional) on a closed/load-failed store",
+          "[rbac_store][visibility]") {
+    // Mirrors the load-failed construction used by the
+    // rbac_enforcement_in_effect fail-closed tests above: a db path whose
+    // parent directory does not exist leaves db_ null. The bug this guards
+    // (Blocker 2 / PR #2202 review): the T8 preflight in server.cpp treats
+    // nullopt as "scan failed, fail closed" and an engaged empty vector as
+    // "scan completed, nothing colliding" — a !db_ store must return the
+    // former, not silently report a clean scan.
+    const auto bogus = yuzu::test::unique_temp_path("yuzu_test_rbac_loadfail-") / "rbac.db";
+    RbacStore broken(bogus);
+    REQUIRE_FALSE(broken.is_open());
+
+    auto result = broken.find_local_groups_with_prefix("engine:");
+    CHECK_FALSE(result.has_value());
+}
+
 // ── IdP membership reconciliation (#1832) ───────────────────────────────────
 
 TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store]") {

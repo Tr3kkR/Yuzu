@@ -29,6 +29,15 @@
 
 namespace yuzu::server {
 
+// The reserved engine-principal namespace (auth-engine-principals design
+// §3.3 / decision log #3). Single literal so every write-surface guard in
+// this file (the `is_reserved_identity_prefix` format check below AND the
+// dedicated `upsert_sso_identity` rejection) agrees on the exact prefix
+// rather than re-deriving it. `rbac_store.cpp` has its own internal-linkage
+// `kEnginePrefix` for the same string — no shared header exists across
+// those two translation units, so this is auth_db.cpp's own copy.
+constexpr std::string_view kEngineReservedPrefix = "engine:";
+
 // ── Username Validation (H1 Fix) ─────────────────────────────────────────────
 
 bool is_valid_username(const std::string& username) {
@@ -55,7 +64,8 @@ bool is_reserved_identity_prefix(const std::string& username) {
     // principals design §3.3 / decision log #3) at this identity surface too
     // — belt-and-braces alongside `is_valid_username`'s ':' ban below, which
     // already makes the exact string unconstructable as a local username.
-    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:", "engine:"};
+    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:",
+                                                              kEngineReservedPrefix};
     for (auto prefix : kReservedPrefixes) {
         if (username.size() < prefix.size())
             continue;
@@ -751,15 +761,24 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
                                                               const std::string& sub,
                                                               const std::string& display_name,
                                                               const std::string& source) {
-    // Also structurally rejects the reserved `engine:` namespace (design
-    // §3.3): `principal` is always `source + ":" + iss + "#" + sub` with
-    // `source` a caller-controlled literal in {"oidc","saml","ad"} — never
-    // "engine" — so this call site can never actually construct an
-    // `engine:`-prefixed principal regardless of `iss`/`sub` content, even
-    // though `is_valid_principal`'s format check (via
-    // `is_reserved_identity_prefix`, now also reserving `engine:`) would
-    // accept the string shape if it somehow arrived. Named explicitly so
-    // the rejection is auditable, not accidental.
+    // design §3.3: the reserved `engine:` principal namespace must be
+    // rejected by THIS WRITE SURFACE, not merely by convention. Today's
+    // only caller always builds `principal` as `source + ":" + iss + "#" +
+    // sub` with `source` a literal in {"oidc","saml","ad"} — never
+    // "engine" — but `is_valid_principal` below (via
+    // `is_reserved_identity_prefix`, which reserves `engine:` alongside the
+    // legitimate oidc:/saml:/ad: prefixes for FORMAT purposes) happily
+    // accepts an `engine:`-shaped string if one ever arrived, since its job
+    // is charset validation, not namespace ownership. A future/relaxed
+    // caller (or a bug in the `source` literal) must not be able to mint a
+    // user row that collides with the engine-principal namespace, so the
+    // rejection is enforced explicitly here rather than relying on the
+    // caller's construction convention.
+    if (principal.starts_with(kEngineReservedPrefix)) {
+        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'", principal);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+
     if (!is_valid_principal(principal)) {
         spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'", principal);
         return std::unexpected(AuthDBError::InvalidUsername);

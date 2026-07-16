@@ -2296,7 +2296,17 @@ public:
             // preflight closed, not be misread as "no collision found".
             bool groups_scan_failed = false;
             if (rbac_store_) {
-                if (auto scan = rbac_store_->find_local_groups_with_prefix("engine:")) {
+                // A non-open store (missing/corrupt/failed-to-load rbac.db)
+                // must never be trusted to report a genuine empty scan —
+                // treat it exactly like a scan error so this preflight
+                // fails closed instead of booting past an unreadable
+                // rbac.db (find_local_groups_with_prefix also returns
+                // nullopt on !db_, but the explicit is_open() guard here
+                // means we never even issue the scan on a store we know is
+                // unusable).
+                if (!rbac_store_->is_open()) {
+                    groups_scan_failed = true;
+                } else if (auto scan = rbac_store_->find_local_groups_with_prefix("engine:")) {
                     colliding_groups = std::move(*scan);
                 } else {
                     groups_scan_failed = true;
@@ -11127,7 +11137,9 @@ private:
                 return response_agent_in_scope(username, agent_id);
             },
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers);
+            app_perf_providers,
+            // PR 4.2 — fleet-wide engine role-assignment authoring surface.
+            engine_principal_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -11327,7 +11339,9 @@ private:
                 // ADR-0024: the SLE discovery store backs the query_software_licenses
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).
-                software_licensing_store_.get());
+                software_licensing_store_.get(),
+                // PR 4.2 — engine role-assignment MCP twins.
+                engine_principal_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------

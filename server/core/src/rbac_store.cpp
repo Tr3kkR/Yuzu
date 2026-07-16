@@ -1097,11 +1097,16 @@ std::optional<std::vector<std::string>>
 RbacStore::find_local_groups_with_prefix(const std::string& prefix) const {
     std::shared_lock lock(mtx_);
     std::vector<std::string> result;
+    // A closed/unopened store is a scan FAILURE, not "nothing to match" —
+    // signal it distinctly (nullopt) so the T8 preflight fails closed
+    // instead of trusting an engaged-but-empty result.
+    if (!db_)
+        return std::nullopt;
     // `prefix` is code-controlled (e.g. `kEnginePrefix`), never user input —
     // fail closed (empty result) rather than trust the caller if it ever
     // carries a LIKE metacharacter, matching audit_store.cpp's action-prefix
     // guard (`%`/`_`/`\` would otherwise widen the match).
-    if (!db_ || prefix.empty() || prefix.find_first_of("%_\\") != std::string::npos)
+    if (prefix.empty() || prefix.find_first_of("%_\\") != std::string::npos)
         return result;
     // Scoped to `source = 'local'` — an IdP-sourced group asserting a
     // same-prefixed name is disambiguated by `principal_type` at the

@@ -11,6 +11,7 @@
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -643,6 +644,53 @@ static const ToolDef kTools[] = {
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j"},
 
+    // ── Engine principal role assignments (PR 4.2, design §4.1) — MCP twins of
+    // POST/DELETE/GET /api/v1/engine-principals/{id}/roles. Closes the "no
+    // production caller" gap for RbacStore::assign_role(principal_type="engine"):
+    // without an authoring surface the resolution side (collect_roles_locked's
+    // engine UNION arm) is unreachable — a real grant that never takes effect.
+    {"assign_engine_role",
+     "Grant a FLEET-WIDE RBAC role to an engine principal — the durable identity behind an "
+     "autonomous use-case-engine module (docs/auth-engine-principals-design.md). Use this to "
+     "give a UCE module standing read/write authority over one or more securables so it can "
+     "act without a human relaying every call. Grants are ALWAYS fleet-wide in this phase "
+     "(no per-management-group scope yet — that is a named follow-on, ADR-0017 PR-A). Engine "
+     "principals can NEVER hold the admin/Administrator role or any built-in system role "
+     "(design §4.2 'no admin, ever') — such a request is REJECTED with an error, never "
+     "silently narrowed to something safer. Mirrors POST "
+     "/api/v1/engine-principals/{id}/roles. Requires Security:Write (supervised MCP tier; "
+     "approval-gated like every other Security:Write operation).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
+     R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     R"j(},"required":["principal_id","role"]})j",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":false,"idempotentHint":false,"destructiveHint":false,"title":"Assign a fleet-wide role to an engine principal"})"},
+
+    {"unassign_engine_role",
+     "Revoke a FLEET-WIDE RBAC role from an engine principal, immediately removing the "
+     "standing authority it currently grants that autonomous module. Mirrors DELETE "
+     "/api/v1/engine-principals/{id}/roles/{role}. Destructive — it takes away access a "
+     "module may be actively relying on; verify the module doesn't need this role before "
+     "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
+     R"j("role":{"type":"string","description":"The role name to revoke"})j"
+     R"j(},"required":["principal_id","role"]})j",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":false,"idempotentHint":false,"destructiveHint":true,"title":"Revoke a fleet-wide role from an engine principal"})"},
+
+    {"list_engine_roles",
+     "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
+     "read-only discovery step before assign_engine_role/unassign_engine_role, and the way "
+     "to audit what an autonomous module can actually do right now. Mirrors GET "
+     "/api/v1/engine-principals/{id}/roles. Requires Security:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
+     R"j(},"required":["principal_id"]})j",
+     kObjectOutputSchema,
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"title":"List an engine principal's fleet-wide roles"})"},
+
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
      "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
@@ -735,6 +783,8 @@ static const std::unordered_set<std::string> kWriteTools = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle",
+    // PR 4.2 (design §4.1) — engine-principal role-assignment authoring.
+    "assign_engine_role", "unassign_engine_role",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -814,6 +864,15 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
+    // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
+    // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
+    // (this mapping drives ONLY the C8 tier/approval gate; each handler
+    // separately calls perm_fn with the SAME (Security, Write) op, matching
+    // the REST route so both transports agree — see the quarantine_device
+    // note above on why this invariant matters).
+    {"assign_engine_role", {"Security", "Write"}},
+    {"unassign_engine_role", {"Security", "Write"}},
+    {"list_engine_roles", {"Security", "Read"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -932,7 +991,8 @@ McpServer::HandlerFn McpServer::build_handler(
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
-    std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store) {
+    std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
+    EnginePrincipalStore* engine_principal_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5171,6 +5231,168 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── Engine principal role assignments (PR 4.2, design §4.1) ─────
+            // MCP/REST parity for /api/v1/engine-principals/{id}/roles. `{id}`
+            // arguments are the bare slug (no "engine:" prefix) — the handler
+            // reconstructs the full principal_id, matching the REST route.
+
+            if (tool_name == "assign_engine_role") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!rbac_store || !engine_principal_store) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "RBAC or engine-principal store not available"),
+                                    "application/json");
+                    return;
+                }
+                auto slug = param_str(args, "principal_id");
+                auto role_name = param_str(args, "role");
+                if (slug.empty() || role_name.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "principal_id and role are required"),
+                        "application/json");
+                    return;
+                }
+                const std::string principal_id = "engine:" + slug;
+
+                // Target must name a live (non-revoked) engine principal —
+                // MissingOrRevoked/StoreUnreachable per the store's
+                // three-state contract (engine_principal_store.hpp).
+                auto lookup = engine_principal_store->get_for_auth(principal_id);
+                if (lookup.status == EngineLookupStatus::StoreUnreachable) {
+                    res.set_content(
+                        error_response(id, kInternalError, "engine principal store unavailable"),
+                        "application/json");
+                    return;
+                }
+                if (lookup.status == EngineLookupStatus::MissingOrRevoked) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "no active engine principal '" + principal_id +
+                                                       "'"),
+                                    "application/json");
+                    return;
+                }
+                // Role must be a real, currently-defined RBAC role (assign_role's
+                // INSERT carries no FK — an unchecked call would silently create
+                // an orphan grant, a typo that resolves as an inert no-op).
+                if (!rbac_store->get_role(role_name)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "unknown role '" + role_name + "'"),
+                        "application/json");
+                    return;
+                }
+
+                PrincipalRole assignment;
+                assignment.principal_type = "engine";
+                assignment.principal_id = principal_id;
+                assignment.role_name = role_name;
+                auto result = rbac_store->assign_role(assignment);
+                if (!result) {
+                    // validate_assignment + the is_system-role check reject
+                    // admin/built-in/malformed-namespace grants — a 4xx-shaped
+                    // JSON-RPC error, never an internal-error 500-equivalent
+                    // (design §4.2 "no admin, ever").
+                    (void)audit_fn(req, "engine_principal.role.assigned", "denied",
+                                   "EnginePrincipal", principal_id,
+                                   role_name + ": " + result.error());
+                    res.set_content(error_response(id, kInvalidParams, result.error()),
+                                    "application/json");
+                    return;
+                }
+                bool audit_ok = audit_fn(req, "engine_principal.role.assigned", "success",
+                                         "EnginePrincipal", principal_id, role_name);
+                nlohmann::json payload = {
+                    {"assigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "unassign_engine_role") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!rbac_store) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                auto slug = param_str(args, "principal_id");
+                auto role_name = param_str(args, "role");
+                if (slug.empty() || role_name.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "principal_id and role are required"),
+                        "application/json");
+                    return;
+                }
+                const std::string principal_id = "engine:" + slug;
+                auto result = rbac_store->unassign_role("engine", principal_id, role_name);
+                if (!result) {
+                    res.set_content(error_response(id, kInvalidParams, result.error()),
+                                    "application/json");
+                    return;
+                }
+                bool audit_ok = audit_fn(req, "engine_principal.role.unassigned", "success",
+                                         "EnginePrincipal", principal_id, role_name);
+                nlohmann::json payload = {
+                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_engine_roles") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!rbac_store) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                auto slug = param_str(args, "principal_id");
+                if (slug.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "principal_id is required"),
+                                    "application/json");
+                    return;
+                }
+                const std::string principal_id = "engine:" + slug;
+                auto roles = rbac_store->get_principal_roles("engine", principal_id);
+                std::vector<nlohmann::json> items;
+                items.reserve(roles.size());
+                for (const auto& r : roles)
+                    items.push_back({{"principal_id", r.principal_id}, {"role", r.role_name}});
+                nlohmann::json payload = {{"principal_id", principal_id},
+                                          {"count", items.size()},
+                                          {"roles", std::move(items)}};
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────
             // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME
             // builder function in discover_routes.hpp — REST and MCP read the
@@ -5453,7 +5675,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
                                 const bool* mcp_streaming_disabled,
                                 std::vector<std::string> allowed_origins,
-                                SoftwareLicensingStore* software_licensing_store) {
+                                SoftwareLicensingStore* software_licensing_store,
+                                EnginePrincipalStore* engine_principal_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -5475,7 +5698,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                            sessions, mcp_streaming_disabled, std::move(allowed_origins),
-                           software_licensing_store));
+                           software_licensing_store, engine_principal_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

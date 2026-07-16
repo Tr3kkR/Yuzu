@@ -116,20 +116,28 @@ step, not a routine failure mode.
    sqlite3 /var/lib/yuzu/auth.db \
      "SELECT username, is_active, identity_source FROM users WHERE username LIKE 'engine:%';"
 
-   # Soft-delete the colliding row if it's genuinely stale (SOC 2 CC6.8
-   # soft-delete path — see docs/ops-runbooks/auth-db-recovery.md for the
-   # general auth.db surgery cautions: stop the service first, back up
-   # auth.db before any direct SQL).
+   # Stop the service and back up auth.db first (see
+   # docs/ops-runbooks/auth-db-recovery.md for the general auth.db surgery
+   # cautions). Then EITHER rename the colliding row out of the reserved
+   # namespace (preferred — preserves the account's audit history), OR
+   # hard-delete it if it is genuinely stale and unwanted.
+   #
+   # Rename (preferred): move it to a non-reserved username. Do the same
+   # rename in any table that carries the username as a foreign key if you
+   # want to keep the account usable.
    sqlite3 /var/lib/yuzu/auth.db \
-     "UPDATE users SET is_active = 0 WHERE username = 'engine:legacy';"
+     "UPDATE users SET username = 'legacy_engine_reclaimed' WHERE username = 'engine:legacy';"
+
+   # OR hard-delete (only if the row is stale and you do not need it):
+   sqlite3 /var/lib/yuzu/auth.db \
+     "DELETE FROM users WHERE username = 'engine:legacy';"
    ```
    `find_reserved_prefix_users` intentionally includes soft-deleted rows
    too (it scans the `username` primary key, not active-user visibility) —
-   a soft-deleted collision still occupies the reserved name and must
-   still be renamed away, not merely deactivated, if you want the boot
-   check to pass. Deletion (not soft-delete) is the only way to actually
-   clear the primary-key collision; soft-delete alone will NOT satisfy
-   this preflight.
+   a soft-deleted collision still occupies the reserved name, so
+   `UPDATE users SET is_active = 0` alone will NOT satisfy this preflight.
+   Only a rename (moving the name out of the `engine:` namespace) or a hard
+   `DELETE` (removing the primary-key row) actually clears the collision.
 3. For each colliding **local RBAC group**: `RbacStore::create_group`
    already refuses new creates in this namespace, so a collision here is
    necessarily a pre-existing row. Inspect and delete it via

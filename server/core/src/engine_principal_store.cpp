@@ -232,53 +232,84 @@ EnginePrincipalStore::create(const std::string& display_name, const std::string&
     return read_row(res.get(), 0);
 }
 
-std::optional<EnginePrincipalRow> EnginePrincipalStore::get(const std::string& principal_id) const {
-    if (!open_ || principal_id.empty())
-        return std::nullopt;
+std::expected<std::optional<EnginePrincipalRow>, std::string>
+EnginePrincipalStore::get(const std::string& principal_id) const {
+    // Authoritative store (ADR-0012 §1): distinguish a runtime read error
+    // (surfaced → caller 503s/retries) from a genuine no-such-row (value ==
+    // nullopt → caller 404s), mirroring ApiTokenStore::get_token. A bare
+    // `optional<...>` return here previously conflated the two.
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty())
+        return std::optional<EnginePrincipalRow>{std::nullopt}; // argument guard, not a DB error
+
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return std::unexpected("database unavailable — try again");
+
     std::string sql =
         std::string("SELECT ") + kCols + " FROM engine_principal_store.engine_principals "
                                          "WHERE principal_id = $1";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
                                        std::vector<std::string>{principal_id});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
-    return read_row(res.get(), 0);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("get read failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<EnginePrincipalRow>{std::nullopt}; // genuine not-found
+
+    return std::optional<EnginePrincipalRow>{read_row(res.get(), 0)};
 }
 
-bool EnginePrincipalStore::revoke(const std::string& principal_id,
-                                  const std::string& superseded_by) {
-    if (!open_ || principal_id.empty())
-        return false;
+std::expected<bool, std::string>
+EnginePrincipalStore::revoke(const std::string& principal_id,
+                             const std::string& superseded_by) {
+    // Authoritative store (ADR-0012 §1): distinguish a write that did NOT
+    // persist (unexpected — caller must 503/retry, never audit success) from
+    // a write that ran fine but matched no active row (false — genuine
+    // no-op), mirroring ApiTokenStore::revoke_token. A bare `bool` return
+    // here previously conflated the two.
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty())
+        return false; // argument guard, not a DB error — nothing to revoke
+
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return false; // authoritative — a lease failure is never a silent success
+        return std::unexpected("database unavailable — try again");
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE engine_principal_store.engine_principals "
         "SET lifecycle_state='revoked', revoked_at=$3::bigint, superseded_by=$2 "
         "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
         std::vector<std::string>{principal_id, superseded_by, std::to_string(now_epoch())});
-    // RETURNING 0 rows ⇒ no such principal or already revoked (no-op) → false,
-    // never a silent success on a query error (ADR-0012 §1).
-    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("revoke did not persist: ") +
+                               PQerrorMessage(lease.get()));
+    // RETURNING 0 rows ⇒ no such principal or already revoked — a genuine
+    // no-op (ADR-0012 §1), distinct from the query-error arm above.
+    return PQntuples(res.get()) > 0;
 }
 
-bool EnginePrincipalStore::transfer_owner(const std::string& principal_id,
-                                          const std::string& new_owner) {
-    if (!open_ || principal_id.empty() || new_owner.empty())
-        return false;
+std::expected<bool, std::string>
+EnginePrincipalStore::transfer_owner(const std::string& principal_id,
+                                     const std::string& new_owner) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty() || new_owner.empty())
+        return false; // argument guard, not a DB error — nothing to transfer
+
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
-        return false;
+        return std::unexpected("database unavailable — try again");
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE engine_principal_store.engine_principals SET owner_username=$2 "
         "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
         std::vector<std::string>{principal_id, new_owner});
-    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("transfer_owner did not persist: ") +
+                               PQerrorMessage(lease.get()));
+    return PQntuples(res.get()) > 0;
 }
 
 } // namespace yuzu::server

@@ -440,6 +440,37 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     if (auth::is_elevated(*session))
         return true;
 
+    // Engine principals have NO legacy or service-scoped authority — their only
+    // authority is an explicit RBAC assignment (design §4.2 default-deny). The
+    // pre-RBAC legacy fallback below would otherwise hand an engine credential
+    // fleet-wide Read the moment RBAC is off (the default). Resolve engine
+    // sessions here, RBAC-only, or deny.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            // Cannot evaluate authority — fail closed, 503.
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                        operation}),
+                            "application/json");
+            return false;
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied " + securable_type + ":" + operation);
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        return true;
+    }
+
     // MCP-tier tokens: enforce the tier policy (readonly/operator/supervised) then
     // fall through to the standard RBAC/role check using the creator's actual role.
     // The tier is the primary MCP access control boundary; RBAC is a secondary layer.
@@ -558,6 +589,38 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
     if (auth::is_elevated(*session))
         return true;
+
+    // Engine principals have NO legacy or service-scoped authority — their only
+    // authority is an explicit RBAC assignment (design §4.2 default-deny). The
+    // pre-RBAC legacy fallback below would otherwise hand an engine credential
+    // fleet-wide Read the moment RBAC is off (the default). Resolve engine
+    // sessions here, RBAC-only, or deny.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            // Cannot evaluate authority — fail closed, 503.
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.permission = securable_type + ":" +
+                                                                        operation}),
+                            "application/json");
+            return false;
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_scoped_permission(session->username, securable_type, operation,
+                                                  agent_id, mgmt_group_store_)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "engine principal denied " + securable_type + ":" + operation);
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        return true;
+    }
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
     // RBAC/role check using the creator's actual role. Approval-gated operations
@@ -722,6 +785,16 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
         event.principal_role = auth::role_to_string(auth::effective_role(*session));
         event.session_id = extract_session_cookie(req);
+        // principal_class_of(req) above can only distinguish by credential
+        // presentation (bearer token → "agent"), which mislabels an engine
+        // principal's bearer-token requests. Re-stamp from the resolved
+        // session's persisted principal_kind so engine-principal actions are
+        // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
+        // Decision 9 — the AuditStore column reports it now; the HTTP metric
+        // is deferred to 4.5).
+        if (session->principal_kind == "engine") {
+            event.principal_class = "engine";
+        }
     }
     return event;
 }

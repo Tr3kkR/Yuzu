@@ -35,9 +35,13 @@
 /// Revoke is TERMINAL (never un-revoked — a false-positive compromise
 /// response mints a successor principal instead, recorded via
 /// `superseded_by`) and SOFT-RETAINED (a revoked row is never hard-deleted,
-/// so audit attribution survives). `revoke()`/`transfer_owner()` are
-/// authoritative mutations: a lease/query failure returns `false`, never a
-/// silent success.
+/// so audit attribution survives). `get()`/`revoke()`/`transfer_owner()` are
+/// likewise authoritative (ADR-0012 §1): each returns a typed
+/// `std::expected<..., std::string>` — mirroring `ApiTokenStore::get_token`/
+/// `revoke_token` — so a genuine lease/query failure surfaces as
+/// `unexpected(msg)` and is never conflated with the legitimate not-found /
+/// no-op case (`nullopt` / `false`). A lease/query failure is NEVER a silent
+/// success and NEVER reads as "no such row".
 ///
 /// Substrate contract (ADR-0008/0012): holds a `PgPool&`, runs its migration
 /// at construction on a pinned lease, schema-qualifies every runtime
@@ -124,20 +128,46 @@ public:
 
     /// Plain read by id, ANY lifecycle_state (admin/test surface — not the
     /// auth chokepoint; use `get_for_auth` for authorization decisions).
-    [[nodiscard]] std::optional<EnginePrincipalRow> get(const std::string& principal_id) const;
+    /// Authoritative (ADR-0012 §1), mirrors `ApiTokenStore::get_token`'s typed
+    /// result — a bare `optional` conflated "no such row" with "the store
+    /// couldn't be asked":
+    ///   * value `nullopt`   — genuine not-found; caller may 404.
+    ///   * value (has row)   — the row, any lifecycle_state.
+    ///   * `unexpected(msg)` — the store is closed, or a lease/query failed;
+    ///     caller MUST surface this (503 / retry), never read it as
+    ///     not-found.
+    [[nodiscard]] std::expected<std::optional<EnginePrincipalRow>, std::string>
+    get(const std::string& principal_id) const;
 
     /// Terminal revoke: active → revoked, `revoked_at` stamped,
     /// `superseded_by` recorded if given. Never un-revocable, never a
-    /// hard-delete (soft-retain — audit attribution survives). Authoritative:
-    /// a lease/query failure returns false, never a silent success. Returns
-    /// false (no-op) if the row is absent or already revoked.
-    bool revoke(const std::string& principal_id, const std::string& superseded_by = "");
+    /// hard-delete (soft-retain — audit attribution survives). Authoritative
+    /// (ADR-0012 §1), mirrors `ApiTokenStore::revoke_token`'s typed result —
+    /// a bare `bool` conflated "the write didn't land" with "there was
+    /// nothing to revoke":
+    ///   * value `true`      — the row existed (active) and is now revoked.
+    ///   * value `false`     — the DB write ran fine but was a no-op — the
+    ///     row is absent or already revoked. Not an error.
+    ///   * `unexpected(msg)` — the write did NOT persist (store closed /
+    ///     lease timeout / query error). The caller MUST surface this
+    ///     (503 / retry), never audit or report success.
+    [[nodiscard]] std::expected<bool, std::string>
+    revoke(const std::string& principal_id, const std::string& superseded_by = "");
 
     /// Reassign ownership of an active principal (admin-forced — the design
     /// deliberately does not gate this on the outgoing owner's cooperation;
     /// that policy decision lives in the PR 4.3 route, this is the store
-    /// primitive). Returns false if the row is absent or not active.
-    bool transfer_owner(const std::string& principal_id, const std::string& new_owner);
+    /// primitive). Authoritative (ADR-0012 §1), same typed-result posture as
+    /// `revoke`:
+    ///   * value `true`      — the row existed (active) and is now
+    ///     reassigned.
+    ///   * value `false`     — the DB write ran fine but was a no-op — the
+    ///     row is absent or not active. Not an error.
+    ///   * `unexpected(msg)` — the write did NOT persist (store closed /
+    ///     lease timeout / query error). The caller MUST surface this
+    ///     (503 / retry), never a silent success.
+    [[nodiscard]] std::expected<bool, std::string>
+    transfer_owner(const std::string& principal_id, const std::string& new_owner);
 
 private:
     pg::PgPool& pool_;

@@ -94,14 +94,18 @@ TEST_CASE("EnginePrincipalStore::create rejects invalid classification and names
         auto r = store.create("Vuln Sync", "alice", "cloud IAM parity", /*classification=*/"",
                               "admin", "engine:vuln");
         REQUIRE_FALSE(r.has_value());
-        CHECK_FALSE(store.get("engine:vuln").has_value());
+        auto fetched = store.get("engine:vuln");
+        REQUIRE(fetched.has_value());
+        CHECK_FALSE(fetched->has_value());
     }
 
     SECTION("garbage classification is rejected") {
         auto r = store.create("Vuln Sync", "alice", "cloud IAM parity", "nonsense", "admin",
                               "engine:vuln");
         REQUIRE_FALSE(r.has_value());
-        CHECK_FALSE(store.get("engine:vuln").has_value());
+        auto fetched = store.get("engine:vuln");
+        REQUIRE(fetched.has_value());
+        CHECK_FALSE(fetched->has_value());
     }
 
     SECTION("principal_id missing the engine: prefix is rejected") {
@@ -132,14 +136,18 @@ TEST_CASE("EnginePrincipalStore::create rejects invalid classification and names
         auto r = store.create("Vuln Sync", "", "cloud IAM parity", "internal", "admin",
                               "engine:no-owner");
         REQUIRE_FALSE(r.has_value());
-        CHECK_FALSE(store.get("engine:no-owner").has_value());
+        auto fetched = store.get("engine:no-owner");
+        REQUIRE(fetched.has_value());
+        CHECK_FALSE(fetched->has_value());
     }
 
     SECTION("empty justification is rejected") {
         auto r = store.create("Vuln Sync", "alice", /*justification=*/"", "internal", "admin",
                               "engine:no-justification");
         REQUIRE_FALSE(r.has_value());
-        CHECK_FALSE(store.get("engine:no-justification").has_value());
+        auto fetched = store.get("engine:no-justification");
+        REQUIRE(fetched.has_value());
+        CHECK_FALSE(fetched->has_value());
     }
 
     // G4 (governance hardening, UP-4): the slug (part after "engine:") is
@@ -194,9 +202,10 @@ TEST_CASE("EnginePrincipalStore::create rejects a duplicate principal_id (PK con
     // The original row is untouched.
     auto row = store.get("engine:dup");
     REQUIRE(row.has_value());
-    CHECK(row->display_name == "Vuln Sync");
-    CHECK(row->owner_username == "alice");
-    CHECK(row->classification == "internal");
+    REQUIRE(row->has_value());
+    CHECK((*row)->display_name == "Vuln Sync");
+    CHECK((*row)->owner_username == "alice");
+    CHECK((*row)->classification == "internal");
 }
 
 // ── create → get round-trip ────────────────────────────────────────────────
@@ -225,16 +234,17 @@ TEST_CASE("EnginePrincipalStore::create → get round-trips every field",
 
     auto fetched = store.get("engine:vuln-rt");
     REQUIRE(fetched.has_value());
-    CHECK(fetched->principal_id == created->principal_id);
-    CHECK(fetched->display_name == created->display_name);
-    CHECK(fetched->owner_username == created->owner_username);
-    CHECK(fetched->justification == created->justification);
-    CHECK(fetched->classification == created->classification);
-    CHECK(fetched->lifecycle_state == created->lifecycle_state);
-    CHECK(fetched->superseded_by == created->superseded_by);
-    CHECK(fetched->created_at == created->created_at);
-    CHECK(fetched->revoked_at == created->revoked_at);
-    CHECK(fetched->created_by == created->created_by);
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->principal_id == created->principal_id);
+    CHECK((*fetched)->display_name == created->display_name);
+    CHECK((*fetched)->owner_username == created->owner_username);
+    CHECK((*fetched)->justification == created->justification);
+    CHECK((*fetched)->classification == created->classification);
+    CHECK((*fetched)->lifecycle_state == created->lifecycle_state);
+    CHECK((*fetched)->superseded_by == created->superseded_by);
+    CHECK((*fetched)->created_at == created->created_at);
+    CHECK((*fetched)->revoked_at == created->revoked_at);
+    CHECK((*fetched)->created_by == created->created_by);
 }
 
 // ── revoke: terminal + soft-retained ───────────────────────────────────────
@@ -251,21 +261,76 @@ TEST_CASE("EnginePrincipalStore::revoke is terminal and soft-retained",
                .has_value());
 
     SECTION("revoke succeeds once, records superseded_by, row survives (soft-retain)") {
-        CHECK(store.revoke("engine:revoke-me", "engine:revoke-me-v2"));
+        auto revoked = store.revoke("engine:revoke-me", "engine:revoke-me-v2");
+        REQUIRE(revoked.has_value());
+        CHECK(*revoked);
         auto row = store.get("engine:revoke-me"); // never hard-deleted
         REQUIRE(row.has_value());
-        CHECK(row->lifecycle_state == "revoked");
-        CHECK(row->superseded_by == "engine:revoke-me-v2");
-        CHECK(row->revoked_at > 0);
+        REQUIRE(row->has_value());
+        CHECK((*row)->lifecycle_state == "revoked");
+        CHECK((*row)->superseded_by == "engine:revoke-me-v2");
+        CHECK((*row)->revoked_at > 0);
     }
 
     SECTION("revoke is terminal — a second revoke is a no-op, not a re-revoke") {
-        CHECK(store.revoke("engine:revoke-me"));
-        CHECK_FALSE(store.revoke("engine:revoke-me")); // already revoked → false
+        auto first = store.revoke("engine:revoke-me");
+        REQUIRE(first.has_value());
+        CHECK(*first);
+        auto second = store.revoke("engine:revoke-me");
+        REQUIRE(second.has_value()); // DB write ran fine — already revoked, not an error
+        CHECK_FALSE(*second);
     }
 
-    SECTION("revoking an unknown principal returns false") {
-        CHECK_FALSE(store.revoke("engine:does-not-exist"));
+    SECTION("revoking an unknown principal returns false (no-op), not a failure") {
+        auto revoked = store.revoke("engine:does-not-exist");
+        REQUIRE(revoked.has_value());
+        CHECK_FALSE(*revoked);
+    }
+}
+
+// ── revoke/get/transfer_owner: infrastructure-failure state ────────────────
+//
+// The finding this task fixes: get/revoke/transfer_owner previously collapsed
+// a genuine store/lease/query FAILURE into the same result as legitimate
+// not-found / no-op. Proving a real lease/query failure (e.g. a live
+// connection dropped mid-query) is impractical in this harness — the closed
+// (!is_open()) arm below is the practical equivalent: it exercises the exact
+// same early-return guard the lease/query failure paths share
+// (`std::unexpected("database not open")`), and is the same substitution
+// test_engine_principal_store.cpp's own StoreUnreachable get_for_auth section
+// uses. The lease-acquire-timeout and query-error arms inside get/revoke/
+// transfer_owner are structurally identical to get_for_auth's (same
+// try_acquire_for + res.status() != PGRES_TUPLES_OK checks, reviewed
+// line-by-line against get_for_auth's already-tested equivalents) and are
+// noted here as review-by-code rather than re-proven with a live-connection
+// fault injection this harness cannot express.
+TEST_CASE("EnginePrincipalStore::get/revoke/transfer_owner return unexpected (not "
+          "not-found/no-op) when the store is not open",
+          "[pg][engine_principal][store]") {
+    // No live DB needed — a malformed conninfo means PgPool::valid() is false
+    // and acquire() never attempts a connection, mirroring the
+    // get_for_auth StoreUnreachable section above.
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    SECTION("get returns unexpected, not nullopt") {
+        auto r = store.get("engine:whatever");
+        CHECK_FALSE(r.has_value());
+        CHECK_FALSE(r.error().empty());
+    }
+
+    SECTION("revoke returns unexpected, not false") {
+        auto r = store.revoke("engine:whatever");
+        CHECK_FALSE(r.has_value());
+        CHECK_FALSE(r.error().empty());
+    }
+
+    SECTION("transfer_owner returns unexpected, not false") {
+        auto r = store.transfer_owner("engine:whatever", "bob");
+        CHECK_FALSE(r.has_value());
+        CHECK_FALSE(r.error().empty());
     }
 }
 
@@ -283,19 +348,28 @@ TEST_CASE("EnginePrincipalStore::transfer_owner reassigns ownership of an active
                .has_value());
 
     SECTION("transfer succeeds and round-trips the new owner") {
-        CHECK(store.transfer_owner("engine:xfer", "bob"));
+        auto transferred = store.transfer_owner("engine:xfer", "bob");
+        REQUIRE(transferred.has_value());
+        CHECK(*transferred);
         auto row = store.get("engine:xfer");
         REQUIRE(row.has_value());
-        CHECK(row->owner_username == "bob");
+        REQUIRE(row->has_value());
+        CHECK((*row)->owner_username == "bob");
     }
 
-    SECTION("transfer on a revoked principal fails — not an active row") {
-        REQUIRE(store.revoke("engine:xfer"));
-        CHECK_FALSE(store.transfer_owner("engine:xfer", "bob"));
+    SECTION("transfer on a revoked principal is a no-op — not an active row") {
+        auto revoked = store.revoke("engine:xfer");
+        REQUIRE(revoked.has_value());
+        CHECK(*revoked);
+        auto transferred = store.transfer_owner("engine:xfer", "bob");
+        REQUIRE(transferred.has_value());
+        CHECK_FALSE(*transferred);
     }
 
-    SECTION("transfer on an unknown principal fails") {
-        CHECK_FALSE(store.transfer_owner("engine:does-not-exist", "bob"));
+    SECTION("transfer on an unknown principal is a no-op, not a failure") {
+        auto transferred = store.transfer_owner("engine:does-not-exist", "bob");
+        REQUIRE(transferred.has_value());
+        CHECK_FALSE(*transferred);
     }
 }
 
@@ -339,7 +413,9 @@ TEST_CASE("EnginePrincipalStore::get_for_auth — Active vs MissingOrRevoked vs 
         REQUIRE(store.is_open());
         REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:auth-revoked")
                    .has_value());
-        REQUIRE(store.revoke("engine:auth-revoked"));
+        auto revoked = store.revoke("engine:auth-revoked");
+        REQUIRE(revoked.has_value());
+        REQUIRE(*revoked);
 
         EngineLookup lookup = store.get_for_auth("engine:auth-revoked");
         CHECK(lookup.status == EngineLookupStatus::MissingOrRevoked);
