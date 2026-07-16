@@ -119,7 +119,7 @@ A field on a `triaged` or `mitigated` finding (ADR-4004) marking whether it's un
 
 ## Assessment coverage
 
-The vulnerability-management module's own coverage metric: the UNKNOWN-fraction and LOW-provenance-fraction of a device's assessed packages, stamped as-of-inventory — the honest measure of "how much did we actually assess," not inferable from the vulnerability count (ADR-0019). Measures per-endpoint CVE-assessment completeness specifically — a deliberately distinct name from any reachability-graph coverage metric, so the two never sit ambiguously side by side on a dashboard.
+The vulnerability-management module's own coverage metric, named by ADR-4004: the UNKNOWN-fraction and LOW-provenance-fraction of a device's assessed packages, stamped as-of-inventory — the honest measure of "how much did we actually assess," not inferable from the vulnerability count (the underlying assessment axis is ADR-0019's). Measures per-endpoint CVE-assessment completeness specifically — a deliberately distinct name from any reachability-graph coverage metric, so the two never sit ambiguously side by side on a dashboard.
 
 ## Component inventory
 
