@@ -599,6 +599,60 @@ public:
         metrics_.describe("yuzu_fleet_net_throughput_bps",
                           "Fleet device network throughput in bytes/s, by {stat,os}: avg / p50 / p90 "
                           "/ max", "gauge");
+        // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 — OBSERVE-ONLY). All
+        // os-labelled (per-OS, never a cross-OS blend — File/Registry are Windows-only,
+        // Service is Windows+Linux, macOS has none). ABSENT means no reporting agent of
+        // that OS/mechanism this cycle — never read absence as 0-is-healthy. At rung 1
+        // (no consumer armed) every counter is 0, so only reporting + mechanisms +
+        // failed/disabled carry signal; the counters go live at rung 2. ALERTING: the
+        // counter-derived gauges are a fleet SUM of cumulative per-agent counters — a
+        // bare `> 0` LATCHES forever once any agent ever counted one, and counter-typing
+        // the fleet sum is not implementable server-side (it needs per-agent deltas and
+        // a server-owned counter, #2083) — so their alert templates ship COMMENTED OUT
+        // until rung 2 (see the spark preamble in docs/prometheus/yuzu-alerts.yml). The
+        // exception is yuzu_fleet_spark_failed: a STATE gauge recomputed and cleared
+        // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
+        metrics_.describe("yuzu_fleet_spark_reporting",
+                          "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
+                          "running (spark_running=1) — the denominator for all spark telemetry",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_spark_disabled",
+                          "Agents (per `os`) running with SparkEngine deliberately off "
+                          "(--spark-disable). An operator decision — expected to be non-zero; "
+                          "do NOT alert on it", "gauge");
+        metrics_.describe("yuzu_fleet_spark_failed",
+                          "Agents (per `os`) where SparkEngine was ENABLED but boot-time "
+                          "instantiation THREW, so the agent degraded to no-spark. Distinct from "
+                          "`disabled` on purpose: this is a fault, not a choice — ALERT on it. "
+                          "Absent = no agent of that os reported a failure this cycle", "gauge");
+        metrics_.describe("yuzu_fleet_spark_mechanisms",
+                          "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
+                          "event-driven mechanism (file / registry / service). An OS with agents "
+                          "reporting but no {mechanism} series does not support it (e.g. no file "
+                          "on linux)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_armed_faulted",
+                          "Fleet sum (per `os`) of armed spark watches a mechanism reported deaf "
+                          "(a live gauge, not cumulative). > 0 means detection is silently down "
+                          "for that many watches", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_faults",
+                          "Fleet sum (per `os`) of cumulative post-arm watch-fault edges "
+                          "(watch_faults_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_queued_dropped",
+                          "Fleet sum (per `os`) of cumulative queued events dropped (bounded-queue "
+                          "overflow + shutdown). On the enforce lane (rung 3) a drop is a silent "
+                          "compliance failure", "gauge");
+        metrics_.describe("yuzu_fleet_spark_consumer_errors",
+                          "Fleet sum (per `os`) of cumulative queued handlers that threw "
+                          "(consumer_errors_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_rejected",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "a rule that could not arm (denial-of-detection)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_quarantined",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "a structural leak that should stay 0; any value is page-worthy", "gauge");
+        metrics_.describe("yuzu_fleet_spark_slow_op",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
+                          "(a stalled watcher)", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -776,8 +830,10 @@ public:
         // alert rules can be authored up front; the series simply never
         // increments on a disabled surface.
         metrics_.describe("yuzu_scim_requests_total",
-                          "Total /scim/v2/Users requests, by op "
-                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "Total /scim/v2/Users and /scim/v2/Groups (#2021) requests, by op "
+                          "(create|get|list|replace|patch|delete for Users; "
+                          "group_create|group_get|group_list|group_replace|group_patch|"
+                          "group_delete for Groups) and status (2xx|4xx|5xx)",
                           "counter");
         metrics_.describe("yuzu_scim_auth_failures_total",
                           "Total /scim/v2/* requests rejected by the bearer gate — a "
@@ -798,6 +854,29 @@ public:
                           "provisioning_source is not 'scim' (or its role was elevated outside "
                           "SCIM's ownership) — SCIM attempting to touch an account it does not "
                           "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
+        // SCIM v2 Groups->role application core (#2021). Bumped only when
+        // recompute_scim_user_role ACTUALLY changes a role (promotion or
+        // demotion via group membership) — never on a no-op recompute, and
+        // never for a value that fails the provenance guard (see
+        // yuzu_scim_provenance_denied_total for that refusal class, though
+        // this particular guard doesn't bump it — recompute_scim_user_role
+        // just silently declines).
+        metrics_.describe("yuzu_scim_role_changes_total",
+                          "Total SCIM-provisioned user role changes applied via SCIM Group "
+                          "membership (--scim-admin-group), by the group-membership-driven "
+                          "role-recompute core - a sustained rate is a normal signal of IdP "
+                          "group-membership churn, not itself an anomaly",
+                          "counter");
+        // CC6.7 evidence-gap fix (governance hardening round): bumped when
+        // recompute_scim_user_role's AuthManager::update_role call reports a
+        // genuine AuthDB write failure (row missing/inactive/write error) —
+        // a durable role change that could not be applied, distinct from
+        // yuzu_scim_role_changes_total's success path.
+        metrics_.describe("yuzu_scim_role_change_failures_total",
+                          "Total SCIM-driven role changes that failed to write to AuthDB during "
+                          "group-membership recompute - a sustained non-zero rate means role "
+                          "changes are silently not taking effect",
                           "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
@@ -1378,6 +1457,36 @@ public:
                               "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // ApiTokenStore — born-on-PG Bearer-token store (plan PR 4.1). Same
+        // fail-CLOSED construction posture as the other born-on-PG stores
+        // (ADR-0012 §1): a reachable database whose schema can't migrate/open
+        // is a deploy error, not a serve-degraded state. FRESH START — no
+        // SQLite backfill; the legacy api-tokens.db is no longer opened.
+        if (pg_pool_ && !startup_failed_) {
+            api_token_store_ = std::make_unique<ApiTokenStore>(*pg_pool_);
+            if (!api_token_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: api-token store migration/open failed "
+                              "(database reachable but the api_token_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // FRESH-START migration (ADR-0030): the legacy SQLite
+                // api-tokens.db is never opened; existing API/MCP tokens are
+                // invalidated on upgrade. Warn if the stale file is still on
+                // disk so an in-place upgrade's mass 401s are diagnosable (the
+                // file is inert + hash-only and can be deleted).
+                std::error_code ec;
+                const auto legacy_db = cfg_.db_dir() / "api-tokens.db";
+                if (std::filesystem::exists(legacy_db, ec)) {
+                    spdlog::warn("[auth] Legacy SQLite api-tokens.db found at {} — API/MCP "
+                                 "tokens now live in PostgreSQL and any prior tokens were "
+                                 "INVALIDATED by the migration (ADR-0030); re-mint them. The "
+                                 "old file is inert and can be removed.",
+                                 legacy_db.string());
+                }
             }
         }
 
@@ -2147,10 +2256,6 @@ public:
             agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
-        }
-        {
-            auto token_db = cfg_.db_dir() / "api-tokens.db";
-            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
         }
         {
             auto quar_db = cfg_.db_dir() / "quarantine.db";
@@ -3540,6 +3645,12 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
+        // hold a raw pointer, and every HTTP handler thread is already
+        // quiesced by the drain above); keep the ADR-0012 teardown discipline
+        // so a future consumer can't UAF.
+        api_token_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -10540,6 +10651,15 @@ private:
         // entries at all. main.cpp already refuses to start if --scim-enable is
         // set without --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
+            // sec-L3/UP-9 (governance hardening round): trim leading/trailing
+            // ASCII whitespace from the admin-group config value — same
+            // trailing-space silent-lockout bug fixed for
+            // --oidc-admin-group/--saml-admin-group above. Mutate cfg_
+            // itself so every reader of cfg_.scim_admin_group (the routes
+            // registration below, recompute_scim_user_role) sees the
+            // trimmed value.
+            cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
+
             scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
             if (!scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,
@@ -10572,7 +10692,7 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get());
+                                          audit_store_.get(), cfg_.scim_admin_group);
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -10661,8 +10781,21 @@ private:
                    bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
                 const auto revoke = auth_mgr_.invalidate_user_sessions(username);
                 std::size_t tokens = 0;
+                bool api_tokens_db_persisted = true; // vacuously true when not requested
                 if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
-                    tokens = api_token_store_->revoke_for_principal(username);
+                    auto revoked = api_token_store_->revoke_for_principal(username);
+                    if (revoked.has_value()) {
+                        tokens = *revoked;
+                    } else {
+                        // The API-token revoke did NOT persist (lease timeout /
+                        // query error). Do NOT report a count — 0 would read as
+                        // "the principal had no tokens". Flag it so the handler
+                        // audits "partial", never a false "signed out
+                        // everywhere" (ADR-0030 §Posture, the stolen-laptop path).
+                        api_tokens_db_persisted = false;
+                        spdlog::error("revoke_for_principal did not persist for {}: {}", username,
+                                      revoked.error());
+                    }
                 }
                 // CC7.2 anomaly-detection signal: a spike in this counter
                 // is the operator's automated alert for compromised-account
@@ -10670,18 +10803,21 @@ private:
                 // Caller dimension is inferred from the api-tokens flag:
                 // /me passes true (self full-credential revoke), admin
                 // path passes false (cookies only, automation tokens
-                // intact). Result dimension carries db_persisted so SOC 2
+                // intact). Result dimension is "partial" if EITHER the cookie
+                // dual-write OR the API-token revoke failed, so SOC 2
                 // partial-failure rows are filterable.
+                const bool all_persisted = revoke.db_persisted && api_tokens_db_persisted;
                 metrics_
                     .counter("yuzu_auth_sessions_revoked_total",
                              {{"caller", revoke_api_tokens ? "self" : "admin"},
-                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"result", all_persisted ? "success" : "partial"},
                               {"scope", revoke_api_tokens ? "all" : "cookies"}})
                     .increment();
                 return RestApiV1::SessionRevokeResult{
                     revoke.count,
                     tokens,
                     revoke.db_persisted,
+                    api_tokens_db_persisted,
                 };
             },
             // W5.1 — pass the per-execution event bus into the REST
@@ -11350,6 +11486,10 @@ private:
     // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    // Born-on-PG (plan PR 4.1). Borrows pg_pool_ — declared after it (line
+    // ~11270) so normal reverse-declaration-order destruction is already
+    // correct; stop() also explicitly resets it before pg_pool_.reset() (ADR-0012
+    // destruct-before-pool discipline, matching the other born-on-PG stores).
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<ResultSetStore> result_set_store_;

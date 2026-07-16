@@ -44,6 +44,9 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
+#include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
 
 #ifdef _WIN32
@@ -750,11 +753,17 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
-        // Initialize bounded thread pool for command dispatch
-        thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
-
-        // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
+            // SparkEngine FIRST — before thread_pool_ is reset below. Rung 1's engine
+            // does not borrow the pool, but rung 2's queued Guardian consumer is expected
+            // to dispatch through it (#2037's bounded-dispatch pattern), and this guard
+            // resets the pool on every run() exit. Stopping spark here means its threads
+            // are quiesced before anything it may borrow goes away — on the exception and
+            // early-return paths too, not just the graceful one. Idempotent: Agent::stop()
+            // may already have called it. (Gate-8 cpp-safety: an earlier comment claimed
+            // this guard already covered spark. It did not — it never touched it.)
+            if (spark_engine_)
+                spark_engine_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
             // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
@@ -786,6 +795,149 @@ public:
             thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
+
+        // NOTE: constructed AFTER the ScopeExit above is armed. The failure path below
+        // returns early, and before this reorder that return escaped WITHOUT the guard —
+        // so plugins already dlopen'd and init()'d were dlclose'd without ever having
+        // their shutdown() called (~PluginHandle only DLCLOSEs; the ScopeExit is the sole
+        // caller of shutdown()). Unflushed plugin state, unreleased OS handles, and any
+        // plugin-init thread left executing unmapped code. (governance Gate-8 UP8-3.)
+        // Initialize bounded thread pool for command dispatch.
+        //
+        // ThreadPool's ctor now joins whatever it managed to spawn and RETHROWS on
+        // std::thread's EAGAIN (thread/pid exhaustion — a pids-capped container,
+        // RLIMIT_NPROC). That fixed the terminate-in-~vector, but the rethrow has nowhere
+        // to go: main.cpp's `agent->run()` is a BARE call with no enclosing handler, and
+        // this construction sits before run()'s own inner try. So the exception escaped
+        // main() and std::terminate'd anyway — trading one terminate for another
+        // (governance Gate-4 UP-5).
+        //
+        // Catch it here and report a CLEAN STARTUP FAILURE instead: a non-zero exit that
+        // systemd Restart= / Docker / the Windows SCM can react to (#1303), and — the
+        // point of rung 1 — an agent that lives long enough to SAY spark degraded, rather
+        // than a crash-loop that destroys the very signal the degrade path produces.
+        try {
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+        } catch (const std::exception& e) {
+            spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
+                             "is out of threads. Exiting with a startup failure rather than "
+                             "aborting.",
+                             e.what());
+            startup_failed_ = true;
+            return;
+        } catch (...) {
+            // Belt-and-braces, and NOT theoretical: ThreadPool's ctor now logs INSIDE its own
+            // try, and spdlog RETHROWS non-std exceptions. A catch(std::exception&) alone
+            // would let such a throw escape the bare `agent->run()` in main.cpp and
+            // std::terminate — re-opening the very hole this catch exists to close
+            // (governance Gate-8 cpp-safety).
+            spdlog::critical("could not create the command dispatch thread pool (non-std "
+                             "exception) — exiting with a startup failure rather than aborting.");
+            startup_failed_ = true;
+            return;
+        }
+
+        // SparkEngine (ADR-0021 Stage-2, rung 1 — INSTANTIATE + OBSERVE).
+        //
+        // POSITION IS LOAD-BEARING — this block must stay AFTER thread_pool_'s
+        // construction and AFTER the ScopeExit above. Two governance findings pin it:
+        //
+        //  (a) DEGRADATION PRIORITY (Gate-4 UP-3). Spark spawns up to 4 threads and
+        //      degrades gracefully if it cannot (the catch below). ThreadPool does NOT:
+        //      its ctor emplace_back()s std::threads, and on EAGAIN the throw destroys a
+        //      vector<std::thread> holding JOINABLE threads → std::terminate. Standing
+        //      spark up FIRST let the OPTIONAL subsystem eat the thread budget that the
+        //      MANDATORY one then died for — an optional feature crash-looping the agent
+        //      on a pids-capped host. Mandatory subsystems claim their threads first.
+        //
+        //  (b) SCOPEEXIT COVERAGE. Constructed before the guard was armed, a throw between
+        //      here and the guard left spark's threads running with no cleanup on the
+        //      run()-exit path. NOTE: the guard did not stop spark either until Gate-8
+        //      cpp-safety pointed out that it never touched it — it does now, as its FIRST
+        //      statement, ahead of thread_pool_.reset().
+        //
+        // See also the member declaration order (spark_engine_ AFTER thread_pool_) so
+        // spark is DESTROYED before the pool it may borrow at rung 2.
+        // The next-generation event-driven detection engine is stood up here
+        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
+        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
+        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
+        // up now proves the engine runs and reports at rest, so its resource +
+        // observability envelope can be measured before it carries any load.
+        //
+        // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
+        // when set, SparkEngine is never instantiated and watches nothing — but the
+        // heartbeat still carries the posture itself (spark_running=0 + spark_disabled=1),
+        // so the fleet can tell a deliberate opt-out apart from an engine that FAILED
+        // to start (see the DISABLED branch in the heartbeat emit block below).
+        // The flag selects exactly one detection path at instantiation, establishing
+        // the "old and new never both drive enforce" property the rung-2/3 cutover
+        // leans on (moot at rung 1 — spark has no consumer — but pinned here).
+        if (cfg_.spark_disable) {
+            spdlog::info("SparkEngine: disabled by --spark-disable — not instantiated; "
+                         "Guardian detection path = legacy IGuard (enforcing)");
+        } else {
+            // DEGRADE-TO-NO-SPARK on any boot exception. SparkEngine::start() (and a
+            // mechanism start()) spawns threads; thread creation throws
+            // std::system_error under EAGAIN / thread-or-handle exhaustion — most
+            // likely on exactly the overloaded endpoint where the agent must SURVIVE,
+            // not crash-loop. run() is not wrapped by a catch at its call site
+            // (main.cpp `agent->run()`), and this block runs before run()'s own inner
+            // try, so an escape here would std::terminate the process (gov UP-1).
+            try {
+                spark_engine_ = std::make_unique<SparkEngine>();
+                // Register the platform event-driven mechanisms. Each factory returns
+                // nullptr off its platform (File/Registry: Windows-only; Service:
+                // Windows-SCM + Linux-systemd), so an unsupported type is simply left
+                // unregistered — SparkEngine then rejects any future arm() of it. The
+                // set actually registered IS the agent's spark capability, surfaced to
+                // the fleet via the yuzu.spark_mechs heartbeat tag.
+                const auto try_register = [&](SparkType type,
+                                             std::unique_ptr<ISparkMechanism> mech) {
+                    if (!mech)
+                        return; // unsupported on this OS — leave the type unregistered
+                    if (auto r = spark_engine_->register_mechanism(type, std::move(mech)); !r)
+                        spdlog::warn("SparkEngine: register {} mechanism failed: {}",
+                                     spark_type_token(type), r.error());
+                };
+                try_register(SparkType::File, make_file_mechanism());
+                try_register(SparkType::Registry, make_registry_mechanism());
+                try_register(SparkType::Service, make_service_mechanism());
+                spark_engine_->start();
+                spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
+                             "Guardian detection path = legacy IGuard (enforcing)");
+            } catch (const std::exception& e) {
+                // ~SparkEngine (via reset) joins whatever already started; the
+                // heartbeat's else branch then ships the FAILED posture
+                // (spark_running=0, no disabled key) — a boot failure is visible
+                // on the wire, never silent.
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed ({}) — continuing WITHOUT "
+                             "spark; legacy IGuard detection is unaffected",
+                             e.what());
+            } catch (...) {
+                // Belt-and-braces: NOTHING may terminate the agent for an observe-only
+                // best-effort subsystem, even a non-std throw (gov re-review NICE).
+                spark_engine_.reset();
+                spdlog::warn("SparkEngine: instantiation failed (unknown exception) — "
+                             "continuing WITHOUT spark; legacy IGuard detection is unaffected");
+            }
+        }
+        // Publish "the spark slot is final" to cross-thread readers — REQUIRED, not
+        // advisory. Handlers are installed and g_agent is published BEFORE run() (so a
+        // wedged make_agent can still be interrupted), which means Agent::stop() on the
+        // shutdown-watcher / SCM / console thread is concurrent with THIS boot block —
+        // and the catch paths above FREE the engine via reset(). A bare `if
+        // (spark_engine_)` in stop() during that window is a load racing a store/free:
+        // TSan caught it for real (randomized-SIGTERM fuzz, 101 ms delay — read at
+        // stop()'s spark gate vs the make_unique store above). stop() therefore gates
+        // its spark access on this latch and SKIPS spark before it flips: that is safe,
+        // not a leak, because this thread's OWN ScopeExit (armed above) stops the
+        // engine on every run() exit — same thread, no race. After the latch flips the
+        // slot is never written again until ~AgentImpl, which runs after the watcher
+        // join / g_agent_mu barrier. (Governance Gate-3 cpp-safety SAFE-1; the same
+        // boot-window shape updater_ already handles with updater_mu_.)
+        spark_boot_done_.store(true, std::memory_order_release);
 
         // Wire trigger dispatch + start the engine. Plugins registered their
         // triggers during init() (above); the engine has been holding them
@@ -1090,6 +1242,12 @@ public:
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
+        /// approval check is not instant — but FINITE, which is the whole point: without it a
+        /// server that completes TLS and then goes silent parks the main thread forever, and on
+        /// the OTA self-stop path there is no signal and no supervisor timeout to rescue it.
+        /// A failed attempt just falls into the existing reconnect backoff.
+        constexpr auto kRegisterTimeout = std::chrono::seconds{30};
         constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -1106,6 +1264,42 @@ public:
 
             {
                 grpc::ClientContext ctx;
+                // THE FOURTH ClientContext — and until now the only one outside the CtxSlot
+                // regime: no deadline, and no cancellable slot.
+                //
+                // Register is a BLOCKING unary call on the main thread. Against a server or
+                // gateway that completes TCP+TLS and then never answers — a sick gateway, a
+                // hung load balancer, an approval backlog — SIGTERM did this: the watcher ran
+                // Agent::stop(), which cancelled subscribe/heartbeat/sync (ALL NULL: none is
+                // published until AFTER registration succeeds), returned, and exited. Main
+                // stayed parked in Register. run() never returned, ~Agent never ran, and the
+                // agent hung until the supervisor's SIGKILL — 90s under systemd, and under
+                // Docker a SIGKILL mid-teardown. It is the same class the code calls out as a
+                // cpp-safety BLOCKING one screen down, on the drain.
+                //
+                // Two independent fixes, because either alone leaves a hole:
+                //   * a DEADLINE, so a silent server cannot park us forever even with no signal
+                //     (this is also the OTA self-stop path, which gets no signal at all); and
+                //   * a CtxSlot, so stop() can cancel an in-flight Register immediately rather
+                //     than waiting the deadline out.
+                // MEASURED against a black-hole server (accepts TCP, never answers), Linux, 49
+                // plugins: 18.0s -> 8-9s (n=4). The 18.0s was gRPC's own transport timeout
+                // expiring. An earlier version of this comment said "~1s", which was the
+                // second-signal figure pasted onto the wrong case; it is corrected here rather
+                // than left to justify a bound nobody measured.
+                // (governance: cpp-safety BLOCKING, unhappy-path UP-C11/C12, enterprise C1.)
+                ctx.set_deadline(std::chrono::system_clock::now() + kRegisterTimeout);
+                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx};
+
+                // PUBLISH, THEN RE-CHECK. The loop tested stop_requested_ above, but a stop()
+                // landing in the window between that test and the publish above finds
+                // register_ctx_ still NULL — so it cancels nothing, and this Register runs to its
+                // full 30s deadline while the supervisor's grace (Docker's is 10s) expires and
+                // SIGKILLs us mid-teardown. The window is a few instructions wide; the fix is one
+                // line, and it closes it structurally rather than by argument.
+                // (governance: security-guardian, cpp-safety — independently, this PR.)
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
                 info->set_agent_id(cfg_.agent_id);
@@ -1370,29 +1564,64 @@ public:
 
             // 3b. OTA updater: rollback check and old binary cleanup
             {
-                updater_ = std::make_unique<Updater>(
+                // Publish the fresh Updater, then work through the LOCAL copy — the slot can
+                // be re-read by Agent::stop() on another thread at any moment.
+                auto updater = std::make_shared<Updater>(
                     UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                     current_executable_path());
+                set_updater(updater);
 
-                if (updater_->rollback_if_needed()) {
+                if (updater->rollback_if_needed()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
-                updater_->cleanup_old_binary();
+                updater->cleanup_old_binary();
             }
 
             // 4. Open Subscribe bidi stream
             {
+                // DECLARATION ORDER IS LOAD-BEARING: `sub_ctx` MUST be declared BEFORE its
+                // CtxSlot. Destruction is reverse-order, so ~CtxSlot retracts the pointer
+                // (under ctx_mu_, blocking any in-flight cancel) and only THEN is `sub_ctx`
+                // destroyed. Swap these two lines and the context dies while still published —
+                // reopening the exact use-after-free this slot exists to close, with every test
+                // still green. TSan will not catch the reorder. (Gate-8 round 8 unhappy-path
+                // UP8-4.)
                 grpc::ClientContext sub_ctx;
                 if (!session_id_.empty()) {
                     sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
                 }
-                subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
+                // Published for the whole of this scope; retracted under ctx_mu_ by the dtor
+                // on EVERY exit — including the `continue` below and any throw.
+                //
+                // It stays published LONGER than the old hand-written clear did (which fired
+                // before the joins below): the plugin shutdown loop, the thread-pool reset and
+                // the heartbeat/sync joins now all run with it live, so stop() can TryCancel a
+                // context whose stream is already gone. That is safe — gRPC's ClientContext
+                // owns the underlying call ref, so TryCancel after the stream dies is a no-op,
+                // not a UAF — and `sub_ctx` outlives every moment it is published.
+                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx};
+                // PUBLISH-THEN-RE-CHECK, the register_slot pattern's SIBLING SITE. A stop()
+                // that ran to completion in the window between Register success and this
+                // publish — a WIDE window: CSR/TLS handling, Updater construction,
+                // rollback_if_needed()'s and cleanup_old_binary()'s file I/O — cancelled
+                // nothing (all slots were null) and is already consumed (the watcher callback
+                // fires once). Without this re-check, run() would open Subscribe against a
+                // HEALTHY server and park at stream->Read() with no in-process canceller
+                // left: the hb/sync/update threads see their stop flags and exit instantly,
+                // so nothing ever cancels the stream, and the only exits are server-side
+                // session reap or the supervisor's SIGKILL (Docker: 10s grace) — the exact
+                // class this PR removes for Register. A stop() landing AFTER this check and
+                // before the call binds is covered by gRPC's call_canceled_ latch, with the
+                // stream's own lifecycle as backstop. The original hand-split applied the
+                // re-check to register_slot only and orphaned this sibling.
+                // (governance gate round: cpp-safety BLOCKING, this branch.)
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
 
                 std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
                 if (!stream) {
                     spdlog::error("Failed to open Subscribe stream");
-                    subscribe_ctx_.store(nullptr, std::memory_order_release);
                     if (!stop_requested_.load(std::memory_order_acquire)) {
                         ++reconnect_count;
                         spdlog::warn("Subscribe failed — will attempt reconnect");
@@ -1422,13 +1651,18 @@ public:
                 }
 
                 // 4b. Spawn OTA update check thread
-                if (cfg_.auto_update && updater_) {
+                if (cfg_.auto_update && updater()) {
                     auto* raw_stub = static_cast<void*>(stub.get());
-                    update_thread_ = std::thread([this, raw_stub]() {
+                    // The thread CAPTURES its own shared_ptr. It must not re-read updater_ on
+                    // every iteration: run() may publish a new Updater on the next reconnect,
+                    // and this thread would then be using a different object mid-flight (and,
+                    // with a unique_ptr, a freed one).
+                    update_thread_ = std::thread([this, raw_stub,
+                                                  updater = updater()]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
                         while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater_->check_and_apply(raw_stub);
+                            auto result = updater->check_and_apply(raw_stub);
                             if (result.has_value() && result.value()) {
                                 spdlog::info("OTA update applied - agent will restart");
                                 stop();
@@ -1532,11 +1766,13 @@ public:
                             // sync coincides with a disconnect; the 30s deadline is the backstop.
                             ctx.set_deadline(std::chrono::system_clock::now() +
                                              std::chrono::seconds{30});
-                            sync_ctx_.store(&ctx, std::memory_order_release);
+                            // Was a BARE store/store(nullptr) pair — the one slot that got no
+                            // lock at all, so a teardown cancel could TryCancel this frame's
+                            // `ctx` after it had been destroyed. Retracted under ctx_mu_ by the
+                            // dtor, on the early `return std::nullopt` below too.
+                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx};
                             pb::InventoryAck ack;
                             auto status = sync_stub->ReportInventory(&ctx, report, &ack);
-                            // Clear before `ctx` leaves scope so teardown never derefs a dead ctx.
-                            sync_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::debug("sync: ReportInventory RPC failed: {}",
                                               status.error_message());
@@ -1651,7 +1887,9 @@ public:
 
                             // Build heartbeat with piggybacked metrics
                             grpc::ClientContext ctx;
-                            heartbeat_ctx_.store(&ctx, std::memory_order_release);
+                            // Per-iteration: the dtor retracts it under ctx_mu_ at the end of
+                            // this loop body, before `ctx` is destroyed.
+                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx};
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1820,6 +2058,72 @@ public:
                                         std::format("{:.0f}", ns.throughput_bps);
                             }
 
+                            // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
+                            // OBSERVE-ONLY). Keys are pinned to
+                            // server/core/src/spark_fleet_tags.hpp by
+                            // tests/unit/server/test_spark_fleet_tags.cpp — a drift is
+                            // silent zero-reporting. Counters ship SPARSELY (only when >0):
+                            // fleet-scale, and every counter is 0 at rung 1 (no consumer
+                            // armed), so a quiescent agent ships just the two always-present
+                            // capability keys.
+                            //
+                            // The FOUR postures are DISTINGUISHABLE on the wire (see
+                            // spark_heartbeat.hpp): RUNNING reports spark_running=1; FAILED and
+                            // DISABLED both report spark_running=0 and are told apart by
+                            // spark_disabled=1 on DISABLED only; ABSENT emits no spark keys at
+                            // all (a stopped engine, and any pre-rung-1 agent).
+                            // Emitting nothing on the failure path (the old behaviour) made
+                            // a fleet-wide boot failure invisible — the exact condition
+                            // rung 1 exists to detect (governance Gate-4 consistency/UP-10).
+                            //
+                            // try/catch: this runs on the heartbeat thread, whose callable
+                            // has NO top-level handler — an escaping bad_alloc from the
+                            // stats map or the tag strings would std::terminate the agent,
+                            // on precisely the memory-exhausted host where the boot-time
+                            // degrade guard was written to keep it alive. NOTHING may
+                            // terminate the agent for an observe-only subsystem
+                            // (governance Gate-4 UP-2).
+                            try {
+                                if (stop_requested_.load(std::memory_order_acquire)) {
+                                    // SHUTTING DOWN — emit NOTHING (the ABSENT posture).
+                                    //
+                                    // Agent::stop() and run()'s ScopeExit both call
+                                    // spark_engine_->stop(), and this thread can compose a
+                                    // beat AFTER that. STOPPED is not FAILED: bucketing a
+                                    // cleanly-stopping agent into yuzu_fleet_spark_failed{os}
+                                    // — the ONE gauge documented "alert on it" — would page
+                                    // on-call on every `systemctl restart` and every OTA cycle
+                                    // with a fault that never happened (governance Gate-2
+                                    // security). ABSENT is the honest wire state, and the
+                                    // server reads absence as "did not report", never as 0.
+                                    //
+                                    // THIS GUARD IS DEFENCE IN DEPTH, AND THE SECOND LAYER IS
+                                    // THE LOAD-BEARING ONE. An earlier version of this comment
+                                    // claimed a stopped engine "would fall through to the
+                                    // FAILED posture below" without this branch. It would not:
+                                    // `else if (spark_engine_)` is taken, and
+                                    // emit_spark_heartbeat_tags(running=false) early-returns
+                                    // emitting nothing — ABSENT either way. Do not delete THAT
+                                    // early-return on the strength of this guard, or this guard
+                                    // on the strength of it; and do not "simplify" by trusting
+                                    // a rationale (as this comment used to state one) that the
+                                    // code does not actually implement.
+                                } else if (cfg_.spark_disable) {
+                                    emit_spark_absent_tags(tags, /*disabled=*/true);
+                                } else if (spark_engine_) {
+                                    emit_spark_heartbeat_tags(tags, spark_engine_->is_running(),
+                                                              spark_engine_->stats(),
+                                                              spark_engine_->stats_by_type());
+                                } else {
+                                    // Enabled, but boot-time instantiation threw.
+                                    emit_spark_absent_tags(tags, /*disabled=*/false);
+                                }
+                            } catch (...) {
+                                // Best-effort telemetry: drop this beat's spark tags rather
+                                // than kill the agent. The server reads the absence as
+                                // "did not report", never as 0.
+                            }
+
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
                             // we last shipped. `last_attached_seq` is a
@@ -1842,7 +2146,6 @@ public:
 
                             pb::HeartbeatResponse resp;
                             auto status = hb_stub->Heartbeat(&ctx, req, &resp);
-                            heartbeat_ctx_.store(nullptr, std::memory_order_release);
                             if (!status.ok()) {
                                 spdlog::warn("Heartbeat failed: {}", status.error_message());
                                 // Orphan condition (#1894): the Subscribe stream is
@@ -1892,12 +2195,8 @@ public:
                                         std::this_thread::sleep_for(slice);
                                         left -= slice;
                                     }
-                                    if (!should_stop()) {
-                                        if (auto* sctx = subscribe_ctx_.load(
-                                                std::memory_order_acquire)) {
-                                            sctx->TryCancel();
-                                        }
-                                    }
+                                    if (!should_stop())
+                                        cancel_ctx(subscribe_ctx_); // owned by run()'s frame
                                     break; // this connection is done; a fresh
                                            // heartbeat thread spawns on reconnect
                                 }
@@ -1909,7 +2208,8 @@ public:
                                 forced_rereg_streak_.store(0, std::memory_order_release);
                             }
                         }
-                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
+                        // No store(nullptr) here: the per-iteration CtxSlot already retracted
+                        // it under ctx_mu_ on every way out of the loop body.
                         spdlog::info("Heartbeat thread stopped");
                     });
                 }
@@ -2059,7 +2359,9 @@ public:
                     }
                 }
 
-                subscribe_ctx_.store(nullptr, std::memory_order_release);
+                // No store(nullptr) here: `sub_slot` retracts subscribe_ctx_ under ctx_mu_ when
+                // this scope ends, and it also covers the `continue` paths above that this
+                // hand-written clear never did.
 
                 // Detach the Guardian event-sink from this (now broken) stream BEFORE
                 // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
@@ -2079,26 +2381,28 @@ public:
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
-                if (updater_) {
-                    updater_->stop();
+                if (auto u = updater()) {
+                    u->stop(); // local copy keeps it alive even if run() swaps the slot
                 }
                 if (update_thread_.joinable()) {
                     update_thread_.join();
                 }
 
-                // Signal heartbeat thread to exit and cancel any in-flight RPC
+                // Signal heartbeat thread to exit and cancel any in-flight RPC.
+                // cancel_ctx() holds ctx_mu_ across the load+TryCancel, so the heartbeat
+                // thread's ~CtxSlot cannot retire `ctx` underneath us — this fires on every
+                // TRANSIENT RECONNECT, not just shutdown, so it was the most-executed of the
+                // four UAF sites the first ctx_mu_ patch missed. The lock is released before
+                // the join below (never hold ctx_mu_ across a join).
                 heartbeat_stop_.store(true, std::memory_order_release);
-                if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-                    hctx->TryCancel();
-                }
+                cancel_ctx(heartbeat_ctx_);
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
                 // Daily-sync thread is per-connection (like heartbeat): stop +
                 // join it on disconnect; its state persists in kv_store_.
                 sync_stop_.store(true, std::memory_order_release);
-                if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
-                    sctx->TryCancel(); // unblock an in-flight ReportInventory (mirrors heartbeat)
+                cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory (mirrors heartbeat)
                 if (sync_thread_.joinable()) {
                     sync_thread_.join();
                 }
@@ -2122,6 +2426,17 @@ public:
                     // for every early-return/exception exit, and re-invoking the
                     // helper there is a joinable()-guarded no-op.
                     quiesce_run_workers();
+                    // Stop the TRIGGER ENGINE before the plugin shutdown loop, for the same
+                    // reason the ScopeExit does (:766) — its workers dispatch into plugins_
+                    // from their own threads, so shutting plugins down (and clearing the
+                    // vector below) under running workers is a dispatch-into-dlclose race.
+                    // The ScopeExit's own trigger_engine_.stop() runs too LATE for this
+                    // branch (after the plugin loop below has already run) and re-invoking
+                    // it there is an idempotent no-op. PRE-EXISTING on dev, byte-identical —
+                    // fixed here because this branch's charter is exactly this shutdown
+                    // crash class. (adversarial review K3/C-P2-2 — found by one external
+                    // reviewer, adopted by the other on cross-examination.)
+                    trigger_engine_.stop();
                     for (auto& handle : plugins_) {
                         if (handle.descriptor()->shutdown) {
                             auto it = per_plugin_ctx_.find(handle.descriptor()->name);
@@ -2137,10 +2452,82 @@ public:
 
                 spdlog::info("Subscribe stream ended");
 
-                // Re-create thread pool for next connection cycle
-                thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
-
                 if (!stop_requested_.load(std::memory_order_acquire)) {
+                    // RE-CREATE THE POOL ONLY IF WE ARE ACTUALLY RECONNECTING, AND INSIDE A TRY.
+                    //
+                    // Two defects lived on the old unconditional line, both of them mine:
+                    //
+                    // 1. It ran on the SHUTDOWN path too. Every SIGTERM spawned 4-32 threads
+                    //    that were never used and were joined seconds later by run()'s ScopeExit
+                    //    — pure added teardown latency, in the very change whose purpose is to
+                    //    cut teardown latency.
+                    //
+                    // 2. It was inside NO try. The exception-safe ThreadPool ctor earlier in this
+                    //    branch converted thread exhaustion from a terminate-in-~vector into a
+                    //    THROW — and the boot site (see the ctor at the top of run()) catches it
+                    //    and degrades to startup_failed_. This site did not. Under EAGAIN, or a
+                    //    docker `--pids-limit`, the throw escaped run(), and main.cpp calls
+                    //    `agent->run()` bare — so it was std::terminate WITHOUT UNWINDING: the
+                    //    ScopeExit never ran, plugins never got shutdown(), the SQLite stores
+                    //    never closed, the watcher thread was never joined. A pid-pressure event
+                    //    took the endpoint out hard, and systemd's Restart= then hot-looped it.
+                    //
+                    // Degrade the way the boot site does: stop, and let the supervisor restart us
+                    // cleanly. (governance: cpp-safety BLOCKING, sre OR-5, happy-path F1.)
+                    try {
+                        thread_pool_ =
+                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+                    } catch (const std::exception& e) {
+                        spdlog::critical("could not re-create the command dispatch thread pool on "
+                                         "reconnect ({}) — the host is out of threads. Stopping "
+                                         "cleanly rather than aborting.",
+                                         e.what());
+                        // AND MARK IT A FAILURE, so the exit code says "I could not continue"
+                        // rather than "I was asked to stop".
+                        //
+                        // BE PRECISE ABOUT WHAT THIS BUYS, because the first version of this
+                        // comment overstated it and was itself a false claim: the Windows SCM does
+                        // NOT read this as a clean stop today — service_win.cpp already reports
+                        // specific-error 2 for a run() that returns unsolicited, and the failure
+                        // actions flag is set, so recovery ALREADY fires there. Likewise
+                        // `Restart=always` (the shipped systemd unit) and compose's
+                        // `restart: unless-stopped` both restart on exit 0 anyway.
+                        // What this actually fixes: a `Restart=on-failure` unit (or a k8s
+                        // OnFailure policy), which is the posture a customer with their own unit
+                        // file is most likely to use, and which would NEVER have restarted the
+                        // agent; and it makes the failure DISTINGUISHABLE from an operator stop in
+                        // any log or monitor that reads the exit code.
+                        // (governance: unhappy-path B / B-6 — the second of which caught the first
+                        // version of this very comment asserting something the tree contradicts.)
+                        startup_failed_ = true;
+                        stop_requested_.store(true, std::memory_order_release);
+                        break;
+                    } catch (...) {
+                        spdlog::critical("could not re-create the command dispatch thread pool on "
+                                         "reconnect (non-std exception) — stopping cleanly rather "
+                                         "than aborting.");
+                        // AND MARK IT A FAILURE, so the exit code says "I could not continue"
+                        // rather than "I was asked to stop".
+                        //
+                        // BE PRECISE ABOUT WHAT THIS BUYS, because the first version of this
+                        // comment overstated it and was itself a false claim: the Windows SCM does
+                        // NOT read this as a clean stop today — service_win.cpp already reports
+                        // specific-error 2 for a run() that returns unsolicited, and the failure
+                        // actions flag is set, so recovery ALREADY fires there. Likewise
+                        // `Restart=always` (the shipped systemd unit) and compose's
+                        // `restart: unless-stopped` both restart on exit 0 anyway.
+                        // What this actually fixes: a `Restart=on-failure` unit (or a k8s
+                        // OnFailure policy), which is the posture a customer with their own unit
+                        // file is most likely to use, and which would NEVER have restarted the
+                        // agent; and it makes the failure DISTINGUISHABLE from an operator stop in
+                        // any log or monitor that reads the exit code.
+                        // (governance: unhappy-path B / B-6 — the second of which caught the first
+                        // version of this very comment asserting something the tree contradicts.)
+                        startup_failed_ = true;
+                        stop_requested_.store(true, std::memory_order_release);
+                        break;
+                    }
+
                     ++reconnect_count;
                     metrics_.counter("yuzu_agent_reconnections_total").increment();
                     spdlog::warn("Connection lost — will attempt reconnect");
@@ -2172,19 +2559,36 @@ public:
         // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
         // they stay live through both drains and emit_guardian_event's null-check under
         // the lock remains UAF-safe.
-        if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
-            ctx->TryCancel();
-        }
+        // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
+        // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
+        cancel_ctx(subscribe_ctx_);
         if (guardian_)
             guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
-        if (updater_)
-            updater_->stop();
-        // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
-        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-            hctx->TryCancel();
-        }
+        // Gate on the boot latch BEFORE touching the pointer. This runs on the watcher /
+        // SCM / console thread; run()'s boot block stores AND (on the degrade path) FREES
+        // spark_engine_ until the latch flips — a bare `if (spark_engine_)` here raced
+        // that window (TSan-confirmed via the randomized-SIGTERM fuzz at 101 ms).
+        // Skipping spark pre-latch is safe: run()'s ScopeExit stops the engine on every
+        // run() exit, on run()'s own thread. Acquire pairs with the release store at the
+        // end of the boot block, so a post-latch read sees the final pointer value.
+        if (spark_boot_done_.load(std::memory_order_acquire) && spark_engine_)
+            spark_engine_->stop(); // idempotent; completion-barriered by lifecycle_mu_
+        // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
+        // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
+        if (auto u = updater())
+            u->stop();
+        // Cancel any in-flight heartbeat / daily-sync RPC to unblock those threads. Both
+        // contexts are STACK objects owned by their own thread's frame, and this runs on the
+        // watcher / SCM thread — so both go through cancel_ctx()'s locked load+TryCancel.
+        // sync_ctx_ was missed entirely by the first ctx_mu_ patch.
+        cancel_ctx(heartbeat_ctx_);
+        cancel_ctx(sync_ctx_);
+        // Registration wedge: on a stop during registration this is the ONLY live context —
+        // subscribe/heartbeat/sync are not published until Register has SUCCEEDED, so cancelling
+        // only those three left main parked in Register with nothing to interrupt it.
+        cancel_ctx(register_ctx_);
     }
 
     std::string_view agent_id() const noexcept override { return cfg_.agent_id; }
@@ -2424,17 +2828,18 @@ private:
     void quiesce_run_workers() noexcept {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
-        if (updater_)
-            updater_->stop();
-        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire))
-            hctx->TryCancel();
+        if (auto u = updater())
+            u->stop();
+        // Both cancels go through the locked chokepoint. The lock is released before every
+        // join below — holding ctx_mu_ across a join() would deadlock against the very thread
+        // whose ~CtxSlot needs it to exit.
+        cancel_ctx(heartbeat_ctx_);
         if (snapshot_pump_thread_.joinable())
             snapshot_pump_thread_.join();
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
         sync_stop_.store(true, std::memory_order_release);
-        if (auto* sctx = sync_ctx_.load(std::memory_order_acquire))
-            sctx->TryCancel(); // unblock an in-flight ReportInventory before joining
+        cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
             sync_thread_.join();
         if (update_thread_.joinable())
@@ -2458,6 +2863,7 @@ private:
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
+
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
@@ -2470,10 +2876,92 @@ private:
     // TLS posture refused to connect, or an unreadable cert/key) — not a normal
     // stop(). main() maps it to a non-zero exit. Single-threaded: written in run()
     // before the connect loop, read after run() returns; no atomic needed.
-    bool startup_failed_{false};
+    /// Set on the run() thread, read by main()/service_win after run() returns. ATOMIC because it
+    /// sits behind a PUBLIC VIRTUAL accessor: no race today, but the next cross-thread reader (a
+    /// health probe, a log line in stop()) would silently create one. (governance: cpp-safety.)
+    std::atomic<bool> startup_failed_{false};
+    /// Serialises the three ClientContext pointers below against every cross-thread cancel.
+    ///
+    /// ALL THREE point at STACK objects — `&sub_ctx` in the reconnect-loop frame, `&ctx` in
+    /// the per-iteration heartbeat frame, `&ctx` in the sync sender's frame — and they are
+    /// TryCancel()'d from OTHER threads: the POSIX shutdown watcher, the Windows SCM control
+    /// thread, and (for subscribe_ctx_) the heartbeat thread. Without this lock the owner can
+    /// clear its pointer, leave the scope (destroying the ClientContext), and be joined, while
+    /// a canceller sits between its load() and its TryCancel() — a use-after-free on a freed
+    /// context, or a cancel against a DIFFERENT stream that reused the stack slot.
+    ///
+    /// It was survivable-by-luck before: the signal handler ran stop() inline on whichever
+    /// thread took the signal, often the main thread, i.e. INSIDE run(). Moving the teardown
+    /// onto a dedicated watcher thread (the B2 fix) makes stop() concurrent with run()'s exit
+    /// on EVERY SIGTERM, so the race went from occasional to reliable.
+    ///
+    /// THE RULE, and why it is now STRUCTURAL rather than a convention. Every publish/retract
+    /// goes through CtxSlot, and every cancel through cancel_ctx() — there are no bare
+    /// store()/load()+TryCancel() sites left. The first attempt at this fix hand-rolled a
+    /// lock_guard at each site and covered 3 of 7, leaving the identical UAF open on the
+    /// reconnect path (which runs far more often than shutdown). Three reviewers found it
+    /// independently. A rule you must remember at seven call sites is a rule that gets missed;
+    /// the RAII owner cannot be. (governance Gate-8 round 7: cpp-safety, cpp-expert,
+    /// security-guardian.)
+    ///
+    /// LOCK ORDER: ctx_mu_ is the OUTERMOST lock either of them takes. cancel_ctx() does hold
+    /// it across TryCancel(), which takes gRPC's own internal ClientContext lock — so the order
+    /// is strictly ctx_mu_ -> grpc-internal, and never the reverse (gRPC's sync API never calls
+    /// back into our code, and grpc_call_cancel does not block). Never take ctx_mu_ while
+    /// already holding it — a nested lock_guard on this NON-RECURSIVE mutex self-deadlocked
+    /// Agent::stop() in an earlier round and the agent hung on every SIGTERM; note it would
+    /// HANG, not throw, so a bad path is silent. And never hold it across a join(): the thread
+    /// being joined needs it for its own ~CtxSlot.
+    std::mutex ctx_mu_;
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
     std::atomic<grpc::ClientContext*> sync_ctx_{nullptr}; // ADR-0016 daily-sync RPC (cancel on teardown)
+    /// The Register RPC. Blocking, on the MAIN thread, and the only one of the four that runs
+    /// BEFORE the others are published — so on a registration wedge it is the ONLY context
+    /// stop() has to cancel. It carries a deadline too (kRegisterTimeout): the OTA self-stop
+    /// path gets no signal at all, so cancellation alone would not bound it.
+    std::atomic<grpc::ClientContext*> register_ctx_{nullptr};
+
+    /// Publishes a STACK-owned ClientContext into one of the slots above for exactly the
+    /// lifetime of the enclosing scope, and retracts it under ctx_mu_ on the way out —
+    /// including on the exception and early-return paths a hand-written store(nullptr) misses.
+    /// Because the retraction takes ctx_mu_, an in-flight cancel_ctx() holding the lock keeps
+    /// the pointee alive until its TryCancel() returns.
+    ///
+    /// THE LOCK IS HELD ONLY MOMENTARILY — inside the ctor body and the dtor body, never for
+    /// the slot's LIFETIME. That is load-bearing, not an implementation detail: `sub_slot`'s
+    /// scope encloses `thread_pool_.reset()` and the heartbeat/sync/updater joins, and the
+    /// heartbeat thread's own ~CtxSlot needs ctx_mu_ to exit. Hold the lock for the slot's
+    /// lifetime (e.g. "optimise" these lock_guards into a unique_lock member) and run() would
+    /// deadlock against the very thread it is joining, on every reconnect. Do not.
+    class CtxSlot {
+    public:
+        CtxSlot(std::mutex& mu, std::atomic<grpc::ClientContext*>& slot,
+                grpc::ClientContext* ctx) noexcept
+            : mu_{mu}, slot_{slot} {
+            std::lock_guard lk(mu_);
+            slot_.store(ctx, std::memory_order_release);
+        }
+        ~CtxSlot() {
+            std::lock_guard lk(mu_);
+            slot_.store(nullptr, std::memory_order_release);
+        }
+        CtxSlot(const CtxSlot&) = delete;
+        CtxSlot& operator=(const CtxSlot&) = delete;
+
+    private:
+        std::mutex& mu_;
+        std::atomic<grpc::ClientContext*>& slot_;
+    };
+
+    /// The ONLY way to cancel one of the three contexts. Loads AND TryCancel()s under ctx_mu_
+    /// so the owning frame's ~CtxSlot cannot retire the context in between. Safe on a slot
+    /// that is already null (the common case — the RPC has finished).
+    void cancel_ctx(std::atomic<grpc::ClientContext*>& slot) noexcept {
+        std::lock_guard lk(ctx_mu_);
+        if (auto* c = slot.load(std::memory_order_acquire))
+            c->TryCancel();
+    }
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
@@ -2507,7 +2995,78 @@ private:
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
-    std::unique_ptr<Updater> updater_;
+    // SparkEngine (ADR-0021 Stage-2, rung 1) — instantiated OBSERVE-ONLY with no
+    // consumer, so (unlike guardian_/dex_observer_) it does NOT emit through
+    // guardian_sink_stream_; ~SparkEngine only joins its own internal wheel/mechanism
+    // threads. Read by the heartbeat thread (stats()/stats_by_type()), which is joined
+    // in quiesce_run_workers() before member teardown. nullptr under --spark-disable,
+    // and also nullptr if boot-time instantiation threw (degrade-to-no-spark).
+    //
+    // DECLARATION ORDER IS LOAD-BEARING — spark_engine_ MUST stay AFTER thread_pool_.
+    // Members destroy in reverse declaration order, so this makes ~SparkEngine run
+    // BEFORE ~ThreadPool. Rung 1 does not borrow the pool, but rung 2's queued Guardian
+    // consumer is expected to dispatch through it (the agent's bounded-dispatch pattern,
+    // #2037). Declared the other way round, ~ThreadPool would run first and
+    // ~SparkEngine's join could then invoke a callback against a destroyed pool — and
+    // stop() sequencing masks that only on the graceful path, since a throw between
+    // construction and stop() destroys members directly. Free to fix now; a
+    // use-after-free class to find later (governance Gate-3 architect).
+    std::unique_ptr<SparkEngine> spark_engine_;
+    /// TRUE once run()'s spark boot block has finished mutating spark_engine_ (set on
+    /// every path: instantiated, --spark-disable, or degrade-to-no-spark). Agent::stop()
+    /// — which runs on the watcher/SCM/console thread and is reachable from the moment
+    /// g_agent is published, BEFORE run() — must acquire-load this latch before reading
+    /// spark_engine_: the boot block both stores and (on the catch paths) FREES the
+    /// pointer, and TSan caught the bare read racing that window for real (randomized-
+    /// SIGTERM fuzz, 101 ms delay). Pre-latch, stop() skips spark; run()'s own ScopeExit
+    /// covers teardown on that same thread. Post-latch, the slot is never written again
+    /// until ~AgentImpl (after the watcher join / g_agent_mu barrier). The heartbeat
+    /// thread needs no latch — it is spawned by run() AFTER the boot block, so its reads
+    /// are sequenced by thread creation. (Gate-3 cpp-safety SAFE-1.)
+    std::atomic<bool> spark_boot_done_{false};
+    /// SHARED_PTR BEHIND A MUTEX, not a unique_ptr — and not a std::atomic<shared_ptr> either.
+    ///
+    /// WHY IT IS SHARED. run() REASSIGNS this on every reconnect (a fresh Updater per
+    /// connection, so Updater::stop()'s latched stop_requested_ is cleared — reusing one would
+    /// leave OTA dead after the first disconnect). Meanwhile Agent::stop() dereferences it from
+    /// ANOTHER thread (the POSIX shutdown watcher, the Windows SCM/console thread). With a
+    /// unique_ptr, run() could FREE the Updater while stop() was inside updater_->stop() — a
+    /// use-after-free, and worse: since Updater gained a ctx_mu_ held across TryCancel(), a
+    /// std::mutex DESTROYED WHILE LOCKED (UB; glibc tolerates it, MSVC and Apple Clang do not).
+    ///
+    /// WHY NOT std::atomic<std::shared_ptr<Updater>>, which is the obvious C++20 answer and was
+    /// the first fix I wrote: **libc++ has never implemented P0718R2.** There is no
+    /// atomic<shared_ptr> specialisation, so it instantiates the PRIMARY template over a
+    /// non-trivially-copyable type and is ill-formed. It compiles on libstdc++ and MSVC STL and
+    /// red-lines the macOS leg of Tier-1 CI. A green Linux build is not evidence of portability.
+    /// (governance Gate-8 round 10 cpp-safety.)
+    ///
+    /// THE LOCK IS MOMENTARY — held only across the pointer copy in updater()/set_updater(),
+    /// NEVER across u->stop() or a TryCancel(). Same discipline as CtxSlot. Hold it across the
+    /// stop() and a wedged OTA drain would block run() and ~Agent behind it.
+    ///
+    /// Every reader takes a LOCAL shared_ptr copy first (via updater()), which keeps the object
+    /// alive for the whole call even if run() swaps the slot underneath. There is no
+    /// `updater_->x()` anywhere — grep for it across agents/ , not just this file.
+    mutable std::mutex updater_mu_;
+    std::shared_ptr<Updater> updater_;
+
+    /// A LOCAL copy of the current Updater, or nullptr. The copy is what makes the caller safe.
+    [[nodiscard]] std::shared_ptr<Updater> updater() const {
+        std::lock_guard lk(updater_mu_);
+        return updater_;
+    }
+
+    /// Publish a new Updater. The previous one is released OUTSIDE the lock: if this drops its
+    /// last reference, ~Updater must not run while updater_mu_ is held.
+    void set_updater(std::shared_ptr<Updater> u) {
+        std::shared_ptr<Updater> old;
+        {
+            std::lock_guard lk(updater_mu_);
+            old = std::move(updater_);
+            updater_ = std::move(u);
+        }
+    }
     std::thread update_thread_;
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)

@@ -16,14 +16,39 @@ permissions:
   contents: read
   packages: read
 
-env:
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+# NO workflow-level `env: REGISTRY`. It used to be
+# `ghcr.io/${{ github.repository_owner }}`, which renders as `ghcr.io/Tr3kkR` —
+# Docker rejects uppercase in a repository name outright ("repository name must
+# be lowercase"), so nothing could be pulled. GitHub expressions have no
+# lowercase function, so the owner must be folded in a shell step: the `resolve`
+# job does it once and publishes `needs.resolve.outputs.registry`. Every job that
+# touches an image sets `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`,
+# and steps that cannot read env (action `with:` inputs, e.g. trivy's image-ref)
+# reference the output directly. Defining a mixed-case default here again would
+# just re-arm the trap for the next job that forgets to override it.
 
 jobs:
   # ── Resolve version and download release artifacts ──────────────────
   resolve:
     name: "Resolve version"
     runs-on: ubuntu-24.04
+    # `github.event.workflow_run.head_branch` is the TRIGGERING Release run's
+    # head_branch, which for a `v*` tag push IS the tag (`v0.13.0`) — do not
+    # confuse it with this workflow's own `head_branch`, which is always `main`
+    # because a `workflow_run` workflow always executes on the default branch.
+    # Reading the latter is what makes this gate look permanently dead when it
+    # is not: QA has run on every SUCCESSFUL Release (e.g. run 24937379958 for
+    # v0.11.0, where `resolve` succeeded and `integration` then failed on the
+    # uppercase-registry pull fixed below). It skips on the other runs only
+    # because `conclusion == 'success'` is false — 94 of the last 100 Release
+    # runs failed or were cancelled.
+    #
+    # `startsWith(..., 'v')` is also the condition that keeps the DISPATCH
+    # release path covered: release.yml can be run via workflow_dispatch on a
+    # tag ref (the documented fallback for when GitHub drops a tag-push webhook,
+    # used for v0.11.0-rc1), and such a run still reports head_branch=v0.11.0-rc1.
+    # Narrowing this to `workflow_run.event == 'push'` would silently skip QA on
+    # every manually-cut release — and report green while doing it.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -31,6 +56,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
+      registry: ${{ steps.reg.outputs.registry }}
       has_prev: ${{ steps.prev.outputs.has_prev }}
       prev_tag: ${{ steps.prev.outputs.prev_tag }}
 
@@ -38,6 +64,25 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # `github.repository_owner` is `Tr3kkR` — mixed case. Docker rejects
+      # uppercase in a repository name outright ("repository name must be
+      # lowercase"), so `ghcr.io/${{ github.repository_owner }}/yuzu-server`
+      # cannot be pulled at all. This is not theoretical: the v0.11.0 QA run
+      # (24937379958) died with exactly `invalid reference format: repository
+      # name (Tr3kkR/yuzu-server) must be lowercase`. release.yml lowercases the
+      # owner for this reason; this workflow never did. Every job below that
+      # touches an image overrides REGISTRY with this value, and steps that
+      # cannot read env (action `with:` inputs, e.g. trivy's image-ref) use the
+      # output directly.
+      - name: Lowercase registry owner
+        id: reg
+        env:
+          # Bound to env rather than interpolated into the run body — the next
+          # step documents why, and this step must not be the counter-example.
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "registry=ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: ver
@@ -48,6 +93,9 @@ jobs:
           # workflow_dispatch input can carry shell metacharacters, and
           # direct `${{ ... }}` expansion into a `run:` block is a code-
           # injection sink (CodeQL actions/code-injection/critical).
+          #
+          # EVENT_BRANCH is the TRIGGERING Release run's head_branch, which for a
+          # tag build is the tag itself (`v0.13.0`). See the `if:` above.
           EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
@@ -114,6 +162,11 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Override the workflow-level REGISTRY, which carries the mixed-case owner
+    # (`ghcr.io/Tr3kkR`) that Docker refuses to pull. See resolve's "Lowercase
+    # registry owner".
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -180,8 +233,15 @@ jobs:
                 - "50055:50055"
               volumes:
                 - /tmp/yuzu-qa/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
+              # \`curl\` is NOT in the server runtime image (it installs only
+              # libssl3, libpq5, ca-certificates and bash), so this healthcheck
+              # could never pass: the container would sit \`unhealthy\` forever and
+              # \`gateway\`, which waits on \`condition: service_healthy\`, would
+              # never start. Use bash's /dev/tcp pseudo-device — the same probe
+              # deploy/docker/docker-compose.reference.yml uses. The gate added
+              # in #751 verifies bash + /dev/tcp survive in the image.
               healthcheck:
-                test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+                test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10
@@ -665,6 +725,8 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -760,6 +822,8 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -796,7 +860,7 @@ jobs:
       - name: Scan yuzu-server
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-server:${{ needs.resolve.outputs.version }}
+          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-server:${{ needs.resolve.outputs.version }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '0'
@@ -806,7 +870,7 @@ jobs:
       - name: Scan yuzu-gateway
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
+          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '0'
@@ -828,6 +892,8 @@ jobs:
     needs: [resolve, integration]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -864,8 +930,10 @@ jobs:
               command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              # curl is NOT in the server runtime image — see the integration
+              # job's compose above. bash + /dev/tcp is the supported probe.
               healthcheck:
-                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10
@@ -987,6 +1055,8 @@ jobs:
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -1026,8 +1096,10 @@ jobs:
               command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              # curl is NOT in the server runtime image — see the integration
+              # job's compose above. bash + /dev/tcp is the supported probe.
               healthcheck:
-                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
                 interval: 5s
                 timeout: 3s
                 retries: 10
@@ -1118,6 +1190,7 @@ jobs:
     steps:
       - name: Generate report
         env:
+          R_RESOLVE: ${{ needs.resolve.result }}
           R_INTEGRATION: ${{ needs.integration.result }}
           R_DEB: ${{ needs.install-deb.result }}
           R_RPM: ${{ needs.install-rpm.result }}
@@ -1158,9 +1231,33 @@ jobs:
 
           REPORT
 
-          # Determine overall result
+          # `resolve` is deliberately NOT in ALL_RESULTS below, because a skipped
+          # resolve must not be reported as a pass. This job is `if: always()`,
+          # so when `resolve` skips (the triggering Release failed or was
+          # cancelled — 94 of the last 100 Release runs) every one of the nine
+          # test jobs is `skipped`, nothing matches "failure", and this step used
+          # to print `### Result: PASSED` and exit 0. THAT is why Pre-release QA
+          # has looked permanently green while testing nothing: not a dead
+          # trigger, but a report that treats "never ran" as "passed".
+          if [ "$R_RESOLVE" = "skipped" ]; then
+            echo "### Result: NOT RUN" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No successful \`v*\` Release to test, so no QA was performed." >> "$GITHUB_STEP_SUMMARY"
+            echo "This is NOT a pass — nothing was verified." >> "$GITHUB_STEP_SUMMARY"
+            echo "Pre-release QA did not run: no successful release to test."
+            exit 0
+          fi
+
+          if [ "$R_RESOLVE" != "success" ]; then
+            echo "### Result: FAILED (could not resolve the release under test)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Pre-release QA could not resolve the release under test (resolve=$R_RESOLVE)."
+            exit 1
+          fi
+
+          # Determine overall result. `cancelled` counts as a failure: a cancelled
+          # suite has verified nothing, and must never read as a pass either.
           ALL_RESULTS="$R_INTEGRATION $R_DEB $R_RPM $R_WINDOWS $R_MACOS $R_ARTIFACT $R_SECURITY $R_SOAK $R_UPGRADE"
-          if echo "$ALL_RESULTS" | grep -q "failure"; then
+          if echo "$ALL_RESULTS" | grep -qE "failure|cancelled"; then
             echo "### Result: FAILED" >> "$GITHUB_STEP_SUMMARY"
             echo ""
             echo "QA FAILED for $TAG"
