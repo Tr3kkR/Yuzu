@@ -662,6 +662,40 @@ TEST_CASE("require_permission — engine principal denied Read when RBAC is disa
     CHECK(res.status == 403);
 }
 
+// Belt-and-braces regression for Blocker 1's CLASS (retro action, #2202):
+// the pre-RBAC legacy fallback admitted EVERY Read, so the carve-out must
+// deny an engine session Read across the WHOLE spread of general securables
+// when RBAC is off (the DEFAULT deployment posture) — not just Inventory.
+// If any general read securable slips through here, an engine credential
+// regains fleet-wide read the moment an operator leaves RBAC at its default.
+TEST_CASE("require_permission — engine principal denied Read on EVERY general securable when "
+          "RBAC is off (Blocker 1 class, default posture)",
+          "[pg][engine_principal][integration][auth_routes][rbac]") {
+    EngineRbacGateFixture fix;
+    auto db = yuzu::test::TempDbFile{"engine-rbac-gate-spread-"};
+    RbacStore rbac_store(db.path);
+    REQUIRE(rbac_store.is_open());
+    REQUIRE_FALSE(rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+
+    // A representative spread of the general (non-per-agent) read securables
+    // that real REST read routes gate on. Every one must 403 for an engine
+    // session with zero RBAC assignments and RBAC off.
+    for (const std::string securable :
+         {"Infrastructure", "Response", "ManagementGroup", "AuditLog", "Execution", "Schedule",
+          "InstructionDefinition", "SoftwareDeployment", "GuaranteedState", "License", "Inventory"}) {
+        auto req = fix.request();
+        httplib::Response res;
+        INFO("securable=" << securable);
+        CHECK_FALSE(ar.require_permission(req, res, securable, "Read"));
+        CHECK(res.status == 403);
+    }
+}
+
 TEST_CASE("require_permission — engine principal denied (503) when the RBAC store is "
           "unavailable (Blocker 1)",
           "[pg][engine_principal][integration][auth_routes][rbac]") {
