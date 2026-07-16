@@ -5,7 +5,8 @@
 ## Sources by platform:
 ##   Windows: netsh advfirewall (Domain/Private/Public profiles)
 ##   Linux:   firewalld, ufw, or iptables (auto-detected)
-##   macOS:   pf (pfctl)
+##   macOS:   state: Application Firewall (socketfilterfw) primary, pf (pfctl)
+##            secondary; rules: pf (pfctl)
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,13 +14,16 @@ kind: InstructionDefinition
 metadata:
   id: security.firewall.state
   displayName: Firewall State
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Query the firewall state on the endpoint. On Windows, reports the
     enabled/disabled status of each Windows Firewall profile (Domain,
     Private, Public). On Linux, auto-detects the active firewall backend
-    (firewalld, ufw, or iptables) and reports its state. On macOS,
-    queries pf (pfctl) for enabled/disabled status.
+    (firewalld, ufw, or iptables) and reports its state. On macOS, reports
+    the Application Firewall global state (socketfilterfw --getglobalstate)
+    as the primary signal — with a mode row when block-all is set — and the
+    pf packet filter state as a secondary pf row; unreadable checks report
+    unknown, never a false-safe value.
   tags: [security, firewall, compliance, network]
 
 spec:

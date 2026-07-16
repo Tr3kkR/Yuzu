@@ -10,6 +10,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "firewall_parsers.hpp"
+
 #include <array>
 #include <cstdio>
 #include <format>
@@ -187,15 +189,22 @@ public:
                 }
             }
 #elif defined(__APPLE__)
-            auto output = run_command("pfctl -s info 2>/dev/null");
-            ctx.write_output("backend|pf");
-            if (output.find("Status: Enabled") != std::string::npos) {
-                ctx.write_output("state|enabled");
-            } else if (output.find("Status: Disabled") != std::string::npos) {
-                ctx.write_output("state|disabled");
-            } else {
-                ctx.write_output("state|unknown");
+            // Primary: the macOS Application Firewall — the firewall a Mac
+            // admin means. pf is off by default and unrelated, so reporting it
+            // as THE state gave false confidence. Unprivileged read.
+            auto alf_out = run_command("/usr/libexec/ApplicationFirewall/socketfilterfw "
+                                       "--getglobalstate 2>/dev/null");
+            auto alf = yuzu::firewall::parse_alf_global_state(alf_out);
+            ctx.write_output("backend|appfirewall");
+            ctx.write_output(std::format("state|{}", yuzu::firewall::to_string(alf.state)));
+            if (alf.block_all) {
+                ctx.write_output("mode|block_all");
             }
+            // Secondary: the pf packet filter (reading /dev/pf needs root;
+            // unreadable reports as unknown, never a false-safe value).
+            auto pf_out = run_command("pfctl -s info 2>/dev/null");
+            ctx.write_output(std::format(
+                "pf|{}", yuzu::firewall::to_string(yuzu::firewall::parse_pf_status(pf_out))));
 #endif
             return 0;
         }
