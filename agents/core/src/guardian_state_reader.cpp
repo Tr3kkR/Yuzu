@@ -95,6 +95,7 @@ std::string file_identity(const struct stat& st) {
 // (emplace / to_wide / vector alloc) cannot leak the key.
 struct RegKeyGuard {
     HKEY h = nullptr;
+    RegKeyGuard() = default; // a user-declared (deleted) copy ctor suppresses the implicit default
     ~RegKeyGuard() {
         if (h)
             RegCloseKey(h);

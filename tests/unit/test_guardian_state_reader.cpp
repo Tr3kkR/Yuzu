@@ -182,3 +182,60 @@ TEST_CASE("read_service maps a truly absent unit to Stopped (R5)", "[spark][stat
     REQUIRE(r.snapshot == ServiceRunState::Stopped);        // ...that folds to Stopped (R5)
 }
 #endif
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+TEST_CASE("read_registry (Windows): SZ/DWORD round-trip, REG_BINARY unsupported, absent value",
+          "[spark][statereader]") {
+    const wchar_t* kSub = L"Software\\YuzuStateReaderTest";
+    HKEY h = nullptr;
+    REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, kSub, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &h,
+                            nullptr) == ERROR_SUCCESS);
+    const wchar_t* sval = L"hello world";
+    RegSetValueExW(h, L"Str", 0, REG_SZ, reinterpret_cast<const BYTE*>(sval),
+                   static_cast<DWORD>((wcslen(sval) + 1) * sizeof(wchar_t)));
+    DWORD dval = 4242;
+    RegSetValueExW(h, L"Num", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&dval), sizeof(dval));
+    const BYTE bval[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00};
+    RegSetValueExW(h, L"Bin", 0, REG_BINARY, bval, sizeof(bval));
+    RegCloseKey(h);
+
+    GuardianStateReader reader;
+    const auto r = reader.read_registry(
+        RegistrySparkParams{.hive = "HKCU", .key = "Software\\YuzuStateReaderTest"},
+        RegistryReadPlan{.value_names = {"Str", "Num", "Bin", "Missing"}});
+
+    RegDeleteKeyW(HKEY_CURRENT_USER, kSub); // cleanup (values only, no subkeys)
+
+    REQUIRE(r.values.size() == 4);
+    REQUIRE(r.values.at("Str").known);
+    REQUIRE(r.values.at("Str").snapshot.present);
+    REQUIRE(r.values.at("Str").snapshot.supported);
+    REQUIRE(r.values.at("Str").snapshot.value == "hello world");
+    REQUIRE(r.values.at("Num").snapshot.present);
+    REQUIRE(r.values.at("Num").snapshot.value == "4242"); // REG_DWORD -> decimal
+    REQUIRE(r.values.at("Bin").snapshot.present);
+    REQUIRE_FALSE(r.values.at("Bin").snapshot.supported); // REG_BINARY -> "<unsupported-type>"
+    REQUIRE(r.values.at("Missing").known);
+    REQUIRE_FALSE(r.values.at("Missing").snapshot.present); // absent value -> "<absent>"
+}
+
+TEST_CASE("read_service (Windows): a live service is Known; an absent one folds to Stopped (R5)",
+          "[spark][statereader]") {
+    GuardianStateReader reader;
+    // EventLog is present and running on every live Windows box (a terminal state -> Known).
+    const auto live = reader.read_service(ServiceSparkParams{.service_name = "EventLog"});
+    REQUIRE(live.known);
+    const auto absent =
+        reader.read_service(ServiceSparkParams{.service_name = "YuzuNoSuchServiceXyz123"});
+    REQUIRE(absent.known);
+    REQUIRE(absent.snapshot == ServiceRunState::Stopped); // R5: absent SCM service -> Stopped
+}
+#endif // _WIN32
