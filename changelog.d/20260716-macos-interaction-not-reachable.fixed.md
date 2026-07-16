@@ -11,4 +11,9 @@
   a fabricated button). Windows/Linux behaviour is unchanged. Interaction
   plugin descriptor bumped to 0.3.0; the
   `device.interaction.message_box` definition gains a `status` result column
-  (v1.1.0).
+  (v1.1.0). Separately, the dashboard's Execution Results table now renders
+  all `interaction` plugin rows (`notify`, `message_box`, `input`, `survey`,
+  `set_dnd`) with correctly-aligned Key/Value columns on every platform —
+  they previously fell through to the generic 2-column schema with an extra
+  unlabeled cell. The underlying data was always correct; only the table
+  layout was wrong.

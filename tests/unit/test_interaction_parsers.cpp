@@ -48,3 +48,44 @@ TEST_CASE("dialog: unreachable session / missing binary / garbage is never a fal
     // now emits ##BTN##OK anyway.
     CHECK(parse_dialog_result("button returned:OK") == DialogOutcome::not_reachable);
 }
+
+TEST_CASE("build_dialog_command: exact AppleScript shape, pinned against a typo regression",
+          "[interaction]") {
+    const auto cmd = build_dialog_command("Alert", "Something happened",
+                                          "buttons {\"OK\"} default button \"OK\"");
+    // Title/message land in the one interpolated display-dialog line; every
+    // other fragment (try/on-error/end-try + both sentinel returns) is a
+    // fixed literal a future edit could typo without any compiler diagnostic
+    // — this pins the exact source text parse_dialog_result's contract
+    // depends on.
+    CHECK(cmd ==
+          "osascript -e 'try' "
+          "-e 'display dialog \"Something happened\" with title \"Alert\" "
+          "buttons {\"OK\"} default button \"OK\"' "
+          "-e 'return \"##BTN##\" & (button returned of result)' "
+          "-e 'on error errMsg number errNum' "
+          "-e 'return \"##ERR##\" & errNum' "
+          "-e 'end try' 2>&1");
+}
+
+TEST_CASE("build_dialog_command: btn_spec is threaded through verbatim per button config",
+          "[interaction]") {
+    CHECK(build_dialog_command("T", "M", "buttons {\"OK\"} default button \"OK\"")
+              .contains("buttons {\"OK\"} default button \"OK\"'"));
+    CHECK(build_dialog_command("T", "M", "buttons {\"Cancel\", \"OK\"} default button \"OK\"")
+              .contains("buttons {\"Cancel\", \"OK\"} default button \"OK\"'"));
+    CHECK(build_dialog_command("T", "M", "buttons {\"No\", \"Yes\"} default button \"Yes\"")
+              .contains("buttons {\"No\", \"Yes\"} default button \"Yes\"'"));
+    // The sentinel/control-flow skeleton is identical regardless of button
+    // config — only the one display-dialog line varies.
+    for (auto* spec : {"buttons {\"OK\"} default button \"OK\"",
+                       "buttons {\"Cancel\", \"OK\"} default button \"OK\"",
+                       "buttons {\"No\", \"Yes\"} default button \"Yes\""}) {
+        const auto cmd = build_dialog_command("T", "M", spec);
+        CHECK(cmd.starts_with("osascript -e 'try' "));
+        CHECK(cmd.ends_with("-e 'end try' 2>&1"));
+        CHECK(cmd.contains("-e 'return \"##BTN##\" & (button returned of result)' "));
+        CHECK(cmd.contains("-e 'on error errMsg number errNum' "));
+        CHECK(cmd.contains("-e 'return \"##ERR##\" & errNum' "));
+    }
+}

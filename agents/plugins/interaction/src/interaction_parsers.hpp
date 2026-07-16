@@ -18,6 +18,8 @@
  * "user canceled", decodes to `cancel`; every other error is not_reachable.
  */
 
+#include <format>
+#include <string>
 #include <string_view>
 
 namespace yuzu::interaction {
@@ -25,6 +27,26 @@ namespace yuzu::interaction {
 /// Outcome of a macOS message_box dispatch, decoded from the osascript
 /// sentinel output. `not_reachable` is the fail-closed default.
 enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
+
+/// Builds the try/on-error `display dialog` osascript invocation that
+/// `parse_dialog_result` below decodes. Pulled out as its own pure function
+/// (rather than left inline in the .cpp) so a typo in the AppleScript
+/// fragments — which would silently turn every real button press into
+/// `not_reachable` — is a unit-test failure, not a runtime-only regression.
+/// `safe_title`/`safe_msg` must already be sanitized by the caller; this
+/// function performs no escaping of its own.
+[[nodiscard]] inline std::string build_dialog_command(std::string_view safe_title,
+                                                       std::string_view safe_msg,
+                                                       std::string_view btn_spec) {
+    return std::format(
+        "osascript -e 'try' "
+        "-e 'display dialog \"{}\" with title \"{}\" {}' "
+        "-e 'return \"##BTN##\" & (button returned of result)' "
+        "-e 'on error errMsg number errNum' "
+        "-e 'return \"##ERR##\" & errNum' "
+        "-e 'end try' 2>&1",
+        safe_msg, safe_title, btn_spec);
+}
 
 /// The osascript command wraps `display dialog` in try/on-error and returns
 /// either `##BTN##<button>` (a real button press) or `##ERR##<errNum>` (an

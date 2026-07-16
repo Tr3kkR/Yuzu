@@ -339,14 +339,7 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     // so no shell/AppleScript metacharacter reaches the string); btn_spec
     // and every sentinel/-e fragment are fixed compile-time literals — no
     // operator-supplied text controls the command's shape.
-    std::string cmd = std::format(
-        "osascript -e 'try' "
-        "-e 'display dialog \"{}\" with title \"{}\" {}' "
-        "-e 'return \"##BTN##\" & (button returned of result)' "
-        "-e 'on error errMsg number errNum' "
-        "-e 'return \"##ERR##\" & errNum' "
-        "-e 'end try' 2>&1",
-        safe_msg, safe_title, btn_spec);
+    std::string cmd = yuzu::interaction::build_dialog_command(safe_title, safe_msg, btn_spec);
 
     switch (yuzu::interaction::parse_dialog_result(run_command(cmd))) {
     case yuzu::interaction::DialogOutcome::ok:
