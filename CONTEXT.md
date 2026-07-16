@@ -113,6 +113,14 @@ A directed chain through the reachability graph from an **entry point** to a **c
 
 A node or edge lying on many high-value attack paths, such that removing it — patching/isolating the host, or closing the port/flow — severs the most at-risk value for the least defender effort. Ranked by **defender ROI**: the sum of `crown-jewel value × path probability` over the attack paths the removal would break, **not** by generic graph centrality. The minimum-effort set of removals that fully severs a trust zone from crown jewels it should not reach is a **segmentation recommendation** (a cost-weighted min-cut). Because the graph is observed-grounded, a chokepoint severs *observed* paths; policy-permitted-but-unobserved paths are out of scope until host-firewall potential-reachability enrichment lands.
 
+## Gate state
+
+A field on a `triaged` or `mitigated` finding (ADR-4004) marking whether it's under active remediation scheduling and, if so, how protected it is from being silently re-prioritized by routine rescoring: `none` (unscheduled), `scheduled` (a change record raised), `in_progress` (change window open, no rescore interrupts), or `deferred` (an explicit, TTL-bound pause). Null for every other disposition — it answers a narrower question than the disposition lifecycle itself.
+
+## Assessment coverage
+
+The vulnerability-management module's own coverage metric: the UNKNOWN-fraction and LOW-provenance-fraction of a device's assessed packages, stamped as-of-inventory — the honest measure of "how much did we actually assess," not inferable from the vulnerability count (ADR-0019). Measures per-endpoint CVE-assessment completeness specifically — a deliberately distinct name from any reachability-graph coverage metric, so the two never sit ambiguously side by side on a dashboard.
+
 ## Component inventory
 
 The per-endpoint census of individual software *components* — including ones no package manager
