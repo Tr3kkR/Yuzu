@@ -78,9 +78,12 @@ bool wait_for_workers_to_drain(ActiveWorkersFn&& active_workers,
 }
 
 /// A fail-closed backstop for the F3 orphan-exit check. Construct this
-/// immediately after run() returns - before any operation that could throw
-/// and unwind past the caller's own explicit check (report_status, a logger
-/// flush, a mutex acquisition under resource exhaustion) - and call disarm()
+/// immediately BEFORE calling run() - run() itself is not noexcept and has a
+/// substantial throwing surface, so a guard armed only after it returns would
+/// miss an exception thrown from run() itself - and before any other
+/// operation that could throw and unwind past the caller's own explicit check
+/// (report_status, a logger flush, a mutex acquisition under resource
+/// exhaustion). Call disarm()
 /// once that explicit check has run to completion on the normal path. If
 /// something throws before disarm() is reached, this guard's destructor
 /// performs the SAME check during unwinding, before the caller's own `Agent`
