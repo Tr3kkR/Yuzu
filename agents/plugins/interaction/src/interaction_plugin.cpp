@@ -23,6 +23,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "interaction_parsers.hpp"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -318,21 +320,43 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         btn_spec = "buttons {\"OK\"} default button \"OK\"";
     }
 
+    // Wrap the dialog in try/on-error and return a sentinel so an unreachable
+    // display server (this agent is a root LaunchDaemon with no Aqua/GUI
+    // session — see docs/agent-privilege-model.md) is reported honestly as
+    // not_reachable instead of a false button. The bare substring match this
+    // replaced fell through to "response|ok" for ANY unrecognised output,
+    // claiming the user clicked OK on a dialog that was never shown. The
+    // try/on-error idiom mirrors platform_input; capturing the error NUMBER
+    // keeps a genuine user-cancel (-128) distinct from an undeliverable
+    // session. safe_msg/safe_title are already sanitize()d (no shell/AppleScript
+    // injection); the sentinels are fixed literals.
     std::string cmd = std::format(
-        "osascript -e 'display dialog \"{}\" with title \"{}\" {}' 2>&1",
+        "osascript -e 'try' "
+        "-e 'display dialog \"{}\" with title \"{}\" {}' "
+        "-e 'return \"##BTN##\" & (button returned of result)' "
+        "-e 'on error errMsg number errNum' "
+        "-e 'return \"##ERR##\" & errNum' "
+        "-e 'end try' 2>&1",
         safe_msg, safe_title, btn_spec);
 
-    std::string output = run_command(cmd);
-
-    // osascript returns "button returned:OK" or "button returned:Yes" etc.
-    if (output.find("Cancel") != std::string::npos) {
-        ctx.write_output("response|cancel");
-    } else if (output.find("No") != std::string::npos) {
-        ctx.write_output("response|no");
-    } else if (output.find("Yes") != std::string::npos) {
-        ctx.write_output("response|yes");
-    } else {
+    switch (yuzu::interaction::parse_dialog_result(run_command(cmd))) {
+    case yuzu::interaction::DialogOutcome::ok:
         ctx.write_output("response|ok");
+        break;
+    case yuzu::interaction::DialogOutcome::cancel:
+        ctx.write_output("response|cancel");
+        break;
+    case yuzu::interaction::DialogOutcome::yes:
+        ctx.write_output("response|yes");
+        break;
+    case yuzu::interaction::DialogOutcome::no:
+        ctx.write_output("response|no");
+        break;
+    case yuzu::interaction::DialogOutcome::not_reachable:
+        // No GUI session / TCC denial / osascript failure — honest status,
+        // never a fabricated button. Rides the new `status` result column.
+        ctx.write_output("status|not_reachable");
+        break;
     }
     return 0;
 }
@@ -864,7 +888,7 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 class InteractionPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "interaction"; }
-    std::string_view version() const noexcept override { return "0.2.0"; }
+    std::string_view version() const noexcept override { return "0.3.0"; }
     std::string_view description() const noexcept override {
         return "Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND";
     }

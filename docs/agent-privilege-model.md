@@ -130,7 +130,7 @@ This section matters as much as the positive grants — it documents the privile
 | Membership in `wheel` / `Administrators` | Linux / Windows (dev) | Same audit-surface argument as generic sudo. Only the production virtual service account has equivalent privileges, and those are bounded by what `Administrators` grants in the platform default. |
 | `cap_sys_admin` | Linux | Grants too much (mount, swap, etc.). Plugins should never need this. |
 | Write access to `/usr/local/lib/yuzu/plugins/` | all | A compromised plugin shouldn't be able to tamper with siblings. Plugin signing (future) will add a second layer. |
-| GUI session access | all | Daemons can't reach a logged-in user's display server. The interaction plugin needs a separate per-session helper, not the daemon. |
+| GUI session access | all | Daemons can't reach a logged-in user's display server. The interaction plugin needs a separate per-session helper, not the daemon. On macOS the `interaction` `message_box` action now surfaces this honestly — `status\|not_reachable` when `osascript 'display dialog'` cannot reach a session, never a fabricated button (interaction plugin ≥ 0.3.0). Delivering the dialog to the logged-in user is the deferred per-session helper. |
 | `chown` / `chmod` shell-outs | macOS, Linux | Agent should never rewrite ACLs. If a plugin needs to write a path the agent doesn't own, that's a configuration problem. |
 
 ---
