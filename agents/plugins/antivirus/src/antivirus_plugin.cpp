@@ -198,9 +198,10 @@ void list_av_products_macos(yuzu::CommandContext& ctx) {
     for (const auto& ext : exts) {
         if (!yuzu::antivirus::is_endpoint_security(ext))
             continue;
-        ctx.write_output(
-            std::format("av|{}|{}", ext.name, yuzu::antivirus::sysext_av_state(ext)));
-        ctx.write_output(std::format("edr|{}|{}", ext.bundle_id, ext.version));
+        ctx.write_output(std::format("av|{}|{}", yuzu::antivirus::sanitize_field(ext.name),
+                                      yuzu::antivirus::sysext_av_state(ext)));
+        ctx.write_output(std::format("edr|{}|{}", yuzu::antivirus::sanitize_field(ext.bundle_id),
+                                      yuzu::antivirus::sanitize_field(ext.version)));
         es_names += ext.name;
         es_names += '|';
         es_names += ext.bundle_id;

@@ -4,7 +4,7 @@
  *
  * The popen shell-outs are the impure shell; the decision-shaped parsing of
  * PlistBuddy version output and `systemextensionsctl list` is header-pure and
- * pinned here on every host (the firewall_parsers.hpp pattern). Fixture
+ * pinned here on every host (the licensing_parsers.hpp pattern). Fixture
  * strings marked "real capture" were taken verbatim from a macOS 26 host;
  * older macOS releases are not yet fixture-verified — capture and add when
  * such hardware is available.
@@ -104,6 +104,14 @@ TEST_CASE("sysext: malformed rows are skipped without throwing", "[antivirus]") 
     CHECK(no_ver[0].bundle_id == "com.vendor.thing");
     CHECK(no_ver[0].version.empty());
     CHECK(sysext_av_state(no_ver[0]) == "installed"); // enabled but not active
+}
+
+TEST_CASE("sanitize_field: neutralises pipe/CR/LF that would shift wire-format fields",
+          "[antivirus]") {
+    CHECK(sanitize_field("normal name") == "normal name");
+    CHECK(sanitize_field("evil|injected") == "evil injected");
+    CHECK(sanitize_field("evil\r\ninjected") == "evil  injected");
+    CHECK(sanitize_field("") == "");
 }
 
 TEST_CASE("contains_insensitive: dedupe helper", "[antivirus]") {

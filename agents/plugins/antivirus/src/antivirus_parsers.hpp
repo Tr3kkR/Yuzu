@@ -7,7 +7,7 @@
  * modern EDR/AV products register their endpoint-security extensions.
  *
  * Header-only and OS-free so the parsing is unit-tested on every host
- * (test_antivirus_parsers.cpp — the firewall_parsers.hpp pattern); the popen
+ * (test_antivirus_parsers.cpp — the licensing_parsers.hpp pattern); the popen
  * shell-outs in antivirus_plugin.cpp are the impure shell.
  *
  * Honest-status invariant: empty, truncated, or unrecognised output parses
@@ -26,7 +26,8 @@ namespace yuzu::antivirus {
 /// whitespace, quotes, or colons is error text, not a version — returns an
 /// empty view (the caller maps that to unknown). The returned view aliases
 /// `out` and must not outlive it.
-[[nodiscard]] constexpr std::string_view parse_plist_version(std::string_view out) {
+[[nodiscard]] constexpr std::string_view parse_plist_version(
+    std::string_view out [[clang::lifetimebound]]) {
     // Trim surrounding whitespace/newlines.
     while (!out.empty() && (out.front() == ' ' || out.front() == '\t' || out.front() == '\n' ||
                             out.front() == '\r'))
@@ -142,6 +143,18 @@ struct SysExtension {
 /// present but not protecting ("installed").
 [[nodiscard]] inline std::string_view sysext_av_state(const SysExtension& ext) {
     return ext.enabled && ext.active ? "active" : "installed";
+}
+
+/// The wire format is pipe-delimited, one record per line. A sysext name,
+/// bundle id, or version (vendor-controlled — the same registry a rogue
+/// extension could spoof) containing '|', CR, or LF would shift/split fields
+/// on the server-side positional parser, so neutralise those bytes to a
+/// space before emitting (the processes_plugin.cpp sanitize_field pattern).
+[[nodiscard]] inline std::string sanitize_field(std::string s) {
+    for (char& c : s)
+        if (c == '|' || c == '\n' || c == '\r')
+            c = ' ';
+    return s;
 }
 
 /// Case-insensitive substring test (ASCII), for de-duplicating the pgrep

@@ -391,7 +391,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.1.0 |
+| **Version** | v0.2.0 |
 | **Platforms** | W L M |
 | **Description** | Antivirus product detection and status. |
 
