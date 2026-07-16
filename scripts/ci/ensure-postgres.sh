@@ -46,6 +46,12 @@ SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf"
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432
+# Bump when the durability/-c tuning below changes: the docker container is
+# persistent (--restart unless-stopped), so a container born before a tuning
+# change keeps the OLD flags until recreated. The image-drift guard already
+# recreates on a PG_IMAGE bump; this label makes a tuning bump recreate too,
+# so fsync=off actually reaches runners that already have a container.
+PG_TUNE_LABEL="v1-durability-off"
 
 # ── Per-agent instance selection (#2094) ─────────────────────────────────
 # Both self-hosted pools run 4 runner agents on ONE box (CLAUDE.md standing
@@ -67,6 +73,15 @@ if [[ "${RUNNER_NAME:-}" =~ -([0-9]+)$ ]]; then
     AGENT_IDX=""
   fi
 fi
+# Disposable CI cluster -> durability OFF (fsync/synchronous_commit/
+# full_page_writes). Every [pg] test does CREATE DATABASE ... TEMPLATE + DROP
+# DATABASE WITH (FORCE) per case (~72 cases) — both fsync-heavy — so full
+# durability makes the [pg] shard the slowest-scaling part of the suite,
+# ~20x worse on Windows where fsync is dominant (the 2026-07-14 600s Windows
+# TIMEOUTs). The DBs are throwaway; a crash just re-runs the job. fsync and
+# full_page_writes are POSTMASTER params, so they must be set at the server
+# (the -c flags here / postgresql.conf), not per-connection.
+DOCKER_PG_ARGS=(-c fsync=off -c synchronous_commit=off -c full_page_writes=off)
 if [[ -n "$AGENT_IDX" ]]; then
   # Container-per-agent on 15440+<n>: base deliberately OFF 15432/15433 so
   # agent 0 collides with neither a legacy shared container (15432) nor the
@@ -75,11 +90,17 @@ if [[ -n "$AGENT_IDX" ]]; then
   DOCKER_PORT=$((15440 + AGENT_IDX))
   # Wee-Tam-parity connection headroom (#2096): the server suite's PgPool
   # fan-out can exhaust the postgres default of 100 (the CH-9 flake).
-  DOCKER_PG_ARGS=(-c max_connections=400)
-else
-  DOCKER_PG_ARGS=()
+  DOCKER_PG_ARGS+=(-c max_connections=400)
 fi
 
+# NOTE: durability-off is applied SERVER-SIDE only (docker/brew `-c` flags
+# below; the native Windows service via deploy/windows/Provision-Windows-Runner
+# .ps1 or a one-off `ALTER SYSTEM SET fsync/synchronous_commit/full_page_writes
+# = off` + reload). Do NOT inject it into the emitted DSN via the libpq
+# `options` keyword: PgPool only injects its statement_timeout/lock_timeout
+# GUCs "unless the conninfo sets its own `options`" (pg_pool.hpp), so a DSN-level
+# `options=` silently disables those safety bounds — the [pg][hardening] test
+# "PgPool injects statement_timeout and lock_timeout GUCs" catches it.
 emit_dsn() {
   local dsn="$1" how="$2"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
@@ -95,8 +116,42 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
 }
 
+# PGOPTIONS is process-environment-level, not DSN content: pg_pool.cpp's
+# conninfo_has_options_ gate checks getenv("PGOPTIONS") unconditionally,
+# regardless of which of the 4 paths below built the connection string.
+# A set PGOPTIONS would silently disable PgPool's statement_timeout/
+# lock_timeout safety bounds even on the docker/brew/native paths, which
+# never see a caller-supplied DSN - so this runs unconditionally, before
+# path selection, not only inside the pre-set-DSN branch (path 1 below).
+if [[ -n "${PGOPTIONS:-}" ]]; then
+  echo "::error::ensure-postgres: PGOPTIONS must not be set in the job or runner machine environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+  exit "$SOFT_EXIT"
+fi
+
 # ── 1. Pre-set DSN wins ──────────────────────────────────────────────────
 if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+  # PgPool (pg_pool.cpp) only injects its statement_timeout/lock_timeout
+  # safety-bound GUCs when PQconninfoParse finds no `options` keyword (the
+  # PGOPTIONS half of that same gate is checked unconditionally above). An
+  # `options=` in a pre-set DSN (URI query form OR keyword form) silently
+  # disables those bounds (the [pg][hardening] test "PgPool injects
+  # statement_timeout and lock_timeout GUCs"). This is the one path that
+  # takes a caller-supplied DSN (paths 2-4 build DSNs from constants), so
+  # gate it before the per-agent derivation below, which would otherwise
+  # carry an unsafe `options=` straight into PA_DSN. DSN-literal match
+  # only - an indirect `service=` naming a pg_service.conf section that
+  # itself sets `options=` is out of scope for this string check. Case-
+  # sensitive is intentional: libpq's conninfo_storeval (fe-connect.c)
+  # matches keywords via a case-sensitive strcmp, so an "OPTIONS=" variant
+  # isn't honored as the `options` keyword by libpq either. Keyword-form
+  # conninfo allows whitespace around `=` (`options = -c ...` is valid
+  # per libpq's conninfo_parse), so the `=` is matched with `[[:space:]]*`
+  # in front, not a bare `=` - adversarial review v2 F1', reproduced
+  # empirically against `options = '-c statement_timeout=0'`.
+  if [[ "${YUZU_TEST_POSTGRES_DSN}" =~ (^|[?&[:space:]])options[[:space:]]*= ]]; then
+    echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+    exit "$SOFT_EXIT"
+  fi
   # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
   # (machine env on Wee Tam) names the agent-0 cluster; agent <n> shifts
   # the port by <n> (Wee Tam: 5433 -> 5434..5436, provisioned by
@@ -147,15 +202,21 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # runners that already have one — tests would silently keep running the
   # old Postgres. Recreate when the recorded image differs.
   EXISTING_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-  if [[ -n "$EXISTING_IMAGE" && "$EXISTING_IMAGE" != "$PG_IMAGE" ]]; then
-    echo "ensure-postgres: ${CONTAINER} image ${EXISTING_IMAGE} != pinned ${PG_IMAGE} — recreating" >&2
+  EXISTING_TUNE="$(docker inspect -f '{{index .Config.Labels "yuzu-pgtune"}}' "$CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$EXISTING_IMAGE" && ( "$EXISTING_IMAGE" != "$PG_IMAGE" || "$EXISTING_TUNE" != "$PG_TUNE_LABEL" ) ]]; then
+    echo "ensure-postgres: ${CONTAINER} drift (image ${EXISTING_IMAGE} vs ${PG_IMAGE}, tune ${EXISTING_TUNE:-none} vs ${PG_TUNE_LABEL}) — recreating" >&2
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+      echo "::error::ensure-postgres: failed to remove stale ${CONTAINER} - old tuning still active. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+      exit "$SOFT_EXIT"
+    fi
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != "true" ]]; then
     # ${arr[@]+...} guarded expansion: empty-array-safe under `set -u` on
     # bash 3.2 (macOS /bin/bash) too.
     docker start "$CONTAINER" >/dev/null 2>&1 || docker run -d \
       --name "$CONTAINER" \
+      --label "yuzu-pgtune=${PG_TUNE_LABEL}" \
       --restart unless-stopped \
       -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu_test \
       -p "127.0.0.1:${DOCKER_PORT}:5432" \
@@ -194,8 +255,9 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     "$PGBIN/initdb" --username=yuzu --auth=trust --no-instructions -D "$PGDATA" >/dev/null
   fi
   if ! "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+    # Durability off — throwaway per-job cluster (see DOCKER_PG_ARGS rationale).
     "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGLOG" \
-      -o "-p ${DOCKER_PORT} -c listen_addresses=127.0.0.1" start >/dev/null
+      -o "-p ${DOCKER_PORT} -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" start >/dev/null
   fi
   for _ in $(seq 1 15); do
     if "$PGBIN/pg_isready" -h 127.0.0.1 -p "$DOCKER_PORT" -U yuzu >/dev/null 2>&1; then

@@ -57,10 +57,22 @@ $ProgressPreference    = 'SilentlyContinue'
 New-Item -ItemType Directory -Force 'C:\ProvisionLogs' | Out-Null
 Start-Transcript -Path "C:\ProvisionLogs\provision-$(Get-Date -Format yyyyMMdd-HHmmss).log" | Out-Null
 
+$script:failedSteps = @()
 function Step([string]$name,[scriptblock]$body){
+  # Every Step still runs regardless of an earlier one's failure (unchanged
+  # semantics) - only the PROCESS exit code changes. Before this, a failed
+  # Step printed red [FAIL] but the script always exited 0, so nothing
+  # calling this non-interactively (a wrapper, a scheduled reconciliation
+  # job) could tell success from failure - adversarial review v2 F3',
+  # PR #2167. $script: is required: Step is a function, so a bare
+  # $failedSteps assignment in the catch below would be local to that one
+  # call and never accumulate across Step() invocations.
   Write-Host "`n===== $name =====" -ForegroundColor Cyan
   try   { & $body; Write-Host "[OK]  $name" -ForegroundColor Green }
-  catch { Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red }
+  catch {
+    Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red
+    $script:failedSteps += $name
+  }
 }
 function WG([string]$id,[string]$ver='',[string]$override='',[string]$scope='machine'){
   $a=@('install','--id',$id,'-e','--source','winget','--accept-source-agreements','--accept-package-agreements','--disable-interactivity')
@@ -152,7 +164,13 @@ Step 'VS 2022 Build Tools (C++ workload)' {
 
 Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_test)" {
   $major = $PostgresVersion.Split('.')[0]
-  $pgbin = "C:\Program Files\PostgreSQL\$major\bin"
+  # Prefer an EXISTING install, whatever its layout: Wee Tam ships a zip install
+  # at C:\pgsql\bin, a winget install lands in Program Files. Hardcoding the
+  # Program Files path made the per-agent step throw "initdb not found" on Wee
+  # Tam — why #2094 was never provisioned there. Fall back to the winget target
+  # for a fresh box where psql does not exist yet (the agent-0 step installs it).
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   if(-not (Test-Path "$pgbin\psql.exe")){
     WG -id "PostgreSQL.PostgreSQL.$major" -ver $PostgresVersion -scope '' `
        -override "--mode unattended --unattendedmodeui none --superpassword postgres --servicename postgresql-x64-$major-yuzu-ci --serverport $PostgresPort"
@@ -162,24 +180,48 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
   $env:PGPASSWORD='postgres'
-  $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$PostgresPort")
-  if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
-    & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+  # try/finally so Remove-Item runs on every exit path, including a throw from
+  # the LASTEXITCODE checks below - same PGPASSWORD-leak class of bug the
+  # per-agent block below was fixed for; agent-0 gets the identical guard for
+  # sibling parity (Gate 4 consistency-auditor review of PR #2167).
+  try {
+    $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$PostgresPort")
+    if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
+      & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+    }
+    if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
+      & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
+    }
+    # Tune for the shared 4-runner instance: server-test suites across concurrent
+    # CCD-pinned runners exhaust the default max_connections=100, so PgPool.acquire()
+    # returns an empty lease (the CH-9 [pg][chaos] flake). logging_collector=on so a
+    # future exhaustion is diagnosable (off by default leaves no log files). Both are
+    # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
+    # $LASTEXITCODE is checked explicitly - see the per-agent block below for why
+    # $ErrorActionPreference='Continue' alone doesn't catch a failed psql.exe here.
+    & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET max_connections failed" }
+    & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET logging_collector failed" }
+    # Disposable CI cluster -> durability OFF. Every [pg] test does CREATE DATABASE
+    # ... TEMPLATE + DROP DATABASE WITH (FORCE), both fsync-heavy, and Windows fsync
+    # is ~20x costlier than Linux (the 2026-07-14 Wee Tam 600s [pg]-shard TIMEOUTs).
+    # A crash just re-runs the job. Removing these re-arms the timeout. All three
+    # are sighup/user context, so applying them to a LIVE cluster needs only a
+    # reload (`SELECT pg_reload_conf()`), no restart — the restart below is for
+    # max_connections (postmaster) and applies these in passing.
+    & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed" }
+    & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed" }
+    & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+    if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed" }
+  } finally {
+    Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
   }
-  if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
-    & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
-  }
-  # Tune for the shared 4-runner instance: server-test suites across concurrent
-  # CCD-pinned runners exhaust the default max_connections=100, so PgPool.acquire()
-  # returns an empty lease (the CH-9 [pg][chaos] flake). logging_collector=on so a
-  # future exhaustion is diagnosable (off by default leaves no log files). Both are
-  # postmaster params -> restart to apply. Idempotent (ALTER SYSTEM -> auto.conf).
-  & $psql @H -c "ALTER SYSTEM SET max_connections = $PostgresMaxConnections"
-  & $psql @H -c 'ALTER SYSTEM SET logging_collector = on'
   Restart-Service $svc -Force
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
-  Remove-Item Env:\PGPASSWORD
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
@@ -193,53 +235,137 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   # switching, so no runner .env / wrapper / re-registration is needed —
   # provisioning these clusters IS the whole cutover.
   $major = $PostgresVersion.Split('.')[0]
-  $pgbin = "C:\Program Files\PostgreSQL\$major\bin"
+  # Prefer an EXISTING install, whatever its layout: Wee Tam ships a zip install
+  # at C:\pgsql\bin, a winget install lands in Program Files. Hardcoding the
+  # Program Files path made the per-agent step throw "initdb not found" on Wee
+  # Tam — why #2094 was never provisioned there. Fall back to the winget target
+  # for a fresh box where psql does not exist yet (the agent-0 step installs it).
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   if(-not (Test-Path "$pgbin\initdb.exe")){ throw "initdb not found at $pgbin — the main PostgreSQL step must succeed first" }
   $pw = Join-Path $env:TEMP 'yuzu-pg-pwfile.txt'
   Set-Content $pw 'postgres' -Encoding Ascii
   try {
+    $failedAgents = @()
     for($n=1; $n -lt $RunnerCount; $n++){
       $port = $PostgresPort + $n
       $data = "$CacheRoot\pg\agent-$n"
       $svc  = "postgresql-x64-$major-yuzu-ci-$n"
-      if(-not (Test-Path "$data\PG_VERSION")){
-        New-Item -ItemType Directory -Force $data | Out-Null
-        # initdb/pg_ctl drop admin rights via a restricted token, so the
-        # invoking user needs an EXPLICIT grant (its Administrators ACE no
-        # longer applies); NETWORK SERVICE (S-1-5-20 — the same account the
-        # EDB-installed agent-0 service runs as) owns the cluster at runtime.
-        icacls $data /grant "$($env:USERNAME):(OI)(CI)F" | Out-Null
-        icacls $data /grant '*S-1-5-20:(OI)(CI)F' | Out-Null
-        & "$pgbin\initdb.exe" -D $data -U postgres -A password --pwfile=$pw -E UTF8 | Out-Null
-        if(-not (Test-Path "$data\PG_VERSION")){ throw "initdb failed for $data" }
-        Add-Content "$data\postgresql.conf" "`n# yuzu CI per-agent cluster $n (#2094)`nlisten_addresses = '127.0.0.1'`nport = $port`nmax_connections = $PostgresMaxConnections`nlogging_collector = on`n"
+      # Catch PER AGENT, not just per-call: one agent's failure (initdb,
+      # service-not-ready, or an ALTER SYSTEM/reload check below) must not
+      # abort provisioning for agents n+1..RunnerCount-1 - that would
+      # silently leave them un-tuned with no signal beyond this one agent's
+      # error, reproducing on a subset of runners the exact [pg]-shard
+      # timeout this PR exists to fix, with no automated detection (Gate 4
+      # unhappy-path UP-2/UP-3, PR #2167). Record and continue; the
+      # accumulated failure list after the loop still throws once, naming
+      # every failed agent, so this isn't silently swallowed either.
+      try {
+        if(-not (Test-Path "$data\PG_VERSION")){
+          New-Item -ItemType Directory -Force $data | Out-Null
+          # initdb/pg_ctl drop admin rights via a restricted token, so the
+          # invoking user needs an EXPLICIT grant (its Administrators ACE no
+          # longer applies); NETWORK SERVICE (S-1-5-20 — the same account the
+          # EDB-installed agent-0 service runs as) owns the cluster at runtime.
+          icacls $data /grant "$($env:USERNAME):(OI)(CI)F" | Out-Null
+          icacls $data /grant '*S-1-5-20:(OI)(CI)F' | Out-Null
+          & "$pgbin\initdb.exe" -D $data -U postgres -A password --pwfile=$pw -E UTF8 | Out-Null
+          if(-not (Test-Path "$data\PG_VERSION")){ throw "initdb failed for $data" }
+          # Durability off — disposable CI cluster (see the agent-0 tune block above).
+          Add-Content "$data\postgresql.conf" "`n# yuzu CI per-agent cluster $n (#2094)`nlisten_addresses = '127.0.0.1'`nport = $port`nmax_connections = $PostgresMaxConnections`nlogging_collector = on`nfsync = off`nsynchronous_commit = off`nfull_page_writes = off`n"
+        }
+        if(-not (Get-Service $svc -EA SilentlyContinue)){
+          & "$pgbin\pg_ctl.exe" register -N $svc -D $data -S auto -U 'NT AUTHORITY\NetworkService'
+        }
+        Start-Service $svc
+        $deadline=(Get-Date).AddSeconds(90)
+        do {
+          & "$pgbin\pg_isready.exe" -q -h 127.0.0.1 -p $port 2>$null
+          if($LASTEXITCODE -eq 0){ break }
+          Start-Sleep 2
+        } while((Get-Date) -lt $deadline)
+        if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s (svc $svc, data $data)" }
+        $env:PGPASSWORD='postgres'
+        # $env:PGPASSWORD is process-scoped, not scriptblock-scoped, so every
+        # exit out of this span - including a throw from the LASTEXITCODE
+        # checks below - must go through Remove-Item, or the password stays
+        # set (and inheritable by child processes) for every later Step in
+        # this same PowerShell process. try/finally, not a bare Remove-Item
+        # at the bottom, so a throw still cleans up.
+        try {
+          $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$port")
+          if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
+            & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
+          }
+          if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
+            & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
+          }
+          # Durability off - applied UNCONDITIONALLY (not only inside the initdb
+          # guard above) so re-provisioning an EXISTING per-agent cluster also
+          # picks up the tuning; a cluster provisioned before this PR landed
+          # would otherwise keep fsync=on forever and keep hitting the
+          # [pg]-shard timeout on its port. Mirrors the agent-0 tune block
+          # above. All three are sighup/user context -> reload suffices, no
+          # restart needed. $LASTEXITCODE is checked explicitly:
+          # $ErrorActionPreference='Continue' does not intercept a native
+          # exe's nonzero exit on this PS 5.1 host, so an unchecked psql.exe
+          # failure here would silently leave durability ON while the loop
+          # still reports the agent "ready" - exactly the kind of swallowed
+          # failure this PR's other fixes are closing elsewhere.
+          & $psql @H -c 'ALTER SYSTEM SET fsync = off'
+          if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET fsync=off failed on agent $n (:$port)" }
+          & $psql @H -c 'ALTER SYSTEM SET synchronous_commit = off'
+          if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET synchronous_commit=off failed on agent $n (:$port)" }
+          & $psql @H -c 'ALTER SYSTEM SET full_page_writes = off'
+          if($LASTEXITCODE -ne 0){ throw "ALTER SYSTEM SET full_page_writes=off failed on agent $n (:$port)" }
+          & $psql @H -c 'SELECT pg_reload_conf()' | Out-Null
+          if($LASTEXITCODE -ne 0){ throw "pg_reload_conf() failed on agent $n (:$port)" }
+        } finally {
+          Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
+        }
+        Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
+      } catch {
+        Write-Warning "agent ${n} provisioning FAILED: $($_.Exception.Message) - continuing to the next agent; re-run this script to retry agent $n (already-provisioned agents are untouched on re-run)"
+        $failedAgents += $n
       }
-      if(-not (Get-Service $svc -EA SilentlyContinue)){
-        & "$pgbin\pg_ctl.exe" register -N $svc -D $data -S auto -U 'NT AUTHORITY\NetworkService'
-      }
-      Start-Service $svc
-      $deadline=(Get-Date).AddSeconds(90)
-      do {
-        & "$pgbin\pg_isready.exe" -q -h 127.0.0.1 -p $port 2>$null
-        if($LASTEXITCODE -eq 0){ break }
-        Start-Sleep 2
-      } while((Get-Date) -lt $deadline)
-      if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s (svc $svc, data $data)" }
-      $env:PGPASSWORD='postgres'
-      $psql="$pgbin\psql.exe"; $H=@('-U','postgres','-h','127.0.0.1','-p',"$port")
-      if((& $psql @H -tAc 'SELECT 1 FROM pg_roles WHERE rolname=''yuzu''') -ne '1'){
-        & $psql @H -c 'CREATE ROLE yuzu LOGIN SUPERUSER PASSWORD ''yuzu'''
-      }
-      if((& $psql @H -tAc 'SELECT 1 FROM pg_database WHERE datname=''yuzu_test''') -ne '1'){
-        & $psql @H -c 'CREATE DATABASE yuzu_test OWNER yuzu'
-      }
-      Remove-Item Env:\PGPASSWORD
-      Write-Host "agent ${n}: PG on :$port ready (svc $svc, data $data)"
+    }
+    if($failedAgents.Count -gt 0){
+      throw "per-agent Postgres provisioning failed for agent(s) $($failedAgents -join ', ') - see the WARNING lines above; re-run this script to retry them"
     }
     "per-agent clusters 1..$($RunnerCount-1) ready on :$($PostgresPort+1)..:$($PostgresPort+$RunnerCount-1)"
   } finally {
     Remove-Item $pw -EA SilentlyContinue
   }
+}
+
+Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
+  # THE dominant [pg]-shard cost on Windows: Postgres has no fork(), so it
+  # CreateProcess()es a fresh postgres.exe backend PER CONNECTION, and Defender
+  # scans that binary on every spawn. Measured 570 ms/connection unexcluded vs
+  # 36 ms excluded (~16x); the shard opens ~1000+ connections, so this is the
+  # difference between the 900s TIMEOUT and finishing. postgres.exe joins the
+  # cl/link/ninja/python process exclusions this box already carries for the
+  # same reason. Also exclude the data dirs (CREATE DATABASE ... TEMPLATE file
+  # writes) — a smaller, secondary win. Disposable test data on a CI runner.
+  $major = $PostgresVersion.Split('.')[0]
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  # Path-scoped, not a bare filename: 'postgres.exe' alone excludes any
+  # process with that name machine-wide. $pgbin is the one bin dir every
+  # agent's service (agent-0 + agents 1..N-1) launches postgres.exe from.
+  if($pgbin){
+    Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue   # per-connection backend spawn (the big one)
+  } else {
+    Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
+  }
+  $paths = @()
+  if($pgbin){
+    $paths += $pgbin                                          # bin dir: postgres.exe not scanned on launch
+    $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
+  }
+  $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
+  foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
+  $procExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(skipped - pgbin not found)' }
+  "Defender exclusions added: process=$procExcl; paths=" + ($paths -join ', ')
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
@@ -275,6 +401,14 @@ Step "emit toolchain manifest -> $ManifestPath" {
   $vsw="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   $msvc = if(Test-Path $vsw){ (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1) } else { $null }
   $major = $PostgresVersion.Split('.')[0]
+  # Same resolution as the PostgreSQL/per-agent-cluster/Defender-exclusion
+  # steps above - each Step scriptblock gets its own scope, so $pgbin from
+  # those earlier steps doesn't carry over here and must be re-resolved.
+  # A hardcoded Program Files path (Wee Tam is a C:\pgsql zip install)
+  # made Assert-Toolchain.ps1's self-test report [MISS] postgres after a
+  # successful provision - adversarial review v2 F2'.
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   $tools = @(
     @{ name='python';     path=(Get-Command python -EA SilentlyContinue).Source; version=(Ver { python --version }); required=$true }
     @{ name='meson';      path=(Get-Command meson  -EA SilentlyContinue).Source; version=(Ver { meson --version });  required=$true }
@@ -287,7 +421,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
     @{ name='msvc';       path=$msvc; version=$null; required=$true }
     @{ name='msys2_bash'; path="$Msys2Root\usr\bin\bash.exe"; version=(Ver { & "$Msys2Root\usr\bin\bash.exe" --version }); required=$true }
     @{ name='vcpkg';      path="$VcpkgRoot\vcpkg.exe"; version=(Ver { & "$VcpkgRoot\vcpkg.exe" version }); required=$true }
-    @{ name='postgres';   path="C:\Program Files\PostgreSQL\$major\bin\psql.exe"; version=$PostgresVersion; required=$true }
+    @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
   $manifest = [ordered]@{
     generated = (Get-Date).ToUniversalTime().ToString('o')
@@ -307,6 +441,11 @@ Step "emit toolchain manifest -> $ManifestPath" {
 }
 
 Stop-Transcript | Out-Null
+if($script:failedSteps.Count -gt 0){
+  Write-Host "`n$($script:failedSteps.Count) step(s) FAILED: $($script:failedSteps -join ', ')" -ForegroundColor Red
+  Write-Host "See the transcript in C:\ProvisionLogs\ for details. Steps are idempotent - re-run this script to retry." -ForegroundColor Red
+  exit 1
+}
 Write-Host "`nDone. Transcript in C:\ProvisionLogs\. Open a NEW shell so machine PATH/env take effect." -ForegroundColor Yellow
 Write-Host "Verify: pwsh -File deploy\windows\Assert-Toolchain.ps1 -ManifestPath $ManifestPath" -ForegroundColor Yellow
 Write-Host "Next: register the 4 CCD-pinned runners — see deploy\windows\README.md + Start-PinnedRunner.ps1." -ForegroundColor Yellow
