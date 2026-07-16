@@ -21,6 +21,8 @@
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "software_inventory_store.hpp"
+#include "software_licensing_ingestion.hpp"
+#include "software_licensing_store.hpp"
 #include "peer_ip.hpp"
 
 namespace yuzu::server::detail {
@@ -535,9 +537,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
 
     // Generic per-source blob persistence (sync-framework baseline; backs the
     // kInventoryQuery scope source + the inventory eval engine). The TYPED sources
-    // (installed_software / app_perf / device_ci) are persisted via their own
-    // normalized stores + shared seams below — skip them here, or they double-store
-    // into the generic InventoryStore. That generic store is read on
+    // (installed_software / app_perf / device_ci / software_licensing) are persisted
+    // via their own normalized stores + shared seams below — skip them here, or they
+    // double-store into the generic InventoryStore. That generic store is read on
     // Infrastructure:Read (query_inventory/get_agent_inventory), so a typed source
     // leaking into it bypasses its own securable AND breaks direct/gateway parity
     // (the direct ReportInventory path has no generic loop). is_typed_inventory_source
@@ -598,6 +600,23 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } catch (...) {
             spdlog::warn("[gateway] ProxyInventory: device_ci ingest threw (unknown) for agent={} "
                          "— acked",
+                         agent_id);
+        }
+    }
+    // Typed software_licensing via its shared seam (ADR-0024 Decision 5) —
+    // byte-identical to the direct ReportInventory path, independently guarded
+    // + isolated.
+    if (software_licensing_store_ && software_licensing_store_->is_open()) {
+        try {
+            ingest_software_licensing_report(*software_licensing_store_, agent_id, *request,
+                                             *response, metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[gateway] ProxyInventory: software_licensing ingest threw for agent={} "
+                         "— acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("[gateway] ProxyInventory: software_licensing ingest threw (unknown) for "
+                         "agent={} — acked",
                          agent_id);
         }
     }

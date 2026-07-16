@@ -18,6 +18,30 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: dashboard YAML Save is schema-aware and stricter (#1993)
+
+`POST /api/instructions/yaml` (the New Definition panel's Save endpoint) and
+`POST /api/instructions/validate-yaml` now share one schema-aware parser that
+accepts the canonical nested InstructionDefinition schema (`metadata.id`,
+`spec.execution.plugin/action` — the documented format every shipped
+definition uses), which the old substring scanner rejected. In exchange, the
+endpoint is stricter about malformed input:
+
+**Who this affects:** automation POSTing YAML to `/api/instructions/yaml`
+that (a) omits `apiVersion:`/`kind:` lines, (b) relied on a stray `name:`
+substring anywhere in the document being picked up as the definition name,
+(c) re-creates a definition whose `metadata.id` already exists (now **409**
+with a denied audit row instead of a silent second copy under a generated
+id), (d) supplies an explicit id outside `[A-Za-z0-9._-]{1,128}`, or
+(e) pastes multi-document (`---`-separated) files (now rejected; save one
+definition at a time). Interactive panel users are unaffected — the
+structured form's output stays accepted.
+
+**Verify:** re-run your automation against a test server; failures surface as
+specific per-field messages (e.g. `Missing metadata.id (or metadata.name)
+field`), and successful saves now emit `instruction.create` /
+`instruction.update` audit rows.
+
 ## ⚠️ Reserved on-behalf-of headers rejected + `principal_class` metric label (ADR-1005 Phase 1)
 
 Two operator-visible changes ship together:
@@ -366,6 +390,26 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- [ ] **New SparkEngine health telemetry (auto-on, engine-health only):** on agent
+  upgrade, agents begin shipping SparkEngine posture tags on the existing
+  heartbeat (2 keys when quiescent), and the server exposes 11 new
+  `yuzu_fleet_spark_*` gauges. The engine is **observe-only at this rung** —
+  nothing about Guard detection or enforcement changes — and the tags are pure
+  engine-health counts (no user, process, or path identity; no works-council
+  trigger). During a staged rollout, not-yet-upgraded agents are simply absent
+  from the new gauges — expected, see the staged-rollout example in
+  [Metrics](metrics.md#sparkengine-fleet-gauges). Deploy-time opt-out:
+  `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (the opt-out itself stays
+  visible as `yuzu_fleet_spark_disabled`). See
+  [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only).
+- [ ] **Changed agent signal handling (Linux/macOS):** graceful shutdown now runs
+  on a dedicated watcher thread (fixes an abort/hang class on `SIGTERM`), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the agent (exit 1) —
+  by design, with **no grace window**: the second signal is read as "the stop is
+  wedged". Stop scripts that deliberately double-signal agents will now
+  force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
+  also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app
   DisplayName/Publisher/Version in vulnerability findings), `os_info` (OS
@@ -590,6 +634,48 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
+
+This release adds the **SLE** (Software Licensing & Entitlements) **discovery** surface,
+gated on a new **`SoftwareLicensing`** RBAC securable. Per **ADR-1005** the server ships
+the discovery mechanism only: the per-device **`GET /api/v1/sle/agents/{id}`** drill, its
+machine-scope MCP twin `query_software_licenses`, and the audited erasure
+**`DELETE /api/v1/sle/agents/{id}`**. The licence **compliance / entitlement / reclamation**
+views and the fleet **posture** reads (a `/sle` page and `/api/v1/sle/summary` ·
+`/licenses` · the per-product device fan-out) **interpret** discovered facts and ship with
+the future **SAM use-case-engine module** — they are *not* in this release, so a reader
+who saw the earlier ADR expecting an in-server compliance page should not look for one yet.
+Because RBAC role defaults are seeded with `INSERT OR IGNORE` on **every** boot, an
+upgrading deployment **silently auto-grants** the new securable to the built-in roles the
+first time it starts the new build:
+
+| Role | Grant |
+|---|---|
+| Viewer, PlatformEngineer | Read |
+| Operator | Read + Write |
+| ITServiceOwner, Administrator | full CRUD |
+| ApiTokenManager | none |
+
+**No action is required** if that matches your intent — the securable gates the SLE
+discovery reads/erasure (`GET`/`DELETE /api/v1/sle/agents/{id}` and the MCP twin); the
+`/inventory` software catalog is unchanged and remains under `Inventory:Read`.
+
+**But** the per-device drill exposes each endpoint's **detected-licence facts** —
+product, vendor, channel, status, expiry, and, on per-user surfaces, the per-user
+**`user_ref`** identifier — **to every Read holder, including `Viewer`**. **A deployment
+that must restrict this visibility should deny or remove the `SoftwareLicensing` Read
+grant from `Viewer` (and any other broad role) BEFORE enabling the SLE sources.** A
+**deny rule wins** over the seeded allow (deny-override), so an explicit deny is the
+durable control — re-seeding on the next boot cannot re-open it. (Entitlement/purchase
+**cost** metadata is *not* served in-server this release — it is the SAM UCE module's,
+governed by that module's own RBAC when it ships.)
+
+The SLE detection source also collects a new, suppressible **per-user identifier**
+(`user_ref`) on per-user licence surfaces. It defaults to a per-device keyed-HMAC
+pseudonym; see [Software licence detection](software-licensing.md) for the
+`--license-scan-user-ref` flag, the honest limits of that default, and the
+`--inventory-disable` source-level opt-out.
 
 ### Gateway distribution cookie now required (#659) — **BREAKING**
 

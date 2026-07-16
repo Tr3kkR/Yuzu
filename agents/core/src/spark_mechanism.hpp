@@ -105,6 +105,19 @@ struct SparkMechanismStats {
     /// own "slow" threshold while holding its lock (#1980) — an early warning
     /// for a stalled watcher, not a hard fault.
     std::uint64_t slow_op_total{0};
+    /// TRUE when the mechanism started but could NOT bind its OS facility, so every
+    /// watch() will be refused: no systemd system bus (a container — Dockerfile.agent
+    /// ships libsystemd0, but a container has no bus), OpenSCManager denied, or the
+    /// IOCP/threadpool could not be created. The mechanism stays REGISTERED (so arm()
+    /// gets an honest rejection rather than "unknown type"), which is exactly why this
+    /// bit is needed: without it, `registered` and `functional` are indistinguishable
+    /// on the wire, and an inert mechanism reports byte-identically to a healthy idle
+    /// one — "looks healthy, can detect nothing".
+    ///
+    /// Known at start(), NOT at arm() — which is why it lands at rung 1 rather than
+    /// waiting on #2084's armed-but-deaf liveness (governance Gate-3 cross-platform +
+    /// Gate-6 sre, reached independently).
+    bool inert{false};
 };
 
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
@@ -151,6 +164,13 @@ public:
     /// engine-lock coordination — an implementation with counters to report
     /// backs them with atomics, never a lock shared with watch/unwatch/stop.
     /// Defaulted so existing/fake mechanisms need no change.
+    ///
+    /// MUST STAY LOCK-FREE — this is now LOAD-BEARING, not merely a preference
+    /// (governance Gate-2 security). `SparkEngine::stats_by_type()` calls this while
+    /// holding the engine's `mu_`, and a mechanism worker can hold its own lock while
+    /// calling `emit_event()`, which takes `mu_`. A mechanism that acquires a lock in
+    /// stats() therefore closes an ABBA cycle and can deadlock the agent. All three
+    /// shipped mechanisms read only `std::atomic`s here. Keep it that way.
     [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
 };
 

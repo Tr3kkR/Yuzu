@@ -39,6 +39,7 @@
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
 #include "instruction_store.hpp"
+#include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp"
@@ -53,6 +54,10 @@
 #include "pg/pg_pool.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
+#include "software_licensing_store.hpp"
+#include "product_registry_store.hpp"
+#include "sle_routes.hpp"
+#include "agent_decommission.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -594,6 +599,60 @@ public:
         metrics_.describe("yuzu_fleet_net_throughput_bps",
                           "Fleet device network throughput in bytes/s, by {stat,os}: avg / p50 / p90 "
                           "/ max", "gauge");
+        // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 — OBSERVE-ONLY). All
+        // os-labelled (per-OS, never a cross-OS blend — File/Registry are Windows-only,
+        // Service is Windows+Linux, macOS has none). ABSENT means no reporting agent of
+        // that OS/mechanism this cycle — never read absence as 0-is-healthy. At rung 1
+        // (no consumer armed) every counter is 0, so only reporting + mechanisms +
+        // failed/disabled carry signal; the counters go live at rung 2. ALERTING: the
+        // counter-derived gauges are a fleet SUM of cumulative per-agent counters — a
+        // bare `> 0` LATCHES forever once any agent ever counted one, and counter-typing
+        // the fleet sum is not implementable server-side (it needs per-agent deltas and
+        // a server-owned counter, #2083) — so their alert templates ship COMMENTED OUT
+        // until rung 2 (see the spark preamble in docs/prometheus/yuzu-alerts.yml). The
+        // exception is yuzu_fleet_spark_failed: a STATE gauge recomputed and cleared
+        // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
+        metrics_.describe("yuzu_fleet_spark_reporting",
+                          "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
+                          "running (spark_running=1) — the denominator for all spark telemetry",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_spark_disabled",
+                          "Agents (per `os`) running with SparkEngine deliberately off "
+                          "(--spark-disable). An operator decision — expected to be non-zero; "
+                          "do NOT alert on it", "gauge");
+        metrics_.describe("yuzu_fleet_spark_failed",
+                          "Agents (per `os`) where SparkEngine was ENABLED but boot-time "
+                          "instantiation THREW, so the agent degraded to no-spark. Distinct from "
+                          "`disabled` on purpose: this is a fault, not a choice — ALERT on it. "
+                          "Absent = no agent of that os reported a failure this cycle", "gauge");
+        metrics_.describe("yuzu_fleet_spark_mechanisms",
+                          "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
+                          "event-driven mechanism (file / registry / service). An OS with agents "
+                          "reporting but no {mechanism} series does not support it (e.g. no file "
+                          "on linux)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_armed_faulted",
+                          "Fleet sum (per `os`) of armed spark watches a mechanism reported deaf "
+                          "(a live gauge, not cumulative). > 0 means detection is silently down "
+                          "for that many watches", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_faults",
+                          "Fleet sum (per `os`) of cumulative post-arm watch-fault edges "
+                          "(watch_faults_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_queued_dropped",
+                          "Fleet sum (per `os`) of cumulative queued events dropped (bounded-queue "
+                          "overflow + shutdown). On the enforce lane (rung 3) a drop is a silent "
+                          "compliance failure", "gauge");
+        metrics_.describe("yuzu_fleet_spark_consumer_errors",
+                          "Fleet sum (per `os`) of cumulative queued handlers that threw "
+                          "(consumer_errors_total)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_watch_rejected",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "a rule that could not arm (denial-of-detection)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_quarantined",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "a structural leak that should stay 0; any value is page-worthy", "gauge");
+        metrics_.describe("yuzu_fleet_spark_slow_op",
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
+                          "(a stalled watcher)", "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -771,8 +830,10 @@ public:
         // alert rules can be authored up front; the series simply never
         // increments on a disabled surface.
         metrics_.describe("yuzu_scim_requests_total",
-                          "Total /scim/v2/Users requests, by op "
-                          "(create|get|list|replace|patch|delete) and status (2xx|4xx|5xx)",
+                          "Total /scim/v2/Users and /scim/v2/Groups (#2021) requests, by op "
+                          "(create|get|list|replace|patch|delete for Users; "
+                          "group_create|group_get|group_list|group_replace|group_patch|"
+                          "group_delete for Groups) and status (2xx|4xx|5xx)",
                           "counter");
         metrics_.describe("yuzu_scim_auth_failures_total",
                           "Total /scim/v2/* requests rejected by the bearer gate — a "
@@ -793,6 +854,29 @@ public:
                           "provisioning_source is not 'scim' (or its role was elevated outside "
                           "SCIM's ownership) — SCIM attempting to touch an account it does not "
                           "own is a misconfigured-IdP or compromised-IdP signal",
+                          "counter");
+        // SCIM v2 Groups->role application core (#2021). Bumped only when
+        // recompute_scim_user_role ACTUALLY changes a role (promotion or
+        // demotion via group membership) — never on a no-op recompute, and
+        // never for a value that fails the provenance guard (see
+        // yuzu_scim_provenance_denied_total for that refusal class, though
+        // this particular guard doesn't bump it — recompute_scim_user_role
+        // just silently declines).
+        metrics_.describe("yuzu_scim_role_changes_total",
+                          "Total SCIM-provisioned user role changes applied via SCIM Group "
+                          "membership (--scim-admin-group), by the group-membership-driven "
+                          "role-recompute core - a sustained rate is a normal signal of IdP "
+                          "group-membership churn, not itself an anomaly",
+                          "counter");
+        // CC6.7 evidence-gap fix (governance hardening round): bumped when
+        // recompute_scim_user_role's AuthManager::update_role call reports a
+        // genuine AuthDB write failure (row missing/inactive/write error) —
+        // a durable role change that could not be applied, distinct from
+        // yuzu_scim_role_changes_total's success path.
+        metrics_.describe("yuzu_scim_role_change_failures_total",
+                          "Total SCIM-driven role changes that failed to write to AuthDB during "
+                          "group-membership recompute - a sustained non-zero rate means role "
+                          "changes are silently not taking effect",
                           "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
@@ -2416,6 +2500,52 @@ public:
             }
         }
 
+        // Typed detected-licence projection — born-on-Postgres (ADR-0024 Decision
+        // 4, SLE `software_licensing` source). Independent of the stores above
+        // (its own schema, its own fail-closed). Wires BOTH server entry points
+        // (direct ReportInventory + gateway ProxyInventory) to the licensing
+        // ingest seam, which is otherwise dead: agent_service_/gateway_service_
+        // already carry the set_software_licensing_store() setter + the ingest
+        // call, but skip it while the store pointer is null.
+        //
+        // SLE wiring (PR1a): the detected-licence store (step 7) + the canonical
+        // ProductRegistryStore (step 8), both born-on-PG and fail-closed. The
+        // entitlement/usage stores, the compliance evaluator, and the posture-rollup
+        // thread are the SAM UCE module's (ADR-1005: interpretation is never built
+        // in-server) — NOT a later in-server PR step. The /api/v1/sle/* READ routes
+        // are registered below (in the route-wiring block) against these two stores.
+        if (pg_pool_ && !startup_failed_) {
+            software_licensing_store_ = std::make_unique<SoftwareLicensingStore>(*pg_pool_);
+            if (!software_licensing_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software_licensing store migration/open "
+                              "failed (database reachable but the software_licensing_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                software_licensing_store_->set_metrics(&metrics_);
+                agent_service_.set_software_licensing_store(software_licensing_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_software_licensing_store(software_licensing_store_.get());
+            }
+        }
+        // ProductRegistryStore — SLE canonical product identities + match links
+        // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
+        // own fail-closed open. The UCE module's compliance evaluator (ADR-1005) is
+        // what writes it via the matcher pass; the server constructs it so the store
+        // ladder + /readyz probe are complete (roadmap G-10) and the SLE routes can
+        // share the pool-guarded lifetime.
+        if (pg_pool_ && !startup_failed_) {
+            product_registry_store_ = std::make_unique<ProductRegistryStore>(*pg_pool_);
+            if (!product_registry_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: product_registry store migration/open "
+                              "failed (database reachable but the product_registry_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                product_registry_store_->set_metrics(&metrics_);
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -3248,6 +3378,46 @@ public:
         agent_server_->Wait();
     }
 
+    /// Decommission an agent for good: fan `delete_agent(agent_id)` across every
+    /// per-agent store this server owns, durably erasing the machine's stored
+    /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
+    /// `delete_agent` methods had no production caller before this). Best-effort
+    /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
+    /// not configured (e.g. no Postgres, so only the SQLite `InventoryStore` is
+    /// live) is skipped, and one store's failure never aborts the others — but
+    /// each `delete_agent` now reports its commit status, so a delete that did
+    /// NOT commit is recorded `Failed` (not `Deleted`) and
+    /// `DecommissionResult::ok()` confirms erasure across every configured store.
+    /// A caller relying on this as Art.17 erasure evidence MUST check `ok()`.
+    ///
+    /// The cascade is built HERE from the LIVE store pointers on each call
+    /// (never a long-lived borrow), so it is inherently safe against the store
+    /// teardown ordering in `stop()` — a store already reset to null is simply
+    /// skipped.
+    ///
+    /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on a SCOPED
+    /// CONJUNCTION over every securable the cascade erases through —
+    /// `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`
+    /// (app_perf_daily is DEX behavioural PII) — plus audit-before-erase fail-closed
+    /// (Decision 11). ADDING A STORE BELOW? Add its governing securable's Delete to
+    /// that conjunction too; the drift guard in test_agent_decommission.cpp fails
+    /// until you do.
+    /// Today's OTHER agent-removal paths (registry session teardown, enrollment
+    /// deny/remove, cert revocation) are non-durable-data by design and deliberately
+    /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
+    /// survive); this durable erasure is the deliberate, separately-gated Art.17 path.
+    [[nodiscard]] DecommissionResult decommission_agent(std::string_view agent_id) {
+        AgentDecommission cascade{AgentDecommissionStores{
+            .inventory = inventory_store_.get(),
+            .software_inventory = software_inventory_store_.get(),
+            .app_perf_daily = app_perf_daily_store_.get(),
+            .device_inventory = device_inventory_store_.get(),
+            .software_licensing = software_licensing_store_.get(),
+        }};
+        return cascade.decommission(agent_id);
+    }
+
     void stop() noexcept override {
         // Guard against re-entrant calls from repeated signals.
         // The signal handler calls stop() directly, so a second Ctrl+C
@@ -3474,6 +3644,19 @@ public:
         if (gateway_service_)
             gateway_service_->set_device_inventory_store(nullptr);
         device_inventory_store_.reset();
+        // SLE detected-licence store: same discipline. The decommission cascade
+        // is built on-demand from the live store pointers (never a long-lived
+        // borrow), so there is nothing else to unwire here before the reset.
+        agent_service_.set_software_licensing_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_software_licensing_store(nullptr);
+        software_licensing_store_.reset();
+        // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
+        // and dereference this store only at request time; the gRPC + HTTP drains
+        // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
+        // destruct-before-pool). Nothing borrows it long-lived (its writer is the UCE
+        // module's evaluator, out-of-server), so no unwire step precedes the reset.
+        product_registry_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -4152,6 +4335,20 @@ private:
 
     // -- HTML helpers ---------------------------------------------------------
 
+    // Sanitize an operator-supplied value (definition id, approval id) before
+    // it goes into a server log line: control characters — CR/LF especially —
+    // would otherwise let a caller forge additional log lines (Gate 8 LOW).
+    // Truncates for good measure; callers already substr to bound length.
+    static std::string log_safe(const std::string& s, std::size_t max = 64) {
+        std::string out;
+        out.reserve(std::min(s.size(), max));
+        for (std::size_t i = 0; i < s.size() && i < max; ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            out += (c < 0x20 || c == 0x7f) ? '?' : s[i];
+        }
+        return out;
+    }
+
     static std::string html_escape(const std::string& s) {
         std::string out;
         out.reserve(s.size());
@@ -4278,17 +4475,16 @@ private:
     }
 
     static std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
-        std::vector<std::string> errors;
-        if (yaml_source.empty())
-            errors.push_back("YAML source is empty");
-        if (yaml_source.find("apiVersion:") == std::string::npos)
-            errors.push_back("Missing apiVersion field");
-        if (yaml_source.find("kind:") == std::string::npos)
-            errors.push_back("Missing kind field");
-        if (yaml_source.find("plugin:") == std::string::npos)
-            errors.push_back("Missing spec.plugin field");
-        if (yaml_source.find("action:") == std::string::npos)
-            errors.push_back("Missing spec.action field");
+        // Shared with the POST /api/instructions/yaml save path so validate
+        // and save can never diverge on what a complete definition is (#1993).
+        auto errors = instruction_yaml::validate_definition_yaml(yaml_source);
+        // Also run the store-level gates (scope-walking combos, flow-mapping
+        // scope) that create/update enforce — same contract, one verdict
+        // (governance UP-3). Skip when byte-level errors already fired.
+        if (errors.empty()) {
+            if (auto err = validate_definition_scope(yaml_source))
+                errors.push_back(*err);
+        }
         return errors;
     }
 
@@ -5277,6 +5473,15 @@ private:
                 // software_inventory_store row above (silent no-ingest ack if dead).
                 {"device_inventory_store",
                  device_inventory_store_ && device_inventory_store_->is_open()},
+                // ADR-0024 SLE born-on-Pg stores (roadmap G-10, HC-1 Pattern E). Same
+                // rationale as the inventory stores: fail-closed at boot, but a not-open
+                // state post-boot makes ReportInventory silently ack the licensing blob
+                // with no ingest (software_licensing_store) and the /api/v1/sle/* reads
+                // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
+                {"software_licensing_store",
+                 software_licensing_store_ && software_licensing_store_->is_open()},
+                {"product_registry_store",
+                 product_registry_store_ && product_registry_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
                 // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
                 // that fails to open AND `--allow-unsigned-packs` set produces
@@ -8176,7 +8381,28 @@ private:
             auto result = approval_manager_->approve(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // A denied review is an access-control decision (e.g. the
+                // self-approval segregation-of-duties block) — leave an audit
+                // trace like the other denial paths in this file (governance
+                // compliance CC6.1/CC6.3), and a greppable server-side line.
+                (void)audit_log(req, "approval.approve", "denied", "approval", id,
+                                result.error());
+                spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
+                             log_safe(id), reviewer, log_safe(result.error(), 256));
+                // htmx doesn't swap a non-2xx response, so without a trigger
+                // the denial (e.g. the self-approval block) is a silent no-op
+                // in the dashboard (#1821). HX-Trigger headers ARE processed
+                // on error responses — surface the reason as a toast. dump()
+                // uses `replace`: the error can echo the raw URL id, and the
+                // default handler throws on invalid UTF-8 (governance UP-5).
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content(nlohmann::json({{"error", result.error()}})
+                                    .dump(-1, ' ', false,
+                                          nlohmann::json::error_handler_t::replace),
                                 "application/json");
                 return;
             }
@@ -8207,7 +8433,21 @@ private:
             auto result = approval_manager_->reject(id, reviewer, comment);
             if (!result) {
                 res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // Same as the approve branch: audit the denial, log it, and
+                // surface it as a toast (#1821) — htmx swallows non-2xx
+                // bodies but processes HX-Trigger on them.
+                (void)audit_log(req, "approval.reject", "denied", "approval", id,
+                                result.error());
+                spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
+                             log_safe(id), reviewer, log_safe(result.error(), 256));
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content(nlohmann::json({{"error", result.error()}})
+                                    .dump(-1, ' ', false,
+                                          nlohmann::json::error_handler_t::replace),
                                 "application/json");
                 return;
             }
@@ -8328,14 +8568,28 @@ private:
                                                 : d.instruction_set_id.substr(0, 8)) +
                                 "</td>"
                                 "<td>";
+                        // d.id is operator-chosen since #402 (JSON create) /
+                        // #1993 (YAML metadata.id). The store now bounds NEW
+                        // ids to [A-Za-z0-9._-]{1,128}, but a row that predates
+                        // that gate may hold arbitrary text — so encode it for
+                        // the DOM at every interpolation (governance sec-M1).
+                        // The Edit control carries the id in a data-attribute
+                        // (html_escape makes it a safe attribute value) and
+                        // reads it back via this.dataset.defId, NOT string-
+                        // interpolated into the onclick JS: the browser
+                        // entity-decodes an attribute BEFORE the JS parser runs,
+                        // so a bare html_escape inside onclick="openEditor('…')"
+                        // would still let a legacy id break out of the string
+                        // and execute in the admin's session (Gate 8 SEC-1).
                         if (can_author) {
                             html += "<button class=\"btn btn-secondary btn-sm\" "
-                                    "onclick=\"openEditor('" +
-                                    d.id + "')\">Edit</button> ";
+                                    "data-def-id=\"" +
+                                    html_escape(d.id) +
+                                    "\" onclick=\"openEditor(this.dataset.defId)\">Edit</button> ";
                         }
                         html += "<button class=\"btn btn-danger btn-sm\" "
                                 "hx-delete=\"/api/instructions/" +
-                                d.id +
+                                html_escape(d.id) +
                                 "\" hx-target=\"#tab-definitions\" hx-swap=\"innerHTML\" "
                                 "hx-confirm=\"Delete definition '" +
                                 html_escape(d.name) + "'?\">Delete</button></td></tr>";
@@ -8452,81 +8706,120 @@ private:
             auto yaml_source = req.get_param_value("yaml_source");
             auto def_id = req.get_param_value("id");
 
-            if (yaml_source.empty()) {
-                res.set_content(
-                    "<div class=\"alert alert-error\">YAML source cannot be empty</div>",
-                    "text/html");
+            // Save shares one contract with /api/instructions/validate-yaml
+            // (#1993): YAML that passes validation always carries what Save
+            // needs, and a failing Save names the actual missing field
+            // instead of a blanket "Missing required fields" for all three.
+            auto errors = validate_yaml_source(yaml_source);
+            if (!errors.empty()) {
+                std::string html =
+                    "<div class=\"alert alert-error\"><strong>Cannot save:</strong><ul>";
+                for (const auto& e : errors)
+                    html += "<li>" + html_escape(e) + "</li>";
+                html += "</ul></div>";
+                res.set_content(html, "text/html");
                 return;
             }
 
-            // Minimal YAML field extraction (name, plugin, action from the YAML text).
-            // Full yaml-cpp parsing is deferred; for now we extract fields via simple
-            // line scanning — the YAML source is stored verbatim as source of truth.
-            auto extract = [&](const std::string& key) -> std::string {
-                auto needle = key + ": ";
-                auto pos = yaml_source.find(needle);
-                if (pos == std::string::npos)
-                    return {};
-                auto start = pos + needle.size();
-                auto end = yaml_source.find('\n', start);
-                auto val = yaml_source.substr(start, end - start);
-                // Strip quotes
-                if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
-                    val = val.substr(1, val.size() - 2);
-                return val;
-            };
+            // Schema-aware extraction of the denormalized columns — accepts
+            // both the canonical nested schema (metadata.id,
+            // spec.execution.plugin/action — what the docs, validate-yaml,
+            // and every bundled definition use) and the flat schema the New
+            // Definition panel's structured form generates (metadata.name,
+            // spec.plugin/action). The YAML source stays the verbatim source
+            // of truth; absent optional fields get the same defaults the
+            // bundled importer applies (embed_content.py::def_envelope).
+            auto fields = instruction_yaml::parse_definition_yaml(yaml_source);
 
             InstructionDefinition def;
-            def.name = extract("name");
-            def.version = extract("version");
-            def.plugin = extract("plugin");
-            def.action = extract("action");
-            // Normalize action to lowercase — agent plugins match case-sensitively
-            for (auto& c : def.action)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            def.type = extract("type");
-            def.description = extract("description");
-            def.concurrency_mode = extract("concurrency");
-            def.approval_mode = extract("approval");
-            // Validate approval_mode — reject unknown values at creation time
-            if (!def.approval_mode.empty() && def.approval_mode != "auto" &&
-                def.approval_mode != "role-gated" && def.approval_mode != "always") {
-                res.set_content("<div class=\"alert alert-error\">Invalid approval mode: &quot;" +
-                                    html_escape(def.approval_mode) +
-                                    "&quot;. Must be auto, role-gated, or always.</div>",
-                                "text/html");
-                return;
-            }
+            def.name = fields.name;
+            def.version = fields.version.empty() ? "1.0.0" : fields.version;
+            def.plugin = fields.plugin;
+            def.action = fields.action; // lowercased by the parser
+            def.type = fields.type.empty() ? "question" : fields.type;
+            def.description = fields.description;
+            def.concurrency_mode = fields.concurrency.empty() ? "per-device" : fields.concurrency;
+            def.approval_mode = fields.approval.empty() ? "auto" : fields.approval;
             def.yaml_source = yaml_source;
             def.created_by = session->username;
             def.enabled = true;
 
-            if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
-                res.set_content("<div class=\"alert alert-error\">Missing required fields: "
-                                "name, plugin, action</div>",
+            // Toast + inline alert for every outcome. dump() uses the
+            // `replace` error handler: failure messages can embed
+            // operator-supplied ids, and the default handler would throw on
+            // invalid UTF-8, degrading the feedback to a bare httplib 500
+            // (governance cpp-S1 / UP-4).
+            auto respond = [&](const std::string& msg, bool ok) {
+                nlohmann::json trigger = {
+                    {"showToast", {{"message", msg}, {"level", ok ? "success" : "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', false,
+                                            nlohmann::json::error_handler_t::replace));
+                res.set_content("<div class=\"alert alert-" +
+                                    std::string(ok ? "success" : "error") + "\">" +
+                                    html_escape(msg) + "</div>",
                                 "text/html");
-                return;
-            }
+            };
 
-            std::string msg;
             if (!def_id.empty()) {
+                // Route id is authoritative on update — but a yaml_source
+                // self-declaring a DIFFERENT metadata.id would be stored
+                // verbatim and fork the definition on any later re-import
+                // (governance UP-8/cons-N1). Reject the divergence outright.
+                if (!fields.id.empty() && fields.id != def_id) {
+                    respond("YAML metadata.id '" + fields.id +
+                                "' does not match the definition being edited ('" + def_id +
+                                "') — correct or remove metadata.id",
+                            false);
+                    return;
+                }
                 def.id = def_id;
                 auto result = instruction_store_->update_definition(def);
-                msg = result ? "Definition updated" : "Update failed: " + result.error();
+                if (!result) {
+                    spdlog::warn("instruction yaml update failed: id={} error={}",
+                                 log_safe(def_id), result.error());
+                    respond("Update failed: " + result.error(), false);
+                    return;
+                }
+                (void)audit_log(req, "instruction.update", "success", "InstructionDefinition",
+                                def_id);
+                emit_event("instruction.updated", req, {}, {{"instruction_id", def_id}});
+                respond("Definition updated", true);
             } else {
+                // A canonical definition names itself via metadata.id — honor
+                // it (the store 409s on conflict), matching bundled-importer
+                // semantics; without one the store generates an id.
+                def.id = fields.id;
                 auto result = instruction_store_->create_definition(def);
-                msg = result ? "Definition created" : "Create failed: " + result.error();
+                if (!result) {
+                    // #402 pattern (mirrors the JSON create route): strip the
+                    // internal store↔route conflict token before it reaches
+                    // the operator, map to 409 so scripted re-runs of the
+                    // getting-started import see a real status, and leave a
+                    // denied-audit trace for duplicate-id probing.
+                    bool is_conflict = is_conflict_error(result.error());
+                    spdlog::warn("instruction yaml create failed: id={} error={}",
+                                 log_safe(def.id), result.error());
+                    if (is_conflict) {
+                        res.status = 409;
+                        (void)audit_log(req, "instruction.create", "denied",
+                                        "InstructionDefinition", def.id, "duplicate_id");
+                        respond("Create failed: " +
+                                    std::string(strip_conflict_prefix(result.error())),
+                                false);
+                    } else {
+                        respond("Create failed: " + result.error(), false);
+                    }
+                    return;
+                }
+                (void)audit_log(req, "instruction.create", "success", "InstructionDefinition",
+                                *result, def.name);
+                emit_event("instruction.created", req,
+                           {{"name", def.name}, {"plugin", def.plugin}, {"action", def.action},
+                            {"type", def.type}},
+                           {{"instruction_id", *result}});
+                respond("Definition created", true);
             }
-
-            std::string cls =
-                msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
-            {
-                auto level = msg.find("failed") == std::string::npos ? "success" : "error";
-                nlohmann::json trigger = {{"showToast", {{"message", msg}, {"level", level}}}};
-                res.set_header("HX-Trigger", trigger.dump());
-            }
-            res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
-                            "text/html");
         });
 
         // -- YAML validate endpoint --
@@ -8607,19 +8900,29 @@ private:
                                 "</code></td>"
                                 "<td>";
                         if (a.status == "pending") {
-                            html += "<button class=\"btn btn-primary\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem "
-                                    "0.5rem;margin-right:0.3rem\" "
-                                    "hx-post=\"/api/approvals/" +
-                                    a.id +
-                                    "/approve\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Approve</button>"
-                                    "<button class=\"btn btn-danger\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
-                                    "hx-post=\"/api/approvals/" +
-                                    a.id +
-                                    "/reject\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Reject</button>";
+                            if (a.submitted_by == session->username) {
+                                // Self-review is denied server-side
+                                // (ApprovalManager: "reviewer cannot be the
+                                // same as the submitter") — don't render
+                                // buttons that can only silently fail (#1821).
+                                html += "<span style=\"font-size:0.65rem;color:var(--muted)\">"
+                                        "You submitted this — another reviewer must "
+                                        "approve</span>";
+                            } else {
+                                html += "<button class=\"btn btn-primary\" "
+                                        "style=\"font-size:0.65rem;padding:0.15rem "
+                                        "0.5rem;margin-right:0.3rem\" "
+                                        "hx-post=\"/api/approvals/" +
+                                        a.id +
+                                        "/approve\" hx-target=\"#tab-approvals\" "
+                                        "hx-swap=\"innerHTML\">Approve</button>"
+                                        "<button class=\"btn btn-danger\" "
+                                        "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                        "hx-post=\"/api/approvals/" +
+                                        a.id +
+                                        "/reject\" hx-target=\"#tab-approvals\" "
+                                        "hx-swap=\"innerHTML\">Reject</button>";
+                            }
                         }
                         html += "</td></tr>";
                     }
@@ -9918,6 +10221,73 @@ private:
                 return device_inventory_store_->get_device_ci(id);
             });
 
+        // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
+        // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
+        // (roadmap G-1 / Decision 10). The shared require_permission /
+        // require_scoped_permission use the is_rbac_enabled() shape, which on a
+        // corrupt / load-failed rbac.db (is_rbac_enabled()==false) falls through to a
+        // legacy-open Read — the #1717 fail-open. rbac_enforcement_in_effect() is true
+        // for a null / !is_open() store as well as an enabled one, so this guard only
+        // permits the legacy-open path when the store is loaded AND explicitly disabled;
+        // a null/corrupt store is REFUSED (503), never served a legacy-open (and, for
+        // the drill, UNSCOPED) Read of licence data incl. user_ref PII. This closes
+        // #1717 for the SLE gates now, without waiting on the global-gate fix.
+        auto sle_gate_usable = [this](const httplib::Request& req, httplib::Response& res) -> bool {
+            if (rbac_enforcement_in_effect(rbac_store_.get()) &&
+                !(rbac_store_ && rbac_store_->is_open())) {
+                // Resolve auth first so an unauthenticated caller sees 401 (and never
+                // learns the store state) before the fail-closed 503.
+                if (require_auth(req, res)) {
+                    res.status = 503;
+                    // Carry the route's REAL correlation id (already stamped on the
+                    // response as X-Correlation-Id by the SLE handler before the gate
+                    // ran) into the A4 body, matching every other SLE 503 — never a
+                    // hardcoded empty id. The cid is the grep-safe `req-<hex>-<hex>`
+                    // shape (no JSON metacharacters), so plain interpolation is safe;
+                    // an unset header falls back to "" (the prior behaviour).
+                    const std::string cid = res.get_header_value("X-Correlation-Id");
+                    res.set_content(
+                        std::string(
+                            R"({"error":{"code":503,"message":"authorization subsystem )"
+                            R"(unavailable","correlation_id":")") +
+                            cid +
+                            R"(","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                }
+                return false;
+            }
+            return true;
+        };
+        auto sle_scoped_perm_fn = [this, sle_gate_usable](
+                                      const httplib::Request& req, httplib::Response& res,
+                                      const std::string& type, const std::string& op,
+                                      const std::string& agent_id) -> bool {
+            if (!sle_gate_usable(req, res))
+                return false;
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        sle_routes_ = std::make_unique<SleRoutes>();
+        // Per ADR-0024 "Placement under ADR-1005", only the discovery mechanism is
+        // in-server: the raw per-agent drill (GET) and the audited durable-erasure
+        // trigger (DELETE). The posture/compliance reads and the fan-out list are the
+        // SAM UCE module's interpretation surface, not built here. The discovery
+        // read's machine-surface twin is the `query_software_licenses` MCP tool
+        // (mcp_server.cpp), per ADR-1005 Decision 1.
+        sle_routes_->register_routes(
+            *web_server_, sle_scoped_perm_fn,
+            // Single-agent drill — REAL detected-licence data. nullopt on degrade → 503.
+            [this](const std::string& agent_id) -> std::optional<std::vector<AgentLicenseRow>> {
+                if (!software_licensing_store_)
+                    return std::nullopt;
+                return software_licensing_store_->agent_licenses(agent_id);
+            },
+            // Erasure cascade — the DELETE route's production caller (Decision 11):
+            // fans delete_agent across every registered per-agent store.
+            [this](const std::string& agent_id) -> DecommissionResult {
+                return decommission_agent(agent_id);
+            },
+            audit_fn);
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
@@ -10249,6 +10619,15 @@ private:
         // entries at all. main.cpp already refuses to start if --scim-enable is
         // set without --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
+            // sec-L3/UP-9 (governance hardening round): trim leading/trailing
+            // ASCII whitespace from the admin-group config value — same
+            // trailing-space silent-lockout bug fixed for
+            // --oidc-admin-group/--saml-admin-group above. Mutate cfg_
+            // itself so every reader of cfg_.scim_admin_group (the routes
+            // registration below, recompute_scim_user_role) sees the
+            // trimmed value.
+            cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
+
             scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
             if (!scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,
@@ -10281,7 +10660,7 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get());
+                                          audit_store_.get(), cfg_.scim_admin_group);
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -10763,7 +11142,11 @@ private:
                 // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f): the
                 // session registry, the --mcp-no-streaming kill switch (by live
                 // pointer into cfg_), and the Origin allowlist.
-                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins);
+                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins,
+                // ADR-0024: the SLE discovery store backs the query_software_licenses
+                // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
+                // per-user user_ref PII stays on the audited REST drill).
+                software_licensing_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -11113,6 +11496,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
+    std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
@@ -11200,6 +11584,13 @@ private:
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
     std::unique_ptr<DeviceInventoryStore> device_inventory_store_;
+    // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
+    // so it destructs before the pool.
+    std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
+    // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
+    // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
+    // module's evaluator writes it, out-of-server).
+    std::unique_ptr<ProductRegistryStore> product_registry_store_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;

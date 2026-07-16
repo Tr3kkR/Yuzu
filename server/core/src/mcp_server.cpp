@@ -9,6 +9,8 @@
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
+#include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
+#include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -706,6 +708,16 @@ static const ToolDef kTools[] = {
      "before acting.",
      R"({"type":"object","properties":{}})", kObjectOutputSchema,
      R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
+    {"query_software_licenses",
+     "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
+     "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
+     "vendor, version, type, effective state, expiry, channel, key_hint, detector, and "
+     "confidence. MACHINE-SCOPE FACTS ONLY: the per-user user_ref personal data (Decision "
+     "11) is NOT returned here — it is served only by the audited, management-group-scoped "
+     "REST drill. Requires SoftwareLicensing:Read.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j",
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Query software licenses"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -813,6 +825,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"discover_routes", {"Infrastructure", "Read"}},
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
+    {"query_software_licenses", {"SoftwareLicensing", "Read"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -919,7 +932,7 @@ McpServer::HandlerFn McpServer::build_handler(
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
-    std::vector<std::string> allowed_origins) {
+    std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -1609,11 +1622,19 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // retry_after_ms: pass a non-negative value on a TRANSIENT failure (a
+            // store degrade / transient outage) so an agentic worker backs off and
+            // retries rather than treating the error as terminal; leave the default
+            // (-1 ⇒ null) on non-retryable errors (tier/permission/validation). This
+            // matches the REST a4 envelope, which emits retry_after_ms:5000 on the
+            // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
-                                  std::string_view remediation = {}) {
+                                  std::string_view remediation = {}, long retry_after_ms = -1) {
                 const std::string cid = yuzu::server::detail::make_correlation_id();
-                std::string data = R"({"correlation_id":")" + cid +
-                                   R"(","retry_after_ms":null,"remediation":)";
+                std::string data = R"({"correlation_id":")" + cid + R"(","retry_after_ms":)" +
+                                   (retry_after_ms >= 0 ? std::to_string(retry_after_ms)
+                                                        : std::string("null")) +
+                                   R"(,"remediation":)";
                 if (remediation.empty()) {
                     data += "null";
                 } else {
@@ -2580,6 +2601,105 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 mcp_audit("success", agent_id);
                 res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── query_software_licenses (ADR-0024 discovery plane) ─────────
+            // The MCP twin of GET /api/v1/sle/agents/{id}: one agent's discovered-
+            // licence FACTS. Machine-scope only — user_scope/user_ref (Decision 11
+            // personal data) are DELIBERATELY omitted; that PII is served only by the
+            // audited REST drill. Gated exactly like the REST drill: the per-device
+            // ancestor-aware SCOPED SoftwareLicensing:Read gate (ADR-0017 confinement —
+            // a group-confined operator reads their in-scope agents, is 403'd outside),
+            // plus the same #1717 fail-closed guard (a corrupt/load-failed rbac.db
+            // REFUSES rather than falling through to a legacy-open Read). Errors carry
+            // the A4 envelope (correlation_id + retry_after_ms), like the tier denial.
+            if (tool_name == "query_software_licenses") {
+                if (!tier_allows(tier, "SoftwareLicensing", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // #1717 fail-closed (parity with the REST SLE gate's sle_gate_usable):
+                // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
+                // legacy-open Read of per-agent licence facts.
+                if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
+                    // CC7.2: a fail-closed refusal still leaves a behavioural trail —
+                    // the sibling query_installed_software audits its store-degrade the
+                    // same way, and the REST drill persists a failure audit on 503.
+                    mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
+                    res.set_content(a4_error(kInternalError, "authorization subsystem unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate (SoftwareLicensing:Read + management group) —
+                // the SAME ancestor-aware confinement the REST drill takes (the set_tag
+                // precedent), NOT the global perm gate. Fail closed if it is unwired.
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "SoftwareLicensing", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!software_licensing_store) {
+                    mcp_audit("failure", "software licensing store unavailable; agent=" + agent_id);
+                    res.set_content(a4_error(kInternalError, "Software licensing store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                auto rows = software_licensing_store->agent_licenses(agent_id);
+                if (!rows) {
+                    // Authoritative read: a store/pool/query degrade is an ERROR, never
+                    // success+[] — a licence query must not read a transient outage as
+                    // "nothing licensed". retry_after_ms mirrors the REST drill's 503.
+                    mcp_audit("failure", "detected-licence store degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "detected-licence store unavailable — read failed",
+                                 "retry the request", /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& r : *rows) {
+                    // user_scope / user_ref (Decision 11 PII) deliberately omitted here.
+                    arr.add(JObj()
+                                .add("product", r.product)
+                                .add("vendor", r.vendor)
+                                .add("version", r.version)
+                                .add("license_type", r.license_type)
+                                .add("state", r.state)
+                                .add("expiry_at", r.expiry_at)
+                                .add("channel", r.channel)
+                                .add("key_hint", r.key_hint)
+                                .add("detector", r.detector)
+                                .add("confidence", r.confidence)
+                                .add("exe_hints", r.exe_hints));
+                }
+                JObj payload;
+                payload.add("agent_id", agent_id)
+                    .add("count", static_cast<std::int64_t>(rows->size()))
+                    .raw("licenses", arr.str());
+                // The access-audit row is the SOC 2 evidence for this read, so its
+                // persistence bool is NOT discardable: a dropped row means licence facts
+                // were served with no durable trail. MCP has no response-header channel
+                // (the REST drill's Sec-Audit-Failed), so the gap rides the body as
+                // audit_persisted:false — set-and-proceed, exactly as the sibling
+                // query_installed_software does (#1647; rest_audit.hpp's MCP contract).
+                // Absent on success: consumers key on the KEY's absence, not on `true`.
+                const bool audit_ok = mcp_audit("success", agent_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -5332,7 +5452,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
                                 const bool* mcp_streaming_disabled,
-                                std::vector<std::string> allowed_origins) {
+                                std::vector<std::string> allowed_origins,
+                                SoftwareLicensingStore* software_licensing_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -5353,7 +5474,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, std::move(allowed_origins)));
+                           sessions, mcp_streaming_disabled, std::move(allowed_origins),
+                           software_licensing_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

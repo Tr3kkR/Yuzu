@@ -8,6 +8,8 @@
 
 #include "patch_manager.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdio>
@@ -20,26 +22,15 @@ using namespace yuzu::server;
 
 // ── RAII wrapper for temp DB file ───────────────────────────────────────────
 
-static int g_test_counter = 0;
-
+// The previous fixture salted with a per-process counter + the object's own
+// address — cross-process uniqueness rested on ASLR, not a deliberate salt.
+// yuzu::test::TempDbFile carries the process-salted naming and -wal/-shm
+// cleanup (#1883). Member order matters: file FIRST so it outlives mgr —
+// PatchManager closes the DB before the file (and its sidecars) is removed.
 struct TestPatchDb {
-    std::filesystem::path path;
-    PatchManager mgr;
-
-    TestPatchDb()
-        : path(std::filesystem::temp_directory_path() /
-               ("test_patch_mgr_" + std::to_string(++g_test_counter) + "_" +
-                std::to_string(reinterpret_cast<uintptr_t>(this)) + ".db")),
-          mgr(path) {}
-
-    ~TestPatchDb() {
-        // Destructor of mgr closes the DB; then remove the file.
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        // WAL/SHM files
-        std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
-        std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
-    }
+    yuzu::test::TempDbFile file{"yuzu_test_patch_mgr-"};
+    std::filesystem::path path{file.path};
+    PatchManager mgr{path};
 };
 
 // ── Helpers for dispatch mocking ────────────────────────────────────────────

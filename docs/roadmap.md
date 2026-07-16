@@ -1102,6 +1102,17 @@ Multi-source inventory cleanup pipeline:
 
 *Normalized software identification for license management and compliance reporting.*
 
+> **Superseded by ADR-0024 (2026-07-06).** This phase's design is superseded by
+> `docs/adr/0024-software-licensing-entitlements.md` ("Software Licensing &
+> Entitlements", capability §27 — renamed by the same ADR). The sketches below are
+> stale where they conflict: the SQLite `CatalogStore` becomes the born-on-Postgres
+> `ProductRegistryStore`; entitlements are a five-source plane (manual, CSV, M365
+> connector, agent-observed FlexLM/KMS), not a manual-only register; licence discovery
+> is a new agent `license_scan` plugin on the ADR-0016 daily-sync framework; REST is
+> unified under `/api/v1/sle/*`; usage metering (10.2 / #265) becomes **opt-in**
+> (`--usage-sync-enable`, default off) and machine-scope, not on-by-default launch
+> tracking. The issue breakdown is retained for traceability (10.1–10.4 ↔ #264–#267).
+
 ### Issue 10.1: Software Catalog Store
 **Capability:** new | **Scope:** Server | **Status:** Open
 **Depends on:** 9.8
@@ -1710,6 +1721,13 @@ CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on `open
 
 TPM, Secure Boot, UEFI verification. Reports posture state into compliance reporting (18.2).
 
+### Issue 18.7: Agent-Side Component Inventory Collection
+**Capability:** new | **Scope:** Agent + server | **Status:** Proposed
+
+Bundled/vendored-dependency and embedded-runtime detection (Electron/Chromium, Go/Rust buildinfo,
+filesystem-resident lockfiles) that today's package-manager-based `installed_software` source can't
+see — the generation-side companion to Issue 18.5 (SBOM Ingest). See `docs/adr/0028-*`.
+
 ### Out of scope (documented exclusions)
 
 - **MDM (mobile)** — partner integration only; Yuzu's agent surface is workstation + server, not iOS / Android.
@@ -1868,7 +1886,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 
 1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading done — `offload_targets.db` + REST `/api/v1/offload-targets` + global fan-out wired into `AgentServiceImpl` for `agent.registered` and `execution.completed`. Phase 8 complete.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
-3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
+3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization; superseded by ADR-0024 "Software Licensing & Entitlements" — see the Phase 10 section note)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)
 5. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12)
 6. **Phase 13** — Security hardening & polish (2FA, branding, MCP write tools)

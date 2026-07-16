@@ -16,6 +16,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
+#include "shutdown_watcher.hpp" // POSIX self-pipe + watcher thread (the B2 root fix)
 #include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
 
 #include <CLI/CLI.hpp>
@@ -28,8 +29,13 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #ifdef _WIN32
 #include <win_sc_handle.hpp> // shared yuzu::win SC_HANDLE RAII owner (#1822)
 #else
+#include <fcntl.h>  // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
 #include <unistd.h>
 #endif
+
+#include <cerrno>
+#include <cstring>
+#include <thread>
 #include <sqlite3.h>
 
 #include <cstdlib>
@@ -37,24 +43,239 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <format>
 #include <iostream>
 #include <memory>
+#include <optional>
+#include <mutex>
 #include <string>
 #include <vector>
 
 static std::atomic<yuzu::agent::Agent*> g_agent{nullptr};
 
+// Both globals below are read FROM A SIGNAL HANDLER. Only a lock-free atomic is legal
+// there ([support.signal]) — a non-lock-free one takes an internal spinlock, and a handler
+// interrupting a thread that holds it deadlocks the process (governance Gate-8 cpp-safety).
+static_assert(std::atomic<yuzu::agent::Agent*>::is_always_lock_free);
+
+#ifdef _WIN32
+/// WINDOWS ONLY. Serialises the console handler's `g_agent->stop()` against main()'s
+/// unpublish-and-destroy, so the Agent cannot be destroyed while a stop() is still running on
+/// it. Taken ONLY inside the `#ifdef _WIN32` branch of on_signal — where the CRT has already
+/// handed us an ordinary thread, so locking is legal. It must NEVER be taken on the POSIX
+/// path: a mutex in a real signal handler is not async-signal-safe, which is precisely why
+/// POSIX uses the self-pipe and gets this barrier from ~ShutdownWatcher's join() instead.
+///
+/// This mirrors service_win.cpp's `g_agent_mu` + AgentUnpublisher (#1822), which solved the
+/// same race for the SCM service path. The console path never had it.
+/// (governance Gate-8 round 8 unhappy-path UP8-1.)
+static std::mutex g_agent_mu;
+#endif
+
+/// Signals seen. The SECOND one escalates — see on_signal.
+///
+/// DELIBERATELY NOT inside `#ifndef _WIN32`. It used to be, which meant the escalation was
+/// POSIX-only and Windows had NO way out of a wedged graceful stop at all. That became acute
+/// once the console handler started holding g_agent_mu across `a->stop()` (round 8): a second
+/// Ctrl-C would arrive on a fresh CRT thread and BLOCK on the mutex the first one holds across
+/// an unbounded guardian_/dex_observer_ drain — so the operator's second Ctrl-C did nothing at
+/// all, forever. Escalation must exist on BOTH platforms, and must run BEFORE any lock.
+/// (governance Gate-8 round 9 — a defect introduced by round 8's own fix.)
+static std::atomic<int> g_signal_count{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+#ifndef _WIN32
+/// Write end of the shutdown self-pipe. The handler's ONLY job is to poke this.
+static std::atomic<int> g_shutdown_wfd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// SIGNAL HANDLING — the handler must do NOTHING but poke a pipe.
+//
+// It used to call `a->stop()` directly, under a comment that said "Only async-signal-safe
+// calls allowed here". Agent::stop() is not remotely that: it takes mutexes, joins worker
+// threads, calls sd_bus_unref() (malloc/free) and logs through spdlog. Calling any of them
+// from a handler is undefined behaviour, and it had a concrete failure mode:
+//
+//   A process-directed signal is delivered on an ARBITRARY thread that has not blocked it,
+//   and nothing blocked it anywhere. If it landed on a thread that stop() then JOINS — a
+//   SparkEngine wheel/mechanism/consumer thread, a Guardian drift worker, the DEX observer,
+//   the updater — that join is a SELF-JOIN. std::thread::join() throws
+//   std::system_error(resource_deadlock_would_occur), the exception escapes Agent::stop()
+//   (which is `noexcept`), and the agent std::terminate()s. On SIGTERM: on every
+//   `systemctl stop`, every reboot, every OTA cycle. It could also self-DEADLOCK, by
+//   re-entering a non-recursive mutex the interrupted thread already held.
+//
+// Fixing it here, at the root, is what lets SparkEngine DELETE its whole mitigation layer
+// (signal masking on its threads, a same-thread re-entry guard, a lock-free self-join
+// bail-out). Those existed only to survive stop() running on a spark thread; with the
+// teardown moved off the handler, it cannot.
+//
+// FIVE TRAPS, all hit for real by an earlier attempt. Do not "simplify" past them:
+//   1. A bare joinable std::thread in main()'s scope. `agent->run()` is NOT wrapped in a
+//      try at its call site, so a throw unwinds past it → ~std::thread on a joinable
+//      thread → std::terminate. Hence the RAII type below.
+//   2. A throw from the RAII type's CONSTRUCTOR BODY skips its destructor. std::thread's
+//      ctor throws std::system_error under EAGAIN — on exactly the thread-exhausted host
+//      this is meant to survive. RAII does not save you; the ctor cleans up by hand.
+//   3. pipe2(fds, O_CLOEXEC | O_NONBLOCK) sets O_NONBLOCK on BOTH ends. The watcher's
+//      read() then returns EAGAIN immediately, the thread exits at once, and SIGTERM
+//      silently stops triggering a graceful stop while still killing the process via the
+//      default disposition — so nothing LOOKS broken. O_NONBLOCK goes on the WRITE end
+//      only; the read end must BLOCK.
+//   4. Without O_CLOEXEC both fds are inherited by every popen()/fork+exec child (the
+//      trigger engine plus the ioc / firewall / services / software_actions / wol /
+//      license_scan plugins) — handing every subprocess a lever to shut the agent down.
+//   5. Closing the read end while keeping the write end open raises SIGPIPE, whose
+//      disposition here is SIG_DFL — so a late handler write, or the destructor's own
+//      sentinel write, KILLS the agent (exit 141). Leave BOTH ends open for the run.
+//
+// Windows keeps the direct call: the CRT dispatches console/CTRL signals on a freshly
+// created thread, so it is already an ordinary thread context; SIGTERM is not meaningfully
+// raised there, and the service path goes through service_win.cpp's SCM control thread.
+// ─────────────────────────────────────────────────────────────────────────────────
+/// LAST-RESORT HANDLER, used ONLY when the shutdown watcher could not be constructed (fd or thread
+/// exhaustion at boot). It does not try to be graceful — it cannot, there is no watcher to run the
+/// teardown — it only guarantees the process remains KILLABLE, including as PID 1 in a container
+/// where a default disposition is discarded by the kernel. Async-signal-safe: no locks, no stdio.
+/// spdlog allocates and RETHROWS non-std exceptions, and main() has NO enclosing handler — so a
+/// throw from a log call on an OOM/exhausted host is a std::terminate WITHOUT unwinding, which is
+/// the very thing the surrounding code exists to prevent. Every log on a failure path in this file
+/// goes through here. (thread_pool.hpp and ShutdownWatcher::log_quietly carry the same firewall.)
+static void log_quietly(const char* what) noexcept {
+    try {
+        spdlog::error("{}", what);
+    } catch (...) {
+        // Nothing to do, and nowhere to say it. A logger must never kill the agent.
+    }
+}
+
+static void on_signal_hard_exit(int sig) {
+    (void)sig;
+#ifdef _WIN32
+    // Never ::_exit() here: it routes via ExitProcess -> DLL_PROCESS_DETACH across ~49 plugin DLLs
+    // -> the loader lock a wedged thread may hold. TerminateProcess runs no DllMain.
+    ::TerminateProcess(::GetCurrentProcess(), 1);
+#else
+    ::_exit(1); // exit_group(2): async-signal-safe, no atexit, no dtors, cannot block.
+#endif
+}
+
 static void on_signal(int sig) {
-    // Only async-signal-safe calls allowed here.
-    // write() to stderr instead of spdlog (which allocates and locks).
+    // A process-directed signal lands on an ARBITRARY unmasked thread — possibly one sitting
+    // between a failing syscall and its `errno` check. Every write() below can set errno (the
+    // O_NONBLOCK write end is *expected* to return EAGAIN), so clobbering it here would
+    // silently rewrite an unrelated thread's error. Save and restore around the handler.
+    // (Gate-8 round 7 cpp-expert. Not restored before _exit — nothing runs after it.)
+    const int saved_errno = errno;
+
+    // Only async-signal-safe calls allowed here — and now that is actually true.
     const char msg[] = "Received signal, shutting down...\n";
+    (void)sig;
+
+    // ── SECOND SIGNAL => ESCALATE. BOTH PLATFORMS, AND BEFORE ANY LOCK. ──────────────
+    //
+    // WHY IT IS FIRST, above the platform split and above g_agent_mu. A wedged graceful stop
+    // is exactly when escalation is needed, and it is also exactly when everything below can
+    // block:
+    //   * POSIX — the watcher thread cannot escalate: its callback IS Agent::stop(), which
+    //     blocks until teardown completes (stop() drains guardian_/dex_observer_ with an
+    //     UNBOUNDED wait), so a wedged teardown leaves it parked and it never reads another
+    //     byte. The handler is the only thing still able to act.
+    //   * WINDOWS — the console handler holds g_agent_mu across `a->stop()` (below). If the
+    //     escalation sat after that lock, a second Ctrl-C would arrive on a fresh CRT thread
+    //     and BLOCK on the mutex the first one is holding across the wedged drain. The
+    //     operator's second Ctrl-C would do nothing, forever.
+    //
+    // Escalation used to live inside the POSIX branch only, so Windows had NO escape from a
+    // wedged stop at all — and round 8's g_agent_mu turned "second Ctrl-C returns uselessly"
+    // into "second Ctrl-C blocks forever". Hoisted here. `_exit()` is async-signal-safe and
+    // takes no locks, so it works from either platform's handler context.
+    // (governance Gate-8 round 9 — a defect introduced by round 8's own fix.)
+    //
+    // HONEST CAVEAT, WINDOWS, UNVERIFIED ON HARDWARE: the UCRT is documented to reset a
+    // signal()-installed handler to SIG_DFL before invoking it for SIGINT. If it does, a
+    // second Ctrl-C never re-enters here at all — it takes the default disposition, which also
+    // terminates, so the OPERATOR still gets out either way. What this hoist guarantees is the
+    // thing that actually mattered: IF the handler is re-entered, it CANNOT block on
+    // g_agent_mu behind a wedged stop(). Do not upgrade this comment to "the escalation is what
+    // rescues Windows" without a two-Ctrl-C-during-a-wedged-stop repro on a real Windows box.
+    // (Deliberately NOT re-arming with std::signal(sig, on_signal) here: that would be new,
+    // unverifiable behaviour on the one platform this session cannot build or test.)
+    if (g_signal_count.fetch_add(1, std::memory_order_acq_rel) >= 1) {
+        // NOTHING MAY PRECEDE THE EXIT — not even a log.
+        //
+        // This used to write a "Second signal ..." banner to stderr first. But stderr is a
+        // BLOCKING pipe under Docker's json-logger and under journald, so a stalled collector or
+        // a full log disk blocks the write INSIDE THE HANDLER — and the escape hatch whose whole
+        // purpose is to work when everything else is wedged became the thing that wedged. The
+        // operator still gets out: the process dies immediately. BE HONEST ABOUT WHAT IS LOST —
+        // the banner is not relocated anywhere, it is GONE, and exit 1 here is indistinguishable
+        // from a startup failure. A second signal therefore produces no diagnostic at all. The
+        // internal shutdown deadline that was meant to carry that diagnosis (on an ordinary
+        // thread, where logging is safe) is deferred to a separate PR; until it lands, a wedged
+        // stop is diagnosed from the supervisor's log and the absence of "Yuzu agent stopped".
+        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
+#ifdef _WIN32
+        // ::_exit() routes through ExitProcess, which terminates every other thread and THEN
+        // runs DLL_PROCESS_DETACH for each of the ~49 loaded plugin DLLs — taking the loader
+        // lock a wedged thread may already hold. The one path whose entire job is unconditional
+        // escape could itself deadlock. TerminateProcess runs no DllMain and takes no loader
+        // lock. (governance: cross-platform SHOULD-1.)
+        ::TerminateProcess(::GetCurrentProcess(), 1);
+#else
+        ::_exit(1); // exit_group(2): no atexit, no dtors, no loader lock. Cannot block.
+#endif
+    }
+
 #ifdef _WIN32
     _write(2, msg, sizeof(msg) - 1);
+    // Windows: the CRT dispatches this on a freshly created ORDINARY thread, not in a real
+    // signal context, so the teardown may run inline and a mutex is legal here (it would not
+    // be on POSIX — that is the entire reason for the self-pipe below).
+    //
+    // HOLD g_agent_mu ACROSS a->stop(), not merely across the load. main() takes the same
+    // mutex to unpublish, so it BLOCKS until an in-flight stop() has returned, and only then
+    // destroys the Agent. Without that barrier, `stop()` (which drains guardian_/dex_observer_
+    // with an unbounded wait) runs on THIS thread while main returns from run(), unpublishes
+    // and destroys the Agent out from under it — reading guardian_, spark_engine_, updater_
+    // and ctx_mu_ as they are destructed. Nulling an atomic pointer does NOT close that
+    // window; it only closes the load-null race.
+    //
+    // POSIX gets this barrier for free from ~ShutdownWatcher's join() (the watcher thread is
+    // the one running stop(), and it is joined before ~Agent). Windows has no watcher, so it
+    // needs the lock. service_win.cpp's SCM path already does exactly this (g_agent_mu held
+    // across g_agent->stop(), AgentUnpublisher taking the same mutex, #1822); the CONSOLE path
+    // never got it — and an earlier version of the comment in main() below wrongly claimed
+    // that unpublishing g_agent had closed this. (governance Gate-8 round 8 unhappy-path UP8-1.)
+    //
+    // Blocking here is SAFE ONLY BECAUSE the escalation above runs first: a wedged stop() can
+    // park this thread indefinitely, and the second signal is what rescues the operator.
+    {
+        std::lock_guard<std::mutex> lock(g_agent_mu);
+        if (auto* a = g_agent.load(std::memory_order_acquire))
+            a->stop();
+    }
 #else
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // ── THE PIPE BYTE GOES FIRST. THE LOG IS NEVER ALLOWED TO GATE THE TEARDOWN. ──────
+    //
+    // stderr is a BLOCKING pipe under Docker's json-logger and under journald. A stalled log
+    // consumer, a full log disk, or a wedged collector makes this write() block INSIDE THE
+    // SIGNAL HANDLER — and glibc masks the signal while its handler runs, so the operator's
+    // second SIGTERM cannot even be delivered. Logging first therefore defeated BOTH the
+    // graceful stop AND the escalation that exists to rescue it, on a fleet-correlated fault
+    // (disk-full hits every endpoint at once). The pipe write is O_NONBLOCK and cannot block;
+    // the log is best-effort and comes after. (governance: security-guardian + unhappy-path.)
+    const int wfd = g_shutdown_wfd.load(std::memory_order_acquire);
+    if (wfd >= 0) {
+        const char byte = yuzu::agent::ShutdownWatcher::kSignal;
+        ssize_t n = ::write(wfd, &byte, 1); // async-signal-safe, and CANNOT block (O_NONBLOCK)
+        (void)n; // EAGAIN on a full pipe just means a shutdown is already pending — which is
+                 // exactly what we wanted.
+    }
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1); // best-effort; may block, harmlessly now
 #endif
-    (void)sig;
-    if (auto* a = g_agent.load(std::memory_order_acquire))
-        a->stop();
+    errno = saved_errno;
 }
+
 
 // Verifies preconditions and constructs the Agent. Shared by the console path and
 // the Windows service path (service_win.cpp's ServiceMain calls this on its own
@@ -196,6 +417,7 @@ int main(int argc, char* argv[]) {
                    "Update check interval in seconds (default: 21600 = 6h)")
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
+
     app.add_flag("--dex-disable", cfg.dex_disable,
                  "Disable the Guardian DEX crash recorder (collect no process-crash "
                  "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
@@ -207,6 +429,29 @@ int main(int argc, char* argv[]) {
                  "jurisdictions / works-council agreements that require it off; not a "
                  "server-side runtime toggle.")
         ->envname("YUZU_AGENT_INVENTORY_DISABLE");
+
+    app.add_flag("--spark-disable", cfg.spark_disable,
+                 "Disable the SparkEngine detection engine (ADR-0021 Stage-2): it is never "
+                 "instantiated, watches nothing, and reports no capability or health "
+                 "counters. The heartbeat still carries two facts — that spark is off, and "
+                 "that this was deliberate (spark_running=0, spark_disabled=1) — so the "
+                 "fleet can tell a deliberate opt-out apart from an engine that FAILED to "
+                 "start. Deploy-time opt-out; the enforcing legacy Guardian path is "
+                 "unaffected. Not a server-side runtime toggle.")
+        ->envname("YUZU_AGENT_SPARK_DISABLE");
+
+    // SLE (ADR-0024 Decision 11): how the software_licensing source records a
+    // detected per-user licence's local profile name. hash (default) = a
+    // per-agent keyed pseudonym HMAC-SHA256(k_agent, profile)/16-hex; collect =
+    // the raw profile name (opt-in); omit = no identifier (user_scope still marks
+    // the detection per-user). CLI::IsMember rejects anything else at parse.
+    app.add_option("--license-scan-user-ref", cfg.license_scan_user_ref,
+                   "How the software_licensing sync records per-user licence profile names: "
+                   "collect|hash|omit (default hash — a per-agent keyed pseudonym). "
+                   "Env: YUZU_AGENT_LICENSE_SCAN_USER_REF.")
+        ->default_val("hash")
+        ->check(CLI::IsMember({"collect", "hash", "omit"}))
+        ->envname("YUZU_AGENT_LICENSE_SCAN_USER_REF");
 
     // Windows service management
     bool install_service = false;
@@ -394,6 +639,9 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+    // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
+    // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
+    spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
 
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the
@@ -419,10 +667,176 @@ int main(int argc, char* argv[]) {
     // handlers any earlier -- e.g. before calling make_agent() -- would
     // widen that pre-existing signal gap to cover make_agent()'s work too
     // (Gate 3 cpp-expert finding, governance re-run).
+#ifndef _WIN32
+    // The handler only write()s a byte; THIS thread performs the teardown, so stop()'s
+    // joins can never be a self-join and no mutex/malloc/spdlog ever runs in a signal
+    // context. See the on_signal comment block for the five traps this avoids.
+    //
+    // Constructed BEFORE the handlers are installed, so `g_shutdown_wfd` is always live by
+    // the time a handler can fire. The other way round leaves a window in which a SIGTERM
+    // finds wfd == -1 and is SILENTLY SWALLOWED. (The watcher tolerates a signal arriving
+    // before g_agent is published: it keeps waiting rather than being consumed.)
+    //
+    // RAII, and DECLARATION ORDER IS LOAD-BEARING: `agent` is declared ABOVE, so
+    // reverse-order destruction destroys the watcher FIRST — joining its thread — before
+    // the Agent it calls stop() on dies. Declare it above `agent` and the watcher could
+    // call stop() on a destroyed Agent. RAII rather than a bare thread because
+    // `agent->run()` below is NOT wrapped in a try at its call site: a throw would unwind
+    // past a joinable std::thread and std::terminate. Do not reorder.
+    // CONSTRUCTED INSIDE A TRY, in an optional, because its own construction can throw on exactly
+    // the host it exists to survive. `state_`'s make_shared sits in the mem-init-list — OUTSIDE the
+    // ctor body's firewall — and `main()` has no enclosing handler, so a bad_alloc/EAGAIN there
+    // escaped main and std::terminate'd WITHOUT UNWINDING: no plugin shutdown(), no SQLite close.
+    // That is the identical hole this branch wraps make_unique<ThreadPool> to close, in the same
+    // file, for the same reason. If it throws, the !ok() branch below installs the hard-exit
+    // handler — NOT SIG_DFL, which pid 1 would discard.
+    // (governance: cpp-expert, this PR.)
+    std::optional<yuzu::agent::ShutdownWatcher> shutdown_watcher;
+    try {
+        shutdown_watcher.emplace(
+        g_shutdown_wfd,
+        [] {
+            auto* a = g_agent.load(std::memory_order_acquire);
+            if (!a)
+                return false; // not published yet — keep waiting, do not consume the watcher
+            a->stop();        // ordinary thread: safe to lock, join, malloc, log
+            return true;
+        },
+        [] {
+            // TRAP 6 — the watcher died on a read() error. If we leave the handlers installed,
+            // on_signal keeps writing bytes into a pipe with NO READER and every SIGTERM is
+            // SWALLOWED: the agent becomes unkillable by anything but SIGKILL.
+            //
+            // AND SIG_DFL IS NOT THE ANSWER, for the same reason it is not the answer at the
+            // construction-failure site: the agent is PID 1 in every shipped container image, and
+            // the kernel DISCARDS a default-disposition signal for pid 1. Handing the signals
+            // "back to the kernel" there means SIGTERM is IGNORED — the exact unkillable state
+            // this callback exists to escape. Install the hard-exit handler instead: ungraceful,
+            // but genuinely killable, on every platform and as pid 1.
+            // (governance: security-guardian — the sibling site I fixed at one place and not here.)
+            std::signal(SIGINT, on_signal_hard_exit);
+            std::signal(SIGTERM, on_signal_hard_exit);
+        });
+    } catch (...) {
+        // Firewalled: an unguarded spdlog call here would terminate WITHOUT unwinding on exactly
+        // the OOM/exhausted host this try exists for. And the handlers are NOT left at SIG_DFL —
+        // the `!ok()` branch below installs the hard-exit handler, because pid 1 discards SIG_DFL.
+        log_quietly("could not construct the shutdown watcher (out of memory or threads) — SIGINT/"
+                    "SIGTERM will exit the process immediately and UNGRACEFULLY (no plugin "
+                    "shutdown, no clean DB close). That is the killable posture; a default "
+                    "disposition would be IGNORED by pid 1 in a container.");
+    }
+#endif
+
+    g_agent.store(agent.get(), std::memory_order_release);
+
+    // UNPUBLISH ON EVERY PATH, INCLUDING AN UNWIND — and BEFORE the watcher is destroyed.
+    //
+    // ~ShutdownWatcher's detach path is justified in its own header by "g_agent is already null by
+    // then". That was FALSE on the exception path: the explicit g_agent.store(nullptr) below sits
+    // AFTER agent->run(), so a throw out of run() skips it, and a detached watcher's callback could
+    // then load a LIVE g_agent and call stop() on an Agent that is being destroyed.
+    // This guard is declared AFTER `agent` AND AFTER the watcher, so reverse-order destruction
+    // runs it BEFORE ~ShutdownWatcher on every path — which makes the header's stated reason
+    // actually true, structurally, instead of by argument. (Declared BEFORE the watcher it
+    // would be destroyed AFTER it — the detach path could then observe a live g_agent, the
+    // exact S1 UAF.) (governance: cpp-safety S1; order corrected in the gate-round fold.)
+    struct AgentUnpublisher {
+        ~AgentUnpublisher() { g_agent.store(nullptr, std::memory_order_release); }
+    } agent_unpublisher;
+
+
+#ifndef _WIN32
+    // ONLY install the handlers if the watcher is live. If it is not (pipe or thread
+    // creation failed), on_signal would catch the signal, find no pipe, and RETURN —
+    // swallowing it, with no default disposition left. SIGTERM and Ctrl-C would stop
+    // working entirely and `systemctl stop` would hang to TimeoutStopSec before SIGKILL:
+    // a fail-open-to-hang regression, on exactly the exhausted host this path exists for.
+    // The fallback is the hard-exit handler below (NOT SIG_DFL — pid 1 discards it).
+    // (governance Gate-8 cpp-safety.)
+    if (shutdown_watcher && shutdown_watcher->ok()) {
+        std::signal(SIGINT, on_signal);
+        std::signal(SIGTERM, on_signal);
+        // RE-CHECK after the install (TOCTOU): a watcher dying between the ok() test above
+        // and these installs runs died() FIRST — it retracts the wfd slot and installs the
+        // hard-exit handler — and the two std::signal calls above then OVERWRITE it with
+        // on_signal, which finds wfd < 0 and returns: signal swallowed, agent unkillable —
+        // the exact trap-6 state this branch closes. Re-checking AFTER the install makes
+        // every interleaving converge: a died() that runs after this re-check installs
+        // last and wins; one that ran before is caught here.
+        // (governance gate round: cpp-expert SHOULD-1, this branch.)
+        if (!shutdown_watcher->ok()) {
+            std::signal(SIGINT, on_signal_hard_exit);
+            std::signal(SIGTERM, on_signal_hard_exit);
+        }
+    } else {
+        // SIG_DFL IS NOT A SAFE FALLBACK IN A CONTAINER, AND THE AGENT IS PID 1 THERE.
+        //
+        // The kernel DISCARDS a default-action signal for PID 1 — a signal with no installed
+        // handler is ignored, not fatal. So "leave SIG_DFL, the process still dies promptly" is
+        // simply FALSE in every shipped agent image (exec-form ENTRYPOINT, no init): SIGTERM would
+        // be swallowed and `docker stop` would hang the full grace before SIGKILL. That is WORSE
+        // than the behaviour this branch replaced, which installed a handler unconditionally.
+        //
+        // Install a handler that does nothing but LEAVE. It needs no pipe and no watcher, and
+        // _exit()/TerminateProcess are async-signal-safe, so it is >= SIG_DFL everywhere and
+        // strictly better on PID 1. Ungraceful — but killable, which is the whole point.
+        // (governance: unhappy-path A, this PR.)
+        std::signal(SIGINT, on_signal_hard_exit);
+        std::signal(SIGTERM, on_signal_hard_exit);
+        spdlog::warn("shutdown watcher unavailable — SIGINT/SIGTERM will now exit the process "
+                     "IMMEDIATELY and UNGRACEFULLY (no plugin shutdown, no clean DB close). A "
+                     "default disposition would be IGNORED by PID 1 in a container, so this is "
+                     "the killable posture.");
+    }
+#else
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
-    g_agent.store(agent.get(), std::memory_order_release);
+#endif
+
     agent->run();
+
+    // ── THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM ──────────────────────────────
+    // From here on nothing can act on a signal: the watcher is about to be joined and
+    // `g_shutdown_wfd` cleared, so on_signal would find wfd == -1 and simply RETURN —
+    // SWALLOWING the signal, with no default disposition left. That window is not small: it
+    // spans the whole of ~Agent, which still joins the Guardian/DEX worker threads and closes
+    // the SQLite stores. An operator's `systemctl stop` landing there would do NOTHING, and
+    // systemd would wait out TimeoutStopSec before SIGKILL — the exact fail-open-to-hang this
+    // self-pipe exists to remove, reintroduced at the tail. (Gate-8 round 7, unhappy-path UP-2.)
+    //
+    // Run()'s ScopeExit has already done the operator-visible teardown (plugin shutdown(),
+    // trigger engine, thread-pool drain) — the graceful path is spent, and SQLite's WAL is
+    // crash-safe, so dying promptly here beats hanging silently.
+    // NOT SIG_DFL — pid 1 discards it (see on_signal_hard_exit). This window is not small: it
+    // spans the whole of ~Agent (the Guardian/DEX joins, the SQLite closes). A signal arriving here
+    // means "you are taking too long", and on pid 1 a default disposition would simply be ignored,
+    // so `docker stop` would hang the full grace. Leave a handler that guarantees we LEAVE.
+    // (governance: security-guardian — the second sibling site.)
+    std::signal(SIGINT, on_signal_hard_exit);
+    std::signal(SIGTERM, on_signal_hard_exit);
+    // Unpublish BEFORE ~Agent, and only once the handlers are already the hard-exit handler
+    // (which never touches g_agent — so there is no instant where a g_agent-dereferencing
+    // handler is installed while g_agent is null).
+    //
+    // ON WINDOWS THE STORE ALONE IS NOT ENOUGH, and an earlier version of this comment
+    // wrongly claimed it was ("closes the Windows g_agent use-after-free"). Nulling an atomic
+    // pointer closes only the load-null race. The console handler derefs g_agent and calls
+    // `a->stop()` INLINE on a CRT-spawned thread; stop() drains guardian_/dex_observer_ with
+    // an unbounded wait, so it can still be running here — and a bare store does not wait for
+    // it. main would then return and destroy the Agent while stop() is reading its members.
+    // Taking g_agent_mu (which on_signal holds ACROSS stop()) makes this BLOCK until any
+    // in-flight stop() has returned. That is the barrier POSIX already gets from
+    // ~ShutdownWatcher's join(), and the one service_win.cpp has had since #1822.
+    // (governance Gate-8 round 8 unhappy-path UP8-1.)
+#ifdef _WIN32
+    {
+        std::lock_guard<std::mutex> lock(g_agent_mu);
+        g_agent.store(nullptr, std::memory_order_release);
+    }
+#else
+    g_agent.store(nullptr, std::memory_order_release);
+#endif
 
     // #1303: a fatal STARTUP failure (e.g. the fail-closed TLS posture refused to
     // connect with no pinnable CA) must surface as a non-zero exit so systemd
