@@ -336,6 +336,10 @@ int main(int argc, char* argv[]) {
                   "Bearer credential IdPs present on every /scim/v2/* request. "
                   "Required when --scim-enable is set; stored as a sha256 hash only.")
         ->envname("YUZU_SCIM_TOKEN");
+    app.add_option("--scim-admin-group", cfg.scim_admin_group,
+                  "SCIM Group displayName that maps to admin role; empty disables "
+                  "SCIM-group-to-admin mapping")
+        ->envname("YUZU_SCIM_ADMIN_GROUP");
 
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
     app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,

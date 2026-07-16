@@ -132,8 +132,12 @@ public:
         if (!iocp_) {
             spdlog::error("spark_file: CreateIoCompletionPort failed (err={}) — file sparks inert",
                           ::GetLastError());
+            // Publish it: a registered-but-inert mechanism must not report as a live
+            // capability (governance Gate-3 cross-platform / Gate-6 sre).
+            inert_.store(true, std::memory_order_release);
             return;
         }
+        inert_.store(false, std::memory_order_release);
         stop_.store(false, std::memory_order_release);
         worker_ = std::thread([this] { run(); });
     }
@@ -314,6 +318,7 @@ public:
             .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
             .quarantined_total = quarantined_.load(std::memory_order_relaxed),
             .slow_op_total = slow_op_.load(std::memory_order_relaxed),
+            .inert = inert_.load(std::memory_order_acquire),
         };
     }
 
@@ -723,6 +728,9 @@ private:
     std::atomic<std::uint64_t> watch_rejected_{0};
     std::atomic<std::uint64_t> quarantined_{0};
     std::atomic<std::uint64_t> slow_op_{0}; ///< bumped by PR-E (#1980)
+    /// Started, but the IOCP could not be created — every watch() will be refused.
+    /// Atomic so stats() (const, heartbeat thread) reads it without mu_.
+    std::atomic<bool> inert_{false};
 };
 
 } // namespace

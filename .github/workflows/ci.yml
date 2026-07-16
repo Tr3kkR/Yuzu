@@ -491,6 +491,20 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
 
+      # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
+      # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
+      # completely — and three shutdown defects shipped and were each caught only by a human
+      # sending a signal by hand: O_NONBLOCK on both pipe ends (SIGTERM silently stopped being
+      # graceful), a nested lock_guard that self-deadlocked Agent::stop() (the agent hung on every
+      # SIGTERM while the suites and TSan stayed green), and handlers installed without a live
+      # watcher (signal swallowed, agent unkillable). Needs no server: the agent's reconnect loop
+      # against a closed port is a fully-booted steady state.
+      - name: Agent graceful-shutdown smoke test
+        env:
+          YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
+          YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
+        run: bash scripts/test/agent-shutdown-smoke.sh
+
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
       # the last 100 lines, which is enough for a Catch2 failure but loses
