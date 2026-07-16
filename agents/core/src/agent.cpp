@@ -764,6 +764,19 @@ public:
             // this guard already covered spark. It did not — it never touched it.)
             if (spark_engine_)
                 spark_engine_->stop();
+            // Guardian, on EVERY run() exit - not just the externally-triggered
+            // Agent::stop() path (handler_ex / the shutdown watcher / the console
+            // handler). A run() exit that never went through an explicit stop()
+            // request (e.g. the dispatch-pool re-creation failure below setting
+            // stop_requested_ directly) previously left guardian_->stop() never
+            // called at all, so F3's orphan check in main()/service_win.cpp could
+            // sample guardian_active_io_workers() before Guardian I/O admission
+            // was ever closed - not merely before it finished, but before it had
+            // even started (Sol rung-7.6 review round 3, finding 1). Idempotent:
+            // Agent::stop() may already have called it, exactly like spark_engine_
+            // above.
+            if (guardian_)
+                guardian_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
             // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
