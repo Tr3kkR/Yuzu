@@ -180,7 +180,9 @@ spec:
       - name: definition_version
         type: string
       - name: last_update
-        type: string
+        type: string # ISO-8601 (macOS `stat`); the Windows defender_status
+                      # last_update is a locale-dependent PowerShell render —
+                      # do not treat the two as interchangeably formatted
       - name: remediator_version
         type: string
       - name: mrt_version
@@ -199,6 +201,10 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
+    # Gates the agent daemon version, NOT the antivirus plugin's own version
+    # (0.2.0, AntivirusPlugin::version()) — no minPluginVersion mechanism
+    # exists today. An agent running plugin <0.2.0 degrades to
+    # status|not_available rather than being gated out here.
     minAgentVersion: 0.1.0
     requiredPlugins: [antivirus]
 
