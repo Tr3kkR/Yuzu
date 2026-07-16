@@ -933,7 +933,7 @@ public:
         if (action == "set_dnd")
             return do_set_dnd(ctx, params);
 
-        ctx.write_output(std::format("unknown action: {}", action));
+        ctx.write_output(std::format("status|error|unknown action: {}", action));
         return 1;
     }
 
