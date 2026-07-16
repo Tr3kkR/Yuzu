@@ -12,7 +12,8 @@
  * Platform implementations:
  *   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList / WlanQueryInterface
  *   Linux:   nmcli device wifi list / nmcli device wifi show
- *   macOS:   airport -s / airport -I
+ *   macOS:   list_networks — airport -s / system_profiler (legacy; airport gone in 14+)
+ *            connected     — CoreWLAN (wifi_corewlan.mm)
  */
 
 #include <yuzu/plugin.hpp>
@@ -24,6 +25,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#ifdef __APPLE__
+#include "wifi_corewlan.hpp"  // CoreWLAN current-connection query (first .mm TU)
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -461,40 +466,22 @@ int do_connected(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto airport_out = run_command(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport "
-        "-I 2>/dev/null");
-    if (!airport_out.empty()) {
-        std::istringstream ss(airport_out);
-        std::string line;
-        std::string ssid, rssi, security, bssid, channel;
-        while (std::getline(ss, line)) {
-            // Trim leading whitespace
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            auto trimmed = line.substr(start);
-
-            if (trimmed.starts_with("SSID: "))
-                ssid = trimmed.substr(6);
-            else if (trimmed.starts_with("agrCtlRSSI: "))
-                rssi = trimmed.substr(12);
-            else if (trimmed.starts_with("link auth: "))
-                security = trimmed.substr(11);
-            else if (trimmed.starts_with("BSSID: "))
-                bssid = trimmed.substr(7);
-            else if (trimmed.starts_with("channel: "))
-                channel = trimmed.substr(9);
-        }
-
-        if (!ssid.empty()) {
-            ctx.write_output(
-                std::format("connected|{}|{}|{}|{}|{}", ssid, rssi.empty() ? "0" : rssi,
-                            security.empty() ? "Open" : security, bssid.empty() ? "-" : bssid,
-                            channel.empty() ? "0" : channel));
-        } else {
-            ctx.write_output("connected|none|Not connected|0|none|none");
-        }
+    // CoreWLAN, not `airport -I`: the private airport binary was removed in
+    // macOS 14 (Sonoma), so the old shell-out returned nothing and we always
+    // reported "Not connected" even while associated. Fields stay in the
+    // established macOS order: SSID | RSSI | Security | BSSID | Channel.
+    //
+    // Location Services (macOS 14+) withholds SSID/BSSID from a background
+    // daemon, but the association, RSSI, channel and security are still
+    // readable — so an authorised-withheld SSID becomes an honest
+    // "<ssid-withheld>" marker on a real connection, never a false
+    // "Not connected".
+    yuzu::wifi::WifiConnection conn;
+    if (yuzu::wifi::corewlan_current_connection(conn) && conn.associated) {
+        std::string ssid = conn.ssid_available ? conn.ssid : "<ssid-withheld>";
+        ctx.write_output(std::format("connected|{}|{}|{}|{}|{}", ssid, conn.rssi,
+                                     conn.security.empty() ? "Unknown" : conn.security,
+                                     conn.bssid.empty() ? "-" : conn.bssid, conn.channel));
     } else {
         ctx.write_output("connected|none|Not connected|0|none|none");
     }
