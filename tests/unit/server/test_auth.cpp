@@ -241,6 +241,90 @@ TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
     REQUIRE_FALSE(auth_db.get_user("dana").has_value());
 }
 
+// ── update_role: cold-cache DB truth (CC6.7, SCIM hardening round) ─────────
+//
+// Same class of bug as CC6.8 above but for `update_role`: it historically
+// gated its return on whether the in-memory `users_` cache happened to
+// contain the username, even on the AuthDB-backed path where the DB write is
+// authoritative. A cold-booted server (or, as here, a second AuthManager
+// wired to the same AuthDB that never warmed its cache for this user) would
+// durably update the role in AuthDB yet report failure back to the caller.
+// SCIM's group->role sync audits `update_role`'s return value as
+// `scim.user.role_changed` = success|failure — the false-negative meant a
+// real, durable role change went unaudited post-restart. The fix returns the
+// AuthDB `std::expected<void, AuthDBError>` truth, with cache/session
+// cleanup demoted to a best-effort side effect (mirrors remove_user).
+TEST_CASE("update_role returns true for a cold-cache DB hit and the DB row reflects the change",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    // Seed the row directly through AuthDB, bypassing AuthManager entirely —
+    // no AuthManager instance ever caches this username.
+    auto salt = AuthManager::random_bytes(16);
+    auto salt_hex = AuthManager::bytes_to_hex(salt);
+    REQUIRE(auth_db
+                .upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
+                             salt_hex, Role::user)
+                .has_value());
+
+    // A fresh AuthManager over the SAME AuthDB, modeling a cold-booted
+    // process: its in-memory users_ map has never seen "cora".
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(&auth_db);
+
+    REQUIRE(cold_mgr.update_role("cora", Role::admin));
+
+    // The DB row itself reflects the change — this is the assertion that
+    // proves the fix (previously this would return false despite the DB
+    // write above having already succeeded).
+    auto entry = auth_db.get_user("cora");
+    REQUIRE(entry.has_value());
+    REQUIRE(entry->role == Role::admin);
+}
+
+TEST_CASE("update_role returns false for a DB miss, no error (cold cache)",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(&auth_db);
+
+    REQUIRE_FALSE(cold_mgr.update_role("nonexistent", Role::admin));
+}
+
+TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
+          "[auth][user][cold_cache]") {
+    yuzu::test::TempDir dir;
+    fs::create_directories(dir.path);
+    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(auth_db.initialize().has_value());
+
+    AuthManager mgr;
+    mgr.set_auth_db(&auth_db);
+
+    // upsert_user goes through AuthManager, so it warms the cache too.
+    REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
+    auto token = mgr.authenticate("dana", "password1234");
+    REQUIRE(token.has_value());
+    REQUIRE(mgr.validate_session(*token).has_value());
+
+    REQUIRE(mgr.update_role("dana", Role::admin));
+
+    // Sessions belonging to the role-changed user are invalidated so the
+    // stale session role can't grant old privileges.
+    REQUIRE_FALSE(mgr.validate_session(*token).has_value());
+    REQUIRE(mgr.get_user_role("dana") == Role::admin);
+    auto entry = auth_db.get_user("dana");
+    REQUIRE(entry.has_value());
+    REQUIRE(entry->role == Role::admin);
+}
+
 // ── Authentication ───────────────────────────────────────────────────────────
 
 TEST_CASE("authenticate succeeds with correct password", "[auth][session]") {

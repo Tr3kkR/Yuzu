@@ -5884,11 +5884,13 @@ Discovery — static capability document (patch/filter/bulk support flags).
 
 #### `GET /scim/v2/ResourceTypes`
 
-Discovery — a SCIM `ListResponse` describing the `User` resource type.
+Discovery — a SCIM `ListResponse` describing the User and Group resource
+types.
 
 #### `GET /scim/v2/Schemas`
 
-Discovery — a SCIM `ListResponse` describing the core `User` schema.
+Discovery — a SCIM `ListResponse` describing the core User and Group
+schemas.
 
 #### `POST /scim/v2/Users`
 
@@ -5910,11 +5912,13 @@ are tolerated and ignored).
 | `201` + `Location` + `ETag` | Created | SCIM User representation |
 | `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
 
-Created at the fixed `role=user` with a discarded CSPRNG password — the
-account authenticates via SSO, never a local password. If the `userName`
-instead matches an existing SCIM-provisioned account that is currently
-**deactivated**, `POST` revives that account (a returning-employee
-reprovision) rather than `409`ing.
+Created with a discarded CSPRNG password — the account authenticates via
+SSO, never a local password. Role defaults to `user`, recomputed
+immediately against `--scim-admin-group` membership (see Groups → role
+mapping below) — created `role=admin` iff already a member of that group at
+creation time. If the `userName` instead matches an existing
+SCIM-provisioned account that is currently **deactivated**, `POST` revives
+that account (a returning-employee reprovision) rather than `409`ing.
 
 #### `GET /scim/v2/Users/{id}`
 
@@ -5976,12 +5980,68 @@ account immediately before mutating it, and refuses with **`404` — never
 from "no such SCIM resource") plus a `scim.user.provenance_denied` audit row.
 This is what makes it safe to point an IdP's SCIM connector at this surface
 at all: a locally-created admin, or the `--break-glass-user` account, can
-never be deactivated by a SCIM call; SCIM-provisioned accounts are always
-`role=user` at creation so a compromised IdP cannot create an admin; and the
-`role` check means an operator-elevated former-SCIM account (later promoted
-by a human via the dashboard) also drops out of SCIM's write authority. See
-`docs/auth-architecture.md` "SCIM v2 provisioning" for the full threat
-discussion.
+never be deactivated by a SCIM call; the only path from a SCIM request to
+`role=admin` is Groups → role mapping below, bounded to the single
+configured `--scim-admin-group`, so a compromised IdP cannot create an
+admin outside that mapping; and the `role` check means an operator-elevated
+former-SCIM account (later promoted by a human via the dashboard, or via
+Groups → role mapping) also drops out of SCIM's write authority until it is
+back to `role=user`. See `docs/auth-architecture.md` "SCIM v2 provisioning"
+for the full threat discussion.
+
+#### Groups → role mapping
+
+`Group` is advertised in `/scim/v2/ResourceTypes` and `/scim/v2/Schemas`
+(schema urn `urn:ietf:params:scim:schemas:core:2.0:Group`). Gated by
+`--scim-admin-group` (`YUZU_SCIM_ADMIN_GROUP`, default empty — no SCIM group
+grants admin). Full design detail (role-resolution, provenance guard
+interaction, deprovision-ordering) is in `docs/auth-architecture.md` "SCIM v2
+provisioning" § Groups → role mapping; operator walkthrough is
+[docs/user-manual/scim-provisioning.md](scim-provisioning.md#groups--role-mapping).
+
+#### `POST /scim/v2/Groups`
+
+Create a group. Body: `displayName` (required), optional `members[]`
+(each `{"value": "<scim-user-id>"}`).
+
+| Status | Condition | Body |
+|---|---|---|
+| `201` + `Location` + `ETag` | Created | SCIM Group representation |
+| `409` (`scim_type=uniqueness`) | `displayName` already in use | SCIM error envelope |
+
+#### `GET /scim/v2/Groups/{id}`
+
+Read a single group by its SCIM `id`. `200` + Group representation, or
+`404` if unknown.
+
+#### `GET /scim/v2/Groups?filter=displayName eq "x"&startIndex=&count=`
+
+List groups. Same pagination contract as `GET /scim/v2/Users`
+(`startIndex`/`count`, SCIM `ListResponse` envelope, `startIndex` 1-based per
+RFC 7644 §3.4.2). Optional `filter=displayName eq "..."` (case-insensitive
+attribute/operator, double-quoted value); any other filter expression is
+rejected `400` (`scim_type=invalidFilter`).
+
+#### `PUT /scim/v2/Groups/{id}`
+
+Replace a group (`displayName`, `members[]`). `200` + Group representation;
+`404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
+onto a `displayName` already used by a different group.
+
+#### `PATCH /scim/v2/Groups/{id}`
+
+Add/remove members — RFC 7644 §3.5.2 PatchOp on the `members` path
+(`"op": "add"` / `"op": "remove"`, `"path": "members"`). `200` + Group
+representation, or `404` if unknown.
+
+#### `DELETE /scim/v2/Groups/{id}`
+
+Delete a group. `204` on success; `404` if unknown.
+
+Any Group `POST`/`PUT`/`PATCH`/`DELETE` that changes a user's membership of
+the `--scim-admin-group` group recomputes that user's role immediately
+(`scim.user.role_changed` audit row, see below) — there is no separate
+"apply role changes" step.
 
 #### Audit actions
 
@@ -5996,11 +6056,19 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision / rolls back `500` |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
+| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 
 #### Metrics
 
-`yuzu_scim_requests_total{op,status}`, `yuzu_scim_auth_failures_total`,
-`yuzu_scim_audit_write_failures_total`, `yuzu_scim_provenance_denied_total`.
+`yuzu_scim_requests_total{op,status}` (now including group ops),
+`yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
+`yuzu_scim_provenance_denied_total`, `yuzu_scim_role_changes_total`,
+`yuzu_scim_role_change_failures_total` (a role change that was decided but
+failed to durably apply — pairs with `scim.user.role_changed` `failure`
+rows).
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics.
 
