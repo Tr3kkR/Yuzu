@@ -5,7 +5,9 @@
  * The popen shell-outs are the impure shell; the decision-shaped parsing of
  * `socketfilterfw --getglobalstate` and `pfctl -s info` output is header-pure
  * and pinned here on every host (the netprobe_stats.hpp pattern). Fixture
- * strings marked "real capture" were taken verbatim from a macOS 26 host.
+ * strings marked "real capture" were taken verbatim from a macOS 26 host;
+ * older macOS releases are not yet fixture-verified — capture and add when
+ * such hardware is available.
  */
 
 #include "firewall_parsers.hpp"
@@ -56,6 +58,17 @@ TEST_CASE("alf: unrecognised state number falls back to prose", "[firewall]") {
     CHECK(parse_alf_global_state("Firewall is enabled. (State = 7)").state ==
           FwState::enabled);
     CHECK(parse_alf_global_state("Mystery text. (State = 7)").state == FwState::unknown);
+}
+
+TEST_CASE("alf: multi-digit or negative state numbers are unrecognised", "[firewall]") {
+    // "(State = 10)" must not be misread as State 1 — the clause is
+    // unrecognised and the prose decides instead.
+    CHECK(parse_alf_global_state("Firewall is enabled. (State = 10)").state ==
+          FwState::enabled); // via prose fallback, not the '1'
+    auto r = parse_alf_global_state("Mystery text. (State = 10)");
+    CHECK(r.state == FwState::unknown);
+    CHECK_FALSE(r.block_all);
+    CHECK(parse_alf_global_state("Mystery text. (State = -1)").state == FwState::unknown);
 }
 
 TEST_CASE("alf: truncated clause at end of output is not read past", "[firewall]") {

@@ -186,6 +186,31 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — macOS firewall `state` now reports the Application Firewall (backend key changed)
+
+The `firewall` plugin's macOS `state` action previously reported the pf packet
+filter — which is off by default and unrelated to the Application Firewall a
+Mac admin means — so a Mac with the real firewall on could read `disabled`.
+Three things are visible after upgrading agents:
+
+1. **The `backend` row value changes from `pf` to `appfirewall`**, and `state`
+   now reflects `socketfilterfw --getglobalstate`. Integrations keying on
+   `backend|pf` or treating `state` as pf state must switch to the new rows.
+   Two additive rows appear: `mode|block_all` (only when block-all is set) and
+   `pf|<state>` (the demoted pf signal; `unknown` on agents not running as
+   root). `state|unknown` means the check was unreadable — never assumed safe.
+2. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   `backend|pf` + pf-based `state`. Expect both shapes side by side until the
+   fleet is fully upgraded — not a server bug; the `backend` row disambiguates
+   per device.
+3. **Existing installs keep the old definition description.** Bundled
+   definitions seed insert-or-skip by id at boot, so the corrected
+   `security.firewall.state` description (v1.1.0) lands on fresh installs
+   only; upgraded fleets get the corrected *behavior* regardless. To refresh
+   the text, delete `security.firewall.state` and re-import it via
+   `POST /api/v1/definitions/import` — do not edit it in the dashboard YAML
+   editor, which drops the definition's `spec.visualization` on save.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track

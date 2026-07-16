@@ -130,7 +130,7 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
 class FirewallPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "firewall"; }
-    std::string_view version() const noexcept override { return "0.1.0"; }
+    std::string_view version() const noexcept override { return "0.2.0"; }
     std::string_view description() const noexcept override {
         return "Firewall status and rule listing";
     }
@@ -202,7 +202,8 @@ public:
             }
             // Secondary: the pf packet filter (reading /dev/pf needs root;
             // unreadable reports as unknown, never a false-safe value).
-            auto pf_out = run_command("pfctl -s info 2>/dev/null");
+            // Absolute path per the quarantine plugin's kPfctl discipline.
+            auto pf_out = run_command("/sbin/pfctl -s info 2>/dev/null");
             ctx.write_output(std::format(
                 "pf|{}", yuzu::firewall::to_string(yuzu::firewall::parse_pf_status(pf_out))));
 #endif
@@ -225,7 +226,7 @@ public:
                 }
             }
 #elif defined(__APPLE__)
-            auto output = run_command("pfctl -s rules 2>/dev/null");
+            auto output = run_command("/sbin/pfctl -s rules 2>/dev/null");
             std::istringstream iss(output);
             std::string line;
             while (std::getline(iss, line)) {
