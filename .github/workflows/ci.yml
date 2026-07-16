@@ -887,7 +887,46 @@ jobs:
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
-          brew install cmake ninja ccache pipx autoconf automake libtool
+          #
+          # cmake deliberately excluded from this brew line, pinned via pipx
+          # below instead. 2026-07-16: brew's floating `cmake` drifted to
+          # 4.4.0 underneath us with no code change on our side, and that
+          # release crashes resolving httplib's CMake package: FindThreads'
+          # try_compile() trips CMake's own internal "This should not have
+          # happened" guard in Internal/CheckSourceCompiles.cmake, which
+          # poisons every subsequent cmake-method dependency lookup in the
+          # same configure. Broke macOS CI fleet-wide across unrelated PRs
+          # simultaneously (e.g. #2224). Pin like meson below so a future
+          # brew bump can't repeat this.
+          brew install ninja ccache pipx autoconf automake libtool
+          # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
+          # (that's what the log line "cmake 4.4.0 is already installed and
+          # up-to-date" was reporting) independent of this workflow's brew
+          # line, so dropping cmake above doesn't remove it. Unlink it so it
+          # can never win a PATH race against the pinned pipx cmake below.
+          # `|| true`: fine if a future image doesn't pre-bake cmake at all;
+          # stderr is left visible (not redirected) so a genuine unlink
+          # failure still shows up in the step log for a future debugger.
+          brew unlink cmake || true
+          # 4.3.4 is the latest 4.x release before the 4.4.0 regression
+          # above. Bump deliberately once a fixed release is confirmed clean
+          # here. Query pipx's own shim dir and prepend it to GITHUB_PATH
+          # (mirrors the pip3 --user pattern the Linux legs use, above) so
+          # it's guaranteed to win on PATH rather than assumed to. Captured
+          # into a variable first (not inlined into the `echo` argument):
+          # under `set -e`, a failing/empty command substitution inlined
+          # into `echo "$(...)"` would NOT abort the step (echo's own exit
+          # status is what -e checks), silently writing a blank PATH entry.
+          pipx install cmake==4.3.4
+          pipx_bin_dir="$(pipx environment --value PIPX_BIN_DIR)"
+          test -n "$pipx_bin_dir"
+          echo "$pipx_bin_dir" >> "$GITHUB_PATH"
+          # GITHUB_PATH only takes effect from the next step onward, not
+          # within this script, so verify via the resolved dir directly
+          # rather than a bare `cmake` (which may still hit an empty PATH
+          # slot right here). Self-documents the fix in every future log:
+          # today's incident was exactly this kind of silent version drift.
+          "$pipx_bin_dir/cmake" --version
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
