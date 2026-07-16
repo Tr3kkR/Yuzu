@@ -27,12 +27,15 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
+#include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
 class KvStore;
@@ -49,6 +52,22 @@ namespace yuzu::agent::v1 {
 class CommandRequest;
 } // namespace yuzu::agent::v1
 
+// Forward-declared rather than #include-d: these live under agents/core/src/
+// (agent-internal implementation headers), and no header under
+// agents/core/include/yuzu/agent/ has ever crossed that boundary - this stays
+// consistent. Only used here as std::function<SendResult(const OutboxEntry&)>
+// parameter types, which do not need complete types to declare (only to call).
+namespace yuzu::agent {
+class SparkEngine;
+class GuardianSparkRuntime;
+class ConvergenceScheduler;
+class GuardianOutboxDrainWorker;
+class GuardianStateReader;
+class GuardianSparkEngineBackend;
+struct OutboxEntry;
+enum class SendResult;
+} // namespace yuzu::agent
+
 namespace yuzu::agent {
 
 /// Result of dispatching a `__guard__` command. The caller (agent.cpp)
@@ -64,11 +83,39 @@ struct GuardianDispatchResult {
 /// internal mutex serialises apply_rules / dispatch / get_status.
 class YUZU_EXPORT GuardianEngine {
 public:
+    /// The immutable, set-once outcome of wire_spark_engine() - never a
+    /// mutable runtime toggle (rung 7: Sol's rev-1 review explicitly rejected
+    /// a test-only mutable setter for the spark-vs-legacy decision; this is a
+    /// constructor-time parameter instead, see `prefer_spark` below).
+    ///   Unwired       - wire_spark_engine() has not yet run (the member-
+    ///                   initializer default). A programming fault if
+    ///                   reconcile ever observes it with prefer_spark true -
+    ///                   NEVER silently falls back to legacy.
+    ///   SparkDisabled - --spark-disable: a deliberate kill-switch. Legacy is
+    ///                   the CORRECT, expected path here, not a fallback.
+    ///   SparkFailed   - spark_engine_ failed to boot, OR this engine's own
+    ///                   wiring sequence failed after that (consumer
+    ///                   registration, scheduler start). NEVER falls back to
+    ///                   legacy - a failure must be visible (errored via
+    ///                   get_status()'s existing fail-closed behaviour), not
+    ///                   silently absorbed (the mutual-exclusion invariant).
+    ///   Available     - spark_runtime_/spark_scheduler_/the drain worker are
+    ///                   live; the reconcile op classifies per-rule from here.
+    enum class SparkAvailability { Unwired, SparkDisabled, SparkFailed, Available };
+
     /// The KvStore pointer may be null at construction (e.g. KV open
     /// failed). All subsequent methods degrade to soft failures with
     /// error strings rather than crashing — matches the agent's
     /// existing "KV unavailable is a warning, not a fatal" posture.
-    GuardianEngine(KvStore* kv, std::string agent_id);
+    ///
+    /// `prefer_spark`: whether the reconcile op ATTEMPTS the spark path at
+    /// all when wire_spark_engine() later reports Available. IMMUTABLE for
+    /// this object's lifetime (a constructor parameter, not a setter) - rung
+    /// 7 ships with every production agent.cpp call site passing the literal
+    /// `false` (legacy stays the observable default); rung 12's "default
+    /// flip" changes that one literal. Tests pass `true` to exercise the
+    /// spark path.
+    GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false);
     ~GuardianEngine();
 
     GuardianEngine(const GuardianEngine&) = delete;
@@ -117,11 +164,19 @@ public:
     /// Number of rules currently persisted. Informational only.
     std::size_t rule_count() const;
 
-    /// Number of guards CURRENTLY ARMED (may be < rule_count(): a disabled rule,
-    /// an unsupported/off-platform spark type, or a failed start all persist the
-    /// rule without arming a guard). Informational + the test seam for the
-    /// enabled()/disable/re-enable/same-id-replace contract (rung 6).
+    /// Number of guards CURRENTLY ARMED via the LEGACY IGuard path (may be <
+    /// rule_count(): a disabled rule, an unsupported/off-platform spark type,
+    /// or a failed start all persist the rule without arming a guard).
+    /// Informational + the test seam for the enabled()/disable/re-enable/
+    /// same-id-replace contract (rung 6) and the rung-7 mutual-exclusion
+    /// invariant (a rule_id is never counted here AND in
+    /// spark_armed_rule_count() at once).
     std::size_t armed_guard_count() const;
+
+    /// Number of rules CURRENTLY ARMED via the SPARK path (0 if spark was
+    /// never wired). The rung-7 counterpart to armed_guard_count() - the
+    /// mutual-exclusion test seam.
+    std::size_t spark_armed_rule_count() const;
 
     /// Current policy generation — monotonically increasing; bumped on
     /// every successful apply_rules call. Persisted across restarts.
@@ -130,6 +185,32 @@ public:
     /// KV namespace used for all Guardian persistent state. Exposed for
     /// tests — do not read from this namespace in production code.
     static std::string_view kv_namespace();
+
+    /// Wire the spark detection path, once, before start_local() (agent.cpp,
+    /// rung 7.7): builds the reader, the SparkEngine backend adapter, the
+    /// runtime, registers the SparkEngine consumer, starts the convergence
+    /// scheduler and the outbox drain worker - an all-or-nothing transaction
+    /// (ANY step failing after `engine` is confirmed non-null rolls every
+    /// partial construction back and reports SparkFailed; see the .cpp for
+    /// the exact rollback sequence). `engine` is a BORROWED pointer, safe
+    /// only because of the agent.cpp member-declaration-order guarantee that
+    /// spark_engine_ outlives this GuardianEngine's teardown (rung 7.7).
+    /// `spark_disabled_by_config` disambiguates a null `engine` meaning
+    /// --spark-disable from one meaning spark_engine_ failed to boot -
+    /// agent.cpp already knows which case it is; this method must not guess.
+    /// `send` is the wire-serializing callback the drain worker uses; a fake
+    /// suffices for tests that only need wiring/reconcile behaviour, not real
+    /// delivery. Idempotent-once: a second call is a no-op (logs and returns)
+    /// once spark_availability() is anything other than Unwired.
+    void wire_spark_engine(SparkEngine* engine, bool spark_disabled_by_config,
+                           std::function<SendResult(const OutboxEntry&)> send);
+
+    /// The current, immutable-after-set outcome of wire_spark_engine().
+    [[nodiscard]] SparkAvailability spark_availability() const;
+
+    /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
+    /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
+    [[nodiscard]] std::size_t active_io_workers() const;
 
 private:
     KvStore* kv_;
@@ -155,6 +236,36 @@ private:
     bool start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void stop_all_guards_locked();
 
+    /// Retire any legacy guard armed for rule_id, if one exists. Idempotent
+    /// for a rule with none. This is start_guard_for_rule_locked's own
+    /// rung-6 hoisted find-stop-erase block, factored out so
+    /// reconcile_rule_locked (rung 7) can call it directly on the
+    /// disabled/invalid/spark-armed paths without duplicating it.
+    void withdraw_legacy_guard_locked(const std::string& rule_id);
+
+    /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,
+    /// replacing the direct start_guard_for_rule_locked call apply_rules and
+    /// start_local's A2 re-arm loop used to make. Decides spark vs legacy per
+    /// rule (see the SparkAvailability doc above for the exact state matrix)
+    /// and guarantees the mutual-exclusion invariant: a rule is armed in
+    /// AT MOST ONE of guards_ / spark_runtime_, and an arm failure on
+    /// whichever path was attempted is errored, NEVER a silent fallback to
+    /// the other. Called under mtx_. Returns true iff the rule ended up armed
+    /// via EITHER backend (so callers - A2's re-arm counter, apply_rules'
+    /// telemetry - keep counting correctly regardless of which path armed it).
+    bool reconcile_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
+
+    /// Unwind a partially-completed wire_spark_engine() attempt, in the
+    /// reverse order construction attempted the steps (each step is
+    /// independently null-safe, so this is correct regardless of exactly how
+    /// far wiring got before it threw). `registered` + `consumer_id` capture
+    /// whether register_consumer() itself succeeded before the failure, so
+    /// this can unregister a leaked consumer registration. Always ends by
+    /// setting spark_availability_ to SparkFailed. Called under mtx_, only
+    /// from wire_spark_engine() itself.
+    void rollback_spark_wiring_locked(SparkEngine* engine, bool registered,
+                                      std::uint64_t consumer_id);
+
     /// Build a GuaranteedStateEvent from a guard's drift report and ship it to
     /// the current event sink. Called from guard worker threads, so it takes
     /// ONLY sink_mtx_ (never mtx_): guards may fire during apply_rules / stop
@@ -177,6 +288,16 @@ private:
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
+
+    // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
+    const bool prefer_spark_; ///< IMMUTABLE for object lifetime; set only at construction
+    SparkAvailability spark_availability_{SparkAvailability::Unwired};
+    SparkEngine* spark_engine_{nullptr}; ///< BORROWED - see wire_spark_engine's doc
+    std::shared_ptr<GuardianStateReader> spark_reader_;
+    std::shared_ptr<GuardianSparkEngineBackend> spark_backend_;
+    std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
+    std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
+    std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the
