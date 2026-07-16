@@ -202,21 +202,26 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
         if (!stop_already_requested)
             report_status(SERVICE_RUNNING);
 
-        agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
-
-        // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2): the
-        // logger flush and report_status() calls below could in principle throw
-        // and unwind past the explicit orphan check further down, which would
-        // let normal C++ teardown run while a Guardian I/O worker might still be
-        // active - exactly what F3 exists to prevent. Constructed AFTER `agent`
-        // (declared above), so reverse-declaration-order destruction runs this
-        // guard BEFORE the Agent's own destructor on every exit path, including
-        // an unwind into the catch block below - the same pattern
-        // `AgentUnpublisher` already relies on. Disarmed once the explicit check
-        // has run to completion on the normal path; its destructor is a
-        // deliberately non-throwing, unlogged fallback for every other path.
+        // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2 - and
+        // round 4, which caught that this MUST be armed BEFORE agent->run()
+        // below, not after: run() itself is not noexcept and has a substantial
+        // throwing surface, so a guard constructed only after it returns would
+        // miss an exception thrown FROM run() itself). Everything from here
+        // through the explicit orphan check further down (run() itself, the
+        // logger flush, the report_status() chain) could in principle throw and
+        // unwind past that check entirely, which would let normal C++ teardown
+        // run while a Guardian I/O worker might still be active - exactly what
+        // F3 exists to prevent. Constructed AFTER `agent` (declared above), so
+        // reverse-declaration-order destruction runs this guard BEFORE the
+        // Agent's own destructor on every exit path, including an unwind into
+        // the catch block below - the same pattern `AgentUnpublisher` already
+        // relies on. Disarmed once the explicit check has run to completion on
+        // the normal path; its destructor is a deliberately non-throwing,
+        // unlogged fallback for every other path.
         yuzu::agent::OrphanExitGuard orphan_guard{
             [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+
+        agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
         spdlog::default_logger()->flush();
 

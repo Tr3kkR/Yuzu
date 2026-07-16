@@ -784,22 +784,26 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, on_signal);
 #endif
 
-    agent->run();
-
-    // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2): several
-    // operations between here and the explicit orphan check below
-    // (g_agent_mu acquisition on Windows, report_status-equivalent logging)
-    // could in principle throw and unwind past that check entirely, which
-    // would let normal C++ teardown run below while a Guardian I/O worker
-    // might still be active - exactly what F3 exists to prevent. Constructed
-    // AFTER `agent`, so reverse-declaration-order destruction runs this guard
-    // BEFORE the Agent's own destructor on every exit path, including an
-    // unwind - the same pattern `shutdown_watcher`/`agent_unpublisher` below
-    // already rely on. Disarmed once the explicit check has run to
-    // completion on the normal path (see below); its destructor is a
-    // deliberately non-throwing, unlogged fallback for every other path.
+    // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2 - and
+    // round 4, which caught that this MUST be armed BEFORE agent->run() below,
+    // not after: run() itself is not noexcept and has a substantial throwing
+    // surface, so a guard constructed only after it returns would miss an
+    // exception thrown FROM run() itself). Everything from here through the
+    // explicit orphan check further down (run() itself, g_agent_mu acquisition
+    // on Windows, report_status-equivalent logging) could in principle throw
+    // and unwind past that check entirely, which would let normal C++ teardown
+    // run while a Guardian I/O worker might still be active - exactly what F3
+    // exists to prevent. Constructed AFTER `agent`, so reverse-declaration-
+    // order destruction runs this guard BEFORE the Agent's own destructor on
+    // every exit path, including an unwind - the same pattern
+    // `shutdown_watcher`/`agent_unpublisher` below already rely on. Disarmed
+    // once the explicit check has run to completion on the normal path (see
+    // below); its destructor is a deliberately non-throwing, unlogged fallback
+    // for every other path.
     yuzu::agent::OrphanExitGuard orphan_guard{
         [&] { return agent->guardian_active_io_workers(); }, std::chrono::seconds(3), 3};
+
+    agent->run();
 
     // ── THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM ──────────────────────────────
     // From here on nothing can act on a signal: the watcher is about to be joined and
