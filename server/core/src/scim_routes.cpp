@@ -10,11 +10,14 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -64,6 +67,15 @@ constexpr const char* kScimJson = "application/scim+json";
 // few KB; 64 KiB is generous headroom while refusing a multi-MB POST on this
 // provisioning surface.
 constexpr std::size_t kMaxBodyBytes = 64 * 1024;
+
+// sre-capacity (governance hardening round): every Group mutation fans out a
+// per-member `recompute_scim_user_role` call under the global AuthManager
+// lock (O(N members x |sessions_|) per op, via the session-invalidation
+// sweep in `AuthManager::update_role`/`remove_user`). Bound N so a single
+// pathological IdP-authored Group cannot turn one PUT/PATCH/POST into an
+// unbounded stall. 5000 is generous headroom over any real deployment's
+// admin/role-mapping group size while still bounding the worst case.
+constexpr std::size_t kMaxGroupMembers = 5000;
 
 void send_scim_error(httplib::Response& res, int status, std::string_view detail,
                      std::string_view scim_type = "") {
@@ -161,6 +173,25 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
         m->counter("yuzu_scim_provenance_denied_total").increment();
 }
 
+/// #2021 slice 2: bumped every time `recompute_scim_user_role` actually
+/// changes a SCIM-provisioned user's role (promotion OR demotion).
+void bump_role_changed(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_role_changes_total").increment();
+}
+
+/// CC6.7 evidence-gap fix (governance hardening round): bumped when
+/// `recompute_scim_user_role`'s `AuthManager::update_role` call reports a
+/// genuine AuthDB write failure — a durable role change that did not apply.
+void bump_role_change_failure(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_role_change_failures_total").increment();
+}
+
 // ── Audit ────────────────────────────────────────────────────────────────
 
 /// Emit a SCIM audit row. AuditStore::log is [[nodiscard]] bool; per the
@@ -178,7 +209,7 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
 /// evidence gap) bumps regardless of the caller's response.
 bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::Request& req,
           const std::string& action, const std::string& result, const std::string& target_id,
-          const std::string& detail = {}) {
+          const std::string& detail = {}, const std::string& target_type = "User") {
     if (!audit_store) {
         bump_audit_write_failure(auth_mgr, action);
         return false;
@@ -187,7 +218,7 @@ bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::
     ev.principal = kScimPrincipal;
     ev.principal_role = kScimPrincipal; // S-PRINCIPAL-ROLE — every other machine principal sets one
     ev.action = action;
-    ev.target_type = "User";
+    ev.target_type = target_type; // "User" (default) or "Group" (#2021 group ops)
     ev.target_id = target_id;
     ev.detail = detail;
     ev.result = result;
@@ -213,6 +244,74 @@ std::string location_base(const httplib::Request& req) {
         scheme = "https";
     std::string host = req.get_header_value("Host");
     return scheme + "://" + host + "/scim/v2/Users";
+}
+
+/// Group counterpart of `location_base` — the `/scim/v2/Groups` collection
+/// URL for `meta.location`/`Location` header on the Group codec (#2021).
+std::string groups_location_base(const httplib::Request& req) {
+    std::string scheme = req.get_header_value("X-Forwarded-Proto");
+    if (scheme.empty())
+        scheme = "https";
+    std::string host = req.get_header_value("Host");
+    return scheme + "://" + host + "/scim/v2/Groups";
+}
+
+/// #2021: resolve raw Group `members[].value` strings against live SCIM
+/// User resources. VALIDATE-AND-SKIP: an unresolvable/unknown value (never
+/// provisioned, already deleted, or simply a typo/garbage from the IdP) is
+/// silently dropped rather than erroring the whole request — but a phantom
+/// membership pointing at nothing is NEVER persisted (`ScimStore::
+/// set_group_members`/`add_group_member` only ever see values this function
+/// already confirmed resolve to a real User resource). Deduplicates and
+/// preserves the relative order of `values`.
+std::vector<std::string> resolve_member_values(ScimStore* scim_store,
+                                               const std::vector<std::string>& values) {
+    std::vector<std::string> resolved;
+    resolved.reserve(values.size());
+    for (const auto& v : values) {
+        if (!scim_store->get_by_scim_id(v).has_value())
+            continue; // validate-and-skip
+        if (std::find(resolved.begin(), resolved.end(), v) == resolved.end())
+            resolved.push_back(v);
+    }
+    return resolved;
+}
+
+/// #2127 review HIGH fix: fold an ORDERED list of `ScimGroupMemberOp`s onto
+/// a starting membership set, applying each op in the body's own document
+/// order — never all-removes-then-all-adds (the old bucketed-apply order,
+/// which made `[{add:U},{remove:U}]` and `[{remove:U},{add:U}]` produce the
+/// SAME wrong result: U left a member either way, because a `remove` on a
+/// not-yet-added id was an idempotent no-op and the `remove`/`add` buckets
+/// were applied in a fixed order regardless of which the caller sent last).
+/// Values are the RAW (unresolved) `value` strings from the request body —
+/// the caller resolves the final result against live SCIM Users in one pass
+/// (`resolve_member_values`), not per-op, per the reworked
+/// resolve-final -> validate-final -> persist design.
+std::vector<std::string> fold_group_member_ops(const std::vector<std::string>& current,
+                                               const std::vector<scim::ScimGroupMemberOp>& ops) {
+    std::vector<std::string> result = current;
+    for (const auto& op : ops) {
+        switch (op.kind) {
+        case scim::ScimGroupMemberOp::Kind::Add:
+            for (const auto& v : op.values) {
+                if (std::find(result.begin(), result.end(), v) == result.end())
+                    result.push_back(v);
+            }
+            break;
+        case scim::ScimGroupMemberOp::Kind::Remove:
+            for (const auto& v : op.values)
+                result.erase(std::remove(result.begin(), result.end(), v), result.end());
+            break;
+        case scim::ScimGroupMemberOp::Kind::RemoveAll:
+            result.clear();
+            break;
+        case scim::ScimGroupMemberOp::Kind::ReplaceAll:
+            result = op.values;
+            break;
+        }
+    }
+    return result;
 }
 
 /// Bearer gate shared by every /scim/v2/* route. Reads ONLY the
@@ -310,22 +409,36 @@ std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
     return entry->role;
 }
 
-/// M-DEPROV-ROLE (sec MEDIUM): refuse to deprovision (deactivate/delete) an
-/// account whose CURRENT role is not `user` — an operator who elevated a
-/// SCIM-provisioned account to admin has taken its lifecycle out of SCIM's
-/// read-only ownership model; SCIM only ever tears down what it still
-/// recognises as its own. Checked only while the account is still ACTIVE.
-/// Role is read via `db_authoritative_role` (H2) — the DB row, never the
-/// AuthManager in-memory cache, which can be cold on a freshly-started
-/// process. Returns true iff the deprovision may proceed; FAILS CLOSED
-/// (refuses) if the role cannot be determined at all, not just when it
-/// resolves to something other than `user`. On refusal sends 404 (never
-/// 403 — matches the provenance guard's no-existence-oracle posture) and
-/// reuses `scim.user.provenance_denied` (same "SCIM does not own this
-/// account's lifecycle right now" refusal class).
+/// M-DEPROV-ROLE (sec MEDIUM): a demote-before-delete ORDERING GATE — refuse
+/// to deprovision (deactivate/delete) an account whose CURRENT role is not
+/// `user`, whether that elevation was applied by an operator (manual) or by
+/// `recompute_scim_user_role` (group-derived, Model A: IdP group membership
+/// is authoritative for role). Either way, the account must first be
+/// demoted back to `user` — by an operator, or by the IdP removing it from
+/// the admin group — before SCIM may tear it down; this is a sequencing
+/// requirement, not a permanent carve-out for operator-owned accounts.
+/// Checked only while the account is still ACTIVE. Role is read via
+/// `db_authoritative_role` (H2) — the DB row, never the AuthManager
+/// in-memory cache, which can be cold on a freshly-started process. Returns
+/// true iff the deprovision may proceed; FAILS CLOSED (refuses) if the role
+/// cannot be determined at all, not just when it resolves to something
+/// other than `user`. On refusal sends 404 (never 403 — matches the
+/// provenance guard's no-existence-oracle posture) and reuses
+/// `scim.user.provenance_denied` (same "SCIM does not own this account's
+/// lifecycle right now" refusal class).
 bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
                         const httplib::Request& req, const std::string& username,
                         const std::string& scim_id, httplib::Response& res) {
+    // #2021 (Groups->role): deliberately NOT weakened for a group-elevated
+    // admin. A SCIM user promoted to admin via Group membership still fails
+    // this guard exactly like an operator-elevated one — the IdP must
+    // remove them from the admin group FIRST (recompute_scim_user_role then
+    // demotes them to 'user' on the next membership change), and only THEN
+    // can SCIM deprovision (deactivate/delete) them. This ordering is the
+    // point, not a gap: it stops a compromised/misconfigured IdP from
+    // group-promoting an account to admin and deprovisioning it in the same
+    // breath in a way that could race an operator's own admin actions on
+    // that account. Do not add a bypass for the group-elevated case.
     auto role = db_authoritative_role(auth_mgr, username);
     if (!role.has_value() || *role != auth::Role::user) {
         spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' or "
@@ -340,6 +453,158 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
         return false;
     }
     return true;
+}
+
+/// ⚠️ SECURITY-CRITICAL (#2021 slice 2) — the SCIM-group->Yuzu-role
+/// application core. Re-derives `user_scim_id`'s role from its CURRENT SCIM
+/// group memberships and applies the change if it differs from the
+/// authoritative DB role. Called after every mutation that could have
+/// changed a user's group membership (Group POST/PUT/PATCH/DELETE, User
+/// POST including the revive-on-reprovision path) — see scim_routes.hpp's
+/// header doc.
+///
+/// Steps (in order, each a hard gate — any failure means "return, no
+/// action"):
+///   1. Resolve `user_scim_id` to a live SCIM User resource (`ScimStore::
+///      get_by_scim_id`). If it doesn't resolve to a scim user resource
+///      (e.g. a Group member value that never matched a real User, or one
+///      that has since been deleted), there is nothing to recompute.
+///   2. PROVENANCE GUARD (LOAD-BEARING, do not weaken): the resolved
+///      username's `AuthDB::get_provisioning_source` MUST read exactly
+///      `"scim"` RIGHT NOW. A Group member `value` that happens to map to a
+///      local admin, a break-glass account, or any other non-SCIM-owned
+///      principal must NEVER cause a role change — this is the same
+///      provenance boundary `provenance_ok` enforces for every other
+///      mutation on this surface, checked independently here because this
+///      helper can be reached from a DIFFERENT resource's route (a Group
+///      mutation) than the one whose provenance was already checked by the
+///      caller's own guard.
+///   3. Resolve the role via `auth::resolve_role_from_groups` over
+///      `ScimStore::list_group_display_names_for_user` and
+///      `scim_admin_group` (empty ⇒ always `Role::user`, never promotes).
+///   4. Read the CURRENT role via `db_authoritative_role` (H2 — the DB row,
+///      never the in-memory cache). `nullopt` fails closed (no change) —
+///      matching every other role read on this surface.
+///   5. If the resolved role differs from the current role, apply it via
+///      `AuthManager::update_role` (which also invalidates the user's
+///      sessions) and audit `scim.user.role_changed` (set-and-proceed, same
+///      posture as every other audit on this surface — see `audit()`'s doc
+///      comment). `trigger_detail` is a caller-supplied, human-readable
+///      description of WHAT triggered this recompute (e.g. the triggering
+///      group's displayName + op, or "user_provision" for the user
+///      create/revive call site) and is folded into the audit detail as
+///      `via_group="<...>"` (CC6.7 evidence: which group/op caused this role
+///      change, since a user can match via multiple admin groups). Purely
+///      cosmetic — never affects the resolved role logic.
+///
+/// CONCURRENCY (TOCTOU role drift, Hermes security gate): steps 1-5 above are
+/// a non-atomic read-resolve-write — each of `ScimStore`'s `db_mtx_` and
+/// `AuthManager`'s `mu_` is taken and released independently per step. Two
+/// concurrent Group mutations affecting the SAME user (e.g. one removing
+/// them from the admin group, another concurrently adding them) can
+/// otherwise interleave so the second-committing recompute reads a stale
+/// `current` role, no-ops on `resolved == current`, and leaves the durable
+/// DB role contradicting the FINAL committed group membership. `kRecomputeMu`
+/// serializes the entire body below so recomputes for (in practice) any user
+/// are linearized process-wide — recompute is not a hot path (only Group ops
+/// + user create/revive, bounded by `kMaxGroupMembers`), so a single mutex is
+/// fine; per-user striping would be over-engineering here. Because each
+/// Group op commits its membership change to `ScimStore` BEFORE calling this
+/// function, serializing the critical section guarantees the
+/// last-scheduled recompute observes the final committed membership and
+/// applies the correct role — any earlier, now-stale role gets corrected by
+/// whichever recompute runs last.
+///
+/// LOCK ORDER (do not invert): `kRecomputeMu` → `ScimStore::db_mtx_` (taken
+/// and released inside `get_by_scim_id`/`list_group_display_names_for_user`)
+/// → `AuthManager::mu_` (taken and released inside `db_authoritative_role`/
+/// `update_role`). `kRecomputeMu` is acquired ACROSS both of those calls but
+/// is never itself acquired by any code reachable from within `db_mtx_` or
+/// `mu_` — this function is the only acquirer, so there is no path back into
+/// `kRecomputeMu` while either inner lock is held, and thus no inversion/
+/// deadlock. Do not add a second acquirer without re-checking this.
+void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+                              AuditStore* audit_store, const httplib::Request& req,
+                              const std::string& user_scim_id,
+                              const std::string& scim_admin_group,
+                              const std::string& trigger_detail) {
+    if (!scim_store || !auth_mgr)
+        return;
+
+    static std::mutex kRecomputeMu;
+    std::lock_guard<std::mutex> recompute_lock(kRecomputeMu);
+
+    // Step 1: user_scim_id must resolve to a live SCIM User resource.
+    auto resource = scim_store->get_by_scim_id(user_scim_id);
+    if (!resource)
+        return;
+
+    AuthDB* db = auth_mgr->auth_db_ptr();
+    if (!db)
+        return;
+
+    // Step 2 — PROVENANCE GUARD (LOAD-BEARING): refuse to touch anything
+    // SCIM did not provision, no matter how a Group came to reference it.
+    auto source = db->get_provisioning_source(resource->username);
+    if (!source || *source != kProvisioningSourceScim) {
+        spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
+                    "provisioning_source is not 'scim' (a Group referenced a non-SCIM account)",
+                    resource->username, user_scim_id);
+        // Metric-only signal (Minor #2, reviewer-adjudicated): this IS a
+        // provenance-based skip, so it reuses the same counter every other
+        // provenance refusal on this surface bumps. Deliberately NOT an
+        // audit row here — recompute runs per-member, and a bulk Group
+        // mutation with many non-SCIM members would flood the audit log;
+        // the counter is the right-weight signal for a load-bearing guard
+        // that still needs to be observable.
+        bump_provenance_denied(auth_mgr);
+        return;
+    }
+
+    // Step 3: resolve the role from CURRENT group membership.
+    auto groups = scim_store->list_group_display_names_for_user(user_scim_id);
+    auth::Role resolved = auth::resolve_role_from_groups(groups, scim_admin_group);
+
+    // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
+    // posture, matching db_authoritative_role's every other caller).
+    auto current = db_authoritative_role(auth_mgr, resource->username);
+    if (!current.has_value()) {
+        spdlog::warn("SCIM: recompute_scim_user_role — could not determine the DB-authoritative "
+                    "current role for '{}' (scim_id={}); declining to recompute (fail-closed)",
+                    resource->username, user_scim_id);
+        return;
+    }
+
+    // Step 5: apply only on an actual change.
+    if (resolved == *current)
+        return;
+
+    std::string old_role_str = auth::role_to_string(*current);
+    std::string new_role_str = auth::role_to_string(resolved);
+    // CC6.7: fold the caller-supplied trigger context (which group/op — or
+    // user-provision — caused this recompute) into the audit detail. A user
+    // can match via multiple admin groups; this records the one whose
+    // mutation actually triggered THIS recompute call.
+    std::string via_detail =
+        trigger_detail.empty() ? "" : " via_group=\"" + trigger_detail + "\"";
+    if (!auth_mgr->update_role(resource->username, resolved)) {
+        spdlog::error("SCIM: recompute_scim_user_role — update_role failed for '{}' "
+                     "(scim_id={}, intended {} -> {}); role change did NOT apply",
+                     resource->username, user_scim_id, old_role_str, new_role_str);
+        audit(auth_mgr, audit_store, req, "scim.user.role_changed", "failure", user_scim_id,
+             "reason=group old_role=" + old_role_str + " intended_new_role=" + new_role_str +
+                 via_detail);
+        bump_role_change_failure(auth_mgr);
+        return;
+    }
+    spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
+                "via group membership",
+                resource->username, user_scim_id, old_role_str, new_role_str);
+    // Set-and-proceed (UP-N2) — see `audit()`'s doc comment; the role change
+    // above already committed.
+    audit(auth_mgr, audit_store, req, "scim.user.role_changed", "success", user_scim_id,
+         "reason=group old_role=" + old_role_str + " new_role=" + new_role_str + via_detail);
+    bump_role_changed(auth_mgr);
 }
 
 /// Deactivate the auth account backing `resource` (provenance- and role-
@@ -442,13 +707,15 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
 } // namespace
 
 void ScimRoutes::register_routes(httplib::Server& svr, ScimStore* scim_store,
-                                 auth::AuthManager* auth_mgr, AuditStore* audit_store) {
+                                 auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                 std::string scim_admin_group) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, scim_store, auth_mgr, audit_store);
+    register_routes(sink, scim_store, auth_mgr, audit_store, std::move(scim_admin_group));
 }
 
 void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
-                                 auth::AuthManager* auth_mgr, AuditStore* audit_store) {
+                                 auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                 std::string scim_admin_group) {
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
@@ -481,8 +748,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     // ── POST /scim/v2/Users — provision. ──────────────────────────────────
 
-    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store,
+                                 scim_admin_group](const httplib::Request& req,
+                                                   httplib::Response& res) {
         if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
             record_request(auth_mgr, "create", res.status);
             return;
@@ -762,6 +1030,18 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             record_request(auth_mgr, "create", 500);
             return;
         }
+
+        // #2021 (Groups->role, trigger (d)): a fresh-create is always
+        // provisioned at 'user' (see the fresh-create branch above) so this
+        // is a no-op there, but the REVIVE branch can hand back an account
+        // that is already referenced by an existing Group's membership (the
+        // IdP re-adds a member by the scim_id it learns from THIS response,
+        // and — defensively — in case any stale membership already points
+        // at this identity) — recompute now so the freshly (re)provisioned
+        // account's role reflects group membership immediately, not only
+        // after the next Group mutation.
+        recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, resource->scim_id,
+                                 scim_admin_group, "user_provision");
 
         // Honour an explicit active:false on create (some IdPs stage a user
         // deactivated) by immediately deactivating the account we just
@@ -1306,6 +1586,605 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
+               });
+
+    // ── SCIM v2 Groups (#2021, slice 2) ───────────────────────────────────
+    //
+    // Every mutation below that can change a user's group membership calls
+    // `recompute_scim_user_role` for every AFFECTED member (added AND
+    // removed) once its own ScimStore write has committed — see that
+    // function's doc comment for the provenance guard it enforces
+    // independently of this route's own checks.
+
+    // ── POST /scim/v2/Groups — create. ────────────────────────────────────
+
+    sink.Post("/scim/v2/Groups", [scim_store, auth_mgr, audit_store,
+                                  scim_admin_group](const httplib::Request& req,
+                                                    httplib::Response& res) {
+        if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+            record_request(auth_mgr, "group_create", res.status);
+            return;
+        }
+        if (req.body.size() > kMaxBodyBytes) {
+            send_scim_error(res, 413, "request body too large");
+            record_request(auth_mgr, "group_create", 413);
+            return;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception&) {
+            send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+            record_request(auth_mgr, "group_create", 400);
+            return;
+        }
+        auto parsed = scim::parse_group(body);
+        if (!parsed) {
+            send_scim_error(res, parsed.error());
+            record_request(auth_mgr, "group_create", parsed.error().status);
+            return;
+        }
+        const auto& input = *parsed;
+
+        // #7 (sre capacity): bound the member count before doing any further
+        // work — see kMaxGroupMembers's doc comment.
+        if (input.member_values.size() > kMaxGroupMembers) {
+            send_scim_error(res, 400, "members exceeds the maximum group size", "invalidValue");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
+                 "member count exceeds cap", "Group");
+            record_request(auth_mgr, "group_create", 400);
+            return;
+        }
+
+        // Idempotent-create on displayName — no DB-level UNIQUE (ScimStore's
+        // doc comment on get_group_by_display_name); the routes layer owns
+        // the 409.
+        if (scim_store->get_group_by_display_name(input.display_name).has_value()) {
+            send_scim_error(res, 409, "displayName already exists", "uniqueness");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
+                 "displayName already exists: " + input.display_name, "Group");
+            record_request(auth_mgr, "group_create", 409);
+            return;
+        }
+
+        auto group = scim_store->create_group(input.display_name, input.external_id);
+        if (!group) {
+            send_scim_error(res, 500, "failed to create the SCIM group");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
+                 input.display_name, "Group");
+            record_request(auth_mgr, "group_create", 500);
+            return;
+        }
+
+        auto members = resolve_member_values(scim_store, input.member_values);
+        if (!members.empty() && !scim_store->set_group_members(group->scim_id, members)) {
+            spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}",
+                         group->scim_id);
+            send_scim_error(res, 500, "failed to persist group membership");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", group->scim_id, {},
+                 "Group");
+            record_request(auth_mgr, "group_create", 500);
+            return;
+        }
+
+        // #2021 trigger (a): recompute role for every member on create.
+        for (const auto& uid : members)
+            recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                     scim_admin_group,
+                                     input.display_name + " op=group_create");
+
+        auto gbase = groups_location_base(req);
+        auto ubase = location_base(req);
+        res.status = 201;
+        res.set_header("Location", gbase + "/" + group->scim_id);
+        res.set_header("ETag", "W/\"" + std::to_string(group->etag_version) + "\"");
+        res.set_content(scim::group_to_json(*group, members, gbase, ubase).dump(), kScimJson);
+        audit(auth_mgr, audit_store, req, "scim.group.created", "success", group->scim_id, {},
+             "Group");
+        record_request(auth_mgr, "group_create", 201);
+    });
+
+    // ── GET /scim/v2/Groups/{id} ───────────────────────────────────────────
+
+    sink.Get(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+            [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+                                                httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_get", res.status);
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto group = scim_store->get_group_by_id(id);
+                if (!group) {
+                    send_scim_error(res, 404, "resource not found");
+                    record_request(auth_mgr, "group_get", 404);
+                    return;
+                }
+                auto members = scim_store->list_group_member_user_scim_ids(id);
+                res.set_content(scim::group_to_json(*group, members, groups_location_base(req),
+                                                    location_base(req))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_get", 200);
+            });
+
+    // ── GET /scim/v2/Groups — list / filter. ──────────────────────────────
+
+    sink.Get("/scim/v2/Groups",
+            [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+                                                httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_list", res.status);
+                    return;
+                }
+                auto gbase = groups_location_base(req);
+                auto ubase = location_base(req);
+
+                int start_index = 1;
+                if (req.has_param("startIndex")) {
+                    auto parsed =
+                        parse_scim_int_param(res, req.get_param_value("startIndex"), "startIndex");
+                    if (!parsed) {
+                        record_request(auth_mgr, "group_list", 400);
+                        return;
+                    }
+                    start_index = *parsed;
+                    if (start_index < 1)
+                        start_index = 1;
+                }
+                int count = 100;
+                if (req.has_param("count")) {
+                    auto parsed = parse_scim_int_param(res, req.get_param_value("count"), "count");
+                    if (!parsed) {
+                        record_request(auth_mgr, "group_list", 400);
+                        return;
+                    }
+                    count = *parsed;
+                }
+                if (count > scim::kMaxScimListResults)
+                    count = scim::kMaxScimListResults;
+
+                if (req.has_param("filter")) {
+                    auto filter_name = scim::parse_displayname_filter(req.get_param_value("filter"));
+                    if (!filter_name) {
+                        send_scim_error(res, filter_name.error());
+                        record_request(auth_mgr, "group_list", filter_name.error().status);
+                        return;
+                    }
+                    std::vector<json> resources;
+                    int total = 0;
+                    if (auto group = scim_store->get_group_by_display_name(*filter_name)) {
+                        auto members = scim_store->list_group_member_user_scim_ids(group->scim_id);
+                        resources.push_back(scim::group_to_json(*group, members, gbase, ubase));
+                        total = 1;
+                    }
+                    res.set_content(
+                        scim::list_response(resources, total, 1,
+                                           static_cast<int>(resources.size()))
+                            .dump(),
+                        kScimJson);
+                    record_request(auth_mgr, "group_list", 200);
+                    return;
+                }
+
+                int total = 0;
+                auto page = scim_store->list_groups(start_index, count, total);
+                std::vector<json> resources;
+                resources.reserve(page.size());
+                for (const auto& g : page) {
+                    auto members = scim_store->list_group_member_user_scim_ids(g.scim_id);
+                    resources.push_back(scim::group_to_json(g, members, gbase, ubase));
+                }
+                res.set_content(scim::list_response(resources, total, start_index,
+                                                    static_cast<int>(resources.size()))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_list", 200);
+            });
+
+    // CONCURRENCY (lost-update on Group membership): PUT/PATCH/DELETE each do
+    // a read-modify-write of a group's membership — read the current members,
+    // fold/compute the final set, persist the WHOLE set via
+    // `replace_group_and_members`/`delete_group`. That read...persist is not
+    // atomic across two concurrent mutations of the SAME group: two requests
+    // touching DIFFERENT members can interleave read-then-write and last-
+    // writer-wins loses one (a lost REMOVAL leaves a member admin who should
+    // have been demoted). `kGroupMutationMu` serializes the entire
+    // read-modify-write critical section (current-members read through the
+    // store persist call through the old-union-final recompute loop) across
+    // all three handlers, process-wide — mirrors `recompute_scim_user_role`'s
+    // `kRecomputeMu` precedent above; Group mutation is not a hot path so a
+    // single mutex is fine, no per-group striping needed.
+    //
+    // LOCK ORDER (do not invert): `kGroupMutationMu` is the OUTER lock;
+    // `recompute_scim_user_role` (called from inside each critical section)
+    // takes `kRecomputeMu` internally, so the order is always
+    // `kGroupMutationMu` -> `kRecomputeMu`, never the reverse.
+    // `kGroupMutationMu`'s sole acquirers are the three critical sections
+    // below (PUT/PATCH/DELETE) — nothing reachable while it is held (the
+    // store calls, `resolve_member_values`, `fold_group_member_ops`,
+    // `recompute_scim_user_role`) acquires it again, so there is no
+    // self-deadlock. The User create/revive call site of
+    // `recompute_scim_user_role` takes only `kRecomputeMu`, never
+    // `kGroupMutationMu` — no inversion there either.
+    static std::mutex kGroupMutationMu;
+
+    // ── PUT /scim/v2/Groups/{id} — full replace. ──────────────────────────
+
+    sink.Put(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+            [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+                if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                    record_request(auth_mgr, "group_replace", res.status);
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto group = scim_store->get_group_by_id(id);
+                if (!group) {
+                    send_scim_error(res, 404, "resource not found");
+                    record_request(auth_mgr, "group_replace", 404);
+                    return;
+                }
+                if (req.body.size() > kMaxBodyBytes) {
+                    send_scim_error(res, 413, "request body too large");
+                    record_request(auth_mgr, "group_replace", 413);
+                    return;
+                }
+                json body;
+                try {
+                    body = json::parse(req.body);
+                } catch (const std::exception&) {
+                    send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+                    record_request(auth_mgr, "group_replace", 400);
+                    return;
+                }
+                auto parsed = scim::parse_group(body);
+                if (!parsed) {
+                    send_scim_error(res, parsed.error());
+                    record_request(auth_mgr, "group_replace", parsed.error().status);
+                    return;
+                }
+                const auto& input = *parsed;
+
+                // #7 (sre capacity): bound the member count before doing any
+                // further work — see kMaxGroupMembers's doc comment.
+                if (input.member_values.size() > kMaxGroupMembers) {
+                    send_scim_error(res, 400, "members exceeds the maximum group size", "invalidValue");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                         "member count exceeds cap", "Group");
+                    record_request(auth_mgr, "group_replace", 400);
+                    return;
+                }
+
+                // #4 (arch-S4/UP-2): a rename onto an existing (possibly
+                // admin) group's displayName is refused — mirrors the
+                // create-time 409 (S1526).
+                if (input.display_name != group->display_name) {
+                    if (auto existing = scim_store->get_group_by_display_name(input.display_name);
+                        existing && existing->scim_id != id) {
+                        send_scim_error(res, 409, "displayName already exists", "uniqueness");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                             "displayName already exists", "Group");
+                        record_request(auth_mgr, "group_replace", 409);
+                        return;
+                    }
+                }
+
+                std::vector<std::string> new_members;
+                {
+                    // CONCURRENCY: kGroupMutationMu's doc comment above —
+                    // serializes this read-modify-write critical section
+                    // (current-members read -> persist -> recompute) against
+                    // concurrent PUT/PATCH/DELETE.
+                    std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
+
+                    // Snapshot membership BEFORE the replace so the recompute
+                    // below can cover the union of old+new (a PUT replace can
+                    // both add and remove members in the same call — spec
+                    // trigger (a), "for PUT also the REMOVED members").
+                    auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                    new_members = resolve_member_values(scim_store, input.member_values);
+
+                    // #2127 review MEDIUM fix: persist the rename AND the
+                    // membership replace atomically, in ONE transaction (was
+                    // `update_group` + `set_group_members` as two separate
+                    // transactions — a membership-write failure after a
+                    // committed rename left partial state + stale roles).
+                    auto commit_result = scim_store->replace_group_and_members(
+                        id, input.display_name, input.external_id, new_members);
+                    if (!commit_result.has_value()) {
+                        spdlog::error("ScimRoutes: replace_group_and_members failed for group "
+                                     "scim_id={}",
+                                     id);
+                        send_scim_error(res, 500, "failed to update the SCIM group");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                             "Group");
+                        record_request(auth_mgr, "group_replace", 500);
+                        return;
+                    }
+                    if (!*commit_result) {
+                        // The group existed at the top of this handler but is
+                        // gone now — a concurrent DELETE won the race.
+                        send_scim_error(res, 404, "resource not found");
+                        record_request(auth_mgr, "group_replace", 404);
+                        return;
+                    }
+
+                    std::vector<std::string> affected = old_members;
+                    for (const auto& m : new_members)
+                        if (std::find(affected.begin(), affected.end(), m) == affected.end())
+                            affected.push_back(m);
+                    for (const auto& uid : affected)
+                        recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                 scim_admin_group,
+                                                 input.display_name + " op=group_replace");
+                }
+
+                auto updated = scim_store->get_group_by_id(id);
+                if (!updated) {
+                    spdlog::error("ScimRoutes: PUT Groups — group scim_id={} vanished "
+                                 "mid-request",
+                                 id);
+                    send_scim_error(res, 500, "resource state changed mid-request");
+                    audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                         "Group");
+                    record_request(auth_mgr, "group_replace", 500);
+                    return;
+                }
+                audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
+                     "Group");
+                res.set_content(scim::group_to_json(*updated, new_members,
+                                                    groups_location_base(req), location_base(req))
+                                    .dump(),
+                                kScimJson);
+                record_request(auth_mgr, "group_replace", 200);
+            });
+
+    // ── PATCH /scim/v2/Groups/{id} — the critical role-driving path. ──────
+
+    sink.Patch(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+              [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+                  if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                      record_request(auth_mgr, "group_patch", res.status);
+                      return;
+                  }
+                  auto id = req.matches[1].str();
+                  auto group = scim_store->get_group_by_id(id);
+                  if (!group) {
+                      send_scim_error(res, 404, "resource not found");
+                      record_request(auth_mgr, "group_patch", 404);
+                      return;
+                  }
+                  if (req.body.size() > kMaxBodyBytes) {
+                      send_scim_error(res, 413, "request body too large");
+                      record_request(auth_mgr, "group_patch", 413);
+                      return;
+                  }
+                  json body;
+                  try {
+                      body = json::parse(req.body);
+                  } catch (const std::exception&) {
+                      send_scim_error(res, 400, "request body is not valid JSON", "invalidValue");
+                      record_request(auth_mgr, "group_patch", 400);
+                      return;
+                  }
+                  auto parsed = scim::parse_group_patch(body);
+                  if (!parsed) {
+                      send_scim_error(res, parsed.error());
+                      record_request(auth_mgr, "group_patch", parsed.error().status);
+                      return;
+                  }
+                  const auto& patch = *parsed;
+
+                  // #2127 review rework: resolve-final -> validate-final ->
+                  // atomic-persist -> recompute-union. Everything below reads
+                  // the CURRENT state once, computes what the FINAL state
+                  // would be, validates that FINAL state before touching the
+                  // store at all, then persists it in one transaction — no
+                  // partial-commit window between the rename and the
+                  // membership change (finding #3), no early-return that
+                  // skips recompute after a commit (finding #3), and no
+                  // stale-arithmetic cap bypass (finding #2).
+
+                  std::vector<std::string> final_members;
+                  std::string final_display;
+                  bool renamed = false;
+                  {
+                      // CONCURRENCY: kGroupMutationMu's doc comment above —
+                      // serializes this read-modify-write critical section
+                      // (current-members read -> persist -> recompute)
+                      // against concurrent PUT/PATCH/DELETE.
+                      std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
+
+                      // Re-read the group's CURRENT metadata under the lock —
+                      // the pre-lock `group` snapshot (top of handler) can be
+                      // stale by the time we get here: a concurrent PATCH/PUT
+                      // may have renamed it between that read and acquiring
+                      // this lock. Using the stale snapshot as the `value_or`
+                      // baseline for a PATCH that omits displayName would
+                      // silently revert the concurrent rename (and, since
+                      // display_name drives the --scim-admin-group match,
+                      // could re-promote/un-demote members). Also covers the
+                      // group having been deleted entirely in that window.
+                      auto current = scim_store->get_group_by_id(id);
+                      if (!current) {
+                          send_scim_error(res, 404, "resource not found");
+                          record_request(auth_mgr, "group_patch", 404);
+                          return;
+                      }
+
+                      // Step 1: fold the ORDERED member ops onto a copy of the
+                      // CURRENT membership (raw ids, not yet resolved against
+                      // live Users) — see fold_group_member_ops's doc comment
+                      // for why order matters ([HIGH] finding #1).
+                      auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                      auto final_members_raw =
+                          fold_group_member_ops(old_members, patch.member_ops);
+
+                      // Step 2: resolve/validate-and-skip the WHOLE final set
+                      // against live SCIM User resources in one pass (never
+                      // per-op) — an unresolvable id (never provisioned,
+                      // deleted, or garbage from the IdP) is silently dropped,
+                      // same validate-and-skip contract as before.
+                      final_members = resolve_member_values(scim_store, final_members_raw);
+
+                      const std::string pre_update_display_name = current->display_name;
+                      final_display = patch.display_name.value_or(current->display_name);
+                      const std::string final_external =
+                          patch.external_id.value_or(current->external_id);
+                      renamed = (final_display != pre_update_display_name);
+
+                      // Step 3a: member cap on the FINAL set — closes the
+                      // requested-remove-arithmetic bypass ([MEDIUM] finding #2):
+                      // N bogus removes no longer buy headroom for N real adds,
+                      // because the cap is checked against what would ACTUALLY
+                      // persist, not what the request claims to remove.
+                      if (final_members.size() > kMaxGroupMembers) {
+                          send_scim_error(res, 400, "members exceeds the maximum group size",
+                                         "invalidValue");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                               "member count exceeds cap", "Group");
+                          record_request(auth_mgr, "group_patch", 400);
+                          return;
+                      }
+
+                      // Step 3b: rename-uniqueness — refused BEFORE any mutation
+                      // (arch-S4/UP-2), same as before.
+                      if (renamed) {
+                          if (auto existing = scim_store->get_group_by_display_name(final_display);
+                              existing && existing->scim_id != id) {
+                              send_scim_error(res, 409, "displayName already exists", "uniqueness");
+                              audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
+                                   "displayName already exists", "Group");
+                              record_request(auth_mgr, "group_patch", 409);
+                              return;
+                          }
+                      }
+
+                      // Step 4: persist the rename AND the membership replace
+                      // atomically, in ONE transaction — the durable fix for
+                      // finding #3 (a mid-write failure could previously leave a
+                      // committed rename with stale/partial membership).
+                      auto commit_result =
+                          scim_store->replace_group_and_members(id, final_display, final_external,
+                                                                final_members);
+                      if (!commit_result.has_value()) {
+                          spdlog::error("ScimRoutes: replace_group_and_members failed for group "
+                                       "scim_id={}",
+                                       id);
+                          send_scim_error(res, 500, "failed to update the SCIM group");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id, {},
+                               "Group");
+                          record_request(auth_mgr, "group_patch", 500);
+                          return;
+                      }
+                      if (!*commit_result) {
+                          // The group existed at the top of this handler but is
+                          // gone now — a concurrent DELETE won the race.
+                          send_scim_error(res, 404, "resource not found");
+                          record_request(auth_mgr, "group_patch", 404);
+                          return;
+                      }
+
+                      // Step 5: recompute is gated on the commit above actually
+                      // having happened — affected = old ∪ final, unconditional,
+                      // covers promotions, demotions, removed members, AND a
+                      // rename that flips the --scim-admin-group match, all in
+                      // one pass (no more separate display_name_changed-gated
+                      // "recompute everybody current" branch — folding old ∪
+                      // final already subsumes it, since a metadata-only PATCH
+                      // has final == old).
+                      std::vector<std::string> to_recompute = old_members;
+                      for (const auto& uid : final_members)
+                          if (std::find(to_recompute.begin(), to_recompute.end(), uid) ==
+                              to_recompute.end())
+                              to_recompute.push_back(uid);
+
+                      std::string trigger = final_display + " op=group_patch";
+                      if (renamed)
+                          trigger += " renamed_from='" + pre_update_display_name + "'";
+                      for (const auto& uid : to_recompute)
+                          recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                   scim_admin_group, trigger);
+                  }
+
+                  auto updated = scim_store->get_group_by_id(id);
+                  if (!updated) {
+                      spdlog::error("ScimRoutes: PATCH Groups — group scim_id={} vanished "
+                                   "mid-request",
+                                   id);
+                      send_scim_error(res, 500, "resource state changed mid-request");
+                      record_request(auth_mgr, "group_patch", 500);
+                      return;
+                  }
+                  audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
+                       "Group");
+                  res.set_content(scim::group_to_json(*updated, final_members,
+                                                      groups_location_base(req),
+                                                      location_base(req))
+                                      .dump(),
+                                  kScimJson);
+                  record_request(auth_mgr, "group_patch", 200);
+              });
+
+    // ── DELETE /scim/v2/Groups/{id} ────────────────────────────────────────
+
+    sink.Delete(R"(/scim/v2/Groups/([0-9a-fA-F]+))",
+               [scim_store, auth_mgr, audit_store, scim_admin_group](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
+                       record_request(auth_mgr, "group_delete", res.status);
+                       return;
+                   }
+                   auto id = req.matches[1].str();
+                   auto group = scim_store->get_group_by_id(id);
+                   if (!group) {
+                       send_scim_error(res, 404, "resource not found");
+                       record_request(auth_mgr, "group_delete", 404);
+                       return;
+                   }
+                   {
+                       // CONCURRENCY: kGroupMutationMu's doc comment above —
+                       // serializes this read-modify-write critical section
+                       // (former-members read -> delete -> recompute) against
+                       // concurrent PUT/PATCH/DELETE.
+                       std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
+
+                       // #2021 trigger (c): snapshot the full membership
+                       // BEFORE delete_group tears down the
+                       // scim_group_members rows alongside the group
+                       // (ScimStore::delete_group's doc comment) — these are
+                       // the users who lose this group.
+                       auto former_members = scim_store->list_group_member_user_scim_ids(id);
+
+                       auto delete_result = scim_store->delete_group(id);
+                       if (!delete_result.has_value()) {
+                           spdlog::error(
+                               "ScimRoutes: ScimStore::delete_group failed for scim_id={}", id);
+                           send_scim_error(res, 500, "failed to remove the SCIM group");
+                           audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id,
+                                {}, "Group");
+                           record_request(auth_mgr, "group_delete", 500);
+                           return;
+                       }
+                       if (!*delete_result) {
+                           spdlog::info("ScimRoutes: DELETE Groups scim_id={} — already gone "
+                                       "(concurrent/duplicate DELETE); treating as idempotent "
+                                       "success",
+                                       id);
+                       }
+
+                       for (const auto& uid : former_members)
+                           recompute_scim_user_role(scim_store, auth_mgr, audit_store, req, uid,
+                                                    scim_admin_group,
+                                                    group->display_name + " op=group_delete");
+                   }
+
+                   audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id, {},
+                        "Group");
+                   res.status = 204;
+                   record_request(auth_mgr, "group_delete", 204);
                });
 }
 

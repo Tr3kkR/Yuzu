@@ -390,6 +390,26 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- [ ] **New SparkEngine health telemetry (auto-on, engine-health only):** on agent
+  upgrade, agents begin shipping SparkEngine posture tags on the existing
+  heartbeat (2 keys when quiescent), and the server exposes 11 new
+  `yuzu_fleet_spark_*` gauges. The engine is **observe-only at this rung** —
+  nothing about Guard detection or enforcement changes — and the tags are pure
+  engine-health counts (no user, process, or path identity; no works-council
+  trigger). During a staged rollout, not-yet-upgraded agents are simply absent
+  from the new gauges — expected, see the staged-rollout example in
+  [Metrics](metrics.md#sparkengine-fleet-gauges). Deploy-time opt-out:
+  `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (the opt-out itself stays
+  visible as `yuzu_fleet_spark_disabled`). See
+  [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only).
+- [ ] **Changed agent signal handling (Linux/macOS):** graceful shutdown now runs
+  on a dedicated watcher thread (fixes an abort/hang class on `SIGTERM`), and a
+  **second** `SIGTERM`/`SIGINT` immediately hard-exits the agent (exit 1) —
+  by design, with **no grace window**: the second signal is read as "the stop is
+  wedged". Stop scripts that deliberately double-signal agents will now
+  force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
+  also terminates promptly. See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - **Non-English fleets — additional plugins (#1682).** The same `Reg*A` → `Reg*W`
   encoding fix was extended to four more Windows plugins: `vuln_scan` (app
   DisplayName/Publisher/Version in vulnerability findings), `os_info` (OS
