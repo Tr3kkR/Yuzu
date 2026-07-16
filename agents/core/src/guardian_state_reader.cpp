@@ -549,21 +549,30 @@ ReadResult<ServiceRunState> read_service_blocking(const ServiceSparkParams& p) {
     // the other sd-bus resources in this function.
     struct SdBusErrorGuard {
         sd_bus_error* e;
+        explicit SdBusErrorGuard(sd_bus_error* err) : e(err) {}
         ~SdBusErrorGuard() { sd_bus_error_free(e); }
+        SdBusErrorGuard(const SdBusErrorGuard&) = delete;
+        SdBusErrorGuard& operator=(const SdBusErrorGuard&) = delete;
     };
     struct SdBusMessageGuard {
         sd_bus_message* m;
+        explicit SdBusMessageGuard(sd_bus_message* msg) : m(msg) {}
         ~SdBusMessageGuard() {
             if (m)
                 sd_bus_message_unref(m);
         }
+        SdBusMessageGuard(const SdBusMessageGuard&) = delete;
+        SdBusMessageGuard& operator=(const SdBusMessageGuard&) = delete;
     };
     struct CStrGuard {
         char* s;
+        explicit CStrGuard(char* str) : s(str) {}
         ~CStrGuard() {
             if (s)
                 free(s);
         }
+        CStrGuard(const CStrGuard&) = delete;
+        CStrGuard& operator=(const CStrGuard&) = delete;
     };
 
     // Split the total budget across the two sequential calls: LoadUnit gets the

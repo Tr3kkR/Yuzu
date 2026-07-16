@@ -38,6 +38,9 @@ struct BCryptAlgGuard {
         if (h)
             BCryptCloseAlgorithmProvider(h, 0);
     }
+    BCryptAlgGuard(const BCryptAlgGuard&) = delete;
+    BCryptAlgGuard& operator=(const BCryptAlgGuard&) = delete;
+    BCryptAlgGuard() = default;
 };
 struct BCryptHashGuard {
     BCRYPT_HASH_HANDLE h = nullptr;
@@ -45,6 +48,9 @@ struct BCryptHashGuard {
         if (h)
             BCryptDestroyHash(h);
     }
+    BCryptHashGuard(const BCryptHashGuard&) = delete;
+    BCryptHashGuard& operator=(const BCryptHashGuard&) = delete;
+    BCryptHashGuard() = default;
 };
 } // namespace
 
@@ -134,6 +140,9 @@ struct EvpMdCtxGuard {
         if (ctx)
             EVP_MD_CTX_free(ctx);
     }
+    EvpMdCtxGuard(const EvpMdCtxGuard&) = delete;
+    EvpMdCtxGuard& operator=(const EvpMdCtxGuard&) = delete;
+    EvpMdCtxGuard() = default;
 };
 } // namespace
 
