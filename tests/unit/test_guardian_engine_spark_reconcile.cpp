@@ -182,7 +182,22 @@ struct SparkReconcileFixture {
         gpb::GuaranteedStatePush p;
         p.set_full_sync(full_sync);
         *p.add_rules() = rule;
-        REQUIRE(engine->apply_rules(p).has_value());
+        // Serialize-then-dispatch, NOT engine->apply_rules(p) directly: every
+        // rule here carries an assertion params Map (service_name/hive/key/
+        // path), and on Windows MSVC debug, populating that Map in the TEST
+        // EXE and then reading it DLL-side hits the #501 cross-image abseil
+        // hash-seed split - .find() silently misses ~50% of the time,
+        // producing an empty string exactly as if the field were never set
+        // (confirmed on DGRHP: every service-type test here failed spark
+        // validation with "spec derivation failed", i.e. guardian_assertion_
+        // param("service_name") read back empty). guardian_dispatch_push_
+        // bytes_for_test deserializes the bytes INSIDE the DLL, so the Map is
+        // populated using the DLL's own seed - see guardian_engine.hpp's
+        // doc comment on the helper for the full mechanism. Linux is blind to
+        // this class of bug (single shared object, no split seed), which is
+        // why this went uncaught until the first real Windows compile.
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
     }
 };
 
@@ -379,7 +394,15 @@ TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spa
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
     *p.add_rules() = make_service_rule("r1");
-    REQUIRE(engine.apply_rules(p).has_value());
+    // Serialize-then-dispatch, not apply_rules(p) directly - see the fixture's
+    // apply() helper above for the #501 cross-image Map rationale. This
+    // test's own assertions happen to pass either way (spark stays untouched
+    // whether prefer_spark_ correctly gates it or the #501 bug invalidly
+    // rejects the rule before that gate is even reached), but a wrong-reason
+    // pass defeats the point of the test - fixed for correctness even though
+    // it wasn't in DGRHP's failure list.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
 
     CHECK(engine.spark_armed_rule_count() == 0); // spark never even consulted
     CHECK(mechanism->watching_count() == 0);
