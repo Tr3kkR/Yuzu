@@ -24,9 +24,10 @@
  *   - peek / send / remove-on-success. drain() sends in FIFO order and removes an
  *     entry only when the send reports success; a false return OR a throw retains
  *     the entry and STOPS the drain (the stream is down - do not burn N syscalls).
- *   - SEPARATE coalescing domains. compliance / health / lifecycle each coalesce to
- *     the latest per rule independently; a health event never overwrites a pending
- *     compliance event for the same rule.
+ *   - SEPARATE coalescing domains. compliance / health each coalesce to the latest
+ *     per rule independently; a health event never overwrites a pending compliance
+ *     event for the same rule. Lifecycle is NOT a domain this class accepts - see
+ *     GuardianLifecycleLog below and enqueue()'s rejection of it.
  *   - generation-tagged, purged on rule update/disable. A stale entry from a
  *     superseded generation is dropped, never sent.
  *   - event_id + timestamp fixed at ENQUEUE (the caller sets them; this stays free
@@ -53,10 +54,14 @@ namespace yuzu::agent {
 
 /// Independent coalescing channels. Two entries coalesce (latest wins) only when
 /// BOTH domain and rule_id match, so a rule can have one pending entry per domain.
+/// Lifecycle is the odd one out: GuardianOutbox::enqueue()/enqueue_all() REJECT
+/// it (see there for why - coalescing is the wrong semantics for an audit trail).
+/// It exists on this shared enum/struct only because GuardianLifecycleLog reuses
+/// OutboxEntry as its payload type; production code only ever routes it there.
 enum class OutboxDomain {
     Compliance, ///< guard.compliant / guard.drift (payload: GuardDrift)
     Health,     ///< guard.unhealthy / guard.healthy (payload: healthy + detail)
-    Lifecycle,  ///< guard.armed / guard.disarmed / guard.errored (payload: kind)
+    Lifecycle,  ///< guard.armed / guard.disarmed / guard.errored (payload: kind) - GuardianLifecycleLog only
 };
 
 /// One buffered emit. Which payload fields are meaningful is fixed by `domain`.
@@ -131,7 +136,15 @@ public:
     /// pending (does NOT commit its decider copy) and this bumps the backpressure
     /// counter. Coalescing an existing key never grows the buffer, so it always
     /// succeeds and replaces the payload/id/timestamp/generation in place.
+    ///
+    /// Also returns false (no counter bump - this is a caller bug, not a capacity
+    /// condition) for a Lifecycle-domain entry: this class's coalescing semantics
+    /// would silently lose armed/disarmed/errored audit evidence, which is exactly
+    /// what GuardianLifecycleLog exists to prevent. Route Lifecycle entries to
+    /// GuardianLifecycleLog::enqueue() instead.
     bool enqueue(OutboxEntry e) {
+        if (e.domain == OutboxDomain::Lifecycle)
+            return false;
         const Key k{e.domain, e.rule_id};
         const auto it = index_.find(k);
         if (it != index_.end()) {
@@ -154,6 +167,10 @@ public:
     /// must land together or not at all - a partial commit would advance decider state
     /// for an event the server never receives. Coalescing entries never count as growth.
     bool enqueue_all(std::vector<OutboxEntry> entries) {
+        for (const auto& e : entries) {
+            if (e.domain == OutboxDomain::Lifecycle) // see enqueue()'s rejection note
+                return false;
+        }
         std::size_t new_keys = 0;
         std::unordered_set<Key, KeyHash> adding;
         for (const auto& e : entries) {

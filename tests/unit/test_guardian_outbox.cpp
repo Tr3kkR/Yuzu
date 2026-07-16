@@ -199,13 +199,29 @@ TEST_CASE("drop_rule removes every domain for a rule", "[spark][outbox]") {
     GuardianOutbox ob{16};
     ob.enqueue(comp("a", 1, "e1", 100, "x"));
     ob.enqueue(OutboxEntry::health("a", 1, "h1", 101, false, "io"));
-    ob.enqueue(OutboxEntry::lifecycle("a", 1, "l1", 102, "errored"));
     ob.enqueue(comp("b", 1, "e2", 103, "y"));
-    REQUIRE(ob.size() == 4);
+    REQUIRE(ob.size() == 3);
 
     ob.drop_rule("a");
     REQUIRE(ob.size() == 1);
     Recorder rec;
     ob.drain(std::ref(rec));
     REQUIRE(rec.sent == std::vector<std::string>{"0:b:e2"});
+}
+
+TEST_CASE("enqueue/enqueue_all reject a Lifecycle-domain entry", "[spark][outbox]") {
+    // GuardianOutbox's coalescing semantics are wrong for the Lifecycle audit
+    // trail (see GuardianLifecycleLog) - a Lifecycle entry must be routed there
+    // instead, never accepted here, even if a future caller reaches for this
+    // class by name-similarity mistake.
+    GuardianOutbox ob{16};
+    REQUIRE_FALSE(ob.enqueue(OutboxEntry::lifecycle("a", 1, "l1", 102, "errored")));
+    REQUIRE(ob.size() == 0);
+    REQUIRE(ob.backpressure_drops() == 0); // a routing bug, not a capacity condition
+
+    std::vector<OutboxEntry> mixed;
+    mixed.push_back(comp("a", 1, "e1", 100, "x"));
+    mixed.push_back(OutboxEntry::lifecycle("a", 1, "l1", 102, "errored"));
+    REQUIRE_FALSE(ob.enqueue_all(std::move(mixed)));
+    REQUIRE(ob.size() == 0); // both-or-neither: the compliance entry is not buffered either
 }
