@@ -263,6 +263,25 @@ TEST_CASE("MCP assign_engine_role: nonexistent engine principal rejected",
     CHECK(h.rbac_store.get_principal_roles("engine", "engine:no-such-principal").empty());
 }
 
+TEST_CASE("MCP engine-role tools reject a slug outside [a-z0-9._-] (A1 — no charset gap vs REST)",
+          "[pg][mcp][engine_principal][rbac]") {
+    McpEngineRolesHarness h;
+    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+
+    // The MCP slug arrives via param_str (any string) — unlike the REST URL
+    // regex — so it must be charset-validated before becoming engine:<slug>
+    // or landing in an audit-detail string. Uppercase, ':' (double-prefix),
+    // path-traversal, and markup chars must all be rejected with an error,
+    // and no grant must land.
+    for (const std::string bad : {"Vuln", "a:b", "../etc", "x<script>", "has space"}) {
+        auto res = h.call_tool("assign_engine_role", {{"principal_id", bad}, {"role", "EngineReader"}});
+        REQUIRE(res);
+        CHECK(res->body.find("\"error\"") != std::string::npos);
+        CHECK(res->body.find("invalid principal_id") != std::string::npos);
+        CHECK(h.rbac_store.get_principal_roles("engine", "engine:" + bad).empty());
+    }
+}
+
 TEST_CASE("MCP: assign_engine_role / unassign_engine_role / list_engine_roles are advertised "
           "in tools/list",
           "[pg][mcp][engine_principal][integration]") {

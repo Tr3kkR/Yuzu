@@ -5259,6 +5259,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // A1: the MCP slug arrives via param_str (any string), unlike
+                // the REST route whose URL regex constrains it. Enforce the
+                // same charset before it becomes engine:<slug> / flows into
+                // audit detail — reject anything outside [a-z0-9._-].
+                if (slug.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789._-") !=
+                    std::string::npos) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid principal_id (allowed characters: a-z 0-9 . _ -)"),
+                        "application/json");
+                    return;
+                }
                 const std::string principal_id = "engine:" + slug;
 
                 // Target must name a live (non-revoked) engine principal —
@@ -5347,6 +5359,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // A1: the MCP slug arrives via param_str (any string), unlike
+                // the REST route whose URL regex constrains it. Enforce the
+                // same charset before it becomes engine:<slug> / flows into
+                // audit detail — reject anything outside [a-z0-9._-].
+                if (slug.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789._-") !=
+                    std::string::npos) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid principal_id (allowed characters: a-z 0-9 . _ -)"),
+                        "application/json");
+                    return;
+                }
                 const std::string principal_id = "engine:" + slug;
                 // Idempotent DELETE (success even if the role was not held).
                 // With the store confirmed open, a !result is a runtime query
@@ -5387,6 +5411,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (slug.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "principal_id is required"),
                                     "application/json");
+                    return;
+                }
+                // A1: the MCP slug arrives via param_str (any string), unlike
+                // the REST route whose URL regex constrains it. Enforce the
+                // same charset before it becomes engine:<slug> / flows into
+                // audit detail — reject anything outside [a-z0-9._-].
+                if (slug.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789._-") !=
+                    std::string::npos) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid principal_id (allowed characters: a-z 0-9 . _ -)"),
+                        "application/json");
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
