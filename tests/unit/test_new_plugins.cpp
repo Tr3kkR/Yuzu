@@ -126,6 +126,12 @@ PluginHandle load_plugin(const std::string& name) {
     }
     // Also try builddir directly
     search_dirs.push_back(fs::path{"builddir"} / "agents" / "plugins" / name);
+    // Canonical per-OS build dirs, so the tests-build-* symlink invocation
+    // from the project root (CLAUDE.md "Direct binary invocation") finds the
+    // plugins instead of silently skipping every descriptor test.
+    for (const char* os_dir : {"build-macos", "build-linux", "build-windows"}) {
+        search_dirs.push_back(fs::path{os_dir} / "agents" / "plugins" / name);
+    }
 
     std::string lib_name = name + kPluginExt;
     fs::path found_path;
