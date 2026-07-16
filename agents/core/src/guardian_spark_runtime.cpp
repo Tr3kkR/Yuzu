@@ -101,14 +101,19 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
         const bool arm_edge = index_->add(key, rule_id);
-        // Unwinds index_->add() (and, if this call armed a NEW watcher, the
-        // backend subscription + keys_ entry) unless committed - covers any
-        // throw between here and the end of the locked block (map/set
-        // insertion bad_alloc, etc.) so a mid-construction exception cannot
-        // leave a live, untracked SparkEngine subscription (Sol rung-7.5
-        // review finding 1).
-        ScopeExit rollback;
+        // `pk` is declared BEFORE `rollback` so it is destroyed AFTER it
+        // (reverse construction order): `rollback`'s destructor lambda
+        // references `pk` by reference, so `pk` must still be alive when
+        // that destructor runs.
         std::shared_ptr<PerKey> pk;
+        // Unwinds EVERY mutation below unless committed - covers any throw
+        // between here and the end of the locked block (map/set insertion
+        // bad_alloc, etc.) so a mid-construction exception cannot leave a
+        // live, untracked SparkEngine subscription, nor a stale rules_/
+        // pending_initial entry with no corresponding key/subscription (Sol
+        // rung-7.5 review finding 1). `rules_.erase`/`pending_initial.erase`
+        // are safe no-ops if those inserts never ran.
+        ScopeExit rollback;
         if (arm_edge) {
             auto armed = backend_->arm(spec);
             if (!armed) {
@@ -116,11 +121,14 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 return std::unexpected(armed.error());
             }
             const std::uint64_t sub = *armed;
-            rollback.fn = [this, rule_id, key, sub] {
+            rollback.fn = [this, rule_id, key, sub, &pk] {
                 const auto vacated = index_->remove_rule(rule_id);
                 keys_.erase(key);
                 if (vacated)
                     backend_->disarm(sub);
+                rules_.erase(rule_id);
+                if (pk)
+                    pk->pending_initial.erase(rule_id);
             };
             pk = std::make_shared<PerKey>();
             pk->spec = spec;
@@ -128,7 +136,12 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             keys_.emplace(key, pk);
         } else {
             pk = keys_.at(key); // an existing shared watcher for this key
-            rollback.fn = [this, rule_id] { index_->remove_rule(rule_id); };
+            rollback.fn = [this, rule_id, &pk] {
+                index_->remove_rule(rule_id);
+                rules_.erase(rule_id);
+                if (pk)
+                    pk->pending_initial.erase(rule_id);
+            };
         }
 
         rules_.insert_or_assign(rule_id, std::move(rg));
@@ -138,9 +151,12 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // arm itself (the audit trail must not compromise real detection
         // capability); see enqueue_lifecycle_locked's doc.
         enqueue_lifecycle_locked(rule_id, gen, "armed");
-        rollback.committed = true;
+        // waker/outbox_waker are copied BEFORE commit: if either copy itself
+        // throws, rollback still runs rather than reporting an exception on
+        // an already-committed arm (Sol rung-7.5 review finding 1).
         waker = pending_initial_waker_;   // copy; call after releasing registry_mu_
         outbox_waker = outbox_enqueue_waker_;
+        rollback.committed = true;
         new_gen = gen;
     }
     // Outside the lock (avoids a registry_mu_ -> scheduler_mu_ inversion): let the
