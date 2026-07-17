@@ -614,16 +614,16 @@ public:
         // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
         metrics_.describe("yuzu_fleet_spark_reporting",
                           "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
-                          "running (spark_running=1) — the denominator for all spark telemetry",
+                          "running (spark_running=1) - the denominator for all spark telemetry",
                           "gauge");
         metrics_.describe("yuzu_fleet_spark_disabled",
                           "Agents (per `os`) running with SparkEngine deliberately off "
-                          "(--spark-disable). An operator decision — expected to be non-zero; "
+                          "(--spark-disable). An operator decision - expected to be non-zero; "
                           "do NOT alert on it", "gauge");
         metrics_.describe("yuzu_fleet_spark_failed",
                           "Agents (per `os`) where SparkEngine was ENABLED but boot-time "
                           "instantiation THREW, so the agent degraded to no-spark. Distinct from "
-                          "`disabled` on purpose: this is a fault, not a choice — ALERT on it. "
+                          "`disabled` on purpose: this is a fault, not a choice - ALERT on it. "
                           "Absent = no agent of that os reported a failure this cycle", "gauge");
         metrics_.describe("yuzu_fleet_spark_mechanisms",
                           "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
@@ -645,10 +645,10 @@ public:
                           "Fleet sum (per `os`) of cumulative queued handlers that threw "
                           "(consumer_errors_total)", "gauge");
         metrics_.describe("yuzu_fleet_spark_watch_rejected",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections - "
                           "a rule that could not arm (denial-of-detection)", "gauge");
         metrics_.describe("yuzu_fleet_spark_quarantined",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines - "
                           "a structural leak that should stay 0; any value is page-worthy", "gauge");
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
