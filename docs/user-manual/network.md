@@ -91,9 +91,9 @@ ESTATS — see its row.
 |---|---|---|---|
 | Linux | Full — netlink `INET_DIAG` per-connection `TCP_INFO` | Yes — per-connection sum | Yes (`/proc/net/dev`) |
 | Windows | Heartbeat: not yet · **per-connection: yes via the opt-in `netqual` tier (ESTATS, elevated — ADR-0020)** | Yes — `GetTcpStatisticsEx` (system-wide; see caveat) | Yes (`GetIfTable2`) |
-| macOS | Not yet | Not yet | Not yet |
+| macOS | Not yet (deferred) | Not yet (deferred) | Yes (`NET_RT_IFLIST2`) |
 
-**Linux and Windows agents emit network facts; macOS does not yet.** At the
+**Linux, Windows, and macOS agents all emit heartbeat network facts.** At the
 **heartbeat** layer Windows reports device throughput (`GetIfTable2`) and an
 interval retransmit rate (`GetTcpStatisticsEx`) but **not RTT** — the fleet
 gauge has no per-connection ESTATS sweep. **Per-connection smoothed RTT IS
@@ -106,10 +106,17 @@ retransmit MIB, so it
 *includes loopback* and cannot be scoped to real interfaces; (2) it is
 **measurement-first, unvalidated on Windows** — the interval-delta signal's
 separation-under-loss was validated under `netem` on Linux only, and on a
-loopback-dominated host (e.g. a single-box UAT rig) it dilutes toward ~0. macOS
-agents emit *nothing* yet (a later slice). Absent metrics are always omitted from
-rollups; a device that does not report a metric is excluded from that metric's
-denominator, never counted as zero.
+loopback-dominated host (e.g. a single-box UAT rig) it dilutes toward ~0.
+**macOS reports device throughput only**, via `NET_RT_IFLIST2` (a
+routing-socket interface-list walk) — the same coarse, non-loopback aggregate
+as the Linux/Windows paths. **Retransmit and RTT are deferred on macOS in v1.**
+The originally-planned retransmit source — the global `net.inet.tcp.stats` OID
+— is unusable: it returns an all-zero counter struct on current macOS (every
+field reads 0, matching Apple's own `netstat -s -p tcp`), so it cannot back a
+retransmit metric. A retransmit fact will follow from a per-flow source (the
+NetworkStatistics/`nstat` client, roadmap 2.x). Absent metrics are always
+omitted from rollups; a device that does not report a metric is excluded from
+that metric's denominator, never counted as zero.
 
 ## Collection & privacy
 

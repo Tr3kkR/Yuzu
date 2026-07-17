@@ -119,3 +119,35 @@ TEST_CASE("RetransWindow: counter decrease (DWORD wrap) clamps, never negative",
 // Linux only and is tracked for Windows in issue #1465. Only the cross-platform,
 // deterministic helpers above (median / throughput_bps / RetransWindow) are
 // unit-tested.
+
+#ifdef __APPLE__
+// macOS smoke test: read_net_counters() is the NET_RT_IFLIST2 syscall path, so
+// this exercises the live routing-socket walk on this host rather than a pure
+// helper (mirrors the intent of the Linux/Windows live-rig notes above, but as
+// an automated CI check since the macOS suite runs on real macOS runners).
+TEST_CASE("macOS: read_net_counters walks NET_RT_IFLIST2 and finds live traffic",
+          "[netq][macos]") {
+    const NetCounters c = read_net_counters();
+    // A successful walk always sets valid=true (even a quiescent host has
+    // interfaces to enumerate); this forces the sysctl + bounds-checked walk to
+    // actually run end-to-end, not just compile.
+    REQUIRE(c.valid);
+    // Every real macOS host has at least one non-loopback interface with
+    // since-boot traffic, so this forces the walk to have found and summed a
+    // real RTM_IFINFO2 message — the test fails if the NET_RT_IFLIST2 path is
+    // broken (e.g. always skipping/mis-parsing messages).
+    CHECK(c.rx_bytes + c.tx_bytes > 0);
+}
+
+TEST_CASE("macOS: sample_net_quality omits retransmit and RTT (deferred in v1)",
+          "[netq][macos]") {
+    const NetCounters c1 = read_net_counters();
+    const NetCounters c2 = read_net_counters();
+    const NetQualitySample s = sample_net_quality(c1, c2);
+    // Both are deferred on macOS in v1 — absent, never a fabricated false/0.
+    // Deliberately NOT asserting throughput_bps>0: a quiescent interval between
+    // c1/c2 is legitimately absent (throughput_valid may be true or false).
+    CHECK_FALSE(s.rtt_valid);
+    CHECK_FALSE(s.retrans_valid);
+}
+#endif
