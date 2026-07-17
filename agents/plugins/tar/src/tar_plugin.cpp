@@ -1213,6 +1213,15 @@ private:
                     spdlog::warn("TAR: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
                 }
+            } else if (!pending_nstat_evs_.empty() && nstat_client_) {
+                // R2-2: a poll-only steady-state tick (nstat never became
+                // primary again after a fallback) must still retry a stranded
+                // insert-retry backlog — a batch requeued on the one transition
+                // tick would otherwise sit in memory until disable/shutdown,
+                // since neither branch above runs once nstat_tcp_primary_prev_
+                // has flipped false. Mirrors pending_stream_evs_ being retried
+                // on every process tick.
+                persist_nstat_flow_events({});
             }
 
             auto prev_json = db_->get_state(net_key);
@@ -2733,6 +2742,20 @@ private:
                         prev_perf_ = yuzu::tar::PerfCounters{};
                     else if (src_name == "procperf")
                         prev_proc_ = yuzu::tar::ProcSnapshot{};
+                }
+                // R2-3: the nstat lifecycle client runs unconditionally and keeps
+                // buffering into its ring across a tcp enable/disable toggle. Drain
+                // -and-discard the ring (and any insert-retry backlog) on BOTH edges
+                // of a tcp transition, under collect_mu_ so it is atomic w.r.t. a
+                // collection tick. The disable edge clears everything buffered up to
+                // the pause; the enable edge clears whatever accumulated DURING a
+                // pause too short to have fired the per-tick disabled discard in
+                // collect_fast. Without the enable-edge drain, a sub-fast-interval
+                // disable/re-enable would persist its whole window on the next tick
+                // (a fail-closed forensic-pause violation).
+                if (transition_ok && src_name == "tcp" && nstat_client_) {
+                    nstat_client_->drain();
+                    pending_nstat_evs_.clear();
                 }
             }
             if (!transition_ok) {

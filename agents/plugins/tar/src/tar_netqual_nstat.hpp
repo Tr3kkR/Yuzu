@@ -450,7 +450,10 @@ public:
     bool running() const noexcept;
 
     /// Moves buffered lifecycle (open/close) events out for the batched
-    /// tar.db write. Empty when not running / off-macOS.
+    /// tar.db write. Drains the client-owned ring REGARDLESS of running(), so
+    /// the plugin's death/stall-transition drain can still recover events the
+    /// reader buffered just before a fatal exit (R2-1/HIGH-5). Empty off-macOS
+    /// or when no events are buffered.
     std::vector<NstatFlowEvent> drain();
 
     /// Lifecycle events dropped due to ring overflow since construction.

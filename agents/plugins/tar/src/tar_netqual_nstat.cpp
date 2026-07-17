@@ -605,8 +605,10 @@ struct NstatClient::Impl {
         }
         // HIGH-1 fix: self-detected death, written through the borrowed
         // pointer to the CLIENT's running_ atomic (never touches impl_ from
-        // the client side to observe this).
-        running->store(false, std::memory_order_relaxed);
+        // the client side to observe this). Release so that a layout_mismatch_
+        // set by handle_message() before the break is visible to any thread
+        // that acquires running_ and observes false (R2-4).
+        running->store(false, std::memory_order_release);
     }
 
     void query_loop() {
@@ -689,8 +691,23 @@ bool NstatClient::start() {
                                        &running_);
     impl->fd = fd;
     Impl* raw = impl.get();
-    impl->reader_thread = std::thread([raw] { raw->reader_loop(); });
-    impl->query_thread = std::thread([raw] { raw->query_loop(); });
+    impl_ = std::move(impl);
+
+    // R2-4 fix: publish running_ = true BEFORE launching the reader thread.
+    // The reader self-detects fatal death by storing running_ = false at the
+    // end of reader_loop(); std::thread construction synchronizes-with the new
+    // thread, so a reader that dies immediately stores false strictly AFTER
+    // this store — start() can no longer clobber a dead reader's false with a
+    // stale true (the previous order launched the reader first, then set true,
+    // which could overwrite an instant death and advertise a dead client as
+    // primary). impl_ is already assigned, so any observer of running_ == true
+    // sees a valid impl_; and no external caller can reach running_ during
+    // start() — the client is registered (netqual_nstat_register_client) only
+    // after start() returns.
+    running_.store(true, std::memory_order_release);
+
+    raw->reader_thread = std::thread([raw] { raw->reader_loop(); });
+    raw->query_thread = std::thread([raw] { raw->query_loop(); });
 
     // Subscribe both known TCP provider ids (memo §1) — harmless if one is
     // invalid for this kernel; the flow table is keyed purely by srcref, not
@@ -700,21 +717,13 @@ bool NstatClient::start() {
     add_tcp.hdr.type = kNstatMsgAddAllSrcs;
     add_tcp.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp));
     add_tcp.provider = kNstatProviderTcp;
-    impl->send_msg(&add_tcp, sizeof(add_tcp));
+    raw->send_msg(&add_tcp, sizeof(add_tcp));
 
     nstat_raw::MsgAddAllSrcs add_tcp_kernel{};
     add_tcp_kernel.hdr.type = kNstatMsgAddAllSrcs;
     add_tcp_kernel.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp_kernel));
     add_tcp_kernel.provider = kNstatProviderTcpKernel;
-    impl->send_msg(&add_tcp_kernel, sizeof(add_tcp_kernel));
-
-    impl_ = std::move(impl);
-    // HIGH-1 fix: publish running_ = true only AFTER impl_ is fully set up,
-    // so any thread that observes running_ == true is guaranteed to see a
-    // valid impl_ (the actual cross-thread publication for other threads
-    // reaching this client at all goes through netqual_nstat_register_client's
-    // release/acquire pair, which happens strictly after start() returns).
-    running_.store(true, std::memory_order_relaxed);
+    raw->send_msg(&add_tcp_kernel, sizeof(add_tcp_kernel));
     spdlog::info("TAR: nstat client active (provider=tcp, system_wide={})",
                  system_wide_.load(std::memory_order_relaxed));
     return true;
@@ -728,7 +737,7 @@ void NstatClient::stop() {
     // client_mu_ before this stop() did) is still safely reading impl_ right
     // now — the lock below blocks this stop() until that call releases it,
     // so impl_ is never freed mid-read.
-    running_.store(false, std::memory_order_relaxed);
+    running_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lk(client_mu_);
     // ~Impl shuts down the socket (unblocking the reader's recv), wakes the
     // query thread, joins both, and only then closes the fd (HIGH-2); flows_mu
@@ -740,19 +749,18 @@ void NstatClient::stop() {
 bool NstatClient::running() const noexcept {
     // HIGH-1 fix: reads a client-owned atomic only — no impl_ dereference —
     // so this is always safe to call regardless of a concurrent stop().
-    return running_.load(std::memory_order_relaxed);
+    // Acquire pairs with the reader's release store on death (R2-4).
+    return running_.load(std::memory_order_acquire);
 }
 
 std::vector<NstatFlowEvent> NstatClient::drain() {
-    // HIGH-1 fix: client_mu_ held for the whole body, mirroring
-    // snapshot_quality() — mutually exclusive with stop() resetting impl_.
-    // ring_ itself does not need impl_ (it's a client member, not an Impl
-    // member), but the running_ gate and the lock are kept here anyway for
-    // uniformity with snapshot_quality() and so drain() stays empty exactly
-    // when the class doc promises ("not running / off-macOS").
+    // R2-1/HIGH-5 fix: drain the ring REGARDLESS of running_. The whole point
+    // of the plugin's death/stall-transition drain is to recover events that
+    // were buffered just before the reader died — gating on running_ discarded
+    // exactly those (running_ is already false by then). ring_ is a client
+    // member (it outlives impl_), so this is safe; client_mu_ is still held to
+    // serialize with stop() resetting impl_ (uniform with snapshot_quality()).
     std::lock_guard<std::mutex> lk(client_mu_);
-    if (!running_.load(std::memory_order_relaxed))
-        return {};
     return ring_.drain();
 }
 
