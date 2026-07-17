@@ -16,6 +16,10 @@
 #include <string>
 #include <string_view>
 
+#ifdef __APPLE__
+#include "bitlocker_macos_apfs.hpp"
+#endif
+
 namespace {
 
 std::string run_command(const char* cmd) {
@@ -145,6 +149,41 @@ void list_luks_volumes(yuzu::CommandContext& ctx) {
     }
 }
 
+#elif defined(__APPLE__)
+
+// Emits the honest per-volume FileVault/encryption status. Two signals:
+//  - `fdesetup status` — a global on/off read, retained unconditionally as a
+//    corroborating signal AND as the fallback when diskutil parsing below
+//    yields no volumes (e.g. diskutil unavailable, unexpected output shape).
+//  - `diskutil apfs list` — enumerated per APFS volume, parsed by the pure
+//    header so it stays fixture-testable. Encryption is binary
+//    (encrypted/not_encrypted/unknown) — APFS has no meaningful
+//    percentage-encrypted to report, unlike BitLocker's conversion-in-
+//    progress state, so none is fabricated here.
+void report_filevault_status(yuzu::CommandContext& ctx) {
+    auto fdesetup_output = run_command("fdesetup status 2>/dev/null");
+    if (fdesetup_output.find("On") != std::string::npos ||
+        fdesetup_output.find("FileVault is On") != std::string::npos) {
+        ctx.write_output("filevault|enabled");
+    } else if (fdesetup_output.find("Off") != std::string::npos ||
+               fdesetup_output.find("FileVault is Off") != std::string::npos) {
+        ctx.write_output("filevault|disabled");
+    } else {
+        ctx.write_output(std::format("filevault|unknown|{}", fdesetup_output));
+    }
+
+    auto diskutil_output = run_command("diskutil apfs list 2>/dev/null");
+    auto volumes = yuzu::bitlocker::macos::parse_diskutil_apfs_list(diskutil_output);
+    for (const auto& vol : volumes) {
+        ctx.write_output(std::format("volume|{}|{}|{}",
+                                     yuzu::bitlocker::macos::volume_label(vol),
+                                     yuzu::bitlocker::macos::volume_type(vol),
+                                     vol.encrypted_state));
+    }
+    // If diskutil yielded nothing parseable, the fdesetup row above already
+    // served as the fallback signal — no synthetic "no volumes" row needed.
+}
+
 #endif
 
 } // namespace
@@ -179,16 +218,7 @@ public:
 #elif defined(__linux__)
             list_luks_volumes(ctx);
 #elif defined(__APPLE__)
-            auto output = run_command("fdesetup status 2>/dev/null");
-            if (output.find("On") != std::string::npos ||
-                output.find("FileVault is On") != std::string::npos) {
-                ctx.write_output("filevault|enabled");
-            } else if (output.find("Off") != std::string::npos ||
-                       output.find("FileVault is Off") != std::string::npos) {
-                ctx.write_output("filevault|disabled");
-            } else {
-                ctx.write_output(std::format("filevault|unknown|{}", output));
-            }
+            report_filevault_status(ctx);
 #endif
             return 0;
         }
