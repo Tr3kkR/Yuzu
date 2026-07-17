@@ -706,8 +706,20 @@ bool NstatClient::start() {
     // after start() returns.
     running_.store(true, std::memory_order_release);
 
-    raw->reader_thread = std::thread([raw] { raw->reader_loop(); });
-    raw->query_thread = std::thread([raw] { raw->query_loop(); });
+    // C2 fix: std::thread construction can throw under resource exhaustion.
+    // Roll back to the inert state (running_ = false, impl_ reset — ~Impl joins
+    // any thread that WAS created and closes the fd) so the client is never
+    // advertised live with missing workers; the caller falls back to the poll.
+    try {
+        raw->reader_thread = std::thread([raw] { raw->reader_loop(); });
+        raw->query_thread = std::thread([raw] { raw->query_loop(); });
+    } catch (const std::system_error& e) {
+        running_.store(false, std::memory_order_release);
+        impl_.reset();
+        spdlog::warn("TAR: nstat client thread launch failed ({}); falling back to poll",
+                     e.what());
+        return false;
+    }
 
     // Subscribe both known TCP provider ids (memo §1) — harmless if one is
     // invalid for this kernel; the flow table is keyed purely by srcref, not

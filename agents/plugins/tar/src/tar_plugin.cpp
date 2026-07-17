@@ -2722,6 +2722,15 @@ private:
                 std::unique_lock<std::mutex> sw_lock;
                 if (src_name == "software")
                     sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
+                // C1 fix: capture the prior tcp enabled state BEFORE applying, so the
+                // R2-3 nstat-ring drain below fires only on an actual enable<->disable
+                // EDGE. An idempotent tcp_enabled=true re-assert (common from
+                // desired-state reconciliation) returns transition_ok==true but is NOT
+                // a pause boundary and must never discard live buffered lifecycle
+                // events (nstat stays primary and the poll is filtered to UDP, so the
+                // loss would be unobservable).
+                const bool tcp_prev_enabled =
+                    (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -2743,17 +2752,17 @@ private:
                     else if (src_name == "procperf")
                         prev_proc_ = yuzu::tar::ProcSnapshot{};
                 }
-                // R2-3: the nstat lifecycle client runs unconditionally and keeps
-                // buffering into its ring across a tcp enable/disable toggle. Drain
-                // -and-discard the ring (and any insert-retry backlog) on BOTH edges
-                // of a tcp transition, under collect_mu_ so it is atomic w.r.t. a
-                // collection tick. The disable edge clears everything buffered up to
-                // the pause; the enable edge clears whatever accumulated DURING a
-                // pause too short to have fired the per-tick disabled discard in
-                // collect_fast. Without the enable-edge drain, a sub-fast-interval
-                // disable/re-enable would persist its whole window on the next tick
-                // (a fail-closed forensic-pause violation).
-                if (transition_ok && src_name == "tcp" && nstat_client_) {
+                // R2-3 (edge-gated per C1): drain-and-discard the nstat ring and
+                // insert-retry backlog on a real tcp enable<->disable EDGE, under
+                // collect_mu_ so it is atomic w.r.t. a collection tick. The disable
+                // edge clears everything buffered up to the pause; the enable edge
+                // clears whatever accumulated DURING a pause too short to have fired
+                // the per-tick disabled discard in collect_fast. The client keeps
+                // running (it also feeds netqual) — only the lifecycle ring is
+                // discarded. Gated on an actual state change so an idempotent
+                // re-assert never discards live events (C1).
+                if (transition_ok && src_name == "tcp" && nstat_client_ &&
+                    (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
                     pending_nstat_evs_.clear();
                 }
