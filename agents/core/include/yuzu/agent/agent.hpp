@@ -3,6 +3,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -132,6 +133,18 @@ public:
      * (service_win.cpp reports specific-error 1 for BOTH). (governance: consistency-auditor.)
      */
     [[nodiscard]] virtual bool startup_failed() const noexcept = 0;
+
+    /**
+     * Live count of detached Guardian bounded-I/O workers (F3, ADR-0021 rung
+     * 7.6 - see guardian_io_executor.hpp's "ORPHAN PROCESS-EXIT CONTRACT").
+     * Zero whenever Guardian's spark path was never wired (today's default -
+     * rung 7.7 is what wires it). main()/the Windows SCM path poll this after
+     * run() returns and hard_exit() with a nonzero code if it has not
+     * reached zero within a bounded grace, rather than let normal process
+     * exit run C++ static/DSO teardown concurrently with a worker that may
+     * still be executing library code through a wedged syscall.
+     */
+    [[nodiscard]] virtual std::size_t guardian_active_io_workers() const noexcept = 0;
 };
 
 } // namespace yuzu::agent

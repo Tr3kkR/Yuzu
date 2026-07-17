@@ -152,9 +152,22 @@ agent_test_exe = executable(
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
     'unit/test_shutdown_pipe.cpp',
+    'unit/test_hard_exit.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
+    'unit/test_spark_key_rule_index.cpp',
     'unit/test_spark_mechanism.cpp',
+    'unit/test_guardian_spark_bridge.cpp',
+    'unit/test_guardian_spark_backend.cpp',
+    'unit/test_guardian_emit_decider.cpp',
+    'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_runtime.cpp',
+    'unit/test_guardian_state_reader.cpp',
+    'unit/test_guardian_convergence_scheduler.cpp',
+    'unit/test_guardian_io_executor.cpp',
+    'unit/test_guardian_outbox_drain_worker.cpp',
+    'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
@@ -560,6 +573,17 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
+# parser fixtures (incl. PR #1711, the canonical negated close) + the decision
+# ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
+# always run the heavy platform jobs, so meson coverage alone is sufficient.
+test('close automation logic',
+  _python3_test,
+  args: [files('test_close_automation.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit

@@ -825,7 +825,43 @@ jobs:
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
-          brew install cmake ninja ccache pipx autoconf automake libtool
+          #
+          # cmake deliberately excluded from this brew line, pinned via pipx
+          # below instead. 2026-07-16: brew's floating `cmake` drifted to
+          # 4.4.0 underneath us with no code change on our side, and that
+          # release crashes resolving httplib's CMake package: FindThreads'
+          # try_compile() trips CMake's own internal "This should not have
+          # happened" guard in Internal/CheckSourceCompiles.cmake, which
+          # poisons every subsequent cmake-method dependency lookup in the
+          # same configure. Broke macOS CI fleet-wide the same way (ci.yml,
+          # #2224) before it could hit a release build here. Pin like meson
+          # below so a future brew bump can't repeat this.
+          brew install ninja ccache pipx autoconf automake libtool
+          # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
+          # independent of this workflow's brew line, so dropping cmake
+          # above doesn't remove it. Unlink it so it can never win a PATH
+          # race against the pinned pipx cmake below. `|| true`: fine if a
+          # future image doesn't pre-bake cmake at all; stderr is left
+          # visible so a genuine unlink failure still shows in the log.
+          brew unlink cmake || true
+          # 4.3.4 is the latest 4.x release before the 4.4.0 regression
+          # above. Bump deliberately once a fixed release is confirmed clean
+          # here. Query pipx's own shim dir and prepend it to GITHUB_PATH so
+          # it's guaranteed to win on PATH rather than assumed to. Captured
+          # into a variable first (not inlined into the `echo` argument):
+          # under `set -e`, a failing/empty command substitution inlined
+          # into `echo "$(...)"` would NOT abort the step (echo's own exit
+          # status is what -e checks), silently writing a blank PATH entry.
+          pipx install cmake==4.3.4
+          pipx_bin_dir="$(pipx environment --value PIPX_BIN_DIR)"
+          test -n "$pipx_bin_dir"
+          echo "$pipx_bin_dir" >> "$GITHUB_PATH"
+          # GITHUB_PATH only takes effect from the next step onward, not
+          # within this script, so verify via the resolved dir directly
+          # rather than a bare `cmake` (which may still hit an empty PATH
+          # slot right here). Self-documents the fix in every future log:
+          # today's incident was exactly this kind of silent version drift.
+          "$pipx_bin_dir/cmake" --version
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
@@ -1207,6 +1243,50 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Build WITHOUT pushing, verify the image still provides the tool its
+      # compose healthcheck invokes (bash + /dev/tcp for server; busybox wget
+      # --spider for gateway), and only then push.
+      #
+      # Verifying AFTER the push would be too late: a broken tag would already
+      # be in GHCR for users to pull. The failure mode is silent -- a base-image
+      # swap or a dropped apt package breaks nothing at build time and nothing
+      # at boot, only the healthcheck, so Compose parks every container in
+      # `unhealthy` forever with no application error to point at.
+      #
+      # No `cache-to` here. Both builds run against the SAME buildkitd instance
+      # (one `setup-buildx-action` builder per job), so "Build and push" below
+      # hits BuildKit's own in-memory solver cache from this build and rebuilds
+      # nothing -- it pays only for the registry upload. A second `mode=max` local
+      # export would be a full duplicate write of a cache that already includes
+      # the vcpkg builder stage, for no benefit.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          build-args: |
+            TRIPLET=x64-linux
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
 
       - name: Build and push
         id: build
@@ -1601,6 +1681,42 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Same pre-push gate as docker-publish, and it matters MORE here: these
+      # images are FROM scratch, so their healthcheck depends entirely on a
+      # busybox binary the chisel stage symlinks into place. A slice change that
+      # stops shipping it breaks the demo-stack healthchecks and nothing else.
+      # docker-compose.demo.yml invokes busybox by ABSOLUTE path
+      # (`/bin/busybox wget --spider`) for the server and gateway chisel images,
+      # which is exactly what the script probes. The `agent` leg of this matrix is
+      # pre-emptive — no compose healthchecks an agent image today.
+      #
+      # NO TRIPLET build-arg, matching "Build and push" below.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}-chisel
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
 
       - name: Build and push
         id: build
