@@ -10,6 +10,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "firewall_parsers.hpp"
+
 #include <array>
 #include <cstdio>
 #include <format>
@@ -128,7 +130,7 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
 class FirewallPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "firewall"; }
-    std::string_view version() const noexcept override { return "0.1.0"; }
+    std::string_view version() const noexcept override { return "0.2.0"; }
     std::string_view description() const noexcept override {
         return "Firewall status and rule listing";
     }
@@ -187,15 +189,23 @@ public:
                 }
             }
 #elif defined(__APPLE__)
-            auto output = run_command("pfctl -s info 2>/dev/null");
-            ctx.write_output("backend|pf");
-            if (output.find("Status: Enabled") != std::string::npos) {
-                ctx.write_output("state|enabled");
-            } else if (output.find("Status: Disabled") != std::string::npos) {
-                ctx.write_output("state|disabled");
-            } else {
-                ctx.write_output("state|unknown");
+            // Primary: the macOS Application Firewall — the firewall a Mac
+            // admin means. pf is off by default and unrelated, so reporting it
+            // as THE state gave false confidence. Unprivileged read.
+            auto alf_out = run_command("/usr/libexec/ApplicationFirewall/socketfilterfw "
+                                       "--getglobalstate 2>/dev/null");
+            auto alf = yuzu::firewall::parse_alf_global_state(alf_out);
+            ctx.write_output("backend|appfirewall");
+            ctx.write_output(std::format("state|{}", yuzu::firewall::to_string(alf.state)));
+            if (alf.block_all) {
+                ctx.write_output("mode|block_all");
             }
+            // Secondary: the pf packet filter (reading /dev/pf needs root;
+            // unreadable reports as unknown, never a false-safe value).
+            // Absolute path per the quarantine plugin's kPfctl discipline.
+            auto pf_out = run_command("/sbin/pfctl -s info 2>/dev/null");
+            ctx.write_output(std::format(
+                "pf|{}", yuzu::firewall::to_string(yuzu::firewall::parse_pf_status(pf_out))));
 #endif
             return 0;
         }
@@ -216,7 +226,7 @@ public:
                 }
             }
 #elif defined(__APPLE__)
-            auto output = run_command("pfctl -s rules 2>/dev/null");
+            auto output = run_command("/sbin/pfctl -s rules 2>/dev/null");
             std::istringstream iss(output);
             std::string line;
             while (std::getline(iss, line)) {
