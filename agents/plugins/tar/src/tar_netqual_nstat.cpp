@@ -1,0 +1,789 @@
+/**
+ * tar_netqual_nstat.cpp — NstatClient (see tar_netqual_nstat.hpp).
+ *
+ * Layout: pure decode/mapping functions first (compile + unit-test on every
+ * platform, no Apple headers), then the live socket/thread client guarded
+ * `#if defined(__APPLE__)`, then the off-macOS no-op path.
+ */
+
+#include "tar_netqual_nstat.hpp"
+
+#include "tar_netqual.hpp" // nq_delta_clamped
+
+#include <cstring>
+#include <format>
+
+namespace yuzu::tar {
+
+// ── Pure decode (cross-platform, unit-tested everywhere) ──────────────────
+
+std::optional<DecodedMsgHeader> nstat_decode_header(std::span<const std::byte> raw) noexcept {
+    if (raw.size() < sizeof(nstat_raw::NstatMsgHdr))
+        return std::nullopt;
+    nstat_raw::NstatMsgHdr hdr{};
+    std::memcpy(&hdr, raw.data(), sizeof(hdr));
+    return DecodedMsgHeader{hdr.context, hdr.type, hdr.length, hdr.flags};
+}
+
+bool nstat_length_matches_expected(std::uint32_t type, std::uint16_t length) noexcept {
+    switch (type) {
+    case kNstatMsgSrcAdded:
+        return length == sizeof(nstat_raw::MsgSrcAdded);
+    case kNstatMsgSrcRemoved:
+        return length == sizeof(nstat_raw::MsgSrcRemoved);
+    case kNstatMsgSrcCounts:
+        return length == sizeof(nstat_raw::MsgSrcCounts);
+    case kNstatMsgSrcDesc:
+        // Variable: header + provider-specific descriptor. We only ever
+        // decode the TCP provider's descriptor, so the floor is header + the
+        // TCP descriptor size; a shorter declared length can never be ours.
+        return length >= sizeof(nstat_raw::MsgSrcDescHeader) + sizeof(nstat_raw::TcpDescriptor);
+    default:
+        return true; // a type we don't validate has nothing of ours to check
+    }
+}
+
+std::optional<DecodedSrcAdded> nstat_decode_src_added(std::span<const std::byte> raw) noexcept {
+    auto hdr = nstat_decode_header(raw);
+    if (!hdr || hdr->type != kNstatMsgSrcAdded)
+        return std::nullopt;
+    if (!nstat_length_matches_expected(hdr->type, hdr->length))
+        return std::nullopt;
+    if (raw.size() < sizeof(nstat_raw::MsgSrcAdded))
+        return std::nullopt;
+    nstat_raw::MsgSrcAdded msg{};
+    std::memcpy(&msg, raw.data(), sizeof(msg));
+    return DecodedSrcAdded{msg.provider, msg.srcref};
+}
+
+std::optional<DecodedSrcRemoved> nstat_decode_src_removed(std::span<const std::byte> raw) noexcept {
+    auto hdr = nstat_decode_header(raw);
+    if (!hdr || hdr->type != kNstatMsgSrcRemoved)
+        return std::nullopt;
+    if (!nstat_length_matches_expected(hdr->type, hdr->length))
+        return std::nullopt;
+    if (raw.size() < sizeof(nstat_raw::MsgSrcRemoved))
+        return std::nullopt;
+    nstat_raw::MsgSrcRemoved msg{};
+    std::memcpy(&msg, raw.data(), sizeof(msg));
+    return DecodedSrcRemoved{msg.srcref};
+}
+
+namespace {
+
+/// Darwin sockaddr_in / sockaddr_in6 field offsets within the raw 128-byte
+/// blob (sa_len[1] sa_family[1] port[2] ...) — NOT read via a system sockaddr
+/// type; see the header comment on nstat_raw::SockaddrBlob.
+std::string format_ipv4(const std::uint8_t* b) {
+    return std::format("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+}
+
+/// RFC5952 canonical (compressed, lowercase) IPv6 text form. Canonical form
+/// is LOAD-BEARING here, not cosmetic: tar_netqual.hpp's remote_bucket()
+/// pattern-matches on the compressed form ("::1", "fe8"/"fe9"/"fea"/"feb",
+/// "fc"/"fd", "::ffff:") — an uncompressed decode would silently misclassify
+/// loopback/link-local/unique-local/v4-mapped remotes into "public".
+std::string format_ipv6_canonical(const std::uint8_t* b) {
+    bool v4_mapped = true;
+    for (int i = 0; i < 10 && v4_mapped; ++i)
+        if (b[i] != 0)
+            v4_mapped = false;
+    if (v4_mapped && b[10] == 0xff && b[11] == 0xff)
+        return std::format("::ffff:{}.{}.{}.{}", b[12], b[13], b[14], b[15]);
+
+    std::uint16_t groups[8];
+    for (int i = 0; i < 8; ++i)
+        groups[i] = static_cast<std::uint16_t>((b[2 * i] << 8) | b[2 * i + 1]);
+
+    // Longest run of >=2 consecutive zero groups gets compressed to "::".
+    int best_start = -1, best_len = 0, i = 0;
+    while (i < 8) {
+        if (groups[i] == 0) {
+            int j = i;
+            while (j < 8 && groups[j] == 0)
+                ++j;
+            if (j - i > best_len) {
+                best_len = j - i;
+                best_start = i;
+            }
+            i = j;
+        } else {
+            ++i;
+        }
+    }
+
+    std::string out;
+    if (best_len >= 2) {
+        for (i = 0; i < best_start; ++i) {
+            out += std::format("{:x}", groups[i]);
+            if (i < best_start - 1)
+                out += ":";
+        }
+        out += "::";
+        for (i = best_start + best_len; i < 8; ++i) {
+            out += std::format("{:x}", groups[i]);
+            if (i < 7)
+                out += ":";
+        }
+    } else {
+        for (i = 0; i < 8; ++i) {
+            out += std::format("{:x}", groups[i]);
+            if (i < 7)
+                out += ":";
+        }
+    }
+    return out;
+}
+
+struct DecodedAddr {
+    std::string proto_suffix; // "" for v4, "6" for v6 — appended to "tcp"
+    std::string addr;
+    int port{0};
+};
+
+std::optional<DecodedAddr> nstat_decode_sockaddr(const nstat_raw::SockaddrBlob& blob) {
+    const std::uint8_t family = blob.bytes[1];
+    const int port = (static_cast<int>(blob.bytes[2]) << 8) | static_cast<int>(blob.bytes[3]);
+    if (family == kNstatAfInet)
+        return DecodedAddr{"", format_ipv4(&blob.bytes[4]), port};
+    if (family == kNstatAfInet6)
+        return DecodedAddr{"6", format_ipv6_canonical(&blob.bytes[8]), port};
+    return std::nullopt; // not v4/v6 (e.g. an all-zero/unset blob) — not decodable
+}
+
+/// Fixed-size NUL-padded field -> std::string, stopping at the first NUL
+/// (matches the ES collector's es_str / path_basename convention for
+/// kernel-sourced fixed buffers that may not be fully NUL-terminated).
+std::string cstr_from_fixed(const char* buf, std::size_t cap) {
+    std::size_t n = 0;
+    while (n < cap && buf[n] != '\0')
+        ++n;
+    return std::string(buf, n);
+}
+
+} // namespace
+
+std::optional<DecodedTcpDesc> nstat_decode_tcp_src_desc(std::span<const std::byte> raw) {
+    auto hdr = nstat_decode_header(raw);
+    if (!hdr || hdr->type != kNstatMsgSrcDesc)
+        return std::nullopt;
+    if (raw.size() < sizeof(nstat_raw::MsgSrcDescHeader))
+        return std::nullopt;
+
+    nstat_raw::MsgSrcDescHeader head{};
+    std::memcpy(&head, raw.data(), sizeof(head));
+    // Defensive, not a layout concern: the client only subscribes TCP
+    // providers, but a stray non-TCP descriptor must never be mis-decoded as
+    // one rather than simply ignored.
+    if (head.provider != kNstatProviderTcp && head.provider != kNstatProviderTcpKernel)
+        return std::nullopt;
+
+    if (!nstat_length_matches_expected(hdr->type, hdr->length))
+        return std::nullopt;
+    if (raw.size() < sizeof(nstat_raw::MsgSrcDescHeader) + sizeof(nstat_raw::TcpDescriptor))
+        return std::nullopt;
+
+    nstat_raw::TcpDescriptor desc{};
+    std::memcpy(&desc, raw.data() + sizeof(nstat_raw::MsgSrcDescHeader), sizeof(desc));
+
+    auto local = nstat_decode_sockaddr(desc.local);
+    auto remote = nstat_decode_sockaddr(desc.remote);
+    if (!local || !remote)
+        return std::nullopt;
+
+    DecodedTcpDesc out;
+    out.srcref = head.srcref;
+    out.proto = "tcp" + local->proto_suffix;
+    out.local_addr = local->addr;
+    out.local_port = local->port;
+    out.remote_addr = remote->addr;
+    out.remote_port = remote->port;
+    out.pid = desc.pid > 0 ? static_cast<std::uint32_t>(desc.pid) : 0u;
+    // Prefer the effective process (post-exec via a helper, e.g. a login
+    // shell launching a browser) over the reporting process, mirroring what
+    // `nettop` surfaces — TODO(hardware-verify): confirm epname is populated
+    // in the common case and pname is the right fallback, not the reverse.
+    std::string epname = cstr_from_fixed(desc.epname, sizeof(desc.epname));
+    out.process_name = !epname.empty() ? epname : cstr_from_fixed(desc.pname, sizeof(desc.pname));
+    out.uid = desc.uid;
+    return out;
+}
+
+std::optional<DecodedCounts> nstat_decode_src_counts(std::span<const std::byte> raw) noexcept {
+    auto hdr = nstat_decode_header(raw);
+    if (!hdr || hdr->type != kNstatMsgSrcCounts)
+        return std::nullopt;
+    if (!nstat_length_matches_expected(hdr->type, hdr->length))
+        return std::nullopt;
+    if (raw.size() < sizeof(nstat_raw::MsgSrcCounts))
+        return std::nullopt;
+    nstat_raw::MsgSrcCounts msg{};
+    std::memcpy(&msg, raw.data(), sizeof(msg));
+    DecodedCounts out;
+    out.srcref = msg.srcref;
+    out.txpackets = msg.counts.txpackets;
+    out.txretransmit = msg.counts.txretransmit;
+    out.avg_rtt = msg.counts.avg_rtt;
+    out.var_rtt = msg.counts.var_rtt;
+    return out;
+}
+
+// ── Pure mapping (cross-platform, unit-tested everywhere) ─────────────────
+
+void nstat_apply_tcp_desc(FlowState& flow, const DecodedTcpDesc& desc) {
+    flow.proto = desc.proto;
+    flow.local_addr = desc.local_addr;
+    flow.local_port = desc.local_port;
+    flow.remote_addr = desc.remote_addr;
+    flow.remote_port = desc.remote_port;
+    flow.pid = desc.pid;
+    flow.process_name = desc.process_name;
+    flow.has_desc = true;
+}
+
+void nstat_apply_counts(FlowState& flow, const DecodedCounts& counts) noexcept {
+    // avg_rtt/var_rtt copied as-is — believed microseconds already, see the
+    // TODO(hardware-verify) on TcpQualitySample::rtt_us in the header.
+    flow.rtt_us = static_cast<std::int64_t>(counts.avg_rtt);
+    flow.rtt_var_us = static_cast<std::int64_t>(counts.var_rtt);
+    flow.txpackets_cum = counts.txpackets;
+    flow.txretransmit_cum = counts.txretransmit;
+    flow.has_counts = true;
+}
+
+NstatFlowEvent nstat_build_open_event(std::int64_t ts_unix, const DecodedTcpDesc& desc) {
+    NstatFlowEvent ev;
+    ev.ts_unix = ts_unix;
+    ev.is_open = true;
+    ev.proto = desc.proto;
+    ev.local_addr = desc.local_addr;
+    ev.local_port = desc.local_port;
+    ev.remote_addr = desc.remote_addr;
+    ev.remote_port = desc.remote_port;
+    ev.pid = desc.pid;
+    ev.process_name = desc.process_name;
+    return ev;
+}
+
+NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& last_known) {
+    NstatFlowEvent ev;
+    ev.ts_unix = ts_unix;
+    ev.is_open = false;
+    ev.proto = last_known.proto;
+    ev.local_addr = last_known.local_addr;
+    ev.local_port = last_known.local_port;
+    ev.remote_addr = last_known.remote_addr;
+    ev.remote_port = last_known.remote_port;
+    ev.pid = last_known.pid;
+    ev.process_name = last_known.process_name;
+    return ev;
+}
+
+TcpQualitySample nstat_build_quality_sample(const FlowState& flow) {
+    TcpQualitySample s;
+    s.proto = flow.proto;
+    s.remote_addr = flow.remote_addr; // raw — bucketed downstream, never persisted as-is
+    s.process_name = flow.process_name;
+    s.rtt_us = flow.rtt_us;
+    s.rtt_var_us = flow.rtt_var_us;
+    // `lost` MUST be the per-tick delta, never the raw cumulative — memo §6.3 /
+    // tar_netqual.hpp SIGNAL DISCIPLINE. Reuses the exact clamp Windows ESTATS
+    // uses for the same reason (32/64-bit counter reset -> negative delta ==
+    // "unknown this tick", never a real value).
+    s.lost = nq_delta_clamped(static_cast<std::int64_t>(flow.txretransmit_cum),
+                              static_cast<std::int64_t>(flow.txretransmit_prev_snapshot));
+    s.retrans = static_cast<std::int64_t>(flow.txretransmit_cum); // cumulative — context only
+    s.segs_out = static_cast<std::int64_t>(flow.txpackets_cum);   // cumulative — context only
+    // Minimal two-state synthesis — see the header doc on this function for
+    // why nstat's transcribed Counts can't support nq_win_ca_state's finer
+    // Loss/Recovery/CWR/Disorder distinctions.
+    s.ca_state = s.lost > 0 ? 3 : 0;
+    return s;
+}
+
+void nstat_advance_snapshot_baseline(FlowState& flow) noexcept {
+    flow.txretransmit_prev_snapshot = flow.txretransmit_cum;
+}
+
+bool nstat_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts, std::int64_t now,
+                             std::int64_t threshold_seconds) noexcept {
+    const std::int64_t since = (last_event_ts != 0) ? last_event_ts : started_ts;
+    if (since <= 0)
+        return false; // never started / clock uninitialised — don't fall back blindly
+    return (now - since) > threshold_seconds;
+}
+
+} // namespace yuzu::tar
+
+// The live kctl client compiles only on macOS. Off-macOS every NstatClient
+// method is a no-op / returns empty and start() returns false so the caller
+// falls back to the existing sysctl-based poll (enumerate_connections /
+// collect_tcp_quality's Linux/Windows/other-macOS-fallback paths) cleanly.
+// Unlike tar_proc_es.cpp's Endpoint Security guard, nstat needs no extra
+// framework-detection macro: it is a plain kctl socket over libSystem
+// (<sys/kern_control.h> etc.), always available on any macOS SDK — full
+// Xcode or Command Line Tools alike.
+#if defined(__APPLE__)
+
+#include <spdlog/spdlog.h>
+
+#include <sys/ioctl.h>
+#include <sys/kern_control.h>
+#include <sys/socket.h>
+#include <sys/sys_domain.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstring> // std::strerror
+#include <ctime>
+#include <map>
+#include <mutex>
+#include <string.h> // strlcpy — a BSD extension, global-namespace-only, not in <cstring>/std::
+#include <thread>
+#include <vector>
+
+namespace yuzu::tar {
+
+namespace {
+
+// No liveness heartbeat exists for nstat (unlike an explicit "session ended"
+// callback), so — mirroring the ES idle-fallback rationale — size this well
+// beyond any plausible quiet period on a host with live TCP flows. Only
+// consulted while running() is otherwise true (the reader thread hasn't
+// itself detected its own death yet).
+constexpr std::int64_t kNstatIdleFallbackSeconds = 3600;
+
+// How often the query thread re-requests counts for every known flow
+// (NSTAT_MSG_TYPE_QUERY_SRC per srcref — see the header doc on why this
+// avoids depending on an uncertain-to-exist QUERY_ALL_SRCS message type).
+constexpr auto kNstatQueryInterval = std::chrono::seconds(2);
+
+// recv() buffer: comfortably larger than the largest message we decode
+// (sizeof(MsgSrcDescHeader) + sizeof(TcpDescriptor) == 472 bytes).
+constexpr std::size_t kNstatRecvBufSize = 8192;
+
+} // namespace
+
+struct NstatClient::Impl {
+    int fd{-1};
+    NstatFlowEventRing* ring{nullptr};
+
+    // Borrowed (non-owning) pointers to the CLIENT's stream-health atomics —
+    // same ProcEsCollector rationale: kernel_dropped()/stalled() must stay
+    // readable by a status-command thread without racing a concurrent
+    // stop()/impl_.reset(), and the counters should persist across a
+    // stop()->restart.
+    std::atomic<std::uint64_t>* kernel_dropped{nullptr};
+    std::atomic<std::int64_t>* last_event_ts{nullptr};
+    std::atomic<bool>* layout_mismatch{nullptr};
+
+    std::thread reader_thread;
+    std::thread query_thread;
+    std::atomic<bool> stop_requested{false};
+    // Flips false the instant the reader thread's own loop exits — for
+    // whatever reason (stop() closed the socket, a fatal recv error, or a
+    // layout-mismatch self-heal). Unlike Endpoint Security, our own thread
+    // function returning IS the death signal, so NstatClient::running() can
+    // reflect it immediately rather than relying only on an idle timeout.
+    std::atomic<bool> thread_alive{true};
+
+    std::mutex query_cv_mu;
+    std::condition_variable query_cv;
+
+    mutable std::mutex flows_mu;
+    std::map<std::uint64_t, FlowState> flows; // srcref -> FlowState, guarded by flows_mu
+
+    Impl(NstatFlowEventRing* r, std::atomic<std::uint64_t>* kd, std::atomic<std::int64_t>* let,
+         std::atomic<bool>* lm)
+        : ring(r), kernel_dropped(kd), last_event_ts(let), layout_mismatch(lm) {}
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    // Structural teardown: signal both threads, close the socket (unblocks
+    // the reader's blocking recv per the memo §4.2 contract), wake the query
+    // thread's condvar wait, then join both. Order matters: stop_requested
+    // must be visible before the wake/close so neither thread re-arms work
+    // after seeing it.
+    ~Impl() {
+        stop_requested.store(true, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(query_cv_mu);
+        }
+        query_cv.notify_all();
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
+            fd = -1;
+        }
+        if (query_thread.joinable())
+            query_thread.join();
+        if (reader_thread.joinable())
+            reader_thread.join();
+    }
+
+    void send_msg(const void* data, std::size_t len) {
+        if (fd < 0)
+            return;
+        const ssize_t n = ::send(fd, data, len, 0);
+        if (n < 0)
+            spdlog::debug("TAR: nstat send failed: {}", std::strerror(errno));
+    }
+
+    // Reader thread: DECODE + ROUTE ONLY (memo §4.2) — parse one message,
+    // update the flow map under flows_mu, push at most one lifecycle event to
+    // the ring. No persistence, no DNS, no rule eval here; that all happens
+    // at drain()/snapshot_quality() time on the plugin tick thread.
+    void handle_message(std::span<const std::byte> raw) {
+        auto hdr = nstat_decode_header(raw);
+        if (!hdr)
+            return; // too short to even have a header — drop silently, not fatal
+
+        const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+
+        switch (hdr->type) {
+        case kNstatMsgSrcAdded: {
+            auto added = nstat_decode_src_added(raw);
+            if (!added) {
+                // This is our simplest fixed-size message type; a decode
+                // failure here means our transcribed layout itself is wrong
+                // for this kernel, not a one-off garbled datagram. Fail to
+                // the inert state (memo §6 risk 1) rather than keep guessing.
+                spdlog::warn("TAR: nstat SRC_ADDED decode mismatch — "
+                            "transcribed layout disagrees with this kernel; "
+                            "disabling the nstat client");
+                layout_mismatch->store(true, std::memory_order_relaxed);
+                stop_requested.store(true, std::memory_order_relaxed);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(flows_mu);
+                flows.try_emplace(added->srcref);
+            }
+            nstat_raw::MsgGetSrcDesc req{};
+            req.hdr.type = kNstatMsgGetSrcDesc;
+            req.hdr.length = static_cast<std::uint16_t>(sizeof(req));
+            req.srcref = added->srcref;
+            send_msg(&req, sizeof(req));
+            last_event_ts->store(now, std::memory_order_relaxed);
+            return;
+        }
+        case kNstatMsgSrcRemoved: {
+            auto removed = nstat_decode_src_removed(raw);
+            if (!removed) {
+                spdlog::warn("TAR: nstat SRC_REMOVED decode mismatch — "
+                            "transcribed layout disagrees with this kernel; "
+                            "disabling the nstat client");
+                layout_mismatch->store(true, std::memory_order_relaxed);
+                stop_requested.store(true, std::memory_order_relaxed);
+                return;
+            }
+            std::optional<FlowState> erased;
+            {
+                std::lock_guard<std::mutex> lk(flows_mu);
+                auto it = flows.find(removed->srcref);
+                if (it == flows.end()) {
+                    // A removal for a source we never saw ADDED for — desync.
+                    kernel_dropped->fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    erased = it->second;
+                    flows.erase(it);
+                }
+            }
+            if (erased && erased->has_desc) {
+                // Only a flow whose identity we actually resolved is worth a
+                // close row; one that never got a SRC_DESC has nothing
+                // meaningful to report (memo §2 ADDED->DESC->COUNTS->REMOVED).
+                ring->push(nstat_build_close_event(now, *erased));
+            }
+            last_event_ts->store(now, std::memory_order_relaxed);
+            return;
+        }
+        case kNstatMsgSrcDesc: {
+            auto desc = nstat_decode_tcp_src_desc(raw);
+            if (!desc) {
+                // Could be a non-TCP provider's descriptor (harmless — we
+                // only asked for TCP, but be defensive) OR a genuine layout
+                // mismatch. We cannot tell the two apart from the return
+                // value alone without re-parsing the header ourselves; the
+                // provider check inside nstat_decode_tcp_src_desc already
+                // filters non-TCP away before the layout check runs, so a
+                // header that IS type SRC_DESC and STILL fails to decode has
+                // exhausted the benign explanations.
+                if (hdr->type == kNstatMsgSrcDesc &&
+                    !nstat_length_matches_expected(hdr->type, hdr->length)) {
+                    spdlog::warn("TAR: nstat SRC_DESC decode mismatch — "
+                                "transcribed TcpDescriptor disagrees with "
+                                "this kernel; disabling the nstat client");
+                    layout_mismatch->store(true, std::memory_order_relaxed);
+                    stop_requested.store(true, std::memory_order_relaxed);
+                }
+                return;
+            }
+            bool first_desc = false;
+            {
+                std::lock_guard<std::mutex> lk(flows_mu);
+                auto& flow = flows[desc->srcref]; // upsert — a DESC can race a missed ADDED
+                first_desc = !flow.has_desc;
+                nstat_apply_tcp_desc(flow, *desc);
+            }
+            if (first_desc)
+                ring->push(nstat_build_open_event(now, *desc));
+            last_event_ts->store(now, std::memory_order_relaxed);
+            return;
+        }
+        case kNstatMsgSrcCounts: {
+            auto counts = nstat_decode_src_counts(raw);
+            if (!counts) {
+                if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
+                    spdlog::warn("TAR: nstat SRC_COUNTS decode mismatch — "
+                                "transcribed Counts disagrees with this "
+                                "kernel; disabling the nstat client");
+                    layout_mismatch->store(true, std::memory_order_relaxed);
+                    stop_requested.store(true, std::memory_order_relaxed);
+                }
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(flows_mu);
+                auto it = flows.find(counts->srcref);
+                if (it == flows.end()) {
+                    kernel_dropped->fetch_add(1, std::memory_order_relaxed); // desync
+                } else {
+                    nstat_apply_counts(it->second, *counts);
+                }
+            }
+            last_event_ts->store(now, std::memory_order_relaxed);
+            return;
+        }
+        case kNstatMsgError:
+            spdlog::debug("TAR: nstat kernel returned NSTAT_MSG_TYPE_ERROR (context={})",
+                          hdr->context);
+            return;
+        default:
+            return; // an unhandled/future message type — not our concern
+        }
+    }
+
+    void reader_loop() {
+        std::vector<std::byte> buf(kNstatRecvBufSize);
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+            if (n <= 0) {
+                if (n < 0 && errno == ENOBUFS) {
+                    // TODO(hardware-verify, memo §6 risk 6): unconfirmed
+                    // whether a kctl SOCK_DGRAM recv actually surfaces
+                    // ENOBUFS on kernel-side overrun rather than silently
+                    // dropping — validate against a real connection storm.
+                    kernel_dropped->fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                break; // 0 = orderly close (our own stop()); other errno = fatal
+            }
+            if (stop_requested.load(std::memory_order_relaxed))
+                break;
+            try {
+                handle_message(std::span<const std::byte>(buf.data(), static_cast<std::size_t>(n)));
+            } catch (...) {
+                // A decode/mapping exception (e.g. bad_alloc under memory
+                // pressure) must cost one message, never the reader thread.
+            }
+            if (stop_requested.load(std::memory_order_relaxed))
+                break; // handle_message may have set this on a layout mismatch
+        }
+        thread_alive.store(false, std::memory_order_relaxed);
+    }
+
+    void query_loop() {
+        std::unique_lock<std::mutex> lk(query_cv_mu);
+        while (!stop_requested.load(std::memory_order_relaxed)) {
+            query_cv.wait_for(lk, kNstatQueryInterval);
+            if (stop_requested.load(std::memory_order_relaxed))
+                break;
+            std::vector<std::uint64_t> srcrefs;
+            {
+                std::lock_guard<std::mutex> flk(flows_mu);
+                srcrefs.reserve(flows.size());
+                for (const auto& entry : flows)
+                    srcrefs.push_back(entry.first);
+            }
+            lk.unlock();
+            for (std::uint64_t srcref : srcrefs) {
+                if (stop_requested.load(std::memory_order_relaxed))
+                    break;
+                nstat_raw::MsgQuerySrc q{};
+                q.hdr.type = kNstatMsgQuerySrc;
+                q.hdr.length = static_cast<std::uint16_t>(sizeof(q));
+                q.srcref = srcref;
+                send_msg(&q, sizeof(q));
+            }
+            lk.lock();
+        }
+    }
+};
+
+NstatClient::NstatClient(std::size_t ring_capacity) : ring_(ring_capacity) {}
+
+NstatClient::~NstatClient() { stop(); }
+
+bool NstatClient::start() {
+    if (impl_)
+        return false; // already running
+
+    started_ts_.store(static_cast<std::int64_t>(::time(nullptr)), std::memory_order_relaxed);
+    last_event_ts_.store(0, std::memory_order_relaxed);
+    layout_mismatch_.store(false, std::memory_order_relaxed); // a fresh start gets a fresh chance
+
+    const int fd = ::socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd < 0) {
+        spdlog::warn("TAR: nstat socket() failed: {} — falling back to the poll",
+                     std::strerror(errno));
+        return false;
+    }
+
+    struct ctl_info ci {};
+    ::strlcpy(ci.ctl_name, "com.apple.network.statistics", sizeof(ci.ctl_name));
+    if (::ioctl(fd, CTLIOCGINFO, &ci) < 0) {
+        spdlog::warn("TAR: nstat CTLIOCGINFO failed: {} — falling back to the poll",
+                     std::strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    struct sockaddr_ctl sc {};
+    sc.sc_len = static_cast<unsigned char>(sizeof(sc));
+    sc.sc_family = AF_SYSTEM;
+    sc.ss_sysaddr = AF_SYS_CONTROL;
+    sc.sc_id = ci.ctl_id;
+    sc.sc_unit = 0;
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sc), sizeof(sc)) < 0) {
+        spdlog::warn("TAR: nstat connect() failed: {} — falling back to the poll",
+                     std::strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    // Privilege honesty (memo §3): proxied by effective uid at start(), since
+    // there is no direct "did the kernel actually scope me to my own flows"
+    // signal available. The agent's production LaunchDaemon runs as root, so
+    // this is expected true there; an unprivileged dev run honestly reports
+    // false rather than silently claiming complete capture.
+    system_wide_.store(::geteuid() == 0, std::memory_order_relaxed);
+
+    auto impl = std::make_unique<Impl>(&ring_, &kernel_dropped_, &last_event_ts_, &layout_mismatch_);
+    impl->fd = fd;
+    Impl* raw = impl.get();
+    impl->reader_thread = std::thread([raw] { raw->reader_loop(); });
+    impl->query_thread = std::thread([raw] { raw->query_loop(); });
+
+    // Subscribe both known TCP provider ids (memo §1) — harmless if one is
+    // invalid for this kernel; the flow table is keyed purely by srcref, not
+    // by which provider id "won", so nothing downstream depends on this
+    // succeeding for both.
+    nstat_raw::MsgAddAllSrcs add_tcp{};
+    add_tcp.hdr.type = kNstatMsgAddAllSrcs;
+    add_tcp.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp));
+    add_tcp.provider = kNstatProviderTcp;
+    impl->send_msg(&add_tcp, sizeof(add_tcp));
+
+    nstat_raw::MsgAddAllSrcs add_tcp_kernel{};
+    add_tcp_kernel.hdr.type = kNstatMsgAddAllSrcs;
+    add_tcp_kernel.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp_kernel));
+    add_tcp_kernel.provider = kNstatProviderTcpKernel;
+    impl->send_msg(&add_tcp_kernel, sizeof(add_tcp_kernel));
+
+    impl_ = std::move(impl);
+    spdlog::info("TAR: nstat client active (provider=tcp, system_wide={})",
+                 system_wide_.load(std::memory_order_relaxed));
+    return true;
+}
+
+void NstatClient::stop() {
+    // ~Impl closes the socket (unblocking the reader's recv), wakes the query
+    // thread, and joins both before this reset() completes; flows_mu/ring_
+    // outlive impl_, so teardown is use-after-free-safe by construction —
+    // same structural argument as ProcEsCollector::stop().
+    impl_.reset();
+}
+
+bool NstatClient::running() const noexcept {
+    return impl_ && impl_->thread_alive.load(std::memory_order_relaxed);
+}
+
+std::vector<NstatFlowEvent> NstatClient::drain() {
+    if (!impl_)
+        return {};
+    return ring_.drain();
+}
+
+std::uint64_t NstatClient::dropped() const noexcept { return ring_.dropped(); }
+
+std::uint64_t NstatClient::kernel_dropped() const noexcept {
+    return kernel_dropped_.load(std::memory_order_relaxed);
+}
+
+bool NstatClient::stalled() const noexcept {
+    if (!running())
+        return false;
+    const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+    return nstat_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
+                                   started_ts_.load(std::memory_order_relaxed), now,
+                                   kNstatIdleFallbackSeconds);
+}
+
+bool NstatClient::layout_mismatch() const noexcept {
+    return layout_mismatch_.load(std::memory_order_relaxed);
+}
+
+bool NstatClient::system_wide() const noexcept {
+    return running() && system_wide_.load(std::memory_order_relaxed);
+}
+
+const char* NstatClient::method_name() const noexcept {
+    return (running() && !layout_mismatch()) ? "nstat" : "none";
+}
+
+std::vector<TcpQualitySample> NstatClient::snapshot_quality() const {
+    if (!running())
+        return {};
+    std::vector<TcpQualitySample> out;
+    std::lock_guard<std::mutex> lk(impl_->flows_mu);
+    out.reserve(impl_->flows.size());
+    for (auto& entry : impl_->flows) {
+        FlowState& flow = entry.second;
+        if (!flow.has_desc || !flow.has_counts)
+            continue; // incomplete flow — no full picture yet, skip this tick
+        out.push_back(nstat_build_quality_sample(flow));
+        nstat_advance_snapshot_baseline(flow);
+    }
+    return out;
+}
+
+} // namespace yuzu::tar
+
+#else // not macOS — every method is a no-op, start() returns false
+
+namespace yuzu::tar {
+
+struct NstatClient::Impl {};
+
+NstatClient::NstatClient(std::size_t ring_capacity) : ring_(ring_capacity) {}
+NstatClient::~NstatClient() = default;
+
+bool NstatClient::start() { return false; }
+void NstatClient::stop() {}
+bool NstatClient::running() const noexcept { return false; }
+std::vector<NstatFlowEvent> NstatClient::drain() { return {}; }
+std::uint64_t NstatClient::dropped() const noexcept { return ring_.dropped(); }
+std::uint64_t NstatClient::kernel_dropped() const noexcept { return 0; }
+bool NstatClient::stalled() const noexcept { return false; }
+bool NstatClient::layout_mismatch() const noexcept { return false; }
+bool NstatClient::system_wide() const noexcept { return false; }
+const char* NstatClient::method_name() const noexcept { return "none"; }
+std::vector<TcpQualitySample> NstatClient::snapshot_quality() const { return {}; }
+
+} // namespace yuzu::tar
+
+#endif // __APPLE__
