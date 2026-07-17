@@ -1,0 +1,115 @@
+// Unit tests for guardian_outbox_entry_to_event (ADR-0021 rung 7.7a): the pure
+// OutboxEntry -> GuaranteedStateEvent mapping. Production never invokes this at 7.7a
+// (prefer_spark is false, the outbox stays empty), so these tests ARE the proof the
+// send path is correct before rung 7.7b turns on rule placement.
+
+#include "guardian_spark_send.hpp"
+#include "guardian_outbox.hpp" // OutboxEntry + GuardDrift (via <yuzu/agent/guard.hpp>)
+
+#include <catch2/catch_test_macros.hpp>
+
+using namespace yuzu::agent;
+
+namespace {
+
+// A representative wall-clock nanosecond stamp: 2021-01-01T00:00:00.5Z.
+constexpr std::int64_t kEnq = 1'609'459'200'000'000'000LL + 500'000'000LL;
+
+} // namespace
+
+TEST_CASE("send-map: common fields are taken verbatim from the entry", "[spark][sendmap]") {
+    auto e = OutboxEntry::health("rule-1", 7, "evt-abc", kEnq, /*healthy=*/true, "");
+    auto ev = guardian_outbox_entry_to_event(e, "linux");
+
+    // event_id and rule_id are NOT rebuilt - they are the entry's wire-idempotency key.
+    CHECK(ev.event_id() == "evt-abc");
+    CHECK(ev.rule_id() == "rule-1");
+    CHECK(ev.guard_category() == "event");
+    CHECK(ev.platform() == "linux");
+    // enqueued_ns split into seconds + nanos, NOT a fresh now().
+    CHECK(ev.timestamp().seconds() == 1'609'459'200LL);
+    CHECK(ev.timestamp().nanos() == 500'000'000);
+}
+
+TEST_CASE("send-map: Compliance drift maps like the legacy emit_guard_event", "[spark][sendmap]") {
+    GuardDrift d;
+    d.rule_id = "r";
+    d.rule_name = "No debugger";
+    d.guard_type = "registry";
+    d.detected_value = "1";
+    d.expected_value = "0";
+    d.detection_latency_us = 42;
+
+    SECTION("plain drift") {
+        auto e = OutboxEntry::compliance("r", 1, "id", kEnq, d);
+        auto ev = guardian_outbox_entry_to_event(e, "windows");
+        CHECK(ev.event_type() == "drift.detected");
+        CHECK(ev.rule_name() == "No debugger");
+        CHECK(ev.guard_type() == "registry");
+        CHECK(ev.detected_value() == "1");
+        CHECK(ev.expected_value() == "0");
+        CHECK(ev.detection_latency_us() == 42);
+        CHECK(ev.drift_rate() == 0.0); // no collapse
+    }
+
+    SECTION("compliant edge carries no remediation") {
+        d.compliant = true;
+        auto ev = guardian_outbox_entry_to_event(OutboxEntry::compliance("r", 1, "id", kEnq, d),
+                                                 "windows");
+        CHECK(ev.event_type() == "guard.compliant");
+        CHECK(ev.remediation_action().empty());
+    }
+
+    SECTION("remediation success -> drift.remediated") {
+        d.remediation_attempted = true;
+        d.remediation_success = true;
+        d.remediation_action = "restore";
+        d.remediation_latency_us = 99;
+        auto ev = guardian_outbox_entry_to_event(OutboxEntry::compliance("r", 1, "id", kEnq, d),
+                                                 "windows");
+        CHECK(ev.event_type() == "drift.remediated");
+        CHECK(ev.remediation_action() == "restore");
+        CHECK(ev.remediation_success() == true);
+        CHECK(ev.remediation_latency_us() == 99);
+    }
+
+    SECTION("remediation failure -> remediation.failed") {
+        d.remediation_attempted = true;
+        d.remediation_success = false;
+        auto ev = guardian_outbox_entry_to_event(OutboxEntry::compliance("r", 1, "id", kEnq, d),
+                                                 "windows");
+        CHECK(ev.event_type() == "remediation.failed");
+        CHECK(ev.remediation_success() == false);
+    }
+
+    SECTION("collapsed_count surfaces as drift_rate") {
+        d.collapsed_count = 5;
+        auto ev = guardian_outbox_entry_to_event(OutboxEntry::compliance("r", 1, "id", kEnq, d),
+                                                 "windows");
+        CHECK(ev.drift_rate() == 5.0);
+    }
+}
+
+TEST_CASE("send-map: Health maps healthy/unhealthy and carries detail only when unhealthy",
+          "[spark][sendmap]") {
+    SECTION("recovered") {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/true, "ignored"), "macos");
+        CHECK(ev.event_type() == "guard.healthy");
+        CHECK(ev.detail_json().empty()); // detail is not carried on a healthy edge
+    }
+    SECTION("unhealthy carries the read-error detail") {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, "EACCES on hive"), "macos");
+        CHECK(ev.event_type() == "guard.unhealthy");
+        CHECK(ev.detail_json() == "EACCES on hive");
+    }
+}
+
+TEST_CASE("send-map: Lifecycle kind becomes guard.<kind>", "[spark][sendmap]") {
+    for (const auto& kind : {"armed", "disarmed", "errored"}) {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::lifecycle("r", 1, "id", kEnq, kind), "linux");
+        CHECK(ev.event_type() == std::string("guard.") + kind);
+    }
+}
