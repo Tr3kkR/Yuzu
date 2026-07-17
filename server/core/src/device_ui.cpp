@@ -410,7 +410,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("services", "Services", "", "run state");
     h += card("users", "Logged-in users", "", "sessions");
     h += card("netconfig", "Adapters &amp; IP", "", "addresses");
-    h += card("arp", "ARP / neighbours", "Win", "neighbour table");
+    h += card("arp", "ARP / neighbours", "", "neighbour table");
     h += card("dns_cache", "DNS cache", "Win", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
@@ -695,8 +695,8 @@ std::string render_device_live_tree(const std::vector<LiveProcNode>& nodes,
 
 std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows) {
     if (rows.empty())
-        return "<div class=\"gp-note\">No ARP entries &mdash; not available on this OS (Windows-only) "
-               "or the neighbour table is empty.</div>";
+        return "<div class=\"gp-note\">ARP / neighbour table not available on this platform, "
+               "or the table is empty.</div>";
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Interface</th><th>IP</th><th>MAC</th>"
                     "<th>Type</th></tr></thead><tbody>";
     for (const auto& r : rows) {

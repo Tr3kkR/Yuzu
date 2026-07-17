@@ -422,13 +422,13 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         CHECK(r->body.find("running") != std::string::npos);
         CHECK(r->body.find("1 run") != std::string::npos);
     }
-    SECTION("arp non-Windows error payload -> honest error note, not silent blank") {
+    SECTION("arp non-Windows not_available sentinel -> honest empty-state note, not an error") {
         LiveHarness h;
-        h.fake_rows = {{"a-1", 1, "error|arp not available on this platform", ""}};
+        h.fake_rows = {{"a-1", 1, "arp|not_available", ""}};
         auto r = h.sink.Get("/fragments/device/live/result?command_id=network_config-test"
                             "&agent_id=a-1&kind=arp&n=1");
         REQUIRE(r);
-        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(r->body.find("reported an error") == std::string::npos);
         CHECK(r->body.find("not available on this platform") != std::string::npos);
     }
     SECTION("listening rows render with proto/port/pid") {
