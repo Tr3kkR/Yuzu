@@ -76,6 +76,28 @@ jobs:
           after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           echo "buildx chisel cache: before=${before} after=${after}"
 
+      - name: Sweep leaked healthcheck-gate containers and images (#751)
+        run: |
+          set -eu
+          # scripts/ci/verify-healthcheck-invariants.sh starts a `yuzu-hc-probe-*`
+          # listener container, and its workflows `docker load` a
+          # `yuzu-hc-verify/<role>:<sha>` image. Both are cleaned up in-job, but a
+          # SIGKILL (cancellation grace period expiring, job timeout, daemon
+          # crash) can outrun that cleanup, and Big Tam has no blanket
+          # `docker system prune`, so nothing else would ever reclaim them.
+          #
+          # AGE-FILTERED on purpose. The gate itself must never sweep by name at
+          # startup: Big Tam runs four runners against ONE dockerd and the verify
+          # matrix is five wide, so a name-scoped sweep would `docker rm -f` a
+          # sibling job's LIVE listener mid-probe and fail it with a confident but
+          # false "the tool is missing". `until=24h` cannot do that — the verify
+          # job's timeout is 120 min, so nothing 24h old is still in use.
+          docker ps -aq --filter 'name=^yuzu-hc-probe-' --filter 'until=24h' \
+            | xargs -r docker rm -f || true
+          docker image ls --filter 'reference=yuzu-hc-verify/*' --filter 'until=24h' -q \
+            | xargs -r docker image rm -f || true
+          echo "healthcheck-gate leftovers older than 24h swept"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false

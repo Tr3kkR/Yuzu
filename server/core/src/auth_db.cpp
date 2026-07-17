@@ -29,6 +29,15 @@
 
 namespace yuzu::server {
 
+// The reserved engine-principal namespace (auth-engine-principals design
+// §3.3 / decision log #3). Single literal so every write-surface guard in
+// this file (the `is_reserved_identity_prefix` format check below AND the
+// dedicated `upsert_sso_identity` rejection) agrees on the exact prefix
+// rather than re-deriving it. `rbac_store.cpp` has its own internal-linkage
+// `kEnginePrefix` for the same string — no shared header exists across
+// those two translation units, so this is auth_db.cpp's own copy.
+constexpr std::string_view kEngineReservedPrefix = "engine:";
+
 // ── Username Validation (H1 Fix) ─────────────────────────────────────────────
 
 bool is_valid_username(const std::string& username) {
@@ -51,7 +60,12 @@ bool is_valid_username(const std::string& username) {
 }
 
 bool is_reserved_identity_prefix(const std::string& username) {
-    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:"};
+    // "engine:" reserves the engine-principal namespace (auth-engine-
+    // principals design §3.3 / decision log #3) at this identity surface too
+    // — belt-and-braces alongside `is_valid_username`'s ':' ban below, which
+    // already makes the exact string unconstructable as a local username.
+    static constexpr std::string_view kReservedPrefixes[] = {"oidc:", "saml:", "ad:",
+                                                              kEngineReservedPrefix};
     for (auto prefix : kReservedPrefixes) {
         if (username.size() < prefix.size())
             continue;
@@ -681,6 +695,10 @@ std::expected<void, AuthDBError> AuthDB::upsert_user(const std::string& username
                                                      const std::string& password_hash,
                                                      const std::string& salt_hex, auth::Role role) {
     // H1 FIX: Validate username before any DB operations
+    // Also structurally rejects the reserved `engine:` namespace (design
+    // §3.3) — `is_valid_username`'s ':' ban below makes `engine:<slug>`
+    // unconstructable here; named explicitly so the rejection is auditable,
+    // not accidental.
     if (!is_valid_username(username)) {
         spdlog::warn("upsert_user rejected invalid username: '{}'", username);
         return std::unexpected(AuthDBError::InvalidUsername);
@@ -743,6 +761,24 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
                                                               const std::string& sub,
                                                               const std::string& display_name,
                                                               const std::string& source) {
+    // design §3.3: the reserved `engine:` principal namespace must be
+    // rejected by THIS WRITE SURFACE, not merely by convention. Today's
+    // only caller always builds `principal` as `source + ":" + iss + "#" +
+    // sub` with `source` a literal in {"oidc","saml","ad"} — never
+    // "engine" — but `is_valid_principal` below (via
+    // `is_reserved_identity_prefix`, which reserves `engine:` alongside the
+    // legitimate oidc:/saml:/ad: prefixes for FORMAT purposes) happily
+    // accepts an `engine:`-shaped string if one ever arrived, since its job
+    // is charset validation, not namespace ownership. A future/relaxed
+    // caller (or a bug in the `source` literal) must not be able to mint a
+    // user row that collides with the engine-principal namespace, so the
+    // rejection is enforced explicitly here rather than relying on the
+    // caller's construction convention.
+    if (principal.starts_with(kEngineReservedPrefix)) {
+        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'", principal);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+
     if (!is_valid_principal(principal)) {
         spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'", principal);
         return std::unexpected(AuthDBError::InvalidUsername);
@@ -880,6 +916,56 @@ std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
     return users;
 }
 
+std::optional<std::vector<std::string>> AuthDB::find_reserved_prefix_users(const std::string& prefix) {
+    // Read-only prefix scan over `users.username` — backs the T8 startup
+    // collision-scan preflight (decision log #3: "The PR 4.2 migration
+    // itself scans for pre-existing colliding names rather than allowing
+    // silent coexistence"). The creation-time guards above
+    // (`is_valid_username`'s ':' ban, `is_reserved_identity_prefix`) defend
+    // NEW rows; this defends against a namespace reserved AFTER data already
+    // existed.
+    //
+    // Deliberately includes soft-deleted (`is_active = 0`) rows: this is a
+    // collision scan against the `username` primary key, not a directory
+    // listing — a soft-deleted row still occupies the key and still matters
+    // for the invariant regardless of active status.
+    std::vector<std::string> result;
+    // `prefix` is code-controlled (e.g. "engine:"), never user input — fail
+    // closed (nullopt = cannot verify) rather than trust the caller if it ever
+    // carries a LIKE metacharacter, matching audit_store.cpp's action-prefix guard.
+    if (prefix.empty() || prefix.find_first_of("%_\\") != std::string::npos)
+        return std::nullopt;
+
+    static const char* sql = "SELECT username FROM users WHERE username LIKE ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("Failed to prepare find_reserved_prefix_users statement: {}",
+                     sqlite3_errmsg(impl_->db));
+        return std::nullopt;
+    }
+    std::string pattern = prefix + "%";
+    sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        // Explicit length, not col_text's implicit strlen() — a collision
+        // scan must not silently truncate an embedded-NUL username it is
+        // meant to report (matches scim_store.cpp's row_to_resource idiom).
+        const unsigned char* p = sqlite3_column_text(stmt, 0);
+        if (p) {
+            result.emplace_back(reinterpret_cast<const char*>(p),
+                                static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        spdlog::error("find_reserved_prefix_users query failed: {}", sqlite3_errmsg(impl_->db));
+        return std::nullopt;  // scan error → fail closed at the preflight, never "no collision"
+    }
+    return result;
+}
+
 std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username) {
     // SOC 2 CC6.8 — credential revocation on termination. The soft-delete
     // also wipes MFA enrollment material: clears users.mfa_totp_secret
@@ -1010,6 +1096,11 @@ std::expected<bool, AuthDBError> AuthDB::user_exists(const std::string& username
 
 // ── Session Operations ───────────────────────────────────────────────────────
 
+// Engine sessions (`auth_source == "engine_token"`, design §6) are
+// synthesized fresh per-request by AuthRoutes::synthesize_token_session and
+// never reach this function — no storage path here ever writes
+// `engine_token` into the `sessions` table (or the schema's DEFAULT
+// 'password' auth_source above), so no migration/backfill is needed for it.
 std::expected<std::string, AuthDBError> AuthDB::create_session(const std::string& username,
                                                                auth::Role role,
                                                                const std::string& auth_source,

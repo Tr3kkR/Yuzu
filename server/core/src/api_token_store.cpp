@@ -1,12 +1,18 @@
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"
 #include "mcp_policy.hpp"
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "secure_random.hpp"
 
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 
@@ -25,83 +31,115 @@
 
 namespace yuzu::server {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+namespace {
 
-static int64_t now_epoch() {
+constexpr const char* kStoreName = "api_token_store";
+
+// Bounded acquires (ADR-0012 §2). Token validation sits on the request hot
+// path (every Bearer-authed call falls through here on a cache miss) so it
+// gets the shorter budget; mutations (create/revoke/delete) are user-facing
+// but rarer, so they get a little more room. Neither is unbounded.
+constexpr std::chrono::milliseconds kReadTimeout{1500};
+constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for
+    // the migration txn. Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE api_tokens ("
+         "  token_id      TEXT PRIMARY KEY,"
+         "  token_hash    TEXT NOT NULL UNIQUE,"
+         "  name          TEXT NOT NULL,"
+         "  principal_id  TEXT NOT NULL DEFAULT '',"
+         "  scope_service TEXT NOT NULL DEFAULT '',"
+         "  mcp_tier      TEXT NOT NULL DEFAULT '',"
+         "  principal_kind TEXT NOT NULL DEFAULT 'human' "
+         "    CHECK (principal_kind IN ('human','engine')),"
+         "  created_at    BIGINT NOT NULL DEFAULT 0,"
+         "  expires_at    BIGINT NOT NULL DEFAULT 0,"
+         "  last_used_at  BIGINT NOT NULL DEFAULT 0,"
+         "  revoked       BOOLEAN NOT NULL DEFAULT FALSE);"
+         "CREATE INDEX api_tokens_principal_idx ON api_tokens (principal_id);"},
+    };
+    return kMigrations;
+}
+
+// Epoch SECONDS (unchanged from the SQLite store — do not drift to ms).
+int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
-static const char* safe(const char* p) {
-    return p ? p : "";
+int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<int64_t>(std::strtoll(s, nullptr, 10));
 }
 
-// ── Construction / teardown ──────────────────────────────────────────────────
+bool to_bool(const char* s) {
+    return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1');
+}
 
-ApiTokenStore::ApiTokenStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("ApiTokenStore: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+// Null-safe column read: every column in the v1 projection is NOT NULL, so
+// PQgetvalue never returns a NULL cell today. This gate keeps read_token
+// robust if a future migration relaxes a NOT NULL constraint or the
+// projection drifts from kTokenColsTail — a NULL cell degrades to "" rather
+// than dereferencing a nullptr into std::string.
+const char* col(PGresult* res, int row, int c) {
+    return PQgetisnull(res, row, c) ? "" : PQgetvalue(res, row, c);
+}
+
+// `token_hash` (column 1) is always present in the projection — either the
+// real hash (validate_token) or a literal '' mask (list_tokens/get_token,
+// which never expose the hash — see kTokenColsTail's callers).
+ApiToken read_token(PGresult* res, int row) {
+    ApiToken t;
+    int c = 0;
+    t.token_id = col(res, row, c++);
+    t.token_hash = col(res, row, c++);
+    t.name = col(res, row, c++);
+    t.principal_id = col(res, row, c++);
+    t.scope_service = col(res, row, c++);
+    t.created_at = to_i64(col(res, row, c++));
+    t.expires_at = to_i64(col(res, row, c++));
+    t.last_used_at = to_i64(col(res, row, c++));
+    t.revoked = to_bool(col(res, row, c++));
+    t.mcp_tier = col(res, row, c++);
+    t.principal_kind = col(res, row, c++);
+    return t;
+}
+
+// Column order shared by validate_token / get_token / list_tokens; the
+// token_hash slot is either the real column (validate_token) or a literal
+// '' (list_tokens masks it — never expose the hash in a listing).
+constexpr const char* kTokenColsTail =
+    "name, principal_id, scope_service, created_at, expires_at, last_used_at, revoked, "
+    "mcp_tier, principal_kind";
+
+} // namespace
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+ApiTokenStore::ApiTokenStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("ApiTokenStore: no database connection at construction ({}) — API token "
+                      "store disabled",
+                      pool_.last_error());
         return;
     }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("ApiTokenStore: opened {}", db_path.string());
-}
-
-ApiTokenStore::~ApiTokenStore() {
-    if (db_)
-        sqlite3_close(db_);
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ApiTokenStore: schema migration failed — API token store disabled");
+        return;
+    }
+    open_ = true;
+    spdlog::info("ApiTokenStore: opened (schema {})", kStoreName);
 }
 
 bool ApiTokenStore::is_open() const {
-    return db_ != nullptr;
-}
-
-// ── DDL ──────────────────────────────────────────────────────────────────────
-
-void ApiTokenStore::create_tables() {
-    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
-    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so any
-    // columns added historically via silent ALTERs must still be applied here.
-    sqlite3_exec(db_, "ALTER TABLE api_tokens ADD COLUMN scope_service TEXT NOT NULL DEFAULT '';",
-                 nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "ALTER TABLE api_tokens ADD COLUMN mcp_tier TEXT NOT NULL DEFAULT '';",
-                 nullptr, nullptr, nullptr);
-
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS api_tokens (
-                token_id      TEXT PRIMARY KEY,
-                token_hash    TEXT NOT NULL UNIQUE,
-                name          TEXT NOT NULL,
-                principal_id  TEXT NOT NULL,
-                scope_service TEXT NOT NULL DEFAULT '',
-                mcp_tier      TEXT NOT NULL DEFAULT '',
-                created_at    INTEGER NOT NULL DEFAULT 0,
-                expires_at    INTEGER NOT NULL DEFAULT 0,
-                last_used_at  INTEGER NOT NULL DEFAULT 0,
-                revoked       INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
-            CREATE INDEX IF NOT EXISTS idx_api_tokens_principal ON api_tokens(principal_id);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "api_token_store", kMigrations)) {
-        spdlog::error("ApiTokenStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
+    return open_;
 }
 
 // ── Token generation and hashing ─────────────────────────────────────────────
@@ -161,8 +199,8 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 std::expected<std::string, std::string>
 ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
                             int64_t expires_at, const std::string& scope_service,
-                            const std::string& mcp_tier) {
-    if (!db_)
+                            const std::string& mcp_tier, std::string principal_kind) {
+    if (!open_)
         return std::unexpected("database not open");
     if (name.empty())
         return std::unexpected("token name cannot be empty");
@@ -180,6 +218,74 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
             return std::unexpected("MCP token TTL cannot exceed 90 days");
     }
 
+    // ── Engine principal block (design doc §6/§7/§8) ───────────────────────
+    // C++-side allowlist ahead of the DB CHECK (principal_kind IN
+    // ('human','engine')) — defense-in-depth per governance PR-4.2 prereq:
+    // never let an unrecognized value reach Postgres and rely solely on the
+    // constraint to reject it.
+    if (principal_kind != "human" && principal_kind != "engine")
+        return std::unexpected("invalid principal_kind");
+
+    // G2 (governance hardening, security LOW / UP-1): symmetric namespace
+    // guard. Without this, the `engine:`-namespace guarantee is only as
+    // strong as every call site remembering to pass principal_kind=="engine"
+    // whenever principal_id starts with "engine:" — a human-kind token could
+    // otherwise carry an engine: id that RbacStore's engine-resolution arm
+    // would happily match at role-resolution time. Make the guarantee
+    // structural here, ahead of PR 4.3's engine-minting routes.
+    if (principal_id.starts_with("engine:") && principal_kind != "engine")
+        return std::unexpected("engine:-namespaced principal_id requires principal_kind=engine");
+
+    if (principal_kind == "engine") {
+        // F6 (Hermes pass-2 MEDIUM M3): engine principals are fleet-wide only
+        // (§4.3) — a service-scoped engine token is not a valid combination.
+        // Block it at creation rather than relying on it being silently
+        // denied later at authorization time.
+        if (!scope_service.empty())
+            return std::unexpected("engine principal tokens cannot be service-scoped");
+
+        // §8: mcp_tier readonly hard-lock. Unlike the human path (which
+        // permits an empty mcp_tier for a non-MCP token), an engine token
+        // MUST be readonly — empty or any other tier is rejected outright.
+        if (mcp_tier != "readonly")
+            return std::unexpected("engine principal tokens must use mcp_tier=readonly");
+
+        // §7: non-perpetual / 90-day ceiling. Engine tokens are always
+        // subject to this — checked explicitly here (not left to fall out of
+        // the generic mcp_tier block above) so the invariant holds
+        // regardless of check ordering upstream. Mirrors the constant/logic
+        // of the generic MCP expiry-cap check above.
+        if (expires_at == 0)
+            return std::unexpected("engine principal tokens cannot be perpetual (90-day max)");
+        {
+            auto now = now_epoch();
+            constexpr int64_t k90Days = 90 * 24 * 3600;
+            if (expires_at - now > k90Days)
+                return std::unexpected("engine principal token TTL cannot exceed 90 days");
+        }
+
+        // §6: creation-time referential integrity. Fail-closed if the
+        // resolver isn't wired yet (server.cpp wires it post-construction,
+        // T8) — never mint an engine token without this check.
+        if (!engine_referent_check_)
+            return std::unexpected("engine referent check unavailable");
+        switch (engine_referent_check_(principal_id)) {
+        case EngineLookupStatus::Active:
+            break;
+        case EngineLookupStatus::MissingOrRevoked:
+            // Terminal (401-class) per engine_principal_store.hpp's
+            // three-state contract — the referenced principal doesn't exist
+            // or was revoked.
+            return std::unexpected("engine principal not found or revoked");
+        case EngineLookupStatus::StoreUnreachable:
+            // Retryable (503-class), distinct from the terminal case above —
+            // see the EngineLookupStatus doc comment / design doc §3.1. The
+            // caller should back off and retry, not treat this as a
+            // credential problem.
+            return std::unexpected("engine principal store unavailable — try again");
+        }
+    }
+
     auto raw_result = generate_raw_token();
     if (!raw_result.has_value())
         return std::unexpected(raw_result.error());
@@ -188,43 +294,46 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
     auto token_id = hash.substr(0, 24); // Display ID — 24 hex chars (96 bits, collision-resistant)
     auto now = now_epoch();
 
-    std::unique_lock db_lock(db_mtx_);
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO api_tokens (token_id, token_hash, name, principal_id, "
-                           "scope_service, mcp_tier, created_at, expires_at) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("database unavailable — try again");
 
-    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, scope_service.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 6, mcp_tier.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 7, now);
-    sqlite3_bind_int64(s, 8, expires_at);
-
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("failed to create token: ") + sqlite3_errmsg(db_));
+    // principal_kind is bound as a parameter ($7): "human" by default, or
+    // "engine" once the engine block above has validated the mint (design doc
+    // §§6-8). The DB CHECK (principal_kind IN ('human','engine')) is the
+    // schema-level backstop behind the C++-side allowlist checked earlier.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO api_token_store.api_tokens "
+        "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, principal_kind, "
+        " created_at, expires_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::bigint,$9::bigint) RETURNING token_id",
+        std::vector<std::string>{token_id, hash, name, principal_id, scope_service, mcp_tier,
+                                 principal_kind, std::to_string(now), std::to_string(expires_at)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::unexpected(std::string("failed to create token: ") +
+                               PQerrorMessage(lease.get()));
     return raw; // Return the raw token (shown once to user)
 }
 
 std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_token) {
-    if (!db_ || raw_token.empty())
+    if (!open_ || raw_token.empty())
         return std::nullopt;
 
     auto hash = sha256_hex(raw_token);
 
     // Snapshot the revoke generation BEFORE the cache lookup so that any
     // revoke that races with our DB read is observable at the cache-write
-    // step below (HIGH-1 defence-in-depth).
+    // step below, where we skip caching a stale entry. This guards cache
+    // POISONING only — it does NOT serialize this validate against a
+    // concurrent revoke the way sqlite's db_mtx_ used to. A token revoked
+    // during this call's own execution may still be returned once (bounded;
+    // the next uncached validate SELECTs revoked=true). See the
+    // revoke_generation_ field comment in the hpp for the two residual
+    // windows and the tracked follow-up for a proper close.
     const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
 
-    // Check cache first (avoids SHA256 recomputation is already done, but avoids SQLite query)
+    // Check cache first (avoids the Postgres round-trip on a hit).
     {
         std::lock_guard cache_lock(cache_mtx_);
         auto it = token_cache_.find(hash);
@@ -232,7 +341,6 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
             auto age = std::chrono::steady_clock::now() - it->second.cached_at;
             if (age < kTokenCacheTtl) {
                 const auto& cached = it->second.token;
-                // Re-check expiration against current time
                 auto now = now_epoch();
                 if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
                     token_cache_.erase(it);
@@ -249,73 +357,57 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
 
     cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
-    // Cache miss — query SQLite (lock db for the read + update sequence)
-    std::unique_lock db_lock(db_mtx_);
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT token_id, token_hash, name, principal_id, scope_service, created_at, "
-            "expires_at, last_used_at, revoked, mcp_tier FROM api_tokens WHERE token_hash = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return std::nullopt;
-    sqlite3_bind_text(s, 1, hash.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<ApiToken> result;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        ApiToken t;
-        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        t.token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
-        t.created_at = sqlite3_column_int64(s, 5);
-        t.expires_at = sqlite3_column_int64(s, 6);
-        t.last_used_at = sqlite3_column_int64(s, 7);
-        t.revoked = sqlite3_column_int(s, 8) != 0;
-        t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 9)));
+    const std::string sql = std::string("SELECT token_id, token_hash, ") + kTokenColsTail +
+                            " FROM api_token_store.api_tokens WHERE token_hash = $1";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{hash});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
 
-        // Check revocation
-        if (t.revoked) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
+    ApiToken t = read_token(res.get(), 0);
 
-        // Check expiration
-        auto now = now_epoch();
-        if (t.expires_at > 0 && now > t.expires_at) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
+    if (t.revoked)
+        return std::nullopt;
+    auto now = now_epoch();
+    if (t.expires_at > 0 && now > t.expires_at)
+        return std::nullopt;
 
-        result = std::move(t);
-    }
-    sqlite3_finalize(s);
+    // Update last_used_at (best-effort — do not fail validation on this).
+    pg::exec_params(lease.get(),
+                    "UPDATE api_token_store.api_tokens SET last_used_at = $1::bigint "
+                    "WHERE token_hash = $2",
+                    std::vector<std::string>{std::to_string(now), hash});
 
-    // Update last_used_at and cache the result
-    if (result) {
-        sqlite3_stmt* upd = nullptr;
-        sqlite3_prepare_v2(db_, "UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?;", -1,
-                           &upd, nullptr);
-        sqlite3_bind_int64(upd, 1, now_epoch());
-        sqlite3_bind_text(upd, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(upd);
-        sqlite3_finalize(upd);
+    // Store in cache, but skip the write if a revoke raced our SELECT — this
+    // prevents a stale revoked=false entry surviving the cache TTL. It does
+    // NOT retract the value already being returned below; that bounded
+    // single-request window is documented on revoke_generation_ in the hpp.
+    //
+    // The generation re-check MUST be taken UNDER cache_mtx_, not before it.
+    // invalidate_cache() acquires the same mutex, and revoke_token bumps the
+    // generation BEFORE it locks, so a check-then-lock ordering left a real
+    // window: a revoke's erase could run between our check and our insert
+    // (erasing nothing, since we hadn't inserted yet), after which we inserted a
+    // revoked=false entry that re-authenticated the token for up to
+    // kTokenCacheTtl. Holding the lock across the re-check AND the insert makes
+    // the two operations serialize against the erase: either we observe the
+    // bumped generation and skip, or the revoke's erase runs strictly after our
+    // insert and removes it. Neither leaves a stale entry.
+    if (test_hook_after_validate_select_)
+        test_hook_after_validate_select_();
 
-        // Store in cache, but skip the write if a revoke raced our SELECT.
-        // The db_mtx_ exclusive serialization already prevents this
-        // interleave, but the explicit generation re-check survives any
-        // future refactor that narrows the db_lock scope (HIGH-1 on PR
-        // #883). load/load with acquire ordering against the
-        // revoke-path's release-store is sufficient — we only need to
-        // observe that *some* revoke ran, not its ordering vs. other
-        // operations.
+    {
+        std::lock_guard cache_lock(cache_mtx_);
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
-            std::lock_guard cache_lock(cache_mtx_);
-            token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
+            token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
         }
     }
 
-    return result;
+    return t;
 }
 
 void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
@@ -328,208 +420,198 @@ std::size_t ApiTokenStore::cache_size() const {
     return token_cache_.size();
 }
 
-std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {
+void ApiTokenStore::set_engine_referent_check(
+    std::function<EngineLookupStatus(const std::string&)> fn) {
+    engine_referent_check_ = std::move(fn);
+}
+
+std::expected<std::vector<ApiToken>, std::string>
+ApiTokenStore::list_tokens(const std::string& principal_id) const {
+    // Authoritative store (ADR-0012 §1): a runtime read error is SURFACED, never
+    // papered over as an empty result — a silent empty read here would show an
+    // operator "no tokens" during a Postgres outage and could hide a live
+    // credential. Only a genuine zero-row read returns an empty vector.
+    if (!open_)
+        return std::unexpected("database not open");
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("database unavailable — try again");
+
+    std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
+                      " FROM api_token_store.api_tokens";
+    std::vector<std::string> params;
+    if (!principal_id.empty()) {
+        sql += " WHERE principal_id = $1";
+        params.push_back(principal_id);
+    }
+    sql += " ORDER BY created_at DESC";
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("list_tokens read failed: ") +
+                               PQerrorMessage(lease.get()));
+
     std::vector<ApiToken> result;
-    if (!db_)
-        return result;
-
-    std::shared_lock db_lock(db_mtx_);
-
-    std::string sql =
-        "SELECT token_id, '', name, principal_id, scope_service, created_at, expires_at, "
-        "last_used_at, revoked, mcp_tier FROM api_tokens";
-    if (!principal_id.empty())
-        sql += " WHERE principal_id = ?";
-    sql += " ORDER BY created_at DESC;";
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
-        return result;
-    if (!principal_id.empty())
-        sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        ApiToken t;
-        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        t.token_hash = ""; // Never expose hash in listing
-        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
-        t.created_at = sqlite3_column_int64(s, 5);
-        t.expires_at = sqlite3_column_int64(s, 6);
-        t.last_used_at = sqlite3_column_int64(s, 7);
-        t.revoked = sqlite3_column_int(s, 8) != 0;
-        t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 9)));
-        result.push_back(std::move(t));
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        result.push_back(read_token(res.get(), i)); // token_hash is the literal '' column above
     }
-    sqlite3_finalize(s);
     return result;
 }
 
-std::optional<ApiToken> ApiTokenStore::get_token(const std::string& token_id) const {
-    if (!db_ || token_id.empty())
-        return std::nullopt;
+std::expected<std::optional<ApiToken>, std::string>
+ApiTokenStore::get_token(const std::string& token_id) const {
+    // Authoritative store (ADR-0012 §1): distinguish a runtime read error
+    // (surfaced → caller 503s) from a genuine no-such-row (value == nullopt →
+    // caller 404s). The old nullopt-on-DB-error made an ownership pre-check 404
+    // during an outage while the token stayed live (#2188 review).
+    if (!open_)
+        return std::unexpected("database not open");
+    if (token_id.empty())
+        return std::optional<ApiToken>{std::nullopt}; // argument guard, not a DB error
 
-    std::shared_lock db_lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("database unavailable — try again");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT token_id, name, principal_id, scope_service, created_at, "
-                           "expires_at, last_used_at, revoked, mcp_tier FROM api_tokens "
-                           "WHERE token_id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
-    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
+    const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
+                            " FROM api_token_store.api_tokens WHERE token_id = $1";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("get_token read failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ApiToken>{std::nullopt}; // genuine not-found
 
-    std::optional<ApiToken> result;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        ApiToken t;
-        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.created_at = sqlite3_column_int64(s, 4);
-        t.expires_at = sqlite3_column_int64(s, 5);
-        t.last_used_at = sqlite3_column_int64(s, 6);
-        t.revoked = sqlite3_column_int(s, 7) != 0;
-        t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 8)));
-        result = std::move(t);
-    }
-    sqlite3_finalize(s);
-    return result;
+    return std::optional<ApiToken>{read_token(res.get(), 0)};
 }
 
-bool ApiTokenStore::revoke_token(const std::string& token_id) {
-    if (!db_)
-        return false;
+std::expected<bool, std::string> ApiTokenStore::revoke_token(const std::string& token_id) {
+    if (!open_)
+        return std::unexpected("database not open");
 
-    std::unique_lock db_lock(db_mtx_);
     // Bump the revoke generation BEFORE the UPDATE so any concurrent
     // validate_token whose SELECT outraces this UPDATE will observe the
-    // generation move at its cache-write step and skip the stale write
-    // (HIGH-1).
+    // generation move at its cache-write step and skip the stale write.
     revoke_generation_.fetch_add(1, std::memory_order_release);
-    // Look up the token_hash before revoking so we can invalidate the cache
-    std::string token_hash;
-    {
-        sqlite3_stmt* q = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT token_hash FROM api_tokens WHERE token_id = ?;", -1, &q,
-                               nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(q) == SQLITE_ROW)
-                token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
-            sqlite3_finalize(q);
-        }
-    }
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "UPDATE api_tokens SET revoked = 1 WHERE token_id = ?;", -1, &s,
-                           nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    if (test_hook_after_first_revoke_bump_)
+        test_hook_after_first_revoke_bump_();
 
-    bool changed = sqlite3_changes(db_) > 0;
-    if (changed && !token_hash.empty())
-        invalidate_cache(token_hash);
-    return changed;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        // authoritative: a lease timeout is a WRITE FAILURE — never a silent
+        // success and never a false "not found". The caller must 503/retry.
+        return std::unexpected("database unavailable — try again");
+
+    // RETURNING token_hash — never sqlite3_changes()-style mutate-then-count
+    // (#1033). PQntuples > 0 IS the changed check, and the returned hash is
+    // exactly what we need to invalidate the cache (no pre-SELECT needed).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = $1 "
+        "RETURNING token_hash",
+        std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("revoke did not persist: ") +
+                               PQerrorMessage(lease.get()));
+
+    const int rows = PQntuples(res.get());
+    if (rows == 0)
+        return false; // DB write succeeded; no such token (already gone / unknown id)
+
+    // Second generation bump — AFTER the UPDATE has committed, BEFORE we
+    // invalidate. The pre-UPDATE bump alone only catches a validate_token that
+    // snapshotted revoke_generation_ *before* it. A validate that started AFTER
+    // that first bump captured the already-incremented value as its baseline,
+    // and under Postgres READ COMMITTED its SELECT can still read this row's
+    // pre-commit revoked=false; its post-SELECT re-check would then match its
+    // own snapshot and cache the stale row for the full TTL (PR #2188 round-3
+    // review). This second transition moves the generation past that snapshot,
+    // so the racing validate skips its cache write; invalidate_cache below then
+    // clears any entry that still beat us (both serialize on cache_mtx_).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
+    invalidate_cache(PQgetvalue(res.get(), 0, 0));
+    return true;
 }
 
-std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
-    if (!db_ || principal_id.empty())
-        return 0;
+std::expected<std::size_t, std::string>
+ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (principal_id.empty())
+        return std::size_t{0}; // argument guard: nothing to revoke, DB untouched
 
-    std::unique_lock db_lock(db_mtx_);
     // Bump revoke generation BEFORE the UPDATE — same contract as
-    // `revoke_token` (HIGH-1).
+    // `revoke_token`.
     revoke_generation_.fetch_add(1, std::memory_order_release);
 
-    // Snapshot the hashes of every non-revoked token for the principal so
-    // we can invalidate the in-memory validate_token cache after the
-    // UPDATE. Without this, a freshly-revoked token would still validate
-    // for up to `kTokenCacheTtl` seconds (60 s) — long enough for a
-    // stolen API token to keep working through the entire incident
-    // response window of someone clicking "Sign out everywhere".
-    std::vector<std::string> hashes_to_invalidate;
-    {
-        sqlite3_stmt* q = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT token_hash FROM api_tokens "
-                               "WHERE principal_id = ? AND revoked = 0;",
-                               -1, &q, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-            while (sqlite3_step(q) == SQLITE_ROW) {
-                hashes_to_invalidate.emplace_back(
-                    safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0))));
-            }
-            sqlite3_finalize(q);
-        }
-    }
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        // authoritative: never report a count (even 0) when we could not reach
+        // the DB — that is indistinguishable from "the principal had no tokens"
+        // and would let "Sign out everywhere" lie during an outage.
+        return std::unexpected("database unavailable — try again");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE api_tokens SET revoked = 1 "
-                           "WHERE principal_id = ? AND revoked = 0;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    // ONE statement yields both the count (PQntuples) and every hash to
+    // invalidate (RETURNING token_hash) — no separate pre-SELECT snapshot
+    // needed; the UPDATE's own WHERE clause is the authoritative "what
+    // changed" answer (#1033).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE api_token_store.api_tokens SET revoked = TRUE "
+        "WHERE principal_id = $1 AND revoked = FALSE RETURNING token_hash",
+        std::vector<std::string>{principal_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("revoke_for_principal did not persist: ") +
+                               PQerrorMessage(lease.get()));
 
-    // The hashes we snapshotted under db_mtx_ exclusive at lines 453-467
-    // are exactly the rows the UPDATE just transitioned to revoked=1: the
-    // SELECT and UPDATE share the same `WHERE principal_id = ? AND
-    // revoked = 0` predicate, and no other writer can sneak in while we
-    // hold db_mtx_ exclusively. So `hashes_to_invalidate.size()` is the
-    // count — no need for `sqlite3_changes()`.
-    //
-    // Also dodges two distinct foot-guns:
-    //   1. Windows: `std::max(sqlite3_changes(db_), 0)` mangles to garbage
-    //      because `<windows.h>` defines `max` as a macro when NOMINMAX
-    //      is not set, and the macro fight loses to `std::max`.
-    //   2. CLAUDE.md issue #1033: `sqlite3_changes()` after `sqlite3_step()`
-    //      on a FULLMUTEX handle is a documented data race against any
-    //      concurrent step() on the same handle.
-    for (const auto& h : hashes_to_invalidate)
-        invalidate_cache(h);
-    return hashes_to_invalidate.size();
+    const int rows = PQntuples(res.get());
+    // Second generation bump after the UPDATE commits, before invalidating —
+    // see revoke_token for the full rationale (closes the post-first-bump /
+    // pre-commit READ COMMITTED cache-poisoning window).
+    if (rows > 0)
+        revoke_generation_.fetch_add(1, std::memory_order_release);
+    for (int i = 0; i < rows; ++i)
+        invalidate_cache(PQgetvalue(res.get(), i, 0));
+    return static_cast<std::size_t>(rows);
 }
 
-bool ApiTokenStore::delete_token(const std::string& token_id) {
-    if (!db_)
-        return false;
+std::expected<bool, std::string> ApiTokenStore::delete_token(const std::string& token_id) {
+    if (!open_)
+        return std::unexpected("database not open");
 
-    std::unique_lock db_lock(db_mtx_);
     // Bump revoke generation BEFORE the DELETE — a delete is a stronger
     // form of revoke from the cache's perspective, so the same TOCTOU
-    // applies (HIGH-1).
+    // applies.
     revoke_generation_.fetch_add(1, std::memory_order_release);
-    // Look up the token_hash before deleting so we can invalidate the cache
-    std::string token_hash;
-    {
-        sqlite3_stmt* q = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT token_hash FROM api_tokens WHERE token_id = ?;", -1, &q,
-                               nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(q) == SQLITE_ROW)
-                token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
-            sqlite3_finalize(q);
-        }
-    }
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM api_tokens WHERE token_id = ?;", -1, &s, nullptr) !=
-        SQLITE_OK)
-        return false;
-    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        // authoritative (ADR-0030 §Posture names delete_token alongside
+        // revoke_*): a lease timeout is a WRITE FAILURE, never a silent success
+        // and never a false "not found".
+        return std::unexpected("database unavailable — try again");
 
-    bool changed = sqlite3_changes(db_) > 0;
-    if (changed && !token_hash.empty())
-        invalidate_cache(token_hash);
-    return changed;
+    // RETURNING token_hash — same #1033 idiom as revoke_token: PQntuples is
+    // the changed-check, the returned hash is the cache-invalidation key.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM api_token_store.api_tokens WHERE token_id = $1 RETURNING token_hash",
+        std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("delete did not persist: ") + PQerrorMessage(lease.get()));
+
+    const int rows = PQntuples(res.get());
+    if (rows == 0)
+        return false; // DB write succeeded; no such token (already gone / unknown id)
+
+    // Second generation bump after the DELETE commits, before invalidating —
+    // see revoke_token for the full rationale.
+    revoke_generation_.fetch_add(1, std::memory_order_release);
+    invalidate_cache(PQgetvalue(res.get(), 0, 0));
+    return true;
 }
 
 } // namespace yuzu::server

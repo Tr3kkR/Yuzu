@@ -57,6 +57,12 @@ class BaselineStore;
 // ADR-0016: the typed daily-sync software store backs GET /api/v1/inventory/software.
 // Forward-declared (pointer-only in register_routes); the .cpp includes the header.
 class SoftwareInventoryStore;
+// PR 4.2 (docs/auth-engine-principals-design.md §4.1) — the fleet-wide engine
+// role-assignment authoring surface (/api/v1/engine-principals/{id}/roles)
+// validates the target id against this store before calling
+// RbacStore::assign_role. Forward-declared (pointer-only in register_routes);
+// the .cpp includes engine_principal_store.hpp.
+class EnginePrincipalStore;
 }
 
 #include <httplib.h>
@@ -166,13 +172,21 @@ public:
     /// only when the caller asked for full-principal revocation
     /// (`/me`'s "Sign out everywhere"; admin force-logout deliberately
     /// leaves automation tokens intact). `db_persisted` reports whether
-    /// the AuthDB DELETE for cookie sessions succeeded; when false, the
-    /// caller MUST surface this in the audit row (a "success" audit row
-    /// hiding a DB write failure produces fictional CC6.3/CC6.6 evidence).
+    /// the AuthDB DELETE for cookie sessions succeeded; `api_tokens_db_persisted`
+    /// reports the SAME for the API-token revoke leg — kept as its OWN field
+    /// rather than folded into `db_persisted`, because the two writes hit
+    /// independent stores (AuthDB vs `api_token_store`) and either can fail
+    /// alone. When EITHER is false the caller MUST surface it in the audit row
+    /// (a "success" row hiding a failed API-token revoke tells an operator who
+    /// revoked a stolen laptop that every credential died when it did not —
+    /// fictional CC6.3/CC6.6 evidence, and the exact failure ADR-0030 §Posture
+    /// forbids). `api_tokens_db_persisted` is vacuously true when API-token
+    /// revocation was not requested (the admin force-logout path).
     struct SessionRevokeResult {
         std::size_t cookie_sessions_revoked{0};
         std::size_t api_tokens_revoked{0};
         bool db_persisted{true};
+        bool api_tokens_db_persisted{true};
     };
 
     /// Carrier for the audit-emission outcome on a session-revocation
@@ -258,17 +272,26 @@ public:
         ResponseScopeFn response_scope_fn = {},
         // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
         // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {});
+        AppPerfProviders app_perf_providers = {},
+        // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
+        // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
+        // optional dep; nullptr leaves the assign/unassign routes answering
+        // 503 (list still works if rbac_store is wired — it doesn't need
+        // this store).
+        EnginePrincipalStore* engine_principal_store = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
     ///
-    /// `step_up_fn` (PR2, optional) — when present, the 9 high-risk REST
-    /// handlers (token create/revoke, session revoke, Guardian rule
-    /// create/update/push, software package create, software deploy
-    /// start, file retrieval upload) gate behind it after permissions
-    /// pass. Empty functor disables the gate entirely (default — preserves
+    /// `step_up_fn` (PR2, optional) — when present, the high-risk REST /
+    /// Settings handlers (token create/revoke, session revoke, Guardian rule
+    /// create/update/push, software package create, software deploy start,
+    /// file retrieval upload, user delete/role-change, and the two
+    /// engine-principal role assign/unassign routes) gate behind it after
+    /// permissions pass — the canonical enumerated list lives in
+    /// docs/user-manual/rest-api.md "Step-up envelope on high-risk endpoints".
+    /// Empty functor disables the gate entirely (default — preserves
     /// pre-PR2 behaviour for any caller that hasn't wired it).
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
@@ -301,7 +324,13 @@ public:
         ResponseScopeFn response_scope_fn = {},
         // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
         // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {});
+        AppPerfProviders app_perf_providers = {},
+        // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
+        // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
+        // optional dep; nullptr leaves the assign/unassign routes answering
+        // 503 (list still works if rbac_store is wired — it doesn't need
+        // this store).
+        EnginePrincipalStore* engine_principal_store = nullptr);
 };
 
 } // namespace yuzu::server

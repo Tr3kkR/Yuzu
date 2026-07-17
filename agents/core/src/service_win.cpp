@@ -2,11 +2,14 @@
 
 #include "service_win.hpp"
 
+#include "hard_exit.hpp" // shared TerminateProcess + F3 orphan-drain poll (rung 7.6)
+
 #include <yuzu/agent/agent.hpp>
 
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -199,6 +202,25 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
         if (!stop_already_requested)
             report_status(SERVICE_RUNNING);
 
+        // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2 - and
+        // round 4, which caught that this MUST be armed BEFORE agent->run()
+        // below, not after: run() itself is not noexcept and has a substantial
+        // throwing surface, so a guard constructed only after it returns would
+        // miss an exception thrown FROM run() itself). Everything from here
+        // through the explicit orphan check further down (run() itself, the
+        // logger flush, the report_status() chain) could in principle throw and
+        // unwind past that check entirely, which would let normal C++ teardown
+        // run while a Guardian I/O worker might still be active - exactly what
+        // F3 exists to prevent. Constructed AFTER `agent` (declared above), so
+        // reverse-declaration-order destruction runs this guard BEFORE the
+        // Agent's own destructor on every exit path, including an unwind into
+        // the catch block below - the same pattern `AgentUnpublisher` already
+        // relies on. Disarmed once the explicit check has run to completion on
+        // the normal path; its destructor is a deliberately non-throwing,
+        // unlogged fallback for every other path.
+        yuzu::agent::OrphanExitGuard orphan_guard{
+            [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
+
         agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
         spdlog::default_logger()->flush();
@@ -225,6 +247,48 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             // run() returned on its own, without a STOP/SHUTDOWN control -- unexpected.
             report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/2);
         }
+
+        // F3 orphan-exit obligation (ADR-0021 rung 7.6; guardian_io_executor.hpp's
+        // "ORPHAN PROCESS-EXIT CONTRACT"), Windows SCM path. Mirrors main.cpp's
+        // console-mode check: a detached Guardian bounded-I/O worker cannot be
+        // joined or force-cancelled, so give it a short grace to actually finish
+        // before this function returns and the process runs normal C++ teardown.
+        //
+        // DELIBERATELY AFTER the report_status chain above, not before it: "AN
+        // EXPLICIT OPERATOR STOP ALWAYS WINS" (the comment above) must still hold
+        // for what the SCM is TOLD, even when an orphan forces a hard exit right
+        // after. hard_exit() only sets the process's raw exit code -- it cannot
+        // itself call SetServiceStatus -- so the correct status must already be
+        // reported before it runs, never after (Sol rung-7.6 review finding 3).
+        {
+            // Force synchronization against a possibly-still-in-flight handler_ex
+            // or the catch-up block above: stop_requested_ is stop()'s FIRST
+            // statement, so run()'s reconnect loop can return before stop()'s
+            // LATER steps (guardian_->stop(), dex_observer_->stop()) have actually
+            // completed. Both call sites hold g_agent_mu across their entire
+            // stop() call; re-acquiring it here blocks until any in-flight call
+            // has fully returned before the orphan count below is sampled -
+            // otherwise a zero count is meaningless (Sol rung-7.6 review finding
+            // 1 - mirrors main.cpp's console-path fix).
+            std::lock_guard<std::mutex> lock(g_agent_mu);
+        }
+        if (const auto n = agent->guardian_active_io_workers(); n > 0) {
+            if (!yuzu::agent::wait_for_workers_to_drain(
+                    [&] { return agent->guardian_active_io_workers(); },
+                    yuzu::agent::kOrphanDrainGrace)) {
+                // Firewalled: a logging exception here must never skip hard_exit()
+                // below (Sol rung-7.6 review finding 2).
+                try {
+                    spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
+                                     "forcing process exit rather than race static/DSO teardown "
+                                     "against them",
+                                     n, yuzu::agent::kOrphanDrainGrace.count());
+                } catch (...) {
+                }
+                yuzu::agent::hard_exit(3); // the SCM status above already reported the real outcome
+            }
+        }
+        orphan_guard.disarm(); // the explicit check above has run to completion
     } catch (const std::exception& e) {
         // service_main is a raw WINAPI callback invoked directly by the SCM
         // dispatcher thread -- an exception must never cross that C ABI boundary

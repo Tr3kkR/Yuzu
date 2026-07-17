@@ -60,10 +60,21 @@ struct Session {
     std::string display_name;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
+    // "local", "oidc", "saml", "api_token", "mcp_token", or "engine_token" (six values —
+    // docs/auth-engine-principals-design.md §6; the sixth is minted only by
+    // AuthRoutes::synthesize_token_session for a principal_kind="engine" ApiToken).
+    std::string auth_source{"local"};
     std::string oidc_sub;             // OIDC subject claim (empty for local auth)
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
+    /// Discriminator for the session's principal class — "human" (default) or
+    /// "engine". In-memory only (no auth.db schema change: token sessions are
+    /// synthesized fresh per request, never persisted — see design doc §6).
+    /// Set by `synthesize_token_session` from the source `ApiToken::principal_kind`;
+    /// every other session-creation site leaves the "human" default. This is the
+    /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
+    /// never infer principal kind from the shape of `username`.
+    std::string principal_kind{"human"};
     /// Timestamp of the most recent successful MFA proof on this session
     /// (login completion or step-up). Default-constructed sentinel means
     /// "no MFA proof yet". Compared against
