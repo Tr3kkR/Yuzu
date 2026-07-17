@@ -46,6 +46,8 @@
 #include <optional>
 #include <vector>
 
+#include <yuzu/plugin.h>  // YUZU_EXPORT
+
 namespace yuzu::agent::netq {
 
 /// Interface byte counters for the throughput delta (kept across heartbeats).
@@ -129,7 +131,7 @@ struct RetransWindow {
 
 /// Read current non-loopback interface byte counters (Linux: /proc/net/dev).
 /// Returns invalid off Linux or on read failure.
-NetCounters read_net_counters();
+YUZU_EXPORT NetCounters read_net_counters();
 
 /// Produce the heartbeat sample. Linux: a one-shot INET_DIAG dump for rtt/retrans
 /// + throughput from prev/cur counters. Windows: throughput from prev/cur +
@@ -138,7 +140,7 @@ NetCounters read_net_counters();
 /// `prev` invalid (first heartbeat) → throughput omitted this cycle. Other
 /// platforms → all-invalid. Called only from the heartbeat thread; all state
 /// is local or caller-owned (no shared state).
-NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
+YUZU_EXPORT NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
 
 // ── Pure helpers (header-inline so they link into tests without DLL export,
 //    matching the dex_perf_breach pattern) ───────────────────────────────────
