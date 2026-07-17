@@ -129,8 +129,9 @@ struct RetransWindow {
     }
 };
 
-/// Read current non-loopback interface byte counters (Linux: /proc/net/dev).
-/// Returns invalid off Linux or on read failure.
+/// Read current non-loopback interface byte counters (Linux: /proc/net/dev;
+/// Windows: GetIfTable2; macOS: NET_RT_IFLIST2).
+/// Returns invalid on unsupported platforms or on read failure.
 YUZU_EXPORT NetCounters read_net_counters();
 
 /// Produce the heartbeat sample. Linux: a one-shot INET_DIAG dump for rtt/retrans
