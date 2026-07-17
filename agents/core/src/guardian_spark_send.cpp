@@ -1,5 +1,7 @@
 #include "guardian_spark_send.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -63,10 +65,16 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
     }
     case OutboxDomain::Health:
         // healthy = the watch recovered (Unknown -> Known); !healthy = a read error
-        // left the guard unable to evaluate. Separate from compliance state.
+        // left the guard unable to evaluate. Separate from compliance state. The
+        // read-error text goes into detail_json as a STRUCTURED JSON object
+        // {"detail": "..."} - the proto/server define detail_json as JSON, so a bare
+        // string like "EACCES on hive" would be malformed. nlohmann handles escaping.
         ev.set_event_type(e.healthy ? "guard.healthy" : "guard.unhealthy");
-        if (!e.healthy && !e.health_detail.empty())
-            ev.set_detail_json(e.health_detail);
+        if (!e.healthy && !e.health_detail.empty()) {
+            nlohmann::json j;
+            j["detail"] = e.health_detail;
+            ev.set_detail_json(j.dump());
+        }
         break;
     case OutboxDomain::Lifecycle:
         // lifecycle_kind is one of "armed" | "disarmed" | "errored"; the wire token

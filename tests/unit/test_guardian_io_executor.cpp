@@ -163,6 +163,39 @@ TEST_CASE("run: file-lane saturation does not block a service read (per-type bul
     CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
 }
 
+TEST_CASE("Config: an oversubscribing injected quota is clamped to the process ceiling",
+          "[spark][ioexecutor]") {
+    // A pathological injected Config (100/100/100) must NOT let the executor spawn 300
+    // workers - the derived process bound is clamped to kMaxProcessIoWorkers. (The
+    // DEFAULT config is static-asserted safe; this guards runtime-injected values.)
+    GuardianIoExecutor ex{GuardianIoExecutor::Config{
+        .file_quota = 100, .registry_quota = 100, .service_quota = 100}};
+    auto gate = std::make_shared<Gate>();
+    std::vector<std::thread> callers;
+    for (int i = 0; i < GuardianIoExecutor::kMaxProcessIoWorkers; ++i) {
+        callers.emplace_back([&ex, gate, i] {
+            ex.run(IoClass::File, "f" + std::to_string(i), 30s, [gate] {
+                gate->wait();
+                return 0;
+            });
+        });
+    }
+    REQUIRE(spin_until(
+        [&] { return ex.active_worker_count() == GuardianIoExecutor::kMaxProcessIoWorkers; }));
+    // The (ceiling+1)-th read is rejected: the process bound was clamped to the ceiling,
+    // not the injected sum of 300.
+    auto over = ex.run(IoClass::File, "f-over", 1s, [gate] {
+        gate->wait();
+        return 0;
+    });
+    CHECK(over.error() == IoFailure::CapacityExhausted);
+
+    gate->release();
+    for (auto& t : callers)
+        t.join();
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
 TEST_CASE("run: a saturated file+registry lane never starves the service lane (R3 exact bulkheads)",
           "[spark][ioexecutor]") {
     // The default config is the shipped-bug shape: File 4 + Registry 3 = 7 workers.

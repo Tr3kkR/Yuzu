@@ -6,6 +6,8 @@
 #include "guardian_spark_send.hpp"
 #include "guardian_outbox.hpp" // OutboxEntry + GuardDrift (via <yuzu/agent/guard.hpp>)
 
+#include <nlohmann/json.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 using namespace yuzu::agent;
@@ -98,11 +100,13 @@ TEST_CASE("send-map: Health maps healthy/unhealthy and carries detail only when 
         CHECK(ev.event_type() == "guard.healthy");
         CHECK(ev.detail_json().empty()); // detail is not carried on a healthy edge
     }
-    SECTION("unhealthy carries the read-error detail") {
+    SECTION("unhealthy carries the read-error detail as valid JSON") {
         auto ev = guardian_outbox_entry_to_event(
             OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, "EACCES on hive"), "macos");
         CHECK(ev.event_type() == "guard.unhealthy");
-        CHECK(ev.detail_json() == "EACCES on hive");
+        // detail_json is a JSON object, not a bare string - the field is defined as JSON.
+        CHECK(ev.detail_json() == R"({"detail":"EACCES on hive"})");
+        CHECK(nlohmann::json::parse(ev.detail_json())["detail"] == "EACCES on hive");
     }
 }
 

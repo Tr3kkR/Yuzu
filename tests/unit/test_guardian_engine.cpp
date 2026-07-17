@@ -664,3 +664,24 @@ TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
     CHECK_FALSE(applied.has_value());
     CHECK(applied.error().find("stopped") != std::string::npos);
 }
+
+TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not resurrect the engine",
+          "[guardian][engine][lifecycle]") {
+    // rung 7.7a reordered start_local() to run AFTER SparkEngine start + wire_spark_engine.
+    // If a stop() lands during boot (a SIGTERM / service-stop mid-startup), the later
+    // start_local() must NOT bring the engine back to life - otherwise stop() was not
+    // truthful (and at rung 7.7b, detection + buffered sends could resume post-stop).
+    GuardianFixture f;
+    f.engine->stop();
+    // start_local() returns cleanly but is a no-op: it must not clear the stopped state.
+    REQUIRE(f.engine->start_local().has_value());
+    // Proof the engine stayed stopped: apply_rules still fails with "stopped". Without
+    // the sticky guard, start_local() would have set stopped_=false and this would
+    // succeed - i.e. the engine would have silently resurrected after stop() returned.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "after-stop-then-startlocal");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(applied.error().find("stopped") != std::string::npos);
+}
