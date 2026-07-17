@@ -41,7 +41,7 @@ Four surfaces hold responses open today, all on the same shared pool:
 | `GET /mcp/v1/` | token (principal-bound session) | the MCP Streamable HTTP channel (track 2f PR 2) |
 | `GET /api/v1/events` | token (`Execution:Read`) | the agentic execution-event stream |
 | `GET /sse/executions/{id}` | cookie | the dashboard executions drawer |
-| `GET /events` | **none** | the legacy dashboard live-update stream |
+| `GET /events` | cookie (session) | the legacy dashboard live-update stream |
 
 **Provenance.** Every claim below about `StreamBudget`, the `GET /mcp/v1/` channel and the
 admission arithmetic is stated **as of `feat/mcp-streamable-http-pr2` @ 3bac4647** — the branch
@@ -68,9 +68,14 @@ safety feature; it is the visible edge of a self-inflicted scarcity. Rationing i
 carefully — capping the other three surfaces so they cannot starve each other — makes the
 accounting honest but leaves the ceiling exactly where it is.
 
-A second fact, surfaced by the same arithmetic: `GET /events` performs **no authentication**
-and enqueues without a cap. An unauthenticated caller can therefore pin worker threads and
-grow an unbounded per-connection queue. That is a pre-auth denial-of-service on today's
+A second fact, surfaced by the same arithmetic: `GET /events` is session-gated: the
+pre-routing chokepoint 401s an un-authenticated caller (`/events` is not in
+`is_login_exempt_path`; it sits in the `if (!session)` -> `401` branch alongside `/api/` and
+`/mcp/`), but its per-connection sink queue is enqueued **without a cap**
+(`sink_state->queue.push_back` in the `/events` handler, in contrast to the
+`kPerConnectionQueueCapDefault` slow-consumer protection `/api/v1/events` opts into). An
+**authenticated** caller with a slow or blackholed consumer can therefore grow an unbounded
+per-connection queue. That is an authenticated slow-consumer denial-of-service on today's
 `dev`, independent of anything in track 2f, and it is filed separately — but it is the
 sharpest illustration of why "a held-open connection costs a thread" is the wrong primitive
 to build a fleet-scale platform on.
@@ -97,9 +102,11 @@ lease outside the reserve. A **per-principal lease cap** on the authenticated su
 `/api/v1/events`, the dashboard drawer), keyed by authenticated credential or session, is required
 before the agentic surface is production-enabled. This is a **distinct** policy from ADR-0032's
 per-principal run/grant caps: a held-open stream lease is a different resource from a run admission or
-a delegation artifact, so it is sized and keyed on its own. The unauthenticated legacy `/events`
-stream cannot be principal-keyed at all; it needs a **separate pre-auth limit** (and its missing
-authentication is the pre-auth DoS filed separately below).
+a delegation artifact, so it is sized and keyed on its own. The legacy `/events` stream is
+session-gated like the dashboard drawer, so it **can** be principal-keyed on its session; the
+residual it carries is not missing authentication but a missing per-connection queue cap - it
+should opt into the same `kPerConnectionQueueCapDefault` slow-consumer protection
+`/api/v1/events` already uses (the authenticated slow-consumer DoS filed separately below).
 
 **2. Derive the worker pool from the intended stream count — not the cap from the accidental
 pool.** This inverts the arrow. A thread blocked in `cv.wait_for` burns **zero CPU** — the only
@@ -170,7 +177,7 @@ than a box inserted in front of the server.
 ## Consequences
 
 - Track 2f PR 2 implements Decision 1's **shared-budget guardrail** plus (2) and (3). The
-  per-principal lease cap and the pre-auth `/events` limit named in Decision 1 are **prerequisites
+  per-principal lease cap and the `/events` per-connection queue cap named in Decision 1 are **prerequisites
   still to land**, not part of PR 2. The MCP stream cap stops being a capacity limit
   (12) and becomes an anti-abuse backstop against a pool sized for the declared workload.
 - The dashboard and `/api/v1/events` are bounded for the first time — closing a starvation
