@@ -343,6 +343,12 @@ struct FlowState {
     /// cumulative counter nstat actually exposes. 0 (== "no prior snapshot")
     /// on the flow's first tick, which the delta clamp already treats safely.
     std::uint64_t txretransmit_prev_snapshot{0};
+    /// Monotonic seconds (nstat_mono_seconds) of the last message that touched
+    /// this flow (ADDED/DESC/COUNTS). The flow reaper (UP-2) evicts entries not
+    /// updated within kNstatFlowStaleSeconds — a live flow is refreshed by the
+    /// 2s QUERY_SRC/SRC_COUNTS cycle; a flow whose SRC_REMOVED was lost stops
+    /// updating and is reaped, so a dropped removal can never leak forever.
+    std::int64_t last_update_mono{0};
 };
 
 // ── Pure mapping: decoded messages -> FlowState mutations ──────────────────
@@ -470,6 +476,16 @@ public:
     /// (tar_proc_stream.hpp:173). Always false off-macOS / before start.
     bool stalled() const noexcept;
 
+    /// Flows evicted by the UP-2 bound since construction: reaped as stale (a
+    /// lost SRC_REMOVED) or dropped at the hard cap. Non-zero here is the
+    /// observable signal of a leaking/oversized kernel-flow table. 0 off-macOS.
+    std::uint64_t flow_reaped() const noexcept;
+
+    /// Current live flow-table cardinality (Impl::flows.size()), mirrored to a
+    /// client-owned atomic so a status read never dereferences impl_ or takes
+    /// flows_mu. 0 off-macOS / not running.
+    std::int64_t flow_table_size() const noexcept;
+
     /// True when the runtime layout self-check (nstat_length_matches_expected)
     /// forced the client to an inert state — a fixed-size message's declared
     /// length disagreed with our transcribed struct. Reset at the start of
@@ -528,6 +544,10 @@ private:
     [[maybe_unused]] std::atomic<std::int64_t> started_ts_{0};
     [[maybe_unused]] std::atomic<bool> layout_mismatch_{false};
     [[maybe_unused]] std::atomic<bool> system_wide_{false};
+    // UP-2: flow-table bound observability — same borrowed-atomic idiom so a
+    // status read never touches impl_/flows_mu.
+    [[maybe_unused]] std::atomic<std::uint64_t> flow_reaped_{0};
+    [[maybe_unused]] std::atomic<std::int64_t> flow_table_size_{0};
 
     // HIGH-1 fix: collector-owned running flag. Set true at the END of a
     // successful start() (after impl_ is published) and false at the START

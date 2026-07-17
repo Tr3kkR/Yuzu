@@ -1962,6 +1962,30 @@ private:
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
 
+        // nstat (macOS tcp lifecycle) stream health — emitted UNCONDITIONALLY,
+        // same key-always-present NFR-visibility contract as the process/module
+        // streams above (there is no agent /metrics endpoint; tar.status is the
+        // operator/agentic surface, so ring-overflow / kernel-desync / flow-table
+        // growth must never be silent). All 0/false/"none" off-macOS or when no
+        // client. nstat_flow_table_size + nstat_flow_reaped are the observable
+        // signals of the bounded kernel-flow table (a lost SRC_REMOVED shows up
+        // as reaped, never as unbounded growth).
+        ctx.write_output(std::format("config|nstat_capture_method|{}",
+                                     nstat_client_ ? nstat_client_->method_name() : "none"));
+        ctx.write_output(std::format("config|nstat_stream_dropped|{}",
+                                     nstat_client_ ? nstat_client_->dropped() : 0));
+        ctx.write_output(std::format("config|nstat_stream_kernel_dropped|{}",
+                                     nstat_client_ ? nstat_client_->kernel_dropped() : 0));
+        ctx.write_output(std::format("config|nstat_flow_table_size|{}",
+                                     nstat_client_ ? nstat_client_->flow_table_size() : 0));
+        ctx.write_output(std::format("config|nstat_flow_reaped|{}",
+                                     nstat_client_ ? nstat_client_->flow_reaped() : 0));
+        ctx.write_output(std::format("config|nstat_stalled|{}",
+                                     (nstat_client_ && nstat_client_->stalled()) ? "true" : "false"));
+        ctx.write_output(
+            std::format("config|nstat_layout_mismatch|{}",
+                        (nstat_client_ && nstat_client_->layout_mismatch()) ? "true" : "false"));
+
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
         // active), "estats_pending" (Windows, gate not yet tested — or netqual

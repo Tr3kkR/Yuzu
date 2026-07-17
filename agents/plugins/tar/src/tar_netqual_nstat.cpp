@@ -364,6 +364,26 @@ constexpr auto kNstatQueryInterval = std::chrono::seconds(2);
 // (sizeof(MsgSrcDescHeader) + sizeof(TcpDescriptor) == 472 bytes).
 constexpr std::size_t kNstatRecvBufSize = 8192;
 
+// UP-2 flow-table bound. The kernel table is normally self-limiting (SRC_REMOVED
+// erases a closed flow), but a LOST removal (ENOBUFS/kernel drop during a storm)
+// would leak an entry forever. Two mechanisms keep it bounded: (a) a TTL reaper —
+// query_loop re-queries every live flow every 2s, so a genuinely-open flow's
+// last_update_mono stays fresh while a flow whose removal was lost stops getting
+// SRC_COUNTS and goes stale; anything not updated within kNstatFlowStaleSeconds is
+// reaped. (b) a hard-cap backstop for a burst faster than the reaper.
+constexpr std::int64_t kNstatFlowStaleSeconds = 60; // several 2s query cycles with no counts
+constexpr std::size_t kNstatMaxFlows = 50000;       // backstop cap; drops+counts beyond it
+
+// Monotonic seconds for liveness/staleness comparisons (stall detection, the flow
+// reaper) — never wall-clock time(), so an NTP/DST step cannot make a "seconds
+// since" go negative and mis-decide a stall or a reap (UP-6). Event ts_unix that
+// gets PERSISTED stays wall-clock (a real timestamp), separate from this.
+inline std::int64_t nstat_mono_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 } // namespace
 
 struct NstatClient::Impl {
@@ -386,6 +406,9 @@ struct NstatClient::Impl {
     // dereferences impl_, so this preserves the immediate self-detection the
     // old impl_->thread_alive check gave without the use-after-free race.
     std::atomic<bool>* running{nullptr};
+    // UP-2: borrowed counters for the flow-table bound (same idiom as above).
+    std::atomic<std::uint64_t>* flow_reaped{nullptr};
+    std::atomic<std::int64_t>* flow_table_size{nullptr};
 
     std::thread reader_thread;
     std::thread query_thread;
@@ -398,8 +421,29 @@ struct NstatClient::Impl {
     std::map<std::uint64_t, FlowState> flows; // srcref -> FlowState, guarded by flows_mu
 
     Impl(NstatFlowEventRing* r, std::atomic<std::uint64_t>* kd, std::atomic<std::int64_t>* let,
-         std::atomic<bool>* lm, std::atomic<bool>* rn)
-        : ring(r), kernel_dropped(kd), last_event_ts(let), layout_mismatch(lm), running(rn) {}
+         std::atomic<bool>* lm, std::atomic<bool>* rn, std::atomic<std::uint64_t>* fr,
+         std::atomic<std::int64_t>* fts)
+        : ring(r), kernel_dropped(kd), last_event_ts(let), layout_mismatch(lm), running(rn),
+          flow_reaped(fr), flow_table_size(fts) {}
+
+    // UP-2 reaper. Caller MUST hold flows_mu. Evicts flows not updated within
+    // kNstatFlowStaleSeconds (a lost SRC_REMOVED stops refreshing them) and
+    // republishes the live size. Returns the number reaped.
+    std::size_t reap_stale_flows_locked(std::int64_t mono_now) {
+        std::size_t reaped = 0;
+        for (auto it = flows.begin(); it != flows.end();) {
+            if (mono_now - it->second.last_update_mono > kNstatFlowStaleSeconds) {
+                it = flows.erase(it);
+                ++reaped;
+            } else {
+                ++it;
+            }
+        }
+        if (reaped)
+            flow_reaped->fetch_add(reaped, std::memory_order_relaxed);
+        flow_table_size->store(static_cast<std::int64_t>(flows.size()), std::memory_order_relaxed);
+        return reaped;
+    }
 
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
@@ -451,7 +495,8 @@ struct NstatClient::Impl {
         if (!hdr)
             return; // too short to even have a header — drop silently, not fatal
 
-        const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+        const std::int64_t wall_now = static_cast<std::int64_t>(::time(nullptr)); // persisted event ts
+        const std::int64_t mono = nstat_mono_seconds(); // liveness/reaper timestamps (UP-6)
 
         switch (hdr->type) {
         case kNstatMsgSrcAdded: {
@@ -468,16 +513,40 @@ struct NstatClient::Impl {
                 stop_requested.store(true, std::memory_order_relaxed);
                 return;
             }
+            // UP-7: only track TCP-provider sources. We subscribe only TCP
+            // providers, but a non-TCP source arriving (provider-id ambiguity)
+            // would create a permanent has_desc=false orphan we never query a
+            // DESC for — a concrete leak into the flow table. Drop it.
+            if (added->provider != kNstatProviderTcp &&
+                added->provider != kNstatProviderTcpKernel)
+                return;
+            bool tracked = false;
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
-                flows.try_emplace(added->srcref);
+                const bool known = flows.find(added->srcref) != flows.end();
+                if (!known && flows.size() >= kNstatMaxFlows) {
+                    // UP-2 backstop: at the hard cap, reap stale entries first;
+                    // if that frees nothing, drop this new flow (bounded +
+                    // counted) rather than grow the table without bound.
+                    reap_stale_flows_locked(mono);
+                }
+                if (known || flows.size() < kNstatMaxFlows) {
+                    flows[added->srcref].last_update_mono = mono;
+                    tracked = true;
+                } else {
+                    flow_reaped->fetch_add(1, std::memory_order_relaxed);
+                }
+                flow_table_size->store(static_cast<std::int64_t>(flows.size()),
+                                       std::memory_order_relaxed);
             }
-            nstat_raw::MsgGetSrcDesc req{};
-            req.hdr.type = kNstatMsgGetSrcDesc;
-            req.hdr.length = static_cast<std::uint16_t>(sizeof(req));
-            req.srcref = added->srcref;
-            send_msg(&req, sizeof(req));
-            last_event_ts->store(now, std::memory_order_relaxed);
+            if (tracked) {
+                nstat_raw::MsgGetSrcDesc req{};
+                req.hdr.type = kNstatMsgGetSrcDesc;
+                req.hdr.length = static_cast<std::uint16_t>(sizeof(req));
+                req.srcref = added->srcref;
+                send_msg(&req, sizeof(req));
+            }
+            last_event_ts->store(mono, std::memory_order_relaxed);
             return;
         }
         case kNstatMsgSrcRemoved: {
@@ -500,15 +569,17 @@ struct NstatClient::Impl {
                 } else {
                     erased = it->second;
                     flows.erase(it);
+                    flow_table_size->store(static_cast<std::int64_t>(flows.size()),
+                                           std::memory_order_relaxed);
                 }
             }
             if (erased && erased->has_desc) {
                 // Only a flow whose identity we actually resolved is worth a
                 // close row; one that never got a SRC_DESC has nothing
                 // meaningful to report (memo §2 ADDED->DESC->COUNTS->REMOVED).
-                ring->push(nstat_build_close_event(now, *erased));
+                ring->push(nstat_build_close_event(wall_now, *erased));
             }
-            last_event_ts->store(now, std::memory_order_relaxed);
+            last_event_ts->store(mono, std::memory_order_relaxed);
             return;
         }
         case kNstatMsgSrcDesc: {
@@ -538,10 +609,13 @@ struct NstatClient::Impl {
                 auto& flow = flows[desc->srcref]; // upsert — a DESC can race a missed ADDED
                 first_desc = !flow.has_desc;
                 nstat_apply_tcp_desc(flow, *desc);
+                flow.last_update_mono = mono;
+                flow_table_size->store(static_cast<std::int64_t>(flows.size()),
+                                       std::memory_order_relaxed);
             }
             if (first_desc)
-                ring->push(nstat_build_open_event(now, *desc));
-            last_event_ts->store(now, std::memory_order_relaxed);
+                ring->push(nstat_build_open_event(wall_now, *desc));
+            last_event_ts->store(mono, std::memory_order_relaxed);
             return;
         }
         case kNstatMsgSrcCounts: {
@@ -563,9 +637,10 @@ struct NstatClient::Impl {
                     kernel_dropped->fetch_add(1, std::memory_order_relaxed); // desync
                 } else {
                     nstat_apply_counts(it->second, *counts);
+                    it->second.last_update_mono = mono; // refresh liveness (UP-2 reaper)
                 }
             }
-            last_event_ts->store(now, std::memory_order_relaxed);
+            last_event_ts->store(mono, std::memory_order_relaxed);
             return;
         }
         case kNstatMsgError:
@@ -620,6 +695,10 @@ struct NstatClient::Impl {
             std::vector<std::uint64_t> srcrefs;
             {
                 std::lock_guard<std::mutex> flk(flows_mu);
+                // UP-2: reap flows the kernel stopped reporting (a lost
+                // SRC_REMOVED) before re-querying, so the table can't leak and
+                // the O(n) query volume stays bounded to genuinely-live flows.
+                reap_stale_flows_locked(nstat_mono_seconds());
                 srcrefs.reserve(flows.size());
                 for (const auto& entry : flows)
                     srcrefs.push_back(entry.first);
@@ -647,9 +726,14 @@ bool NstatClient::start() {
     if (impl_)
         return false; // already running
 
-    started_ts_.store(static_cast<std::int64_t>(::time(nullptr)), std::memory_order_relaxed);
-    last_event_ts_.store(0, std::memory_order_relaxed);
+    // Stall/liveness timestamps are MONOTONIC (UP-6): an NTP/DST step must not
+    // corrupt "seconds since" and mis-decide a stall. Seed last_event to now so
+    // a just-started client isn't instantly considered stalled.
+    const std::int64_t mono0 = nstat_mono_seconds();
+    started_ts_.store(mono0, std::memory_order_relaxed);
+    last_event_ts_.store(mono0, std::memory_order_relaxed);
     layout_mismatch_.store(false, std::memory_order_relaxed); // a fresh start gets a fresh chance
+    flow_table_size_.store(0, std::memory_order_relaxed);     // fresh impl_ starts with an empty table
 
     const int fd = ::socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
     if (fd < 0) {
@@ -688,7 +772,7 @@ bool NstatClient::start() {
     system_wide_.store(::geteuid() == 0, std::memory_order_relaxed);
 
     auto impl = std::make_unique<Impl>(&ring_, &kernel_dropped_, &last_event_ts_, &layout_mismatch_,
-                                       &running_);
+                                       &running_, &flow_reaped_, &flow_table_size_);
     impl->fd = fd;
     Impl* raw = impl.get();
     impl_ = std::move(impl);
@@ -782,10 +866,21 @@ std::uint64_t NstatClient::kernel_dropped() const noexcept {
     return kernel_dropped_.load(std::memory_order_relaxed);
 }
 
+std::uint64_t NstatClient::flow_reaped() const noexcept {
+    return flow_reaped_.load(std::memory_order_relaxed);
+}
+
+std::int64_t NstatClient::flow_table_size() const noexcept {
+    return flow_table_size_.load(std::memory_order_relaxed);
+}
+
 bool NstatClient::stalled() const noexcept {
     if (!running())
         return false;
-    const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+    // MONOTONIC now, matching the monotonic last_event_ts_/started_ts_ stores
+    // (UP-6) — a wall-clock backward step can no longer make this negative and
+    // falsely report not-stalled (which would suppress the poll fallback).
+    const std::int64_t now = nstat_mono_seconds();
     return nstat_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
                                    started_ts_.load(std::memory_order_relaxed), now,
                                    kNstatIdleFallbackSeconds);
@@ -841,6 +936,8 @@ bool NstatClient::running() const noexcept { return false; }
 std::vector<NstatFlowEvent> NstatClient::drain() { return {}; }
 std::uint64_t NstatClient::dropped() const noexcept { return ring_.dropped(); }
 std::uint64_t NstatClient::kernel_dropped() const noexcept { return 0; }
+std::uint64_t NstatClient::flow_reaped() const noexcept { return 0; }
+std::int64_t NstatClient::flow_table_size() const noexcept { return 0; }
 bool NstatClient::stalled() const noexcept { return false; }
 bool NstatClient::layout_mismatch() const noexcept { return false; }
 bool NstatClient::system_wide() const noexcept { return false; }
