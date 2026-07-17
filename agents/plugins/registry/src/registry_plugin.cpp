@@ -10,7 +10,9 @@
  *   "enumerate_keys"   — List subkeys.
  *   "enumerate_values" — List values in a key.
  *
- * Windows-only. Returns error on Linux/macOS.
+ * Windows-only. Reports registry|unsupported|... on Linux/macOS (no
+ * equivalent surface there — see the macOS parity notes for the flagged
+ * product decision).
  */
 
 #include <yuzu/plugin.hpp>
@@ -88,8 +90,8 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
-        ctx.write_output("error|registry not available on this platform");
-        return 1;
+        ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
+        return 0;
 #else
         if (action == "get_value")        return do_get_value(ctx, params);
         if (action == "set_value")        return do_set_value(ctx, params);

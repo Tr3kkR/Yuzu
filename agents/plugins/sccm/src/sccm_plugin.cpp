@@ -108,8 +108,7 @@ int do_client_version(yuzu::CommandContext& ctx) {
     }
 
 #else
-    ctx.write_output("installed|false");
-    ctx.write_output("error|platform not supported");
+    ctx.write_output("sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management");
 #endif
     return 0;
 }
@@ -162,7 +161,7 @@ int do_site(yuzu::CommandContext& ctx) {
     }
 
 #else
-    ctx.write_output("error|platform not supported");
+    ctx.write_output("sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management");
 #endif
     return 0;
 }

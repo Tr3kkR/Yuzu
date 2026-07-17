@@ -20,7 +20,9 @@
  * as "state not confirmed" and retry — especially on the disable path,
  * which is the security-relevant direction.
  *
- * Windows-only. Returns error on Linux/macOS.
+ * Windows-only. Reports rdp_control|unsupported|... on Linux/macOS (no
+ * equivalent surface there — see the macOS parity notes for the flagged
+ * product decision).
  */
 
 #include <yuzu/plugin.hpp>
@@ -317,9 +319,9 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
-        ctx.write_output(std::format("error|rdp_control not available on this platform ({})",
-                                     action));
-        return 1;
+        (void)action;
+        ctx.write_output("rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing");
+        return 0;
 #else
         if (action == "set_state") return do_set_state(ctx, params);
         if (action == "status")    return do_status(ctx);
