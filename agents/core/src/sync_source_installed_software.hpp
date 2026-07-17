@@ -30,17 +30,18 @@ struct SwEntry {
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags / macOS codesign)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
+    std::string bundle_id;        // macOS CFBundleIdentifier (macOS rows only)
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
 /// `inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
-/// signature_status|distro_id|distro_version` lines) into machine-scope
-/// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
-/// ignored; missing trailing tokens read as empty fields (tolerant), tokens
-/// beyond the 12th field are dropped (fields never shift).
+/// signature_status|distro_id|distro_version|bundle_id` lines) into
+/// machine-scope entries. Rows with any other prefix (`app|`, `user_app|`,
+/// `error|`, ...) are ignored; missing trailing tokens read as empty fields
+/// (tolerant), tokens beyond the 13th field are dropped (fields never shift).
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries

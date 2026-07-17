@@ -27,7 +27,7 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // collected_at on top of the blob. At 4 MiB the wire message would exceed the
 // 4 MiB receive ceiling and the RPC would be rejected before the handler runs —
 // a permanent tight retry loop (governance UP-6). A 3 MiB canonical blob is
-// ~20k v2 entries (~150 B/record with the 12-field blob-v2 layout), which
+// ~20k v2 entries (~150 B/record with the 13-field blob-v2 layout), which
 // matches kMaxEntries as the binding limit; no real machine reaches it, and an
 // over-cap host is dropped (governance UP-4) rather than looping. Lowering this
 // trades "outlier host skips" for "outlier host loops" — the right call for
@@ -41,7 +41,7 @@ constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
 // server's canonical hashes diverge → permanent always-full. This source's
 // field cap is kMaxFieldLen above (comment-coordinated with the server seam).
 
-// Sort/dedup key walks ALL 12 v2 fields in blob order. MUST mirror the server's
+// Sort/dedup key walks ALL 13 v2 fields in blob order. MUST mirror the server's
 // entry_less/entry_equal (software_inventory_store.cpp) or the two sides'
 // canonical hashes diverge → permanent always-full.
 bool entry_less(const SwEntry& a, const SwEntry& b) {
@@ -67,7 +67,9 @@ bool entry_less(const SwEntry& a, const SwEntry& b) {
         return a.signature_status < b.signature_status;
     if (a.distro_id != b.distro_id)
         return a.distro_id < b.distro_id;
-    return a.distro_version < b.distro_version;
+    if (a.distro_version != b.distro_version)
+        return a.distro_version < b.distro_version;
+    return a.bundle_id < b.bundle_id;
 }
 
 bool entry_equal(const SwEntry& a, const SwEntry& b) {
@@ -75,7 +77,7 @@ bool entry_equal(const SwEntry& a, const SwEntry& b) {
            a.install_date == b.install_date && a.kind == b.kind && a.ecosystem == b.ecosystem &&
            a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
            a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
-           a.distro_version == b.distro_version;
+           a.distro_version == b.distro_version && a.bundle_id == b.bundle_id;
 }
 
 } // namespace
@@ -94,12 +96,12 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         if (line.empty())
             continue;
 
-        // Split on '|' into up to 13 tokens (the `inv` prefix + 12 v2 fields).
-        // Anything past the 13th token is dropped — the same truncation the
-        // server's parse applies past field 12, so fields can never shift.
+        // Split on '|' into up to 14 tokens (the `inv` prefix + 13 v2 fields).
+        // Anything past the 14th token is dropped — the same truncation the
+        // server's parse applies past field 13, so fields can never shift.
         std::vector<std::string_view> tok;
         std::size_t fp = 0;
-        while (tok.size() < 13) {
+        while (tok.size() < 14) {
             std::size_t bar = line.find('|', fp);
             if (bar == std::string_view::npos) {
                 tok.push_back(line.substr(fp));
@@ -130,6 +132,7 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         e.signature_status = field(10);
         e.distro_id = field(11);
         e.distro_version = field(12);
+        e.bundle_id = field(13);
         // Drop a name that became empty AFTER clamping (e.g. a separator-only
         // name). The server's parse_software_blob drops empty-name rows, so the
         // agent must too or the two canonical hashes diverge → permanent
@@ -144,7 +147,7 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
     std::sort(entries.begin(), entries.end(), entry_less);
     entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
-    // Blob contract v2: 12 fields, 0x1F-separated, in this exact order, record-
+    // Blob contract v2: 13 fields, 0x1F-separated, in this exact order, record-
     // terminated 0x1E — byte-identical to the server's canonical_hash walk
     // (software_inventory_store.cpp). Append-only: never reorder.
     std::string canon;
@@ -173,6 +176,8 @@ std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
         canon += e.distro_id;
         canon += '\x1f';
         canon += e.distro_version;
+        canon += '\x1f';
+        canon += e.bundle_id;
         canon += '\x1e';
     }
     return canon;
@@ -188,7 +193,7 @@ SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor
             return std::nullopt;
         }
         LocalDispatcher dispatcher;
-        // Per-call capture cap: v2's 12-field rows (~200 B each raw) would
+        // Per-call capture cap: v2's 13-field rows (~200 B each raw) would
         // saturate the shared 2 MiB default around ~14k packages, turning a
         // dense host into a permanent silent cycle-skip. 3.5 MiB re-aligns the
         // capture ceiling with kMaxEntries (20k) as the binding limit: a 20k-row

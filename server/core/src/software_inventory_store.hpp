@@ -58,7 +58,9 @@ namespace yuzu::server {
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
 /// are kind=app with name/version/publisher only; distro_id/distro_version are
-/// stamped on every Linux row from /etc/os-release.
+/// stamped on every Linux row from /etc/os-release. macOS rows additionally
+/// carry publisher/signature_status (codesign-derived) and bundle_id (mdls
+/// CFBundleIdentifier) — every other ecosystem leaves bundle_id EMPTY.
 struct SoftwareEntry {
     std::string name;
     std::string version; // upstream version, release/revision stripped (v2)
@@ -69,9 +71,10 @@ struct SoftwareEntry {
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags / macOS codesign)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
+    std::string bundle_id;        // macOS CFBundleIdentifier (macOS rows only)
 };
 
 /// One fleet-query row: which agent carries which entry.

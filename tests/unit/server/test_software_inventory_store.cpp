@@ -49,23 +49,34 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
         throw std::runtime_error("swinv template: store failed to migrate");
 }};
 
-// THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the agent
-// computes the SAME hash for the SAME input (see tests/unit/test_inventory_sync.cpp
-// — identical constant). If the agent's and server's canonicalisation ever drift
-// by one byte, one of the two assertions fails and the hash-skip optimisation is
-// broken before it ships.
+// THE cross-side pin (ADR-0016 §4, blob contract v2 — 13 fields, bundle_id
+// appended last): the agent computes the SAME hash for the SAME input (see
+// tests/unit/test_inventory_sync.cpp — identical constant). If the agent's
+// and server's canonicalisation ever drift by one byte, one of the two
+// assertions fails and the hash-skip optimisation is broken before it ships.
 constexpr const char* kCrossPinHash =
-    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
+    "b5b7880f80f2ed8ae36444a8ed7b089c3d29b27328b647ec6621739985175e01";
+
+// Independent SINGLE-entry pin (identical literal in the agent suite —
+// tests/unit/test_inventory_sync.cpp), computed THERE from the agent's own
+// installed_software_canonical_blob + sha256_hex over {full_v2_entry()}
+// alone — NOT derived from this store's canonical_hash. The ingest-seam test
+// below ("v2 wire blob... hash-only follow-up") uses this literal as the
+// claimed agent hash, so that section can actually detect an agent/server
+// canonicalisation disagreement instead of comparing the server's
+// canonical_hash against itself (A-1.10 fix round finding A-6).
+constexpr const char* kCrossPinHashOneEntry =
+    "aabea807fca88d624d2fe0093766e58fa0652db6ec8e2f0feea39cef1a1841e7";
 
 // v1-form wire blob for one entry (4 fields 0x1F-separated, entry terminated
 // 0x1E). Post-v2 this doubles as the MIXED-VERSION fixture: a v1 agent's
-// record must still parse (fields 5–12 default-empty) — see the compat test.
+// record must still parse (fields 5–13 default-empty) — see the compat test.
 std::string blob1(const std::string& n, const std::string& v, const std::string& p,
                   const std::string& d) {
     return n + '\x1f' + v + '\x1f' + p + '\x1f' + d + '\x1e';
 }
 
-// Fully-populated v2 entry (every one of the 12 fields non-empty) for the
+// Fully-populated v2 entry (every one of the 13 fields non-empty) for the
 // round-trip / hash fixtures.
 SoftwareEntry full_v2_entry() {
     SoftwareEntry e;
@@ -81,13 +92,14 @@ SoftwareEntry full_v2_entry() {
     e.signature_status = "signed";
     e.distro_id = "fedora";
     e.distro_version = "40";
+    e.bundle_id = "com.example.bash";
     return e;
 }
 } // namespace
 
 TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
           "[software_inventory][hash]") {
-    // Deliberately unsorted + a duplicate, and one entry populating ALL 12 v2
+    // Deliberately unsorted + a duplicate, and one entry populating ALL 13 v2
     // fields: normalize() must sort + dedup to the same canonical bytes the
     // constant was computed from.
     std::vector<SoftwareEntry> e = {
@@ -97,6 +109,12 @@ TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
     };
     CHECK(SoftwareInventoryStore::canonical_hash(e) == kCrossPinHash);
+
+    // Single-entry pin, independently computed on the agent side (see
+    // tests/unit/test_inventory_sync.cpp): proves the server's own
+    // canonical_hash agrees with the agent's blob builder for exactly the
+    // fixture the ingest-seam test below uses as its claimed agent hash.
+    CHECK(SoftwareInventoryStore::canonical_hash({full_v2_entry()}) == kCrossPinHashOneEntry);
 }
 
 TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_inventory]") {
@@ -224,7 +242,7 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
     }
 }
 
-TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest seam",
+TEST_CASE("blob contract v2: 13-field entry round-trips through store and ingest seam",
           "[pg][software_inventory][v2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -249,6 +267,7 @@ TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest
         CHECK(g.signature_status == "signed");
         CHECK(g.distro_id == "fedora");
         CHECK(g.distro_version == "40");
+        CHECK(g.bundle_id == "com.example.bash");
 
         SoftwareFleetQuery q;
         q.name = "bash";
@@ -257,17 +276,23 @@ TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest
         REQUIRE(fl->size() == 1);
         CHECK((*fl)[0].entry.ecosystem == "rpm");
         CHECK((*fl)[0].entry.distro_version == "40");
+        CHECK((*fl)[0].entry.bundle_id == "com.example.bash");
     }
 
-    SECTION("v2 wire blob (12 fields) through the ingest seam") {
+    SECTION("v2 wire blob (13 fields, bundle_id included) through the ingest seam, then a "
+            "hash-only follow-up cross-pins as touched") {
         const std::string rec = e.name + '\x1f' + e.version + '\x1f' + e.publisher + '\x1f' +
                                 e.install_date + '\x1f' + e.kind + '\x1f' + e.ecosystem + '\x1f' +
                                 e.epoch + '\x1f' + e.release + '\x1f' + e.arch + '\x1f' +
                                 e.signature_status + '\x1f' + e.distro_id + '\x1f' +
-                                e.distro_version + '\x1e';
+                                e.distro_version + '\x1f' + e.bundle_id + '\x1e';
+        // The claimed hash is the INDEPENDENTLY agent-pinned literal (see
+        // kCrossPinHashOneEntry above), not this store's own canonical_hash —
+        // a self-referential agent_hash could never detect a one-sided drift
+        // between the two sides' canonicalisation (A-1.10 fix round finding A-6).
+        const std::string agent_hash = kCrossPinHashOneEntry;
         agentpb::InventoryReport rep;
-        (*rep.mutable_content_hashes())["installed_software"] =
-            SoftwareInventoryStore::canonical_hash({e});
+        (*rep.mutable_content_hashes())["installed_software"] = agent_hash;
         (*rep.mutable_plugin_data())["installed_software"] = rec;
         agentpb::InventoryAck ack;
         yuzu::server::ingest_inventory_report(store, "agent-v2-wire", rep, ack);
@@ -277,13 +302,28 @@ TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest
         REQUIRE(got->size() == 1);
         CHECK((*got)[0].signature_status == "signed");
         CHECK((*got)[0].ecosystem == "rpm");
+        CHECK((*got)[0].bundle_id == "com.example.bash");
+
+        // Cross-pin: a hash-only follow-up carrying the SAME hash the agent
+        // computed from its own 13-field blob (including bundle_id) must
+        // touch, not need_full — proving parse_software_blob's field(13)
+        // read and canonical_hash's bundle_id append agree byte-for-byte
+        // with the agent's blob builder for a real wire-shaped record, not
+        // just the in-memory fixture pin above. agent_hash is the literal
+        // pinned independently on the agent side, so this is a genuine
+        // cross-implementation proof, not the server agreeing with itself.
+        agentpb::InventoryReport rep2;
+        (*rep2.mutable_content_hashes())["installed_software"] = agent_hash; // no blob
+        agentpb::InventoryAck ack2;
+        yuzu::server::ingest_inventory_report(store, "agent-v2-wire", rep2, ack2);
+        CHECK(ack2.need_full_size() == 0); // touched, not need_full
     }
 }
 
-TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 empty (mixed-version)",
+TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-13 empty (mixed-version)",
           "[pg][software_inventory][v2]") {
     // The CHOSEN mixed-version behaviour, pinned so it stays a property, not an
-    // accident: an old agent's 4-field records parse with the 8 v2 fields
+    // accident: an old agent's 4-field records parse with the 9 v2 fields
     // default-empty, store cleanly, and the server hash is the v2-form recomputed
     // over those empties (so the OLD agent's v1 claimed hash will keep
     // mismatching → the documented bounded ~2-RPC/day loop until agent upgrade,
@@ -317,8 +357,9 @@ TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 emp
     CHECK(g.signature_status.empty());
     CHECK(g.distro_id.empty());
     CHECK(g.distro_version.empty());
+    CHECK(g.bundle_id.empty());
 
-    // The stored hash is the v2-form recompute (12-field canon over the parsed
+    // The stored hash is the v2-form recompute (13-field canon over the parsed
     // rows), NOT the agent's v1 claim: a follow-up hash-only report with the v1
     // claim must nack need_full.
     agentpb::InventoryReport rep2;
@@ -342,20 +383,24 @@ TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 emp
     CHECK(ack3.need_full_size() == 0);
 }
 
-TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and re-runs "
-          "idempotently",
+TEST_CASE("migrations v5+v7 backfill '' into v2/bundle_id columns for pre-existing rows and "
+          "re-run idempotently",
           "[pg][software_inventory][v2]") {
-    // Upgrade semantics on a live table: rows written before v5 must read back
-    // with '' in every v2 column (the ADD COLUMN ... DEFAULT '' guarantee), and
-    // re-running v5 over an already-migrated table (schema_meta rewind, the
-    // partial-migration retry case) must succeed (IF NOT EXISTS, v4 precedent).
+    // Upgrade semantics on a live table: rows written before v5/v7 must read back
+    // with '' in every v2 column AND bundle_id (the ADD COLUMN ... DEFAULT ''
+    // guarantee), and re-running v5/v7 over an already-migrated table (schema_meta
+    // rewind, the partial-migration retry case) must succeed (IF NOT EXISTS, v4
+    // precedent).
     //
     // To genuinely reproduce a v4-era table (not just an omitted-column INSERT
-    // into an already-v5 table, which would pass for the wrong reason — ordinary
-    // SQL column-default semantics, not migration backfill), this DROPs the 8
-    // v2 columns after the first construction, seeds the row into that
-    // genuinely-4-column table, then rewinds schema_meta and reconstructs so v5
-    // re-adds the columns over live pre-existing data.
+    // into an already-v5-and-v7 table, which would pass for the wrong reason —
+    // ordinary SQL column-default semantics, not migration backfill), this DROPs
+    // the 8 v2 columns AND bundle_id after the first construction, seeds the row
+    // into that genuinely-4-column table, then rewinds schema_meta and
+    // reconstructs so v5 AND v7 both re-add their columns over live pre-existing
+    // data (schema_meta version 4 is before both migrations, so the rewind
+    // exercises migration 7's own ADD COLUMN/backfill path, not just its
+    // IF NOT EXISTS no-op).
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -363,8 +408,8 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
     }
-    { // revert to a genuine v4 shape: drop the 8 v2 columns, seed a legacy row,
-      // rewind the recorded version to 4
+    { // revert to a genuine v4 shape: drop the 9 v2/bundle_id columns, seed a
+      // legacy row, rewind the recorded version to 4
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         pg::PgResult drop = pg::exec_params(
@@ -372,7 +417,8 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
             "ALTER TABLE software_inventory_store.installed_software "
             "DROP COLUMN kind, DROP COLUMN ecosystem, DROP COLUMN epoch, "
             "DROP COLUMN release, DROP COLUMN arch, DROP COLUMN signature_status, "
-            "DROP COLUMN distro_id, DROP COLUMN distro_version",
+            "DROP COLUMN distro_id, DROP COLUMN distro_version, "
+            "DROP COLUMN bundle_id",
             std::vector<std::string>{});
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
         pg::PgResult ins = pg::exec_params(
@@ -388,7 +434,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
             std::vector<std::string>{});
         REQUIRE(back.status() == PGRES_COMMAND_OK);
     }
-    SoftwareInventoryStore store{pool}; // re-runs v5, ADD COLUMN over the live row
+    SoftwareInventoryStore store{pool}; // re-runs v5+v7, ADD COLUMN over the live row
     REQUIRE(store.is_open());
 
     auto got = store.get_agent_software("agent-legacy");
@@ -399,6 +445,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
     CHECK((*got)[0].ecosystem.empty());
     CHECK((*got)[0].signature_status.empty());
     CHECK((*got)[0].distro_version.empty());
+    CHECK((*got)[0].bundle_id.empty()); // migration 7's own ADD COLUMN/backfill, exercised here
 }
 
 TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",

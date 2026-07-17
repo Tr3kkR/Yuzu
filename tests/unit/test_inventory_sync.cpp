@@ -29,12 +29,24 @@ using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 
 namespace {
-// THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the server
-// computes the SAME hash for the SAME input
+// THE cross-side pin (ADR-0016 §4, blob contract v2 — 13 fields, bundle_id
+// appended last): the server computes the SAME hash for the SAME input
 // (tests/unit/server/test_software_inventory_store.cpp — identical constant).
 // A one-byte drift in either canonicalisation fails one assertion.
 constexpr const char* kCrossPinHash =
-    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
+    "b5b7880f80f2ed8ae36444a8ed7b089c3d29b27328b647ec6621739985175e01";
+
+// Independent SINGLE-entry pin (identical literal in the server suite —
+// tests/unit/server/test_software_inventory_store.cpp). Computed HERE from
+// this file's own installed_software_canonical_blob + sha256_hex over
+// {full_v2_entry()} alone (no sort/dedup interaction, unlike kCrossPinHash's
+// 4-entry fixture). The server suite's ingest-seam "hash-only follow-up"
+// test uses this literal as its claimed agent hash instead of asking the
+// server to hash its own fixture and calling the result "the agent's hash" —
+// that self-referential form could never have caught a one-sided drift
+// between the two canonicalisations.
+constexpr const char* kCrossPinHashOneEntry =
+    "aabea807fca88d624d2fe0093766e58fa0652db6ec8e2f0feea39cef1a1841e7";
 
 // Fully-populated v2 entry — the identical fixture the server pin test uses.
 SwEntry full_v2_entry() {
@@ -51,12 +63,13 @@ SwEntry full_v2_entry() {
     e.signature_status = "signed";
     e.distro_id = "fedora";
     e.distro_version = "40";
+    e.bundle_id = "com.example.bash";
     return e;
 }
 } // namespace
 
 TEST_CASE("installed_software canonical hash matches the cross-pin", "[sync][hash]") {
-    // Unsorted + duplicate + one entry populating ALL 12 v2 fields:
+    // Unsorted + duplicate + one entry populating ALL 13 v2 fields:
     // canonical_blob must sort + dedup to the exact bytes the constant was
     // computed from.
     std::vector<SwEntry> e = {
@@ -66,6 +79,12 @@ TEST_CASE("installed_software canonical hash matches the cross-pin", "[sync][has
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
     };
     CHECK(sha256_hex(installed_software_canonical_blob(e)) == kCrossPinHash);
+
+    // Single-entry pin: the literal the server suite's ingest-seam test uses
+    // as an independently-agent-computed claimed hash (A-1.10 fix round
+    // finding A-6).
+    CHECK(sha256_hex(installed_software_canonical_blob({full_v2_entry()})) ==
+          kCrossPinHashOneEntry);
 }
 
 TEST_CASE("parse_installed_apps_output keeps inv| rows only (blob v2)", "[sync][parse]") {
@@ -106,15 +125,17 @@ TEST_CASE("parse_installed_apps_output tolerates short and over-long inv rows",
         CHECK(entries[0].publisher.empty());
         CHECK(entries[0].kind.empty());
         CHECK(entries[0].distro_version.empty());
+        CHECK(entries[0].bundle_id.empty());
     }
-    SECTION("tokens past the 12th field are dropped, fields do not shift") {
+    SECTION("tokens past the 13th field are dropped, fields do not shift") {
         auto entries = parse_installed_apps_output(
-            "inv|N|v|p|d|package|deb|1|2|amd64|sig|debian|12|EXTRA\n");
+            "inv|N|v|p|d|package|deb|1|2|amd64|sig|debian|12|com.example.n|EXTRA\n");
         REQUIRE(entries.size() == 1);
         CHECK(entries[0].name == "N");
         CHECK(entries[0].distro_id == "debian");
-        CHECK(entries[0].distro_version == "12"); // EXTRA dropped — mirrors the
-                                                  // server's parse past field 12
+        CHECK(entries[0].distro_version == "12");
+        CHECK(entries[0].bundle_id == "com.example.n");
+        // EXTRA dropped — mirrors the server's parse past field 13.
     }
     SECTION("empty-name rows are dropped") {
         CHECK(parse_installed_apps_output("inv||1.0\n").empty());
@@ -327,15 +348,15 @@ TEST_CASE("a name that becomes empty after clamping is dropped (UP-1 hash parity
 }
 
 TEST_CASE("canonical blob is the exact wire format the server parses", "[sync][hash]") {
-    // Pins the byte layout (not just the hash): sorted, 0x1F between the 12 v2
+    // Pins the byte layout (not just the hash): sorted, 0x1F between the 13 v2
     // fields, 0x1E terminating each entry. The server's parse_software_blob
     // reads this same form (tests/unit/server/test_software_inventory_store.cpp).
     std::vector<SwEntry> e = {{"B", "2", "", ""}, {"A", "1", "P", "D"}}; // unsorted
-    // A|1|P|D|×8-empty<rec>  B|2|×10-empty<rec>  (| == 0x1F, <rec> == 0x1E);
-    // 11 separators per record regardless of how many trailing fields are empty.
+    // A|1|P|D|×9-empty<rec>  B|2|×11-empty<rec>  (| == 0x1F, <rec> == 0x1E);
+    // 12 separators per record regardless of how many trailing fields are empty.
     CHECK(installed_software_canonical_blob(e) ==
-          std::string("A\0371\037P\037D\037\037\037\037\037\037\037\037\036"
-                      "B\0372\037\037\037\037\037\037\037\037\037\037\036"));
+          std::string("A\0371\037P\037D\037\037\037\037\037\037\037\037\037\036"
+                      "B\0372\037\037\037\037\037\037\037\037\037\037\037\036"));
 }
 
 TEST_CASE("empty inventory parses to no entries and a stable empty hash",

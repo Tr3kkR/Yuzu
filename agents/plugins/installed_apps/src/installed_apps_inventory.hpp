@@ -7,8 +7,13 @@
 // synthesised. Every function here is a pure string operation -- no popen, no
 // platform #ifdefs -- so the unit test (test_installed_apps_inventory.cpp)
 // exercises the exact code the plugin runs against per-ecosystem fixture
-// vectors, without needing dpkg/rpm/pacman/apk on the test host (same
-// header-for-testability pattern as installed_apps_registry_utf8.hpp, #1662).
+// vectors, without needing dpkg/rpm/pacman/apk/system_profiler/codesign/mdls
+// on the test host (same header-for-testability pattern as
+// installed_apps_registry_utf8.hpp, #1662). The macOS parsers
+// (parse_macos_app_headers/parse_codesign_output/parse_mdls_bundle_id_output)
+// take the SUBPROCESS OUTPUT TEXT as input -- the plugin owns invoking
+// system_profiler/codesign/mdls, this header owns making sense of what comes
+// back.
 
 #include <algorithm>
 #include <cctype>
@@ -22,7 +27,7 @@ namespace yuzu::installed_apps::inventory {
 // One `inv|` row. Member order == wire order after the prefix -- the blob
 // contract v2 field order the agent core hashes and the server re-parses:
 //   name, version, publisher, install_date, kind, ecosystem, epoch, release,
-//   arch, signature_status, distro_id, distro_version
+//   arch, signature_status, distro_id, distro_version, bundle_id
 struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
@@ -33,9 +38,10 @@ struct InvRecord {
     std::string epoch;
     std::string release;      // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags / macOS codesign)
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
+    std::string bundle_id;        // macOS CFBundleIdentifier (macOS rows only)
 };
 
 // Epoch/version/release triple shared by the deb and pacman splitters.
@@ -50,6 +56,26 @@ struct ApkParts {
     std::string name;
     std::string version;
     std::string release;
+};
+
+// One application header parsed from `system_profiler SPApplicationsDataType
+// -detailLevel mini` output (piped through the macOS collector's own grep
+// '^ {4}\w|Version:|Last Modified:|Location:'). Covers exactly what the
+// macOS `list`/`query`/`list_inventory` collectors need: name (the header
+// text), version/last_modified for the legacy row, and location (Location:,
+// the bundle path) for list_inventory's per-app codesign/mdls calls.
+struct MacosAppHeader {
+    std::string name;
+    std::string version;
+    std::string last_modified;
+    std::string location;
+};
+
+// codesign -dvvv <bundle> 2>&1 -derived signing identity. "signed"/"unsigned"
+// only -- never a fabricated third state (see parse_codesign_output below).
+struct MacosSignature {
+    std::string signature_status; // "signed" | "unsigned"
+    std::string publisher;        // first Authority= line's value, when signed
 };
 
 namespace detail {
@@ -301,6 +327,118 @@ inline std::optional<InvRecord> parse_apk_inv_line(std::string_view line) {
     return r;
 }
 
+// Application headers in `system_profiler SPApplicationsDataType
+// -detailLevel mini` output are indented by exactly 4 spaces -- the same
+// anchor the macOS collector's own grep '^ {4}\w' relies on to capture them
+// at all -- while Version:/Last Modified:/Location: metadata always sits
+// deeper (6 spaces). Metadata-line detection is keyed off that DEPTH for
+// ALL THREE labels, never off matching the label text alone: an app
+// literally named "Version", "Last Modified", or "Location" (all plausible
+// third-party app names) produces a bare 4-space header line whose trimmed
+// text equals a metadata prefix -- matching on text alone would misread
+// that header as the PRECEDING app's own field instead of starting a new
+// app, silently dropping the app from legacy `list`/`query` and v2
+// `list_inventory` alike. Worse, a bare "Label:" header carries no trailing
+// value, so feeding it into the metadata-value extraction without the depth
+// guard throws std::out_of_range rather than merely omitting the app (A-1
+// fix round regression: this exact bug shipped for Version:/Last Modified:
+// when an earlier pass added the depth guard for Location: only -- the
+// three labels must always move together).
+// `out` is the collector's already-grep-filtered capture.
+inline std::vector<MacosAppHeader> parse_macos_app_headers(std::string_view out) {
+    std::vector<MacosAppHeader> apps;
+    MacosAppHeader current;
+    std::size_t pos = 0;
+    while (pos <= out.size()) {
+        std::size_t eol = out.find('\n', pos);
+        if (eol == std::string_view::npos)
+            eol = out.size();
+        std::string_view raw = out.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (!raw.empty() && raw.back() == '\r')
+            raw.remove_suffix(1);
+
+        const std::size_t start = raw.find_first_not_of(" \t");
+        if (start == std::string_view::npos)
+            continue;
+        const bool is_metadata = start > 4;
+        const std::string_view line = raw.substr(start);
+
+        // Metadata VALUE text after "Label:" -- offset by the colon alone
+        // (+1), never +2: a label with no trailing value (e.g. a genuinely
+        // empty field) would put find(':')+2 past the view's end and
+        // std::string_view::substr would throw std::out_of_range. A single
+        // leading space (the normal "Label: value" shape) is stripped
+        // separately, tolerating a missing one instead of assuming it.
+        const auto metadata_value = [](std::string_view text) {
+            std::string_view value = text.substr(text.find(':') + 1);
+            if (!value.empty() && value.front() == ' ')
+                value.remove_prefix(1);
+            return std::string(value);
+        };
+
+        if (is_metadata && line.starts_with("Version:")) {
+            current.version = metadata_value(line);
+        } else if (is_metadata && line.starts_with("Last Modified:")) {
+            current.last_modified = metadata_value(line);
+        } else if (is_metadata && line.starts_with("Location:")) {
+            current.location = metadata_value(line);
+        } else if (!line.empty() && line.back() == ':') {
+            // A new application header -- emit whatever was accumulated first.
+            if (!current.name.empty())
+                apps.push_back(current);
+            current = MacosAppHeader{};
+            current.name = std::string(line.substr(0, line.size() - 1));
+        }
+    }
+    if (!current.name.empty())
+        apps.push_back(current);
+    return apps;
+}
+
+// `codesign -dvvv <bundle> 2>&1` output -> signing identity. A recognised
+// `Authority=` line means signed (publisher = that line's value, the leaf
+// signing identity codesign itself reports); "code object is not signed at
+// all" AND any other output without an Authority= line (e.g. an ad-hoc
+// signature) both fold into "unsigned" -- the same affirmative-negative-
+// claim policy this header documents for the rpm collector (an indeterminate
+// result reads as a stronger claim than "unrecorded", deliberate, not an
+// oversight), never a fabricated third state.
+inline MacosSignature parse_codesign_output(std::string_view out) {
+    MacosSignature info;
+    std::size_t pos = 0;
+    while (pos <= out.size()) {
+        std::size_t eol = out.find('\n', pos);
+        if (eol == std::string_view::npos)
+            eol = out.size();
+        std::string_view line = out.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (line.starts_with("Authority=")) {
+            info.publisher = std::string(line.substr(std::string_view("Authority=").size()));
+            break; // first Authority= line is the leaf signing identity
+        }
+    }
+    info.signature_status = info.publisher.empty() ? "unsigned" : "signed";
+    return info;
+}
+
+// `mdls -name kMDItemCFBundleIdentifier <bundle>` output -> CFBundleIdentifier.
+// Honest-empty when the output doesn't match the stable
+// "kMDItemCFBundleIdentifier = ..." shape at all (mdls's own error text, e.g.
+// a path that doesn't resolve), or the attribute is genuinely unset (mdls
+// prints the literal unquoted "(null)").
+inline std::string parse_mdls_bundle_id_output(std::string_view out) {
+    constexpr std::string_view kPrefix = "kMDItemCFBundleIdentifier = ";
+    if (!out.starts_with(kPrefix))
+        return {};
+    const std::string_view val = out.substr(kPrefix.size());
+    if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
+        return std::string(val.substr(1, val.size() - 2));
+    return {}; // "(null)" (unset attribute) or any other unquoted shape
+}
+
 // Field values must never corrupt the row framing ('|') nor carry the internal
 // query separator or line breaks. Package fields are single-line tokens, so
 // deletion (matching the agent core's clamp_field philosophy for 0x1F/0x1E) is
@@ -317,14 +455,15 @@ inline std::string pipe_safe(std::string_view v) {
     return out;
 }
 
-// The one place that knows the 13-token `inv|` row layout. Keep in lockstep
+// The one place that knows the 14-token `inv|` row layout. Keep in lockstep
 // with parse_installed_apps_output (agents/core/src/sync_source_installed_software.cpp).
 inline std::string format_inv_row(const InvRecord& r) {
     std::string out = "inv";
-    const std::string_view fields[12] = {r.name,  r.version,   r.publisher,
+    const std::string_view fields[13] = {r.name,  r.version,   r.publisher,
                                          r.install_date, r.kind, r.ecosystem,
                                          r.epoch, r.release,   r.arch,
-                                         r.signature_status, r.distro_id, r.distro_version};
+                                         r.signature_status, r.distro_id, r.distro_version,
+                                         r.bundle_id};
     for (const auto& f : fields) {
         out.push_back('|');
         out += pipe_safe(f);
