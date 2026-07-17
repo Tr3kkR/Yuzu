@@ -72,9 +72,52 @@ Triggers for loading each doc:
 | **MEDIUM** | Missing input validation, weak crypto params, missing audit event | Requires acknowledgment. Should be fixed in same PR or tracked. |
 | **LOW** | Defense-in-depth suggestions, hardening opportunities | Informational. Fix when convenient. |
 
+## New authz surface / principal class (LOAD-BEARING — added after #2202)
+
+A rebase of already-gated engine-principal code shipped **4 HIGH** auth
+findings past a 14-agent `/governance` run + two Hermes passes; an
+external panel caught all four. The lesson: review *chokepoint coverage*,
+not *file coverage*. When a diff adds/changes a principal class,
+`auth_source`, authorization entry point, or a capability reachable by a
+new kind of actor:
+
+- **Every chokepoint, proven.** Enumerate ALL authz entry points the new
+  actor can reach — `require_permission`, `require_scoped_permission`,
+  `require_admin`, every inline `check_permission`/`check_scoped_permission`,
+  `authorize_list_read` (`AuthRoutes::require_list_read` + MCP/dashboard
+  wrappers), the MCP tier gate, any service-scoped/elevation/legacy
+  fallback — and prove allow/deny/step-up at each. **List/fan-out reads
+  of per-agent data are a DISTINCT chokepoint** — they MUST use the
+  admit-then-filter `authorize_list_read` (World A, ADR-0017), never a
+  bare global `require_permission` (inert for a confined operator, fails
+  *open* on a corrupt `rbac.db`); a carve-out that gets single-target
+  checks right but leaks a fleet-wide list is the same failure as #2202.
+  A carve-out on only the new routes (or only where a sibling guard
+  already sits) is the #2202 gap. Grep the chokepoints (incl.
+  `authorize_list_read`/`require_list_read`).
+- **Default config.** Re-run the reasoning with the security toggle in
+  its DEFAULT state (e.g. RBAC *off* — the default). #2202's fleet-wide
+  read only triggered with RBAC off; nobody exercised it.
+- **Branch reachability.** Every new authz/resolution branch must have a
+  production caller — grep for one. Test-only ⇒ dead code or a
+  shipped-incomplete deliverable (#2202 Blocker 4).
+- **Fail-closed reads.** A store/DB failure in the authz/identity path —
+  a new read OR an existing resolver this change makes newly load-bearing
+  for the new actor — must deny or refuse boot, never read as
+  empty/absent-and-allow (engaged-empty vs `nullopt`/`std::expected`).
+- **Audit attribution.** Trace the new actor through EVERY audit helper
+  (`make_audit_event`, `emit_behavioral_audit`, inline `audit_log`) and
+  prove the persisted row's `principal`, `principal_class`, `auth_source`,
+  effective role, and denied-path attribution are all *correct* — never
+  the creating human or a presentation-only default. "Events emitted" is
+  not enough (#2202 Blocker 3: engine actions stamped `principal_class=agent`).
+- **Comment-vs-code.** Diff each comment near a new authz branch against
+  the code — #2202 shipped one asserting the opposite of its behavior.
+
 ## Review Checklist
 
 When performing deep-dive review:
+- [ ] New principal class / authz entry point: carve-out proven at EVERY chokepoint, in the DEFAULT config, every new branch has a production caller (see section above)
 - [ ] All SQL queries use parameterized statements (`?` placeholders)
 - [ ] All REST endpoints check RBAC permissions
 - [ ] No credentials, tokens, or keys appear in log messages or error responses
