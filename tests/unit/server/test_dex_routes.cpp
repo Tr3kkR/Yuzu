@@ -90,7 +90,9 @@ std::optional<int> family_score(const std::string& html, const std::string& fami
 // output, View 2) — nullopt when no Health-score tile rendered at all (mon==0 or the
 // denominator is 0, so the score is suppressed rather than shown as a number).
 std::optional<int> group_score(const std::string& html) {
-    const auto lbl_pos = html.find("Health score");
+    // Anchor on the tile's LABEL div — the drill-down's subnav also contains a
+    // bare "Health score" link text, which must not match.
+    const auto lbl_pos = html.find("<div class=\"l\">Health score");
     if (lbl_pos == std::string::npos)
         return std::nullopt;
     const auto n_pos = html.rfind("<div class=\"n ", lbl_pos);
@@ -350,6 +352,7 @@ TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator
     fleet.total_online = 10;
     fleet.windows_online = 7;
     fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "darwin"};
 
     const auto html_before =
         render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "macos");
