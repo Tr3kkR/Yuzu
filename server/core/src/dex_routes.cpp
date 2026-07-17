@@ -593,7 +593,6 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
 
     // -- Coverage scope: which platforms are in view ("all" = connected fleet) --
     auto norm = [](std::string o) -> std::string {
@@ -606,6 +605,17 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     const std::string osf = (os_filter == "windows" || os_filter == "linux" || os_filter == "macos")
                                 ? os_filter
                                 : "all";
+
+    // -- Per-OS scoping (#1746): "all" keeps the established all-connected
+    // composite (windows_online + the all-OS signal rollup) — byte-unchanged. A
+    // single-OS chip scores that OS against its OWN online count and its OWN
+    // signals, so a Linux/macOS family score is never silently Windows-derived. --
+    const int64_t N_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
+    const auto signals_scoped =
+        osf == "all" ? store->dex_signal_summary(since) : store->dex_signal_summary(since, osf);
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -628,8 +638,10 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     // -- Per-family health score: the ONE canonical composite, projected per family
     // (score = 100 − that family's deduction; same formula as dex_compute_health).
-    // Windows-denominated today (the existing fleet composite); a per-OS read is the
-    // shared follow-up. --
+    // Scoped per #1746: the "all" chip stays the fleet-wide composite
+    // (windows_online + all-OS signals); a single-OS chip is now scored against
+    // N_scoped/signals_scoped ABOVE — that OS's own online count and own signals,
+    // never a Windows-derived number read under a Linux/macOS heading. --
     std::size_t total_types = dex_catalogued_type_count();
     std::size_t mon_types = 0;
     for (const auto& g : dex_signal_groups())
@@ -665,16 +677,16 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     h += "<div class=\"gp-fgrid\">";
     for (const auto& g : dex_signal_groups()) {
-        const auto r = dex_family_rollup(g, signals);
+        const auto r = dex_family_rollup(g, signals_scoped);
         int mon = 0;
         for (const char* t : g.types)
             if (monitored(t))
                 ++mon;
         const bool dark = (mon == 0);
         double score = -1.0;
-        if (!dark && fleet.windows_online > 0)
+        if (!dark && N_scoped > 0)
             score = std::clamp(
-                100.0 - dex_family_health_deduction(g, signals, fleet.windows_online), 0.0, 100.0);
+                100.0 - dex_family_health_deduction(g, signals_scoped, N_scoped), 0.0, 100.0);
         const char* tone =
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
@@ -712,7 +724,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // so nothing the fleet reports is silently dropped.)
     {
         std::vector<const DexSignalCount*> extras;
-        for (const auto& sig : signals) {
+        for (const auto& sig : signals_scoped) {
             bool known = false;
             for (const auto& g : dex_signal_groups()) {
                 for (const char* t : g.types)

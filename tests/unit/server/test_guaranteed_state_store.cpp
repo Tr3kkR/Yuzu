@@ -924,6 +924,70 @@ TEST_CASE("GuaranteedStateStore: multi-signal summary, hang-aware apps, boot sta
     CHECK(dh[3].metric == 43210.0);
 }
 
+TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; "
+          "empty stays all-OS (#1746)",
+          "[guaranteed_state_store][dex][signals]") {
+    // The Catalogue's single-OS filter needs its own signal rollup, not the
+    // all-fleet composite read under a Linux/macOS heading. `platform` is an
+    // ADDITIVE filter on top of the existing GROUP BY obs_type — proven here on
+    // both a type shared across all three platforms (process.crashed) and a type
+    // exclusive to one (network.wifi_drop, macOS-only).
+    GuaranteedStateStore store(":memory:");
+    auto sig = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = type;
+        e.severity = "info";
+        e.detail_json = "{\"subject\":\"x\",\"platform\":\"" + plat + "\"}";
+        e.timestamp = ts;
+        REQUIRE(store.insert_event(e));
+    };
+    sig("w1", "agent-A", "process.crashed", "windows", "2026-06-09T10:00:00Z");
+    sig("w2", "agent-B", "process.crashed", "windows", "2026-06-09T10:05:00Z");
+    sig("l1", "agent-C", "process.crashed", "linux", "2026-06-09T10:10:00Z");
+    sig("m1", "agent-D", "process.crashed", "macos", "2026-06-09T10:15:00Z");
+    sig("m2", "agent-D", "network.wifi_drop", "macos", "2026-06-09T10:20:00Z");
+
+    // Scoped to macOS: only macOS's own rows — its slice of process.crashed AND
+    // its exclusive network.wifi_drop. Windows/Linux crashes never leak in.
+    auto mac = store.dex_signal_summary("", "macos");
+    REQUIRE(mac.size() == 2);
+    CHECK(mac[0].obs_type == "network.wifi_drop"); // tie at count=1, obs_type ASC
+    CHECK(mac[0].count == 1);
+    CHECK(mac[0].distinct_devices == 1);
+    CHECK(mac[1].obs_type == "process.crashed");
+    CHECK(mac[1].count == 1);
+    CHECK(mac[1].distinct_devices == 1);
+
+    // Scoped to windows: 2 crashes, 2 devices; the macOS-only wifi_drop is absent.
+    auto win = store.dex_signal_summary("", "windows");
+    REQUIRE(win.size() == 1);
+    CHECK(win[0].obs_type == "process.crashed");
+    CHECK(win[0].count == 2);
+    CHECK(win[0].distinct_devices == 2);
+
+    // Scoped to linux: 1 crash, 1 device.
+    auto lin = store.dex_signal_summary("", "linux");
+    REQUIRE(lin.size() == 1);
+    CHECK(lin[0].obs_type == "process.crashed");
+    CHECK(lin[0].count == 1);
+    CHECK(lin[0].distinct_devices == 1);
+
+    // Unscoped (platform="", the default parameter): the full all-OS rollup is
+    // unchanged — process.crashed spans all 3 platforms (4 rows, 4 distinct
+    // agents), network.wifi_drop is macOS-only (1 row).
+    auto all = store.dex_signal_summary();
+    REQUIRE(all.size() == 2);
+    CHECK(all[0].obs_type == "process.crashed"); // count=4 beats wifi_drop's count=1
+    CHECK(all[0].count == 4);
+    CHECK(all[0].distinct_devices == 4);
+    CHECK(all[1].obs_type == "network.wifi_drop");
+    CHECK(all[1].count == 1);
+}
+
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");

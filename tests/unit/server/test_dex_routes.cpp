@@ -67,6 +67,25 @@ void seed_boot(GuaranteedStateStore& store, const std::string& id, const std::st
                 ts);
 }
 
+// Extracts one family's rendered health score from a Catalogue View-1 grid
+// (render_dex_catalogue_fragment output) — nullopt when the card shows the
+// suppressed "&mdash;" marker instead of a number. Anchors on the family name
+// inside its own "fn" div so distinct cards never collide.
+std::optional<int> family_score(const std::string& html, const std::string& family) {
+    const auto name_pos = html.find("<div class=\"fn\">" + family + "<span");
+    if (name_pos == std::string::npos)
+        return std::nullopt;
+    const auto fev_pos = html.find("<div class=\"fev", name_pos);
+    if (fev_pos == std::string::npos)
+        return std::nullopt;
+    const auto gt = html.find('>', fev_pos);
+    const auto lt = html.find('<', gt);
+    const std::string inner = html.substr(gt + 1, lt - gt - 1);
+    if (inner.find("mdash") != std::string::npos)
+        return std::nullopt;
+    return std::stoi(inner);
+}
+
 // Route fragments filter signals by a now()-relative window (the handler computes
 // `dex_iso_since(window_to_days)` as the cutoff), so seeds with hardcoded calendar
 // dates age out of the window and the route tests start failing once the wall
@@ -176,6 +195,99 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
         CHECK(html.find(fam) != std::string::npos);
     // a card drills into the family-detail fragment
     CHECK(html.find("/fragments/dex/catalogue/group?name=") != std::string::npos);
+}
+
+TEST_CASE("DEX catalogue: single-OS filter scores its OWN denominator + signals, "
+          "no cross-OS bleed (#1746)",
+          "[dex][routes][catalogue]") {
+    GuaranteedStateStore store(":memory:");
+    // network.wifi_drop (Network family) is monitored on both windows+macos
+    // (dex_obs_platforms); seed it macOS-only so the family's macOS-scoped rollup
+    // has exactly one signal, with a KNOWN max_signal_devices.
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 10;
+    fleet.windows_online = 7;
+    fleet.macos_online = 3;
+
+    const auto html_before = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    const auto score_before = family_score(html_before, "Network");
+    REQUIRE(score_before.has_value()); // (b) numeric — never suppressed once macos_online > 0
+
+    // Hand-computed against the SAME macOS-scoped signal: "Network" is "med"
+    // severity (6 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both MAC-1/MAC-2 hit); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected_macos =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+    CHECK(*score_before == expected_macos);
+
+    // (a) Differential: had the route kept borrowing fleet.windows_online as the
+    // denominator (the #1746 bug) for this SAME macOS signal, the score would be
+    // different — proves macos_online, not windows_online, actually drives the
+    // number.
+    const double impact_if_windows_online = 2.0 / 7.0;
+    const int score_if_windows_online =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_if_windows_online, 0.0, 100.0) + 0.5);
+    CHECK(*score_before != score_if_windows_online);
+
+    // Now add a Windows-only signal in the SAME family, on MORE devices than the
+    // macOS one — if signals_scoped were still the all-OS aggregate (the bug),
+    // this would dominate max_signal_devices and move the macOS card's score.
+    seed_signal(store, "w1", "WIN-1", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "w2", "WIN-2", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "w3", "WIN-3", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:20:00Z");
+    const auto html_after = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    const auto score_after = family_score(html_after, "Network");
+    REQUIRE(score_after.has_value());
+    CHECK(*score_after == *score_before); // no cross-OS contamination
+
+    // The Windows lens scores off windows_online + the Windows-only signal.
+    const auto html_win = render_dex_catalogue_fragment(&store, "", 7, fleet, "windows");
+    const auto score_win = family_score(html_win, "Network");
+    REQUIRE(score_win.has_value());
+    const double impact_win = 3.0 / 7.0; // 3 devices / windows_online(7)
+    const int expected_win =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_win, 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected_win);
+}
+
+TEST_CASE("DEX catalogue: os=windows lens matches the unchanged 'all' composite "
+          "(no regression, #1746)",
+          "[dex][routes][catalogue]") {
+    // A Windows-only fleet reporting Windows-only signals: the "all" lens (kept
+    // byte-unchanged by #1746) and the "windows" lens now compute off the SAME
+    // denominator (windows_online) and the SAME signals (nothing else to scope
+    // away), so they must render the identical score — proving the per-OS
+    // refactor didn't regress the pre-existing Windows-denominated composite.
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "c1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:00:00Z");
+    seed_crash(store, "c2", "WS-2", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:05:00Z");
+    seed_hang(store, "h1", "WS-3", "chrome.exe", kDayB + "T10:10:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 5;
+    fleet.windows_online = 5;
+    fleet.connected_os = {"windows"};
+
+    const auto html_all = render_dex_catalogue_fragment(&store, "", 7, fleet, "all");
+    const auto html_win = render_dex_catalogue_fragment(&store, "", 7, fleet, "windows");
+    const auto score_all = family_score(html_all, "App reliability");
+    const auto score_win = family_score(html_win, "App reliability");
+    REQUIRE(score_all.has_value());
+    REQUIRE(score_win.has_value());
+    CHECK(*score_all == *score_win);
+    // Exact value: "App reliability" is "high" severity (12 pts); max_signal_devices
+    // = 2 (process.crashed on WS-1+WS-2 beats process.hung's 1); N=windows_online=5.
+    const int expected = static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 5.0), 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected);
 }
 
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",

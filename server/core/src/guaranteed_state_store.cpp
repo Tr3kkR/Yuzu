@@ -1196,7 +1196,7 @@ GuaranteedStateStore::dex_crashes_by_day(const std::string& since) const {
 }
 
 std::vector<DexSignalCount>
-GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
+GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::string& platform) const {
     std::shared_lock lock(mtx_);
     std::vector<DexSignalCount> out;
     if (!db_)
@@ -1204,17 +1204,26 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     // The whole-catalogue rollup: one row per obs_type present in the window.
     // Fully generic — a catalogue signal added agent-side appears here with NO
     // server change (the projection writes it, this GROUP BY surfaces it).
-    const char* sql = R"(
+    // `platform` (#1746) narrows the rollup to one OS's own observations — empty
+    // (the default) keeps the all-OS composite exactly as before this parameter
+    // existed.
+    std::string sql = R"(
         SELECT obs_type, COUNT(*), COUNT(DISTINCT agent_id), MAX(observed_at)
         FROM guardian_observations
         WHERE observed_at >= ?1
+    )";
+    if (!platform.empty())
+        sql += " AND platform = ?2";
+    sql += R"(
         GROUP BY obs_type
         ORDER BY COUNT(*) DESC, obs_type ASC
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 2, platform.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexSignalCount c;
         c.obs_type = col_text(st.get(), 0);
