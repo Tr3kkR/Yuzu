@@ -19,20 +19,22 @@
 // an Apple-Silicon host, so it is exercised only by synthetic specimens in
 // the unit test and is NOT validated parity against real hardware.
 
-#include <nlohmann/json.hpp>
-
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace yuzu::hardware::macos {
 
 namespace detail {
 
-// Replace pipe/CR/LF with a space so an odd/hostile model string can never
-// shift the downstream pipe-column parse or forge a second row (PLAN-06).
+// Replace pipe and any control byte (including CR/LF and NUL) with a space so
+// an odd/hostile model string can never shift the downstream pipe-column
+// parse or forge a second row (PLAN-06).
 inline std::string sanitize_disk_field(std::string value) {
     for (char& c : value) {
-        if (c == '|' || c == '\r' || c == '\n')
+        const auto byte = static_cast<unsigned char>(c);
+        if (c == '|' || byte < 0x20 || byte == 0x7f)
             c = ' ';
     }
     return value;
@@ -62,7 +64,9 @@ inline std::string sata_medium_type_for(const nlohmann::json& storage_volumes,
         auto medium_it = pd_it->find("medium_type");
         if (medium_it != pd_it->end() && medium_it->is_string())
             return medium_it->get<std::string>();
-        return {};
+        continue; // this volume matched by name but has no usable medium_type -
+                  // keep scanning in case a later volume for the same device
+                  // carries it (PKG01-002)
     }
     return {};
 }
@@ -119,11 +123,15 @@ inline std::vector<std::string> parse_macos_disks(const std::string& system_prof
                             continue; // no usable identity - skip this item only
                         }
 
-                        std::string size_gb = "0";
+                        long long bytes = 0;
                         if (auto it = item.find("size_in_bytes");
                             it != item.end() && it->is_number_integer()) {
-                            size_gb = std::to_string(it->get<long long>() / (1024LL * 1024 * 1024));
+                            bytes = it->get<long long>();
                         }
+                        const long long gb = bytes / (1024LL * 1024 * 1024);
+                        if (gb <= 0)
+                            continue; // no positive capacity - fail closed, skip this item only (BR-001)
+                        const std::string size_gb = std::to_string(gb);
 
                         std::string type;
                         std::string iface;

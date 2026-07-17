@@ -219,7 +219,7 @@ TEST_CASE("one broken item does not suppress a valid row (non-object element)",
     REQUIRE(rows == std::vector<std::string>{"disk|0|APPLE SSD AP0256Z|233|SSD|NVMe"});
 }
 
-TEST_CASE("one broken item does not suppress a valid row (size_in_bytes null)",
+TEST_CASE("no-capacity item is skipped without suppressing the valid row",
           "[hardware_disks_macos][resilience]") {
     static const char* kOneBrokenNullSize = R"JSON({
       "SPNVMeDataType" : [
@@ -243,11 +243,32 @@ TEST_CASE("one broken item does not suppress a valid row (size_in_bytes null)",
       "SPStorageDataType" : []
     })JSON";
     auto rows = parse_macos_disks(kOneBrokenNullSize);
-    // The broken item still yields a row (size falls back to "0" - only the
-    // identity fields are required); it must not suppress the valid row.
-    REQUIRE(rows.size() == 2);
-    CHECK(rows[0] == "disk|0|APPLE SSD AP0256Z|233|SSD|NVMe");
-    CHECK(rows[1] == "disk|1|Broken Disk|0|SSD|NVMe");
+    // The no-capacity item is skipped (fail-closed, BR-001) - it must not
+    // suppress the valid preceding row.
+    REQUIRE(rows == std::vector<std::string>{"disk|0|APPLE SSD AP0256Z|233|SSD|NVMe"});
+}
+
+TEST_CASE("item with no capacity at all yields the failure sentinel",
+          "[hardware_disks_macos][resilience][sentinel]") {
+    static const char* kNoCapacity = R"JSON({
+      "SPNVMeDataType" : [
+        {
+          "_items" : [
+            {
+              "_name" : "No Capacity Disk",
+              "device_model" : "No Capacity Disk"
+            }
+          ],
+          "_name" : "Apple SSD Controller"
+        }
+      ],
+      "SPSerialATADataType" : [],
+      "SPStorageDataType" : []
+    })JSON";
+    auto rows = macos_disk_rows_or_sentinel(kNoCapacity);
+    // No usable capacity anywhere - the single item is skipped and the
+    // rows-or-sentinel seam falls back to the failure sentinel (BR-001).
+    REQUIRE(rows == std::vector<std::string>{"disk|0|unknown|0|unknown|unknown"});
 }
 
 // ── Delimiter safety (PLAN-06) ───────────────────────────────────────────────
@@ -278,6 +299,35 @@ TEST_CASE("model containing pipe and newline is sanitized to a single valid row"
     CHECK(t[3] == "233");
     CHECK(t[4] == "SSD");
     CHECK(t[5] == "NVMe");
+}
+
+TEST_CASE("model containing an embedded NUL and a control byte is sanitized",
+          "[hardware_disks_macos][delimiter]") {
+    // The JSON escapes below decode to a literal NUL between "AB" and "C"
+    // and a literal SOH (0x01) between "C" and "D" - both are control bytes
+    // below 0x20 that sanitize_disk_field must blank out (BR-003), same as
+    // it does for CR/LF/pipe.
+    static const char* kControlBytesModel = R"JSON({
+      "SPNVMeDataType" : [
+        {
+          "_items" : [
+            {
+              "_name" : "control-bytes",
+              "device_model" : "AB\u0000C\u0001D",
+              "size_in_bytes" : 251000193024
+            }
+          ],
+          "_name" : "Apple SSD Controller"
+        }
+      ],
+      "SPSerialATADataType" : [],
+      "SPStorageDataType" : []
+    })JSON";
+    auto rows = parse_macos_disks(kControlBytesModel);
+    REQUIRE(rows.size() == 1);
+    auto t = split_pipe(rows[0]);
+    REQUIRE(t.size() == 6);
+    CHECK(t[2] == "AB C D");
 }
 
 // ── SATA best-effort (PLAN-02) ───────────────────────────────────────────────
@@ -343,6 +393,93 @@ TEST_CASE("synthetic SATA item with no medium_type match falls back to unknown",
     REQUIRE(rows.size() == 1);
     auto t = split_pipe(rows[0]);
     CHECK(t[4] == "unknown");
+    CHECK(t[5] == "SATA");
+}
+
+TEST_CASE("SATA lookup keeps scanning past a same-name volume with no medium_type"
+          " (PKG01-002)",
+          "[hardware_disks_macos][sata][unverified]") {
+    // UNVERIFIED against real Intel/SATA hardware - no real SATA fixture is
+    // obtainable on this Apple-Silicon host. Two SPStorageDataType volumes
+    // share the disk's device_name; the first carries no medium_type at all
+    // and the second does. The scan must not bail out on the first match -
+    // it must keep looking and pick up the second volume's "ssd".
+    static const char* kSyntheticSataTwoVolumes = R"JSON({
+      "SPNVMeDataType" : [],
+      "SPSerialATADataType" : [
+        {
+          "_items" : [
+            {
+              "_name" : "FAKE SATA SSD",
+              "device_model" : "FAKE SATA SSD",
+              "size_in_bytes" : 500000000000
+            }
+          ],
+          "_name" : "SATA Controller"
+        }
+      ],
+      "SPStorageDataType" : [
+        {
+          "_name" : "FakeVolumeNoMedium",
+          "physical_drive" : {
+            "device_name" : "FAKE SATA SSD"
+          },
+          "size_in_bytes" : 500000000000
+        },
+        {
+          "_name" : "FakeVolumeWithMedium",
+          "physical_drive" : {
+            "device_name" : "FAKE SATA SSD",
+            "medium_type" : "ssd"
+          },
+          "size_in_bytes" : 500000000000
+        }
+      ]
+    })JSON";
+    auto rows = parse_macos_disks(kSyntheticSataTwoVolumes);
+    REQUIRE(rows.size() == 1);
+    auto t = split_pipe(rows[0]);
+    REQUIRE(t.size() == 6);
+    CHECK(t[4] == "SSD");
+    CHECK(t[5] == "SATA");
+}
+
+TEST_CASE("synthetic SATA rotational medium is reported as HDD (PKG01-003)",
+          "[hardware_disks_macos][sata][unverified]") {
+    // UNVERIFIED against real Intel/SATA hardware - no real SATA fixture is
+    // obtainable on this Apple-Silicon host. Exercises the HDD branch of the
+    // medium_type classification, which none of the other synthetic SATA
+    // specimens above cover.
+    static const char* kSyntheticSataHdd = R"JSON({
+      "SPNVMeDataType" : [],
+      "SPSerialATADataType" : [
+        {
+          "_items" : [
+            {
+              "_name" : "FAKE SATA HDD",
+              "device_model" : "FAKE SATA HDD",
+              "size_in_bytes" : 1000000000000
+            }
+          ],
+          "_name" : "SATA Controller"
+        }
+      ],
+      "SPStorageDataType" : [
+        {
+          "_name" : "FakeVolume",
+          "physical_drive" : {
+            "device_name" : "FAKE SATA HDD",
+            "medium_type" : "rotational"
+          },
+          "size_in_bytes" : 1000000000000
+        }
+      ]
+    })JSON";
+    auto rows = parse_macos_disks(kSyntheticSataHdd);
+    REQUIRE(rows.size() == 1);
+    auto t = split_pipe(rows[0]);
+    REQUIRE(t.size() == 6);
+    CHECK(t[4] == "HDD");
     CHECK(t[5] == "SATA");
 }
 
