@@ -625,8 +625,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"network_diag.listening", "List listening TCP ports"},
         {"network_diag.connections", "List established TCP connections"},
         // msi_packages
-        {"msi_packages.list", "List all installed MSI packages"},
-        {"msi_packages.product_codes", "Compact list of installed MSI product code GUIDs"},
+        {"msi_packages.list", "List installed packages (Windows MSI / macOS pkgutil receipts)"},
+        {"msi_packages.product_codes",
+         "Compact list of installed package identifiers (Windows MSI GUIDs / macOS pkgutil "
+         "reverse-domain IDs)"},
         // sccm
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},

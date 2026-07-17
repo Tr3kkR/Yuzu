@@ -1,15 +1,20 @@
 /**
- * msi_packages_plugin.cpp — MSI package inventory plugin for Yuzu
+ * msi_packages_plugin.cpp — MSI / pkgutil package inventory plugin for Yuzu
  *
  * Actions:
- *   "list"          — Lists all installed MSI packages.
- *   "product_codes" — Returns compact list of product code GUIDs.
+ *   "list"          — Lists all installed packages.
+ *   "product_codes" — Returns compact list of package identifiers.
  *
- * Windows-only. On other platforms, returns "platform not supported".
+ * Windows: enumerates MSI products via MsiEnumProductsA; the code slot is a
+ *   real {GUID} product code.
+ * macOS: enumerates `pkgutil --pkgs` receipts; the code slot is the honest
+ *   reverse-domain package identifier (e.g. "com.apple.pkg.Core") — never a
+ *   fabricated GUID.
+ * Other platforms: returns "platform not supported".
  *
  * Output is pipe-delimited via write_output():
- *   msi|product_code|name|version|install_location
- *   product_code|{GUID}|name
+ *   msi|code|name|version|install_location
+ *   product_code|code|name
  */
 
 #include <yuzu/plugin.hpp>
@@ -33,22 +38,18 @@
 static constexpr const char* kInstalledProductName = "InstalledProductName";
 static constexpr const char* kVersionString = "VersionString";
 static constexpr const char* kInstallLocation = "InstallLocation";
+#elif defined(__APPLE__)
+#include <array>
+#include <cstdio>
+
+#include "msi_packages_macos.hpp"
 #endif
 
 namespace {
 
-#ifdef _WIN32
-// Get an MSI product property as a std::string.
-std::string get_product_info(const char* product_code, const char* property) {
-    char buf[512]{};
-    DWORD size = sizeof(buf);
-    if (MsiGetProductInfoA(product_code, property, buf, &size) == ERROR_SUCCESS) {
-        return std::string(buf, size);
-    }
-    return {};
-}
-
-// Replace invalid UTF-8 bytes with '?' (MSI data can contain non-UTF-8 chars).
+// Replace invalid UTF-8 bytes with '?' (MSI/pkgutil data can contain
+// non-UTF-8 chars). Platform-agnostic, reused by both the Windows and macOS
+// branches below.
 std::string sanitize_utf8(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -86,6 +87,55 @@ std::string sanitize_utf8(const std::string& s) {
     }
     return out;
 }
+
+#ifdef _WIN32
+// Get an MSI product property as a std::string.
+std::string get_product_info(const char* product_code, const char* property) {
+    char buf[512]{};
+    DWORD size = sizeof(buf);
+    if (MsiGetProductInfoA(product_code, property, buf, &size) == ERROR_SUCCESS) {
+        return std::string(buf, size);
+    }
+    return {};
+}
+#elif defined(__APPLE__)
+// Run a shell command, capturing stdout with trailing newline(s) stripped.
+// Internal newlines are preserved — callers that need per-line data (pkgutil
+// output) parse those via the pure helpers in msi_packages_macos.hpp.
+std::string run_command(const std::string& cmd) {
+    std::string result;
+    std::array<char, 512> buf{};
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe)
+        return result;
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
+        result += buf.data();
+    }
+    pclose(pipe);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    return result;
+}
+
+// Single-quote a package identifier for safe interpolation into a shell
+// command line (identifiers come from a prior `pkgutil --pkgs` call, but are
+// still untrusted free text as far as this process is concerned).
+std::string shell_quote(std::string_view s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += "'";
+    return out;
+}
+
+// pkgutil --pkg-info loops are sequential and per-package; a receipt DB can
+// legitimately hold hundreds of entries, so bound the number of --pkg-info
+// calls a single `list` gather issues.
+constexpr std::size_t kMaxPackages = 500;
 #endif
 
 int do_list(yuzu::CommandContext& ctx) {
@@ -105,6 +155,29 @@ int do_list(yuzu::CommandContext& ctx) {
     }
     if (count == 0) {
         ctx.write_output("msi|No MSI packages found|-|-|-");
+    }
+#elif defined(__APPLE__)
+    using yuzu::msi_packages::macos::derive_display_name;
+    using yuzu::msi_packages::macos::parse_pkg_ids;
+    using yuzu::msi_packages::macos::parse_pkg_info;
+
+    auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
+    if (ids.size() > kMaxPackages)
+        ids.resize(kMaxPackages);
+
+    int count = 0;
+    for (const auto& id : ids) {
+        auto info = parse_pkg_info(
+            run_command(std::format("pkgutil --pkg-info {} 2>/dev/null", shell_quote(id))), id);
+        auto name = derive_display_name(info.identifier);
+        ctx.write_output(sanitize_utf8(std::format(
+            "msi|{}|{}|{}|{}", info.identifier, name.empty() ? "-" : name,
+            info.version.empty() ? "-" : info.version,
+            info.install_location.empty() ? "-" : info.install_location)));
+        ++count;
+    }
+    if (count == 0) {
+        ctx.write_output("msi|No packages found|-|-|-");
     }
 #else
     ctx.write_output("error|platform not supported");
@@ -127,6 +200,25 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     if (count == 0) {
         ctx.write_output("product_code|none|-");
     }
+#elif defined(__APPLE__)
+    using yuzu::msi_packages::macos::derive_display_name;
+    using yuzu::msi_packages::macos::parse_pkg_ids;
+
+    // Names are derived purely from the identifier (pkgutil's --pkg-info
+    // receipt carries no separate display-name field either — see
+    // msi_packages_macos.hpp), so this action never needs the per-package
+    // --pkg-info round trip that `list` does.
+    auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
+    int count = 0;
+    for (const auto& id : ids) {
+        auto name = derive_display_name(id);
+        ctx.write_output(
+            sanitize_utf8(std::format("product_code|{}|{}", id, name.empty() ? "-" : name)));
+        ++count;
+    }
+    if (count == 0) {
+        ctx.write_output("product_code|none|-");
+    }
 #else
     ctx.write_output("error|platform not supported");
     return 1;
@@ -141,7 +233,7 @@ public:
     std::string_view name() const noexcept override { return "msi_packages"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Enumerates installed MSI packages and product codes (Windows only)";
+        return "Enumerates installed packages and product codes (Windows MSI / macOS pkgutil)";
     }
 
     const char* const* actions() const noexcept override {
