@@ -1,4 +1,5 @@
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"
 #include "mcp_policy.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -198,7 +199,7 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 std::expected<std::string, std::string>
 ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
                             int64_t expires_at, const std::string& scope_service,
-                            const std::string& mcp_tier) {
+                            const std::string& mcp_tier, std::string principal_kind) {
     if (!open_)
         return std::unexpected("database not open");
     if (name.empty())
@@ -217,6 +218,74 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
             return std::unexpected("MCP token TTL cannot exceed 90 days");
     }
 
+    // ── Engine principal block (design doc §6/§7/§8) ───────────────────────
+    // C++-side allowlist ahead of the DB CHECK (principal_kind IN
+    // ('human','engine')) — defense-in-depth per governance PR-4.2 prereq:
+    // never let an unrecognized value reach Postgres and rely solely on the
+    // constraint to reject it.
+    if (principal_kind != "human" && principal_kind != "engine")
+        return std::unexpected("invalid principal_kind");
+
+    // G2 (governance hardening, security LOW / UP-1): symmetric namespace
+    // guard. Without this, the `engine:`-namespace guarantee is only as
+    // strong as every call site remembering to pass principal_kind=="engine"
+    // whenever principal_id starts with "engine:" — a human-kind token could
+    // otherwise carry an engine: id that RbacStore's engine-resolution arm
+    // would happily match at role-resolution time. Make the guarantee
+    // structural here, ahead of PR 4.3's engine-minting routes.
+    if (principal_id.starts_with("engine:") && principal_kind != "engine")
+        return std::unexpected("engine:-namespaced principal_id requires principal_kind=engine");
+
+    if (principal_kind == "engine") {
+        // F6 (Hermes pass-2 MEDIUM M3): engine principals are fleet-wide only
+        // (§4.3) — a service-scoped engine token is not a valid combination.
+        // Block it at creation rather than relying on it being silently
+        // denied later at authorization time.
+        if (!scope_service.empty())
+            return std::unexpected("engine principal tokens cannot be service-scoped");
+
+        // §8: mcp_tier readonly hard-lock. Unlike the human path (which
+        // permits an empty mcp_tier for a non-MCP token), an engine token
+        // MUST be readonly — empty or any other tier is rejected outright.
+        if (mcp_tier != "readonly")
+            return std::unexpected("engine principal tokens must use mcp_tier=readonly");
+
+        // §7: non-perpetual / 90-day ceiling. Engine tokens are always
+        // subject to this — checked explicitly here (not left to fall out of
+        // the generic mcp_tier block above) so the invariant holds
+        // regardless of check ordering upstream. Mirrors the constant/logic
+        // of the generic MCP expiry-cap check above.
+        if (expires_at == 0)
+            return std::unexpected("engine principal tokens cannot be perpetual (90-day max)");
+        {
+            auto now = now_epoch();
+            constexpr int64_t k90Days = 90 * 24 * 3600;
+            if (expires_at - now > k90Days)
+                return std::unexpected("engine principal token TTL cannot exceed 90 days");
+        }
+
+        // §6: creation-time referential integrity. Fail-closed if the
+        // resolver isn't wired yet (server.cpp wires it post-construction,
+        // T8) — never mint an engine token without this check.
+        if (!engine_referent_check_)
+            return std::unexpected("engine referent check unavailable");
+        switch (engine_referent_check_(principal_id)) {
+        case EngineLookupStatus::Active:
+            break;
+        case EngineLookupStatus::MissingOrRevoked:
+            // Terminal (401-class) per engine_principal_store.hpp's
+            // three-state contract — the referenced principal doesn't exist
+            // or was revoked.
+            return std::unexpected("engine principal not found or revoked");
+        case EngineLookupStatus::StoreUnreachable:
+            // Retryable (503-class), distinct from the terminal case above —
+            // see the EngineLookupStatus doc comment / design doc §3.1. The
+            // caller should back off and retry, not treat this as a
+            // credential problem.
+            return std::unexpected("engine principal store unavailable — try again");
+        }
+    }
+
     auto raw_result = generate_raw_token();
     if (!raw_result.has_value())
         return std::unexpected(raw_result.error());
@@ -229,18 +298,18 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
     if (!lease)
         return std::unexpected("database unavailable — try again");
 
-    // principal_kind is bound as the SQL literal 'human' — PR 4.1 has no
-    // engine write path (the caller-supplied kind + its C++-side allowlist
-    // land in PR 4.2, design doc §§6-8/11). The column still exists (the seam
-    // the rest of Phase 4 stacks on) and its CHECK bounds it to the allowlist.
+    // principal_kind is bound as a parameter ($7): "human" by default, or
+    // "engine" once the engine block above has validated the mint (design doc
+    // §§6-8). The DB CHECK (principal_kind IN ('human','engine')) is the
+    // schema-level backstop behind the C++-side allowlist checked earlier.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO api_token_store.api_tokens "
         "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, principal_kind, "
         " created_at, expires_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint) RETURNING token_id",
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8::bigint,$9::bigint) RETURNING token_id",
         std::vector<std::string>{token_id, hash, name, principal_id, scope_service, mcp_tier,
-                                 std::to_string(now), std::to_string(expires_at)});
+                                 principal_kind, std::to_string(now), std::to_string(expires_at)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::unexpected(std::string("failed to create token: ") +
                                PQerrorMessage(lease.get()));
@@ -349,6 +418,11 @@ void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
 std::size_t ApiTokenStore::cache_size() const {
     std::lock_guard cache_lock(cache_mtx_);
     return token_cache_.size();
+}
+
+void ApiTokenStore::set_engine_referent_check(
+    std::function<EngineLookupStatus(const std::string&)> fn) {
+    engine_referent_check_ = std::move(fn);
 }
 
 std::expected<std::vector<ApiToken>, std::string>

@@ -34,7 +34,7 @@ struct ManagementGroupMember {
 
 struct GroupRoleAssignment {
     std::string group_id;
-    std::string principal_type; // "user" or "group"
+    std::string principal_type; // "user", "group", or "engine" (PR 4.2, design §4.1)
     std::string principal_id;
     std::string role_name;
 };
