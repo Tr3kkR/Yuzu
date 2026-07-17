@@ -378,16 +378,18 @@ struct NstatClient::Impl {
     std::atomic<std::uint64_t>* kernel_dropped{nullptr};
     std::atomic<std::int64_t>* last_event_ts{nullptr};
     std::atomic<bool>* layout_mismatch{nullptr};
+    // HIGH-1 fix: borrowed (non-owning) pointer to the CLIENT's running_
+    // atomic — same rationale as the three pointers above. The reader thread
+    // clears *running the instant its own loop exits, for whatever reason
+    // (stop() shut the socket down, a fatal recv error, or a layout-mismatch
+    // self-heal); NstatClient::running() reads running_ directly and never
+    // dereferences impl_, so this preserves the immediate self-detection the
+    // old impl_->thread_alive check gave without the use-after-free race.
+    std::atomic<bool>* running{nullptr};
 
     std::thread reader_thread;
     std::thread query_thread;
     std::atomic<bool> stop_requested{false};
-    // Flips false the instant the reader thread's own loop exits — for
-    // whatever reason (stop() closed the socket, a fatal recv error, or a
-    // layout-mismatch self-heal). Unlike Endpoint Security, our own thread
-    // function returning IS the death signal, so NstatClient::running() can
-    // reflect it immediately rather than relying only on an idle timeout.
-    std::atomic<bool> thread_alive{true};
 
     std::mutex query_cv_mu;
     std::condition_variable query_cv;
@@ -396,17 +398,21 @@ struct NstatClient::Impl {
     std::map<std::uint64_t, FlowState> flows; // srcref -> FlowState, guarded by flows_mu
 
     Impl(NstatFlowEventRing* r, std::atomic<std::uint64_t>* kd, std::atomic<std::int64_t>* let,
-         std::atomic<bool>* lm)
-        : ring(r), kernel_dropped(kd), last_event_ts(let), layout_mismatch(lm) {}
+         std::atomic<bool>* lm, std::atomic<bool>* rn)
+        : ring(r), kernel_dropped(kd), last_event_ts(let), layout_mismatch(lm), running(rn) {}
 
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
 
-    // Structural teardown: signal both threads, close the socket (unblocks
-    // the reader's blocking recv per the memo §4.2 contract), wake the query
-    // thread's condvar wait, then join both. Order matters: stop_requested
-    // must be visible before the wake/close so neither thread re-arms work
-    // after seeing it.
+    // Structural teardown (HIGH-2 fix): signal both threads, shutdown() the
+    // socket to unblock the reader's blocking recv (memo §4.2 contract), wake
+    // the query thread's condvar wait, JOIN both threads, and ONLY THEN close
+    // the fd. Closing before the joins let a thread still holding the plain
+    // `fd` int race a fd-number reuse by an unrelated open() elsewhere in the
+    // process — a query/reader thread could then send()/recv() on a socket
+    // that is no longer ours. shutdown() alone is sufficient to unblock recv;
+    // the fd number itself must stay allocated (open) until neither thread
+    // can touch it again, i.e. until both joins have returned.
     ~Impl() {
         stop_requested.store(true, std::memory_order_relaxed);
         {
@@ -415,13 +421,17 @@ struct NstatClient::Impl {
         query_cv.notify_all();
         if (fd >= 0) {
             ::shutdown(fd, SHUT_RDWR);
-            ::close(fd);
-            fd = -1;
         }
         if (query_thread.joinable())
             query_thread.join();
         if (reader_thread.joinable())
             reader_thread.join();
+        // Only now, with both threads fully exited, is it safe to close the
+        // fd and let the number be reused.
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
     }
 
     void send_msg(const void* data, std::size_t len) {
@@ -593,7 +603,10 @@ struct NstatClient::Impl {
             if (stop_requested.load(std::memory_order_relaxed))
                 break; // handle_message may have set this on a layout mismatch
         }
-        thread_alive.store(false, std::memory_order_relaxed);
+        // HIGH-1 fix: self-detected death, written through the borrowed
+        // pointer to the CLIENT's running_ atomic (never touches impl_ from
+        // the client side to observe this).
+        running->store(false, std::memory_order_relaxed);
     }
 
     void query_loop() {
@@ -672,7 +685,8 @@ bool NstatClient::start() {
     // false rather than silently claiming complete capture.
     system_wide_.store(::geteuid() == 0, std::memory_order_relaxed);
 
-    auto impl = std::make_unique<Impl>(&ring_, &kernel_dropped_, &last_event_ts_, &layout_mismatch_);
+    auto impl = std::make_unique<Impl>(&ring_, &kernel_dropped_, &last_event_ts_, &layout_mismatch_,
+                                       &running_);
     impl->fd = fd;
     Impl* raw = impl.get();
     impl->reader_thread = std::thread([raw] { raw->reader_loop(); });
@@ -695,25 +709,49 @@ bool NstatClient::start() {
     impl->send_msg(&add_tcp_kernel, sizeof(add_tcp_kernel));
 
     impl_ = std::move(impl);
+    // HIGH-1 fix: publish running_ = true only AFTER impl_ is fully set up,
+    // so any thread that observes running_ == true is guaranteed to see a
+    // valid impl_ (the actual cross-thread publication for other threads
+    // reaching this client at all goes through netqual_nstat_register_client's
+    // release/acquire pair, which happens strictly after start() returns).
+    running_.store(true, std::memory_order_relaxed);
     spdlog::info("TAR: nstat client active (provider=tcp, system_wide={})",
                  system_wide_.load(std::memory_order_relaxed));
     return true;
 }
 
 void NstatClient::stop() {
-    // ~Impl closes the socket (unblocking the reader's recv), wakes the query
-    // thread, and joins both before this reset() completes; flows_mu/ring_
-    // outlive impl_, so teardown is use-after-free-safe by construction —
-    // same structural argument as ProcEsCollector::stop().
+    // HIGH-1 fix: clear running_ BEFORE taking client_mu_/resetting impl_, so
+    // a snapshot_quality()/drain() call that has not yet acquired client_mu_
+    // (or acquires it after this stop()) observes running_ == false and never
+    // touches impl_ at all. A call that already holds client_mu_ (acquired
+    // client_mu_ before this stop() did) is still safely reading impl_ right
+    // now — the lock below blocks this stop() until that call releases it,
+    // so impl_ is never freed mid-read.
+    running_.store(false, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(client_mu_);
+    // ~Impl shuts down the socket (unblocking the reader's recv), wakes the
+    // query thread, joins both, and only then closes the fd (HIGH-2); flows_mu
+    // /ring_ outlive impl_, so teardown is use-after-free-safe by construction
+    // — same structural argument as ProcEsCollector::stop().
     impl_.reset();
 }
 
 bool NstatClient::running() const noexcept {
-    return impl_ && impl_->thread_alive.load(std::memory_order_relaxed);
+    // HIGH-1 fix: reads a client-owned atomic only — no impl_ dereference —
+    // so this is always safe to call regardless of a concurrent stop().
+    return running_.load(std::memory_order_relaxed);
 }
 
 std::vector<NstatFlowEvent> NstatClient::drain() {
-    if (!impl_)
+    // HIGH-1 fix: client_mu_ held for the whole body, mirroring
+    // snapshot_quality() — mutually exclusive with stop() resetting impl_.
+    // ring_ itself does not need impl_ (it's a client member, not an Impl
+    // member), but the running_ gate and the lock are kept here anyway for
+    // uniformity with snapshot_quality() and so drain() stays empty exactly
+    // when the class doc promises ("not running / off-macOS").
+    std::lock_guard<std::mutex> lk(client_mu_);
+    if (!running_.load(std::memory_order_relaxed))
         return {};
     return ring_.drain();
 }
@@ -746,10 +784,15 @@ const char* NstatClient::method_name() const noexcept {
 }
 
 std::vector<TcpQualitySample> NstatClient::snapshot_quality() const {
-    if (!running())
+    // HIGH-1 fix: client_mu_ held for the ENTIRE body — the running_ check
+    // AND every impl_ access below — so a concurrent stop() cannot free
+    // impl_ while this function is reading it. See client_mu_'s doc comment
+    // (tar_netqual_nstat.hpp) for the ordering argument.
+    std::lock_guard<std::mutex> lk(client_mu_);
+    if (!running_.load(std::memory_order_relaxed))
         return {};
     std::vector<TcpQualitySample> out;
-    std::lock_guard<std::mutex> lk(impl_->flows_mu);
+    std::lock_guard<std::mutex> flk(impl_->flows_mu);
     out.reserve(impl_->flows.size());
     for (auto& entry : impl_->flows) {
         FlowState& flow = entry.second;

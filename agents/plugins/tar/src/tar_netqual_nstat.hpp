@@ -62,6 +62,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -440,7 +441,12 @@ public:
     /// the fail-to-inert path (layout_mismatch()). Unlike a stream with no
     /// way to detect its own death (Endpoint Security), the nstat reader
     /// thread's exit IS the detection, so this flips immediately rather than
-    /// only after an idle timeout.
+    /// only after an idle timeout. Reads a client-owned atomic ONLY — never
+    /// dereferences impl_ — so it is always safe to call concurrently with
+    /// stop() (HIGH-1 fix); the reader thread clears it (via a borrowed
+    /// pointer, same idiom as kernel_dropped_/last_event_ts_/layout_mismatch_
+    /// below) the instant it exits for any reason, and stop() also clears it
+    /// explicitly before impl_.reset().
     bool running() const noexcept;
 
     /// Moves buffered lifecycle (open/close) events out for the batched
@@ -497,6 +503,11 @@ public:
     /// this twice in immediate succession will report `lost` as 0 the second
     /// time, by design (there is no new cumulative-counter movement to diff
     /// against yet).
+    ///
+    /// HIGH-1 fix: takes client_mu_ for its entire body (the running_ check
+    /// AND the impl_ read), so a concurrent stop() can never free impl_ while
+    /// this is reading it — see client_mu_'s doc comment for the ordering
+    /// argument.
     std::vector<TcpQualitySample> snapshot_quality() const;
 
 private:
@@ -514,6 +525,26 @@ private:
     [[maybe_unused]] std::atomic<std::int64_t> started_ts_{0};
     [[maybe_unused]] std::atomic<bool> layout_mismatch_{false};
     [[maybe_unused]] std::atomic<bool> system_wide_{false};
+
+    // HIGH-1 fix: collector-owned running flag. Set true at the END of a
+    // successful start() (after impl_ is published) and false at the START
+    // of stop() (before impl_.reset()); the reader thread ALSO clears it
+    // (through a borrowed pointer, same idiom as kernel_dropped/last_event_ts
+    // /layout_mismatch above) the instant its own loop exits for any reason,
+    // preserving the immediate self-detection the old impl_->thread_alive
+    // check gave -- just relocated so running() never dereferences impl_.
+    [[maybe_unused]] std::atomic<bool> running_{false};
+
+    // HIGH-1 fix: the innermost lock. Guards the impl_-touching bodies of
+    // snapshot_quality()/drain() and is taken by stop() before impl_.reset(),
+    // so a concurrent reader and a concurrent teardown are mutually
+    // exclusive -- impl_ can never be freed while snapshot_quality()/drain()
+    // is reading it. Lock order: the plugin's collect_mu_ may already be
+    // held by whatever calls into drain()/snapshot_quality()/stop() (all
+    // three are called under collect_mu_ today), but client_mu_ itself never
+    // calls back out to the plugin nor takes any other lock while held --
+    // so there is no cycle. mutable: snapshot_quality() is const.
+    mutable std::mutex client_mu_;
 };
 
 } // namespace yuzu::tar

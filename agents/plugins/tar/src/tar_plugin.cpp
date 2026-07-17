@@ -910,6 +910,15 @@ private:
     // High-water mark of NstatClient::dropped() already logged (same pattern
     // as last_logged_dropped_/last_module_dropped_). Guarded by collect_mu_.
     std::uint64_t last_nstat_dropped_{0};
+    // HIGH-3: events mapped from the nstat lifecycle ring but not yet
+    // persisted because a prior insert failed (DB locked/full) — mirrors
+    // pending_stream_evs_/pending_module_evs_ above so a transient DB failure
+    // never permanently loses tcp lifecycle events. Guarded by collect_mu_;
+    // bounded by kPendingStreamCap. HIGH-4 clears this when the tcp source is
+    // disabled (the buffered-but-undelivered batch belongs to the paused
+    // window and must never be persisted on re-enable); HIGH-5 also feeds it
+    // from the stream-death/stall drain-before-fallback path.
+    std::vector<yuzu::tar::NetworkEvent> pending_nstat_evs_;
     // Whether nstat was the tcp lifecycle PRIMARY source on the previous
     // collect_fast tick — lets the "tcp" leg detect a nstat→poll fallback
     // transition and reseed the poll's diff baseline instead of misreporting
@@ -1106,9 +1115,16 @@ private:
             // routed through nstat.
             bool nstat_primary = nstat_client_ && nstat_client_->running() &&
                                  nstat_client_->system_wide() && !nstat_client_->stalled();
-            if (nstat_primary) {
-                auto flow_events = nstat_client_->drain();
-                if (!flow_events.empty()) {
+
+            // HIGH-3: maps a batch of drained lifecycle events into
+            // NetworkEvent rows, prepends anything held over from a prior
+            // failed insert (mirrors pending_stream_evs_/pending_module_evs_
+            // above), and inserts. On success the pending queue is cleared;
+            // on FAILURE the whole (already-typed) batch is retained,
+            // bounded, for a retry next tick — the previous behavior only
+            // logged "dropped this tick" and lost the batch for good.
+            auto persist_nstat_flow_events =
+                [&](std::vector<yuzu::tar::NstatFlowEvent> flow_events) {
                     std::vector<yuzu::tar::NetworkEvent> typed;
                     typed.reserve(flow_events.size());
                     for (const auto& e : flow_events) {
@@ -1135,19 +1151,67 @@ private:
                         ev.process_name = e.process_name;
                         typed.push_back(std::move(ev));
                     }
+                    if (!pending_nstat_evs_.empty()) {
+                        typed.insert(typed.begin(),
+                                     std::make_move_iterator(pending_nstat_evs_.begin()),
+                                     std::make_move_iterator(pending_nstat_evs_.end()));
+                        pending_nstat_evs_.clear();
+                    }
+                    if (typed.empty())
+                        return;
                     if (!db_->insert_network_events(typed)) {
-                        spdlog::error("TAR: nstat tcp lifecycle insert failed — {} events "
-                                      "dropped this tick",
+                        spdlog::error("TAR: nstat tcp lifecycle insert failed — re-queuing "
+                                      "{} events for the next tick",
                                       typed.size());
+                        pending_nstat_evs_ = std::move(typed);
+                        if (pending_nstat_evs_.size() > kPendingStreamCap) {
+                            const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
+                                                     pending_nstat_evs_.begin() +
+                                                         static_cast<std::ptrdiff_t>(excess));
+                        }
                     } else {
                         total_events += static_cast<int>(typed.size());
                     }
-                }
+                };
+
+            if (nstat_primary) {
+                persist_nstat_flow_events(nstat_client_->drain());
                 if (auto d = nstat_client_->dropped(); d > last_nstat_dropped_) {
                     spdlog::warn("TAR: nstat lifecycle ring overflow — {} dropped (+{} since "
                                  "last drain)",
                                  d, d - last_nstat_dropped_);
                     last_nstat_dropped_ = d;
+                }
+            } else if (nstat_tcp_primary_prev_ && nstat_client_) {
+                // HIGH-5: a stream-death/stall transition — nstat owned the
+                // tcp lifecycle LAST tick but is not primary THIS tick
+                // (running() self-detected the reader thread's death,
+                // system_wide() dropped, or stalled() tripped). drain() only
+                // needs the ring, not running(), so it can still hold events
+                // the reader buffered before it died; draining BEFORE
+                // seeding the poll's diff baseline below mirrors the process
+                // stream precedent of draining the ring before checking
+                // running() (see the "process" leg above) rather than
+                // abandoning a still-populated ring. A layout_mismatch()
+                // means our transcribed wire layout disagreed with this
+                // kernel, so the buffered bytes are untrustworthy and must
+                // be discarded, never persisted; the self-heal
+                // baseline-priming below (nstat_tcp_primary_prev_) applies
+                // either way.
+                if (!nstat_client_->layout_mismatch()) {
+                    persist_nstat_flow_events(nstat_client_->drain());
+                } else {
+                    // Discard, never persist: a layout mismatch is permanent
+                    // for this client's remaining session (running() stays
+                    // false — no future tick can ever become nstat_primary
+                    // again to retry a queued batch), so also drop any
+                    // already-typed pending_nstat_evs_ from an earlier failed
+                    // insert rather than let it sit stuck-forever bounded.
+                    nstat_client_->drain(); // discard — untrustworthy bytes
+                    pending_nstat_evs_.clear();
+                    spdlog::warn("TAR: nstat layout mismatch on stream death — discarding "
+                                 "the buffered tcp lifecycle ring");
                 }
             }
 
@@ -1201,6 +1265,21 @@ private:
             // both protocols).
             db_->set_state(net_key,
                            connections_to_json(nstat_primary ? *diff_current : current).dump());
+        } else if (nstat_client_) {
+            // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat
+            // client keeps its reader thread running and filling its ring
+            // even while the `tcp` source is disabled (the whole block above
+            // is skipped, so nothing here would otherwise touch it), unlike
+            // the poll which simply stops enumerating. Drain-and-DISCARD
+            // each disabled tick so the paused window is never inserted on
+            // re-enable — mirrors the process/module stream drain-and-discard
+            // contract above (tar_plugin.cpp process/module leg comments).
+            // Drop any pre-disable insert-retry backlog too. The client
+            // itself stays running (it also feeds netqual, which has its own
+            // independent enable gate below) — only the lifecycle ring is
+            // discarded here.
+            nstat_client_->drain();
+            pending_nstat_evs_.clear();
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
