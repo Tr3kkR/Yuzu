@@ -137,12 +137,26 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 - **On-device.** These rows stay in the local warehouse (queryable via the
   Execute-gated TAR SQL surface as `$NetQual_Live`); they are not shipped to the
   server. A per-tick top-N cap and a row-count retention ceiling bound storage.
-- **Linux and Windows.** Linux reads netlink INET_DIAG; Windows reads TCP ESTATS
-  (ADR-0020) and **requires an elevated agent** — non-elevated it records
-  nothing and `tar.status` reports `netqual_capture_method|none`. Windows RTT is
-  ms-resolution and `retrans`/`segs_out` count from first observation of the
-  connection, not connection start (constraints listed in the compatibility
-  matrix). macOS is planned.
+- **Linux, Windows, and macOS.** Linux reads netlink INET_DIAG; Windows reads
+  TCP ESTATS (ADR-0020) and **requires an elevated agent** — non-elevated it
+  records nothing and `tar.status` reports `netqual_capture_method|none`.
+  Windows RTT is ms-resolution and `retrans`/`segs_out` count from first
+  observation of the connection, not connection start (constraints listed in
+  the compatibility matrix). **macOS reads per-socket `tcp_connection_info`
+  via `nstat`**, the private `com.apple.network.statistics` kernel control
+  (no framework, no entitlement) that also drives the macOS `tcp` source's
+  event-driven lifecycle. It carries the same elevation caveat as
+  Windows in spirit but a different mechanism: **system-wide flow visibility
+  requires root**, so a non-root agent records nothing and reports
+  `netqual_capture_method|none` rather than a silently partial capture. macOS
+  RTT is already microsecond-resolution (no unit conversion); `lost` is a
+  per-tick delta like Windows, since nstat exposes cumulative retransmit
+  counters, not an instantaneous loss gauge. The struct layout is a private,
+  version-unstable interface — a runtime self-check falls back to
+  `capture_method=none` on a layout mismatch rather than emit wrong values,
+  and the mechanism is pending validation on real hardware (see
+  `docs/darwin-compat.md` and the compatibility matrix in
+  [the TAR dashboard doc](tar.md)).
 - **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
   boot from since-boot OS counters — a coarse "network quality before TAR was
   running this boot" baseline — and the separate opt-in **`netconn`** source
