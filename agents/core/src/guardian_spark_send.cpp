@@ -23,8 +23,18 @@ void set_common(gpb::GuaranteedStateEvent& ev, const OutboxEntry& e, std::string
     ev.set_event_id(e.event_id);
     ev.set_rule_id(e.rule_id);
     ev.set_guard_category("event");
-    ev.mutable_timestamp()->set_seconds(e.enqueued_ns / kNsPerSec);
-    ev.mutable_timestamp()->set_nanos(static_cast<std::int32_t>(e.enqueued_ns % kNsPerSec));
+    // The well-known Timestamp requires nanos in [0, 1e9): integer % is
+    // sign-preserving in C++, so a negative enqueued_ns (a badly-skewed / pre-epoch
+    // wall clock) would yield a negative nanos and a malformed Timestamp some consumers
+    // reject. Normalize to a canonical (seconds, nanos>=0) pair via floored division.
+    std::int64_t secs = e.enqueued_ns / kNsPerSec;
+    std::int64_t nanos = e.enqueued_ns % kNsPerSec;
+    if (nanos < 0) {
+        nanos += kNsPerSec;
+        --secs;
+    }
+    ev.mutable_timestamp()->set_seconds(secs);
+    ev.mutable_timestamp()->set_nanos(static_cast<std::int32_t>(nanos));
     ev.set_platform(std::string(platform));
 }
 
@@ -73,7 +83,12 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
         if (!e.healthy && !e.health_detail.empty()) {
             nlohmann::json j;
             j["detail"] = e.health_detail;
-            ev.set_detail_json(j.dump());
+            // A read-error string can carry non-UTF-8 bytes (e.g. a Linux filesystem
+            // path); nlohmann's default dump() THROWS type_error 316 on those. The
+            // outbox drain firewalls the throw (catch-all + retain) but a permanently
+            // un-dumpable entry then jams the outbox head every drain cycle. Emit
+            // U+FFFD for invalid bytes instead so the entry always serializes.
+            ev.set_detail_json(j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
         }
         break;
     case OutboxDomain::Lifecycle:

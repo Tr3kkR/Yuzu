@@ -964,20 +964,23 @@ public:
             [this](const OutboxEntry& e) { return send_guardian_outbox_entry(e); });
         switch (guardian_->spark_availability()) {
         case GuardianEngine::SparkAvailability::Available:
-            spdlog::info("Guardian spark path WIRED (observe-only, prefer_spark=false); "
+            spdlog::info("Guardian: spark path WIRED (observe-only, prefer_spark=false); "
                          "detection backend = legacy IGuard");
             break;
         case GuardianEngine::SparkAvailability::SparkDisabled:
-            spdlog::info("Guardian spark path wired as DISABLED (--spark-disable); "
+            spdlog::info("Guardian: spark path wired as DISABLED (--spark-disable); "
                          "detection backend = legacy IGuard");
             break;
         case GuardianEngine::SparkAvailability::SparkFailed:
-            spdlog::warn("Guardian spark path wired as FAILED (SparkEngine did not boot); "
+            spdlog::warn("Guardian: spark path wired as FAILED (SparkEngine did not boot); "
                          "detection backend = legacy IGuard");
             break;
         case GuardianEngine::SparkAvailability::Unwired:
-            spdlog::error("Guardian spark path reports Unwired after wire_spark_engine() - "
-                          "unexpected; detection backend = legacy IGuard");
+            // Reachable, and NOT an error: wire_spark_engine() bails leaving Unwired when
+            // a stop() already ran (a SIGTERM / service-stop during boot). Log at info -
+            // the agent is shutting down; legacy was never displaced.
+            spdlog::info("Guardian: spark path left Unwired (stop requested during boot); "
+                         "detection backend = legacy IGuard");
             break;
         }
 

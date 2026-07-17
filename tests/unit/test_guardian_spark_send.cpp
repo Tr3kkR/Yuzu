@@ -108,6 +108,36 @@ TEST_CASE("send-map: Health maps healthy/unhealthy and carries detail only when 
         CHECK(ev.detail_json() == R"({"detail":"EACCES on hive"})");
         CHECK(nlohmann::json::parse(ev.detail_json())["detail"] == "EACCES on hive");
     }
+    SECTION("unhealthy with empty detail carries no detail_json") {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, ""), "macos");
+        CHECK(ev.event_type() == "guard.unhealthy");
+        CHECK(ev.detail_json().empty()); // no {"detail":""} noise
+    }
+    SECTION("unhealthy detail with non-UTF-8 bytes still serializes (no throw / no outbox jam)") {
+        // A Linux filesystem path in a read-error can carry non-UTF-8 bytes; the mapping
+        // must not throw (which would jam the outbox drain head permanently).
+        std::string bad = "bad path \xff\xfe";
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, bad), "linux");
+        CHECK(ev.event_type() == "guard.unhealthy");
+        CHECK_FALSE(ev.detail_json().empty());
+        CHECK_NOTHROW(nlohmann::json::parse(ev.detail_json())); // valid JSON (U+FFFD substituted)
+    }
+}
+
+TEST_CASE("send-map: a negative/pre-epoch enqueued_ns yields a valid (non-negative nanos) Timestamp",
+          "[spark][sendmap]") {
+    // A badly-skewed / pre-1970 wall clock produces a negative enqueued_ns. The
+    // well-known Timestamp requires nanos in [0, 1e9): the mapping must normalize
+    // rather than emit a negative nanos some consumers reject.
+    const std::int64_t neg = -500'000'000; // 0.5s before the epoch
+    auto ev = guardian_outbox_entry_to_event(
+        OutboxEntry::lifecycle("r", 1, "id", neg, "armed"), "linux");
+    CHECK(ev.timestamp().nanos() >= 0);
+    CHECK(ev.timestamp().nanos() < 1'000'000'000);
+    CHECK(ev.timestamp().seconds() == -1);          // floored
+    CHECK(ev.timestamp().nanos() == 500'000'000);   // -0.5s == -1s + 0.5s
 }
 
 TEST_CASE("send-map: Lifecycle kind becomes guard.<kind>", "[spark][sendmap]") {

@@ -662,7 +662,7 @@ TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
     *p.add_rules() = GuardianFixture::make_rule("r-1", "after-stop");
     auto applied = f.engine->apply_rules(p);
     CHECK_FALSE(applied.has_value());
-    CHECK(applied.error().find("stopped") != std::string::npos);
+    CHECK(applied.error() == "guardian engine stopped");
 }
 
 TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not resurrect the engine",
@@ -683,5 +683,5 @@ TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not res
     *p.add_rules() = GuardianFixture::make_rule("r-1", "after-stop-then-startlocal");
     auto applied = f.engine->apply_rules(p);
     CHECK_FALSE(applied.has_value());
-    CHECK(applied.error().find("stopped") != std::string::npos);
+    CHECK(applied.error() == "guardian engine stopped");
 }
