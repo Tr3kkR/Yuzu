@@ -609,6 +609,8 @@ test('issue lifecycle docs',
   args: [files('test_issue_docs.py')],
   suite: 'docs',
   timeout: 10,
+)
+
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
 # entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
 # the cancelled-path "which entry never finished" inference. It reuses
