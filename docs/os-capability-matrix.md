@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-16._
 
 ## Matrix
 
@@ -43,6 +43,7 @@ _Last hand-updated: 2026-07-13._
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
+| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `netsh advfirewall` | ✅ backend autodetect (firewalld / ufw / iptables) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate
