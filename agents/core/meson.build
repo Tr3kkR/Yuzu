@@ -36,6 +36,28 @@ if host_machine.system() == 'linux'
     message('libsystemd not used (systemd_guard != enabled, and not found) — Linux '
           + 'systemd service guard built as a no-op stub')
   endif
+elif host_machine.system() == 'darwin'
+  # macOS agent-owned mTLS client identity (roadmap 1.20): cert_store.cpp's
+  # __APPLE__ branch reads an operator-provisioned identity (certificate +
+  # private key) out of the current user's LOGIN keychain via
+  # SecItemCopyMatching, mirroring the Windows CryptoAPI path below. Unlike
+  # EndpointSecurity (agents/plugins/tar/meson.build), Security.framework
+  # ships even with the Command-Line-Tools-only SDK, so `required: false`
+  # here is defense-in-depth rather than an expected miss: found → the real
+  # keychain path compiles in; NOT found → cert_store.cpp compiles its
+  # honest-error stub (no crash, no fabricated PEM) and a --cert-store
+  # operator gets a clear startup failure instead of a silent PEM fallback —
+  # the same fail-closed posture agent.cpp already applies to a cert-store
+  # miss on Windows.
+  security_dep = dependency('appleframeworks', modules: ['Security'], required: false,
+                            include_type: 'system')
+  if security_dep.found()
+    agent_platform_deps += security_dep
+    agent_platform_args += '-DYUZU_HAVE_SECURITY'
+  else
+    message('macOS: Security.framework not found — --cert-store keychain identity '
+          + 'compiles as an honest-error stub; use --client-cert/--client-key PEM files.')
+  endif
 endif
 
 yuzu_agent_core_lib = shared_library(

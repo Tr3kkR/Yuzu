@@ -18,12 +18,19 @@ struct YUZU_EXPORT CertStoreResult {
 
 /// Read a client certificate and private key from the OS certificate store.
 ///
-/// @param store_name  Windows: store name (e.g. "MY" for Personal). Ignored on other platforms.
+/// @param store_name  Windows: store name (e.g. "MY" for Personal). Ignored on macOS/Linux.
 /// @param subject     Subject CN or substring to match (e.g. "yuzu-agent", "*.corp.example.com").
 /// @param thumbprint  Hex-encoded SHA-1 thumbprint. Takes priority over subject if non-empty.
 ///
-/// On Windows, uses CryptoAPI to read from the Local Machine store.
-/// On Linux/macOS, returns an error — use PEM files or PKCS#11 instead.
+/// On Windows, uses CryptoAPI to read from the Local Machine (falling back to
+/// Current User) store.
+/// On macOS, uses the Security framework (SecItemCopyMatching) to read an
+/// identity — certificate chain + private key — from the current user's
+/// LOGIN keychain only; System.keychain is never queried and no interactive
+/// unlock/authentication prompt is ever forced. Requires Security.framework
+/// at build time (YUZU_HAVE_SECURITY); an honest error CertStoreResult is
+/// returned otherwise, never a fabricated success.
+/// On Linux, returns an error — use PEM files instead.
 YUZU_EXPORT CertStoreResult read_cert_from_store(const std::string& store_name,
                                                  const std::string& subject,
                                                  const std::string& thumbprint);
