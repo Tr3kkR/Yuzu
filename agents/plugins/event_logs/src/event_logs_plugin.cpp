@@ -16,9 +16,12 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "event_logs_deadline.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -37,8 +40,21 @@
 
 namespace {
 
+#if defined(__APPLE__)
+// Hard wall-clock cap on `log show` — the unified log has no built-in
+// timeout and GNU `timeout` is not available on macOS. A hung/slow scan
+// (e.g. a very wide --last window on a busy Mac) is killed at this point
+// rather than blocking the plugin indefinitely; see event_logs_deadline.hpp.
+constexpr auto kLogShowDeadline = std::chrono::seconds(20);
+#endif
+
 // ── subprocess helpers ─────────────────────────────────────────────────────
 
+#ifndef __APPLE__
+// Used by the Windows/Linux branches below. macOS routes `log show` through
+// event_logs::bounded_run() instead (deadline + process-group kill; see
+// event_logs_deadline.hpp), so this popen-based helper — which has no
+// timeout of its own — is not used on that platform.
 std::vector<std::string> run_command_lines(const char* cmd) {
     std::vector<std::string> lines;
     std::array<char, 512> buf{};
@@ -63,6 +79,7 @@ std::vector<std::string> run_command_lines(const char* cmd) {
 #endif
     return lines;
 }
+#endif // !__APPLE__
 
 // ── input sanitization ────────────────────────────────────────────────────
 
@@ -158,12 +175,18 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'messageType == error' --last {}h "
-                           "--style compact 2>/dev/null | head -100",
-                           hours);
-    auto lines = run_command_lines(cmd.c_str());
+    // Invoked directly via execvp (no shell), so no shell-quoting is needed
+    // around the predicate; bounded_run() enforces kLogShowDeadline and caps
+    // storage at 100 lines (replacing the old `| head -100`).
+    std::vector<std::string> argv{
+        "log",    "show", "--predicate", "messageType == error",
+        "--last", std::format("{}h", hours), "--style", "compact"};
+    auto result = yuzu::event_logs::bounded_run(argv, kLogShowDeadline, /*max_lines=*/100);
+    const auto& lines = result.lines;
     if (lines.empty()) {
-        ctx.write_output("error|none|-|No error events found");
+        ctx.write_output(result.timed_out
+                              ? "error|none|-|log show did not complete within the deadline"
+                              : "error|none|-|No error events found");
         return 0;
     }
     for (const auto& line : lines) {
@@ -185,6 +208,10 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (message.size() > 200)
             message = message.substr(0, 200);
         ctx.write_output(std::format("error|{}|{}|{}", timestamp, process, message));
+    }
+    if (result.timed_out) {
+        ctx.write_output(
+            "error|none|-|log show timed out before finishing; results above are partial");
     }
 
 #else
@@ -275,12 +302,20 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'eventMessage contains \"{}\"' --last 24h "
-                           "--style compact 2>/dev/null | head -{}",
-                           filter, count);
-    auto lines = run_command_lines(cmd.c_str());
+    // do_query has no hours parameter (:198-224) — the 24h window below is
+    // the documented contract (event_logs.yaml), not a bug to "fix" by
+    // threading in a hidden hours param. Invoked directly via execvp (no
+    // shell), so the embedded double quotes are the NSPredicate string-
+    // literal syntax `log show` expects, not shell quoting.
+    std::vector<std::string> argv{
+        "log", "show", "--predicate", std::format("eventMessage contains \"{}\"", filter),
+        "--last", "24h", "--style", "compact"};
+    auto result = yuzu::event_logs::bounded_run(argv, kLogShowDeadline, static_cast<size_t>(count));
+    const auto& lines = result.lines;
     if (lines.empty()) {
-        ctx.write_output("event|none|-|No matching events found");
+        ctx.write_output(result.timed_out
+                              ? "event|none|-|log show did not complete within the deadline"
+                              : "event|none|-|No matching events found");
         return 0;
     }
     for (const auto& line : lines) {
@@ -301,6 +336,10 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (message.size() > 200)
             message = message.substr(0, 200);
         ctx.write_output(std::format("event|{}|{}|{}", timestamp, process, message));
+    }
+    if (result.timed_out) {
+        ctx.write_output(
+            "event|none|-|log show timed out before finishing; results above are partial");
     }
 
 #else
