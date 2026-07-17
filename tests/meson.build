@@ -183,6 +183,7 @@ agent_test_exe = executable(
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
     'unit/test_interaction_parsers.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -192,6 +193,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
