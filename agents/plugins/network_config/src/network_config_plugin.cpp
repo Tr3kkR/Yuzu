@@ -90,6 +90,7 @@ int mac_link_speed_mbps(const std::string& name) {
     // no manual close() on any exit path, including future early returns).
     struct SocketGuard {
         int fd;
+        explicit SocketGuard(int f) : fd(f) {}
         ~SocketGuard() {
             if (fd >= 0)
                 ::close(fd);
