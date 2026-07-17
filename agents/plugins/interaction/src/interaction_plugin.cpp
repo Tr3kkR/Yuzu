@@ -155,6 +155,90 @@ int run_command_status(const std::string& cmd) {
     return status;
 #endif
 }
+
+/**
+ * Result of run_command_capture(): the captured output plus the process
+ * exit code, from a single popen/pclose round trip.
+ */
+struct CommandResult {
+    std::string output;
+    int exit_code = -1;
+};
+
+/**
+ * Move-only RAII owner for a popen() FILE* pipe. Guarantees pclose() runs
+ * exactly once — including if an exception (e.g. std::string allocation
+ * failure while accumulating output) unwinds through the owning scope —
+ * and surfaces pclose()'s raw wait-status return to the caller.
+ */
+class PopenPipe {
+public:
+    explicit PopenPipe(FILE* pipe) noexcept : pipe_(pipe) {}
+    PopenPipe(const PopenPipe&) = delete;
+    PopenPipe& operator=(const PopenPipe&) = delete;
+    PopenPipe(PopenPipe&& other) noexcept : pipe_(other.pipe_) { other.pipe_ = nullptr; }
+    PopenPipe& operator=(PopenPipe&& other) noexcept {
+        if (this != &other) {
+            close();
+            pipe_ = other.pipe_;
+            other.pipe_ = nullptr;
+        }
+        return *this;
+    }
+    ~PopenPipe() { close(); }
+
+    FILE* get() const noexcept { return pipe_; }
+    explicit operator bool() const noexcept { return pipe_ != nullptr; }
+
+    // Closes the pipe now if still open and returns pclose()'s wait status
+    // (or -1 if already closed / never open). Safe to call more than once.
+    int close() noexcept {
+        if (!pipe_) return -1;
+        int status = pclose(pipe_);
+        pipe_ = nullptr;
+        return status;
+    }
+
+private:
+    FILE* pipe_;
+};
+
+/**
+ * Run a command via popen, capturing both its output and its exit status
+ * in one invocation (unlike calling run_command() + run_command_status()
+ * separately, which would run an interactive command — e.g. an osascript
+ * dialog — twice).
+ *
+ * Used on macOS to tell "osascript ran and produced this text" apart from
+ * "osascript failed" (non-zero exit, e.g. no reachable GUI session for the
+ * daemon to display a dialog on) so failure is never mistaken for a
+ * successful-but-unrecognized response.
+ */
+CommandResult run_command_capture(const std::string& cmd) {
+    CommandResult result;
+    PopenPipe pipe(popen(cmd.c_str(), "r"));
+    if (!pipe) return result;
+
+    std::array<char, 256> buf{};
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get()) != nullptr) {
+        result.output += buf.data();
+    }
+    int status = pipe.close();
+#if defined(__linux__) || defined(__APPLE__)
+    if (WIFEXITED(status)) {
+        result.exit_code = WEXITSTATUS(status);
+    }
+#else
+    result.exit_code = status;
+#endif
+
+    // Trim trailing newline
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    return result;
+}
 #endif // !_WIN32
 
 // ── Platform: notify ──────────────────────────────────────────────────────────
@@ -224,7 +308,11 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     if (rc == 0) {
         ctx.write_output("status|ok");
     } else {
-        ctx.write_output("status|error|osascript failed");
+        // Non-zero exit from osascript on a daemon most often means there is
+        // no reachable GUI session to post the notification to. Report that
+        // honestly rather than a bare "failed" (which reads like a bug in
+        // this plugin rather than an environment limitation).
+        ctx.write_output("status|unavailable|no reachable GUI session");
     }
     return 0;
 }
@@ -318,21 +406,49 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         btn_spec = "buttons {\"OK\"} default button \"OK\"";
     }
 
+    // Wrapped in try/on error so a genuine Cancel click (AppleScript error
+    // -128, "User canceled") can be told apart from every other failure.
+    // -128 is converted to a "##CANCELLED##" sentinel and returned (exit 0);
+    // any other error is re-raised via "error number err_num", which makes
+    // osascript exit non-zero — that is what the exit_code check below relies
+    // on to detect an unreachable GUI session instead of misreading it as a
+    // Cancel click.
     std::string cmd = std::format(
-        "osascript -e 'display dialog \"{}\" with title \"{}\" {}' 2>&1",
+        "osascript -e 'try' "
+        "-e 'return button returned of (display dialog \"{}\" with title \"{}\" {})' "
+        "-e 'on error number err_num' "
+        "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+        "-e 'error number err_num' -e 'end try' 2>&1",
         safe_msg, safe_title, btn_spec);
 
-    std::string output = run_command(cmd);
+    auto result = run_command_capture(cmd);
 
-    // osascript returns "button returned:OK" or "button returned:Yes" etc.
-    if (output.find("Cancel") != std::string::npos) {
+    if (result.exit_code != 0) {
+        // osascript failed outright — e.g. the daemon has no reachable GUI
+        // session to display the dialog on. No dialog was ever shown, so no
+        // button was ever clicked; do not fabricate "ok".
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 0;
+    }
+
+    // On success the script returns exactly the clicked button's label (or
+    // the "##CANCELLED##" sentinel for a genuine Cancel/-128). Match exactly
+    // rather than by substring — only text we can attribute to one of our
+    // own button labels is reported as a click; anything else on a
+    // *successful* invocation is unrecognized output, not a click, so it is
+    // reported the same honest way as a hard failure rather than defaulted
+    // to "ok".
+    const std::string& output = result.output;
+    if (output == "##CANCELLED##") {
         ctx.write_output("response|cancel");
-    } else if (output.find("No") != std::string::npos) {
+    } else if (output == "No") {
         ctx.write_output("response|no");
-    } else if (output.find("Yes") != std::string::npos) {
+    } else if (output == "Yes") {
         ctx.write_output("response|yes");
-    } else {
+    } else if (output == "OK") {
         ctx.write_output("response|ok");
+    } else {
+        ctx.write_output("status|unavailable|no reachable GUI session");
     }
     return 0;
 }
@@ -433,18 +549,35 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
 
+    // "on error number err_num" + re-raising every code other than -128
+    // (the AppleScript "User canceled" error) ensures only a genuine Cancel
+    // click is converted to the "##CANCELLED##" sentinel at exit 0; any
+    // other failure (e.g. no reachable GUI session) propagates as a
+    // non-zero osascript exit so it is never misreported as cancellation.
     std::string cmd = std::format(
         "osascript -e 'try' -e 'set result to text returned of "
         "(display dialog \"{}\" with title \"{}\" default answer \"{}\")' "
-        "-e 'return result' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+        "-e 'return result' -e 'on error number err_num' "
+        "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+        "-e 'error number err_num' -e 'end try' 2>&1",
         safe_prompt, safe_title, safe_default);
 
-    std::string output = run_command(cmd);
+    auto result = run_command_capture(cmd);
 
-    if (output == "##CANCELLED##") {
+    if (result.exit_code != 0) {
+        // osascript failed outright (as opposed to the AppleScript-level
+        // "on error" above, which only catches user cancellation and still
+        // exits 0) — most likely no reachable GUI session. The captured
+        // text here is an error message, not user input; never wrap it in
+        // "response|...".
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 0;
+    }
+
+    if (result.output == "##CANCELLED##") {
         ctx.write_output("cancelled|true");
     } else {
-        ctx.write_output(std::format("response|{}", output));
+        ctx.write_output(std::format("response|{}", result.output));
     }
     return 0;
 }
@@ -705,9 +838,10 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                     const std::vector<SurveyQuestion>& questions) {
-    // macOS: sequential osascript dialogs for each question
-    ctx.write_output("cancelled|false");
-
+    // macOS: sequential osascript dialogs for each question. "cancelled|false"
+    // is emitted only after every question below has succeeded (see the tail
+    // of this function) — emitting it up front here would contradict a later
+    // "status|unavailable" or "cancelled|true" for the very same survey.
     for (size_t i = 0; i < questions.size(); ++i) {
         const auto& q = questions[i];
         std::string safe_prompt = sanitize(q.prompt);
@@ -718,15 +852,24 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 "osascript -e 'try' -e 'set r to button returned of "
                 "(display dialog \"{}\" with title \"{}\" buttons {{\"No\", \"Yes\"}} "
                 "default button \"Yes\")' -e 'return r' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+                "-e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1",
                 safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                // osascript failed outright (not the AppleScript-level "on
+                // error", which exits 0) — no reachable GUI session. Stop
+                // the survey rather than fabricate an answer.
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 0;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
             ctx.write_output(std::format("answer_{}|{}", i,
-                out.find("Yes") != std::string::npos ? "yes" : "no"));
+                result.output.find("Yes") != std::string::npos ? "yes" : "no"));
 
         } else if (q.type == "choice" && !q.choices.empty()) {
             // Build AppleScript choose from list
@@ -740,29 +883,44 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 "} with title \"" + safe_title + "\" with prompt \"" + safe_prompt +
                 "\"' -e 'if r is false then' -e 'return \"##CANCELLED##\"' "
                 "-e 'else' -e 'return item 1 of r' -e 'end if' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1";
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+                "-e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1";
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 0;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
         } else {
             // text input
             std::string cmd = std::format(
                 "osascript -e 'try' -e 'set r to text returned of "
                 "(display dialog \"{}\" with title \"{}\" default answer \"\")' "
-                "-e 'return r' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+                "-e 'return r' -e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1",
                 safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 0;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
         }
     }
+    // All questions completed without failure or cancellation — only now is
+    // it accurate to report the survey as not cancelled.
+    ctx.write_output("cancelled|false");
     ctx.write_output(std::format("question_count|{}", questions.size()));
     return 0;
 }
