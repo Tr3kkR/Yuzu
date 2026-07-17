@@ -114,6 +114,34 @@ TEST_CASE("AuthDB::upsert_sso_identity rejects a non-principal, non-username str
                     .has_value());
 }
 
+TEST_CASE("AuthDB::upsert_sso_identity rejects an 'engine:'-prefixed principal",
+          "[sso][authdb][engine_principal]") {
+    // Security review finding on PR #2202 (engine principals 4.2): the write
+    // surface itself must reject a reserved `engine:` principal (design
+    // §3.3), not merely rely on the OIDC/SAML/AD caller's own construction
+    // convention (`source` is always a literal in {"oidc","saml","ad"}, never
+    // "engine") to keep it from happening. `is_valid_principal`'s format
+    // check alone is NOT sufficient here — it structurally accepts an
+    // `engine:`-shaped string (see `is_reserved_identity_prefix`), so this
+    // proves the dedicated guard added directly in `upsert_sso_identity`.
+    auto dir = yuzu::test::TempDir{};
+    fs::create_directories(dir.path);
+    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    CHECK_FALSE(db.upsert_sso_identity("engine:vuln-scanner", "https://issuer.example", "sub-1",
+                                       "Impersonating Row", "oidc")
+                    .has_value());
+    CHECK_FALSE(db.get_user("engine:vuln-scanner").has_value());
+
+    // A normal SSO principal (no reserved prefix collision) is unaffected.
+    const std::string principal = "oidc:https://idp.example.com/#sub-engine-guard";
+    REQUIRE(db.upsert_sso_identity(principal, "https://idp.example.com/", "sub-engine-guard",
+                                   "Dave", "oidc")
+                .has_value());
+    CHECK(db.get_user(principal).has_value());
+}
+
 TEST_CASE("AuthDB::mfa_status stays strict — rejects an SSO principal", "[sso][authdb]") {
     auto dir = yuzu::test::TempDir{};
     fs::create_directories(dir.path);

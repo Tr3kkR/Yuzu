@@ -11,6 +11,7 @@
  */
 
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -379,16 +380,33 @@ TEST_CASE("ApiTokenStore: create_token pins principal_kind to 'human'; the CHECK
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
+    // Engine block prerequisites (design doc §6/§7/§8): mcp_tier must be
+    // "readonly", expires_at must be non-zero and within the 90-day ceiling,
+    // and the referent resolver must be wired — a stub reporting Active,
+    // matching how server.cpp wires the real EnginePrincipalStore.
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
 
-    // (a) The only mint path is "human" — there is no engine code path in 4.1.
-    auto raw = store.create_token("human-token", "alice");
-    REQUIRE(raw.has_value());
-    auto v = store.validate_token(*raw);
+    auto human_raw = store.create_token("human-token", "alice");
+    REQUIRE(human_raw.has_value());
+    // The get_token/validate paths returning std::expected are covered by the
+    // dedicated PR-4.1 read tests below; here we assert both the human and the
+    // engine mint paths succeed against the wired referent check.
+    auto v = store.validate_token(*human_raw);
     REQUIRE(v.has_value());
     CHECK(v->principal_kind == "human");
     auto meta = store.get_token(v->token_id).value();
     REQUIRE(meta.has_value());
     CHECK(meta->principal_kind == "human");
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto engine_raw =
+        store.create_token("engine-token", "svc-ci", now + 3600, "", "readonly", "engine");
+    REQUIRE(engine_raw.has_value());
+    auto ev = store.validate_token(*engine_raw);
+    REQUIRE(ev.has_value());
+    CHECK(ev->principal_kind == "engine");
 
     // (b) The column CHECK is the schema-level allowlist: a direct write of a
     // value outside ('human','engine') is rejected at the database, never
