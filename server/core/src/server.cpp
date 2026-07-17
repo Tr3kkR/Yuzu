@@ -34,6 +34,7 @@
 #include "deployment_store.hpp"
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
+#include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
@@ -1490,6 +1491,53 @@ public:
             }
         }
 
+        // EnginePrincipalStore — born-on-PG identity store for autonomous
+        // engine principals (plan PR 4.2, design doc §3.1). Same fail-CLOSED
+        // construction posture as the other born-on-PG stores (ADR-0012 §1):
+        // a reachable database whose schema can't migrate/open is a deploy
+        // error, not a serve-degraded state.
+        if (pg_pool_ && !startup_failed_) {
+            engine_principal_store_ = std::make_unique<EnginePrincipalStore>(*pg_pool_);
+            if (!engine_principal_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: engine-principal store migration/open "
+                              "failed");
+                startup_failed_ = true;
+            } else if (api_token_store_ && api_token_store_->is_open()) {
+                // Wire the referential-integrity resolver seam (design §6) now
+                // that both born-on-PG stores are open. api_token_store_'s
+                // create_token engine block fails closed until this is set.
+                api_token_store_->set_engine_referent_check(
+                    [this](const std::string& id) {
+                        // F5 (Hermes pass-2 MEDIUM M3): null-guard in addition to the
+                        // declaration-order fix above — belt-and-braces against any future
+                        // code path that resets engine_principal_store_ (e.g. a hot-reload)
+                        // while this resolver is still installed. Treat "store gone" the
+                        // same as "store unreachable": retryable/fail-closed, never a silent
+                        // crash or a false Active.
+                        //
+                        // G9 (governance hardening, cpp-safety SHOULD): this null-check is
+                        // sound ONLY under the current lifecycle — engine_principal_store_ is
+                        // constructed once above, before the server starts serving requests,
+                        // and (per shutdown ordering elsewhere in this file) is only ever
+                        // reset to null AFTER the HTTP request-handling threads have drained.
+                        // There is today no code path that resets engine_principal_store_
+                        // while a request is concurrently in flight, so a bare pointer read
+                        // here is race-free. A FUTURE hot-reload feature that swaps or resets
+                        // engine_principal_store_ while the server is still live would turn
+                        // this into a genuine TOCTOU/use-after-free the null-guard does NOT
+                        // cover (reading a non-null pointer here does not guarantee it stays
+                        // valid through the get_for_auth() call below). Any such future path
+                        // MUST swap the pointer under a mutex or make it a
+                        // std::atomic<EnginePrincipalStore*> (or shared_ptr), and MUST add
+                        // TSan coverage exercising the reload racing a live lookup — do not
+                        // extend the null-guard-only pattern to cover it.
+                        return engine_principal_store_
+                                   ? engine_principal_store_->get_for_auth(id).status
+                                   : EngineLookupStatus::StoreUnreachable;
+                    });
+            }
+        }
+
         // Initialize response store
         {
             auto resp_db = cfg_.db_dir() / "responses.db";
@@ -2216,6 +2264,82 @@ public:
         {
             auto rbac_db = cfg_.db_dir() / "rbac.db";
             rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        }
+
+        // Engine-principal namespace collision-scan preflight (design doc
+        // §3.1 upgrade hazard / decision log #3): "the PR 4.2 migration
+        // itself scans for pre-existing colliding names rather than allowing
+        // silent coexistence". An `engine:`-named local user or RBAC group
+        // predating this reservation could otherwise be silently shadowed by
+        // (or silently grant roles to) a real engine principal — fail closed
+        // and refuse to start rather than let that ambiguity stand. Runs once
+        // engine_principal_store_ + rbac_store_ both exist; auth_mgr_.auth_db_ptr()
+        // is available from construction.
+        if (!startup_failed_ && engine_principal_store_) {
+            std::vector<std::string> colliding_users;
+            // Symmetric with the groups scan below (governance G3 residual): a
+            // users-scan error must fail this preflight CLOSED, not read as
+            // "no colliding users" — find_reserved_prefix_users returns nullopt
+            // on a scan error vs an empty vector for a completed-clean scan.
+            bool users_scan_failed = false;
+            if (auto* db = auth_mgr_.auth_db_ptr()) {
+                if (auto scan = db->find_reserved_prefix_users("engine:")) {
+                    colliding_users = std::move(*scan);
+                } else {
+                    users_scan_failed = true;
+                }
+            }
+            std::vector<std::string> colliding_groups;
+            // G3 (governance hardening, UP-2): `find_local_groups_with_prefix`
+            // returns nullopt on a scan error (as opposed to a genuinely empty,
+            // successfully-completed scan) — a scan error must fail this
+            // preflight closed, not be misread as "no collision found".
+            bool groups_scan_failed = false;
+            if (rbac_store_) {
+                // A non-open store (missing/corrupt/failed-to-load rbac.db)
+                // must never be trusted to report a genuine empty scan —
+                // treat it exactly like a scan error so this preflight
+                // fails closed instead of booting past an unreadable
+                // rbac.db (find_local_groups_with_prefix also returns
+                // nullopt on !db_, but the explicit is_open() guard here
+                // means we never even issue the scan on a store we know is
+                // unusable).
+                if (!rbac_store_->is_open()) {
+                    groups_scan_failed = true;
+                } else if (auto scan = rbac_store_->find_local_groups_with_prefix("engine:")) {
+                    colliding_groups = std::move(*scan);
+                } else {
+                    groups_scan_failed = true;
+                }
+            }
+            if (!colliding_users.empty() || !colliding_groups.empty() || users_scan_failed ||
+                groups_scan_failed) {
+                auto join = [](const std::vector<std::string>& v) {
+                    std::string out;
+                    for (size_t i = 0; i < v.size(); ++i) {
+                        if (i)
+                            out += ", ";
+                        out += v[i];
+                    }
+                    return out;
+                };
+                if (users_scan_failed || groups_scan_failed) {
+                    spdlog::error(
+                        "[auth] Refusing to start: the 'engine:' namespace collision scan failed "
+                        "(users_scan_failed={}, groups_scan_failed={}; see prior error) — cannot "
+                        "verify the reserved namespace is clear, failing closed rather than "
+                        "booting with an unknown collision state.",
+                        users_scan_failed, groups_scan_failed);
+                } else {
+                    spdlog::error(
+                        "[auth] Refusing to start: the 'engine:' namespace is reserved for engine "
+                        "principals (design doc §3.3) but pre-existing names collide with it — "
+                        "colliding users: [{}]; colliding local RBAC groups: [{}]. Rename or "
+                        "remove these before upgrading.",
+                        join(colliding_users), join(colliding_groups));
+                }
+                startup_failed_ = true;
+            }
         }
         {
             auto mgmt_db = cfg_.db_dir() / "management-groups.db";
@@ -3034,6 +3158,11 @@ public:
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
             mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
             oidc_provider_, saml_provider_.get());
+        // Nullable setter (design §6) — a null engine_principal_store_ (no PG
+        // configured, or its construction failed before startup_failed_ was
+        // checked here) makes AuthRoutes::synthesize_token_session fail closed
+        // for every engine-kind token rather than dereference a dangling store.
+        auth_routes_->set_engine_principal_store(engine_principal_store_.get());
 
         start_web_server();
 
@@ -3650,7 +3779,15 @@ public:
         // hold a raw pointer, and every HTTP handler thread is already
         // quiesced by the drain above); keep the ADR-0012 teardown discipline
         // so a future consumer can't UAF.
+        // F5: api_token_store_ MUST reset before engine_principal_store_ — its
+        // set_engine_referent_check resolver derefs engine_principal_store_, so
+        // dropping api_token_store_ first ensures no lingering resolver can ever
+        // observe engine_principal_store_ mid-reset (belt-and-braces alongside
+        // the declaration-order fix + the resolver's own null-guard above).
         api_token_store_.reset();
+        // EnginePrincipalStore borrows pg_pool_ — drop before the pool, same
+        // discipline as api_token_store_ above (ADR-0012 destruct-before-pool).
+        engine_principal_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -4551,10 +4688,14 @@ private:
     }
 
     // -- Auth helpers: thin delegation wrappers to AuthRoutes -----------------
-
-    auth::Session synthesize_token_session(const ApiToken& api_token) {
-        return auth_routes_->synthesize_token_session(api_token);
-    }
+    //
+    // NOTE: a `synthesize_token_session` thin-wrapper used to live here. T8
+    // integration (design doc §6/PR 4.2) verified it has zero callers —
+    // AuthRoutes' own internal call sites (resolve_session) call
+    // `AuthRoutes::synthesize_token_session` directly, not through
+    // ServerImpl — so it was deleted rather than widened to the new
+    // `std::optional<auth::Session>` return type. If a caller resurfaces,
+    // reintroduce it with that signature.
 
     std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res) {
         return auth_routes_->require_auth(req, res);
@@ -5424,6 +5565,8 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                {"engine_principal_store",
+                 engine_principal_store_ && engine_principal_store_->is_open()},
                 // Load-bearing for the MCP write surface + REST /api/approvals/*
                 // (governance sre-BLOCKING-1). is_open() is false after a failed
                 // consumed_at migration, so a broken approval schema fails readyz.
@@ -10994,7 +11137,9 @@ private:
                 return response_agent_in_scope(username, agent_id);
             },
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers);
+            app_perf_providers,
+            // PR 4.2 — fleet-wide engine role-assignment authoring surface.
+            engine_principal_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -11194,7 +11339,9 @@ private:
                 // ADR-0024: the SLE discovery store backs the query_software_licenses
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).
-                software_licensing_store_.get());
+                software_licensing_store_.get(),
+                // PR 4.2 — engine role-assignment MCP twins.
+                engine_principal_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -11486,10 +11633,23 @@ private:
     // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
-    // Born-on-PG (plan PR 4.1). Borrows pg_pool_ — declared after it (line
-    // ~11270) so normal reverse-declaration-order destruction is already
-    // correct; stop() also explicitly resets it before pg_pool_.reset() (ADR-0012
-    // destruct-before-pool discipline, matching the other born-on-PG stores).
+    // F5 (Hermes pass-2 MEDIUM M3): engine_principal_store_ MUST be declared
+    // BEFORE api_token_store_ — order is load-bearing, same pattern as the
+    // rbac_store_/mgmt_group_store_ note above. api_token_store_'s
+    // `set_engine_referent_check` resolver captures `this` and derefs
+    // `engine_principal_store_` on every `create_token` call. Members
+    // destruct in REVERSE declaration order, so declaring
+    // engine_principal_store_ first means it destructs SECOND (after
+    // api_token_store_) — it always outlives the resolver holder. The
+    // opposite order would let engine_principal_store_ be destroyed while
+    // api_token_store_ (and its resolver) still exists, so a late
+    // `create_token` call during shutdown could deref a freed store. Do not
+    // reorder these two. Both still borrow pg_pool_ and are declared after
+    // it, so normal reverse-declaration-order destruction is correct there
+    // too; stop() also explicitly resets api_token_store_ before
+    // engine_principal_store_ before pg_pool_.reset() (ADR-0012
+    // destruct-before-pool discipline).
+    std::unique_ptr<EnginePrincipalStore> engine_principal_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<ResultSetStore> result_set_store_;
