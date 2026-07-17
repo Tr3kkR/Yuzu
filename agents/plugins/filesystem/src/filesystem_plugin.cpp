@@ -8,7 +8,11 @@
  *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
  *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *   "search_dir"      — Find directories/files by name pattern (glob/regex).
- *   "get_version_info" — Extract PE version resource info (Windows only).
+ *   "get_signature"   — Verify a code signature: Authenticode on Windows
+ *                        (WinVerifyTrust), codesign on macOS.
+ *   "get_version_info" — Extract version info: PE version resource on
+ *                        Windows, Info.plist (CFBundleShortVersionString /
+ *                        CFBundleVersion) via plutil on macOS.
  *   "search"          — Search file contents for a pattern.
  *   "replace"         — Find/replace text in a file (atomic write).
  *   "write_content"   — Write or overwrite file contents.
@@ -73,6 +77,10 @@
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include "filesystem_macos_sig.hpp"
 #endif
 
 namespace {
@@ -292,6 +300,74 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     }
     return result;
 }
+
+#ifdef __APPLE__
+
+// Run a macOS command-line tool (codesign, plutil) as a fixed argv via
+// execvp -- no shell, so a path containing spaces or shell metacharacters
+// (e.g. "/Applications/Google Chrome.app") cannot inject anything. Captures
+// COMBINED stdout+stderr (codesign writes its diagnostics to stderr).
+// `tool_ran` is false only when the exec itself failed (binary missing from
+// PATH) -- a real invocation, however it exits, always leaves tool_ran true.
+struct MacosToolResult {
+    bool tool_ran = false;
+    int exit_code = -1;
+    std::string output;
+};
+
+MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
+    MacosToolResult result;
+    if (argv.empty())
+        return result;
+
+    int pipe_fd[2];
+    if (pipe(pipe_fd) != 0)
+        return result;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return result;
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]);
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
+
+        std::vector<const char*> c_argv;
+        c_argv.reserve(argv.size() + 1);
+        for (const auto& arg : argv)
+            c_argv.push_back(arg.c_str());
+        c_argv.push_back(nullptr);
+
+        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+        _exit(127); // exec failed -- codesign/plutil never legitimately exit 127
+    }
+
+    close(pipe_fd[1]);
+
+    std::array<char, 4096> buf{};
+    ssize_t n;
+    while ((n = read(pipe_fd[0], buf.data(), buf.size())) > 0) {
+        result.output.append(buf.data(), static_cast<size_t>(n));
+        if (result.output.size() > 1'000'000) // sanity cap; real output is tiny
+            break;
+    }
+    close(pipe_fd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        result.exit_code = WEXITSTATUS(status);
+        result.tool_ran = (result.exit_code != 127);
+    }
+    return result;
+}
+
+#endif // __APPLE__
 
 #endif
 
@@ -949,7 +1025,7 @@ private:
 #endif
     }
 
-    // ── get_signature: Check Authenticode signature (Windows only) ────────
+    // ── get_signature: Check code signature (Authenticode/Windows, codesign/macOS) ──
 
     int do_get_signature(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path = params.get("path");
@@ -1017,8 +1093,22 @@ private:
         WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
 
         return 0;
+#elif defined(__APPLE__)
+        // codesign --verify --deep --strict is the macOS analogue of
+        // WinVerifyTrust: it walks the whole bundle (or a lone Mach-O) and
+        // fails on ANY broken seal, not just a missing top-level signature.
+        // Its status vocabulary is deliberately its OWN honest enum (see
+        // filesystem_macos_sig.hpp) -- reusing the Windows Authenticode
+        // strings here would misrepresent a codesign verdict as a
+        // WinVerifyTrust one.
+        auto run = run_macos_tool({"codesign", "--verify", "--deep", "--strict", validated});
+        auto status = yuzu::filesystem_macos::classify_codesign_result(
+            run.tool_ran, run.exit_code, run.output);
+        ctx.write_output(
+            std::format("signature_status|{}", yuzu::filesystem_macos::to_string(status)));
+        return 0;
 #else
-        ctx.write_output("error|Authenticode signature verification is not supported on this platform");
+        ctx.write_output("error|code signature verification is not supported on this platform");
         return 1;
 #endif
     }
@@ -1128,7 +1218,7 @@ private:
         return 0;
     }
 
-    // ── get_version_info: Extract PE version resource (Windows) ─────────
+    // ── get_version_info: PE version resource (Windows) / Info.plist via plutil (macOS) ──
 
     int do_get_version_info(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path = params.get("path");
@@ -1209,8 +1299,57 @@ private:
         }
 
         return 0;
+#elif defined(__APPLE__)
+        // macOS has no PE version resource; the nearest equivalent is the
+        // bundle's Info.plist, read via `plutil -extract ... raw -o -`.
+        // plutil handles BOTH binary (bplist00) and XML plists natively, so
+        // (unlike the license_scan text-plist reader) no bplist parsing is
+        // needed here. `validated` must resolve to either a .app bundle
+        // directory or an Info.plist file directly -- a plain binary with
+        // neither honestly reports not_available rather than fabricating a
+        // version.
+        fs::path vpath(validated);
+        std::error_code plist_ec;
+        std::string info_plist;
+        if (fs::is_directory(vpath, plist_ec) && vpath.extension() == ".app") {
+            info_plist = (vpath / "Contents" / "Info.plist").string();
+        } else if (vpath.filename() == "Info.plist") {
+            info_plist = validated;
+        }
+
+        if (info_plist.empty() || !fs::exists(info_plist, plist_ec)) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // CFBundleShortVersionString is the user-visible "marketing"
+        // version (n.n.n) -- the closest analogue of Windows ProductVersion.
+        auto short_ver_run =
+            run_macos_tool({"plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-",
+                            info_plist});
+        auto short_ver = yuzu::filesystem_macos::classify_plutil_extract(
+            short_ver_run.tool_ran, short_ver_run.exit_code, short_ver_run.output);
+
+        // CFBundleVersion is the machine-readable, monotonically increasing
+        // build number -- the closest analogue of Windows FileVersion.
+        auto build_ver_run = run_macos_tool(
+            {"plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist});
+        auto build_ver = yuzu::filesystem_macos::classify_plutil_extract(
+            build_ver_run.tool_ran, build_ver_run.exit_code, build_ver_run.output);
+
+        if (!short_ver.available && !build_ver.available) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        if (short_ver.available)
+            ctx.write_output(std::format("product_version|{}", short_ver.value));
+        if (build_ver.available)
+            ctx.write_output(std::format("file_version|{}", build_ver.value));
+
+        return 0;
 #else
-        ctx.write_output("error|PE version info is only available on Windows");
+        ctx.write_output("error|version info extraction is not supported on this platform");
         return 1;
 #endif
     }

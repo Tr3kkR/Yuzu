@@ -11,6 +11,13 @@
 
 #include "test_helpers.hpp"
 
+// Pure macOS signature/version-info mappers (A-1.14) -- header-only, no
+// __APPLE__ guard, so these are exercised on every CI host regardless of
+// platform. Relative path (rather than a new tests/meson.build
+// include_directories entry) mirrors test_plugin_loader.cpp's include of
+// agents/core/src/plugin_config_sync.hpp.
+#include "../../agents/plugins/filesystem/src/filesystem_macos_sig.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -910,4 +917,95 @@ TEST_CASE("DeleteLines: end_line clamped to total lines", "[filesystem][deleteli
     auto final_lines = read_lines(tf.path);
     REQUIRE(final_lines.size() == 1);
     CHECK(final_lines[0] == "line1");
+}
+
+// ── macOS get_signature / get_version_info pure mappers (A-1.14) ───────────
+//
+// filesystem_macos_sig.hpp's classify_codesign_result() and
+// classify_plutil_extract() take an already-captured exit code + output
+// string, so they run on every CI host without a macOS box or the real
+// codesign/plutil binaries — only the fixtures below are macOS-flavoured.
+
+using yuzu::filesystem_macos::classify_codesign_result;
+using yuzu::filesystem_macos::classify_plutil_extract;
+using yuzu::filesystem_macos::SignatureStatus;
+using yuzu::filesystem_macos::to_string;
+
+TEST_CASE("MacosSig: codesign exit 0 is valid", "[filesystem][macos_sig]") {
+    auto status = classify_codesign_result(/*tool_ran=*/true, /*exit_code=*/0, "");
+    CHECK(status == SignatureStatus::valid);
+    CHECK(to_string(status) == "valid");
+}
+
+TEST_CASE("MacosSig: codesign 'not signed at all' maps to unsigned", "[filesystem][macos_sig]") {
+    // Real codesign --verify stderr for an unsigned binary.
+    std::string_view output = "/tmp/App.app: code object is not signed at all\n";
+    auto status = classify_codesign_result(true, 1, output);
+    CHECK(status == SignatureStatus::not_signed);
+    CHECK(to_string(status) == "unsigned");
+}
+
+TEST_CASE("MacosSig: codesign broken-seal diagnostic maps to invalid", "[filesystem][macos_sig]") {
+    // Real codesign --verify --deep --strict stderr for a tampered bundle.
+    std::string_view output =
+        "/tmp/App.app: a sealed resource is missing or invalid\n"
+        "file added: /tmp/App.app/Contents/Resources/extra\n";
+    auto status = classify_codesign_result(true, 3, output);
+    CHECK(status == SignatureStatus::invalid);
+    CHECK(to_string(status) == "invalid");
+}
+
+TEST_CASE("MacosSig: codesign non-zero exit with no output is unknown, not guessed",
+          "[filesystem][macos_sig]") {
+    auto status = classify_codesign_result(true, 1, "");
+    CHECK(status == SignatureStatus::unknown);
+    CHECK(to_string(status) == "unknown");
+}
+
+TEST_CASE("MacosSig: missing codesign binary is unknown regardless of exit_code/output",
+          "[filesystem][macos_sig]") {
+    // tool_ran == false models exec() itself failing (binary not on PATH) --
+    // never mistaken for "code object is not signed at all" honesty.
+    auto status = classify_codesign_result(/*tool_ran=*/false, 0, "code object is not signed at all");
+    CHECK(status == SignatureStatus::unknown);
+}
+
+TEST_CASE("MacosSig: plutil success yields the trimmed raw value", "[filesystem][macos_sig]") {
+    // `plutil -extract CFBundleShortVersionString raw -o -` prints the bare
+    // value plus a trailing newline on success.
+    auto result = classify_plutil_extract(/*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    CHECK(result.available == true);
+    CHECK(result.value == "1.2.3");
+}
+
+TEST_CASE("MacosSig: plutil success on a value read out of a BINARY Info.plist "
+          "is indistinguishable from XML (P13)",
+          "[filesystem][macos_sig]") {
+    // The whole point of using plutil (P13): it normalizes bplist00 and XML
+    // plists to the same raw-value output, so the pure mapper never needs to
+    // know or care which encoding the source Info.plist used.
+    auto result = classify_plutil_extract(true, 0, "42\n");
+    CHECK(result.available == true);
+    CHECK(result.value == "42");
+}
+
+TEST_CASE("MacosSig: plutil missing-key failure is honest not_available",
+          "[filesystem][macos_sig]") {
+    // Real plutil stderr when the key isn't present in the plist.
+    std::string_view output =
+        "No value at that key path or invalid key path: CFBundleShortVersionString\n";
+    auto result = classify_plutil_extract(true, 1, output);
+    CHECK(result.available == false);
+    CHECK(result.value.empty());
+}
+
+TEST_CASE("MacosSig: plutil whitespace-only stdout is honest not_available",
+          "[filesystem][macos_sig]") {
+    auto result = classify_plutil_extract(true, 0, "   \n");
+    CHECK(result.available == false);
+}
+
+TEST_CASE("MacosSig: missing plutil binary is honest not_available", "[filesystem][macos_sig]") {
+    auto result = classify_plutil_extract(/*tool_ran=*/false, 0, "1.2.3\n");
+    CHECK(result.available == false);
 }
