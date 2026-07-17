@@ -147,7 +147,20 @@ struct MapDriveHistoryRow {
 // tar_schema_registry.cpp. Full recipe: docs/tar-implementer.md "Adding a
 // capture source".
 
-/** Enumerate active network connections on the current host. */
+/**
+ * Enumerate active network connections on the current host — a POLLED
+ * snapshot (proc_pidfdinfo on macOS; see the platform .cpp for the other
+ * OSes). Used unconditionally: it is the sole source on Linux/Windows, the
+ * full live picture fleet_snapshot needs, and on macOS it doubles as the tcp
+ * lifecycle's fallback/seed poll (roadmap 2.2) — TCP lifecycle events are
+ * PRIMARILY sourced from the plugin-owned NstatClient event stream when it is
+ * running() and system_wide() (see tar_plugin.cpp's collect_fast tcp leg,
+ * which drains that stream directly and filters this poll's diff down to UDP
+ * only for that tick); this function's own poll logic is unchanged and keeps
+ * covering UDP always plus TCP whenever nstat is not running/stalled — never
+ * a silent lifecycle gap, mirroring the ES-stream-with-poll-fallback shape
+ * used for process_live.
+ */
 std::vector<NetConnection> enumerate_connections();
 
 /**
@@ -164,7 +177,13 @@ std::vector<NetConnection> enumerate_connections();
  * sight of a connection baselines it and emits nothing; samples start one
  * tick later, with the Windows field semantics documented in tar_netqual.hpp.
  *
- * Empty on macOS (kPlanned — see the `netqual` source in the schema registry).
+ * macOS (roadmap 2.2): the plugin-owned NstatClient's snapshot_quality()
+ * (com.apple.network.statistics kctl — see tar_netqual_nstat.hpp) when the
+ * client is running() AND system_wide() (root; an unprivileged session sees
+ * only its own flows, which is NOT complete capture — see
+ * netqual_nstat_register_client below). Empty otherwise, INCLUDING a
+ * layout_mismatch() session (running() already reflects that — the reader
+ * thread self-stops on a wire-layout self-check failure).
  *
  * Returns RAW remote addresses; the caller MUST pass the result through
  * select_netqual_rows (which buckets the address away) before persisting —
@@ -172,16 +191,44 @@ std::vector<NetConnection> enumerate_connections();
  */
 std::vector<TcpQualitySample> collect_tcp_quality();
 
+class NstatClient; // tar_netqual_nstat.hpp — fwd-declared, full type not needed here
+
+/**
+ * Registers the plugin-owned NstatClient (tar_netqual_nstat.hpp) so the
+ * macOS legs of collect_tcp_quality() / netqual_effective_capture_method()
+ * can reach its live state without a second, independently-owned client.
+ *
+ * Non-owning: tar_plugin.cpp is the SOLE owner — it constructs, start()s,
+ * and stop()s the client (mirroring the ES process-stream lifecycle
+ * discipline; see the nstat spike memo §4.3 — one consumer surface, no
+ * broker needed). Call with the live client right after construction; call
+ * with nullptr before stop() at shutdown so a call racing teardown observes
+ * "no client" rather than a client mid-destruction (narrows, does not by
+ * itself eliminate, the same collect-vs-shutdown window the ES process
+ * stream already accepts under collect_mu_ — see tar_plugin.cpp shutdown()).
+ *
+ * Declared and callable on EVERY platform (tar_plugin.cpp calls it
+ * unconditionally, matching NstatClient's own "inert off-macOS" contract) —
+ * the Linux/Windows implementations are one-line no-ops.
+ */
+void netqual_nstat_register_client(NstatClient* client);
+
 /**
  * The netqual capture method actually in effect on this host right now:
  * "inetdiag" (Linux), "estats" (Windows once the elevation gate has latched
  * active), "estats_pending" (Windows, netqual enabled but the first collect tick
- * has not yet tested elevation — or netqual disabled), "none" (Windows after the
- * ACCESS_DENIED latch, macOS, unsupported). The pending token exists so a
- * non-elevated agent does not advertise "estats" for the first interval before
- * flipping to "none". Surfaced by the status action as
- * `config|netqual_capture_method|<token>` — mirrors the process/module
- * capture-method pattern.
+ * has not yet tested elevation — or netqual disabled), "nstat" (macOS, roadmap
+ * 2.2, ONLY while the registered NstatClient is running() AND system_wide() —
+ * see netqual_nstat_register_client), "none" (Windows after the ACCESS_DENIED
+ * latch; macOS when no client is registered, the client isn't running, it is
+ * scoped to own-process flows only, or a layout_mismatch() forced it inert;
+ * other unsupported platforms). The pending token exists so a non-elevated
+ * agent does not advertise "estats" for the first interval before flipping to
+ * "none". Surfaced by the status action as `config|netqual_capture_method|
+ * <token>` — mirrors the process/module capture-method pattern. Honesty
+ * invariant (memo §3): NEVER "nstat" for an own-process-only or
+ * layout-mismatched session — that is reported "none", never a silently
+ * partial capture.
  */
 std::string_view netqual_effective_capture_method();
 

@@ -117,10 +117,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "below the fast interval may be missed."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "proc_pidfdinfo",
                  "proc_listallpids + proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via "
-                 "libproc. Inherent TOCTOU between pid enumeration and per-fd "
-                 "query — short-lived sockets that close before the per-fd "
-                 "query may produce empty rows. Endpoint Security framework "
-                 "(kPlanned) is the modern replacement for sub-second fidelity."},
+                 "libproc is the fallback/seed poll (always for udp; for tcp "
+                 "only while the event stream below is unavailable). Inherent "
+                 "TOCTOU between pid enumeration and per-fd query — short-lived "
+                 "sockets that close before the per-fd query may produce empty "
+                 "rows. Sub-second tcp connect/close fidelity comes from nstat "
+                 "(com.apple.network.statistics kctl, SRC_ADDED/SRC_REMOVED) "
+                 "when that client is live and system-wide (root) — the same "
+                 "client the netqual source uses for its quality leg (roadmap "
+                 "2.2). Endpoint Security has NO tcp/inet socket events "
+                 "(NOTIFY_EXEC/EXIT only), so — correcting an earlier claim "
+                 "here — it is not a replacement for this row at any fidelity."},
             },
             .granularities = {
                 {
@@ -442,9 +449,20 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "(sub-ms LAN RTTs read 0); retrans/segs_out count since "
                  "stats-enable, not connection start; lost/ca_state are "
                  "delta-derived approximations of the Linux gauges."},
-                {"macos",   OsSupportStatus::kPlanned,   "nstat",
-                 "per-socket tcp_connection_info via the private nstat / "
-                 "PRIVATE_TCP_INFO path."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
+                 "com.apple.network.statistics kctl (nstat) SRC_DESC/SRC_COUNTS "
+                 "per tcp flow, the same client the tcp source's lifecycle leg "
+                 "uses (roadmap 2.2). Constraints: system-wide flow visibility "
+                 "needs root — an unprivileged agent sees only its own flows "
+                 "and netqual_capture_method honestly reports none rather than "
+                 "a partial capture; rtt/rtt_var are believed microseconds "
+                 "already (no *1000, unlike Windows' ms-resolution ESTATS); "
+                 "lost is a per-tick delta off the cumulative retransmit "
+                 "counter, never the lifetime total; a runtime wire-layout "
+                 "self-check falls back to capture_method=none on any mismatch "
+                 "rather than emit a plausible-but-wrong number (the private, "
+                 "unversioned nstat struct layout is this source's largest "
+                 "risk — see the roadmap 2.1 spike memo)."},
             },
             .granularities = {
                 {

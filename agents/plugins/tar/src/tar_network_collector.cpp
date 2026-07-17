@@ -53,6 +53,11 @@
 #include <arpa/inet.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+// netqual (per-connection quality) + tcp lifecycle event stream (roadmap
+// 2.2) — the plugin-owned NstatClient, reached via a registered pointer (see
+// netqual_nstat_register_client in tar_collectors.hpp).
+#include "tar_netqual_nstat.hpp"
+#include <atomic>
 #elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -537,6 +542,12 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
 
 std::string_view netqual_effective_capture_method() { return "inetdiag"; }
 
+// nstat (tar_netqual_nstat.hpp) is macOS-only; the plugin still calls
+// netqual_nstat_register_client() unconditionally at init/shutdown (matching
+// NstatClient's own "inert off-macOS" contract), so this TU needs a body on
+// every platform it compiles for.
+void netqual_nstat_register_client(NstatClient*) {}
+
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
 
@@ -571,8 +582,25 @@ std::string format_addr6(const struct in6_addr& addr) {
     return buf;
 }
 
+// The plugin-owned NstatClient (roadmap 2.2), reached via
+// netqual_nstat_register_client() — see tar_collectors.hpp for the ownership
+// contract. Non-owning: set/cleared only by tar_plugin.cpp's init()/shutdown().
+std::atomic<NstatClient*> g_nstat_client{nullptr};
+
 } // namespace
 
+void netqual_nstat_register_client(NstatClient* client) {
+    g_nstat_client.store(client, std::memory_order_release);
+}
+
+// The proc_pidfdinfo poll (unchanged below). Roadmap 2.2 makes nstat the
+// PRIMARY tcp connection-lifecycle source when the plugin's NstatClient is
+// running() and system_wide() — that drain lives in tar_plugin.cpp's
+// collect_fast tcp leg (mirrors the ES-stream-with-poll-fallback shape used
+// for process_live), not here. This poll keeps its job unconditionally: it
+// is the tcp lifecycle fallback/seed whenever nstat is not primary, the ONLY
+// source for udp/udp6 (nstat's TCP provider has no UDP counterpart), and the
+// full live snapshot fleet_snapshot reads directly.
 std::vector<NetConnection> enumerate_connections() {
     std::vector<NetConnection> result;
     std::unordered_map<std::string, bool> seen;
@@ -677,11 +705,34 @@ std::vector<NetConnection> enumerate_connections() {
     return result;
 }
 
-// netqual per-connection quality is Linux + Windows for now (macOS: nstat /
-// PRIVATE_TCP_INFO is kPlanned — see the netqual schema source).
-std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
+// netqual per-connection quality (roadmap 2.2): the plugin-owned NstatClient's
+// live flow-table snapshot when it is running() AND system_wide() — an
+// own-process-only session is real capture via nstat, just not COMPLETE
+// capture, so it is deliberately withheld here rather than reported as a
+// partial netqual sample (memo §3, "no silent partial capture"; mirrors the
+// Windows ESTATS admin-only "records nothing" honesty at tar_netqual.hpp).
+// {} when no client is registered (off, not yet started, or this build never
+// wired one), the client isn't running (layout_mismatch or stop()ed), or it
+// is scoped to own-process flows only.
+std::vector<TcpQualitySample> collect_tcp_quality() {
+    NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
+    if (!client || !client->running() || !client->system_wide())
+        return {};
+    return client->snapshot_quality();
+}
 
-std::string_view netqual_effective_capture_method() { return "none"; }
+// "nstat" only while the registered client is running(), system_wide(), and
+// has not self-failed to a layout_mismatch() — running() already reflects a
+// layout-mismatch shutdown (the reader thread stops itself), but the extra
+// check keeps this honest even if that internal coupling ever changes.
+// "none" in every other case: no client registered, not running, own-process
+// scope only, or layout mismatch — never a partial/misleading "nstat".
+std::string_view netqual_effective_capture_method() {
+    NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
+    if (client && client->running() && client->system_wide() && !client->layout_mismatch())
+        return "nstat";
+    return "none";
+}
 
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
@@ -1214,6 +1265,10 @@ std::string_view netqual_effective_capture_method() {
     }
 }
 
+// nstat (tar_netqual_nstat.hpp) is macOS-only — see the Linux definition's
+// comment for why this TU still needs the symbol on every platform.
+void netqual_nstat_register_client(NstatClient*) {}
+
 #else
 // Unsupported platform
 std::vector<NetConnection> enumerate_connections() {
@@ -1223,6 +1278,7 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
     return {};
 }
 std::string_view netqual_effective_capture_method() { return "none"; }
+void netqual_nstat_register_client(NstatClient*) {}
 #endif
 
 } // namespace yuzu::tar
