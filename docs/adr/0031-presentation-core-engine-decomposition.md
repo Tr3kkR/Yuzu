@@ -39,7 +39,7 @@ related: >-
   decomposition's Decision 4 delegates to).
   0033-access-control-spine (the platform-wide authority, approval and Execution-Plan spine both
   of them enforce against).
-  0030-held-open-connection-scaling (this decomposition is what makes ADR-0030's durable fix
+  0034-held-open-connection-scaling (this decomposition is what makes ADR-0034's durable fix
   reachable: presentation becomes a separate binary, so its runtime is a free choice).
   docs/adr-1005-execution-plan.md Decision 3 (the machine surface — voided by this ADR), track 2c,
   track 2d, Phase 5 (server-issued delegation), track 2g (A5 annotations), issue #2056.
@@ -106,7 +106,7 @@ wrong. A rule that can only be enforced by remembering to enforce it will eventu
 Each of those is a reasonable local decision. Together they are a decomposition telling us it is
 wrong: three governed problems, all downstream of *where the UI lives*.
 
-Separately, ADR-0030 recorded that cpp-httplib is thread-per-connection, so every held-open SSE
+Separately, ADR-0034 recorded that cpp-httplib is thread-per-connection, so every held-open SSE
 response pins a worker thread for its life — and that the durable fix is to stop owning a thread
 per stream.
 
@@ -183,7 +183,7 @@ re-admission, evidence and the sequencing interlock — is **ADR-0032**. This AD
 shape: core is the **admission and authority chokepoint, not the byte path**.
 
 **5. Presentation runs on Drogon** (ballot A3, amended). An asynchronous, event-loop C++ framework
-with coroutine handlers: it removes one thread per held-open stream — ADR-0030's durable fix —
+with coroutine handlers: it removes one thread per held-open stream — ADR-0034's durable fix —
 without this project building a web framework on Boost.Beast, and without re-homing ~5k lines of
 `mcp_server.cpp` and the HTMX renderers into another language. Presentation uses Drogon for
 transport, framing and rendering **only**: not its ORM, not its session authorization, not its
@@ -422,11 +422,11 @@ ADR-0017 PR-A, #1715 prerequisite). The test moves; the interlock survives. `doc
 One origin, one session, one auth. The 2c §6 artifact-acquisition and F-8 hand-off flows stop being
 cross-origin by construction.
 
-### ADR-0030's durable fix becomes reachable
+### ADR-0034's durable fix becomes reachable
 
 Presentation is a separate binary, so **its runtime is a free choice**. What makes held-open
 connections expensive is cpp-httplib's thread-per-connection model — a property of *that process*,
-not of the domain. ADR-0030's answer is therefore not "put a gateway in front of the server" but
+not of the domain. ADR-0034's answer is therefore not "put a gateway in front of the server" but
 **"the presentation layer is the connection holder"**, and Decision 5 names Drogon as what it is
 built on. The `StreamBudget` cap landing with track 2f PR 2 (built, not yet merged) stays exactly
 what it was sold as: a stopgap that keeps the fused server from exhausting its thread pool until
@@ -451,7 +451,7 @@ being structural.
   them, restarting presentation would log everyone out and presentation could never scale
   horizontally. **Sessions and the MCP replay ring move behind the core boundary, out of
   presentation** - decided *with* the split, not after it. **Whether they become durable, and whether
-  that is core memory or Postgres, is G6/G7 and remains open** (ADR-0030 Decision 4; exec-plan
+  that is core memory or Postgres, is G6/G7 and remains open** (ADR-0034 Decision 4; exec-plan
   Decision 15(d) holds 2f's sessions in memory with a non-durable replay ring and no new store, so
   naming Postgres here would license a durable session store no ballot approved). What is decided is
   only that presentation stops *owning* them. This reworks the in-memory contracts around JIT
@@ -486,7 +486,7 @@ being structural.
   single localhost round trip is genuinely small against a 250 ms p95 view budget. **K is not
   measured.** Measuring it on the busiest existing dashboard fragment is a **gate on migration step
   4**, not a footnote — sizing a fleet-scale resource off an unmeasured constant is precisely what
-  ADR-0030 records going wrong.
+  ADR-0034 records going wrong.
 - **Observability.** Three `/metrics` endpoints to scrape and one trace context to thread through.
 
 ### Migration — not a big bang

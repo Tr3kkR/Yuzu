@@ -25,7 +25,7 @@ related: >-
   this ADR.
 ---
 
-# ADR-0030 — Held-open connections must not own a worker thread
+# ADR-0034 — Held-open connections must not own a worker thread
 
 ## Context
 
