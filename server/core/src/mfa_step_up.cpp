@@ -25,6 +25,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Bearer-credential principals are step-up-exempt by design. Token
     // issuance was the step-up moment; the token itself does not
     // re-prompt. Mirrors the /auth-and-authz skill's documented scope.
+    //
+    // `engine_token` (auth-engine-principals-design.md §6) is deliberately
+    // NOT added here, even though it is also a bearer credential. It falls
+    // through to the local `mfa_status()` lookup below, which returns
+    // `UserNotFound` (an engine session has no `users` row) and fails
+    // CLOSED. That is the correct posture, not an oversight: an engine
+    // session has no MFA-enrolled user to step up, so it must never be
+    // treated as already-proven the way a human-attributed api_token/
+    // mcp_token session is (§9's structural-denial posture). Do not extend
+    // this exemption to engine_token.
     if (session.auth_source == "api_token" || session.auth_source == "mcp_token") {
         return true;
     }
@@ -36,6 +46,12 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // would fail (UserNotFound) and emit a confusing "auth_db unavailable"
     // message. Do NOT add an exemption here; SAML MFA attestation is
     // deferred to a follow-up slice.
+    //
+    // `auth_source == "engine_token"` never matches this branch (an engine
+    // session's auth_source is exactly "engine_token", never "saml") — it
+    // falls through to the local `mfa_status()` lookup below and fails
+    // closed there, same correct posture as the api_token/mcp_token
+    // comment above.
     if (session.auth_source == "saml") {
         const auto cid = detail::make_correlation_id();
         nlohmann::json envelope = {
@@ -76,6 +92,10 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // is meaningless for an external identity, so the remediation steers
     // the operator back through SSO (see the source-specific challenge
     // URL on the failure path below).
+    // `engine_token` never equals "oidc", so `is_oidc` is false for an engine
+    // session — it takes the `!is_oidc` branch below and hits the local
+    // `mfa_status()` lookup, which fails closed (UserNotFound), matching the
+    // two comments above.
     const bool is_oidc = session.auth_source == "oidc";
 
     if (!is_oidc) {

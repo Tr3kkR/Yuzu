@@ -71,7 +71,10 @@ The concrete token/delegation mechanism is deferred to an auth-architecture foll
 
 ### 6. First-party use-case engine: one host, many modules
 
-Yuzu's own GUI/use-case product is a single **use-case engine host** (auth delegation, server-sync plumbing, UI shell) hosting use-cases as modules. Separate apps per use-case would reinvent that plumbing each time. "One host" is a product-packaging default only — it does not pre-decide principal granularity (see Terminology) or preclude later decomposition. The host's technology stack, internals, and delivery are out of scope and decided when the first module is scoped.
+Yuzu's own GUI/use-case product is a single **use-case engine host** (auth delegation, server-sync plumbing, UI shell) hosting use-cases as modules.
+
+> **AMENDED by ADR-0031 (accepted 2026-07-14): the engine host has NO UI shell.** It is a headless capability provider — no UI, no machine surface of its own. Presentation is a separate binary owned by the platform; engine Use Cases register into core's capability catalogue and are consumed through the one public surface (REST + MCP + dashboard). The rest of this decision — one host, many modules — stands. Decision 7's break-glass console survives and re-homes: ADR-0031 Decision 6a gives core its own minimal break-glass ingress, so a presentation failure cannot lock operators out during an incident.
+ Separate apps per use-case would reinvent that plumbing each time. "One host" is a product-packaging default only — it does not pre-decide principal granularity (see Terminology) or preclude later decomposition. The host's technology stack, internals, and delivery are out of scope and decided when the first module is scoped.
 
 The expected first module is vulnerability management (external vulnerability-feed ingest joined against Yuzu software inventory) — the concrete choice lives in `docs/roadmap.md`, not here. Note this module *re-homes* already-shipped **server-side** capability (the NVD sync + CVE matching — see Grandfathered surfaces); the agent-side `vuln_scan` collection plugin is mechanism and stays core. Scoping the first module MUST include the egress-primitive decision (how engines read fleet data at scale); its server-facing half (bulk reads, engine auth) is gated on the auth follow-up and that egress decision — only its domain-logic half can start immediately.
 

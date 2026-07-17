@@ -156,6 +156,19 @@ public:
     /// List all active users.
     std::expected<std::vector<auth::UserEntry>, AuthDBError> list_users();
 
+    /// Read-only prefix scan over `users.username` (active AND soft-deleted)
+    /// — backs the T8 startup collision-scan preflight (auth-engine-
+    /// principals design decision log #3). `prefix` must be a code-
+    /// controlled literal (e.g. `"engine:"`) — see the `.cpp` for the
+    /// LIKE-metacharacter fail-closed guard. Returns an empty vector on any
+    /// error (no error channel — a scan-time DB failure is logged, not
+    /// surfaced structurally, matching the caller's own preflight contract).
+    // Returns nullopt on a scan error (prepare failure / mid-scan SQLITE error)
+    // so the collision-scan preflight can fail CLOSED — an empty vector means a
+    // genuinely-completed scan with no collision, never a failed scan (symmetric
+    // with RbacStore::find_local_groups_with_prefix; governance G3 residual).
+    std::optional<std::vector<std::string>> find_reserved_prefix_users(const std::string& prefix);
+
     /// Stamp `users.last_login_at = CURRENT_TIMESTAMP` for the named
     /// user. Called by AuthManager after every successful local /
     /// recovery-code login (the MFA-verified login path stamps it as
@@ -539,12 +552,14 @@ private:
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
 
-/// True iff `username` begins with a reserved SSO-principal namespace prefix
-/// (`oidc:`, `saml:`, `ad:`; case-insensitive). Defense-in-depth for the
-/// LOCAL-user CREATE path only — `is_valid_username`'s existing ':' rejection
-/// already makes the exact stable-principal string `oidc:<iss>#<sub>`
+/// True iff `username` begins with a reserved SSO-principal or engine-
+/// principal namespace prefix (`oidc:`, `saml:`, `ad:`, `engine:`; case-
+/// insensitive). Defense-in-depth for the LOCAL-user CREATE path only —
+/// `is_valid_username`'s existing ':' rejection already makes the exact
+/// stable-principal string `oidc:<iss>#<sub>` (or `engine:<slug>`)
 /// unconstructable as a local username, but an explicit reservation
 /// documents the intent and survives a future loosening of that charset.
+/// `engine:` reservation is the auth-engine-principals design §3.3 / PR 4.2.
 /// Without it, an admin could otherwise create a local user that collides
 /// with (or is later made to collide with) an SSO-derived principal — that
 /// local user's row would supply the eligibility/TOTP an SSO principal
@@ -565,6 +580,12 @@ bool is_reserved_identity_prefix(const std::string& username);
 /// — never at user-creation chokepoints, which must keep using
 /// `is_valid_username` (+ `is_reserved_identity_prefix` to reserve the SSO
 /// namespace) so a local account can never be created inside it.
+/// `is_reserved_identity_prefix` now also reserves `engine:` — this widens
+/// the *format* this validator accepts, but no `users` row can ever actually
+/// carry that prefix: local creation stays blocked by `is_valid_username`'s
+/// ':' ban, and `upsert_sso_identity`'s principal is always
+/// `source + ":" + iss + "#" + sub` with `source` a caller-controlled
+/// literal in {"oidc","saml","ad"} — never "engine".
 bool is_valid_principal(const std::string& s);
 
 /// Validate that `username` is usable as the hardened-mode break-glass account:

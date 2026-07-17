@@ -411,6 +411,7 @@ yuzu_server_core_lib = static_library(
     'src/legacy_shim.cpp',
     'src/management_group_store.cpp',
     'src/api_token_store.cpp',
+    'src/engine_principal_store.cpp',
     'src/secure_random.cpp',
     'src/scim_store.cpp',
     'src/scim_json.cpp',
