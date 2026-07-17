@@ -1,5 +1,6 @@
 #include "management_group_store.hpp"
 #include "migration_runner.hpp"
+#include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
 
 #include <spdlog/spdlog.h>
 
@@ -561,6 +562,28 @@ std::expected<void, std::string>
 ManagementGroupStore::assign_role(const GroupRoleAssignment& assignment) {
     if (!db_)
         return std::unexpected("database not open");
+    // G1 (governance hardening, BLOCKING): `validate_assignment` is the
+    // shared name-based bar (kEngineDisallowedRoles) but NOT the `is_system`
+    // DB lookup that `RbacStore::assign_role` layers on top for the
+    // fleet-wide path — this store has no equivalent lookup, so a *scoped*
+    // engine grant to a built-in system role (Operator/ITServiceOwner/etc.)
+    // could otherwise be stored here uncaught, a latent Phase-5 escalation
+    // once scoped engine resolution ships. PR 4.2 only ships FLEET-WIDE
+    // engine grants (design §4.3) — scoped engine role assignment is a
+    // Phase-5 deliverable with its own resolution + review. Reject outright
+    // rather than store something the engine-role resolver can't yet honor
+    // correctly.
+    if (assignment.principal_type == "engine")
+        return std::unexpected(
+            "engine principals cannot hold scoped role assignments in this release");
+    // Shared engine-principal assignment guard — see RbacStore::validate_assignment's
+    // doc (rbac_store.hpp) for the full "no admin, ever" rationale. Same
+    // chokepoint RbacStore::assign_role calls; this is the scoped-assignment
+    // authoring surface named in design §4.1's PR-4.2 deliverable.
+    if (auto v = RbacStore::validate_assignment(assignment.principal_type, assignment.principal_id,
+                                                assignment.role_name);
+        !v)
+        return std::unexpected(v.error());
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,

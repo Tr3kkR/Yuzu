@@ -345,6 +345,9 @@ for the tool to execute.
 | 49 | `discover_routes` | A2 discovery: REST route catalog, a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves. Carries `source:"openapi"` and a caveat that it is hand-maintained, not generated from the live route table. Mirrors `GET /api/v1/discover/routes`. | `Infrastructure:Read` |
 | 50 | `discover_scope_kinds` | A2 discovery: Scope DSL kinds (`__all__`, `group:<name>`, `from_result_set:<id>`, `ostype`, `hostname`, `arch`, `agent_version`, `tag:<key>`, `props.<key>`), comparison operators, and syntax/examples for building a `scope` expression. Fully static — answers even when every store is down. Mirrors `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` |
 | 51 | `discover_plugins` | A2 discovery: plugin/action catalog observed across currently-connected agents. NOT a build-time manifest. Catalog `version: 2`: each action carries an inline `parameter_schema` when it has a published `InstructionDefinition` (matched on plugin+action) **and** the caller holds `InstructionDefinition:Read`; otherwise name+description only (an `Infrastructure:Read`-only caller gets no schemas). A top-level `actions_enriched_with_schema` counts the enriched actions. Mirrors `GET /api/v1/discover/plugins`. | `Infrastructure:Read` |
+| 52 | `assign_engine_role` (PR 4.2) | Grant a fleet-wide RBAC role to an engine principal (arg `principal_id` — the bare slug, WITHOUT the `engine:` prefix — and `role`). Engine principals can never hold `admin`/any built-in system role; such a request is rejected, never silently narrowed. Mirrors `POST /api/v1/engine-principals/{id}/roles`. Not read-only, not destructive (a grant expands, never removes, access). | `Security:Write` |
+| 53 | `unassign_engine_role` (PR 4.2) | Revoke a fleet-wide RBAC role from an engine principal (args `principal_id`, `role`). Destructive — removes standing authority a module may be relying on right now. Mirrors `DELETE /api/v1/engine-principals/{id}/roles/{role}`. | `Security:Write` |
+| 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. | `Security:Read` |
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`
@@ -355,6 +358,20 @@ for the tool to execute.
 > (`Security:Read`) and works on **every** tier including `readonly` (the
 > `readonly` tier permits all Read operations). Exposing both keeps MCP at parity
 > with the dashboard/REST CA surface (agentic-first principle A1).
+
+> **`assign_engine_role`/`unassign_engine_role` tier behavior (PR 4.2):** both
+> map to `Security:Write`, so `readonly` and `operator` tiers are **blocked**
+> outright (`Security:Write` is neither a bare `Read` nor one of `operator`'s
+> narrow Tag/Execution allowances) — only `supervised` can call either tool,
+> and on `supervised` both go through the same **ticket-then-recall approval
+> flow** as every other `Security:Write` op (see below): the first call
+> returns `kApprovalRequired`, and a re-call with the `approval_id` argument
+> performs the assign/unassign. This holds even though only `unassign_engine_role`
+> carries `destructiveHint:true` — the approval gate here keys on the
+> `(Security, Write)` mapping, not the hint (the hint is agentic-worker
+> guidance, not itself an enforcement mechanism). `list_engine_roles` maps to
+> `Security:Read` and works on **every** tier including `readonly`, same as
+> `list_issued_certs` above.
 
 > **Approval-gated tools — ticket-then-recall (#289):** `delete_tag` (operator +
 > supervised), `quarantine_device` (supervised), and every destructive op on the
