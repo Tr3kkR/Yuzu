@@ -37,6 +37,11 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+// PR 4.2 (docs/auth-engine-principals-design.md §4.1) — backs the
+// assign_engine_role/unassign_engine_role/list_engine_roles MCP twins of the
+// REST /api/v1/engine-principals/{id}/roles surface. Forward-declared
+// (pointer-only here); the .cpp includes engine_principal_store.hpp.
+class EnginePrincipalStore;
 }
 
 namespace yuzu::server::detail {
@@ -226,7 +231,14 @@ public:
                             std::vector<std::string> allowed_origins = {},
                             // ADR-0024: backs the query_software_licenses discovery read
                             // (the MCP twin of GET /api/v1/sle/agents/{id}).
-                            SoftwareLicensingStore* software_licensing_store = nullptr);
+                            SoftwareLicensingStore* software_licensing_store = nullptr,
+                            // PR 4.2 (design §4.1): backs assign_engine_role /
+                            // unassign_engine_role / list_engine_roles — the MCP twins
+                            // of the REST engine-principal role-assignment surface.
+                            // Trailing optional dep; nullptr leaves assign/unassign
+                            // answering an internal-error JSON-RPC response (list still
+                            // works if rbac_store is wired).
+                            EnginePrincipalStore* engine_principal_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -270,7 +282,10 @@ public:
                          McpSessionRegistry* sessions = nullptr,
                          const bool* mcp_streaming_disabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
-                         SoftwareLicensingStore* software_licensing_store = nullptr);
+                         SoftwareLicensingStore* software_licensing_store = nullptr,
+                         // PR 4.2 (design §4.1): engine-principal role-assignment MCP
+                         // twins. See the matching build_handler parameter doc.
+                         EnginePrincipalStore* engine_principal_store = nullptr);
 };
 
 } // namespace yuzu::server::mcp

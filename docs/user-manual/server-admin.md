@@ -210,6 +210,16 @@ Three things are visible after upgrading agents:
    the text, delete `security.firewall.state` and re-import it via
    `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
+### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
+
+The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
+a **fresh-start cutover with no data migration** — every pre-upgrade API token and MCP token stops
+working the instant the new server starts (interactive cookie-session/SSO login is unaffected).
+**Re-mint every API/MCP bearer token** after upgrading (`POST /api/v1/tokens`) and update the
+credential wherever it is stored; plan a maintenance window and notify automation owners, since all
+bearer-token integrations break at once. A boot-time warning names the legacy file (inert,
+removable). Full detail + multi-instance caveat: the `## ⚠️ Breaking` section in
+`docs/user-manual/upgrading.md` and ADR-0030.
 
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
@@ -1391,18 +1401,18 @@ REM Register the service (binPath is written for you, including the internal
 REM --service marker the agent needs to run under the SCM control protocol)
 yuzu-agent.exe --install-service
 
-REM Point it at your server / data dir / log file via sc config -- this is the
-REM EXACT quoting convention the shipped installer's own [Run] sc.exe config
-REM line uses (empirically verified working per #1822): quote ONLY the
-REM executable path, leave --service and the flag tokens bare/individually
-REM quoted after it. sc.exe reassembles all of this back into one binPath
-REM value regardless of how many separate quoted segments the command line
-REM contains, so this still works unmodified under a spaced path like
-REM "Program Files" (Gate 4 consistency-auditor finding, governance re-run --
-REM a prior revision of this example wrapped the entire value in one outer
-REM quote pair with escaped inner quotes, a different, less copy-paste-
-REM friendly convention from what the installer itself actually ships).
-sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe" --service --server yuzu.example.com:50051 --data-dir "C:\ProgramData\Yuzu" --plugin-dir "C:\Yuzu\plugins" --log-file "C:\Yuzu\logs\yuzu-agent.log"
+REM Point it at your server / data dir / log file via sc config. binPath= takes a
+REM SINGLE value, so the whole "exe + arguments" string must be ONE quoted token,
+REM with the quotes around a spaced exe path escaped as \" -- sc.exe does NOT
+REM reassemble several quoted segments back into one binPath. Written the other way
+REM round (quoting only the exe and leaving the flags bare after it) sc.exe parses
+REM --service/--server/... as unknown OPTIONS to sc itself, prints its usage block,
+REM and exits 1639 ERROR_INVALID_COMMAND_LINE without touching the service. That is
+REM #1468: the shipped installer had exactly that defect, and because Inno ignores
+REM [Run] exit codes it failed silently -- the service kept the argument-less binPath
+REM --install-service had written, so the agent ran with no --server and fail-closed
+REM on TLS. Check your work with `sc qc YuzuAgent`: every flag below must appear.
+sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir \"C:\ProgramData\Yuzu\" --plugin-dir \"C:\Yuzu\plugins\" --log-file \"C:\Yuzu\logs\yuzu-agent.log\""
 
 sc.exe start YuzuAgent
 sc.exe stop YuzuAgent

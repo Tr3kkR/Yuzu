@@ -16,6 +16,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
+#include "hard_exit.hpp" // shared TerminateProcess/_exit + F3 orphan-drain poll (rung 7.6)
 #include "shutdown_watcher.hpp" // POSIX self-pipe + watcher thread (the B2 root fix)
 #include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
 
@@ -150,13 +151,9 @@ static void log_quietly(const char* what) noexcept {
 
 static void on_signal_hard_exit(int sig) {
     (void)sig;
-#ifdef _WIN32
-    // Never ::_exit() here: it routes via ExitProcess -> DLL_PROCESS_DETACH across ~49 plugin DLLs
-    // -> the loader lock a wedged thread may hold. TerminateProcess runs no DllMain.
-    ::TerminateProcess(::GetCurrentProcess(), 1);
-#else
-    ::_exit(1); // exit_group(2): async-signal-safe, no atexit, no dtors, cannot block.
-#endif
+    // See hard_exit.hpp for why TerminateProcess (not ::_exit()) on Windows,
+    // and why ::_exit() (not std::exit()) on POSIX. Async-signal-safe either way.
+    yuzu::agent::hard_exit(1);
 }
 
 static void on_signal(int sig) {
@@ -214,16 +211,9 @@ static void on_signal(int sig) {
         // thread, where logging is safe) is deferred to a separate PR; until it lands, a wedged
         // stop is diagnosed from the supervisor's log and the absence of "Yuzu agent stopped".
         // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
-#ifdef _WIN32
-        // ::_exit() routes through ExitProcess, which terminates every other thread and THEN
-        // runs DLL_PROCESS_DETACH for each of the ~49 loaded plugin DLLs — taking the loader
-        // lock a wedged thread may already hold. The one path whose entire job is unconditional
-        // escape could itself deadlock. TerminateProcess runs no DllMain and takes no loader
-        // lock. (governance: cross-platform SHOULD-1.)
-        ::TerminateProcess(::GetCurrentProcess(), 1);
-#else
-        ::_exit(1); // exit_group(2): no atexit, no dtors, no loader lock. Cannot block.
-#endif
+        // See hard_exit.hpp: TerminateProcess on Windows (no DllMain, no loader
+        // lock), ::_exit() on POSIX (async-signal-safe, cannot block).
+        yuzu::agent::hard_exit(1);
     }
 
 #ifdef _WIN32
@@ -794,6 +784,25 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, on_signal);
 #endif
 
+    // F3 fail-closed backstop (Sol rung-7.6 review round 3, finding 2 - and
+    // round 4, which caught that this MUST be armed BEFORE agent->run() below,
+    // not after: run() itself is not noexcept and has a substantial throwing
+    // surface, so a guard constructed only after it returns would miss an
+    // exception thrown FROM run() itself). Everything from here through the
+    // explicit orphan check further down (run() itself, g_agent_mu acquisition
+    // on Windows, report_status-equivalent logging) could in principle throw
+    // and unwind past that check entirely, which would let normal C++ teardown
+    // run while a Guardian I/O worker might still be active - exactly what F3
+    // exists to prevent. Constructed AFTER `agent`, so reverse-declaration-
+    // order destruction runs this guard BEFORE the Agent's own destructor on
+    // every exit path, including an unwind - the same pattern
+    // `shutdown_watcher`/`agent_unpublisher` below already rely on. Disarmed
+    // once the explicit check has run to completion on the normal path (see
+    // below); its destructor is a deliberately non-throwing, unlogged fallback
+    // for every other path.
+    yuzu::agent::OrphanExitGuard orphan_guard{
+        [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
+
     agent->run();
 
     // ── THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM ──────────────────────────────
@@ -836,7 +845,51 @@ int main(int argc, char* argv[]) {
     }
 #else
     g_agent.store(nullptr, std::memory_order_release);
+    // F3's orphan check below needs guardian_->stop() to have DEFINITELY
+    // completed before sampling guardian_active_io_workers() - a count of
+    // zero is meaningless otherwise: it could mean "fully quiesced" just as
+    // easily as "the watcher thread's a->stop() call has not even started
+    // yet". ~ShutdownWatcher's destructor JOINS the watcher thread (whose
+    // callback IS a->stop()) - waiting for main()'s natural scope exit to get
+    // that join is too late, since the orphan check below runs first in
+    // program order. Reset it explicitly here instead. g_agent is already
+    // null (above), so this is safe even on the rare detach fallback path
+    // (Sol rung-7.6 review finding 1). On Windows, g_agent_mu already
+    // provides this ordering: the console handler holds it across a->stop(),
+    // and the store above blocks until any in-flight call has returned.
+    shutdown_watcher.reset();
 #endif
+
+    // F3 orphan-exit obligation (ADR-0021 rung 7.6; guardian_io_executor.hpp's
+    // "ORPHAN PROCESS-EXIT CONTRACT"). guardian_->stop() above has already run as
+    // part of Agent's own teardown, but a Guardian bounded-I/O read is spawned
+    // DETACHED and cannot be joined or force-cancelled - a wedged SCM query, a
+    // stalled sd-bus broker, or a hung FUSE/network mount can leave one still
+    // running past its own per-class deadline (which only makes the SUBMITTER
+    // stop waiting; the worker keeps running). Falling through to normal process
+    // exit here would run C++ static/DSO teardown while that worker may still be
+    // executing libsystemd/OpenSSL/Win32-RPC code through it - not safe. Give it
+    // a short grace to actually finish, and if it hasn't, hard_exit() (skip
+    // teardown entirely) with a code that is NEVER EXIT_SUCCESS, so the
+    // supervisor sees a real failure instead of a silently-clean-looking exit.
+    if (const auto n = agent->guardian_active_io_workers(); n > 0) {
+        if (!yuzu::agent::wait_for_workers_to_drain(
+                [&] { return agent->guardian_active_io_workers(); },
+                yuzu::agent::kOrphanDrainGrace)) {
+            // Firewalled: a logging exception here must never skip hard_exit()
+            // below - same rationale as log_quietly() elsewhere in this file
+            // (Sol rung-7.6 review finding 2).
+            try {
+                spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
+                                 "forcing process exit rather than race static/DSO teardown "
+                                 "against them",
+                                 n, yuzu::agent::kOrphanDrainGrace.count());
+            } catch (...) {
+            }
+            yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
+        }
+    }
+    orphan_guard.disarm(); // the explicit check above has run to completion
 
     // #1303: a fatal STARTUP failure (e.g. the fail-closed TLS posture refused to
     // connect with no pinnable CA) must surface as a non-zero exit so systemd

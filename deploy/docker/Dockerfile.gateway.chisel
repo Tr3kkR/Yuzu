@@ -114,6 +114,18 @@ RUN set -eux; \
       [ "$app" = busybox ] && continue; \
       ln -sf busybox "$BBDIR/$app"; \
     done; \
+    # WARNING: busybox has NO `bash` applet. This symlink makes /bin/bash EXIST
+    # while ALWAYS failing -- `/bin/bash -c ...` exits 127 "applet not found"
+    # (verified against the published gateway-chisel image). It is here only so a
+    # `#!/bin/bash` shebang resolves to something; nothing in this image actually
+    # runs bash (the OTP boot script is `#!/bin/sh`).
+    #
+    # NEVER healthcheck this image with bash. Copying the server's
+    # `bash -c 'exec 3<>/dev/tcp/...'` healthcheck onto a chisel image would park
+    # the container `unhealthy` forever while every test still passed -- the exact
+    # failure class #751 exists to prevent, and a `test -x /bin/bash` would not
+    # catch it. Use `/bin/busybox wget --spider`, which is what the demo compose
+    # does and what scripts/ci/verify-healthcheck-invariants.sh enforces.
     ln -sf busybox "$BBDIR/bash"; \
     test -x "$BBDIR/busybox" && test -L "$BBDIR/sh" && test -L "$BBDIR/dirname" && test -L "$BBDIR/sed"
 
