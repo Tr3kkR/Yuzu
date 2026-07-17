@@ -1,4 +1,4 @@
-hardware_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+hardware_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep]
 
 if host_machine.system() == 'windows'
   hardware_deps += cxx.find_library('wbemuuid')
