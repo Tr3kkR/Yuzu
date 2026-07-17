@@ -326,6 +326,156 @@ TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-c
     CHECK(status.errored_rules() == 1);
 }
 
+// ── rung 6: apply_rules must honor enabled() the same way start_local does ──
+// Previously apply_rules called start_guard_for_rule_locked for EVERY pushed
+// rule regardless of enabled() (unlike start_local, which already skipped
+// disabled cached rules on restart), so a disabled rule still armed a guard,
+// and pushing an already-armed rule as disabled never stopped it. These use
+// make_service_rule because it is the one fixture that arms a REAL guard
+// cross-platform (SystemdServiceGuard on Linux+systemd, ServiceGuard on
+// Windows) without depending on the target unit/service existing (R5) - a
+// SKIP mirrors the existing [statereader] "no reachable system bus" precedent
+// for environments where arming genuinely cannot happen.
+//
+// Every push here goes through guardian_dispatch_push_bytes_for_test (byte-
+// serialize then parse INSIDE the DLL) rather than calling apply_rules()
+// directly on a proto built in the test EXE - the #501 rationale above
+// (GuardianFixture::make_rule) applies to any rule carrying a params Map, and
+// make_service_rule's assertion().params() is exactly that. Calling
+// apply_rules() directly on such a rule hits the cross-image hash-seed split
+// on Windows MSVC debug builds: the DLL-side find() can miss the EXE-side-
+// inserted "service_name" entry, arming with an empty service name instead of
+// "Spooler" (caught on DGRHP: [guardian][engine] Windows run, 2026-07-16).
+
+TEST_CASE("GuardianEngine: apply_rules never arms a guard for a disabled rule",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-disabled", "audit");
+    p.mutable_rules(0)->set_enabled(false);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(f.engine->rule_count() == 1);       // still persisted...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but never armed
+}
+
+TEST_CASE("GuardianEngine: full_sync does not arm a disabled rule alongside an enabled one",
+          "[guardian][engine][enabled][full_sync]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-on", "audit");
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-off", "audit");
+    p.mutable_rules(1)->set_enabled(false);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->rule_count() == 2);
+    CHECK(f.engine->armed_guard_count() == 1); // only svc-on
+}
+
+TEST_CASE("GuardianEngine: disabling a previously-armed rule stops it; re-enabling re-arms it",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, now disabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        p.mutable_rules(0)->set_enabled(false);
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);       // the rule is still tracked (disabled, not deleted)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but its guard was stopped
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, re-enabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->armed_guard_count() == 1); // re-armed
+}
+
+TEST_CASE("GuardianEngine: re-pushing an enabled rule with the same id replaces its guard, "
+          "never double-arms",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-replace", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, changed content, still enabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-replace", "enforce");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->armed_guard_count() == 1); // swapped, not accumulated to 2
+}
+
+TEST_CASE("GuardianEngine: a same-id replacement with an invalid new assertion retires the prior "
+          "guard instead of leaving it enforcing stale policy",
+          "[guardian][engine][enabled]") {
+    // Regression for a bug found reviewing the enabled()/replace contract:
+    // start_guard_for_rule_locked's per-branch "stop the existing guard for this
+    // rule_id" step ran only on the happy path, AFTER validating the new rule's
+    // assertion type - so a same-id re-push whose new assertion failed validation
+    // returned false early and left the PRIOR guard armed, silently enforcing a
+    // stale definition even though apply_rules had already persisted (and reported
+    // success for) the new one. The retire-existing-guard step is now hoisted to
+    // the top of start_guard_for_rule_locked so every return path starts clean.
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, still enabled, INVALID assertion type
+        p.set_full_sync(false);
+        auto rule = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        rule.mutable_assertion()->set_type("service-frobnicate"); // not a recognized assertion kind
+        *p.add_rules() = rule;
+        // persistence succeeds regardless of arm outcome
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);       // still persisted (as the new, invalid definition)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but the OLD guard was retired, not left running
+}
+
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;

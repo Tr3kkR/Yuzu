@@ -178,17 +178,19 @@ ADR-0023 (`docs/adr/0023-vulnerability-correlation-engine.md`, owner @lesault) d
   its audit/risk-acceptance trail) intact, rather than inheriting ADR-0023's shipped
   delete-on-`assessed-clean` row disposal. This is proposed design, not yet an accepted requirement;
   treat as authoritative only once the ADR-0019 amendment itself is accepted.
-  **Open reconciliation needed:** this document's own M3 milestone (below) originally specified a
-  5-state disposition lifecycle (`new`/`triaged`/`accepted-risk`/`remediated`/`reopened`); the module
-  design doc (`VULN_UCE_MODULE_DESIGN.md`) proposes 3 additional states
-  (`mitigated`/`disputed`/`verification-failed`) on top of those 5. Please confirm which is
-  authoritative — adopt the module doc's 8-state list as M3's spec, or confirm the original 5-state
-  list is final and the module scope trims to match — either is fine, but the two need to agree
-  before M3's acceptance text (which now intentionally omits a specific count pending this answer —
-  see M3 below) is treated as settled.
-  (Like the parity-baseline shift below, this binds M3's *design* from now and is folded into M3's
-  enumerated acceptance text the next time that text is revised under governance — it is not silently
-  appended to the five-condition list today.)
+  **Resolved (2026-07-16, ADR-4004).** This document's own M3 milestone (below) originally specified
+  a 5-state disposition lifecycle (`new`/`triaged`/`accepted-risk`/`remediated`/`reopened`); the
+  module design work proposed 3 additional states (`mitigated`/`disputed`/`verification-failed`) on
+  top of those 5. A further reconciliation pass — folding in CAVM v20's gate model (ADR-4003) and a
+  false-positive-suppression design — added a 9th state, `dismissed` (a disputed finding confirmed as
+  a genuine matcher/identity mistake, not a real finding), not anticipated when this note was first
+  written. `docs/adr/4004-vulnerability-finding-disposition-lifecycle.md` formally ratifies the full
+  9-state list as M3's disposition-lifecycle spec, adopting the module doc's list (extended by one)
+  rather than trimming to the original 5 — see that ADR for the complete state definitions, required
+  fields per state, and the `gate_state`/CAVM-gate-model reconciliation. M3's acceptance text below is
+  updated accordingly. This resolution is scoped to the disposition/triage axis only — the separate,
+  still-open item immediately above (the ADR-0019 amendment's proposed no-delete-on-reassessment row
+  lifecycle) is untouched by ADR-4004 and remains pending that amendment's own ratification.
 - **M3's parity baseline shifts.** M3(a) was written against `/api/nvd/match` as the reference surface. Once the ADR-0023 engine is live, the honest parity reference becomes the in-server pipeline's per-device tri-state findings — a stronger baseline than the diagnostic route. Phase 7 planning must re-point M3(a)/(b)'s reference at the ADR-0023 findings pipeline as it exists at that time; flagged here rather than silently rewriting M3's governed acceptance text.
 - **Confinement stances agree.** ADR-0023 Decision 5 already mandates the `authorize_list_read` chokepoint plus a dedicated per-agent findings-read audit verb for any in-server findings surface; Decision 14's UCE-side confinement mechanism (the 2c deliverable) is the out-of-server analog of the same requirement.
 
@@ -198,9 +200,11 @@ ADR-0023 (`docs/adr/0023-vulnerability-correlation-engine.md`, owner @lesault) d
 
 - **M1** — UCE host skeleton (server-API client with a min/max supported server-API version handshake, a sync scheduler, the shared fleet-data access layer from Decision 6, a UI shell) plus NVD 2.0 feed sync with a watermark, landing in the module's own Postgres. *Acceptance: CVE count and watermark match a server-side sync over the same window; the host itself exposes a readiness probe and a metrics surface matching `docs/observability-conventions.md` before this milestone is considered done — a CVE-matching module that silently stops syncing must be observable to an operator, not just to the server.*
 - **M2** — catalogue-grain inventory join per Decision 5: read the fleet-wide software catalogue plus per-name device expansion, over a plain API token, autonomous reads only, request-paced. *Acceptance: the module's catalogue snapshot matches server reads for a pilot fleet, AND a synthetic high-cardinality version-string seed is used to measure sync/egress against the 500k design ceiling (validating or correcting the 10–50k catalogue-size estimate in Decision 5), AND the device-expansion read is exercised specifically for correctness (not just the catalogue read) given the 1000-row cap tracked at #1634.*
-- **M3** — matcher parity, a findings store with a disposition lifecycle (exact state list pending
-  reconciliation — see "Findings models compose, they don't compete" above), findings UI, and the
-  operator hand-off seam from Decision 2. *Acceptance, strengthened — this is the gate that authorizes Phase 7's irreversible deletion, so it carries five conditions across two axes (matching-logic parity and device-expansion completeness are different checks, since `/api/nvd/match` itself has no device-count dimension — it takes a `{name,version}` inventory and returns CVE matches, nothing more):*
+- **M3** — matcher parity, a findings store with the 9-state disposition lifecycle ADR-4004 ratifies
+  (`new`/`triaged`/`mitigated`/`accepted-risk`/`disputed`/`verification-failed`/`remediated`/
+  `reopened`/`dismissed` — see "Findings models compose, they don't compete" above and ADR-4004
+  directly for state definitions and required fields), findings UI, and the operator hand-off seam
+  from Decision 2. *Acceptance, strengthened — this is the gate that authorizes Phase 7's irreversible deletion, so it carries five conditions across two axes (matching-logic parity and device-expansion completeness are different checks, since `/api/nvd/match` itself has no device-count dimension — it takes a `{name,version}` inventory and returns CVE matches, nothing more):*
   - *(a) Matching-logic parity: given the identical `{name,version}` inventory input, the module's matcher returns the identical set of CVE findings as the existing `/api/nvd/match` route.*
   - *(a2) Device-expansion completeness (depends on 2e): for a software title seeded via a controlled synthetic fixture (not discovered through the same `query_software` path under test, to avoid a circular check) to be installed on more than 1,000 devices, the module's own device-expansion enumeration (via the keyset-paginated `query_software` from 2e) returns the complete device list with no cap-related truncation — verified against the fixture's known device count, not against `/api/nvd/match`, which was never involved in device counting.*
   - *(b) A production-scale shadow-match run against the live fleet during the deprecation window, comparing the **per-device set of CVE ids**, not just aggregate finding counts — a compensating false-positive/false-negative pair must not pass this check by netting out to the same total.*

@@ -614,16 +614,16 @@ public:
         // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
         metrics_.describe("yuzu_fleet_spark_reporting",
                           "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
-                          "running (spark_running=1) — the denominator for all spark telemetry",
+                          "running (spark_running=1) - the denominator for all spark telemetry",
                           "gauge");
         metrics_.describe("yuzu_fleet_spark_disabled",
                           "Agents (per `os`) running with SparkEngine deliberately off "
-                          "(--spark-disable). An operator decision — expected to be non-zero; "
+                          "(--spark-disable). An operator decision - expected to be non-zero; "
                           "do NOT alert on it", "gauge");
         metrics_.describe("yuzu_fleet_spark_failed",
                           "Agents (per `os`) where SparkEngine was ENABLED but boot-time "
                           "instantiation THREW, so the agent degraded to no-spark. Distinct from "
-                          "`disabled` on purpose: this is a fault, not a choice — ALERT on it. "
+                          "`disabled` on purpose: this is a fault, not a choice - ALERT on it. "
                           "Absent = no agent of that os reported a failure this cycle", "gauge");
         metrics_.describe("yuzu_fleet_spark_mechanisms",
                           "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
@@ -645,10 +645,10 @@ public:
                           "Fleet sum (per `os`) of cumulative queued handlers that threw "
                           "(consumer_errors_total)", "gauge");
         metrics_.describe("yuzu_fleet_spark_watch_rejected",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections - "
                           "a rule that could not arm (denial-of-detection)", "gauge");
         metrics_.describe("yuzu_fleet_spark_quarantined",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines - "
                           "a structural leak that should stay 0; any value is page-worthy", "gauge");
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
@@ -1460,6 +1460,36 @@ public:
             }
         }
 
+        // ApiTokenStore — born-on-PG Bearer-token store (plan PR 4.1). Same
+        // fail-CLOSED construction posture as the other born-on-PG stores
+        // (ADR-0012 §1): a reachable database whose schema can't migrate/open
+        // is a deploy error, not a serve-degraded state. FRESH START — no
+        // SQLite backfill; the legacy api-tokens.db is no longer opened.
+        if (pg_pool_ && !startup_failed_) {
+            api_token_store_ = std::make_unique<ApiTokenStore>(*pg_pool_);
+            if (!api_token_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: api-token store migration/open failed "
+                              "(database reachable but the api_token_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // FRESH-START migration (ADR-0030): the legacy SQLite
+                // api-tokens.db is never opened; existing API/MCP tokens are
+                // invalidated on upgrade. Warn if the stale file is still on
+                // disk so an in-place upgrade's mass 401s are diagnosable (the
+                // file is inert + hash-only and can be deleted).
+                std::error_code ec;
+                const auto legacy_db = cfg_.db_dir() / "api-tokens.db";
+                if (std::filesystem::exists(legacy_db, ec)) {
+                    spdlog::warn("[auth] Legacy SQLite api-tokens.db found at {} — API/MCP "
+                                 "tokens now live in PostgreSQL and any prior tokens were "
+                                 "INVALIDATED by the migration (ADR-0030); re-mint them. The "
+                                 "old file is inert and can be removed.",
+                                 legacy_db.string());
+                }
+            }
+        }
+
         // Initialize response store
         {
             auto resp_db = cfg_.db_dir() / "responses.db";
@@ -2226,10 +2256,6 @@ public:
             agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
-        }
-        {
-            auto token_db = cfg_.db_dir() / "api-tokens.db";
-            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
         }
         {
             auto quar_db = cfg_.db_dir() / "quarantine.db";
@@ -3619,6 +3645,12 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
+        // hold a raw pointer, and every HTTP handler thread is already
+        // quiesced by the drain above); keep the ADR-0012 teardown discipline
+        // so a future consumer can't UAF.
+        api_token_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -10749,8 +10781,21 @@ private:
                    bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
                 const auto revoke = auth_mgr_.invalidate_user_sessions(username);
                 std::size_t tokens = 0;
+                bool api_tokens_db_persisted = true; // vacuously true when not requested
                 if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
-                    tokens = api_token_store_->revoke_for_principal(username);
+                    auto revoked = api_token_store_->revoke_for_principal(username);
+                    if (revoked.has_value()) {
+                        tokens = *revoked;
+                    } else {
+                        // The API-token revoke did NOT persist (lease timeout /
+                        // query error). Do NOT report a count — 0 would read as
+                        // "the principal had no tokens". Flag it so the handler
+                        // audits "partial", never a false "signed out
+                        // everywhere" (ADR-0030 §Posture, the stolen-laptop path).
+                        api_tokens_db_persisted = false;
+                        spdlog::error("revoke_for_principal did not persist for {}: {}", username,
+                                      revoked.error());
+                    }
                 }
                 // CC7.2 anomaly-detection signal: a spike in this counter
                 // is the operator's automated alert for compromised-account
@@ -10758,18 +10803,21 @@ private:
                 // Caller dimension is inferred from the api-tokens flag:
                 // /me passes true (self full-credential revoke), admin
                 // path passes false (cookies only, automation tokens
-                // intact). Result dimension carries db_persisted so SOC 2
+                // intact). Result dimension is "partial" if EITHER the cookie
+                // dual-write OR the API-token revoke failed, so SOC 2
                 // partial-failure rows are filterable.
+                const bool all_persisted = revoke.db_persisted && api_tokens_db_persisted;
                 metrics_
                     .counter("yuzu_auth_sessions_revoked_total",
                              {{"caller", revoke_api_tokens ? "self" : "admin"},
-                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"result", all_persisted ? "success" : "partial"},
                               {"scope", revoke_api_tokens ? "all" : "cookies"}})
                     .increment();
                 return RestApiV1::SessionRevokeResult{
                     revoke.count,
                     tokens,
                     revoke.db_persisted,
+                    api_tokens_db_persisted,
                 };
             },
             // W5.1 — pass the per-execution event bus into the REST
@@ -11438,6 +11486,10 @@ private:
     // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    // Born-on-PG (plan PR 4.1). Borrows pg_pool_ — declared after it (line
+    // ~11270) so normal reverse-declaration-order destruction is already
+    // correct; stop() also explicitly resets it before pg_pool_.reset() (ADR-0012
+    // destruct-before-pool discipline, matching the other born-on-PG stores).
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<ResultSetStore> result_set_store_;

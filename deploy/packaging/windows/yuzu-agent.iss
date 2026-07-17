@@ -128,8 +128,24 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 [Run]
 ; Register and start the service after install
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg: "Registering Yuzu Agent service..."; Flags: runhidden waituntilterminated
-Filename: "sc.exe"; Parameters: "config YuzuAgent binPath= ""{app}\bin\yuzu-agent.exe"" --service --server {code:GetServerAddress} --data-dir ""{commonappdata}\Yuzu"" --plugin-dir ""{app}\plugins"" --log-file ""{app}\logs\yuzu-agent.log"" {code:GetExtraArgs}"; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated shellexec
-Filename: "sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated shellexec; Check: ShouldStartService
+; #1468: `binPath=` takes a SINGLE value -- sc.exe consumes only the next token, so the
+; whole "exe + arguments" string must be one quoted token with the inner quotes escaped
+; (\" -- written \"" here, since "" is a literal quote in an Inno parameters string).
+; Written the old way (bare quoted exe, arguments trailing outside the value) sc.exe parsed
+; --service/--server/... as unknown OPTIONS, printed its usage block and exited 1639
+; ERROR_INVALID_COMMAND_LINE without touching the service -- and because Inno ignores [Run]
+; exit codes, the install still reported success. The service kept the argument-less binPath
+; CreateServiceW wrote ("<exe>" --service, service_win.hpp make_service_binpath), so the agent
+; ran with no --server/--data-dir/--plugin-dir/--log-file and, with TLS on by default and no
+; CA to pin, fail-closed on startup (#1303 posture) -- the service reached RUNNING and then
+; stopped seconds later. `sc qc YuzuAgent` must show every argument below; pre-release.yml's
+; install-windows job asserts exactly that so this cannot regress silently again.
+; {sys}\sc.exe + no shellexec: ShellExecuteEx re-parses lpParameters, so the escaped quotes
+; are only reliably preserved via CreateProcess (which takes the string verbatim); the full
+; path removes the PATH lookup that shellexec was providing.
+; GetExtraArgs supplies its own leading space, so it is appended without one.
+Filename: "{sys}\sc.exe"; Parameters: "config YuzuAgent binPath= ""\""{app}\bin\yuzu-agent.exe\"" --service --server {code:GetServerAddress} --data-dir \""{commonappdata}\Yuzu\"" --plugin-dir \""{app}\plugins\"" --log-file \""{app}\logs\yuzu-agent.log\""{code:GetExtraArgs}"""; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated; Check: ShouldStartService
 ; Configure the boot-window ETW AutoLogger so the kernel captures process
 ; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
 ; at startup to backfill processes that started AND exited before its live ETW
