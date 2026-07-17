@@ -8,6 +8,7 @@ shared_library(
   'certificates',
   files('src/certificates_plugin.cpp'),
   name_prefix: '',
+  include_directories: include_directories('../../shared'),  # macos_console_user.hpp (A-1.11)
   dependencies: cert_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
