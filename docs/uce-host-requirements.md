@@ -181,6 +181,14 @@ settled hand-offs — sources: plan Decisions, 2b §10):
 
 ### 3.2 Findings viewing & confinement (plan Decision 14)
 
+> **RELOCATED by ADR-0031 (accepted 2026-07-14) — F-5, F-6, F-7 and §6.** The engine no longer
+> re-derives ADR-0017 confinement. **Core confines the inputs; the engine composes them** (ADR-0031
+> INV-31-2), and core records every release at read time (ADR-0032 Decision 11). §6's view-time
+> scoped read-through mechanism is therefore not built. **M3 remains the parity gate**; its
+> confinement leg **retargets** to core's release gate — what core released to the engine for an
+> operator must equal what that operator could have read directly (the ADR-0017 evaluate-as-operator
+> seam, #1716; ADR-0032 interlock item (b)). The requirement survives; the mechanism moved.
+
 - **F-5 — Outcome equivalence with `/devices`.** For a management-group-confined
   operator and a given CVE, the findings page MUST show the **same device set
   `/devices` would show that operator for the same scope — never more**. The
@@ -211,6 +219,12 @@ settled hand-offs — sources: plan Decisions, 2b §10):
   security-guardian.
 
 ### 3.4 Consumer model (plan Decision 3)
+
+> **VOIDED by ADR-0031 (accepted 2026-07-14).** The engine has no UI, so the "private UI seam" has
+> no premise. Engine capabilities are reachable by humans **and** agentic workers through core's one
+> public surface, under the same RBAC and audit chain. The `confirm-now` reconciliation item logged
+> against this requirement resolves itself. F-11 (confinement) is untouched — it was never a
+> carve-out.
 
 - **F-10 — No machine consumer; private UI seam.** The UCE's only external
   interface is its human UI; **no machine consumer of the UCE exists** in v1.
@@ -458,6 +472,13 @@ settled hand-offs — sources: plan Decisions, 2b §10):
 
 ### 4.6 Operator login & session (host-universal)
 
+> **VOIDED IN ITS ENTIRETY by ADR-0031 (accepted 2026-07-14).** A headless engine has no browser
+> origin, no login and no session, so every pin below (Yuzu-as-IdP, the cross-origin redeem flow,
+> `state`/nonce binding, the liveness ping) secures a thing that no longer exists. Operators
+> authenticate **once, to presentation**; the engine sees only a core-minted, audience-bound grant
+> (ADR-0032). NF-3, NF-7 and NF-8(vii) are RE-SCOPED for the same reason; **NF-2, NF-5 and NF-6
+> stand unchanged.**
+
 - **NF-9 — Operator login & session security.** The UCE has **no user store**;
   operator login is **Yuzu-as-identity-provider** (the concrete cross-origin
   redirect flow is `docs/uce-deployment-topology-design.md` §3). These pins are
@@ -577,7 +598,13 @@ is answered, not silently overridden.
 
 ---
 
-## 6. Commitment 1 — confinement enforcement mechanism (normative)
+## 6. Commitment 1 — confinement enforcement mechanism (normative) — [RELOCATED by ADR-0031]
+
+> **RELOCATED by ADR-0031 (accepted 2026-07-14).** This section commits the *engine* to enforcing
+> confinement by view-time scoped read-through. That mechanism is not built: confinement moves into
+> **core**, which confines the inputs it releases (INV-31-2) and logs each release (ADR-0032
+> Decision 11). Read this section as the historical record of the requirement, not as the design.
+
 
 **2c commits to candidate (a): view-time scoped read-through.** The findings
 page enforces confinement by asking the Yuzu server, per view, "which of these
@@ -794,6 +821,13 @@ are not re-litigated:
 | NF-7 | Operable separate deployable | host | stack ADR |
 | NF-8 | Observability floor (existence now) | host | stack ADR / sre |
 | NF-9 | Operator login & session security | host | stack ADR (T2b) / security-guardian |
+
+> **RETARGETED by ADR-0031/0032 (accepted 2026-07-14).** The summary rows and the restated interlock
+> below still route confinement through the **§6 mechanism**, which is RELOCATED (see §6 and F-5/F-6):
+> the engine does not confine — **core confines the inputs it releases** (INV-31-2) and logs each
+> release (ADR-0032 Decision 11). M3(d) survives and now tests **core's release gate**, not a
+> module-side re-derivation. Read F-5/F-6/F-15 and the interlock below with that substitution; F-10
+> and NF-9 rows are VOID.
 
 **Hard interlock (restated):** F-5/F-6/F-11 (confinement) and their §6 mechanism
 gate M3's condition (d) and Phase 6 **unconditionally** — Phase 6 cuts the

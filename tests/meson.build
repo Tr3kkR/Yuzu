@@ -152,9 +152,22 @@ agent_test_exe = executable(
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
     'unit/test_shutdown_pipe.cpp',
+    'unit/test_hard_exit.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
+    'unit/test_spark_key_rule_index.cpp',
     'unit/test_spark_mechanism.cpp',
+    'unit/test_guardian_spark_bridge.cpp',
+    'unit/test_guardian_spark_backend.cpp',
+    'unit/test_guardian_emit_decider.cpp',
+    'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_runtime.cpp',
+    'unit/test_guardian_state_reader.cpp',
+    'unit/test_guardian_convergence_scheduler.cpp',
+    'unit/test_guardian_io_executor.cpp',
+    'unit/test_guardian_outbox_drain_worker.cpp',
+    'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_agent_csr.cpp',
@@ -170,6 +183,7 @@ agent_test_exe = executable(
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
     'unit/test_wifi_corewlan.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -179,6 +193,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -344,6 +359,10 @@ if build_server
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_engine_principal_store.cpp',
+      'unit/server/test_engine_principal_integration.cpp',
+      'unit/server/test_rest_engine_principal_roles.cpp',
+      'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',

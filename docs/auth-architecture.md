@@ -1484,7 +1484,7 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -1551,22 +1551,74 @@ header, so these names stay rejected on client ingress permanently.
 ## Engine principals & delegation (ADR-1005 — design)
 
 - **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
-  2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped
-  surface.
+  2b, feeds Phases 4–5). **Partially shipped** as of PR 4.1/4.2 — the identity
+  store, RBAC resolution/authoring, session-authorization semantics, and
+  attribution plumbing below are live; delegation (Phase 5) and any
+  operator-facing CRUD for minting/revoking engine principals (PR 4.3) are
+  not.
 - Third principal class (`engine`) for use-case-engine hosts: dedicated
-  born-on-Postgres `EnginePrincipalStore` (named human owner, justification,
-  soft-retained after revoke), reserved `engine:` id namespace, per-module
-  granularity.
+  born-on-Postgres `EnginePrincipalStore` (`engine_principal_store` schema,
+  ADR-0031; named human owner, justification, soft-retained after revoke),
+  reserved `engine:` id namespace, per-module granularity.
+  **No operator CRUD yet** (PR 4.3 scope) — the store exists and is
+  authoritative, but nothing today mints or revokes an engine principal
+  outside a test/admin code path.
 - Token sessions branch on a persisted `ApiToken.principal_kind`
   (`human`|`engine`) — an engine token attributes to the engine principal
-  itself (`auth_source="engine_token"`), never to its creating human.
+  itself (`auth_source="engine_token"`), never to its creating human. Engine
+  tokens are referentially checked against `EnginePrincipalStore` at mint
+  time, always `mcp_tier=readonly`, and always carry a ≤90-day expiry.
+- **Session-authorization semantics — RBAC-only, no fallback (PR 4.2 fix
+  round).** `AuthRoutes::require_permission`/`require_scoped_permission`
+  branch on `session->principal_kind == "engine"` **before** falling through
+  to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
+  for human and agent sessions. An engine session's authority is resolved
+  **exclusively** against `RbacStore`:
+  - `rbac_store_` null/unopened → **`503`** (cannot evaluate authority;
+    retryable, never a silent allow).
+  - RBAC disabled, or no matching `(principal="engine:<slug>", role, scope)`
+    grant → **`403`**.
+  - A matching grant → allowed.
+
+  This closes the gap where an engine credential — before this fix — inherited
+  fleet-wide `Read` the moment RBAC was off (the historical default), via the
+  same legacy fallback human sessions still use. Engine principals now get
+  **no** legacy fallback and **no** service-scoped fallback under any
+  circumstance; the only path to authority is an explicit assignment. This is
+  the concrete mechanism behind design §4.2's promise: *"An engine principal
+  with no assignments can do nothing."*
+- **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
+  `principal_class="engine"` from the resolved session's `principal_kind`
+  after the generic (credential-presentation-based) classification runs —
+  an engine principal's bearer-token requests previously mislabelled as
+  `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`
+  Decision 9) now attribute truthfully.
+- **Reserved-namespace fail-closed guards.** `find_local_groups_with_prefix`
+  returns `std::nullopt` (not an engaged-empty optional) when the RBAC store
+  can't be read, and the `server.cpp` boot-time `engine:`-collision preflight
+  requires `rbac_store_->is_open()` before trusting a clean scan — a corrupt
+  `rbac.db` now fails the boot closed rather than booting "clean" past a
+  reserved-namespace collision it could not actually see. `upsert_sso_identity`
+  separately rejects any `engine:`-prefixed write at the SSO identity-sync
+  surface (design §3.3), sharing the `kEngineReservedPrefix` constant with the
+  store's own create-path guard.
+- **Fleet-wide role-assignment authoring (PR 4.2 deliverable, design §4.1).**
+  `GET`/`POST`/`DELETE /api/v1/engine-principals/{id}/roles` (+ MCP twins
+  `list_engine_roles`/`assign_engine_role`/`unassign_engine_role`) are the
+  authoring surface that makes `RbacStore::assign_role(principal_type="engine")`
+  reachable in production — see `docs/user-manual/rest-api.md` "Engine
+  Principals" for the full contract. Mutations require admin + MFA step-up;
+  admin/built-in/wildcard role targets are rejected as `4xx`, never silently
+  narrowed or a `500` (design §4.2 "no admin, ever").
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
   ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
   the per-device scoped-permission path for single-target operations
   (ADR-0017 PR-A is a named prerequisite, its charter to be amended or
   extended for the `engine` principal type). Engine principals are
-  default-deny, structurally barred from `admin`.
+  default-deny, structurally barred from `admin`. **Today (PR 4.2) grants are
+  fleet-wide only** — scoped (management-group) engine assignment is rejected
+  pending that Phase-5 chokepoint.
 - Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
   opaque, audience-bound, short-TTL artifact; effective authority = engine
   principal's assignments ∩ operator's assignments ∩ operator's scope
