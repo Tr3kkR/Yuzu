@@ -205,8 +205,8 @@ std::string oslog_predicate() {
     return R"((process == "launchd" AND eventMessage CONTAINS "exited due to"))"
            R"( OR (process == "symptomsd" AND eventMessage CONTAINS "LQM changed"))"
            R"( OR ((process == "softwareupdated" OR process == "cupsd" OR process == "mdmclient")"
-           R"( OR process == "opendirectoryd") AND messageType == "error"))"
-           R"( OR (subsystem == "com.apple.apfs" AND messageType == "error"))";
+           R"( OR process == "opendirectoryd") AND (messageType == "error" OR messageType == "fault")))"
+           R"( OR (subsystem == "com.apple.apfs" AND (messageType == "error" OR messageType == "fault")))";
 }
 
 } // namespace yuzu::agent::macos
