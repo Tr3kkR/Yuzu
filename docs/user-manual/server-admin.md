@@ -1349,6 +1349,16 @@ on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
 
+**Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
+`RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
+rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
+against a *permanently* wedged target (a dead NFS mount, a hung service query) that would
+otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
+puts the unit into `failed` and stops retrying (the device goes dark rather than looping
+silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
+once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
+behaviour hid a crash-looping agent.
+
 **Installation:**
 
 ```bash
