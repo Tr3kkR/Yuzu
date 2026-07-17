@@ -56,6 +56,7 @@ std::string sanitize_detail_value(std::string_view v);
 } // namespace detail
 
 struct Config;
+class EnginePrincipalStore;
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -102,8 +103,25 @@ public:
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
 
-    /// Build a synthetic session from a validated API token.
-    auth::Session synthesize_token_session(const ApiToken& api_token);
+    /// Build a synthetic session from a validated API token. Two-branch on the
+    /// token's persisted `principal_kind` (design doc §6):
+    ///  - "human" (or any legacy/unset value): exactly the pre-#2021 behavior
+    ///    — attribute to the creating user, re-resolve their current role.
+    ///    Always returns a session.
+    ///  - "engine": the session IS the engine principal (`auth_source =
+    ///    "engine_token"`); role/authority resolve from RBAC assignments, never
+    ///    `get_user_role`. Consults `engine_principal_store_` — a missing/
+    ///    revoked or unreachable-store outcome returns `nullopt` (fail-closed;
+    ///    no session), as does a null `engine_principal_store_` (not yet wired).
+    std::optional<auth::Session> synthesize_token_session(const ApiToken& api_token);
+
+    /// Inject the engine-principal auth-lookup store (nullable — a null
+    /// pointer makes every engine-kind token fail closed with no session,
+    /// which is the correct posture before this is wired). Setter rather than
+    /// a ctor param to keep the stacked-PR wiring in server.cpp low-risk.
+    void set_engine_principal_store(EnginePrincipalStore* store) {
+        engine_principal_store_ = store;
+    }
 
     /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional ";
     /// Secure".
@@ -180,6 +198,9 @@ private:
     auth::AuthManager& auth_mgr_;
     RbacStore* rbac_store_;
     ApiTokenStore* api_token_store_;
+    // Nullable — see set_engine_principal_store(). Non-owning; lifetime is
+    // guaranteed by ServerImpl (T8 wiring), which outlives AuthRoutes.
+    EnginePrincipalStore* engine_principal_store_{nullptr};
     AuditStore* audit_store_;
     ManagementGroupStore* mgmt_group_store_;
     TagStore* tag_store_;
