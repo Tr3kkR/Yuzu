@@ -425,24 +425,35 @@ NetCounters read_net_counters() {
     // spin forever, or be tolerated as "close enough" — any malformation
     // invalidates the whole sample rather than publishing a partial
     // aggregate as if it were complete.
+    // Every routing-socket message type (if_msghdr, if_msghdr2, ifa_msghdr, …)
+    // shares this exact leading prefix (see net/route.h / net/if.h). The
+    // interface list interleaves RTM_IFINFO2 records with RTM_NEWADDR address
+    // records whose total length is routinely SHORTER than sizeof(if_msghdr)
+    // (if_msghdr embeds a full if_data), so the per-message minimum is this
+    // prefix — requiring a full if_msghdr would misread a legitimate short
+    // trailing address record as truncation and invalidate the whole sample.
+    struct MsgPrefix {
+        unsigned short msglen;
+        unsigned char version;
+        unsigned char type;
+    };
+    static_assert(sizeof(MsgPrefix) == 4);
+
     while (remaining > 0) {
-        if (remaining < sizeof(struct if_msghdr))
+        if (remaining < sizeof(MsgPrefix))
             return c; // truncated trailing header — not a successful walk
 
-        // if_msghdr and if_msghdr2 share the leading ifm_msglen/ifm_type
-        // layout. memcpy into a local, aligned object rather than
-        // reinterpret_cast the raw kernel bytes: same discipline as the
-        // Linux tcp_info read above — if_data64's uint64_t fields need
-        // 8-byte alignment the vector's byte offset does not guarantee, and
-        // no real object of these types lives in `buf`, so a typed cast
-        // would be alignment + strict-aliasing UB; memcpy moots both.
-        struct if_msghdr ifm {};
-        std::memcpy(&ifm, ptr, sizeof(ifm));
-        const std::size_t msglen = ifm.ifm_msglen;
-        if (msglen == 0 || msglen > remaining)
+        // memcpy into a local, aligned object rather than reinterpret_cast
+        // the raw kernel bytes: same discipline as the Linux tcp_info read
+        // above — no real object of these types lives in `buf`, so a typed
+        // cast would be alignment + strict-aliasing UB; memcpy moots both.
+        MsgPrefix pfx{};
+        std::memcpy(&pfx, ptr, sizeof(pfx));
+        const std::size_t msglen = pfx.msglen;
+        if (msglen < sizeof(MsgPrefix) || msglen > remaining)
             return c; // malformed/truncated — never advance by 0, never overrun
 
-        if (ifm.ifm_type == RTM_IFINFO2 && msglen >= sizeof(struct if_msghdr2)) {
+        if (pfx.type == RTM_IFINFO2 && msglen >= sizeof(struct if_msghdr2)) {
             struct if_msghdr2 ifm2 {};
             std::memcpy(&ifm2, ptr, sizeof(ifm2));
             // Skip the loopback — it is not "the network", and dwarfs real
