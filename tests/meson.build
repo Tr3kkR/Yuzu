@@ -182,6 +182,13 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
+                                          # macos_console_user.hpp already reachable via the agents/shared
+                                          # include_directories entry below.
+    'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
+    'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
+    'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
+    'unit/agent/test_event_logs_deadline.cpp', # C-1.15: bounded_run kill/reap behaviour (P8)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -189,7 +196,11 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
-    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated); also macos_console_user.hpp (test_certificates_macos.cpp)
+    include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
+    include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
+    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/plugins/event_logs/src'),    # event_logs_deadline.hpp (P8 test)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -211,6 +222,36 @@ test(
   timeout: 240,
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
+
+# ── cert_store Security-absent fallback unit test (A-1.20 / P8) ──────────────
+# agents/core/meson.build sets -DYUZU_HAVE_SECURITY on yuzu_agent_core_lib only
+# when Security.framework is FOUND at configure time — which it always is on
+# this build host, so agent_test_exe (linked against yuzu_agent_core_dep) can
+# never reach cert_store.cpp's honest-error stub for a "Security.framework not
+# found" build. This dedicated executable recompiles the SAME untouched
+# cert_store.cpp source directly, deliberately WITHOUT -DYUZU_HAVE_SECURITY, so
+# the __APPLE__ / !YUZU_HAVE_SECURITY branch (never a fabricated success) is
+# actually exercised regardless of what the CI host's SDK provides. macOS only:
+# on Linux/Windows cert_store.cpp's OTHER branches are the real (non-stub)
+# implementations, which this target is not meant to probe.
+if host_machine.system() == 'darwin'
+  cert_store_fallback_test_exe = executable(
+    'yuzu_cert_store_fallback_tests',
+    files(
+      'unit/agent/test_cert_store_fallback.cpp',
+      '../agents/core/src/cert_store.cpp',
+    ),
+    include_directories: [
+      include_directories('../agents/core/include'),  # yuzu/agent/cert_store.hpp
+    ],
+    # Deliberately no agent_platform_args here — that's what would carry
+    # -DYUZU_HAVE_SECURITY back in. spdlog_dep only for the header include path
+    # (cert_store.cpp's unconditional #include <spdlog/spdlog.h>); the
+    # !YUZU_HAVE_SECURITY stub never calls into it.
+    dependencies: [yuzu_sdk_dep, spdlog_dep, catch2_dep],
+  )
+  test('cert_store Security-absent fallback', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
+endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
