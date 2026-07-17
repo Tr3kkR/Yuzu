@@ -149,12 +149,22 @@ of actor, do ALL of the following — do not sample:
 1. **Chokepoint coverage, not file coverage.** Enumerate *every*
    authorization chokepoint an actor of that class can reach —
    `require_permission`, `require_scoped_permission`, `require_admin`,
-   every inline `check_permission`/`check_scoped_permission`, the MCP
-   tier gate, any service-scoped/elevation/legacy fallback — and prove
-   the intended posture (allow/deny/step-up) at EACH. A carve-out that
-   sits only on the new routes, or only where a sibling guard happens to
-   already sit, is the #2202 gap. Grep for the chokepoint functions; do
-   not reason from "the new code looks right."
+   every inline `check_permission`/`check_scoped_permission`,
+   `authorize_list_read` (`AuthRoutes::require_list_read` + its MCP /
+   dashboard wrappers), the MCP tier gate, any service-scoped/elevation/
+   legacy fallback — and prove the intended posture (allow/deny/step-up)
+   at EACH. **List/fan-out reads of per-agent data are a DISTINCT
+   chokepoint from per-object permission checks**: they MUST go through
+   the admit-then-filter `authorize_list_read` (World A, ADR-0017 —
+   `docs/adr/0017-management-group-confinement-list-reads.md`), never a
+   bare global `require_permission` (which is inert for a confined
+   operator and fails *open* on a corrupt `rbac.db`). A carve-out that
+   gets every single-target check right but leaks a fleet-wide list is
+   the same failure mode as #2202. A carve-out that sits only on the new
+   routes, or only where a sibling guard happens to already sit, is the
+   #2202 gap. Grep for the chokepoint functions (incl.
+   `authorize_list_read`/`require_list_read`); do not reason from "the
+   new code looks right."
 
 2. **Test the DEFAULT deployment config, not the hardened one.** Re-run
    the authorization reasoning with the security-relevant toggle in its
@@ -170,15 +180,30 @@ of actor, do ALL of the following — do not sample:
    deliverable — say which. (#2202 Blocker 4: the engine RBAC resolver
    had no route that could author the grant it consumed.)
 
-4. **Fail-closed on infra failure.** For any new authoritative read in
-   the authz/identity path, confirm a store/DB failure denies or refuses
-   boot — never reads as an empty/absent result that silently allows.
-   Check the engaged-empty-vs-`nullopt` / `std::expected` distinction.
+4. **Fail-closed on infra failure.** For any authoritative read in the
+   authz/identity path — a *new* read, OR an existing resolver that this
+   change makes newly load-bearing for the new actor type (a resolver can
+   become security-critical for a new principal without a line in it
+   changing) — confirm a store/DB failure denies or refuses boot, never
+   reads as an empty/absent result that silently allows. Check the
+   engaged-empty-vs-`nullopt` / `std::expected` distinction.
 
 5. **Comment-vs-code diff.** Read each comment near a new authz branch
    against the code it describes. #2202 Blocker 2 shipped a comment that
    asserted the *opposite* of what the function did (`nullopt` on
    failure) — a lying comment is a strong signal, not decoration.
+
+6. **Audit attribution survives to the row.** Trace the new actor through
+   EVERY audit helper it can reach (`make_audit_event`,
+   `emit_behavioral_audit`, any inline `audit_log`/`.log({...})`) and
+   prove the persisted row carries the stable authorization principal,
+   the correct `principal_class`, the correct `auth_source`, the
+   effective role, AND correct attribution on the *denied* path — never
+   the creating human, a presentation-only default, or a half-set field.
+   #2202 Blocker 3 stamped engine actions as `principal_class=agent`
+   because `make_audit_event` set the class before session resolution and
+   never re-stamped. "Audit events are emitted" is NOT enough — the
+   fields must be *correct* for the new actor.
 
 ## New-error-branch audit
 
