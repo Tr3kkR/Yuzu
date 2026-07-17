@@ -36,7 +36,14 @@
 #       that need raw sockets, ptrace, or ip-route management can do
 #       so without an extra sudo round-trip:
 #         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
-# 6.  (Optional) On both platforms, prints a verifying summary that the
+# 6.  (macOS only) Provisions the pf-anchor ACTIVATION prerequisite the
+#       quarantine plugin depends on: installs /etc/pf.anchors/yuzu-quarantine
+#       (initial pass-all), idempotently hooks `anchor "yuzu-quarantine"` +
+#       `load anchor ... from ...` into the active /etc/pf.conf main
+#       ruleset, then loads and enables pf. Without this hook, rules the
+#       plugin loads into the anchor at runtime have no effect on live
+#       traffic — see docs/agent-privilege-model.md.
+# 7.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
 # WHAT THIS SCRIPT DOES NOT DO
@@ -135,6 +142,13 @@ case "$OS" in
         CACHE_DIR="/Library/Caches/Yuzu"
         LOG_DIR="/Library/Logs/Yuzu"
         DEFAULT_BINARY_PATH="/Library/Application Support/Yuzu/yuzu-agent"
+        # pf-anchor ACTIVATION prerequisite for the quarantine plugin (see
+        # docs/agent-privilege-model.md, "macOS pf-anchor provisioning").
+        # PINNED for agents/plugins/quarantine/src/quarantine_plugin.cpp to
+        # match byte-for-byte — do not rename either in isolation.
+        PF_ANCHOR_NAME="yuzu-quarantine"
+        PF_ANCHOR_FILE="/etc/pf.anchors/yuzu-quarantine"
+        PF_CONF="/etc/pf.conf"
         ;;
     Linux)
         PLATFORM="linux"
@@ -581,6 +595,178 @@ apply_setcap() {
     run setcap "cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip" "$BINARY_PATH"
 }
 
+# ── macOS pf-anchor provisioning ─────────────────────────────────────────────
+#
+# ACTIVATION prerequisite, pinned ahead of a FUTURE pf-anchor rework of the
+# quarantine plugin (tracked as A-1.18; not yet landed as of this writing —
+# agents/plugins/quarantine/src/quarantine_plugin.cpp:518's macos_load_ruleset
+# still does `pfctl -f <tempfile>`, replacing the whole main ruleset, not
+# `-a $PF_ANCHOR_NAME`). Once A-1.18 switches to loading rules into
+# `pfctl -a yuzu-quarantine -f <tempfile>`, that load has NO EFFECT on live
+# traffic unless the active MAIN ruleset also invokes that anchor via
+# `anchor "yuzu-quarantine"` + `load anchor ... from ...` in /etc/pf.conf —
+# without this one-time hook, the plugin's pfctl calls would return 0 and
+# look like a successful quarantine, but nothing would actually be blocked.
+# This whole section is idempotent — detect-before-repair on the two-line
+# pf.conf hook, leave-alone-if-present on the anchor file — and re-running
+# the installer only reloads pf when it actually changed the on-disk hook
+# or anchor file, so a routine re-run never clobbers a live anchor A-1.18
+# may have loaded via `pfctl -a` since the last reload.
+#
+# Every write here is validated (pfctl -nf) against a staged copy before
+# it touches the live file, same discipline as install_sudoers above: a
+# syntactically broken /etc/pf.conf fails pf closed.
+#
+# Reload discipline: macos_install_pf_anchor_file and macos_hook_pf_conf
+# each return 0 when nothing needed to change (already present/hooked) and
+# 2 when this invocation actually wrote something. macos_provision_pf_anchor
+# only reloads pf (macos_enable_pf, which does `pfctl -f`) when one of them
+# returned 2 — an unconditional reload on every re-run would re-source the
+# on-disk anchor FILE over whatever quarantine_plugin.cpp last loaded live
+# via `pfctl -a yuzu-quarantine -f <tempfile>`, silently releasing an
+# active quarantine on a routine, documented-idempotent re-install.
+
+generate_pf_anchor_content() {
+    cat <<EOF
+# Yuzu agent quarantine anchor — provisioned by scripts/install-agent-user.sh.
+#
+# Initial state is empty (no rules — a deliberate no-op): an anchor with
+# no filter rules matches nothing, so hooking it into the main ruleset
+# cannot itself pass or block any traffic. A future quarantine_plugin.cpp
+# rework (tracked as A-1.18) is expected to overwrite this anchor's rules
+# via \`pfctl -a $PF_ANCHOR_NAME -f <tempfile>\` on quarantine / whitelist /
+# unquarantine dispatch — treat this file's on-disk contents as a build
+# artifact between dispatches once that lands, not source of truth.
+#
+# Anchor name and this file's path are PINNED in
+# docs/agent-privilege-model.md — do not rename either without updating
+# quarantine_plugin.cpp in lockstep.
+EOF
+}
+
+macos_install_pf_anchor_file() {
+    if [[ -f "$PF_ANCHOR_FILE" ]]; then
+        log "pf anchor file already present: $PF_ANCHOR_FILE — leaving contents alone"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp -t yuzu-pf-anchor.XXXXXX)
+    trap 'rm -f "$tmp"' RETURN
+
+    log "generating pf anchor file at $tmp"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would write the following to $PF_ANCHOR_FILE:"
+        generate_pf_anchor_content | sed 's/^/[dry-run]   /'
+    else
+        generate_pf_anchor_content > "$tmp"
+    fi
+
+    log "installing $tmp -> $PF_ANCHOR_FILE (mode 0644, root:wheel)"
+    run install -m 0644 -o root -g wheel "$tmp" "$PF_ANCHOR_FILE"
+    # Signal "changed" (see the reload-discipline note above
+    # macos_install_pf_anchor_file's block comment) whether this was a
+    # real write or a dry-run preview, so a dry run's summary reflects
+    # what a real run would do.
+    return 2
+}
+
+# Both lines of the two-line hook contract are required, exact-line-matched
+# (grep -qxF): a bare `anchor "yuzu-quarantine"` with no `load anchor ...`
+# — or one pointing at a different file — leaves the pinned anchor FILE
+# never wired into a main-ruleset reload, so quarantine loads would still
+# be a false quarantine even though a naive substring check on `anchor
+# "..."` alone would call the host already provisioned.
+pf_conf_has_full_hook() {
+    local anchor_line="anchor \"$PF_ANCHOR_NAME\""
+    local load_line="load anchor \"$PF_ANCHOR_NAME\" from \"$PF_ANCHOR_FILE\""
+    grep -qxF "$anchor_line" "$PF_CONF" 2>/dev/null && \
+        grep -qxF "$load_line" "$PF_CONF" 2>/dev/null
+}
+
+macos_hook_pf_conf() {
+    if [[ ! -f "$PF_CONF" ]]; then
+        warn "$PF_CONF does not exist — cannot hook the quarantine anchor into it" \
+             "(unexpected on macOS; pf.conf ships with the OS)"
+        return 1
+    fi
+
+    if pf_conf_has_full_hook; then
+        log "$PF_CONF already hooks anchor \"$PF_ANCHOR_NAME\" — skipping (idempotent)"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp -t yuzu-pf-conf.XXXXXX)
+    trap 'rm -f "$tmp"' RETURN
+
+    log "staging hooked $PF_CONF at $tmp"
+    cp "$PF_CONF" "$tmp"
+    {
+        printf '\n# --- Yuzu agent quarantine anchor (scripts/install-agent-user.sh) ---\n'
+        printf 'anchor "%s"\n' "$PF_ANCHOR_NAME"
+        printf 'load anchor "%s" from "%s"\n' "$PF_ANCHOR_NAME" "$PF_ANCHOR_FILE"
+    } >> "$tmp"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would append to $PF_CONF:"
+        tail -n 3 "$tmp" | sed 's/^/[dry-run]   /'
+        return 2
+    fi
+
+    log "validating hooked $PF_CONF with pfctl -nf"
+    if ! pfctl -nf "$tmp" >/dev/null 2>&1; then
+        warn "hooked $PF_CONF failed pfctl -nf syntax validation — NOT installing; leaving the original untouched"
+        pfctl -nf "$tmp" >&2 || true
+        return 1
+    fi
+
+    log "installing $tmp -> $PF_CONF (mode 0644, root:wheel)"
+    run install -m 0644 -o root -g wheel "$tmp" "$PF_CONF"
+    return 2
+}
+
+macos_enable_pf() {
+    log "loading $PF_CONF and enabling pf"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '[dry-run] pfctl -f %s\n' "$PF_CONF"
+        printf '[dry-run] pfctl -e\n'
+        return 0
+    fi
+    if ! pfctl -f "$PF_CONF"; then
+        fail "pfctl -f $PF_CONF failed — refusing to continue with the quarantine anchor hook unloaded"
+    fi
+    # -e (enable) exits non-zero with a harmless "pf already enabled"
+    # warning on stderr when pf is already running — same idempotency
+    # pattern quarantine_plugin.cpp already relies on in macos_load_ruleset.
+    pfctl -e 2>/dev/null || true
+}
+
+macos_provision_pf_anchor() {
+    local anchor_rc hook_rc
+
+    macos_install_pf_anchor_file
+    anchor_rc=$?
+    [[ "$anchor_rc" -eq 1 ]] && fail "failed to install pf anchor file $PF_ANCHOR_FILE"
+
+    macos_hook_pf_conf
+    hook_rc=$?
+    [[ "$hook_rc" -eq 1 ]] && fail "failed to hook anchor \"$PF_ANCHOR_NAME\" into $PF_CONF" \
+        "— without this hook, quarantine anchor loads have no effect on live traffic (false quarantine)"
+
+    # Only reload/enable pf when this invocation actually changed the
+    # anchor file or the pf.conf hook (rc 2 from either helper above).
+    # An unconditional reload here would re-source the on-disk anchor
+    # file's initial (empty) contents over whatever quarantine_plugin.cpp
+    # last loaded live via `pfctl -a yuzu-quarantine -f <tempfile>`,
+    # silently clearing an active quarantine on a routine re-install.
+    if [[ "$anchor_rc" -eq 2 || "$hook_rc" -eq 2 ]]; then
+        macos_enable_pf
+    else
+        log "pf anchor file and $PF_CONF hook already provisioned — leaving the running pf ruleset untouched"
+    fi
+}
+
 # ── verification ────────────────────────────────────────────────────────────
 # --check exits non-zero on ANY drift so the caller can rely on it as a
 # pre-flight gate (e.g., scripts/start-UAT.sh checks before launching
@@ -646,6 +832,54 @@ check_install() {
         fi
     fi
 
+    # 5. pf-anchor ACTIVATION hook (macOS only) — see docs/agent-privilege-
+    # model.md, "macOS pf-anchor provisioning". Loading quarantine rules
+    # into `pfctl -a yuzu-quarantine -f <file>` has no effect on live
+    # traffic unless this anchor is hooked into pf's active MAIN ruleset;
+    # catching a missing/unloaded hook here is the whole point of this
+    # check — a passing --check is what tells the operator quarantine
+    # will actually work, not just that pfctl calls will return 0.
+    if [[ "$PLATFORM" == "macos" ]]; then
+        if [[ ! -f "$PF_ANCHOR_FILE" ]]; then
+            warn "pf anchor file missing: $PF_ANCHOR_FILE"; ((errs++))
+        else
+            log "pf anchor file present: $PF_ANCHOR_FILE"
+        fi
+
+        if [[ ! -f "$PF_CONF" ]] || ! pf_conf_has_full_hook; then
+            warn "$PF_CONF does not hook anchor \"$PF_ANCHOR_NAME\" — quarantine loads would be a FALSE QUARANTINE (no effect on live traffic)" \
+                 "(both \`anchor \"$PF_ANCHOR_NAME\"\` and \`load anchor \"$PF_ANCHOR_NAME\" from \"$PF_ANCHOR_FILE\"\` are required)"
+            ((errs++))
+        else
+            log "$PF_CONF hooks anchor \"$PF_ANCHOR_NAME\""
+
+            # Confirm the hook is actually LOADED into pf's running
+            # ruleset, not just written to the on-disk pf.conf — pf must
+            # be reloaded after editing pf.conf for the hook to take
+            # effect. `pfctl -s rules` requires root to query live kernel
+            # state; degrade to a SKIP-with-instructions rather than a
+            # false FAIL when run unprivileged, same pattern as the
+            # sudoers-file readability check above.
+            if [[ "$EUID" -ne 0 ]]; then
+                log "  (skipping active-ruleset verification — pfctl -s rules requires root;" \
+                    "rerun --check as root/sudo to confirm the anchor is actually loaded, not just written to $PF_CONF)"
+            elif ! pfctl -s rules 2>/dev/null | grep -qF "anchor \"$PF_ANCHOR_NAME\""; then
+                warn "anchor \"$PF_ANCHOR_NAME\" is not present in pf's ACTIVE ruleset (pfctl -s rules)" \
+                     "— pf.conf may need reloading (pfctl -f $PF_CONF), or pf is disabled (pfctl -e)"
+                ((errs++))
+            elif ! pfctl -s info 2>/dev/null | grep -qE '^Status:[[:space:]]+Enabled'; then
+                # The anchor can be present in the loaded ruleset while pf
+                # itself is administratively disabled (`pfctl -d`) — rules
+                # are parsed but not enforced, so this is still a false
+                # quarantine even though the previous check passed.
+                warn "anchor \"$PF_ANCHOR_NAME\" is loaded but pf is DISABLED (pfctl -s info) — quarantine rules will not affect live traffic until pf is enabled (pfctl -e)"
+                ((errs++))
+            else
+                log "anchor \"$PF_ANCHOR_NAME\" confirmed active in pf's running, enabled ruleset"
+            fi
+        fi
+    fi
+
     if [[ "$errs" -eq 0 ]]; then
         log "check passed — install looks correct"
         return 0
@@ -677,6 +911,9 @@ case "$ACTION" in
         create_state_dirs
         install_sudoers
         apply_setcap
+        if [[ "$PLATFORM" == "macos" ]]; then
+            macos_provision_pf_anchor
+        fi
         log "install complete. Verify with: $0 --check"
         ;;
 
