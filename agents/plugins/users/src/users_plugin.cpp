@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if defined(__linux__)
 #include <ctime>
@@ -35,6 +36,7 @@
 
 #if defined(__APPLE__)
 #include <ctime>
+#include <macos_console_user.hpp>
 #endif
 
 #ifdef _WIN32
@@ -316,6 +318,77 @@ int do_sessions(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+#if defined(__APPLE__)
+// macOS `last` reports timestamps as "Weekday Mon DD HH:MM" — no year, no
+// seconds, and (for remote sessions) an extra host column before the
+// weekday whose presence isn't consistent. is_weekday finds the marker
+// token so the timestamp can be located without parsing the line
+// positionally.
+bool is_weekday(std::string_view tok) {
+    static constexpr std::array<std::string_view, 7> days = {"Sun", "Mon", "Tue", "Wed",
+                                                              "Thu", "Fri", "Sat"};
+    for (auto d : days) {
+        if (tok == d)
+            return true;
+    }
+    return false;
+}
+
+// Parse a `last -y`-style "Mon DD HH:MM YYYY" fragment into Windows-style
+// "YYYY-MM-DD HH:MM:SS". Plain BSD `last` never reports the year, which
+// would force guessing it from the current date — wrong for any record
+// older than ~12 months — so the caller requests `-y` and this parser
+// consumes the explicit year `last -y` prints instead of inferring one.
+// Seconds are always ":00" since `last` doesn't report them either.
+// Returns empty on a parse failure, leaving the caller's existing/
+// "unknown"/"Never" value in place.
+std::string parse_last_timestamp(std::string_view month_str, std::string_view day_str,
+                                 std::string_view year_str, std::string_view time_str) {
+    static const std::map<std::string, int> months = {
+        {"Jan", 1}, {"Feb", 2}, {"Mar", 3},  {"Apr", 4},  {"May", 5},  {"Jun", 6},
+        {"Jul", 7}, {"Aug", 8}, {"Sep", 9},  {"Oct", 10}, {"Nov", 11}, {"Dec", 12},
+    };
+    auto mit = months.find(std::string(month_str));
+    if (mit == months.end())
+        return {};
+    int month = mit->second;
+
+    int day = 0;
+    try {
+        day = std::stoi(std::string(day_str));
+    } catch (...) {
+        return {};
+    }
+    if (day < 1 || day > 31)
+        return {};
+
+    auto colon = time_str.find(':');
+    if (colon == std::string_view::npos)
+        return {};
+    int hour = 0;
+    int minute = 0;
+    try {
+        hour = std::stoi(std::string(time_str.substr(0, colon)));
+        minute = std::stoi(std::string(time_str.substr(colon + 1)));
+    } catch (...) {
+        return {};
+    }
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59)
+        return {};
+
+    int year = 0;
+    try {
+        year = std::stoi(std::string(year_str));
+    } catch (...) {
+        return {};
+    }
+    if (year < 1970)
+        return {};
+
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02}:00", year, month, day, hour, minute);
+}
+#endif // __APPLE__
+
 // ── local_users action ────────────────────────────────────────────────────
 
 int do_local_users(yuzu::CommandContext& ctx) {
@@ -386,6 +459,11 @@ int do_local_users(yuzu::CommandContext& ctx) {
     // Tested and verified on macOS 14 (Sonoma). If Apple changes the dscl
     // output format in a future macOS release, this parsing will need updating.
     auto dscl_out = run_command("dscl . -list /Users UniqueID 2>/dev/null");
+    // Queried once per call, not per user: the console/GUI-login user via the
+    // shared helper (agents/shared/macos_console_user.hpp). nullopt (no
+    // SystemConfiguration, or nobody at the console) means every row below
+    // honestly reports is_console_user="unknown" rather than guessing false.
+    auto console_login_user = yuzu::macos::console_user();
     if (!dscl_out.empty()) {
         std::istringstream ss(dscl_out);
         std::string line;
@@ -444,8 +522,75 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 }
             }
 
-            ctx.write_output(std::format("local_user|{}|{}|unknown|{}", user,
-                                         enabled ? "true" : "false", desc.empty() ? "-" : desc));
+            // last_logon: parse `last -y -1 <user>` for this user's most
+            // recent login record (the plugin already uses plain `last` for
+            // primary_user above). `-y` forces an explicit year in the
+            // output so parse_last_timestamp never has to guess one, and
+            // `LC_ALL=C` pins the weekday/month names and the "wtmp begins"
+            // boilerplate to a locale this parser understands. `user` was
+            // already validated by is_safe_identifier above before any
+            // subprocess use. Default is "unknown": a command failure,
+            // empty output, or unrecognized output leaves it there rather
+            // than fabricating "Never" for an indeterminate result. "Never"
+            // is only assigned once the boilerplate line confirms `last`
+            // actually ran and completed its (empty) search for this user.
+            std::string last_logon = "unknown";
+            {
+                auto last_out = run_command(
+                    std::format("LC_ALL=C last -y -1 {} 2>/dev/null", user).c_str());
+                bool saw_record = false;
+                std::istringstream last_ss(last_out);
+                std::string last_line;
+                while (std::getline(last_ss, last_line)) {
+                    if (last_line.empty())
+                        continue;
+                    std::istringstream ls2(last_line);
+                    std::string first;
+                    ls2 >> first;
+                    // Boilerplate lines (e.g. "wtmp begins ...") don't start
+                    // with the username; `last -1 <user>` already filters to
+                    // this user, so a first-token match is the real record.
+                    if (first != user)
+                        continue;
+                    saw_record = true;
+                    std::vector<std::string> tokens;
+                    std::string tok;
+                    while (ls2 >> tok)
+                        tokens.push_back(tok);
+                    for (size_t i = 0; i + 4 < tokens.size(); ++i) {
+                        if (is_weekday(tokens[i])) {
+                            auto parsed = parse_last_timestamp(tokens[i + 1], tokens[i + 2],
+                                                               tokens[i + 3], tokens[i + 4]);
+                            if (!parsed.empty()) {
+                                last_logon = parsed;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (!saw_record && last_out.find("wtmp begins") != std::string::npos)
+                    last_logon = "Never";
+            }
+
+            // console_state is tri-state, not a bool: console_login_user is
+            // std::nullopt whenever detection is unavailable (no
+            // SystemConfiguration, or the API call failed), and that must
+            // stay distinguishable from a confirmed "not the console user"
+            // -- collapsing it to false would misreport an unknown state as
+            // a definite negative, including for the real console user.
+            std::string console_state = "unknown";
+            if (console_login_user)
+                console_state = *console_login_user == user ? "true" : "false";
+
+            // NOTE arity extension: local_user gained a 6th field
+            // (is_console_user) here to surface the GUI-login signal
+            // honestly; other platforms keep the original 5-field
+            // local_user|username|enabled|last_logon|description form. The
+            // field is tri-state ("true"/"false"/"unknown"), not boolean.
+            ctx.write_output(std::format("local_user|{}|{}|{}|{}|{}", user,
+                                         enabled ? "true" : "false", last_logon,
+                                         desc.empty() ? "-" : desc, console_state));
         }
     }
 
