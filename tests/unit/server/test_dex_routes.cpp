@@ -86,6 +86,21 @@ std::optional<int> family_score(const std::string& html, const std::string& fami
     return std::stoi(inner);
 }
 
+// Extracts the family drill-down's Health-score tile (render_dex_catalogue_group_fragment
+// output, View 2) — nullopt when no Health-score tile rendered at all (mon==0 or the
+// denominator is 0, so the score is suppressed rather than shown as a number).
+std::optional<int> group_score(const std::string& html) {
+    const auto lbl_pos = html.find("Health score");
+    if (lbl_pos == std::string::npos)
+        return std::nullopt;
+    const auto n_pos = html.rfind("<div class=\"n ", lbl_pos);
+    if (n_pos == std::string::npos)
+        return std::nullopt;
+    const auto gt = html.find('>', n_pos);
+    const auto lt = html.find('<', gt);
+    return std::stoi(html.substr(gt + 1, lt - gt - 1));
+}
+
 // Route fragments filter signals by a now()-relative window (the handler computes
 // `dex_iso_since(window_to_days)` as the cutoff), so seeds with hardcoded calendar
 // dates age out of the window and the route tests start failing once the wall
@@ -313,6 +328,75 @@ TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
     CHECK(lin.find("/fragments/dex/catalogue?window=7d&os=linux") != std::string::npos);
     // Coverage-first: a Windows-only type reads "not collected" under the Linux lens.
     CHECK(lin.find("not collected") != std::string::npos);
+}
+
+TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator + "
+          "signals, no cross-OS bleed (BR-001, #1746 follow-up)",
+          "[dex][routes][catalogue]") {
+    // BR-001 (Codex branch review, Architect-confirmed): the grid (View 1) scores
+    // per-OS under a single-OS filter (see the "#1746" test above), but the family
+    // drill-down (View 2) still read the all-OS signal set and scored with
+    // fleet.windows_online — so clicking into a family silently reverted to a
+    // Windows-denominated all-OS score under the same os= label. Same signal
+    // shape as the grid's #1746 test, replayed against
+    // render_dex_catalogue_group_fragment.
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 10;
+    fleet.windows_online = 7;
+    fleet.macos_online = 3;
+
+    const auto html_before =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "macos");
+    const auto score_before = group_score(html_before);
+    REQUIRE(score_before.has_value()); // (c) numeric — never the suppressed marker
+
+    // Hand-computed against the macOS-scoped signal alone: "Network" is "med"
+    // severity (6 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both MAC-1/MAC-2 hit); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected_macos =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+    CHECK(*score_before == expected_macos);
+
+    // (a) Differential: had BR-001 persisted, this SAME macOS card would instead
+    // read the all-OS signal set scored against windows_online — a provably
+    // different number (same 2 devices, wrong denominator).
+    const double impact_if_buggy = 2.0 / 7.0; // 2 devices / windows_online(7)
+    const int score_if_buggy =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_if_buggy, 0.0, 100.0) + 0.5);
+    CHECK(*score_before != score_if_buggy);
+
+    // Now add a Windows-only signal in the SAME family, on MORE devices than the
+    // macOS one — under BR-001 this all-OS signal would dominate
+    // max_signal_devices and move the macOS card's score.
+    seed_signal(store, "w1", "WIN-1", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "w2", "WIN-2", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "w3", "WIN-3", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:20:00Z");
+    const auto html_after =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "macos");
+    const auto score_after = group_score(html_after);
+    REQUIRE(score_after.has_value());
+    CHECK(*score_after == *score_before); // (b) no cross-OS contamination
+
+    // The Windows lens, by contrast, DOES pick up dns_timeout scored against
+    // windows_online — the number BR-001 was wrongly giving the macOS card.
+    const auto html_win =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "windows");
+    const auto score_win = group_score(html_win);
+    REQUIRE(score_win.has_value());
+    const double impact_win = 3.0 / 7.0; // 3 devices / windows_online(7)
+    const int expected_win =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_win, 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected_win);
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",

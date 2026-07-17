@@ -778,14 +778,6 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         return placeholder("Unknown family", "No such signal family: " + esc(group_name));
 
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
-    const auto r = dex_family_rollup(*grp, signals);
-    auto find_sig = [&](const char* t) -> const DexSignalCount* {
-        for (const auto& s : signals)
-            if (s.obs_type == t)
-                return &s;
-        return nullptr;
-    };
 
     // -- Coverage scope (mirrors the grid: a type is MONITORED when an in-scope
     // connected platform collects it — not merely when it fired). This is the
@@ -801,6 +793,22 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
                              os_filter == "macos")
                                 ? os_filter
                                 : "all";
+
+    // -- Per-OS scoping (#1746 BR-001): resolved BEFORE the summary read so the
+    // drill-down reads the SAME lens as the grid — "all" keeps the fleet-wide
+    // rollup (byte-unchanged); a single-OS chip reads only that OS's signals.
+    // This single read flows into the family rollup, the per-signal table rows,
+    // AND the score below, so the whole drill-down is OS-consistent with View 1. --
+    const auto signals =
+        osf == "all" ? store->dex_signal_summary(since) : store->dex_signal_summary(since, osf);
+    const auto r = dex_family_rollup(*grp, signals);
+    auto find_sig = [&](const char* t) -> const DexSignalCount* {
+        for (const auto& s : signals)
+            if (s.obs_type == t)
+                return &s;
+        return nullptr;
+    };
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -882,9 +890,15 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
     // Coverage + activity tiles. Health score = this family's slice of the fleet
     // composite (same formula as the grid card), shown when something is monitored.
     h += "<div class=\"gp-tiles\">";
+    // Per-OS denominator (#1746 BR-001), same lens as the grid: a single-OS chip
+    // scores against THAT OS's own online count, never a Windows-derived number
+    // read under a Linux/macOS heading.
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
     double score = -1.0;
-    if (mon > 0 && fleet.windows_online > 0)
-        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, fleet.windows_online),
+    if (mon > 0 && n_scoped > 0)
+        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, n_scoped),
                            0.0, 100.0);
     if (score >= 0)
         h += tile(score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"),
