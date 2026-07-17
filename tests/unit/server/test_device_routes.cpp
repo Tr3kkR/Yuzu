@@ -412,6 +412,24 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         CHECK(r->body.find("running") != std::string::npos); // status, from f[3]
         CHECK(r->body.find("1 run") != std::string::npos);   // counted as running (not the PID)
     }
+    SECTION("services macOS 5-field svc|label|pid|status|startup: honest startup, PID not the name (C-1.12, P10 fix)") {
+        LiveHarness h;
+        // Stopped launchd rows report pid "-" (not a number) per launchctl list's
+        // real output -- the fixture must exercise that, not an impossible
+        // running-style numeric PID on a stopped row.
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running|automatic\n"
+                                  "svc|com.example.helper|-|stopped|disabled", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("com.example.helper") != std::string::npos); // not misrendered as "-"
+        CHECK(r->body.find("1234") == std::string::npos); // PID never rendered as the display name
+        CHECK(r->body.find("running") != std::string::npos);  // status, from f[3]
+        CHECK(r->body.find("automatic") != std::string::npos); // startup, from f[4]
+        CHECK(r->body.find("disabled") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos); // only the running row counted
+    }
     SECTION("services Linux 4-field svc|name|status|desc: State shows status") {
         LiveHarness h;
         h.fake_rows = {{"a-1", 1, "svc|sshd|running|OpenSSH server", ""}};
