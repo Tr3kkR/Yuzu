@@ -24,12 +24,11 @@ struct YUZU_EXPORT CertStoreResult {
 ///
 /// On Windows, uses CryptoAPI to read from the Local Machine (falling back to
 /// Current User) store.
-/// On macOS, uses the Security framework (SecItemCopyMatching) to read an
-/// identity — certificate chain + private key — from the current user's
-/// LOGIN keychain only; System.keychain is never queried and no interactive
-/// unlock/authentication prompt is ever forced. Requires Security.framework
-/// at build time (YUZU_HAVE_SECURITY); an honest error CertStoreResult is
-/// returned otherwise, never a fabricated success.
+/// On macOS, always returns an honest error — the agent runs as a root
+/// LaunchDaemon (docs/agent-privilege-model.md) with no attached user login
+/// session, and therefore no user login keychain an OS-certificate-store
+/// identity could come from. Use --client-cert/--client-key PEM files (or
+/// cert_auto_discovery) instead.
 /// On Linux, returns an error — use PEM files instead.
 YUZU_EXPORT CertStoreResult read_cert_from_store(const std::string& store_name,
                                                  const std::string& subject,

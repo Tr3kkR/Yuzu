@@ -223,17 +223,17 @@ test(
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
-# ── cert_store Security-absent fallback unit test (A-1.20 / P8) ──────────────
-# agents/core/meson.build sets -DYUZU_HAVE_SECURITY on yuzu_agent_core_lib only
-# when Security.framework is FOUND at configure time — which it always is on
-# this build host, so agent_test_exe (linked against yuzu_agent_core_dep) can
-# never reach cert_store.cpp's honest-error stub for a "Security.framework not
-# found" build. This dedicated executable recompiles the SAME untouched
-# cert_store.cpp source directly, deliberately WITHOUT -DYUZU_HAVE_SECURITY, so
-# the __APPLE__ / !YUZU_HAVE_SECURITY branch (never a fabricated success) is
-# actually exercised regardless of what the CI host's SDK provides. macOS only:
-# on Linux/Windows cert_store.cpp's OTHER branches are the real (non-stub)
-# implementations, which this target is not meant to probe.
+# ── cert_store macOS honest-unsupported unit test (A-1.20 / P8; BR-001/BR-003
+#    branch-review fix) ────────────────────────────────────────────────────
+# cert_store.cpp's __APPLE__ branch unconditionally returns an honest
+# "unsupported" CertStoreResult (the macOS agent runs as a root LaunchDaemon
+# with no user login keychain — see the file header comment on
+# read_cert_from_store() there). This dedicated executable recompiles that
+# SAME cert_store.cpp source standalone — no Security/CoreFoundation
+# frameworks, not linked against the rest of yuzu_agent_core — purely to
+# check the contract in isolation. macOS only: on Linux/Windows
+# cert_store.cpp's OTHER branches are the real (non-stub) implementations,
+# which this target is not meant to probe.
 if host_machine.system() == 'darwin'
   cert_store_fallback_test_exe = executable(
     'yuzu_cert_store_fallback_tests',
@@ -244,13 +244,12 @@ if host_machine.system() == 'darwin'
     include_directories: [
       include_directories('../agents/core/include'),  # yuzu/agent/cert_store.hpp
     ],
-    # Deliberately no agent_platform_args here — that's what would carry
-    # -DYUZU_HAVE_SECURITY back in. spdlog_dep only for the header include path
-    # (cert_store.cpp's unconditional #include <spdlog/spdlog.h>); the
-    # !YUZU_HAVE_SECURITY stub never calls into it.
+    # spdlog_dep only for the header include path (cert_store.cpp's
+    # unconditional #include <spdlog/spdlog.h>); the macOS stub never
+    # actually calls into it.
     dependencies: [yuzu_sdk_dep, spdlog_dep, catch2_dep],
   )
-  test('cert_store Security-absent fallback', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
+  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
 endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
