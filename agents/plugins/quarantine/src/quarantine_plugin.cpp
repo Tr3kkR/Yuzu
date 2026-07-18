@@ -513,6 +513,33 @@ std::vector<std::string> linux_get_whitelist() {
 // it otherwise. A top-level `block all`/`block drop all` in `pfctl -s rules`
 // is that fingerprint: our own rules now only ever live inside the
 // yuzu-quarantine anchor, never at the top level.
+//
+// BR-03 (HIGH, fixed): this used to be paired with
+// macos_clear_stale_inline_block(), which reloaded /etc/pf.conf whenever
+// this heuristic fired. That was unsound: absence of the active
+// yuzu-quarantine anchor proves only that SOME main ruleset is active with
+// no anchor hook — NOT that Yuzu authored its `block all`. An admin / VPN /
+// security product can legitimately load its own top-level `block all`
+// with no yuzu-quarantine anchor (e.g. before F-pf-provisioning ever ran
+// on that host), and the old code would silently discard that unrelated
+// live policy on the very next quarantine/whitelist/release call — with no
+// restore, not even on release.
+//
+// There is also no reliable way to fix this by keying on a Yuzu-owned
+// marker instead: the legacy pre-anchor design (before commit 18543181,
+// "A-1.18-quarantine") loaded its `block all` via a bare
+// `pfctl -f <tempfile>` against the live ruleset — it never wrote to
+// /etc/pf.conf or any other durable file, and pfctl -s rules does not
+// preserve the rule-file comments the tempfile happened to contain (see
+// the old macos_load_ruleset() rules-header comment at that revision).
+// So the active ruleset carries no durable, uniquely-Yuzu fingerprint to
+// gate a migration on.
+//
+// Given that, this function is now advisory-only: it still reports the
+// same heuristic (top-level block-all with no anchor hook), but callers
+// must NEVER act on it by touching the main ruleset — only surface an
+// honest note asking the operator to check/clear it by hand. See callers
+// for where that note is emitted.
 bool macos_has_stale_inline_block() {
     auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
     auto output = run_command(cmd.c_str());
@@ -523,39 +550,33 @@ bool macos_has_stale_inline_block() {
 
     // A top-level `block all` alone isn't a unique fingerprint of the
     // pre-anchor design — it's also a perfectly ordinary operator-authored
-    // default-deny policy. Only treat it as OUR stale leftover when the
-    // yuzu-quarantine anchor hook is ALSO absent from the active ruleset:
-    // once F-pf-provisioning has hooked the anchor in, this plugin never
-    // writes to the main ruleset again, so a top-level block all from that
-    // point on is provably not ours. Narrows the false-positive where an
-    // operator runs their own default-deny main ruleset alongside an
-    // already-provisioned yuzu-quarantine anchor — without this, every
-    // quarantine/whitelist/release call on that host would wrongly reload
-    // /etc/pf.conf and discard any non-persisted live rule changes.
+    // default-deny policy. Only flag it as POSSIBLY our stale leftover when
+    // the yuzu-quarantine anchor hook is ALSO absent from the active
+    // ruleset: once F-pf-provisioning has hooked the anchor in, this
+    // plugin never writes to the main ruleset again, so a top-level block
+    // all from that point on is provably not ours. This still can't prove
+    // the block-all IS ours when the anchor is absent (see the function
+    // comment above) — it only narrows candidates for the advisory note.
     bool anchor_hooked = output.find(std::format("anchor \"{}\"", kAnchorName)) != std::string::npos;
     return !anchor_hooked;
 }
 
-// Clear a stale pre-anchor inline block by reloading /etc/pf.conf — the one
-// place the quarantine path still touches the main ruleset directly, and
-// only to undo the OLD design's clobber, never as a substitute for the
-// anchor operations below. Once F-pf-provisioning has run, the reloaded
-// /etc/pf.conf also carries the `anchor "yuzu-quarantine"` hook, so this
-// doubles as picking that hook up if it wasn't active yet.
-int macos_clear_stale_inline_block(std::string* error_out) {
-    const auto* pfx = sudo_prefix();
-    auto cmd = std::format("{}{} -f /etc/pf.conf 2>/dev/null", pfx, kPfctl);
-    int rc = run_command_rc(cmd.c_str());
-    if (rc != 0) {
-        int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : rc;
-        *error_out = std::format(
-            "detected a pre-anchor inline quarantine block still active, but reloading "
-            "/etc/pf.conf to clear it failed (rc={}) — the host may still be blocked; "
-            "run `sudo {} -f /etc/pf.conf` by hand.",
-            exit_code, kPfctl);
-        return 1;
-    }
-    return 0;
+// Advisory note surfaced wherever macos_has_stale_inline_block() fires.
+// Intentionally takes NO action on the main ruleset — see the rationale on
+// macos_has_stale_inline_block() above (BR-03). This is honest about what
+// it does and doesn't know: it never claims to have cleaned anything up.
+std::string macos_stale_inline_block_note() {
+    return std::format(
+        "a top-level `block all`/`block drop all` is present in the active pf ruleset with "
+        "no \"{}\" anchor hook. This MAY be a leftover from a pre-A-1.18 Yuzu build (which "
+        "wrote block-all directly into the main ruleset instead of a dedicated anchor) — or "
+        "it may be an unrelated admin/VPN/security-product policy that happens to look the "
+        "same from here. Yuzu can't tell these apart and will not touch the main ruleset to "
+        "guess; if you know it's a stale Yuzu leftover, remove it by hand (e.g. review and "
+        "reload /etc/pf.conf yourself once you've confirmed it reflects the ruleset you "
+        "actually want active). Quarantine/whitelist/release continue to work normally via "
+        "the \"{}\" anchor regardless of this note.",
+        kAnchorName, kAnchorName);
 }
 
 // P2 (verified): quarantine rules loaded into the yuzu-quarantine anchor via
@@ -731,28 +752,16 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
     rules += "block all\n";
     ++rules_written;
 
-    // Backward-compat cleanup first (see macos_has_stale_inline_block()) —
-    // this may also pick up a not-yet-active F-pf-provisioning hook by
-    // reloading /etc/pf.conf, so it runs before the anchor-hooked check.
-    // But ONLY when /etc/pf.conf on disk already carries the anchor hook:
-    // reloading it is how a stale inline `block all` gets cleared, and if
-    // the hook isn't in the on-disk file yet (F-pf-provisioning never ran),
-    // that reload would strip the old design's block-all with nothing to
-    // replace it — the anchor-hooked check just below then fails the
-    // request anyway, leaving a previously isolated host fully open on a
-    // quarantine call that reports failure. /etc/pf.conf is world-readable
-    // (0644), so checking its on-disk contents needs no sudo.
-    auto pf_conf_on_disk = run_command("/bin/cat /etc/pf.conf 2>/dev/null");
-    bool hook_on_disk =
-        pf_conf_on_disk.find(std::format("anchor \"{}\"", kAnchorName)) != std::string::npos;
-    if (hook_on_disk && macos_has_stale_inline_block()) {
-        std::string cleanup_err;
-        if (macos_clear_stale_inline_block(&cleanup_err) != 0) {
-            *error_out = cleanup_err;
-            return 1;
-        }
-    }
-
+    // BR-03 (fixed): this used to run a "backward-compat cleanup" here that
+    // reloaded /etc/pf.conf whenever macos_has_stale_inline_block() fired.
+    // That heuristic cannot distinguish a stale pre-anchor Yuzu leftover
+    // from an admin/VPN/security product's own legitimate top-level
+    // `block all`, so it was capable of silently discarding an unrelated
+    // live policy on every quarantine call. Removed outright — see the
+    // rationale on macos_has_stale_inline_block() above. This function no
+    // longer touches the main ruleset at all; it only ever loads rules
+    // into the yuzu-quarantine anchor below, which is unaffected by
+    // whatever the main ruleset currently contains.
     if (!macos_anchor_hooked()) {
         *error_out = std::format(
             "pf anchor \"{}\" is not hooked into the active ruleset — quarantine rules "
@@ -871,16 +880,20 @@ constexpr const char* kEmptyAnchorContents =
 int macos_unquarantine(yuzu::CommandContext& ctx) {
     const auto* pfx = sudo_prefix();
 
-    // Backward-compat cleanup first (see macos_has_stale_inline_block()) —
-    // a host mid-migration (quarantined under the pre-anchor plugin, then
-    // upgraded to this build) can carry a stale inline `block all` that the
-    // anchor flush below never touches.
+    // BR-03 (fixed): this used to run a "backward-compat cleanup" here —
+    // reloading /etc/pf.conf whenever macos_has_stale_inline_block() fired,
+    // on the theory that a host mid-migration (quarantined under the
+    // pre-anchor plugin, then upgraded to this build) could carry a stale
+    // inline `block all` the anchor flush below never touches. But the
+    // heuristic can't tell a stale Yuzu leftover apart from an unrelated
+    // admin/VPN/security-product default-deny ruleset, and there's no
+    // durable Yuzu-owned marker to key a safe migration on instead (see the
+    // rationale on macos_has_stale_inline_block() above) — reloading
+    // /etc/pf.conf here could silently discard a live non-Yuzu policy, and
+    // release never restored it. Replaced with an honest advisory note
+    // only; the main ruleset is never touched by this function.
     if (macos_has_stale_inline_block()) {
-        std::string cleanup_err;
-        if (macos_clear_stale_inline_block(&cleanup_err) != 0) {
-            ctx.write_output(std::format("error|{}", cleanup_err));
-            return 1;
-        }
+        ctx.write_output(std::format("note|{}", macos_stale_inline_block_note()));
     }
 
     // Flush the anchor's rule table rather than clobbering /etc/pf.conf —
@@ -1194,6 +1207,13 @@ private:
             ctx.write_output(
                 "note|pf is disabled or its state could not be confirmed via "
                 "`pfctl -s info` — quarantine cannot be enforced until pf is enabled");
+        }
+        // BR-03: advisory only — see macos_has_stale_inline_block() and
+        // macos_stale_inline_block_note(). Never acted on automatically;
+        // surfaced here purely so an operator querying status learns about
+        // it without having to run unquarantine first.
+        if (macos_has_stale_inline_block()) {
+            ctx.write_output(std::format("note|{}", macos_stale_inline_block_note()));
         }
 #endif
 
