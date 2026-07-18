@@ -44,7 +44,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -222,6 +224,28 @@ public:
         return sent;
     }
 
+    /// Peek a COPY of the head (nullopt if empty). For the runtime's unlock-during-send
+    /// drain: copy the head under outbox_mu_, RELEASE it, send (network I/O off-lock),
+    /// re-acquire, then pop_front_if(). Keeps a stalled gRPC Write() off outbox_mu_ so it
+    /// cannot block evaluate_key's emit / arm-disarm enqueue / heartbeat (item 4).
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+
+    /// Pop the head IFF it is STILL the entry with `event_id` - i.e. a coalesce (which
+    /// replaces the node in place with a fresh event_id) or a drop_rule/purge_stale
+    /// during the unlocked send did not replace/remove it. Returns true iff popped.
+    /// event_id is globally unique per enqueue, so it pins the exact sent entry.
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        index_.erase(Key{pending_.front().domain, pending_.front().rule_id});
+        pending_.pop_front();
+        return true;
+    }
+
     /// Drop every pending entry for a rule (used on disable / withdraw).
     void drop_rule(const std::string& rule_id) {
         for (auto it = pending_.begin(); it != pending_.end();) {
@@ -320,6 +344,21 @@ public:
             ++sent;
         }
         return sent;
+    }
+
+    /// Peek/pop primitives for the runtime's unlock-during-send drain (see
+    /// GuardianOutbox::front_copy/pop_front_if). This log coalesces nothing, so a
+    /// pop_front_if mismatch here means only a successful send already removed the head.
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        pending_.pop_front();
+        return true;
     }
 
     [[nodiscard]] std::size_t size() const { return pending_.size(); }

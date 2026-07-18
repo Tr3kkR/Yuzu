@@ -379,6 +379,11 @@ private:
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
     GuardianLifecycleLog lifecycle_log_; ///< capacity set in the ctor init list (see the .cpp)
+    // Serialises drain() calls WITHOUT blocking enqueuers (they take outbox_mu_, not
+    // this): drain() releases outbox_mu_ across each send, so two concurrent drainers
+    // could otherwise both peek+send the same head. drain_once() is public, so this is
+    // load-bearing, not just belt-and-braces (item 4).
+    std::mutex drain_mu_;
 };
 
 } // namespace yuzu::agent

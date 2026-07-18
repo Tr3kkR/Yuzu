@@ -4,6 +4,7 @@
 #include "spark_key_rule_index.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -444,10 +445,53 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     return lifecycle_log_.enqueue(std::move(entry));
 }
 
+namespace {
+// Drain one log with outbox_mu_ RELEASED across each send: copy the head under the
+// lock, unlock, send (the gRPC Write - previously run UNDER outbox_mu_, so a stalled
+// write blocked every evaluate_key emit / arm-disarm enqueue / heartbeat behind it -
+// item 4), then re-lock and pop the head ONLY if it is still the entry we sent. A
+// coalesce/drop during the unlocked window replaces or removes it; pop_front_if(event_id)
+// then no-ops and the current head is handled on the next pass.
+template <typename Log>
+std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
+                               const std::function<SendResult(const OutboxEntry&)>& send) {
+    std::size_t sent = 0;
+    while (true) {
+        OutboxEntry entry;
+        {
+            std::lock_guard<std::mutex> ob{mu};
+            std::optional<OutboxEntry> front = log.front_copy();
+            if (!front)
+                return sent; // drained
+            entry = std::move(*front);
+        }
+        SendResult r = SendResult::Retain;
+        try {
+            r = send(entry); // outbox_mu_ RELEASED here
+        } catch (...) {
+            return sent; // a throw == stream down: keep the head, stop
+        }
+        if (r != SendResult::Sent)
+            return sent; // Retain: keep the head, stop
+        {
+            std::lock_guard<std::mutex> ob{mu};
+            log.pop_front_if(entry.event_id); // remove IFF unchanged during the unlocked send
+        }
+        ++sent;
+    }
+}
+} // namespace
+
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
-    std::lock_guard<std::mutex> ob{outbox_mu_};
-    std::size_t sent = outbox_.drain(send);
-    sent += lifecycle_log_.drain(send);
+    // Single-drainer: the send runs with outbox_mu_ released, so two concurrent drainers
+    // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
+    // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
+    std::lock_guard<std::mutex> dg{drain_mu_};
+    // Lifecycle (audit) BEFORE compliance/health (Fable M6): a rule's "armed" entry must
+    // reach the server before its first drift, or the audit trail shows detection
+    // preceding arm.
+    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send);
+    sent += drain_log_unlocked(outbox_, outbox_mu_, send);
     return sent;
 }
 

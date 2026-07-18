@@ -237,6 +237,50 @@ TEST_CASE("a backend arm failure errors the rule, never a silent legacy fallback
     REQUIRE(rt->rule_count() == 0); // not left half-attached
 }
 
+TEST_CASE("drain sends Lifecycle (armed) before Compliance (item 4 / Fable M6)",
+          "[spark][runtime]") {
+    // The "armed" audit entry must reach the server before the rule's first compliance
+    // event, or the trail shows detection preceding arm.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
+    REQUIRE(rt->outbox_size() == 1);
+
+    // Capture EVERY domain in send order (drain_all/drain_lifecycle filter by domain).
+    std::vector<OutboxEntry> got;
+    rt->drain([&](const OutboxEntry& e) {
+        got.push_back(e);
+        return SendResult::Sent;
+    });
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].domain == OutboxDomain::Lifecycle); // armed first
+    CHECK(got[0].lifecycle_kind == "armed");
+    CHECK(got[1].domain == OutboxDomain::Compliance); // then the edge
+}
+
+TEST_CASE("drain releases outbox_mu_ during send - no head-of-line block (item 4)",
+          "[spark][runtime]") {
+    // Proof the send (a gRPC Write in production) no longer runs UNDER outbox_mu_: the
+    // callback itself takes outbox_mu_ via outbox_size(). Under the old lock-across-send
+    // drain this self-deadlocks the drain thread; with item 4 it completes.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // enqueues an "armed"
+
+    bool callback_ran = false;
+    const std::size_t sent = rt->drain([&](const OutboxEntry&) {
+        (void)rt->outbox_size(); // takes outbox_mu_ - would DEADLOCK if held across send
+        callback_ran = true;
+        return SendResult::Sent;
+    });
+    CHECK(callback_ran);
+    CHECK(sent == 1);
+}
+
 TEST_CASE("detach purges a rule's buffered (undrained) outbox entries", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
