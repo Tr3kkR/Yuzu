@@ -423,7 +423,9 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 ### 9.2 Firewall Status and Rule Enumeration :white_check_mark: `T1`
 
-`firewall` plugin (cross-platform).
+`firewall` plugin (cross-platform). macOS `state` reports the Application
+Firewall (`socketfilterfw --getglobalstate`) as the primary signal, with the
+pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 

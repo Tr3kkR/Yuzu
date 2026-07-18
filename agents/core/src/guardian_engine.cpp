@@ -195,8 +195,13 @@ std::string_view GuardianEngine::kv_namespace() {
 std::expected<void, std::string> GuardianEngine::start_local() {
     std::lock_guard lock(mtx_);
     if (started_) return {};
+    // stop() is STICKY: if it already ran (e.g. a SIGTERM / service-stop arrived
+    // during boot, before the reordered start_local() at rung 7.7a), do NOT
+    // resurrect. Without this, stop() -> start_local() would set started_=true and
+    // re-arm cached guards AFTER stop() returned, so stop() would not be truthful
+    // (and at rung 7.7b, detection + buffered sends could resume post-stop).
+    if (stopped_) return {};
     started_ = true;
-    stopped_ = false;
 
     if (!kv_) {
         spdlog::warn("Guardian: KV store unavailable — rule cache will be in-memory only "
@@ -236,8 +241,22 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         }
         if (!rule.enabled())
             continue;
-        if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
-            ++rearmed;
+        // Arming a legacy guard spawns a std::thread (guard_{file,registry,systemd}.cpp);
+        // under thread-or-handle exhaustion that ctor throws std::system_error. This
+        // loop runs OUTSIDE the json try above, and start_local()'s caller does not
+        // catch, so an uncaught throw here escapes run() and terminates the agent. Since
+        // rung 7.7a re-armed cached guards AFTER the SparkEngine's own boot threads, an
+        // exhausted host could now hit this on the still-authoritative legacy backend.
+        // Degrade per-rule (LOUD error, this rule does not enforce) so the agent survives
+        // to arm the rest, rather than terminating the whole process.
+        try {
+            if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
+                ++rearmed;
+        } catch (const std::exception& e) {
+            spdlog::error("Guardian: rule '{}' failed to re-arm ({}) - NOT enforcing this rule; "
+                          "agent continues with the remaining rules",
+                          rule.rule_id(), e.what());
+        }
     }
 
     spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, policy_generation={})",
@@ -873,6 +892,14 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
 void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_by_config,
                                        std::function<SendResult(const OutboxEntry&)> send) {
     std::lock_guard lock(mtx_);
+    // stop() is STICKY (see start_local): if a stop already ran during boot, do NOT
+    // start any spark machinery. Leaving spark_availability_ Unwired is correct - the
+    // agent is shutting down and there is nothing to detect with.
+    if (stopped_) {
+        spdlog::info("Guardian: wire_spark_engine() after stop() - not wiring (shutdown in "
+                     "progress); spark stays Unwired");
+        return;
+    }
     if (spark_availability_ != SparkAvailability::Unwired) {
         spdlog::warn("Guardian: wire_spark_engine() called more than once - ignoring (already {})",
                      spark_availability_ == SparkAvailability::Available ? "Available"
@@ -928,11 +955,21 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_backend_->bind_consumer(consumer_id);
 
         spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
-        spark_scheduler_->start(); // may throw: spawns 4 threads
-
         spark_drain_worker_ = std::make_unique<GuardianOutboxDrainWorker>(*spark_runtime_,
                                                                           std::move(send));
-        spark_drain_worker_->start();
+        // Start the convergence + drain machinery ONLY when spark is the ACTIVE
+        // detection backend (prefer_spark_). At prefer_spark_=false (rung 7.7a: spark
+        // wired but legacy authoritative) no rule ever places on spark, so the outbox
+        // never fills and the convergence lanes are empty - their 5 threads would be
+        // pure overhead AND would claim thread budget ahead of the still-authoritative
+        // legacy backend, whose re-arm (start_local) follows wiring at boot. rung 7.7b
+        // (prefer_spark_=true) starts them here. stop() calls their stop()
+        // unconditionally, a no-op on an unstarted scheduler/drain. (start() may throw:
+        // it spawns threads - hence the ScopeExit rollback above.)
+        if (prefer_spark_) {
+            spark_scheduler_->start();
+            spark_drain_worker_->start();
+        }
 
         spark_engine_ = engine;
         spark_availability_ = SparkAvailability::Available;
