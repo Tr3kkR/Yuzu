@@ -70,6 +70,12 @@
 # UNINSTALL
 # ─────────
 # Pass --uninstall to reverse:
+#   - (macOS only) tears down the pf quarantine anchor FIRST: flushes any
+#     live rules from the "yuzu-quarantine" anchor, resets the persistent
+#     anchor file back to its empty/released form, and removes the
+#     anchor hook from /etc/pf.conf, reloading pf — so a host that is
+#     quarantined at uninstall time is released, not left blocked forever
+#     across future reboots / pf reloads
 #   - removes /etc/sudoers.d/yuzu-agent
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
@@ -515,10 +521,19 @@ install_sudoers() {
     fi
 
     local target="/etc/sudoers.d/yuzu-agent"
-    local tmp
+    local tmp=""
     tmp=$(mktemp -t yuzu-sudoers.XXXXXX)
-    # Cleanup on any exit path: the temp file should never linger.
-    trap 'rm -f "$tmp"' RETURN
+    # Cleanup on any exit path: the temp file should never linger. A RETURN
+    # trap set inside a function is NOT scoped to that function's own
+    # return — it stays armed for the rest of the script and fires on
+    # every LATER function return too, in whatever caller happens to be
+    # unwinding. Left as `rm -f "$tmp"`, that later fire expands $tmp from
+    # a caller's own scope (unset, since `local tmp` only exists inside
+    # this function) and aborts the whole installer under `set -u`
+    # (partial host mutation already applied by then). Two changes make
+    # this safe: `${tmp:-}` tolerates the unset case, and `trap - RETURN`
+    # disarms the trap the first time it fires so it never fires again.
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
 
     log "generating sudoers file at $tmp"
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -650,9 +665,12 @@ macos_install_pf_anchor_file() {
         return 0
     fi
 
-    local tmp
+    local tmp=""
     tmp=$(mktemp -t yuzu-pf-anchor.XXXXXX)
-    trap 'rm -f "$tmp"' RETURN
+    # Self-clearing, nounset-safe RETURN trap — see the matching comment
+    # in install_sudoers() for why both `${tmp:-}` and `trap - RETURN`
+    # are required, not just one or the other.
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
 
     log "generating pf anchor file at $tmp"
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -696,9 +714,12 @@ macos_hook_pf_conf() {
         return 0
     fi
 
-    local tmp
+    local tmp=""
     tmp=$(mktemp -t yuzu-pf-conf.XXXXXX)
-    trap 'rm -f "$tmp"' RETURN
+    # Self-clearing, nounset-safe RETURN trap — see the matching comment
+    # in install_sudoers() for why both `${tmp:-}` and `trap - RETURN`
+    # are required, not just one or the other.
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
 
     log "staging hooked $PF_CONF at $tmp"
     cp "$PF_CONF" "$tmp"
@@ -764,6 +785,140 @@ macos_provision_pf_anchor() {
         macos_enable_pf
     else
         log "pf anchor file and $PF_CONF hook already provisioned — leaving the running pf ruleset untouched"
+    fi
+}
+
+# ── macOS pf-anchor teardown (uninstall) ─────────────────────────────────────
+#
+# Mirror image of macos_provision_pf_anchor above, run in reverse at
+# uninstall time. This matters because the quarantine anchor is made
+# DURABLE by design: quarantine_plugin.cpp mirrors whatever `block all`
+# ruleset it loads live into the anchor out to $PF_ANCHOR_FILE too, so a
+# reboot or `pfctl -f /etc/pf.conf` replays the same quarantine instead of
+# silently releasing it (see quarantine_plugin.cpp's BR-002 comments). If
+# uninstall doesn't undo that, uninstalling the agent on a host that
+# happens to be quarantined at that moment leaves it blocked FOREVER —
+# every future reboot / pf reload re-imposes a `block all` with no agent
+# left to release it.
+#
+# Every step here tolerates "already clean" (pf disabled, anchor absent,
+# hook absent) so uninstalling a host that was never provisioned, or
+# re-running uninstall, is always a safe no-op — same idempotency
+# discipline as the install-side helpers.
+
+# 1. Flush whatever quarantine rules are loaded LIVE in the anchor. Safe
+#    even if the anchor was never hooked into the main ruleset, was never
+#    populated, or pf itself is absent/disabled — pfctl just no-ops.
+macos_flush_pf_anchor_rules() {
+    if ! command -v pfctl >/dev/null 2>&1; then
+        log "pfctl not found — skipping live pf anchor flush (nothing to undo)"
+        return 0
+    fi
+
+    log "flushing live rules from pf anchor \"$PF_ANCHOR_NAME\" (if loaded)"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '[dry-run] pfctl -a %s -F rules\n' "$PF_ANCHOR_NAME"
+        return 0
+    fi
+    # Tolerate errors: an anchor that was never loaded, or pf being
+    # disabled entirely, both make this a harmless no-op rather than a
+    # failure worth aborting uninstall over.
+    pfctl -a "$PF_ANCHOR_NAME" -F rules >/dev/null 2>&1 || true
+}
+
+# 2. Reset the persistent anchor file back to the same empty/released body
+#    the installer writes for a brand-new install (generate_pf_anchor_
+#    content) — byte-for-byte, so a reboot or `pfctl -f /etc/pf.conf`
+#    after uninstall reconstructs an EMPTY anchor, never a stale
+#    `block all`.
+macos_reset_pf_anchor_file() {
+    if [[ ! -f "$PF_ANCHOR_FILE" ]]; then
+        log "pf anchor file $PF_ANCHOR_FILE already absent — nothing to reset"
+        return 0
+    fi
+
+    local tmp=""
+    tmp=$(mktemp -t yuzu-pf-anchor-reset.XXXXXX)
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
+
+    generate_pf_anchor_content > "$tmp"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would reset $PF_ANCHOR_FILE to its empty/released form:"
+        sed 's/^/[dry-run]   /' "$tmp"
+        return 0
+    fi
+
+    log "resetting $PF_ANCHOR_FILE to its empty/released form"
+    run install -m 0644 -o root -g wheel "$tmp" "$PF_ANCHOR_FILE"
+}
+
+# 3. Remove ONLY the exact hook block macos_hook_pf_conf appends (banner
+#    comment + the two pinned `anchor` / `load anchor` lines) — never
+#    touch any other line in pf.conf, including rules an operator or
+#    other tooling added. Idempotent: a no-op if the hook isn't present.
+macos_unhook_pf_conf() {
+    if [[ ! -f "$PF_CONF" ]]; then
+        log "$PF_CONF does not exist — nothing to unhook"
+        return 0
+    fi
+
+    if ! pf_conf_has_full_hook; then
+        log "$PF_CONF does not hook anchor \"$PF_ANCHOR_NAME\" — nothing to unhook"
+        return 0
+    fi
+
+    local banner_line="# --- Yuzu agent quarantine anchor (scripts/install-agent-user.sh) ---"
+    local anchor_line="anchor \"$PF_ANCHOR_NAME\""
+    local load_line="load anchor \"$PF_ANCHOR_NAME\" from \"$PF_ANCHOR_FILE\""
+
+    local tmp=""
+    tmp=$(mktemp -t yuzu-pf-conf-unhook.XXXXXX)
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
+
+    log "staging unhooked $PF_CONF at $tmp"
+    # Drop only the three exact lines the installer added; everything
+    # else — including surrounding blank lines and any pre-existing
+    # operator-authored rules/anchors — is copied through untouched.
+    grep -vxF -e "$banner_line" -e "$anchor_line" -e "$load_line" "$PF_CONF" > "$tmp" || true
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would remove the Yuzu quarantine anchor hook from $PF_CONF"
+        return 0
+    fi
+
+    log "validating unhooked $PF_CONF with pfctl -nf"
+    if ! pfctl -nf "$tmp" >/dev/null 2>&1; then
+        warn "unhooked $PF_CONF failed pfctl -nf syntax validation — NOT installing; leaving the hook in place" \
+             "(the live anchor was already flushed above, so this host is not blocked — finish removing the hook from $PF_CONF by hand)"
+        pfctl -nf "$tmp" >&2 || true
+        return 1
+    fi
+
+    log "installing $tmp -> $PF_CONF (mode 0644, root:wheel) — removed the Yuzu quarantine anchor hook"
+    run install -m 0644 -o root -g wheel "$tmp" "$PF_CONF"
+}
+
+macos_teardown_pf_anchor() {
+    log "tearing down macOS pf quarantine anchor (account: $ACCOUNT_NAME)"
+
+    macos_flush_pf_anchor_rules
+    macos_reset_pf_anchor_file
+
+    if macos_unhook_pf_conf; then
+        if [[ "$DRY_RUN" -eq 0 ]] && command -v pfctl >/dev/null 2>&1 && [[ -f "$PF_CONF" ]]; then
+            log "reloading $PF_CONF after removing the quarantine anchor hook"
+            if ! pfctl -f "$PF_CONF" >/dev/null 2>&1; then
+                warn "pfctl -f $PF_CONF failed while tearing down the quarantine anchor" \
+                     "— verify manually with 'pfctl -s rules' that no stale hook/anchor remains loaded"
+            fi
+        fi
+    else
+        warn "failed to remove the quarantine anchor hook from $PF_CONF during uninstall" \
+             "— the live anchor rules were already flushed, so this host is not blocked right now," \
+             "but a future reboot / pfctl -f $PF_CONF reload will reconstruct an EMPTY anchor" \
+             "(step 2 already reset $PF_ANCHOR_FILE) via a hook that still points at it — finish" \
+             "removing the hook from $PF_CONF by hand to fully undo the install."
     fi
 }
 
@@ -924,6 +1079,13 @@ case "$ACTION" in
     uninstall)
         require_root
         log "uninstalling Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
+        # pf teardown MUST run before anything else below: a host that is
+        # currently quarantined must be released before we remove the
+        # agent/user that would otherwise be relied on to release it —
+        # see macos_teardown_pf_anchor's block comment.
+        if [[ "$PLATFORM" == "macos" ]]; then
+            macos_teardown_pf_anchor
+        fi
         remove_sudoers
         remove_state_dirs
         if [[ "$PLATFORM" == "macos" ]]; then
