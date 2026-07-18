@@ -272,7 +272,11 @@ std::string slurp_command_output(const char* cmd) {
     return out;
 }
 
-std::vector<ServiceInfo> enumerate_services_macos(bool running_only) {
+// total_seen (out) receives the number of services that passed all filters
+// (label allowlist + running_only) BEFORE the kMaxServiceRows cap, so the
+// caller can emit an honest truncation sentinel when rows were dropped.
+std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t& total_seen) {
+    total_seen = 0;
     std::vector<ServiceInfo> services;
     FILE* pipe = popen("launchctl list 2>/dev/null", "r");
     if (!pipe)
@@ -323,6 +327,10 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only) {
 
         if (running_only && si.pid == "-")
             continue;
+
+        // Count every qualifying service BEFORE the cap so the caller can tell
+        // a truncated inventory from a complete one.
+        ++total_seen;
 
         // Row cap: keep draining the pipe (loop continues) but stop storing
         // once the cap is hit, so the child never blocks on a full pipe.
@@ -617,10 +625,18 @@ private:
             ctx.write_output(std::format("svc|{}|{}|{}", s.name, s.status, s.description));
         }
 #elif defined(__APPLE__)
-        auto services = enumerate_services_macos(running_only);
+        std::size_t total_seen = 0;
+        auto services = enumerate_services_macos(running_only, total_seen);
         for (const auto& s : services) {
             ctx.write_output(
                 std::format("svc|{}|{}|{}|{}", s.label, s.pid, s.status, s.startup_type));
+        }
+        if (total_seen > kMaxServiceRows) {
+            // Honest truncation sentinel: more services qualified than the row
+            // cap kept, so the list above is incomplete. "__truncated__" in the
+            // label slot cannot collide with a real (allowlisted) launchd label,
+            // and total_seen rides in the status slot.
+            ctx.write_output(std::format("svc|__truncated__|-|{}|-", total_seen));
         }
 #else
         ctx.write_output("error|unsupported platform");

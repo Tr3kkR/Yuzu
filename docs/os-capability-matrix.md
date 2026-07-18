@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-18._
 
 ## Matrix
 
@@ -40,7 +40,7 @@ _Last hand-updated: 2026-07-13._
 | **Software-licence detection (SLE)** (daily sync → central Postgres; product/vendor/type/channel/status/expiry per detected licence) | ✅ (WMI `SoftwareLicensingProduct` authoritative + Office C2R + extensible `ProbeSpec` + per-user hives/files — the only OS with per-user surfaces) | 🟡 (rpm/dpkg declared-licence *classification* — no lapse detection, stated gap; RHEL entitlement certs + FlexLM `.lic` expiry are authoritative) | 🟡 (`_MASReceipt` + machine-scope vendor plists — `probable` confidence only) | Per-OS TUs `agents/plugins/license_scan/src/licensing_{win,wmi,linux,macos}.cpp`; synced by `sync_source_software_licensing.cpp` → server `SoftwareLicensingStore` (ADR-0024). Per-surface detail + privacy limits: `docs/user-manual/software-licensing.md` ("What is collected"). Java + ISO-19770-2 SWID tag surfaces are the named fast-follow (#2112) |
 | **Device-identity inventory** (daily sync → central Postgres; serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config` via `LocalDispatcher`. New `hardware` `system` action: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_serial`+`product_uuid` (0400 → needs `cap_dac_read_search`, granted by `install-agent-user.sh`; `unknown` without it); macOS `ioreg IOPlatformExpertDevice` (NB: `IOPlatformUUID` ≠ SMBIOS UUID — cross-OS UUID correlation is a PR2 concern). Machine-scope only. Server: `DeviceInventoryStore` (ADR-0016 source #3). Read surface deferred to PR2 |
 | **Live device snapshot — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent (`/proc/net/tcp` exposes inode, not pid) | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Device page "Get live info" Processes card |
-| **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
+| **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`, Windows); macOS now emits an honest `arp\|not_available` sentinel (real route-sysctl collector still 🔜); Linux `/proc/net/arp` 🔜 |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
 

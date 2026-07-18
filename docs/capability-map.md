@@ -348,7 +348,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.2 Windows Installer (MSI) Package Inventory :white_check_mark: `T1`
 
-`msi_packages` plugin (Windows).
+`msi_packages` plugin (Windows MSI / macOS pkgutil).
 
 ### 7.3 SCCM Integration :white_check_mark: `T2`
 
@@ -429,7 +429,7 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 `bitlocker` plugin (Windows).
 
-> **Gap:** No macOS FileVault or Linux LUKS coverage.
+> **Gap:** No Linux LUKS coverage. (macOS FileVault status now covered via the `bitlocker` plugin.)
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 

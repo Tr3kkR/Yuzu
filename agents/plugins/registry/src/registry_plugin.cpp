@@ -39,6 +39,19 @@ namespace {
 
 YuzuPluginContext* g_ctx = nullptr;
 
+// Strip pipe/newline/CR from a value echoed back into the pipe-delimited
+// protocol so a hostile action string cannot inject synthetic fields or rows
+// (e.g. an action containing '|' forging an extra column). Platform-agnostic;
+// used by the unknown-action error paths on every platform.
+std::string sanitize_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    return out;
+}
+
 #ifdef _WIN32
 // to_wide / from_wide now come from the shared agents/shared/win_str.hpp
 // (#1681) instead of a local copy; brought in unqualified so the existing call
@@ -110,11 +123,18 @@ public:
             }
         }
         if (!is_mutator && !is_reader) {
-            ctx.write_output(std::format("error|unknown action: {}", action));
+            ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
             return 1;
         }
 
+#if defined(__APPLE__)
+        // macOS-specific honest sentinel (points at the real macOS alternative).
         ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
+#else
+        // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+        // tools (defaults/plists) on a Linux agent.
+        ctx.write_output("registry|unsupported|Windows registry is not available on this platform");
+#endif
         // set_value/delete_value/delete_key are STATE-CHANGING (write/delete)
         // actions. On non-Windows they never touch anything, so reporting
         // rc=0 (terminal SUCCESS) would be a false success for a security-
@@ -132,7 +152,7 @@ public:
         if (action == "enumerate_keys")   return do_enumerate_keys(ctx, params);
         if (action == "enumerate_values") return do_enumerate_values(ctx, params);
         if (action == "get_user_value")   return do_get_user_value(ctx, params);
-        ctx.write_output(std::format("error|unknown action: {}", action));
+        ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
         return 1;
 #endif
     }

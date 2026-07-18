@@ -47,6 +47,18 @@
 
 namespace {
 
+// Strip pipe/newline/CR from a value echoed back into the pipe-delimited
+// protocol so a hostile action string cannot inject synthetic fields or rows.
+// Platform-agnostic; used by the unknown-action error paths on every platform.
+std::string sanitize_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    return out;
+}
+
 #ifdef _WIN32
 
 constexpr const wchar_t* kTerminalServerKey = L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server";
@@ -323,11 +335,18 @@ public:
         // platform support, so a misspelled/unknown action is never silently
         // recorded as terminal SUCCESS.
         if (action != "set_state" && action != "status") {
-            ctx.write_output(std::format("error|unknown action: {}", action));
+            ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
             return 1;
         }
 
+#if defined(__APPLE__)
+        // macOS-specific honest sentinel (points at the real macOS alternative).
         ctx.write_output("rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing");
+#else
+        // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+        // tools (Screen Sharing / com.apple.screensharing) on a Linux agent.
+        ctx.write_output("rdp_control|unsupported|Windows Remote Desktop is not available on this platform");
+#endif
         // set_state is a STATE-CHANGING security-control action (enable/
         // disable remote access). On non-Windows it never touches anything,
         // so reporting rc=0 (terminal SUCCESS) would be a false success for
@@ -339,7 +358,7 @@ public:
 #else
         if (action == "set_state") return do_set_state(ctx, params);
         if (action == "status")    return do_status(ctx);
-        ctx.write_output(std::format("error|unknown action: {}", action));
+        ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
         return 1;
 #endif
     }

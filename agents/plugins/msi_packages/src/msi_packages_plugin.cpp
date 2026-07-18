@@ -39,8 +39,11 @@ static constexpr const char* kInstalledProductName = "InstalledProductName";
 static constexpr const char* kVersionString = "VersionString";
 static constexpr const char* kInstallLocation = "InstallLocation";
 #elif defined(__APPLE__)
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
+#include <memory>
 
 #include "msi_packages_macos.hpp"
 #endif
@@ -104,14 +107,21 @@ std::string get_product_info(const char* product_code, const char* property) {
 // output) parse those via the pure helpers in msi_packages_macos.hpp.
 std::string run_command(const std::string& cmd) {
     std::string result;
-    std::array<char, 512> buf{};
-    FILE* pipe = popen(cmd.c_str(), "r");
+    // RAII pipe: a std::bad_alloc on the append below must not leak the pipe
+    // (fd + zombie child) the way a bare popen/pclose pair would.
+    std::unique_ptr<FILE, int (*)(FILE*)> pipe{popen(cmd.c_str(), "r"), &pclose};
     if (!pipe)
         return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+    static constexpr std::size_t kMaxOutputBytes = 2 * 1024 * 1024; // 2 MiB sanity cap
+    std::array<char, 512> buf{};
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), pipe.get())) > 0) {
+        // Keep draining the pipe even once the cap is hit, so the child never
+        // blocks writing into a full pipe; just stop growing the buffer.
+        if (result.size() < kMaxOutputBytes) {
+            result.append(buf.data(), std::min(n, kMaxOutputBytes - result.size()));
+        }
     }
-    pclose(pipe);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
@@ -162,7 +172,9 @@ int do_list(yuzu::CommandContext& ctx) {
     using yuzu::msi_packages::macos::parse_pkg_info;
 
     auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
-    if (ids.size() > kMaxPackages)
+    const std::size_t total_seen = ids.size();
+    const bool truncated = total_seen > kMaxPackages;
+    if (truncated)
         ids.resize(kMaxPackages);
 
     int count = 0;
@@ -175,6 +187,13 @@ int do_list(yuzu::CommandContext& ctx) {
             info.version.empty() ? "-" : info.version,
             info.install_location.empty() ? "-" : info.install_location)));
         ++count;
+    }
+    if (truncated) {
+        // Honest truncation sentinel: the receipt DB held more packages than
+        // kMaxPackages, so the inventory above is incomplete. The "__truncated__"
+        // code slot cannot collide with a real reverse-domain package id, so a
+        // positional downstream parser can distinguish this from a real row.
+        ctx.write_output(std::format("msi|__truncated__|{}|-|-", total_seen));
     }
     if (count == 0) {
         ctx.write_output("msi|No packages found|-|-|-");

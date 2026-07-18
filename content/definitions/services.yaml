@@ -3,9 +3,9 @@
 ## Plugin: services | Actions: list, running, set_start_mode
 ##
 ## Note: Output columns vary by platform. The shared `result.columns` schema
-## below is Windows-shaped; the second column ("display_name_or_pid") holds
-## an actual display name on Windows but the process ID on macOS -- see the
-## per-platform mapping:
+## below is Windows-shaped; the second column ("display_name") holds an actual
+## display name on Windows/Linux but the launchd PID on macOS (see that
+## column's description) -- per-platform mapping:
 ##   Windows: name, display_name,       status, startup_type
 ##   Linux:   name, status,             description  (no startup_type)
 ##   macOS:   label, pid,               status, startup_type
@@ -42,8 +42,12 @@ spec:
     columns:
       - name: name
         type: string
-      - name: display_name_or_pid
+      - name: display_name
         type: string
+        description: >
+          Column 2. On Windows and Linux this is the service display name;
+          on macOS it holds the launchd job's PID (the platform has no
+          per-service display name in `launchctl list`).
       - name: status
         type: string
       - name: startup_type
@@ -104,8 +108,12 @@ spec:
     columns:
       - name: name
         type: string
-      - name: display_name_or_pid
+      - name: display_name
         type: string
+        description: >
+          Column 2. On Windows and Linux this is the service display name;
+          on macOS it holds the launchd job's PID (the platform has no
+          per-service display name in `launchctl list`).
       - name: status
         type: string
       - name: startup_type

@@ -194,6 +194,10 @@ Plugins for querying user accounts and active sessions.
 > machine accounts that end in `$`. The account is still listed; only the
 > last-login lookup is skipped (it is gated to prevent shell injection).
 
+> **Note (macOS):** `local_users` also reports `console_state` — a tri-state
+> (`true`/`false`/`unknown`) flag for whether the account is the current
+> GUI/console-login user. Linux and Windows leave this column empty.
+
 ---
 
 ## Network
@@ -336,13 +340,13 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | | |
 |---|---|
-| **Platforms** | W |
-| **Description** | Windows Installer (MSI) package inventory. |
+| **Platforms** | W M |
+| **Description** | Installed-package inventory: Windows Installer (MSI) products on Windows (`MsiEnumProducts`), `pkgutil` package receipts on macOS. |
 
 | Action | Description |
 |---|---|
-| `list` | All installed MSI packages with name, version, and vendor. |
-| `product_codes` | MSI product codes (GUIDs) for each installed package. Useful for silent uninstall automation. |
+| `list` | All installed packages with name, version, and location. On macOS, `pkgutil` receipts (reverse-domain identifier, derived name, version, install location). |
+| `product_codes` | Package identifiers — MSI product code GUIDs (Windows) or reverse-domain `pkgutil` identifiers (macOS). Useful for silent uninstall automation. |
 
 ### windows_updates
 
