@@ -360,6 +360,49 @@ TEST_CASE("GuaranteedStateStore: an embedded-NUL event field is rejected as malf
     CHECK(store.event_count() == 0);
 }
 
+TEST_CASE("GuaranteedStateStore: every compared field triggers a Conflict when it differs (item-7)",
+          "[guaranteed_state_store][events][redelivery]") {
+    // A same-event_id re-insert that differs in ANY ONE immutable compared field must be
+    // a loud Conflict, not a quiet Redelivered — this pins the whole compare column set so
+    // a column-index off-by-one in stored_event_matches_locked is caught (qa-S2). severity
+    // is EXCLUDED (server-enriched) and is asserted to stay a Redelivery.
+    GuaranteedStateStore store(":memory:");
+
+    auto base = make_event("evt-f", "rule-1", "agent-A");
+    base.detail_json = R"({"k":"v"})";
+    REQUIRE(store.insert_event_classified(base).outcome == EventInsertOutcome::Inserted);
+
+    uint64_t dropped = 0;
+    auto expect_conflict = [&](auto mutate) {
+        auto e = base;
+        mutate(e); // one field differs; event_id stays "evt-f" so it conflicts on the PK
+        CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Conflict);
+        CHECK(store.events_dropped_total() == ++dropped);
+        CHECK(store.event_count() == 1); // never written
+    };
+
+    expect_conflict([](GuaranteedStateEventRow& e) { e.rule_id = "rule-2"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.agent_id = "agent-Z"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.event_type = "drift.detected"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.guard_type = "etw"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.guard_category = "condition"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detected_value = "1"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.expected_value = "0"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_action = "other"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_success = false; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detection_latency_us = 999; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_latency_us = 999; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.timestamp = "2026-04-19T13:00:00Z"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detail_json = R"({"k":"w"})"; });
+
+    // Control: severity is server-enriched -> excluded -> a severity-only change stays a
+    // Redelivery and does not bump the drop counter.
+    auto sev = base;
+    sev.severity = (base.severity == "high") ? "low" : "high";
+    CHECK(store.insert_event_classified(sev).outcome == EventInsertOutcome::Redelivered);
+    CHECK(store.events_dropped_total() == dropped); // unchanged
+}
+
 TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
           "[guaranteed_state_store][events][crash]") {
     // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel

@@ -78,9 +78,13 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // KiB is generous headroom over any real signal payload.
         constexpr std::size_t kMaxDetailJson = 16 * 1024;
         if (ev_row.detail_json.size() > kMaxDetailJson) {
+            // Sanitize the agent-controlled identifiers here too (sec-M1 sibling) — this
+            // WARN predates the classify switch and reaches a log line with the same
+            // CRLF-forging exposure.
             spdlog::warn("Guardian: dropping oversized detail_json ({} bytes) from agent {} "
                          "event {} (cap {})",
-                         ev_row.detail_json.size(), agent_id, ev_row.event_id, kMaxDetailJson);
+                         ev_row.detail_json.size(), sanitize_label(agent_id),
+                         sanitize_label(ev_row.event_id), kMaxDetailJson);
             ev_row.detail_json.clear();
         }
 
@@ -105,18 +109,28 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         case EventInsertOutcome::Inserted:
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
+            // Agent-controlled identifiers are sanitize_label'd before they reach any log
+            // line: the NUL guard strips \0 but not CR/LF, and the tightened
+            // YuzuGuardianEventsDropped alert directs operators to trust these logs, so a
+            // raw event_id could otherwise forge log lines (sec-M1). Same chokepoint the
+            // observer path uses. res.error is dropped on Conflict — it only repeats the
+            // (now-sanitized) event_id.
             spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
                           "event_id={} agent={} rule={}",
-                          ev_row.event_id, agent_id, ev_row.rule_id);
+                          sanitize_label(ev_row.event_id), sanitize_label(agent_id),
+                          sanitize_label(ev_row.rule_id));
             return;
         case EventInsertOutcome::Conflict:
             spdlog::warn("Guardian: event_id collision with MISMATCHED fields (possible "
-                         "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}: {}",
-                         ev_row.event_id, agent_id, ev_row.rule_id, res.error);
+                         "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}",
+                         sanitize_label(ev_row.event_id), sanitize_label(agent_id),
+                         sanitize_label(ev_row.rule_id));
             return;
         case EventInsertOutcome::Error:
-            spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}", agent_id,
-                         ev_row.rule_id, res.error);
+            // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
+            // input — but the identifiers still get sanitized.
+            spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
+                         sanitize_label(agent_id), sanitize_label(ev_row.rule_id), res.error);
             return;
         }
         // Fleet-wide incident detection — RULELESS observations only, and only

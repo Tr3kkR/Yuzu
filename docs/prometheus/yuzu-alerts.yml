@@ -313,6 +313,28 @@ groups:
             investigate a forged-id campaign or a misbehaving agent before tuning.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-events-dropped"
 
+      # A sustained OPERATIONAL ingest-fault rate means the classify/insert machinery is
+      # broken and event_id conflicts are going UNCLASSIFIED — a genuine collision can then
+      # escape yuzu_server_guardian_events_dropped_total entirely (item-7 sec-M2). The
+      # metric resets on restart, so alert on increase() over a window. A metric with no
+      # alert would be the same blind spot #1414 exists to close, one layer down.
+      - alert: YuzuGuardianIngestErrors
+        expr: |
+          increase(yuzu_server_guardian_events_ingest_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian event ingest is failing (conflicts going unclassified)"
+          description: >-
+            The Guardian event ingest path reported operational faults (a failed
+            BEGIN/prepare/insert/commit, or a redelivery compare that could not run) over
+            the last 15 minutes. While this persists, an event_id conflict cannot be
+            classified redelivery-vs-collision, so a genuine forged-id collision can
+            escape yuzu_server_guardian_events_dropped_total. Check the server logs and
+            the guaranteed-state DB health (disk pressure, corruption, lock contention).
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-ingest-errors"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
     # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503

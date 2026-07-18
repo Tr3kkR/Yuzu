@@ -311,7 +311,10 @@ public:
     // mismatched `Conflict` on the loud CC7.3 drop metric. insert_event() is the
     // back-compat convenience wrapper (Inserted/Redelivered -> ok; Conflict/Error ->
     // unexpected) for callers that don't distinguish redelivery (tests, batch seed).
-    EventInsertResult insert_event_classified(const GuaranteedStateEventRow& row);
+    // [[nodiscard]]: the four-way outcome is what the caller gates the DEX observers on
+    // (only `Inserted` may run them). Silently ignoring it re-opens the false-blast-radius
+    // bug this method exists to prevent, so the type system enforces the check.
+    [[nodiscard]] EventInsertResult insert_event_classified(const GuaranteedStateEventRow& row);
     std::expected<void, std::string> insert_event(const GuaranteedStateEventRow& row);
 
     // Batch ingest: wraps all rows in a single transaction. At 10–50x the
@@ -491,6 +494,12 @@ public:
     // agent journal's expected at-least-once retries. High is normal after outages;
     // it is NOT a loss signal (that is events_dropped_total()).
     uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
+    // Cumulative OPERATIONAL ingest faults (a failed BEGIN/prepare/insert/commit, or a
+    // compare SELECT that could not run). A sustained rate means the ingest machinery is
+    // broken and conflicts are going UNCLASSIFIED — a genuine collision can then escape
+    // events_dropped_total(), so this is itself alertable (sec-M2). Excludes malformed
+    // (embedded-NUL) input, which is attacker-drivable and must not inflate this.
+    uint64_t events_ingest_errors_total() const noexcept { return events_ingest_errors_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -505,8 +514,9 @@ private:
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
-    std::atomic<uint64_t> events_dropped_{0};     // #1414: event_id conflict, MISMATCHED payload
-    std::atomic<uint64_t> events_redelivered_{0}; // item-7: event_id conflict, MATCHING payload
+    std::atomic<uint64_t> events_dropped_{0};      // #1414: event_id conflict, MISMATCHED payload
+    std::atomic<uint64_t> events_redelivered_{0};  // item-7: event_id conflict, MATCHING payload
+    std::atomic<uint64_t> events_ingest_errors_{0}; // item-7/sec-M2: operational ingest fault
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;

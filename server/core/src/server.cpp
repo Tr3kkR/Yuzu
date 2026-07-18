@@ -903,6 +903,14 @@ public:
                           "at-least-once retry. High is normal after an agent outage/reconnect; this "
                           "is NOT a loss signal (that is ..._events_dropped_total).",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_events_ingest_errors_total",
+                          "Cumulative OPERATIONAL Guardian ingest faults (a failed BEGIN/prepare/"
+                          "insert/commit, or a redelivery compare that could not run). A sustained "
+                          "rate means conflicts are going UNCLASSIFIED, so a genuine collision can "
+                          "escape ..._events_dropped_total — this is itself alertable (sec-M2). "
+                          "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
+                          "server restart.",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -3428,6 +3436,8 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
                     metrics_.gauge("yuzu_server_guardian_events_redelivered_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_redelivered_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_ingest_errors_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_ingest_errors_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")

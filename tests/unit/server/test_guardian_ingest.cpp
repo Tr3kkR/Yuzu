@@ -12,6 +12,7 @@
 
 #include "guardian_ingest.hpp"
 
+#include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
 #include "guaranteed_state_store.hpp"
 #include "guaranteed_state.pb.h"
@@ -19,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <unordered_set>
 
 using namespace yuzu::server;
 using yuzu::server::detail::ingest_guardian_response;
@@ -54,24 +56,35 @@ TEST_CASE("guardian ingest: DEX observers fire once on insert, never on redelive
     int incidents = 0;
     blast.set_on_incident([&](const BlastRadiusIncident&) { ++incidents; });
 
+    // BOTH observers are wired (the two are gated together; a null router would leave the
+    // alert-router half of the gating unproven — qa-S1). The router fires per routed
+    // sighting, so on_alert firing is itself the "observe() was called" probe.
+    DexAlertRouter router;
+    router.set_routes(std::unordered_set<std::string>{"process.crashed"});
+    int alerts = 0;
+    router.set_on_alert([&](const RoutedSignalAlert&) { ++alerts; });
+
     const auto resp = make_observation("__observation__-1", "svc.exe");
 
-    // 1) First delivery -> Inserted -> the observer fires exactly once.
-    ingest_guardian_response(store, "agent-A", resp, &blast, nullptr);
+    // 1) First delivery -> Inserted -> BOTH observers fire exactly once.
+    ingest_guardian_response(store, "agent-A", resp, &blast, &router);
     CHECK(store.event_count() == 1);
     CHECK(incidents == 1);
+    CHECK(alerts == 1);
 
-    // 2) Exact redelivery (same agent, same payload) -> Redelivered -> the observer
-    //    MUST NOT fire again — no false fleet-wide sighting on a reconnect.
-    ingest_guardian_response(store, "agent-A", resp, &blast, nullptr);
+    // 2) Exact redelivery (same agent, same payload) -> Redelivered -> NEITHER observer
+    //    fires again — no false fleet-wide sighting / duplicate routed alert on reconnect.
+    ingest_guardian_response(store, "agent-A", resp, &blast, &router);
     CHECK(store.event_count() == 1);
     CHECK(store.events_redelivered_total() == 1);
     CHECK(incidents == 1);
+    CHECK(alerts == 1);
 
     // 3) Same event_id from a DIFFERENT (connection-bound) agent -> mismatched-field
-    //    Conflict -> not written, loud drop metric, and NO observer fire.
-    ingest_guardian_response(store, "agent-B", resp, &blast, nullptr);
+    //    Conflict -> not written, loud drop metric, and NEITHER observer fires.
+    ingest_guardian_response(store, "agent-B", resp, &blast, &router);
     CHECK(store.event_count() == 1);
     CHECK(store.events_dropped_total() == 1);
     CHECK(incidents == 1);
+    CHECK(alerts == 1);
 }
