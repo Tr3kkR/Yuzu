@@ -340,20 +340,39 @@ def stamp_version(conn: sqlite3.Connection, version: int) -> None:
     )
 
 
-def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-    """Atomically replace v2's overwrite-on-rerun CI table with v3."""
-    upgraded_at = int(time.time())
-    script = (
-        "BEGIN IMMEDIATE;\n"
-        "DROP TABLE IF EXISTS ci_runs_v3;\n"
-        + SCHEMA_V3_CI_RUNS
-        + SCHEMA_V3_TABLES
-        + "\nINSERT OR REPLACE INTO schema_meta (store, version, upgraded_at) "
-          f"VALUES ('test_runs_db', 3, {upgraded_at});\n"
-        + "COMMIT;\n"
-    )
+def _execute_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a SQL script statement-by-statement in the current transaction.
+
+    sqlite3.Connection.executescript() commits a pending transaction before it
+    runs. Migrations that acquire their lock before checking the schema version
+    therefore use this helper so the re-check and DDL remain under one lock.
+    """
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            conn.execute(pending)
+            pending = ""
+    if pending.strip():
+        raise ValueError("incomplete SQL statement in schema migration")
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> int:
+    """Atomically replace v2's CI table after a lock-protected re-check."""
     try:
-        conn.executescript(script)
+        conn.execute("BEGIN IMMEDIATE")
+        current = schema_version(conn)
+        if current != 2:
+            if current is None:
+                raise RuntimeError("schema version disappeared during v2 migration")
+            conn.commit()
+            return current
+        conn.execute("DROP TABLE IF EXISTS ci_runs_v3")
+        _execute_statements(conn, SCHEMA_V3_CI_RUNS)
+        _execute_statements(conn, SCHEMA_V3_TABLES)
+        stamp_version(conn, 3)
+        conn.commit()
+        return 3
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -372,8 +391,7 @@ def _upgrade_schema(conn: sqlite3.Connection, existing: Optional[int]) -> int:
         version = 2
         stamp_version(conn, version)
     if version == 2:
-        _migrate_v2_to_v3(conn)
-        version = 3
+        version = _migrate_v2_to_v3(conn)
     if version == 3:
         # Idempotently restore indexes/tables if an operator repaired a DB by
         # hand but left the schema-version stamp intact.
@@ -735,7 +753,7 @@ def cmd_ci_record(args: argparse.Namespace) -> int:
         duration = None
         if finished is not None:
             duration = max(0, finished - args.started_at)
-        conn.execute(
+        row = conn.execute(
             """
             INSERT INTO ci_runs
                 (workflow_id, run_id, run_attempt, job_name, triplet, platform,
@@ -750,13 +768,17 @@ def cmd_ci_record(args: argparse.Namespace) -> int:
                 event_name=excluded.event_name,
                 commit_sha=excluded.commit_sha,
                 branch=excluded.branch,
-                started_at=excluded.started_at,
+                started_at=ci_runs.started_at,
                 finished_at=excluded.finished_at,
-                duration_seconds=excluded.duration_seconds,
+                duration_seconds=CASE
+                    WHEN excluded.finished_at IS NULL THEN excluded.duration_seconds
+                    ELSE MAX(0, excluded.finished_at - ci_runs.started_at)
+                END,
                 conclusion=excluded.conclusion,
                 vcpkg_cache_hit=COALESCE(excluded.vcpkg_cache_hit, ci_runs.vcpkg_cache_hit),
                 ccache_hit_ratio=COALESCE(excluded.ccache_hit_ratio, ci_runs.ccache_hit_ratio),
                 notes=excluded.notes
+            RETURNING duration_seconds
             """,
             (
                 args.workflow, args.run_id, args.run_attempt, args.job_name,
@@ -765,7 +787,8 @@ def cmd_ci_record(args: argparse.Namespace) -> int:
                 args.conclusion, args.vcpkg_cache_hit, args.ccache_hit_ratio,
                 args.notes or "",
             ),
-        )
+        ).fetchone()
+        duration = row[0] if row is not None else duration
     duration_text = f"{duration}s" if duration is not None else "in progress"
     print(
         f"test_db: ci_runs <- {args.workflow}#{args.run_id}."
@@ -843,8 +866,20 @@ def cmd_ci_import_junit(args: argparse.Namespace) -> int:
         print(f"test_db: ignoring stale Meson junit at {junit} (predates this job)")
         return 0
 
-    metadata = _meson_test_metadata(builddir)
-    root = ET.parse(junit).getroot()
+    try:
+        metadata = _meson_test_metadata(builddir)
+    except (OSError, ValueError) as exc:
+        print(
+            f"test_db: ignoring malformed Meson test metadata at {builddir}: {exc}",
+            file=sys.stderr,
+        )
+        metadata = {}
+    try:
+        root = ET.parse(junit).getroot()
+    except (OSError, ET.ParseError) as exc:
+        print(f"test_db: cannot import malformed Meson junit at {junit}: {exc}",
+              file=sys.stderr)
+        return 1
     rows: list[tuple[str, str, float, Optional[float]]] = []
     for testcase in root.iter("testcase"):
         junit_name = testcase.get("name", "")
@@ -868,13 +903,53 @@ def cmd_ci_import_junit(args: argparse.Namespace) -> int:
         if args.flake_report
         else builddir / "meson-logs" / "flake-retry.json"
     )
-    recovered: list[dict] = []
-    if flake_report.exists() and flake_report.stat().st_mtime >= job_started_at:
-        report = json.loads(flake_report.read_text(encoding="utf-8"))
-        raw = report.get("recovered", []) if isinstance(report, dict) else []
-        if not isinstance(raw, list):
-            raise ValueError(f"{flake_report}: recovered must be an array")
-        recovered = [entry for entry in raw if isinstance(entry, dict)]
+    recovered: list[tuple[str, int, bool]] = []
+    try:
+        report_is_current = (
+            flake_report.exists()
+            and flake_report.stat().st_mtime >= job_started_at
+        )
+        if report_is_current:
+            report = json.loads(flake_report.read_text(encoding="utf-8"))
+            raw = report.get("recovered", []) if isinstance(report, dict) else []
+            if not isinstance(raw, list):
+                print(
+                    "test_db: skipped malformed recovered flake entries: "
+                    "recovered must be an array",
+                    file=sys.stderr,
+                )
+                raw = []
+            for index, entry in enumerate(raw):
+                reason = None
+                if not isinstance(entry, dict):
+                    reason = "entry must be an object"
+                else:
+                    case_name = entry.get("case")
+                    attempts = entry.get("attempts")
+                    cross_platform = entry.get("cross_platform")
+                    if not isinstance(case_name, str) or not case_name.strip():
+                        reason = "case must be a non-empty string"
+                    elif (
+                        not isinstance(attempts, int)
+                        or isinstance(attempts, bool)
+                        or attempts < 1
+                    ):
+                        reason = "attempts must be a positive integer"
+                    elif not isinstance(cross_platform, bool):
+                        reason = "cross_platform must be a boolean"
+                if reason is not None:
+                    print(
+                        "test_db: skipped malformed recovered flake entry "
+                        f"{index}: {reason}",
+                        file=sys.stderr,
+                    )
+                    continue
+                recovered.append((case_name, attempts, cross_platform))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"test_db: ignored malformed flake retry report at {flake_report}: {exc}",
+            file=sys.stderr,
+        )
 
     with connect(create_dirs=True) as conn:
         _ensure_schema_initialized(conn)
@@ -893,11 +968,7 @@ def cmd_ci_import_junit(args: argparse.Namespace) -> int:
                 """,
                 (*key, suite_name, status, duration, timeout, now),
             )
-        for entry in recovered:
-            case_name = entry.get("case")
-            if not isinstance(case_name, str) or not case_name:
-                continue
-            attempts = entry.get("attempts", 0)
+        for case_name, attempts, cross_platform in recovered:
             conn.execute(
                 """
                 INSERT INTO ci_flake_events
@@ -912,8 +983,8 @@ def cmd_ci_import_junit(args: argparse.Namespace) -> int:
                 (
                     *key,
                     case_name,
-                    int(attempts) if isinstance(attempts, int) else 0,
-                    int(bool(entry.get("cross_platform"))),
+                    attempts,
+                    int(cross_platform),
                     now,
                 ),
             )

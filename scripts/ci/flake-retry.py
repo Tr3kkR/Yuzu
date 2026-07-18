@@ -294,11 +294,10 @@ def retry_case(test, case, retries):
 
 
 def write_retry_report(builddir, this_os, recovered, blocked):
-    """Persist retry evidence for runner-local CI telemetry ingestion."""
+    """Persist retry evidence without changing the test process' result."""
     import json
 
     logs = os.path.join(builddir, "meson-logs")
-    os.makedirs(logs, exist_ok=True)
     path = os.path.join(logs, "flake-retry.json")
     tmp = path + f".{os.getpid()}.tmp"
     payload = {
@@ -313,10 +312,24 @@ def write_retry_report(builddir, this_os, recovered, blocked):
         ],
         "blocked": list(blocked),
     }
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
+    try:
+        os.makedirs(logs, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError) as ex:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        gh(
+            "warning",
+            "flake retry report write failed "
+            f"(reporting only, run unaffected): {ex}",
+        )
+        return False
 
 
 # ── orchestration ─────────────────────────────────────────────────────────────

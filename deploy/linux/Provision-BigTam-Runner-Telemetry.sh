@@ -38,13 +38,18 @@ for ((index=0; index<RUNNER_COUNT; index++)); do
     echo "runner configuration not readable: $runner_config" >&2
     exit 1
   fi
-  # The live Big Tam runners use /srv/ci/work-N, not <runner-root>/_work.
-  # Derive this instead of duplicating registration-time --work configuration.
-  work_folder="$(python3 -c \
-    'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["workFolder"])' \
-    "$runner_config")"
-  if [[ "$work_folder" != /* || ! -d "$work_folder/_tool" ]]; then
-    echo "invalid or missing workFolder for $runner_name: $work_folder" >&2
+  # The work path becomes root-owned systemd configuration below. Treat the
+  # runner-writable .runner file only as an assertion against the canonical
+  # registration path; never interpolate its value into the drop-in.
+  work_folder="/srv/ci/work-$index"
+  if ! python3 -c \
+    'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if data.get("workFolder") == sys.argv[2] else 1)' \
+    "$runner_config" "$work_folder"; then
+    echo "runner workFolder does not match the canonical path for $runner_name" >&2
+    exit 1
+  fi
+  if [[ ! -d "$work_folder/_tool" ]]; then
+    echo "runner tool cache is missing for $runner_name: $work_folder/_tool" >&2
     exit 1
   fi
   tool_cache="$work_folder/_tool"

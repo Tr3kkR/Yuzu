@@ -308,6 +308,7 @@ jobs:
       # the checkout. ci-telemetry exports YUZU_TEST_DB for later steps and
       # records this exact matrix leg; reruns remain distinct by run_attempt.
       - name: Start persistent CI telemetry
+        continue-on-error: true
         env:
           YUZU_TEST_DB: ${{ runner.tool_cache }}/yuzu-test-runs/${{ runner.name }}/test-runs.db
         run: >-
@@ -567,12 +568,16 @@ jobs:
 
       - name: Finish persistent CI telemetry
         if: always()
+        continue-on-error: true
+        env:
+          YUZU_TEST_DB: ${{ runner.tool_cache }}/yuzu-test-runs/${{ runner.name }}/test-runs.db
+          YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python3 scripts/ci/ci-telemetry.py finish
           --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
           --triplet x64-linux
           --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
-          --conclusion ${{ job.status }}
+          --conclusion "$YUZU_CI_CONCLUSION"
 
   # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
@@ -653,6 +658,7 @@ jobs:
           persist-credentials: false
 
       - name: Start persistent CI telemetry
+        continue-on-error: true
         env:
           # Keep the workflow path identical to Start-PinnedRunner.ps1 even
           # before the next safe runner restart propagates its process env.
@@ -891,12 +897,16 @@ jobs:
 
       - name: Finish persistent CI telemetry
         if: always()
+        continue-on-error: true
+        env:
+          YUZU_TEST_DB: D:\ci\test-runs\${{ runner.name }}\test-runs.db
+          YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python scripts/ci/ci-telemetry.py finish
           --job-name "Windows MSVC ${{ matrix.build_type }}"
           --triplet x64-windows
           --builddir build-windows-${{ matrix.build_type }}
-          --conclusion ${{ job.status }}
+          --conclusion "$YUZU_CI_CONCLUSION"
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:

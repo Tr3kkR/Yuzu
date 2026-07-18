@@ -23,6 +23,16 @@ TEST_DB = HERE.parent / "test" / "test_db.py"
 SAFE_RUNNER = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+def warning(message: str) -> None:
+    """Emit a log-safe Actions warning for best-effort telemetry failures."""
+    escaped = (
+        message.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+    print(f"::warning title=CI telemetry::{escaped}", file=sys.stderr)
+
+
 def telemetry_db_path(env: dict[str, str]) -> Path:
     configured = env.get("YUZU_TEST_DB")
     if configured:
@@ -159,12 +169,15 @@ def start(args: argparse.Namespace, env: dict[str, str]) -> int:
     append_github_env(env, "YUZU_CI_JOB_STARTED_AT", str(started))
     export_windows_temp(env)
     if run_db(env, "init") != 0:
-        return 1
+        warning("database initialization failed; telemetry was skipped")
+        return 0
     meta = metadata(env, args.job_name, args.triplet)
     rc = run_db(env, *record_args(meta, started, "in_progress", env))
     if rc == 0:
         print(f"ci-telemetry: {meta['runner']} -> {db}")
-    return rc
+    else:
+        warning("job-start record failed; telemetry was skipped")
+    return 0
 
 
 def finish(args: argparse.Namespace, env: dict[str, str]) -> int:
@@ -175,6 +188,10 @@ def finish(args: argparse.Namespace, env: dict[str, str]) -> int:
         started = int(env["YUZU_CI_JOB_STARTED_AT"])
     except (KeyError, ValueError):
         started = int(time.time())
+        warning(
+            "YUZU_CI_JOB_STARTED_AT is unavailable; the durable database "
+            "start time will be preserved when present"
+        )
     finished = int(time.time())
     record = record_args(meta, started, args.conclusion, env)
     record.extend(["--finished-at", str(finished)])
@@ -182,7 +199,8 @@ def finish(args: argparse.Namespace, env: dict[str, str]) -> int:
     if ratio is not None:
         record.extend(["--ccache-hit-ratio", f"{ratio:.6f}"])
     if run_db(env, *record) != 0:
-        return 1
+        warning("job-finalization record failed; telemetry was skipped")
+        return 0
     if args.builddir:
         rc = run_db(
             env,
@@ -194,7 +212,7 @@ def finish(args: argparse.Namespace, env: dict[str, str]) -> int:
             "--builddir", args.builddir,
         )
         if rc != 0:
-            return rc
+            warning("suite/flake import failed; the CI job result is unaffected")
     print(f"ci-telemetry: finalized {meta['job_name']} as {args.conclusion}")
     return 0
 
@@ -216,9 +234,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return start(args, os.environ.copy()) if args.command == "start" else finish(args, os.environ.copy())
-    except (OSError, ValueError) as exc:
-        print(f"ci-telemetry: {exc}", file=sys.stderr)
-        return 1
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail the CI job
+        warning(f"recorder failed and was skipped: {exc}")
+        return 0
 
 
 if __name__ == "__main__":
