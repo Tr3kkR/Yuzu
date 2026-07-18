@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -74,6 +75,10 @@
 #else
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <cerrno>
+#include <csignal>
+#include <ctime>
+#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
@@ -303,14 +308,43 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 
 #ifdef __APPLE__
 
+// Bound on how long a macOS tool invocation (codesign/plutil) may run
+// before it is killed. Both tools are normally sub-second; this only
+// guards against a pathological hang (e.g. codesign blocking on a network
+// mount, or a filesystem stall) wedging the calling thread forever.
+constexpr auto kMacosToolDeadline = std::chrono::milliseconds(10'000);
+
+// Bound on how long we keep waiting, after SIGKILL, for the pipe to close
+// AND the child to be reaped -- mirrors event_logs_deadline.hpp's
+// kDrainGrace so the "drain" phase itself cannot hang forever.
+constexpr auto kMacosToolDrainGrace = std::chrono::milliseconds(2000);
+
+inline void macos_tool_sleep_briefly(long nanos) {
+    struct timespec ts{0, nanos};
+    nanosleep(&ts, nullptr);
+}
+
 // Run a macOS command-line tool (codesign, plutil) as a fixed argv via
 // execvp -- no shell, so a path containing spaces or shell metacharacters
 // (e.g. "/Applications/Google Chrome.app") cannot inject anything. Captures
 // COMBINED stdout+stderr (codesign writes its diagnostics to stderr).
-// `tool_ran` is false only when the exec itself failed (binary missing from
-// PATH) -- a real invocation, however it exits, always leaves tool_ran true.
+// `tool_ran` is false when the exec itself failed (binary missing from
+// PATH) OR the deadline fired before the child exited -- either way there
+// is no real exit code to reason from, so callers (classify_codesign_result
+// / classify_plutil_extract) already treat !tool_ran as an honest
+// "unknown"/"not_available" rather than fabricating a verdict.
+//
+// The child branch performs ONLY async-signal-safe operations (POSIX
+// 2.4.3): the C-style argv is built entirely in the PARENT, before fork(),
+// so the child never allocates (no std::vector/std::string construction).
+// Allocating after fork() in a multithreaded process is unsafe -- another
+// thread can hold the allocator lock at the moment of fork, which the
+// child inherits already-locked and then deadlocks on, wedging the parent
+// forever in the old no-timeout waitpid(). See event_logs_deadline.hpp for
+// the sibling implementation of this same pattern.
 struct MacosToolResult {
     bool tool_ran = false;
+    bool timed_out = false;
     int exit_code = -1;
     std::string output;
 };
@@ -319,6 +353,16 @@ MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
     MacosToolResult result;
     if (argv.empty())
         return result;
+
+    // Build the C-style argv BEFORE fork(): between fork() and execvp() the
+    // child may only call async-signal-safe functions. The std::string
+    // elements of `argv` outlive this call (they're a local copy already),
+    // so their .c_str() pointers stay valid through the child's execvp().
+    std::vector<const char*> c_argv;
+    c_argv.reserve(argv.size() + 1);
+    for (const auto& arg : argv)
+        c_argv.push_back(arg.c_str());
+    c_argv.push_back(nullptr);
 
     int pipe_fd[2];
     if (pipe(pipe_fd) != 0)
@@ -332,38 +376,119 @@ MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
     }
 
     if (pid == 0) {
-        close(pipe_fd[0]);
+        // Child: async-signal-safe only from here on. New session/process
+        // group so a timeout kill can take out the whole group, not just
+        // this direct child.
+        setsid();
+
         dup2(pipe_fd[1], STDOUT_FILENO);
         dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[0]);
         close(pipe_fd[1]);
-
-        std::vector<const char*> c_argv;
-        c_argv.reserve(argv.size() + 1);
-        for (const auto& arg : argv)
-            c_argv.push_back(arg.c_str());
-        c_argv.push_back(nullptr);
 
         execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
         _exit(127); // exec failed -- codesign/plutil never legitimately exit 127
     }
 
+    // Parent.
     close(pipe_fd[1]);
 
+    int flags = fcntl(pipe_fd[0], F_GETFL, 0);
+    fcntl(pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
+
+    auto start = std::chrono::steady_clock::now();
+    bool killed = false;
+    bool pipe_eof = false;
+    bool child_reaped = false;
+    std::chrono::steady_clock::time_point kill_time{};
     std::array<char, 4096> buf{};
-    ssize_t n;
-    while ((n = read(pipe_fd[0], buf.data(), buf.size())) > 0) {
-        result.output.append(buf.data(), static_cast<size_t>(n));
-        if (result.output.size() > 1'000'000) // sanity cap; real output is tiny
+
+    auto try_reap = [&]() {
+        if (child_reaped)
+            return;
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid) {
+            child_reaped = true;
+            if (WIFEXITED(status)) {
+                result.exit_code = WEXITSTATUS(status);
+                result.tool_ran = (result.exit_code != 127);
+            }
+        } else if (waited < 0 && errno == ECHILD) {
+            child_reaped = true;
+        }
+    };
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Reap opportunistically and non-blockingly every iteration. Pipe
+        // EOF alone does not prove the child exited (only that no one
+        // holds the write end open), so this must not treat EOF as "done"
+        // until the child is independently confirmed dead.
+        try_reap();
+
+        if (!killed && now - start >= kMacosToolDeadline) {
+            result.timed_out = true;
+            killed = true;
+            kill_time = now;
+            kill(-pid, SIGKILL); // whole process group, not just the child
+        }
+
+        if (child_reaped && pipe_eof)
+            break; // child is gone and stdout+stderr is fully drained
+        if (killed && now - kill_time >= kMacosToolDrainGrace)
+            // Bounded grace after a kill: something is still holding the
+            // pipe open or hasn't been reaped yet -- stop waiting rather
+            // than block past the deadline indefinitely.
             break;
+
+        if (pipe_eof) {
+            macos_tool_sleep_briefly(5'000'000L); // 5ms
+            continue;
+        }
+
+        ssize_t n = read(pipe_fd[0], buf.data(), buf.size());
+        if (n > 0) {
+            if (result.output.size() <= 1'000'000) // sanity cap; real output is tiny
+                result.output.append(buf.data(), static_cast<size_t>(n));
+        } else if (n == 0) {
+            pipe_eof = true; // EOF: writer(s) closed their end
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            macos_tool_sleep_briefly(killed ? 5'000'000L : 10'000'000L); // 5ms / 10ms
+            continue;
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            pipe_eof = true; // real read error: stop trying to read further
+        }
     }
+
     close(pipe_fd[0]);
 
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        result.exit_code = WEXITSTATUS(status);
-        result.tool_ran = (result.exit_code != 127);
+    // Cover the kDrainGrace escape hatch: if the loop above broke out
+    // without the child having been confirmed reaped yet, force a final
+    // blocking kill+reap here so no zombie is ever left behind. The child
+    // was already SIGKILLed on the timeout path, so this reap is prompt.
+    if (!child_reaped) {
+        kill(-pid, SIGKILL);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
     }
+
+    if (result.timed_out) {
+        // No real exit code to reason from -- honest "didn't complete"
+        // rather than a fabricated tool_ran/exit_code.
+        result.tool_ran = false;
+        result.exit_code = -1;
+    }
+
     return result;
 }
 
