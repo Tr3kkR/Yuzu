@@ -31,9 +31,13 @@
  *   - Tri-state Unknown (guardian_rule_eval.hpp) leaves decider state untouched
  *     and routes a health event; a Known read commits a compliance verdict.
  *
- * LOCK ORDER (total, never inverted): per-key eval_mu  ->  registry_mu_  ->
- * outbox_mu_. The outbox drain takes outbox_mu_ alone and its injected send fn
- * takes NO runtime lock. Registry mutations take registry_mu_ -> outbox_mu_.
+ * LOCK ORDER (total, never inverted): drain_mu_  ->  per-key eval_mu  ->
+ * registry_mu_  ->  outbox_mu_. Registry mutations take registry_mu_ -> outbox_mu_.
+ * The drain (item 4) takes drain_mu_ (single-drainer), then CYCLES outbox_mu_ per
+ * entry - copy the head, RELEASE outbox_mu_, run the injected send off-lock, re-acquire,
+ * pop-if-unchanged - so a slow send never holds outbox_mu_. The send fn MAY take runtime
+ * locks (e.g. outbox_size()) since outbox_mu_ is released across it, but it must NOT
+ * re-enter drain() (drain_mu_ is non-recursive).
  *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
@@ -47,6 +51,7 @@
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -212,12 +217,14 @@ public:
     void evaluate_key(const std::string& key, EvalReason reason);
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
-    /// Drains the compliance/health outbox AND the Lifecycle audit log (distinct
-    /// structures internally - see GuardianLifecycleLog - but one send callback
-    /// suffices since `send` can switch on OutboxEntry::domain). The drain
-    /// trigger (sink publication + reconnect + live wake-on-enqueue) is wired at
-    /// rung 7; this is the mechanism. Returns the number sent. Takes only the
-    /// outbox lock.
+    /// Drains the Lifecycle audit log FIRST, then (only if it fully cleared) the
+    /// compliance/health outbox - distinct structures internally (see
+    /// GuardianLifecycleLog) but one send callback suffices since `send` can switch on
+    /// OutboxEntry::domain. Holds drain_mu_ (single-drainer) and CYCLES outbox_mu_ per
+    /// entry - the send runs with outbox_mu_ RELEASED (item 4), so a slow send never
+    /// blocks enqueuers/heartbeat. The drain trigger (sink publication + reconnect +
+    /// live wake-on-enqueue) is wired at rung 7; this is the mechanism. Returns the
+    /// number SENT (not removed - a coalesced head counts as sent but is not popped).
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
@@ -287,6 +294,14 @@ public:
     /// capability change - but a drop here must be loudly observable, never
     /// silent). Takes only the outbox lock.
     [[nodiscard]] std::uint64_t lifecycle_backpressure_drops() const;
+
+    /// Cumulative count of drain sends that THREW (caught in drain(); the head is
+    /// retained and that log's drain stops). A nonzero value means an entry could not be
+    /// serialized/sent (e.g. a permanently-failing entry jamming the head, not just a
+    /// stream-down Retain) - surfaced via the heartbeat by item 9. Lock-free.
+    [[nodiscard]] std::uint64_t send_exception_count() const noexcept {
+        return send_exceptions_.load(std::memory_order_relaxed);
+    }
 
     /// Install the source of THIS agent's id, folded into every event_id so the
     /// server's global `event_id` PRIMARY KEY (drops on UNIQUE conflict, #1307)
@@ -382,8 +397,10 @@ private:
     // Serialises drain() calls WITHOUT blocking enqueuers (they take outbox_mu_, not
     // this): drain() releases outbox_mu_ across each send, so two concurrent drainers
     // could otherwise both peek+send the same head. drain_once() is public, so this is
-    // load-bearing, not just belt-and-braces (item 4).
+    // load-bearing, not just belt-and-braces (item 4). NOTE: a send callback must never
+    // re-enter drain() (it would self-deadlock on this mutex); none does.
     std::mutex drain_mu_;
+    std::atomic<std::uint64_t> send_exceptions_{0}; ///< drain sends that threw (item 4 hardening)
 };
 
 } // namespace yuzu::agent

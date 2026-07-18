@@ -3,7 +3,10 @@
 #include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "spark_key_rule_index.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
+#include <atomic>
 #include <optional>
 #include <random>
 #include <set>
@@ -454,7 +457,8 @@ namespace {
 // then no-ops and the current head is handled on the next pass.
 template <typename Log>
 std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
-                               const std::function<SendResult(const OutboxEntry&)>& send) {
+                               const std::function<SendResult(const OutboxEntry&)>& send,
+                               std::atomic<std::uint64_t>& send_exceptions) {
     std::size_t sent = 0;
     while (true) {
         OutboxEntry entry;
@@ -469,7 +473,19 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
         try {
             r = send(entry); // outbox_mu_ RELEASED here
         } catch (...) {
-            return sent; // a throw == stream down: keep the head, stop
+            // A send throw is treated as stream-down (keep the head, stop), BUT unlike a
+            // Retain it can be entry-specific (an un-serializable entry jamming the head
+            // forever). Count it + log the first so a permanent jam is visible, not
+            // silent (Fable). The head is retained either way.
+            const auto n = send_exceptions.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                try {
+                    spdlog::error("Guardian drain: send threw (head retained; may be a "
+                                  "permanently-unsendable entry). Further occurrences counted only.");
+                } catch (...) {
+                }
+            }
+            return sent;
         }
         if (r != SendResult::Sent)
             return sent; // Retain: keep the head, stop
@@ -488,10 +504,22 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
     std::lock_guard<std::mutex> dg{drain_mu_};
     // Lifecycle (audit) BEFORE compliance/health (Fable M6): a rule's "armed" entry must
-    // reach the server before its first drift, or the audit trail shows detection
-    // preceding arm.
-    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send);
-    sent += drain_log_unlocked(outbox_, outbox_mu_, send);
+    // reach the server before its first drift.
+    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_);
+    // Gate compliance on the lifecycle log fully draining. Draining lifecycle first only
+    // orders WITHIN a pass; a reconnect gap between the two phases could otherwise let a
+    // drift send while its "armed" was Retained (Fable M6 deterministic window). If the
+    // audit log did not clear (stream down, or a jammed entry surfaced by send_exceptions_
+    // above), hold compliance for the next pass rather than send a drift ahead of its arm.
+    // (A concurrent arm during the compliance phase can still be sent a pass late - the
+    // watertight fix is a merge-drain by global sequence, tracked as a follow-up.)
+    bool lifecycle_clear = false;
+    {
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        lifecycle_clear = lifecycle_log_.empty();
+    }
+    if (lifecycle_clear)
+        sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
     return sent;
 }
 

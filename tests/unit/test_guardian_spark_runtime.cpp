@@ -261,6 +261,56 @@ TEST_CASE("drain sends Lifecycle (armed) before Compliance (item 4 / Fable M6)",
     CHECK(got[1].domain == OutboxDomain::Compliance); // then the edge
 }
 
+TEST_CASE("drain holds compliance until the lifecycle log clears (item 4 / Fable M6 window)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
+    REQUIRE(rt->outbox_size() == 1);
+
+    // A stream gap on the lifecycle send: Retain the "armed". Compliance must NOT send
+    // this pass - a drift ahead of its armed would invert the audit trail.
+    std::vector<OutboxDomain> got;
+    rt->drain([&](const OutboxEntry& e) {
+        got.push_back(e.domain);
+        return e.domain == OutboxDomain::Lifecycle ? SendResult::Retain : SendResult::Sent;
+    });
+    REQUIRE(got.size() == 1);                 // only the lifecycle attempt happened
+    CHECK(got[0] == OutboxDomain::Lifecycle); // ...which Retained
+    CHECK(rt->outbox_size() == 1);            // compliance HELD, not sent
+
+    // Stream restored: both send, armed first.
+    got.clear();
+    rt->drain([&](const OutboxEntry& e) {
+        got.push_back(e.domain);
+        return SendResult::Sent;
+    });
+    REQUIRE(got.size() == 2);
+    CHECK(got[0] == OutboxDomain::Lifecycle);
+    CHECK(got[1] == OutboxDomain::Compliance);
+}
+
+TEST_CASE("drain counts a send that throws and retains the head (item 4 hardening)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    REQUIRE(rt->send_exception_count() == 0);
+
+    // A throwing send must not escape drain (that would eventually reach the worker's
+    // firewall), must be counted (not silent), and must retain the head.
+    rt->drain([](const OutboxEntry&) -> SendResult { throw std::runtime_error("send boom"); });
+    CHECK(rt->send_exception_count() == 1);
+
+    const auto lc = drain_lifecycle(*rt); // clean drain: the retained head still sends
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].lifecycle_kind == "armed");
+}
+
 TEST_CASE("drain releases outbox_mu_ during send - no head-of-line block (item 4)",
           "[spark][runtime]") {
     // Proof the send (a gRPC Write in production) no longer runs UNDER outbox_mu_: the

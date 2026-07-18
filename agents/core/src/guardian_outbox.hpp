@@ -201,9 +201,12 @@ public:
         return true;
     }
 
-    /// Send buffered entries in FIFO order. `send` is invoked as
-    /// `SendResult send(const OutboxEntry&)`; a Sent entry is removed, a Retain (or
-    /// a thrown exception) is kept and stops the drain. Returns the number sent.
+    /// TEST-ONLY (unit tests of the coalesce/FIFO/purge semantics with an inline send).
+    /// Production drains via GuardianSparkRuntime::drain, which uses front_copy/
+    /// pop_front_if with outbox_mu_ RELEASED across the send - do NOT call this from the
+    /// runtime under outbox_mu_, it reintroduces the head-of-line stall item 4 removed.
+    /// Send buffered entries in FIFO order; a Sent entry is removed, a Retain (or a
+    /// thrown exception) is kept and stops the drain. Returns the number sent.
     template <typename SendFn>
     std::size_t drain(SendFn&& send) {
         std::size_t sent = 0;
@@ -325,6 +328,8 @@ public:
         return true;
     }
 
+    /// TEST-ONLY (see GuardianOutbox::drain's note): production drains via
+    /// GuardianSparkRuntime::drain with outbox_mu_ released across the send.
     /// Send in FIFO order; a Sent entry is removed, a Retain (or a throw) stops
     /// the drain and keeps the head - identical send contract to GuardianOutbox.
     template <typename SendFn>

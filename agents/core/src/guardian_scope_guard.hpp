@@ -13,6 +13,8 @@
 // rule. Swallowed failures are counted for observability (the agent has no /metrics;
 // item 9 surfaces this via the heartbeat).
 
+#include <yuzu/plugin.h> // YUZU_EXPORT
+
 #include <cstdint>
 #include <functional>
 
@@ -21,14 +23,15 @@ namespace yuzu::agent {
 /// Process-wide count of rollback cleanups that threw during unwinding and were
 /// swallowed to avoid std::terminate. A nonzero value means a rollback could not
 /// fully undo its mutation under memory pressure - a real (if rare) leak signal.
-[[nodiscard]] std::uint64_t guardian_rollback_cleanup_failures() noexcept;
+/// YUZU_EXPORT so the test binary can link it against the agent core .so.
+[[nodiscard]] YUZU_EXPORT std::uint64_t guardian_rollback_cleanup_failures() noexcept;
 
 /// A committed-or-rollback scope guard whose destructor NEVER propagates an
 /// exception. Set `fn` to the undo action and `committed = true` on the success
 /// path. Kept an aggregate (only data members + a user-declared destructor, which
 /// preserves aggregate-ness in C++20) so call sites can `GuardianRollback g{fn}` or
 /// default-construct then assign `g.fn`, exactly as the local ScopeExit guards did.
-struct GuardianRollback {
+struct YUZU_EXPORT GuardianRollback {
     std::function<void()> fn;
     bool committed{false};
     ~GuardianRollback();

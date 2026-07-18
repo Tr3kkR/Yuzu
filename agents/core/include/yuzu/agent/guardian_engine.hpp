@@ -186,11 +186,13 @@ public:
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;
 
-    /// Cumulative count of rules whose reconcile (arm) threw and was firewalled in
-    /// apply_rules — i.e. rules that persisted but did not arm. A nonzero value means
-    /// an enforcement gap is (or was) open on this endpoint. Surfaced via the heartbeat
-    /// by item 9 so a persistent gap is fleet-visible even after the generation later
-    /// advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
+    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
+    /// distinct rules: one persistently-failing rule increments it once per push (so it
+    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
+    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
+    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
+    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
     [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
         return arm_failures_.load(std::memory_order_relaxed);
     }
