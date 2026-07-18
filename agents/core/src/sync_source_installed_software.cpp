@@ -80,6 +80,60 @@ bool entry_equal(const SwEntry& a, const SwEntry& b) {
            a.distro_version == b.distro_version && a.bundle_id == b.bundle_id;
 }
 
+// Sort + dedup in place, matching the server's normalize() exactly (same
+// entry_less/entry_equal comment-coordination as above).
+std::vector<SwEntry> normalize(std::vector<SwEntry> entries) {
+    std::sort(entries.begin(), entries.end(), entry_less);
+    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
+    return entries;
+}
+
+// Shared canonical-blob builder for BOTH the current (13-field, bundle_id
+// included) and the LEGACY (12-field, pre-bundle_id) forms — one walk so the
+// two forms can never drift apart on the shared first 12 fields. `entries`
+// MUST already be normalize()d. `include_bundle_id` selects the trailing
+// field:
+//   true  -> current v2 (13 fields) — byte-identical to the server's
+//            SoftwareInventoryStore::canonical_hash (ADR-0016 §4).
+//   false -> legacy v2 (12 fields, no bundle_id, no trailing separator for
+//            it) — byte-identical to the server's canonical_hash_legacy
+//            (ADR-0016 Update, BR-01 version-aware hashing).
+std::string build_canonical_blob(const std::vector<SwEntry>& entries, bool include_bundle_id) {
+    std::string canon;
+    canon.reserve(entries.size() * 96);
+    for (const auto& e : entries) {
+        canon += e.name;
+        canon += '\x1f';
+        canon += e.version;
+        canon += '\x1f';
+        canon += e.publisher;
+        canon += '\x1f';
+        canon += e.install_date;
+        canon += '\x1f';
+        canon += e.kind;
+        canon += '\x1f';
+        canon += e.ecosystem;
+        canon += '\x1f';
+        canon += e.epoch;
+        canon += '\x1f';
+        canon += e.release;
+        canon += '\x1f';
+        canon += e.arch;
+        canon += '\x1f';
+        canon += e.signature_status;
+        canon += '\x1f';
+        canon += e.distro_id;
+        canon += '\x1f';
+        canon += e.distro_version;
+        if (include_bundle_id) {
+            canon += '\x1f';
+            canon += e.bundle_id;
+        }
+        canon += '\x1e';
+    }
+    return canon;
+}
+
 } // namespace
 
 std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
@@ -145,42 +199,14 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
-    std::sort(entries.begin(), entries.end(), entry_less);
-    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
     // Blob contract v2: 13 fields, 0x1F-separated, in this exact order, record-
     // terminated 0x1E — byte-identical to the server's canonical_hash walk
     // (software_inventory_store.cpp). Append-only: never reorder.
-    std::string canon;
-    canon.reserve(entries.size() * 96);
-    for (const auto& e : entries) {
-        canon += e.name;
-        canon += '\x1f';
-        canon += e.version;
-        canon += '\x1f';
-        canon += e.publisher;
-        canon += '\x1f';
-        canon += e.install_date;
-        canon += '\x1f';
-        canon += e.kind;
-        canon += '\x1f';
-        canon += e.ecosystem;
-        canon += '\x1f';
-        canon += e.epoch;
-        canon += '\x1f';
-        canon += e.release;
-        canon += '\x1f';
-        canon += e.arch;
-        canon += '\x1f';
-        canon += e.signature_status;
-        canon += '\x1f';
-        canon += e.distro_id;
-        canon += '\x1f';
-        canon += e.distro_version;
-        canon += '\x1f';
-        canon += e.bundle_id;
-        canon += '\x1e';
-    }
-    return canon;
+    return build_canonical_blob(normalize(std::move(entries)), /*include_bundle_id=*/true);
+}
+
+std::string installed_software_canonical_blob_legacy(std::vector<SwEntry> entries) {
+    return build_canonical_blob(normalize(std::move(entries)), /*include_bundle_id=*/false);
 }
 
 SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor) {

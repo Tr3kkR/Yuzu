@@ -22,6 +22,7 @@
 #include <vector>
 
 using yuzu::agent::installed_software_canonical_blob;
+using yuzu::agent::installed_software_canonical_blob_legacy;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SwEntry;
@@ -47,6 +48,18 @@ constexpr const char* kCrossPinHash =
 // between the two canonicalisations.
 constexpr const char* kCrossPinHashOneEntry =
     "aabea807fca88d624d2fe0093766e58fa0652db6ec8e2f0feea39cef1a1841e7";
+
+// LEGACY (12-field, pre-bundle_id) cross-pin (ADR-0016 Update, BR-01
+// version-aware hashing — identical literals in the server suite,
+// tests/unit/server/test_software_inventory_store.cpp). Computed over the
+// SAME 4-entry fixture as kCrossPinHash, via
+// installed_software_canonical_blob_legacy instead of the 13-field builder —
+// proves the un-upgraded-agent form the server's canonical_hash_legacy must
+// also independently reproduce for the hash-skip fix to hold.
+constexpr const char* kCrossPinHashLegacy =
+    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
+constexpr const char* kCrossPinHashLegacyOneEntry =
+    "b1fd3cc7c2b516f45f35f778a5cc8136c4de62e4631c771d826901e4916cb2c4";
 
 // Fully-populated v2 entry — the identical fixture the server pin test uses.
 SwEntry full_v2_entry() {
@@ -85,6 +98,46 @@ TEST_CASE("installed_software canonical hash matches the cross-pin", "[sync][has
     // finding A-6).
     CHECK(sha256_hex(installed_software_canonical_blob({full_v2_entry()})) ==
           kCrossPinHashOneEntry);
+}
+
+TEST_CASE("installed_software LEGACY (12-field) canonical hash matches the cross-pin "
+          "(ADR-0016 Update, BR-01 version-aware hashing)",
+          "[sync][hash]") {
+    // Same fixture as the 13-field pin above (sort/dedup must agree too) — the
+    // legacy builder must reproduce the exact 12-field bytes an un-upgraded
+    // agent (this branch's predecessor) computes, independently pinned
+    // against the server's canonical_hash_legacy
+    // (tests/unit/server/test_software_inventory_store.cpp — identical
+    // constants).
+    std::vector<SwEntry> e = {
+        {"Zeta", "9", "", ""},
+        full_v2_entry(),
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+    };
+    CHECK(sha256_hex(installed_software_canonical_blob_legacy(e)) == kCrossPinHashLegacy);
+    CHECK(sha256_hex(installed_software_canonical_blob_legacy({full_v2_entry()})) ==
+          kCrossPinHashLegacyOneEntry);
+
+    // The legacy and current (13-field) hashes MUST differ for a fixture
+    // where bundle_id is populated — otherwise this "version-aware" match
+    // would be a no-op and BR-01 would still be open.
+    CHECK(sha256_hex(installed_software_canonical_blob_legacy({full_v2_entry()})) !=
+          sha256_hex(installed_software_canonical_blob({full_v2_entry()})));
+
+    // bundle_id is OMITTED, not merely blanked: two entries differing ONLY in
+    // bundle_id must hash to the SAME legacy value (proves the field and its
+    // separator are truly absent from the legacy canonical string, not just
+    // present-but-empty — a real un-upgraded agent never sends bundle_id at
+    // all).
+    SwEntry with_bundle = full_v2_entry();
+    SwEntry without_bundle = full_v2_entry();
+    without_bundle.bundle_id.clear();
+    CHECK(sha256_hex(installed_software_canonical_blob_legacy({with_bundle})) ==
+          sha256_hex(installed_software_canonical_blob_legacy({without_bundle})));
+    // ...while the CURRENT (13-field) form does distinguish them.
+    CHECK(sha256_hex(installed_software_canonical_blob({with_bundle})) !=
+          sha256_hex(installed_software_canonical_blob({without_bundle})));
 }
 
 TEST_CASE("parse_installed_apps_output keeps inv| rows only (blob v2)", "[sync][parse]") {

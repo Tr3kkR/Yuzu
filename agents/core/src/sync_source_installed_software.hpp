@@ -51,6 +51,19 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 /// this source's. Takes its argument by value (it sorts a copy).
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
 
+/// LEGACY (pre-bundle_id) canonical wire blob: identical sort/dedup + field
+/// layout to `installed_software_canonical_blob`, but the 13th field
+/// (bundle_id) is OMITTED entirely — no trailing 0x1F for it either — the
+/// exact 12-field bytes this branch's PREDECESSOR agent build computes.
+/// ADR-0016 Update (version-aware hashing, BR-01): production code never
+/// calls this — an upgraded agent always sends the 13-field form via
+/// `installed_software_canonical_blob`. It exists so tests can build a
+/// faithful "un-upgraded agent" fixture and cross-pin it against the
+/// server's `SoftwareInventoryStore::canonical_hash_legacy`, instead of
+/// hand-transcribing the field/separator layout a second time — exactly the
+/// kind of one-sided drift BR-01 was about.
+YUZU_EXPORT std::string installed_software_canonical_blob_legacy(std::vector<SwEntry> entries);
+
 /// Build the `installed_software` SyncSource. `descriptor` is the loaded
 /// `installed_apps` plugin descriptor; when null (plugin not built/loaded — e.g.
 /// `build_examples=false`) the source's collect returns std::nullopt and the

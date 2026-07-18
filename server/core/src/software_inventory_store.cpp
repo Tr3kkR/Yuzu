@@ -215,6 +215,33 @@ const std::vector<pg::PgMigration>& migrations() {
          // table. Pre-bundle_id rows read back with '' until the agent's
          // next full resend (the one-time rekey herd this append triggers).
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS bundle_id TEXT NOT NULL DEFAULT '';"},
+        {8,
+         // Version-aware hash-skip (ADR-0016 Update, BR-01): a SECOND stored
+         // hash per (agent_id, source), alongside content_hash — the LEGACY
+         // (12-field, pre-bundle_id) canonical form of the SAME rows just
+         // stored. `apply_installed_software` (re)computes and (re)writes
+         // this on every full ingest, so a hash-only report can match
+         // EITHER the current 13-field content_hash (upgraded agents) or
+         // this legacy_content_hash (agents still on the pre-bundle_id
+         // build) — without it, an un-upgraded agent's daily hash-only claim
+         // permanently mismatches the moment ANY full re-ingest of its rows
+         // happens under this branch's server code, and it re-uploads full
+         // inventory every cycle until the fleet finishes upgrading.
+         // NEVER backfilled for historical rows (plain ADD COLUMN ...
+         // DEFAULT '', matching v5/v7's style) — a row that predates this
+         // migration was written by the PRE-bundle_id server code, so its
+         // EXISTING content_hash is ALREADY the 12-field form an
+         // un-upgraded agent expects; there is nothing to backfill. An
+         // un-migrated '' here simply never matches a real (64-hex) claimed
+         // hash, which is correct — legacy_content_hash starts being
+         // authoritative for an agent only from its next full ingest
+         // onward, at which point content_hash flips to the 13-field form
+         // and legacy_content_hash takes over as the un-upgraded-agent
+         // match. TEXT NOT NULL DEFAULT '' — same "empty, never
+         // synthesised" contract as every other v2 column; a constant
+         // default is metadata-only in PG11+ (no table rewrite), safe on a
+         // live fleet table.
+         "ALTER TABLE inventory_state ADD COLUMN IF NOT EXISTS legacy_content_hash TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -291,6 +318,54 @@ void normalize(std::vector<SoftwareEntry>& entries) {
     entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
 }
 
+// Shared canonical-blob builder for BOTH the current (13-field, bundle_id
+// included) and the LEGACY (12-field, pre-bundle_id) forms — one walk so the
+// two forms can never drift apart on the shared first 12 fields. `entries`
+// MUST already be normalize()d. `include_bundle_id` selects the trailing
+// field:
+//   true  -> current v2 (13 fields) — byte-identical to the agent's
+//            installed_software_canonical_blob (ADR-0016 §4).
+//   false -> legacy v2 (12 fields, no bundle_id, no trailing separator for
+//            it) — byte-identical to the agent's
+//            installed_software_canonical_blob_legacy (ADR-0016 Update,
+//            BR-01 version-aware hashing).
+std::string build_canonical_blob(const std::vector<SoftwareEntry>& entries,
+                                 bool include_bundle_id) {
+    std::string canon;
+    canon.reserve(entries.size() * 96);
+    for (const auto& e : entries) {
+        canon += e.name;
+        canon += '\x1f';
+        canon += e.version;
+        canon += '\x1f';
+        canon += e.publisher;
+        canon += '\x1f';
+        canon += e.install_date;
+        canon += '\x1f';
+        canon += e.kind;
+        canon += '\x1f';
+        canon += e.ecosystem;
+        canon += '\x1f';
+        canon += e.epoch;
+        canon += '\x1f';
+        canon += e.release;
+        canon += '\x1f';
+        canon += e.arch;
+        canon += '\x1f';
+        canon += e.signature_status;
+        canon += '\x1f';
+        canon += e.distro_id;
+        canon += '\x1f';
+        canon += e.distro_version;
+        if (include_bundle_id) {
+            canon += '\x1f';
+            canon += e.bundle_id;
+        }
+        canon += '\x1e';
+    }
+    return canon;
+}
+
 // ── Read-degrade observability (#1675) ───────────────────────────────────────
 // The authoritative reads return nullopt on a store/pool/query degrade, but
 // /readyz stays green under pure pool saturation (it trips only on connection
@@ -361,37 +436,17 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
     // (installed_software_canonical_blob). The v1→v2 reformat is the one-time
     // rekey herd: even all-empty new fields add separators, so every stored v1
     // hash mismatches on the first post-upgrade report (need_full, self-heals).
-    std::string canon;
-    canon.reserve(entries.size() * 96);
-    for (const auto& e : entries) {
-        canon += e.name;
-        canon += '\x1f';
-        canon += e.version;
-        canon += '\x1f';
-        canon += e.publisher;
-        canon += '\x1f';
-        canon += e.install_date;
-        canon += '\x1f';
-        canon += e.kind;
-        canon += '\x1f';
-        canon += e.ecosystem;
-        canon += '\x1f';
-        canon += e.epoch;
-        canon += '\x1f';
-        canon += e.release;
-        canon += '\x1f';
-        canon += e.arch;
-        canon += '\x1f';
-        canon += e.signature_status;
-        canon += '\x1f';
-        canon += e.distro_id;
-        canon += '\x1f';
-        canon += e.distro_version;
-        canon += '\x1f';
-        canon += e.bundle_id;
-        canon += '\x1e';
-    }
-    return sha256_hex(canon);
+    return sha256_hex(build_canonical_blob(entries, /*include_bundle_id=*/true));
+}
+
+std::string SoftwareInventoryStore::canonical_hash_legacy(std::vector<SoftwareEntry> entries) {
+    normalize(entries);
+    // Legacy v2 form (ADR-0016 Update, BR-01): same 12 leading fields as
+    // `canonical_hash`, bundle_id OMITTED entirely (no trailing separator for
+    // it) — byte-identical to the agent's
+    // installed_software_canonical_blob_legacy. See the header doc + BR-01
+    // migration-8 comment for why this exists and how it is used.
+    return sha256_hex(build_canonical_blob(entries, /*include_bundle_id=*/false));
 }
 
 SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
@@ -437,7 +492,7 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         }
         pg::PgResult res = pg::exec_params(
             lease.get(),
-            "SELECT content_hash FROM software_inventory_store.inventory_state "
+            "SELECT content_hash, legacy_content_hash FROM software_inventory_store.inventory_state "
             "WHERE agent_id = $1 AND source = $2",
             std::vector<std::string>{std::string(agent_id), kSourceInstalledSoftware});
         if (res.status() != PGRES_TUPLES_OK) {
@@ -448,7 +503,19 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         if (PQntuples(res.get()) == 0)
             return InventoryIngestOutcome::kNeedFull; // cold cache: nothing to match
         const std::string stored = PQgetvalue(res.get(), 0, 0);
-        if (stored != std::string(claimed_hash))
+        const std::string stored_legacy = PQgetvalue(res.get(), 0, 1);
+        const std::string claimed{claimed_hash};
+        // Version-aware match (ADR-0016 Update, BR-01): accept EITHER the
+        // current 13-field content_hash (upgraded agents) or the legacy
+        // 12-field legacy_content_hash (agents still on the pre-bundle_id
+        // build) — both recomputed from the SAME stored rows at the last
+        // full ingest below. An empty stored_legacy means this agent's rows
+        // predate migration 8's column and haven't had a full re-ingest
+        // since (see the migration comment); guard it out so it can never
+        // accidentally match an empty/malformed claim.
+        const bool matches_current = stored == claimed;
+        const bool matches_legacy = !stored_legacy.empty() && stored_legacy == claimed;
+        if (!matches_current && !matches_legacy)
             return InventoryIngestOutcome::kNeedFull; // drifted: ask for the full list
         // Match — bump last_seen only (RETURNING carries the result, #1033).
         pg::PgResult upd = pg::exec_params(
@@ -470,6 +537,13 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     std::vector<SoftwareEntry> entries = std::move(*rows);
     normalize(entries);
     const std::string server_hash = SoftwareInventoryStore::canonical_hash(entries);
+    // Version-aware hash-skip (ADR-0016 Update, BR-01): ALSO compute + store
+    // the legacy 12-field form of these SAME (already-normalized) rows. For
+    // an un-upgraded agent's own full payload, bundle_id parses as '' on
+    // every row (the field was never on its wire), so this legacy form is
+    // exactly the hash that agent's NEXT hash-only cycle will claim — see
+    // canonical_hash_legacy's doc comment.
+    const std::string legacy_hash = SoftwareInventoryStore::canonical_hash_legacy(entries);
     const std::string agent_id_s{agent_id};
 
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
@@ -555,18 +629,23 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
             if (ins.status() != PGRES_COMMAND_OK)
                 return false;
         }
-        // Upsert parent: $4 seeds first_seen on insert; on conflict keep
-        // first_seen, refresh content_hash + last_seen.
+        // Upsert parent: $5 seeds first_seen on insert; on conflict keep
+        // first_seen, refresh content_hash + legacy_content_hash + last_seen.
+        // legacy_content_hash carries the BR-01 version-aware match (see
+        // canonical_hash_legacy) so an un-upgraded agent's next hash-only
+        // report can still hash-skip against these same rows.
         pg::PgResult par = pg::exec_params(
             c,
             "INSERT INTO software_inventory_store.inventory_state "
-            "(agent_id, source, content_hash, first_seen, last_seen) "
-            "VALUES ($1, $2, $3, $4::bigint, $4::bigint) "
+            "(agent_id, source, content_hash, legacy_content_hash, first_seen, last_seen) "
+            "VALUES ($1, $2, $3, $4, $5::bigint, $5::bigint) "
             "ON CONFLICT (agent_id, source) DO UPDATE SET "
-            "  content_hash = EXCLUDED.content_hash, last_seen = EXCLUDED.last_seen "
+            "  content_hash = EXCLUDED.content_hash, "
+            "  legacy_content_hash = EXCLUDED.legacy_content_hash, "
+            "  last_seen = EXCLUDED.last_seen "
             "RETURNING agent_id",
             std::vector<std::string>{agent_id_s, kSourceInstalledSoftware, server_hash,
-                                     std::to_string(ts)});
+                                     legacy_hash, std::to_string(ts)});
         return par.status() == PGRES_TUPLES_OK;
     });
     if (!ok) {

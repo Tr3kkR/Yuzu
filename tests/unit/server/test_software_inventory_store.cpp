@@ -68,6 +68,17 @@ constexpr const char* kCrossPinHash =
 constexpr const char* kCrossPinHashOneEntry =
     "aabea807fca88d624d2fe0093766e58fa0652db6ec8e2f0feea39cef1a1841e7";
 
+// LEGACY (12-field, pre-bundle_id) cross-pin (ADR-0016 Update, BR-01
+// version-aware hashing — identical literals in the agent suite,
+// tests/unit/test_inventory_sync.cpp). This is the exact hash an
+// un-upgraded agent (this branch's predecessor build) computes for the same
+// fixtures as kCrossPinHash / kCrossPinHashOneEntry, via the 12-field
+// canonical form (bundle_id omitted entirely, not just blanked).
+constexpr const char* kCrossPinHashLegacy =
+    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
+constexpr const char* kCrossPinHashLegacyOneEntry =
+    "b1fd3cc7c2b516f45f35f778a5cc8136c4de62e4631c771d826901e4916cb2c4";
+
 // v1-form wire blob for one entry (4 fields 0x1F-separated, entry terminated
 // 0x1E). Post-v2 this doubles as the MIXED-VERSION fixture: a v1 agent's
 // record must still parse (fields 5–13 default-empty) — see the compat test.
@@ -115,6 +126,43 @@ TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
     // canonical_hash agrees with the agent's blob builder for exactly the
     // fixture the ingest-seam test below uses as its claimed agent hash.
     CHECK(SoftwareInventoryStore::canonical_hash({full_v2_entry()}) == kCrossPinHashOneEntry);
+}
+
+TEST_CASE("SoftwareInventoryStore canonical_hash_legacy is the cross-pinned LEGACY value "
+          "(ADR-0016 Update, BR-01 version-aware hashing)",
+          "[software_inventory][hash]") {
+    // Same fixture as the 13-field pin above — normalize() (sort+dedup) is
+    // shared between canonical_hash and canonical_hash_legacy, so this also
+    // exercises that the LEGACY builder sorts/dedups identically, then omits
+    // only the trailing bundle_id field.
+    std::vector<SoftwareEntry> e = {
+        {"Zeta", "9", "", ""},
+        full_v2_entry(),
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+    };
+    CHECK(SoftwareInventoryStore::canonical_hash_legacy(e) == kCrossPinHashLegacy);
+    CHECK(SoftwareInventoryStore::canonical_hash_legacy({full_v2_entry()}) ==
+          kCrossPinHashLegacyOneEntry);
+
+    // Must differ from the current (13-field) hash for a fixture where
+    // bundle_id is populated, or the "version-aware" match degenerates to
+    // always-current and BR-01's un-upgraded-agent case stays broken.
+    CHECK(SoftwareInventoryStore::canonical_hash_legacy({full_v2_entry()}) !=
+          SoftwareInventoryStore::canonical_hash({full_v2_entry()}));
+
+    // bundle_id is OMITTED, not blanked: two otherwise-identical entries
+    // differing only in bundle_id must hash to the SAME legacy value — the
+    // exact property that makes "legacy full-uploaded rows carry empty
+    // bundle_id" equal "what a 12-field agent computes" (apply_installed_software's
+    // comment).
+    SoftwareEntry with_bundle = full_v2_entry();
+    SoftwareEntry without_bundle = full_v2_entry();
+    without_bundle.bundle_id.clear();
+    CHECK(SoftwareInventoryStore::canonical_hash_legacy({with_bundle}) ==
+          SoftwareInventoryStore::canonical_hash_legacy({without_bundle}));
+    CHECK(SoftwareInventoryStore::canonical_hash({with_bundle}) !=
+          SoftwareInventoryStore::canonical_hash({without_bundle}));
 }
 
 TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_inventory]") {
@@ -180,6 +228,134 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
         REQUIRE(got->size() == 1);
         CHECK((*got)[0].version == "120");
     }
+}
+
+TEST_CASE("version-aware hash-skip: an un-upgraded (legacy 12-field) agent keeps hash-skipping "
+          "after a bundle_id-aware full ingest (ADR-0016 Update, BR-01)",
+          "[pg][software_inventory][v2]") {
+    // BR-01: this branch appended bundle_id as the 13th canonical field. An
+    // ALREADY-DEPLOYED agent that has not picked up the new build still
+    // computes the OLD 12-field hash on its daily hash-only report. Without
+    // version-aware matching, the full ingest below (which the server always
+    // recomputes/stores as the CURRENT 13-field hash, regardless of what the
+    // agent claimed) would make every subsequent hash-only report from this
+    // still-un-upgraded agent mismatch → need_full every cycle, fleet-wide,
+    // until every agent upgrades (the amplification this fix closes).
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Rows shaped exactly like what an un-upgraded agent's full sync
+    // produces: every v2 field except bundle_id populated; bundle_id always
+    // '' (a field that build doesn't know exists).
+    std::vector<SoftwareEntry> rows = {
+        {"bash", "5.2.21", "Fedora Project", "Mon 01 Jan 2026", "package", "rpm", "0", "3.fc40",
+         "x86_64", "signed", "fedora", "40", ""},
+        {"Firefox", "120", "Mozilla", "", "app", "windows", "", "", "", "", "", "", ""},
+    };
+
+    // The claimed hash a REAL un-upgraded agent sends: the LEGACY 12-field
+    // canonical form — NOT this store's own canonical_hash (13-field).
+    const std::string legacy_claimed_hash = SoftwareInventoryStore::canonical_hash_legacy(rows);
+    const std::string current_hash = SoftwareInventoryStore::canonical_hash(rows);
+    // Sanity: the two forms differ for this fixture, or the test would pass
+    // vacuously (both branches at once).
+    REQUIRE(legacy_claimed_hash != current_hash);
+
+    // Full ingest ("12-field v2 full report is stored"): the server ALWAYS
+    // recomputes and stores the current 13-field hash as content_hash
+    // (unchanged behaviour — a full payload's hash is never trusted from the
+    // agent), but per BR-01 ALSO stores the legacy 12-field form alongside it.
+    REQUIRE(store.apply_installed_software("agent-legacy-hs", legacy_claimed_hash, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+
+    // The un-upgraded agent's NEXT cycle: hash-only, still claiming the
+    // legacy 12-field hash (content unchanged, binary unchanged). This is
+    // THE regression: must HASH-SKIP (touched), not need_full.
+    CHECK(store.apply_installed_software("agent-legacy-hs", legacy_claimed_hash, std::nullopt,
+                                         2000) == InventoryIngestOutcome::kTouched);
+
+    // No full replace happened — the row set must be untouched (a hash-skip
+    // must never trigger the DELETE+INSERT replace path). Membership check
+    // only (not a strict name-order CHECK): name collation-order is not the
+    // property under test here.
+    auto got = store.get_agent_software("agent-legacy-hs");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 2);
+    const bool has_bash = (*got)[0].name == "bash" || (*got)[1].name == "bash";
+    const bool has_firefox = (*got)[0].name == "Firefox" || (*got)[1].name == "Firefox";
+    CHECK(has_bash);
+    CHECK(has_firefox);
+
+    // The pre-existing ADR-0016 byte-identical pin is PRESERVED, not
+    // replaced: an UPGRADED agent's claim (the current 13-field hash) for
+    // these exact same stored rows must ALSO hash-skip.
+    CHECK(store.apply_installed_software("agent-legacy-hs", current_hash, std::nullopt, 3000) ==
+          InventoryIngestOutcome::kTouched);
+
+    // A genuinely drifted claim (neither the current nor the legacy form)
+    // still nacks need_full — version-aware matching is an ADDITIONAL
+    // accepted match, not a bypass of hash comparison altogether.
+    CHECK(store.apply_installed_software("agent-legacy-hs", "deadbeef", std::nullopt, 4000) ==
+          InventoryIngestOutcome::kNeedFull);
+}
+
+TEST_CASE("ingest_inventory_report: a 12-field (legacy, no bundle_id) wire blob followed by an "
+          "unchanged hash-only report hash-skips (ADR-0016 Update, BR-01 version-aware hashing)",
+          "[pg][software_inventory][v2][seam]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const SoftwareEntry e = full_v2_entry();
+    // 12-field wire record: fields 1..12 only, NO bundle_id token and no
+    // trailing separator for it — the exact bytes a not-yet-upgraded agent
+    // (still on the pre-bundle_id blob builder) puts on the wire. Mirrors
+    // the "v2 wire blob (13 fields)" test above, minus the 13th field.
+    const std::string rec12 = e.name + '\x1f' + e.version + '\x1f' + e.publisher + '\x1f' +
+                              e.install_date + '\x1f' + e.kind + '\x1f' + e.ecosystem + '\x1f' +
+                              e.epoch + '\x1f' + e.release + '\x1f' + e.arch + '\x1f' +
+                              e.signature_status + '\x1f' + e.distro_id + '\x1f' +
+                              e.distro_version + '\x1e';
+
+    // canonical_hash_legacy ignores bundle_id entirely (pinned above), so the
+    // claimed legacy hash is correct whether or not `e.bundle_id` happens to
+    // be populated in this fixture.
+    const std::string legacy_claimed_hash = SoftwareInventoryStore::canonical_hash_legacy({e});
+
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = legacy_claimed_hash;
+    (*rep.mutable_plugin_data())["installed_software"] = rec12;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-legacy-wire", rep, ack);
+    CHECK(ack.need_full_size() == 0); // full payload stores regardless of claimed hash
+
+    auto got = store.get_agent_software("agent-legacy-wire");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].bundle_id.empty()); // field 13 never sent → parses empty
+    CHECK((*got)[0].distro_version == "40");
+
+    // The un-upgraded agent's NEXT cycle: hash-only, same legacy claim — must
+    // hash-skip (touched), NOT need_full. Prior to version-aware hashing this
+    // would mismatch the server's 13-field recompute and loop need_full every
+    // cycle until agent upgrade — the exact BR-01 amplification.
+    agentpb::InventoryReport rep2;
+    (*rep2.mutable_content_hashes())["installed_software"] = legacy_claimed_hash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-legacy-wire", rep2, ack2);
+    CHECK(ack2.need_full_size() == 0); // touched, not need_full
+
+    // Confirm no full replace happened (row unchanged) — a hash-skip must
+    // never trigger the DELETE+INSERT replace path.
+    auto got2 = store.get_agent_software("agent-legacy-wire");
+    REQUIRE(got2.has_value());
+    CHECK(got2->size() == 1);
+    CHECK((*got2)[0].distro_version == "40");
 }
 
 TEST_CASE("ingest_inventory_report drives the seam + fills need_full",

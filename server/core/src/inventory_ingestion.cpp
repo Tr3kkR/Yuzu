@@ -52,6 +52,15 @@ constexpr int kMaxSources = 64;
 // store with empty v2 columns). Tokens beyond the 13th are dropped. nullopt
 // only when the blob exceeds the cap; an empty list is a legitimate "nothing
 // here".
+//
+// A 12-field (pre-bundle_id) record from an un-upgraded agent parses the
+// same way — field 13 (bundle_id) simply reads as default-empty. The hash
+// COMPARE this feeds does NOT live here: SoftwareInventoryStore's hash-only
+// path (apply_installed_software) is version-aware (ADR-0016 Update, BR-01)
+// — it accepts either the current 13-field content_hash or the legacy
+// 12-field legacy_content_hash computed from these same stored rows, so an
+// un-upgraded agent's un-changed hash-only claim still hash-skips instead of
+// permanently mismatching. See SoftwareInventoryStore::canonical_hash_legacy.
 std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string& blob) {
     if (blob.size() > kMaxBlobBytes)
         return std::nullopt;
