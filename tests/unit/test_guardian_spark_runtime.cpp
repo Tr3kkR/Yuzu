@@ -702,6 +702,43 @@ TEST_CASE("attach_rule: a THROWING backend arm() rolls back with no ghost index 
     CHECK(b->arms.load() == 1);
 }
 
+TEST_CASE("attach_rule: a throw AFTER arm() (waker copy) disarms and leaves no phantom audit",
+          "[spark][runtime]") {
+    // The throwing-arm test above only covers a throw BEFORE arm has any side effect.
+    // This exercises the armed_here=true rollback path: arm() genuinely succeeds, then a
+    // later step throws. A callable whose COPY throws, installed as the pending-initial
+    // waker, makes the std::function copy inside attach_rule (after arm() returned a
+    // subscription) throw. (Fable rung-7.7b: the seam the shipped test lacked.)
+    struct ThrowOnCopy {
+        ThrowOnCopy() = default;
+        ThrowOnCopy(const ThrowOnCopy&) { throw std::runtime_error("waker copy boom"); }
+        ThrowOnCopy(ThrowOnCopy&&) noexcept = default;
+        ThrowOnCopy& operator=(ThrowOnCopy&&) noexcept = default;
+        void operator()() const {}
+    };
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    rt->set_pending_initial_waker(ThrowOnCopy{}); // moved in (noexcept); the COPY inside attach throws
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true),
+                    std::runtime_error);
+    rt->set_pending_initial_waker({}); // clear so the sibling attach below is clean
+
+    // arm() succeeded, then the waker copy threw: the rollback disarmed the just-armed
+    // subscription and removed the rule, and (the waker copy now precedes the lifecycle
+    // enqueue) NO "armed" audit entry was written for the rolled-back attach.
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 1);    // the arm did happen
+    CHECK(b->disarms.load() == 1); // ...and the rollback disarmed it (the armed_here path)
+    CHECK(drain_lifecycle(*rt).empty()); // no phantom "armed"
+
+    // Key is clean afterward: a fresh attach arms exactly once.
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 2);
+}
+
 TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",
           "[spark][runtime]") {
     // The bug Sol's review caught: GuardianOutbox coalesces by (domain,rule_id)

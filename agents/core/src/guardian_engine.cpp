@@ -32,6 +32,7 @@
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
 #include "guardian_outbox_drain_worker.hpp"
+#include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "guardian_spark_backend.hpp"
 #include "guardian_spark_bridge.hpp" // spark_spec_from_rule, rule_assertion_from_rule, classify
 #include "guardian_spark_runtime.hpp"
@@ -64,20 +65,11 @@ constexpr std::string_view kKeyGen      = "meta:policy_generation";
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
 
-/// Generic scope-exit guard: runs `fn` in its destructor unless `committed` was
-/// set. wire_spark_engine() uses this so rollback runs on EVERY exit path -
-/// including a catch handler's own logging call throwing - rather than an
-/// explicit rollback_spark_wiring_locked() call inside each catch block, which
-/// could be skipped if that logging call itself throws (Sol rung-7.5 review
-/// finding 2).
-struct ScopeExit {
-    std::function<void()> fn;
-    bool committed{false};
-    ~ScopeExit() {
-        if (!committed && fn)
-            fn();
-    }
-};
+// The rollback guard used by wire_spark_engine() (rollback runs on EVERY exit path,
+// including a catch handler's own logging throwing - Sol rung-7.5 finding 2) is now
+// the shared, terminate-safe GuardianRollback (guardian_scope_guard.hpp): its cleanup
+// joins threads / resets shared_ptrs and could throw during unwinding, which a plain
+// noexcept ~ScopeExit would turn into std::terminate (rung 7.7b PR-1 item 3 / Sol B3).
 
 std::string hex_encode(const std::string& bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -325,6 +317,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     }
 
     std::size_t applied = 0;
+    std::size_t reconcile_failures = 0;
     for (const auto& rule : push.rules()) {
         if (rule.rule_id().empty()) {
             spdlog::warn("Guardian: skipping rule with empty rule_id (name={})", rule.name());
@@ -335,28 +328,43 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
         // Per-rule exception firewall: reconcile can throw (a spark attach OOM, a
         // backend arm that throws) and must NOT abort the whole push and escape to the
-        // dispatch caller with the KV already partially written and some rules armed and
-        // some not. Degrade loud and continue - the same posture start_local() takes for
-        // a thread-exhaustion throw. The rule is persisted; the next full_sync or a
-        // restart re-arms it. (rung 7.7b PR-1 item 3 / Fable M3.)
+        // dispatch caller - an escaped exception on the unguarded ThreadPool task aborts
+        // the whole agent (#2037). Degrade loud and continue - the posture start_local()
+        // takes for a thread-exhaustion throw. catch(...) not just std::exception, and
+        // the log is guarded (spdlog allocates and could itself throw under the bad_alloc
+        // that triggered this). (rung 7.7b PR-1 item 3 / Sol B1 + Fable.)
         try {
             reconcile_rule_locked(rule); // step 4: arm/withdraw via the reconcile op (rung 7)
-        } catch (const std::exception& e) {
-            spdlog::error("Guardian: reconcile threw for rule '{}': {} - persisted but not armed",
-                          rule.rule_id(), e.what());
-            continue; // not counted as applied; the rule stays persisted for retry
+        } catch (...) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted but not armed",
+                              rule.rule_id());
+            } catch (...) {
+            }
+            continue; // not counted as applied
         }
         ++applied;
     }
 
-    if (push.policy_generation() > policy_generation_) {
+    // Do NOT advance the policy generation when any rule failed to arm. The server's
+    // heartbeat reconcile fn re-pushes only while the agent reports a generation BEHIND
+    // current (server.cpp), so advancing here would tell the server "caught up" and
+    // strand the unarmed rule until restart - a silent enforcement hole on a
+    // Guaranteed-State product. Holding the generation keeps the 25s heartbeat retry
+    // live so a transient OOM/thread-exhaustion self-heals. (Sol B1 / Fable.) A later
+    // successful push can still advance past a persistently-failing rule; arm_failures_
+    // (surfaced via the heartbeat, item 9) is the durable fleet-visible signal for that.
+    if (reconcile_failures == 0 && push.policy_generation() > policy_generation_) {
         policy_generation_ = push.policy_generation();
         persist_generation_locked();
     }
 
     refresh_count_locked();
-    spdlog::info("Guardian: apply_rules ok (applied={}, full_sync={}, generation={}, total={})",
-                 applied, push.full_sync(), policy_generation_, rule_count_);
+    spdlog::info(
+        "Guardian: apply_rules ok (applied={}, failed={}, full_sync={}, generation={}, total={})",
+        applied, reconcile_failures, push.full_sync(), policy_generation_, rule_count_);
     return applied;
 }
 
@@ -923,7 +931,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     // the destructor always fires (Sol rung-7.5 review finding 2: the prior
     // explicit rollback_spark_wiring_locked() call inside each catch block
     // could be skipped if the logging call ahead of it threw).
-    ScopeExit rollback{[this, engine, &registered, &consumer_id] {
+    GuardianRollback rollback{[this, engine, &registered, &consumer_id] {
         rollback_spark_wiring_locked(engine, registered, consumer_id);
     }};
     try {

@@ -1,5 +1,6 @@
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "spark_key_rule_index.hpp"
 
 #include <algorithm>
@@ -27,21 +28,6 @@ std::string make_boot_nonce() {
     }
     return s;
 }
-
-/// Generic scope-exit guard: runs `fn` in its destructor unless `committed` was
-/// set. Used by attach_rule() to unwind a mid-construction exception (Sol rung-7.5
-/// review finding 1): without it, a bad_alloc from a map/set insertion AFTER
-/// backend_->arm() has already succeeded would leave a LIVE SparkEngine
-/// subscription that no rule_id tracks - spark_armed_rule_count() reports it
-/// nowhere, but the mechanism keeps watching it forever.
-struct ScopeExit {
-    std::function<void()> fn;
-    bool committed{false};
-    ~ScopeExit() {
-        if (!committed && fn)
-            fn();
-    }
-};
 
 } // namespace
 
@@ -111,18 +97,23 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         // `pk`/`sub`/`armed_here` are declared BEFORE `rollback` so they outlive its
         // destructor (reverse construction order): the rollback lambda reads them by
-        // reference. ONE rollback is installed BEFORE index_->add and backend_->arm, so
-        // a THROW from either - not only a returned error - unwinds every mutation,
-        // INCLUDING a subscription that armed just before a later step threw. The prior
-        // code assigned the rollback only AFTER arm() and per-branch, so a throwing arm()
-        // (or a throwing rollback-closure assignment after the arm) leaked the
-        // subscription and left a ghost index entry that then corrupted a future sibling
-        // attach (Fable rung-7.7b review M3; extends Sol rung-7.5 finding 1). Every undo
-        // is a safe no-op if its mutation never ran.
+        // reference. ONE rollback is installed BEFORE index_->add and backend_->arm, so a
+        // GUARDIAN-side throw - the index add, or any map/set insertion after arm()
+        // RETURNED a subscription (armed_here=true) - unwinds every Guardian-side mutation
+        // and disarms that subscription. The prior code assigned the rollback only AFTER
+        // arm() and per-branch, so a throwing arm() (or a throwing rollback-closure
+        // assignment after the arm) leaked the subscription and left a ghost index entry
+        // that corrupted a future sibling attach. Every undo is a safe no-op if its
+        // mutation never ran, and GuardianRollback's destructor is terminate-safe.
+        // SCOPE LIMIT (Sol B4): if backend_->arm() itself THROWS after partially mutating
+        // SparkEngine (a bad_alloc inside arm_impl, no subscription returned), armed_here
+        // stays false and this rollback cannot clean the engine's partial state - that is
+        // a SparkEngine strong-guarantee gap tracked separately as a PR-2 flip blocker.
+        // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
         std::shared_ptr<PerKey> pk;
         std::uint64_t sub = 0;
         bool armed_here = false;
-        ScopeExit rollback;
+        GuardianRollback rollback;
         rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
             index_->remove_rule(rule_id); // no-op if add() never ran or threw clean
             if (armed_here) {
@@ -153,16 +144,20 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         rules_.insert_or_assign(rule_id, std::move(rg));
         pk->pending_initial.insert(rule_id);
-        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy -
-        // must not go unaudited. Failure here is counted, never rolls back the
-        // arm itself (the audit trail must not compromise real detection
-        // capability); see enqueue_lifecycle_locked's doc.
-        enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
-        // waker/outbox_waker are copied BEFORE commit: if either copy itself
-        // throws, rollback still runs rather than reporting an exception on
-        // an already-committed arm (Sol rung-7.5 review finding 1).
+        // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
+        // a throw here rolls back with NO audit entry yet. The lifecycle log is
+        // append-only and never purged (guardian_outbox.hpp), so a phantom "armed"
+        // enqueued before a throwing waker copy would be permanent evidence of an arm
+        // that actually rolled back (Sol/Fable SHOULD, rung 7.7b).
         waker = pending_initial_waker_;   // copy; call after releasing registry_mu_
         outbox_waker = outbox_enqueue_waker_;
+        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy - must not
+        // go unaudited. Failure here is counted, never rolls back the arm itself (the
+        // audit trail must not compromise real detection capability); see
+        // enqueue_lifecycle_locked's doc. This is the LAST potentially-throwing step, and
+        // it is all-or-nothing (std::list::push_back is strong), so only the noexcept
+        // commit below follows a successful enqueue.
+        enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
         rollback.committed = true;
         new_gen = gen;
     }

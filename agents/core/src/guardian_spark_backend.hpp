@@ -66,7 +66,20 @@ public:
             return std::unexpected(
                 "GuardianSparkEngineBackend: arm() called before bind_consumer() completed "
                 "wiring - this is a caller-sequencing bug, not a runtime condition");
-        return engine_->arm(consumer_, spec);
+        // Confine a throwing SparkEngine::arm to the returned-error channel. arm_impl
+        // can throw after partially mutating engine state (a bad_alloc mid-sequence); the
+        // ISparkBackend contract is "returns expected", so honour it and let attach_rule
+        // take its clean error path (armed_here=false) instead of unwinding through the
+        // Guardian rollback. This does NOT repair the engine's partial state - that gap
+        // is tracked as a PR-2 flip blocker (Sol B4 / Fable) - but it stops a throw from
+        // propagating out of a path the Guardian rollback cannot fully clean.
+        try {
+            return engine_->arm(consumer_, spec);
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("SparkEngine::arm threw: ") + e.what());
+        } catch (...) {
+            return std::unexpected(std::string("SparkEngine::arm threw a non-std exception"));
+        }
     }
 
     void disarm(std::uint64_t subscription) override {
