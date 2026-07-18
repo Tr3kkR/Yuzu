@@ -44,7 +44,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -79,6 +81,12 @@ struct OutboxEntry {
 
     std::string lifecycle_kind;  ///< Lifecycle payload: "armed" | "disarmed" | "errored"
 
+    // Health + Lifecycle carry the guard identity explicitly (the Compliance domain
+    // carries both inside `drift`). Empty on Compliance entries. Without these the
+    // wire event's guard_type/rule_name were blank on every health/lifecycle event.
+    std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
+    std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
+
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
         OutboxEntry e;
@@ -91,7 +99,8 @@ struct OutboxEntry {
         return e;
     }
     static OutboxEntry health(std::string rule_id, std::uint64_t generation, std::string event_id,
-                              std::int64_t enqueued_ns, bool healthy, std::string detail) {
+                              std::int64_t enqueued_ns, bool healthy, std::string detail,
+                              std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Health;
         e.rule_id = std::move(rule_id);
@@ -100,10 +109,13 @@ struct OutboxEntry {
         e.enqueued_ns = enqueued_ns;
         e.healthy = healthy;
         e.health_detail = std::move(detail);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
     static OutboxEntry lifecycle(std::string rule_id, std::uint64_t generation, std::string event_id,
-                                 std::int64_t enqueued_ns, std::string kind) {
+                                 std::int64_t enqueued_ns, std::string kind,
+                                 std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Lifecycle;
         e.rule_id = std::move(rule_id);
@@ -111,6 +123,8 @@ struct OutboxEntry {
         e.event_id = std::move(event_id);
         e.enqueued_ns = enqueued_ns;
         e.lifecycle_kind = std::move(kind);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
 };
@@ -187,9 +201,12 @@ public:
         return true;
     }
 
-    /// Send buffered entries in FIFO order. `send` is invoked as
-    /// `SendResult send(const OutboxEntry&)`; a Sent entry is removed, a Retain (or
-    /// a thrown exception) is kept and stops the drain. Returns the number sent.
+    /// TEST-ONLY (unit tests of the coalesce/FIFO/purge semantics with an inline send).
+    /// Production drains via GuardianSparkRuntime::drain, which uses front_copy/
+    /// pop_front_if with outbox_mu_ RELEASED across the send - do NOT call this from the
+    /// runtime under outbox_mu_, it reintroduces the head-of-line stall item 4 removed.
+    /// Send buffered entries in FIFO order; a Sent entry is removed, a Retain (or a
+    /// thrown exception) is kept and stops the drain. Returns the number sent.
     template <typename SendFn>
     std::size_t drain(SendFn&& send) {
         std::size_t sent = 0;
@@ -208,6 +225,28 @@ public:
             ++sent;
         }
         return sent;
+    }
+
+    /// Peek a COPY of the head (nullopt if empty). For the runtime's unlock-during-send
+    /// drain: copy the head under outbox_mu_, RELEASE it, send (network I/O off-lock),
+    /// re-acquire, then pop_front_if(). Keeps a stalled gRPC Write() off outbox_mu_ so it
+    /// cannot block evaluate_key's emit / arm-disarm enqueue / heartbeat (item 4).
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+
+    /// Pop the head IFF it is STILL the entry with `event_id` - i.e. a coalesce (which
+    /// replaces the node in place with a fresh event_id) or a drop_rule/purge_stale
+    /// during the unlocked send did not replace/remove it. Returns true iff popped.
+    /// event_id is globally unique per enqueue, so it pins the exact sent entry.
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        index_.erase(Key{pending_.front().domain, pending_.front().rule_id});
+        pending_.pop_front();
+        return true;
     }
 
     /// Drop every pending entry for a rule (used on disable / withdraw).
@@ -289,6 +328,8 @@ public:
         return true;
     }
 
+    /// TEST-ONLY (see GuardianOutbox::drain's note): production drains via
+    /// GuardianSparkRuntime::drain with outbox_mu_ released across the send.
     /// Send in FIFO order; a Sent entry is removed, a Retain (or a throw) stops
     /// the drain and keeps the head - identical send contract to GuardianOutbox.
     template <typename SendFn>
@@ -308,6 +349,21 @@ public:
             ++sent;
         }
         return sent;
+    }
+
+    /// Peek/pop primitives for the runtime's unlock-during-send drain (see
+    /// GuardianOutbox::front_copy/pop_front_if). This log coalesces nothing, so a
+    /// pop_front_if mismatch here means only a successful send already removed the head.
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        pending_.pop_front();
+        return true;
     }
 
     [[nodiscard]] std::size_t size() const { return pending_.size(); }

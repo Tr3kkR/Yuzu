@@ -147,3 +147,22 @@ TEST_CASE("send-map: Lifecycle kind becomes guard.<kind>", "[spark][sendmap]") {
         CHECK(ev.event_type() == std::string("guard.") + kind);
     }
 }
+
+TEST_CASE("send-map: Health + Lifecycle carry guard_type/rule_name (PR-1 item 2)",
+          "[spark][sendmap]") {
+    SECTION("Health") {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::health("r", 1, "id", kEnq, /*healthy=*/false, "EACCES", "file",
+                                "Hosts file integrity"),
+            "linux");
+        CHECK(ev.guard_type() == "file");
+        CHECK(ev.rule_name() == "Hosts file integrity");
+    }
+    SECTION("Lifecycle") {
+        auto ev = guardian_outbox_entry_to_event(
+            OutboxEntry::lifecycle("r", 1, "id", kEnq, "armed", "registry", "No debugger"),
+            "linux");
+        CHECK(ev.guard_type() == "registry");
+        CHECK(ev.rule_name() == "No debugger");
+    }
+}
