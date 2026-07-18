@@ -379,6 +379,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',

@@ -891,9 +891,25 @@ public:
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
         metrics_.describe("yuzu_server_guardian_events_dropped_total",
                           "Cumulative Guaranteed-State events dropped at ingest on an event_id "
-                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
-                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
-                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "PK/UNIQUE conflict where the incoming payload MISMATCHES the stored row "
+                          "(a forged-id pre-claim #1360, or an agent event_seq_ reset / clock skew "
+                          "carrying a different event). Matching-fields redeliveries are NOT counted "
+                          "here (see ..._events_redelivered_total). >0 distinguishes 'no drift' from "
+                          "'drift silently discarded' (CC7.3 evidence gap #1414).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_events_redelivered_total",
+                          "Cumulative idempotent event redeliveries at ingest — a matching-fields "
+                          "event_id conflict, i.e. the durable agent lifecycle journal's expected "
+                          "at-least-once retry. High is normal after an agent outage/reconnect; this "
+                          "is NOT a loss signal (that is ..._events_dropped_total).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_events_ingest_errors_total",
+                          "Cumulative OPERATIONAL Guardian ingest faults (a failed BEGIN/prepare/"
+                          "insert/commit, or a redelivery compare that could not run). A sustained "
+                          "rate means conflicts are going UNCLASSIFIED, so a genuine collision can "
+                          "escape ..._events_dropped_total — this is itself alertable (sec-M2). "
+                          "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
+                          "server restart.",
                           "counter");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
@@ -3418,6 +3434,10 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_dropped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_redelivered_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_redelivered_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_ingest_errors_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_ingest_errors_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
