@@ -926,18 +926,40 @@ int macos_unquarantine(yuzu::CommandContext& ctx) {
                 kAnchorName, kPfctl, kAnchorName, kPfctl));
             return 1;
         }
-        // The anchor flush itself failed, so its persisted rules (still
-        // whatever macos_load_ruleset() last wrote) are the honest
-        // reflection of what's addressable in the anchor's rule table —
-        // pf being administratively disabled is an orthogonal, separate
-        // release mechanism (see the comment above), not evidence the
-        // anchor's own on-disk contents should be cleared. Leave
-        // kAnchorFile as-is here; the note below already tells the
-        // operator the flush failed and to run the anchor-flush command
-        // by hand, which is what would trigger the clear on a retry.
-        ctx.write_output(std::format(
-            "status|released|note|pf disabled (failed to flush anchor \"{}\")", kAnchorName));
-        return 0;
+        // The anchor flush itself failed, so pf being administratively
+        // disabled here is only a temporary, orthogonal release mechanism —
+        // it makes the host reachable right now, but says nothing about the
+        // anchor's own rule table, which is still unconfirmed (that's the
+        // failure we're in) and whose persisted copy on disk still holds
+        // whatever macos_load_ruleset() last wrote. Best-effort clear the
+        // persistent anchor file with the same atomic helper the successful
+        // path uses below, so a stale `block all` doesn't survive to
+        // re-impose quarantine the next time pf is re-enabled, `pfctl -f
+        // /etc/pf.conf` reloads, or the box reboots. But never report
+        // "released"/rc 0 for this branch regardless of whether the
+        // best-effort clear lands: the live anchor's rule table was never
+        // confirmed flushed, so durable quarantine state is not confirmed
+        // cleared and the controller must keep reconciling rather than
+        // treating this host as released.
+        std::string persist_err;
+        const bool persisted =
+            macos_write_anchor_file_atomic(kEmptyAnchorContents, &persist_err);
+        if (persisted) {
+            ctx.write_output(std::format(
+                "status|release_incomplete|note|pf disabled (host reachable) but anchor "
+                "\"{}\" rule table flush failed — persistent anchor file at {} was "
+                "best-effort cleared, but the live anchor's own state is unconfirmed; "
+                "retry `sudo {} -a {} -F rules`",
+                kAnchorName, kAnchorFile, kPfctl, kAnchorName));
+        } else {
+            ctx.write_output(std::format(
+                "status|release_incomplete|note|pf disabled (host reachable) but anchor "
+                "\"{}\" rule table flush failed AND the persistent anchor file at {} could "
+                "not be cleared ({}) — durable quarantine state remains uncleared; retry "
+                "`sudo {} -a {} -F rules` or fix the anchor file by hand",
+                kAnchorName, kAnchorFile, persist_err, kPfctl, kAnchorName));
+        }
+        return 1;
     }
 
     // BR-002: the live anchor flush above succeeded — mirror that to the
