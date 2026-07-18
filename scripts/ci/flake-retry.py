@@ -20,10 +20,12 @@ Cross-platform entries (`"platforms": ["all"]`) are still retried but emit a
 loud ::warning (and MUST carry an `issue`); OS-scoped entries emit a ::notice.
 
 Design was grilled 2026-06-22 (mechanism "C": case-level retry + static in-repo
-list). No DB — visibility is the job summary + annotations; trend is deferred to
-a future `ci-ingest`-style step. Scope: ci.yml only (PR fast-path + push
-matrix); nightly/sanitizer stay fail-loud. Not an ADR (reversible test tooling)
-— rationale lives here and in docs/ci-architecture.md.
+list). Visibility is the job summary + annotations; recovered cases are also
+written to meson-logs/flake-retry.json for import into the runner-local
+test-runs.db. The static list remains the allowlist; DB history never changes
+pass/fail semantics. Scope: ci.yml only (PR fast-path + push matrix);
+nightly/sanitizer stay fail-loud. Not an ADR (reversible test tooling) —
+rationale lives here and in docs/ci-architecture.md.
 
 Effective attempts for a flaky case = original in-suite run + one enumeration
 re-run (to find which cases failed) + up to --retries isolated re-runs.
@@ -278,10 +280,8 @@ def catch2_failed_cases(test, this_os):
 
 
 def retry_case(test, case, retries):
-    """Re-run a single Catch2 case by exact name up to `retries` times; True if
-    any attempt passes. A hung retry counts as a failed attempt, not a script
-    crash — same timeout source and rationale as catch2_failed_cases()."""
-    for _ in range(retries):
+    """Return the 1-based retry attempt that passed, or 0 if none passed."""
+    for attempt in range(1, retries + 1):
         try:
             result = _run(_cmd_without_test_specs(test.get("cmd") or []),
                           test.get("env"), test.get("workdir"), extra=[case],
@@ -289,8 +289,34 @@ def retry_case(test, case, retries):
         except subprocess.TimeoutExpired:
             continue
         if result.returncode == 0:
-            return True
-    return False
+            return attempt
+    return 0
+
+
+def write_retry_report(builddir, this_os, recovered, blocked):
+    """Persist retry evidence for runner-local CI telemetry ingestion."""
+    import json
+
+    logs = os.path.join(builddir, "meson-logs")
+    os.makedirs(logs, exist_ok=True)
+    path = os.path.join(logs, "flake-retry.json")
+    tmp = path + f".{os.getpid()}.tmp"
+    payload = {
+        "platform": this_os,
+        "recovered": [
+            {
+                "case": case,
+                "cross_platform": cross,
+                "attempts": attempts,
+            }
+            for case, cross, attempts in recovered
+        ],
+        "blocked": list(blocked),
+    }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 # ── orchestration ─────────────────────────────────────────────────────────────
@@ -335,6 +361,7 @@ def main(argv=None):
         gh("warning", f"suite-budget watchdog failed (reporting only, run unaffected): {ex}")
 
     if rc == 0:
+        write_retry_report(args.builddir, this_os, [], [])
         return 0
 
     gh("notice", "meson test failed — checking whether every failure is a known flake")
@@ -342,9 +369,15 @@ def main(argv=None):
     failed_suites = meson_failed_suites(args.builddir)
     if not failed_suites:
         gh("error", "test failed but no per-suite junit to classify — failing (no masking)")
+        write_retry_report(
+            args.builddir,
+            this_os,
+            [],
+            ["test failed but no per-suite junit to classify"],
+        )
         return rc or 1
     blocked = []      # case names that must fail the job
-    recovered = []    # (case, cross_platform) that recovered
+    recovered = []    # (case, cross_platform, retry_attempt) that recovered
     for suite_name in sorted(failed_suites):
         test = match_suite(suite_name, tests)
         if test is None:
@@ -368,21 +401,27 @@ def main(argv=None):
             if entry is None:
                 blocked.append(case)
                 continue
-            if retry_case(test, case, args.retries):
+            passed_attempt = retry_case(test, case, args.retries)
+            if passed_attempt:
                 cross = "all" in entry.get("platforms", [])
-                recovered.append((case, cross))
+                recovered.append((case, cross, passed_attempt))
             else:
                 blocked.append(f"{case} (listed flake but failed all {args.retries} retries)")
 
     # Report.
-    for case, cross in recovered:
+    write_retry_report(args.builddir, this_os, recovered, blocked)
+    for case, cross, _attempts in recovered:
         if cross:
             gh("warning", f"CROSS-PLATFORM flake recovered on retry (needs urgent fix): {case}")
         else:
             gh("notice", f"known flake recovered on retry: {case}")
     if recovered:
         lines = ["### flake-retry", "", "Recovered known flakes (passed on retry):", ""]
-        lines += [f"- {'⚠️ **cross-platform** ' if c else ''}`{n}`" for n, c in recovered]
+        lines += [
+            f"- {'⚠️ **cross-platform** ' if cross else ''}`{case}` "
+            f"(retry {attempts})"
+            for case, cross, attempts in recovered
+        ]
         summary("\n".join(lines))
 
     if blocked:

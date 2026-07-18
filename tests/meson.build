@@ -604,6 +604,16 @@ test('flake-retry selftest',
   timeout: 30,
 )
 
+# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
+# flake recoveries land in the persistent per-runner test-runs.db.
+test('ci telemetry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_ci_telemetry.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
 # entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
 # the cancelled-path "which entry never finished" inference. It reuses
