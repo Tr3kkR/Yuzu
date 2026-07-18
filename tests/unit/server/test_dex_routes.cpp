@@ -307,6 +307,133 @@ TEST_CASE("DEX catalogue: os=windows lens matches the unchanged 'all' composite 
     CHECK(*score_win == expected);
 }
 
+TEST_CASE("DEX catalogue grid: linux lens scores off linux_online, not macos/windows_online "
+          "(differential, #1746 follow-up QE-a)",
+          "[dex][routes][catalogue]") {
+    // A fleet with three DISTINCT positive per-OS online counts, so a regression
+    // that borrowed macos_online or windows_online instead of linux_online can't
+    // hide behind an accidental equal denominator.
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "l1", "LNX-1", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "l2", "LNX-2", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 14;
+    fleet.windows_online = 7;
+    fleet.linux_online = 4;
+    fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "linux", "darwin"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "linux");
+    const auto score = family_score(html, "App reliability");
+    REQUIRE(score.has_value());
+
+    // Hand-computed against the linux-scoped signal alone: "App reliability" is
+    // "high" severity (12 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both LNX-1/LNX-2 hit); N=linux_online=4.
+    const double impact_linux = 2.0 / 4.0;
+    const int expected_linux =
+        static_cast<int>(std::clamp(100.0 - 12.0 * impact_linux, 0.0, 100.0) + 0.5);
+    CHECK(*score == expected_linux);
+
+    // Differential: had the denominator been macos_online(3) or windows_online(7)
+    // instead of linux_online(4), the score would be a DIFFERENT number — proves
+    // linux_online, not a borrowed neighbor, actually drives this lens.
+    const int score_if_macos_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 3.0), 0.0, 100.0) + 0.5);
+    const int score_if_windows_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 7.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_macos_online);
+    CHECK(*score != score_if_windows_online);
+}
+
+TEST_CASE("DEX catalogue grid: macos_online=0 suppresses the score even with macOS "
+          "signals seeded (divide-by-zero guard, QE-b)",
+          "[dex][routes][catalogue]") {
+    GuaranteedStateStore store(":memory:");
+    // network.wifi_drop (Network family) IS macOS-collected (dex_obs_platforms),
+    // so this family is MONITORED under the macos lens — the suppression below
+    // must come from the N==0 guard, not from "nothing collects this".
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 7;
+    fleet.windows_online = 7;
+    fleet.macos_online = 0; // no macOS agents online right now
+    fleet.connected_os = {"windows", "darwin"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    CHECK(family_score(html, "Network") == std::nullopt); // suppressed, never a fabricated number
+
+    // Confirm the suppression is the N==0 guard, not the "dark / not collected"
+    // path: the card's meta text still reads "health score" (mon>0), and the
+    // rendered marker is the suppressed em-dash, not a number.
+    const auto name_pos = html.find("<div class=\"fn\">Network<span");
+    REQUIRE(name_pos != std::string::npos);
+    const auto next_card = html.find("<a class=\"gp-fcard", name_pos);
+    const std::string card = html.substr(
+        name_pos, next_card == std::string::npos ? std::string::npos : next_card - name_pos);
+    CHECK(card.find("&mdash;") != std::string::npos);      // suppressed marker
+    CHECK(card.find("health score") != std::string::npos); // proves mon>0 (not the dark case)
+}
+
+TEST_CASE("DEX catalogue grid: \"all\" lens pins to windows_online + the COMBINED "
+          "all-OS signal set on a differentiating fleet (QE-d)",
+          "[dex][routes][catalogue]") {
+    // windows_online(7) != total_online(14) so a regression to total_online can't
+    // hide behind an accidental equality; the seeded signal spans THREE distinct
+    // windows agents + TWO distinct linux agents so a regression that scoped the
+    // "all" lens down to windows-only signals (instead of the combined all-OS
+    // set) produces a different max_signal_devices too.
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "w1", "WIN-1", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "w2", "WIN-2", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:05:00Z");
+    seed_signal(store, "w3", "WIN-3", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "l1", "LNX-1", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "l2", "LNX-2", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:20:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 14;
+    fleet.windows_online = 7;
+    fleet.linux_online = 4;
+    fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "linux", "macos"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "all");
+    const auto score = family_score(html, "App reliability");
+    REQUIRE(score.has_value());
+
+    // Hand-computed: "App reliability" is "high" severity (12 pts) with default
+    // mult 1.0; max_signal_devices=5 (the COMBINED process.crashed set: 3 windows
+    // + 2 linux agents, ONE signal type under the unscoped rollup);
+    // N=windows_online=7 (the established "all"-lens denominator, byte-unchanged
+    // by #1746).
+    const double impact_all = 5.0 / 7.0;
+    const int expected_all =
+        static_cast<int>(std::clamp(100.0 - 12.0 * impact_all, 0.0, 100.0) + 0.5);
+    CHECK(*score == expected_all);
+
+    // (a) Regression to total_online(14) as the denominator, same combined
+    // signal set — a DIFFERENT number.
+    const int score_if_total_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (5.0 / 14.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_total_online);
+
+    // (b) Regression to a windows-only signal set (3 devices, not the combined 5)
+    // under windows_online(7) — also a DIFFERENT number.
+    const int score_if_windows_only_signals =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (3.0 / 7.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_windows_only_signals);
+}
+
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
           "[dex][routes][catalogue]") {
     GuaranteedStateStore store(":memory:");
@@ -400,6 +527,67 @@ TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator
     const int expected_win =
         static_cast<int>(std::clamp(100.0 - 6.0 * impact_win, 0.0, 100.0) + 0.5);
     CHECK(*score_win == expected_win);
+}
+
+TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into both the "
+          "grid and drill-down renderers (QE-handler)",
+          "[dex][routes][catalogue]") {
+    // The #1746/BR-001 tests above prove the RENDER fns are per-OS-honest when
+    // called directly; this exercises the actual ROUTE handlers (query-string
+    // parsing → fleet_fn → render) so a regression that dropped `os=` on the way
+    // in — e.g. a route that stopped reading req.get_param_value("os") — would
+    // fail here even though the render fns themselves are still correct.
+    GuaranteedStateStore store(":memory:");
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() {
+        DexFleet f;
+        f.total_online = 10;
+        f.windows_online = 7;
+        f.macos_online = 3;
+        f.connected_os = {"windows", "darwin"};
+        return f;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, /*audit_fn=*/{});
+
+    // Same hand-computed score as the #1746/BR-001 tests: "Network" is "med"
+    // severity (6 pts) with default-preset mult 1.0; max_signal_devices=2
+    // (MAC-1/MAC-2); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+
+    // (1) Grid: GET the query-string form the "OS" chips actually emit
+    // (?window=7d&os=macos, no encoding needed — "macos" has no reserved chars,
+    // matching how the existing chip/back-link tests above call the harness).
+    auto grid = sink.Get("/fragments/dex/catalogue?window=7d&os=macos");
+    REQUIRE(grid);
+    CHECK(grid->status == 200);
+    // The macOS chip renders as the ACTIVE chip (proves the route read os=macos,
+    // not just defaulted to "all").
+    CHECK(grid->body.find(
+              "<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
+          std::string::npos);
+    CHECK(family_score(grid->body, "Network") == expected); // macOS-scoped score, route → renderer
+
+    // (2) Drill-down: same lens, one level down.
+    auto group = sink.Get("/fragments/dex/catalogue/group?name=Network&window=7d&os=macos");
+    REQUIRE(group);
+    CHECK(group->status == 200);
+    CHECK(group->body.find("<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue/group?"
+                           "name=Network&window=7d&os=macos\"") != std::string::npos);
+    CHECK(group_score(group->body) == expected);
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",

@@ -610,7 +610,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // composite (windows_online + the all-OS signal rollup) — byte-unchanged. A
     // single-OS chip scores that OS against its OWN online count and its OWN
     // signals, so a Linux/macOS family score is never silently Windows-derived. --
-    const int64_t N_scoped = osf == "linux"  ? fleet.linux_online
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
                              : osf == "macos" ? fleet.macos_online
                                                : fleet.windows_online; // "all" or "windows"
     const auto signals_scoped =
@@ -640,7 +640,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // (score = 100 − that family's deduction; same formula as dex_compute_health).
     // Scoped per #1746: the "all" chip stays the fleet-wide composite
     // (windows_online + all-OS signals); a single-OS chip is now scored against
-    // N_scoped/signals_scoped ABOVE — that OS's own online count and own signals,
+    // n_scoped/signals_scoped ABOVE — that OS's own online count and own signals,
     // never a Windows-derived number read under a Linux/macOS heading. --
     std::size_t total_types = dex_catalogued_type_count();
     std::size_t mon_types = 0;
@@ -684,9 +684,9 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                 ++mon;
         const bool dark = (mon == 0);
         double score = -1.0;
-        if (!dark && N_scoped > 0)
+        if (!dark && n_scoped > 0)
             score = std::clamp(
-                100.0 - dex_family_health_deduction(g, signals_scoped, N_scoped), 0.0, 100.0);
+                100.0 - dex_family_health_deduction(g, signals_scoped, n_scoped), 0.0, 100.0);
         const char* tone =
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +

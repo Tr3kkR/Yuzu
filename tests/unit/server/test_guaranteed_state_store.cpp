@@ -954,9 +954,25 @@ TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; 
     // lens filters on exact platform match, so "Darwin" must land in "macos"
     // rather than silently vanishing from every single-OS lens).
     sig("m3", "agent-E", "network.wifi_drop", "Darwin", "2026-06-09T10:25:00Z");
+    // QE-c: three more canonicalization edge cases on top of "Darwin" above.
+    // "WINDOWS" (all-caps) lowercases to "windows" then starts_with("win") — an
+    // ordinary canonicalization, landing in the windows lens like w1/w2.
+    sig("w3", "agent-F", "process.crashed", "WINDOWS", "2026-06-09T10:30:00Z");
+    // "Linux " (trailing space) lowercases to "linux " — starts_with("lin") still
+    // matches on the PREFIX, and the canonicalization is a full literal
+    // reassignment (not a trim), so the trailing space is discarded and this
+    // still lands in the linux lens like l1.
+    sig("l2", "agent-G", "process.crashed", "Linux ", "2026-06-09T10:35:00Z");
+    // "" (no platform key/empty value): none of the canonicalization branches
+    // match, so it stays "". It can never equal "windows"/"linux"/"macos" in the
+    // scoped query's exact-match filter, so it is EXCLUDED from every single-OS
+    // lens — but it has no platform filter at all in the unscoped ("all") query,
+    // so it still counts there.
+    sig("e1", "agent-H", "process.crashed", "", "2026-06-09T10:40:00Z");
 
     // Scoped to macOS: only macOS's own rows — its slice of process.crashed AND
-    // its exclusive network.wifi_drop (including the "Darwin"-token agent).
+    // its exclusive network.wifi_drop (including the "Darwin"-token agent). The
+    // new WINDOWS/"Linux "/"" rows above are all non-macOS, so this is unchanged.
     // Windows/Linux crashes never leak in.
     auto mac = store.dex_signal_summary("", "macos");
     REQUIRE(mac.size() == 2);
@@ -967,29 +983,34 @@ TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; 
     CHECK(mac[1].count == 1);
     CHECK(mac[1].distinct_devices == 1);
 
-    // Scoped to windows: 2 crashes, 2 devices; the macOS-only wifi_drop is absent.
+    // Scoped to windows: w1/w2 plus the canonicalized "WINDOWS" row (w3) = 3
+    // crashes, 3 devices; the macOS-only wifi_drop and the empty-platform row
+    // are both absent.
     auto win = store.dex_signal_summary("", "windows");
     REQUIRE(win.size() == 1);
     CHECK(win[0].obs_type == "process.crashed");
-    CHECK(win[0].count == 2);
-    CHECK(win[0].distinct_devices == 2);
+    CHECK(win[0].count == 3);
+    CHECK(win[0].distinct_devices == 3);
 
-    // Scoped to linux: 1 crash, 1 device.
+    // Scoped to linux: l1 plus the canonicalized "Linux " row (l2) = 2 crashes,
+    // 2 devices; the empty-platform row is absent (never matches an exact
+    // single-OS filter).
     auto lin = store.dex_signal_summary("", "linux");
     REQUIRE(lin.size() == 1);
     CHECK(lin[0].obs_type == "process.crashed");
-    CHECK(lin[0].count == 1);
-    CHECK(lin[0].distinct_devices == 1);
+    CHECK(lin[0].count == 2);
+    CHECK(lin[0].distinct_devices == 2);
 
-    // Unscoped (platform="", the default parameter): the full all-OS rollup is
-    // unchanged — process.crashed spans all 3 platforms (4 rows, 4 distinct
-    // agents), network.wifi_drop is macOS-only (2 rows incl. the canonicalized
-    // "Darwin" agent).
+    // Unscoped (platform="", the default parameter): the full all-OS rollup now
+    // also picks up the WINDOWS/"Linux "/"" rows — process.crashed climbs from 4
+    // to 7 rows / 7 distinct agents (the empty-platform row counts here even
+    // though it's excluded from every single-OS lens above); network.wifi_drop
+    // is macOS-only (2 rows incl. the canonicalized "Darwin" agent), unchanged.
     auto all = store.dex_signal_summary();
     REQUIRE(all.size() == 2);
-    CHECK(all[0].obs_type == "process.crashed"); // count=4 beats wifi_drop's count=2
-    CHECK(all[0].count == 4);
-    CHECK(all[0].distinct_devices == 4);
+    CHECK(all[0].obs_type == "process.crashed"); // count=7 beats wifi_drop's count=2
+    CHECK(all[0].count == 7);
+    CHECK(all[0].distinct_devices == 7);
     CHECK(all[1].obs_type == "network.wifi_drop");
     CHECK(all[1].count == 2);
 }
