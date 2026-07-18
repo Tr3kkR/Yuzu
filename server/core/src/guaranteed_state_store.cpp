@@ -315,7 +315,8 @@ void GuaranteedStateStore::create_tables() {
             -- hung APP's file version, canonicalized agent-side to the same dotted
             -- quad procperf emits, so (subject, version) is ONE identity across
             -- crashes and perf. NOT NULL DEFAULT '' — pre-{8} rows and any signal
-            -- without a version (services, non-Windows crashes, packaged apps) read
+            -- without a version (services, Linux crashes, unversioned/packaged
+            -- apps; macOS crash/hang now carry one) read
             -- as the single "unknown version" bucket. Append-only ALTER: a fresh DB
             -- runs {7} then {8}; an upgrading DB runs only {8}.
             ALTER TABLE guardian_observations

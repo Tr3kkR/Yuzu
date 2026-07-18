@@ -45,9 +45,12 @@ struct GuardianObservationRow;
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` is the coverage-honest
-/// denominator (only the OS with a crash collector today); `total_online` is
-/// context. A struct (not a registry dep) keeps render pure + testable.
+/// registry (NOT the crash store). `windows_online` remains the established
+/// headline crash-rate denominator (and the "all" catalogue lens's denominator,
+/// kept for continuity); macOS and Linux crash/reliability collectors now exist
+/// too, and the per-OS counters below denominate the catalogue's single-OS
+/// lenses. `total_online` is context. A struct (not a registry dep) keeps
+/// render pure + testable.
 struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
