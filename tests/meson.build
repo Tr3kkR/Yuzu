@@ -161,6 +161,7 @@ agent_test_exe = executable(
     'unit/test_guardian_spark_backend.cpp',
     'unit/test_guardian_emit_decider.cpp',
     'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_drift_event.cpp',
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',

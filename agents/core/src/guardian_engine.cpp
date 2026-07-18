@@ -30,6 +30,7 @@
 
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
 #include "guardian_convergence_scheduler.hpp"
+#include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
 #include "guardian_outbox_drain_worker.hpp"
 #include "guardian_spark_backend.hpp"
 #include "guardian_spark_bridge.hpp" // spark_spec_from_rule, rule_assertion_from_rule, classify
@@ -530,38 +531,14 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     ev.set_event_id(d.rule_id + "-" + agent_id_ + "-" + std::to_string(now_ms) + "-" +
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
-    ev.set_rule_name(d.rule_name);
-    ev.set_guard_type(d.guard_type); // "registry" | "file" | "service" — set by the producing guard
     ev.set_guard_category("event");
-    ev.set_detected_value(d.detected_value);
-    ev.set_expected_value(d.expected_value);
-    ev.set_detection_latency_us(d.detection_latency_us);
-    if (d.compliant) {
-        // Compliant transition (Slice B): the watched state is at / returned to
-        // expected. No remediation fields — a compliant edge is never a write-back.
-        // The server buckets guard.compliant + drift.remediated → compliant; the
-        // guard only emits this on the edge, so steady state adds zero traffic.
-        ev.set_event_type("guard.compliant");
-    } else if (d.remediation_attempted) {
-        ev.set_remediation_action(d.remediation_action);
-        ev.set_remediation_success(d.remediation_success);
-        ev.set_remediation_latency_us(d.remediation_latency_us);
-        // drift.remediated = write-back restored the value; remediation.failed =
-        // enforce attempted but the write did not succeed (e.g. read-only-fallback
-        // key, denied ACL). Both are in the frozen taxonomy and the dashboard
-        // renderer styles them; remediation.failed keeps a failed enforce visibly
-        // distinct from a passive detection so the operator sees enforcement is
-        // not working, not just that drift exists.
-        ev.set_event_type(d.remediation_success ? "drift.remediated" : "remediation.failed");
-    } else {
-        ev.set_event_type("drift.detected");
-    }
-    // drift_rate carries the count of ADDITIONAL drift detections the agent-side
-    // sink debounce collapsed into this single event over its window (H3 / #1209):
-    // 0 = sole detection in its window; a high value means a competing writer was
-    // churning the value and the burst was folded to keep the event store bounded.
-    if (d.collapsed_count > 0)
-        ev.set_drift_rate(static_cast<double>(d.collapsed_count));
+    // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
+    // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
+    // byte-for-byte with the spark consumer's Compliance branch — set them from the
+    // single apply_drift_to_event source of truth so the two producers cannot drift
+    // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
+    // stay stamped here (idempotency- and host-specific).
+    apply_drift_to_event(d, ev);
     ev.mutable_timestamp()->set_seconds(now_ms / 1000);
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
