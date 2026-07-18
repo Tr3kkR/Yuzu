@@ -319,6 +319,14 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
+        // Validate against the full known action set FIRST, independent of
+        // platform support, so a misspelled/unknown action is never silently
+        // recorded as terminal SUCCESS.
+        if (action != "set_state" && action != "status") {
+            ctx.write_output(std::format("error|unknown action: {}", action));
+            return 1;
+        }
+
         ctx.write_output("rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing");
         // set_state is a STATE-CHANGING security-control action (enable/
         // disable remote access). On non-Windows it never touches anything,

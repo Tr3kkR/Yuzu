@@ -492,13 +492,26 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
                             std::string_view mode) {
     // launchctl enable/disable operates on service targets.
     // We target the system domain: system/<label>.
+    //
+    // launchd has no third "manual" (start-on-demand-only) state -- it is a
+    // binary enabled/disabled, which is exactly why "list"/"running" only
+    // ever report startup_type as automatic|disabled|unknown (C-1.12, see
+    // file header). Silently mapping "manual" onto "disabled" here while
+    // echoing back the requested "manual" mode would report a value that a
+    // subsequent "list" can never confirm (BR-03: state-changing action
+    // reporting a mode the platform cannot actually represent). Reject it
+    // honestly instead of misrepresenting the effective state.
     std::string cmd;
     if (mode == "automatic") {
         cmd = std::format("launchctl enable system/{} 2>&1", name);
-    } else if (mode == "manual" || mode == "disabled") {
-        // macOS launchctl disable prevents the service from starting at boot
-        // (equivalent for both manual and disabled semantics).
+    } else if (mode == "disabled") {
         cmd = std::format("launchctl disable system/{} 2>&1", name);
+    } else if (mode == "manual") {
+        ctx.write_output(
+            "error|mode 'manual' is not supported on macOS: launchd has no manual/auto "
+            "distinction, only enabled (automatic) and disabled -- use 'automatic' or "
+            "'disabled'");
+        return 1;
     } else {
         ctx.write_output(
             std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));

@@ -767,11 +767,15 @@ private:
         // RAII owner: FreeMibTable runs on every scope exit, including an exception
         // thrown by std::format / write_output between here and the end of the loop
         // (a manual FreeMibTable would leak the kernel table on that path).
-        // Aggregate with a destructor only (a user-declared ctor would disqualify the
-        // {table} brace-init); it's a named local, never copied.
+        // Non-copyable: a copy would duplicate `t` and both destructors would call
+        // FreeMibTable on the same kernel table pointer (double-free). Mirrors
+        // SocketGuard above (~:91-100).
         struct MibTableGuard {
             PMIB_IPNET_TABLE2 t;
+            explicit MibTableGuard(PMIB_IPNET_TABLE2 tbl) : t(tbl) {}
             ~MibTableGuard() { if (t) FreeMibTable(t); }
+            MibTableGuard(const MibTableGuard&) = delete;
+            MibTableGuard& operator=(const MibTableGuard&) = delete;
         } table_guard{table};
         ULONG emitted = 0;
         for (ULONG i = 0; i < table->NumEntries && emitted < kArpEntryCap; ++i) {

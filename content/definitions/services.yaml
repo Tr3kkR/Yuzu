@@ -2,10 +2,13 @@
 ## Enumerates installed and running system services on all platforms.
 ## Plugin: services | Actions: list, running, set_start_mode
 ##
-## Note: Output columns vary by platform:
-##   Windows: name, display_name, status, startup_type
-##   Linux:   name, status, description
-##   macOS:   label, pid, status
+## Note: Output columns vary by platform. The shared `result.columns` schema
+## below is Windows-shaped; the second column ("display_name_or_pid") holds
+## an actual display name on Windows but the process ID on macOS -- see the
+## per-platform mapping:
+##   Windows: name, display_name,       status, startup_type
+##   Linux:   name, status,             description  (no startup_type)
+##   macOS:   label, pid,               status, startup_type
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -39,7 +42,7 @@ spec:
     columns:
       - name: name
         type: string
-      - name: display_name
+      - name: display_name_or_pid
         type: string
       - name: status
         type: string
@@ -101,7 +104,7 @@ spec:
     columns:
       - name: name
         type: string
-      - name: display_name
+      - name: display_name_or_pid
         type: string
       - name: status
         type: string

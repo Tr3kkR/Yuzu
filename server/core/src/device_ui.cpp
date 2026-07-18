@@ -410,7 +410,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("services", "Services", "", "run state");
     h += card("users", "Logged-in users", "", "sessions");
     h += card("netconfig", "Adapters &amp; IP", "", "addresses");
-    h += card("arp", "ARP / neighbours", "", "neighbour table");
+    h += card("arp", "ARP / neighbours", "Win", "neighbour table");
     h += card("dns_cache", "DNS cache", "Win", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");

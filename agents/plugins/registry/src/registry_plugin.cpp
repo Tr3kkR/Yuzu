@@ -91,6 +91,29 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
+        // Validate against the full known action set FIRST, independent of
+        // platform support, so a misspelled/unknown action (e.g. "get_vaule")
+        // is never silently recorded as terminal SUCCESS.
+        static constexpr std::string_view kMutatingActions[] = {
+            "set_value", "delete_value", "delete_key"};
+        static constexpr std::string_view kReadActions[] = {
+            "get_value", "key_exists", "enumerate_keys", "enumerate_values",
+            "get_user_value"};
+        bool is_mutator = false;
+        for (auto a : kMutatingActions) {
+            if (action == a) { is_mutator = true; break; }
+        }
+        bool is_reader = false;
+        if (!is_mutator) {
+            for (auto a : kReadActions) {
+                if (action == a) { is_reader = true; break; }
+            }
+        }
+        if (!is_mutator && !is_reader) {
+            ctx.write_output(std::format("error|unknown action: {}", action));
+            return 1;
+        }
+
         ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
         // set_value/delete_value/delete_key are STATE-CHANGING (write/delete)
         // actions. On non-Windows they never touch anything, so reporting
@@ -99,10 +122,7 @@ public:
         // actions (get_value, key_exists, enumerate_*, get_user_value)
         // honestly determined "unsupported" and may keep rc=0 -- a read
         // correctly reporting unavailability is itself a successful read.
-        if (action == "set_value" || action == "delete_value" || action == "delete_key") {
-            return 1;
-        }
-        return 0;
+        return is_mutator ? 1 : 0;
 #else
         if (action == "get_value")        return do_get_value(ctx, params);
         if (action == "set_value")        return do_set_value(ctx, params);
