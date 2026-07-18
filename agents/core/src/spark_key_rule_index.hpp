@@ -88,12 +88,39 @@ inline bool SparkKeyRuleIndex::add(std::string_view spark_key, std::string_view 
         if (rit->second == spark_key) return false; // identical (key, rule): no-op
         remove_rule(rule_id);                        // moved to a new key: drop the old
     }
+    // Strong exception guarantee: either BOTH indexes gain the mapping, or a throw from
+    // any allocation leaves the index exactly as on entry. The previous `by_key_[key]`
+    // + emplace + insert_or_assign could, on a mid-way bad_alloc, leave an EMPTY by_key_
+    // set (violating the "a key entry never lives empty" invariant, so a later add's
+    // `rules.empty()` mis-reports the 0->1 edge and DOUBLE-ARMS the key) or a forward
+    // mapping with no matching reverse entry. Both corrupt a *future successful* add
+    // (Fable rung-7.7b review M3), so the fix must be here, not only in the caller.
     std::string key{spark_key};
-    auto& rules = by_key_[key];
-    const bool first = rules.empty();
-    rules.emplace(rule_id);
-    by_rule_.insert_or_assign(std::string{rule_id}, std::move(key));
-    return first;
+    const auto kit = by_key_.find(key);
+    if (kit == by_key_.end()) {
+        // New key (0->1 edge). Create the node, then populate it + the reverse index
+        // under a rollback that erases the whole node on any throw.
+        const auto [new_kit, _] = by_key_.emplace(key, std::set<std::string>{}); // may throw: nothing else mutated
+        try {
+            new_kit->second.emplace(rule_id);                     // may throw
+            by_rule_.emplace(std::string{rule_id}, std::move(key)); // may throw
+        } catch (...) {
+            by_key_.erase(new_kit); // undo the (possibly empty) node -> back to entry state
+            throw;
+        }
+        return true;
+    }
+    // Existing key: add to the live set, then the reverse index; undo the set insert if
+    // the reverse insert throws so membership is unchanged.
+    const bool inserted = kit->second.emplace(rule_id).second;    // strong: set unchanged on throw
+    try {
+        by_rule_.emplace(std::string{rule_id}, std::move(key));   // may throw
+    } catch (...) {
+        if (inserted)
+            kit->second.erase(std::string{rule_id});
+        throw;
+    }
+    return false;
 }
 
 inline std::optional<std::string> SparkKeyRuleIndex::remove_rule(std::string_view rule_id) {

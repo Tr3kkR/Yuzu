@@ -333,7 +333,19 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (!put_rule_locked(rule)) {
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
-        reconcile_rule_locked(rule); // step 4: arm/withdraw via the reconcile op (rung 7)
+        // Per-rule exception firewall: reconcile can throw (a spark attach OOM, a
+        // backend arm that throws) and must NOT abort the whole push and escape to the
+        // dispatch caller with the KV already partially written and some rules armed and
+        // some not. Degrade loud and continue - the same posture start_local() takes for
+        // a thread-exhaustion throw. The rule is persisted; the next full_sync or a
+        // restart re-arms it. (rung 7.7b PR-1 item 3 / Fable M3.)
+        try {
+            reconcile_rule_locked(rule); // step 4: arm/withdraw via the reconcile op (rung 7)
+        } catch (const std::exception& e) {
+            spdlog::error("Guardian: reconcile threw for rule '{}': {} - persisted but not armed",
+                          rule.rule_id(), e.what());
+            continue; // not counted as applied; the rule stays persisted for retry
+        }
         ++applied;
     }
 

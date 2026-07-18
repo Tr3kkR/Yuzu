@@ -68,7 +68,9 @@ struct FakeBackend : ISparkBackend {
     std::atomic<int> arms{0};
     std::atomic<int> disarms{0};
     std::atomic<bool> fail_arm{false};
+    std::atomic<bool> throw_arm{false}; ///< arm() throws (a backend that throws, not just fails)
     std::expected<std::uint64_t, std::string> arm(const SparkSpec&) override {
+        if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
         arms.fetch_add(1);
         return next.fetch_add(1);
@@ -669,6 +671,35 @@ TEST_CASE("attach_rule enqueues a Lifecycle 'armed' entry; detach_rule enqueues 
     CHECK(lc[0].lifecycle_kind == "disarmed");
     CHECK(lc[0].guard_type == "file"); // disarmed carries the identity too (captured pre-erase)
     CHECK(lc[0].rule_name == "Hosts integrity");
+}
+
+TEST_CASE("attach_rule: a THROWING backend arm() rolls back with no ghost index entry / no leak",
+          "[spark][runtime]") {
+    // Fable rung-7.7b M3: the pre-fix code installed attach_rule's rollback only AFTER
+    // arm(), so a THROWING arm() left the rule in the index with no subscription. That
+    // ghost then corrupted a LATER successful attach of a sibling rule on the same key
+    // (a false 0->1 edge -> double-arm / untracked subscription).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    b->throw_arm = true;
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true),
+                    std::runtime_error);
+    b->throw_arm = false;
+
+    // Rolled back clean: no armed watcher, the throwing arm did not count, nothing to
+    // disarm (arm threw before returning a subscription).
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+    CHECK(b->disarms.load() == 0);
+
+    // The decisive check: a fresh attach of a SIBLING on the SAME key sees a real 0->1
+    // edge and arms EXACTLY once. A lingering ghost from r1 would make this take the
+    // existing-key branch and never arm (armed_key_count would stay 0, or double-count).
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1);
 }
 
 TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",

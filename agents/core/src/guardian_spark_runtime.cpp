@@ -109,48 +109,46 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         rg->assertion = std::move(assertion);
         rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
-        const bool arm_edge = index_->add(key, rule_id);
-        // `pk` is declared BEFORE `rollback` so it is destroyed AFTER it
-        // (reverse construction order): `rollback`'s destructor lambda
-        // references `pk` by reference, so `pk` must still be alive when
-        // that destructor runs.
+        // `pk`/`sub`/`armed_here` are declared BEFORE `rollback` so they outlive its
+        // destructor (reverse construction order): the rollback lambda reads them by
+        // reference. ONE rollback is installed BEFORE index_->add and backend_->arm, so
+        // a THROW from either - not only a returned error - unwinds every mutation,
+        // INCLUDING a subscription that armed just before a later step threw. The prior
+        // code assigned the rollback only AFTER arm() and per-branch, so a throwing arm()
+        // (or a throwing rollback-closure assignment after the arm) leaked the
+        // subscription and left a ghost index entry that then corrupted a future sibling
+        // attach (Fable rung-7.7b review M3; extends Sol rung-7.5 finding 1). Every undo
+        // is a safe no-op if its mutation never ran.
         std::shared_ptr<PerKey> pk;
-        // Unwinds EVERY mutation below unless committed - covers any throw
-        // between here and the end of the locked block (map/set insertion
-        // bad_alloc, etc.) so a mid-construction exception cannot leave a
-        // live, untracked SparkEngine subscription, nor a stale rules_/
-        // pending_initial entry with no corresponding key/subscription (Sol
-        // rung-7.5 review finding 1). `rules_.erase`/`pending_initial.erase`
-        // are safe no-ops if those inserts never ran.
+        std::uint64_t sub = 0;
+        bool armed_here = false;
         ScopeExit rollback;
-        if (arm_edge) {
-            auto armed = backend_->arm(spec);
-            if (!armed) {
-                index_->remove_rule(rule_id); // undo: an un-armed key must not linger
-                return std::unexpected(armed.error());
+        rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
+            index_->remove_rule(rule_id); // no-op if add() never ran or threw clean
+            if (armed_here) {
+                // THIS attach created the watcher (0->1 edge under registry_mu_, so it is
+                // the sole rule on the key): tear the new subscription + PerKey down.
+                keys_.erase(key); // no-op if the new PerKey was not yet emplaced
+                backend_->disarm(sub);
             }
-            const std::uint64_t sub = *armed;
-            rollback.fn = [this, rule_id, key, sub, &pk] {
-                const auto vacated = index_->remove_rule(rule_id);
-                keys_.erase(key);
-                if (vacated)
-                    backend_->disarm(sub);
-                rules_.erase(rule_id);
-                if (pk)
-                    pk->pending_initial.erase(rule_id);
-            };
+            rules_.erase(rule_id); // no-op if not yet inserted
+            if (pk)
+                pk->pending_initial.erase(rule_id);
+        };
+
+        const bool arm_edge = index_->add(key, rule_id);
+        if (arm_edge) {
+            auto armed = backend_->arm(spec); // may THROW -> rollback undoes the index add
+            if (!armed)
+                return std::unexpected(armed.error()); // rollback undoes the index add
+            sub = *armed;
+            armed_here = true; // from here a throw also disarms the watcher
             pk = std::make_shared<PerKey>();
             pk->spec = spec;
             pk->subscription = sub;
             keys_.emplace(key, pk);
         } else {
-            pk = keys_.at(key); // an existing shared watcher for this key
-            rollback.fn = [this, rule_id, &pk] {
-                index_->remove_rule(rule_id);
-                rules_.erase(rule_id);
-                if (pk)
-                    pk->pending_initial.erase(rule_id);
-            };
+            pk = keys_.at(key); // an existing shared watcher for this key (armed_here stays false)
         }
 
         rules_.insert_or_assign(rule_id, std::move(rg));
